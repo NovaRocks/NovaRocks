@@ -419,10 +419,10 @@ printf 'Spark width_rejected evidence retained at %s\n' "$spark_diag_dir"
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.invalid_data] Data failure (reason 7:498)
-UPDATE iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} AS t
-SET st=s.st
-FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_source_${uuid0} AS s
-WHERE t.id=s.id AND t.id=1;
+MERGE INTO iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} AS t
+USING iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_source_${uuid0} AS s
+ON t.id=s.id AND t.id=1
+WHEN MATCHED THEN UPDATE SET st=s.st;
 
 -- query 16
 -- @result_contains=FIXED_WIDTH_REQUIRED_REJECTED_OK

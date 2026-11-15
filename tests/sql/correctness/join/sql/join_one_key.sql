@@ -160,7 +160,8 @@ FROM ${case_db}.t1 t1 FULL JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
 -- query 14
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100)
 SELECT count(1), count(t1.k1), count(t1.c_bool_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- ========== c_tinyint_null ==========
 
@@ -177,7 +178,8 @@ FROM ${case_db}.t1 t1 FULL JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null;
 -- query 17
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100)
 SELECT count(1), count(t1.k1), count(t1.c_tinyint_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_tinyint_null = t2.c_tinyint_null);
 
 -- ========== c_smallint_null ==========
 
@@ -194,7 +196,8 @@ FROM ${case_db}.t1 t1 FULL JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null
 -- query 20
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10000)
 SELECT count(1), count(t1.k1), count(t1.c_smallint_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_smallint_null = t2.c_smallint_null);
 
 -- ========== c_int (non-null) ==========
 
@@ -208,7 +211,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_int = t2.c_int;
 
 -- query 23
 SELECT count(1), count(t1.k1), count(t1.c_int)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_int_null ==========
 
@@ -222,7 +226,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_int_null = t2.c_int_nul
 
 -- query 26
 SELECT count(1), count(t1.k1), count(t1.c_int_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_int_null = t2.c_int_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_int_null = t2.c_int_null);
 
 -- ========== c_bigint (non-null) ==========
 
@@ -236,7 +241,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_bigint = t2.c_bigint;
 
 -- query 29
 SELECT count(1), count(t1.k1), count(t1.c_bigint)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_bigint_null ==========
 
@@ -250,7 +256,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_bigint_null = t2.c_bigi
 
 -- query 32
 SELECT count(1), count(t1.k1), count(t1.c_bigint_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_bigint_null = t2.c_bigint_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_bigint_null = t2.c_bigint_null);
 
 -- ========== c_largeint (non-null) ==========
 
@@ -264,7 +271,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_largeint = t2.c_largein
 
 -- query 35
 SELECT count(1), count(t1.k1), count(t1.c_largeint)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_largeint_null ==========
 
@@ -278,7 +286,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_largeint_null = t2.c_la
 
 -- query 38
 SELECT count(1), count(t1.k1), count(t1.c_largeint_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_largeint_null = t2.c_largeint_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_largeint_null = t2.c_largeint_null);
 
 -- ========== c_float (non-null) ==========
 
@@ -292,7 +301,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
 
 -- query 41
 SELECT count(1), count(t1.k1), count(t1.c_float)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_float_null ==========
 
@@ -306,7 +316,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_float_null = t2.c_float
 
 -- query 44
 SELECT count(1), count(t1.k1), count(t1.c_float_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float_null = t2.c_float_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float_null = t2.c_float_null);
 
 -- ========== c_double (non-null) ==========
 
@@ -320,7 +331,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_double = t2.c_double;
 
 -- query 47
 SELECT count(1), count(t1.k1), count(t1.c_double)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_double_null ==========
 
@@ -334,7 +346,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_double_null = t2.c_doub
 
 -- query 50
 SELECT count(1), count(t1.k1), count(t1.c_double_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_double_null = t2.c_double_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_double_null = t2.c_double_null);
 
 -- ========== c_decimalv2 (non-null) ==========
 
@@ -348,7 +361,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_decimalv2 = t2.c_decima
 
 -- query 53
 SELECT count(1), count(t1.k1), count(t1.c_decimalv2)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_decimalv2_null ==========
 
@@ -362,7 +376,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_decimalv2_null = t2.c_d
 
 -- query 56
 SELECT count(1), count(t1.k1), count(t1.c_decimalv2_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_decimalv2_null = t2.c_decimalv2_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_decimalv2_null = t2.c_decimalv2_null);
 
 -- ========== c_decimal32 (non-null) ==========
 
@@ -376,7 +391,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_decimal32 = t2.c_decima
 
 -- query 59
 SELECT count(1), count(t1.k1), count(t1.c_decimal32)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_decimal32_null ==========
 
@@ -390,7 +406,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_decimal32_null = t2.c_d
 
 -- query 62
 SELECT count(1), count(t1.k1), count(t1.c_decimal32_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_decimal32_null = t2.c_decimal32_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_decimal32_null = t2.c_decimal32_null);
 
 -- ========== c_decimal64 (non-null) ==========
 
@@ -404,7 +421,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_decimal64 = t2.c_decima
 
 -- query 65
 SELECT count(1), count(t1.k1), count(t1.c_decimal64)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_decimal64_null ==========
 
@@ -418,7 +436,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_decimal64_null = t2.c_d
 
 -- query 68
 SELECT count(1), count(t1.k1), count(t1.c_decimal64_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_decimal64_null = t2.c_decimal64_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_decimal64_null = t2.c_decimal64_null);
 
 -- ========== c_decimal128 (non-null) ==========
 
@@ -432,7 +451,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_decimal128 = t2.c_decim
 
 -- query 71
 SELECT count(1), count(t1.k1), count(t1.c_decimal128)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_decimal128_null ==========
 
@@ -446,7 +466,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_decimal128_null = t2.c_
 
 -- query 74
 SELECT count(1), count(t1.k1), count(t1.c_decimal128_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_decimal128_null = t2.c_decimal128_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_decimal128_null = t2.c_decimal128_null);
 
 -- ========== c_date (non-null) ==========
 
@@ -460,7 +481,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_date = t2.c_date;
 
 -- query 77
 SELECT count(1), count(t1.k1), count(t1.c_date)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_date_null ==========
 
@@ -474,7 +496,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_date_null = t2.c_date_n
 
 -- query 80
 SELECT count(1), count(t1.k1), count(t1.c_date_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_date_null = t2.c_date_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_date_null = t2.c_date_null);
 
 -- ========== c_datetime (non-null) ==========
 
@@ -488,7 +511,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_datetime = t2.c_datetim
 
 -- query 83
 SELECT count(1), count(t1.k1), count(t1.c_datetime)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_datetime_null ==========
 
@@ -502,7 +526,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_datetime_null = t2.c_da
 
 -- query 86
 SELECT count(1), count(t1.k1), count(t1.c_datetime_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_datetime_null = t2.c_datetime_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_datetime_null = t2.c_datetime_null);
 
 -- ========== c_char (non-null) ==========
 
@@ -516,7 +541,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_char = t2.c_char;
 
 -- query 89
 SELECT count(1), count(t1.k1), count(t1.c_char)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_char_null ==========
 
@@ -530,7 +556,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_char_null = t2.c_char_n
 
 -- query 92
 SELECT count(1), count(t1.k1), count(t1.c_char_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_char_null = t2.c_char_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_char_null = t2.c_char_null);
 
 -- ========== c_varchar (non-null) ==========
 
@@ -544,7 +571,8 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_varchar = t2.c_varchar;
 
 -- query 95
 SELECT count(1), count(t1.k1), count(t1.c_varchar)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_float = t2.c_float;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_float = t2.c_float);
 
 -- ========== c_varchar_null ==========
 
@@ -558,4 +586,5 @@ FROM ${case_db}.t1 t1 FULL JOIN ${case_db}.t1 t2 ON t1.c_varchar_null = t2.c_var
 
 -- query 98
 SELECT count(1), count(t1.k1), count(t1.c_varchar_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN ${case_db}.t1 t2 ON t1.c_varchar_null = t2.c_varchar_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_varchar_null = t2.c_varchar_null);

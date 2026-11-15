@@ -34,4 +34,4 @@ ANALYZE TABLE ${case_db}.t_dnn_sr;
 -- @explain_contains=IS NOT NULL
 EXPLAIN VERBOSE SELECT l.v
 FROM ${case_db}.t_dnn_sl l
-LEFT SEMI JOIN ${case_db}.t_dnn_sr r ON l.k = r.k;
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_dnn_sr r WHERE l.k = r.k);

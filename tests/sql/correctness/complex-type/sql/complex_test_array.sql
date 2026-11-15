@@ -318,16 +318,16 @@ select array_generate("2025-10-01", "2025-10-05",1);
 
 -- query 55
 USE ${case_db};
-select array_generate("2025-10-01", "2025-10-05",interval 1 day);
+select array_generate("2025-10-01", "2025-10-05",1, 'day');
 
 -- query 56
 -- @skip_result_check=true
 USE ${case_db};
-select array_generate("2025-10-01", "2025-10-05",interval 0 day);
+select array_generate("2025-10-01", "2025-10-05",0, 'day');
 
 -- query 57
 USE ${case_db};
-select array_generate("2025-10-01", 10000, interval 0 day);
+select array_generate("2025-10-01", 10000, 0, 'day');
 
 -- query 58
 USE ${case_db};
@@ -339,95 +339,95 @@ select array_generate("2025-10-01", "abc", 1);
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
-select array_generate("2025-10-01", "2025-10-05",interval -1 day);
+select array_generate("2025-10-01", "2025-10-05",-1, 'day');
 
 -- query 60
 USE ${case_db};
-select array_generate(DATE"2025-10-01", DATE"2025-10-05",interval 1 day);
+select array_generate(DATE"2025-10-01", DATE"2025-10-05",1, 'day');
 
 -- query 61
 USE ${case_db};
-select array_generate(DATETIME"2025-10-01", DATETIME"2025-10-05",interval 1 day);
+select array_generate(DATETIME"2025-10-01", DATETIME"2025-10-05",1, 'day');
 
 -- query 62
 USE ${case_db};
-select array_generate("2025-10-01", "2027-10-05",interval 1 year);
+select array_generate("2025-10-01", "2027-10-05",1, 'year');
 
 -- query 63
 USE ${case_db};
-select array_generate("2025-10-01", "2027-10-05",interval 1 QUARTER);
+select array_generate("2025-10-01", "2027-10-05",1, 'quarter');
 
 -- query 64
 USE ${case_db};
-select array_generate("2025-10-01", "2026-10-05",interval 2 MONTH);
+select array_generate("2025-10-01", "2026-10-05",2, 'month');
 
 -- query 65
 USE ${case_db};
-select array_generate("2025-10-01", "2025-12-05",interval 2 WEEK);
+select array_generate("2025-10-01", "2025-12-05",2, 'week');
 
 -- query 66
 USE ${case_db};
-select array_generate("2025-10-01", "2025-10-05",interval 2 day);
+select array_generate("2025-10-01", "2025-10-05",2, 'day');
 
 -- query 67
 USE ${case_db};
-select array_generate("2025-10-01 14:28:31", "2025-10-01 23:12:36",interval 3 hour);
+select array_generate("2025-10-01 14:28:31", "2025-10-01 23:12:36",3, 'hour');
 
 -- query 68
 USE ${case_db};
-select array_generate("2025-10-01 14:28:31", "2025-10-01 15:12:36",interval 8 MINUTE);
+select array_generate("2025-10-01 14:28:31", "2025-10-01 15:12:36",8, 'minute');
 
 -- query 69
 USE ${case_db};
-select array_generate("2025-10-01 14:28:31", "2025-10-01 14:29:36",interval 10 SECOND);
+select array_generate("2025-10-01 14:28:31", "2025-10-01 14:29:36",10, 'second');
 
 -- query 70
 USE ${case_db};
-select array_generate("2025-10-01 14:28:31", "2025-10-01 14:28:34",interval 500 MILLISECOND);
+select array_generate("2025-10-01 14:28:31", "2025-10-01 14:28:34",500, 'millisecond');
 
 -- query 71
 USE ${case_db};
-select array_generate("2025-10-01 14:28:31", "2025-10-01 14:28:32.800000",interval 500000 MICROSECOND);
+select array_generate("2025-10-01 14:28:31", "2025-10-01 14:28:32.800000",500000, 'microsecond');
 
 -- query 72
 USE ${case_db};
-select array_generate("2027-10-05", "2025-10-01",interval 1 year);
+select array_generate("2027-10-05", "2025-10-01",1, 'year');
 
 -- query 73
 USE ${case_db};
-select array_generate("2027-10-05", "2025-10-01",interval 1 QUARTER);
+select array_generate("2027-10-05", "2025-10-01",1, 'quarter');
 
 -- query 74
 USE ${case_db};
-select array_generate("2026-10-05", "2025-10-01",interval 2 MONTH);
+select array_generate("2026-10-05", "2025-10-01",2, 'month');
 
 -- query 75
 USE ${case_db};
-select array_generate("2025-12-05", "2025-10-01",interval 2 WEEK);
+select array_generate("2025-12-05", "2025-10-01",2, 'week');
 
 -- query 76
 USE ${case_db};
-select array_generate("2025-10-05", "2025-10-01",interval 2 day);
+select array_generate("2025-10-05", "2025-10-01",2, 'day');
 
 -- query 77
 USE ${case_db};
-select array_generate("2025-10-01 23:12:36", "2025-10-01 14:28:31",interval 3 hour);
+select array_generate("2025-10-01 23:12:36", "2025-10-01 14:28:31",3, 'hour');
 
 -- query 78
 USE ${case_db};
-select array_generate("2025-10-01 15:12:36", "2025-10-01 14:28:31",interval 8 MINUTE);
+select array_generate("2025-10-01 15:12:36", "2025-10-01 14:28:31",8, 'minute');
 
 -- query 79
 USE ${case_db};
-select array_generate("2025-10-01 14:29:36", "2025-10-01 14:28:31",interval 10 SECOND);
+select array_generate("2025-10-01 14:29:36", "2025-10-01 14:28:31",10, 'second');
 
 -- query 80
 USE ${case_db};
-select array_generate("2025-10-01 14:28:34", "2025-10-01 14:28:31",interval 500 MILLISECOND);
+select array_generate("2025-10-01 14:28:34", "2025-10-01 14:28:31",500, 'millisecond');
 
 -- query 81
 USE ${case_db};
-select array_generate("2025-10-01 14:28:32.800000", "2025-10-01 14:28:31",interval 500000 MICROSECOND);
+select array_generate("2025-10-01 14:28:32.800000", "2025-10-01 14:28:31",500000, 'microsecond');
 
 -- query 82
 -- @expect_error_tier=target
@@ -435,7 +435,7 @@ select array_generate("2025-10-01 14:28:32.800000", "2025-10-01 14:28:31",interv
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
-select array_generate("2025-10-05", "2025-10-01",interval -1 day);
+select array_generate("2025-10-05", "2025-10-01",-1, 'day');
 
 -- query 83
 -- @expect_error=array_generate requires step parameter must be a constant integer

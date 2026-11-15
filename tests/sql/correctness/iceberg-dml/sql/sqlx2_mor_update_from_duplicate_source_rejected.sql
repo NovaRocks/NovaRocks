@@ -43,11 +43,11 @@ INSERT INTO ${case_db}.sqlx2_mor_update_source VALUES (1, 'x'), (1, 'y');
 
 -- query 2
 -- @expect_error_tier=drift
--- @expect_error=TrinoError { name=MERGE_TARGET_ROW_MULTIPLE_MATCHES type=USER_ERROR code=119 }: One UPDATE target table row matched more than one source row
-UPDATE ${case_db}.sqlx2_mor_update_target AS t
-SET v = s.new_v
-FROM ${case_db}.sqlx2_mor_update_source AS s
-WHERE t.id = s.id;
+-- @expect_error=TrinoError { name=MERGE_TARGET_ROW_MULTIPLE_MATCHES type=USER_ERROR code=119 }: One MERGE target table row matched more than one source row
+MERGE INTO ${case_db}.sqlx2_mor_update_target AS t
+USING ${case_db}.sqlx2_mor_update_source AS s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.new_v;
 
 -- query 3
 SELECT id, v

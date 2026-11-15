@@ -42,7 +42,7 @@ FROM (
     SELECT k AS ak, v
     FROM ${case_db}.rf_remap_a
 ) pa
-LEFT SEMI JOIN ${case_db}.rf_remap_b b ON pa.ak = b.k;
+WHERE EXISTS (SELECT 1 FROM ${case_db}.rf_remap_b b WHERE pa.ak = b.k);
 
 -- @explain_contains=UNION ALL
 -- @explain_contains=producer binding

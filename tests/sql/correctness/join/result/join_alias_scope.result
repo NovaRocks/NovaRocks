@@ -1,0 +1,24 @@
+-- query 2
+-- types	integer
+matched
+1
+
+-- query 3
+-- types	integer
+matched
+1
+
+-- query 4
+-- types	integer
+unmatched
+3
+
+-- query 5
+-- types	integer
+unmatched
+3
+
+-- query 6
+-- types	integer
+matched
+1

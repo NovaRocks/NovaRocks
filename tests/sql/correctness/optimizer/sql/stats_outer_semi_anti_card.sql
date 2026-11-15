@@ -47,7 +47,7 @@ LEFT OUTER JOIN ${case_db}.oq12_stats_join_r r ON l.k = r.k;
 -- @explain_not_contains=stats={rows=1}
 EXPLAIN VERBOSE SELECT l.k
 FROM ${case_db}.oq12_stats_join_l l
-LEFT SEMI JOIN ${case_db}.oq12_stats_join_r r ON l.k = r.k;
+WHERE EXISTS (SELECT 1 FROM ${case_db}.oq12_stats_join_r r WHERE l.k = r.k);
 
 -- @explain_contains=HASH JOIN
 -- @explain_contains=LEFT ANTI
@@ -56,4 +56,4 @@ LEFT SEMI JOIN ${case_db}.oq12_stats_join_r r ON l.k = r.k;
 -- @explain_not_contains=stats={rows=1}
 EXPLAIN VERBOSE SELECT l.k
 FROM ${case_db}.oq12_stats_join_l l
-LEFT ANTI JOIN ${case_db}.oq12_stats_join_r r ON l.k = r.k;
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.oq12_stats_join_r r WHERE l.k = r.k);

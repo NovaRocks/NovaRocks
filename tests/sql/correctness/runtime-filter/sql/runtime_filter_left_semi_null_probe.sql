@@ -49,6 +49,5 @@ INSERT INTO ${case_db}.t_rf_left_semi_null_probe_r VALUES
 
 SELECT l.id, l.k
 FROM ${case_db}.t_rf_left_semi_null_probe_l l
-LEFT SEMI JOIN ${case_db}.t_rf_left_semi_null_probe_r r
-  ON l.k = r.k
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_rf_left_semi_null_probe_r r WHERE l.k = r.k)
 ORDER BY l.id;

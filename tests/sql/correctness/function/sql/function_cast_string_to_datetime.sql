@@ -49,10 +49,10 @@ insert into __row_util select k1 + 80000 from __row_util;
 insert into t1
 select
     cast(random() *2e9 as int),
-    cast(cast(date_add('2020-01-01', INTERVAL row_number() over() DAY) as date) as varchar),
-    concat(cast(cast(date_add('2020-01-01', INTERVAL row_number() over() DAY) as date) as varchar), ' 01:02:03'),
-    concat('  ', cast(cast(date_add('2020-01-01', INTERVAL row_number() over() DAY) as date) as varchar), '  '),
-    concat('   ', cast(cast(date_add('2020-01-01', INTERVAL row_number() over() DAY) as date) as varchar), ' 01:02:03  ')
+    cast(cast(days_add('2020-01-01', row_number() over()) as date) as varchar),
+    concat(cast(cast(days_add('2020-01-01', row_number() over()) as date) as varchar), ' 01:02:03'),
+    concat('  ', cast(cast(days_add('2020-01-01', row_number() over()) as date) as varchar), '  '),
+    concat('   ', cast(cast(days_add('2020-01-01', row_number() over()) as date) as varchar), ' 01:02:03  ')
 from __row_util;
 
 insert into t1 (date_str)

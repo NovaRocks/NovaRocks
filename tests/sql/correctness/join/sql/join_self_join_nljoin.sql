@@ -81,12 +81,10 @@ FULL OUTER JOIN ${case_db}.t_self_join_nl b
 -- LEFT SEMI JOIN self ON non-equality
 SELECT count(*), count(a.v1)
 FROM ${case_db}.t_self_join_nl a
-LEFT SEMI JOIN ${case_db}.t_self_join_nl b
-  ON a.k1 > b.k1;
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_self_join_nl b WHERE a.k1 > b.k1);
 
 -- query 10
 -- LEFT ANTI JOIN self ON non-equality
 SELECT count(*), count(a.v1)
 FROM ${case_db}.t_self_join_nl a
-LEFT ANTI JOIN ${case_db}.t_self_join_nl b
-  ON a.k1 > b.k1;
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t_self_join_nl b WHERE a.k1 > b.k1);

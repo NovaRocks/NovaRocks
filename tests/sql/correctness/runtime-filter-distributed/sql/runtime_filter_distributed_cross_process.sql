@@ -77,12 +77,12 @@ WHERE b.flag = 'Y';
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
 SELECT 'left_semi_string' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
-LEFT SEMI JOIN ${case_db}.rf_dist_build b ON p.s = b.s AND b.flag = 'Y';
+WHERE EXISTS (SELECT 1 FROM ${case_db}.rf_dist_build b WHERE p.s = b.s AND b.flag = 'Y');
 
 SET disable_optimizer_rules = '';
 SELECT 'left_semi_string' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
-LEFT SEMI JOIN ${case_db}.rf_dist_build b ON p.s = b.s AND b.flag = 'Y';
+WHERE EXISTS (SELECT 1 FROM ${case_db}.rf_dist_build b WHERE p.s = b.s AND b.flag = 'Y');
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
 SELECT 'multi_column' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum

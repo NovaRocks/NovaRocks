@@ -47,6 +47,5 @@ INSERT INTO ${case_db}.t_join_left_semi_r VALUES
   (4, 'R4');
 SELECT l.id, l.lv
 FROM ${case_db}.t_join_left_semi_l l
-LEFT SEMI JOIN ${case_db}.t_join_left_semi_r r
-  ON l.id = r.id
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_join_left_semi_r r WHERE l.id = r.id)
 ORDER BY l.id;

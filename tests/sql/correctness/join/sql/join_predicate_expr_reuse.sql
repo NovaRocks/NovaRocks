@@ -183,12 +183,12 @@ WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v
 -- query 22
 -- @order_sensitive=false
 -- LEFT SEMI JOIN with reused abs() in WHERE + GROUP BY
-SELECT COUNT(*), abs(${case_db}.pre_t0.v1) FROM ${case_db}.pre_t0 LEFT SEMI JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
-WHERE abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) > 10 AND abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) < 100 AND abs(${case_db}.pre_t0.v1) > 5
+SELECT COUNT(*), abs(${case_db}.pre_t0.v1) FROM ${case_db}.pre_t0
+WHERE EXISTS (SELECT 1 FROM ${case_db}.pre_t1 WHERE ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4) AND (abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) > 10 AND abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) < 100 AND abs(${case_db}.pre_t0.v1) > 5)
 GROUP BY abs(${case_db}.pre_t0.v1);
 
 -- query 23
 -- LEFT ANTI JOIN with reused abs() in WHERE + GROUP BY (expect empty)
-SELECT COUNT(*), abs(${case_db}.pre_t0.v1) FROM ${case_db}.pre_t0 LEFT ANTI JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
-WHERE abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) > 10 AND abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) < 100 AND abs(${case_db}.pre_t0.v1) > 5
+SELECT COUNT(*), abs(${case_db}.pre_t0.v1) FROM ${case_db}.pre_t0
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.pre_t1 WHERE ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4) AND (abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) > 10 AND abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) < 100 AND abs(${case_db}.pre_t0.v1) > 5)
 GROUP BY abs(${case_db}.pre_t0.v1);

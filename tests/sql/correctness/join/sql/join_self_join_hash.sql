@@ -77,33 +77,29 @@ FULL OUTER JOIN ${case_db}.t_self_join_hash b
 -- LEFT SEMI JOIN self + other conjuncts
 SELECT count(*), count(a.v1)
 FROM ${case_db}.t_self_join_hash a
-LEFT SEMI JOIN ${case_db}.t_self_join_hash b
-  ON a.k1 = b.k1
-  AND (a.v1 + b.v1) % 3 = 0;
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_self_join_hash b WHERE a.k1 = b.k1
+  AND (a.v1 + b.v1) % 3 = 0);
 
 -- query 9
 -- LEFT ANTI JOIN self + other conjuncts
 SELECT count(*), count(a.v1)
 FROM ${case_db}.t_self_join_hash a
-LEFT ANTI JOIN ${case_db}.t_self_join_hash b
-  ON a.k1 = b.k1
-  AND (a.v1 + b.v1) % 3 = 0;
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t_self_join_hash b WHERE a.k1 = b.k1
+  AND (a.v1 + b.v1) % 3 = 0);
 
 -- query 10
 -- RIGHT SEMI JOIN self + other conjuncts (original bug scenario)
 SELECT count(*), count(b.v1)
-FROM ${case_db}.t_self_join_hash a
-RIGHT SEMI JOIN ${case_db}.t_self_join_hash b
-  ON a.k1 = b.k1
-  AND (a.v1 + b.v1) % 3 = 0;
+FROM ${case_db}.t_self_join_hash b
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_self_join_hash a WHERE a.k1 = b.k1
+  AND (a.v1 + b.v1) % 3 = 0);
 
 -- query 11
 -- RIGHT ANTI JOIN self + other conjuncts (original bug scenario)
 SELECT count(*), count(b.v1)
-FROM ${case_db}.t_self_join_hash a
-RIGHT ANTI JOIN ${case_db}.t_self_join_hash b
-  ON a.k1 = b.k1
-  AND (a.v1 + b.v1) % 3 = 0;
+FROM ${case_db}.t_self_join_hash b
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t_self_join_hash a WHERE a.k1 = b.k1
+  AND (a.v1 + b.v1) % 3 = 0);
 
 -- query 12
 -- NULL AWARE LEFT ANTI JOIN (NOT IN subquery)

@@ -51,7 +51,6 @@ INSERT INTO ${case_db}.t_join_right_semi_residual_r VALUES
   (4, 1, 'r4_nomatch'),
   (NULL, 1, 'rnull');
 SELECT r.id, r.threshold, r.tag
-FROM ${case_db}.t_join_right_semi_residual_l l
-RIGHT SEMI JOIN ${case_db}.t_join_right_semi_residual_r r
-  ON l.id = r.id AND l.score > r.threshold
+FROM ${case_db}.t_join_right_semi_residual_r r
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_join_right_semi_residual_l l WHERE l.id = r.id AND l.score > r.threshold)
 ORDER BY r.id, r.threshold;

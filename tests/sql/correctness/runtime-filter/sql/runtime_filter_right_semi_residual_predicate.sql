@@ -52,10 +52,9 @@ INSERT INTO ${case_db}.t_rf_right_semi_residual_r VALUES
     (4, 1, 'r4_nomatch'),
     (NULL, 1, 'rnull');
 
--- @explain_contains=RIGHT SEMI
+-- @explain_contains=LEFT SEMI
 -- @explain_contains=producer binding
 SELECT r.k, r.threshold, r.tag
-FROM ${case_db}.t_rf_right_semi_residual_l l
-RIGHT SEMI JOIN ${case_db}.t_rf_right_semi_residual_r r
-  ON l.k = r.k AND l.score > r.threshold
+FROM ${case_db}.t_rf_right_semi_residual_r r
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_rf_right_semi_residual_l l WHERE l.k = r.k AND l.score > r.threshold)
 ORDER BY r.k, r.threshold;

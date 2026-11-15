@@ -133,13 +133,13 @@ SELECT
     idx % 32768, idx % 32768,
     idx % 2147483648, idx % 2147483648,
     idx, idx,
-    cast(date_add('2023-01-01', interval idx day) as date),
-    cast(date_add('2023-01-01', interval idx day) as date),
+    cast(days_add('2023-01-01', idx) as date),
+    cast(days_add('2023-01-01', idx) as date),
     idx, idx,
     concat('str-abc-', idx), concat('str-abc-', idx),
     concat('str-abc-', idx % 256), concat('str-abc-', idx % 256),
-    cast(date_add('2023-01-01', interval idx second) as datetime),
-    cast(date_add('2023-01-01', interval idx second) as datetime)
+    cast(seconds_add('2023-01-01', idx) as datetime),
+    cast(seconds_add('2023-01-01', idx) as datetime)
 FROM ${case_db}.row_util
 ORDER BY idx LIMIT 500;
 
@@ -152,11 +152,11 @@ SELECT
     NULL, idx % 32768,
     NULL, idx % 2147483648,
     NULL, idx,
-    NULL, cast(date_add('2023-01-01', interval idx day) as date),
+    NULL, cast(days_add('2023-01-01', idx) as date),
     NULL, idx,
     NULL, concat('str-abc-', idx),
     NULL, concat('str-abc-', idx % 256),
-    NULL, cast(date_add('2023-01-01', interval idx second) as datetime)
+    NULL, cast(seconds_add('2023-01-01', idx) as datetime)
 FROM ${case_db}.row_util
 ORDER BY idx LIMIT 500, 50;
 
@@ -169,13 +169,13 @@ SELECT
     idx % 32768, idx % 32768,
     idx * 370 % 2147483648, idx * 370 % 2147483648,
     idx * 370, idx * 370,
-    cast(date_add('2023-01-01', interval idx * 370 day) as date),
-    cast(date_add('2023-01-01', interval idx * 370 day) as date),
+    cast(days_add('2023-01-01', idx * 370) as date),
+    cast(days_add('2023-01-01', idx * 370) as date),
     idx * 370, idx * 370,
     concat('str-abc-', idx), concat('str-abc-', idx),
     concat('str-abc-', idx % 256), concat('str-abc-', idx % 256),
-    cast(date_add('2023-01-01', interval idx second) as datetime),
-    cast(date_add('2023-01-01', interval idx second) as datetime)
+    cast(seconds_add('2023-01-01', idx) as datetime),
+    cast(seconds_add('2023-01-01', idx) as datetime)
 FROM ${case_db}.row_util
 ORDER BY idx LIMIT 500;
 
@@ -188,11 +188,11 @@ SELECT
     NULL, idx % 32768,
     NULL, idx * 370 % 2147483648,
     NULL, idx * 370,
-    NULL, cast(date_add('2023-01-01', interval idx * 370 day) as date),
+    NULL, cast(days_add('2023-01-01', idx * 370) as date),
     NULL, idx * 370,
     NULL, concat('str-abc-', idx),
     NULL, concat('str-abc-', idx % 256),
-    NULL, cast(date_add('2023-01-01', interval idx second) as datetime)
+    NULL, cast(seconds_add('2023-01-01', idx) as datetime)
 FROM ${case_db}.row_util
 ORDER BY idx LIMIT 500, 50;
 
@@ -205,13 +205,13 @@ SELECT
     idx % 32768, idx % 32768,
     idx % 2147483648, idx % 2147483648,
     idx, idx,
-    cast(date_add('2023-01-01', interval idx day) as date),
-    cast(date_add('2023-01-01', interval idx day) as date),
+    cast(days_add('2023-01-01', idx) as date),
+    cast(days_add('2023-01-01', idx) as date),
     idx, idx,
     concat('str-abc-', idx), concat('str-abc-', idx),
     concat('str-abc-', idx % 256), concat('str-abc-', idx % 256),
-    cast(date_add('2023-01-01', interval idx second) as datetime),
-    cast(date_add('2023-01-01', interval idx second) as datetime)
+    cast(seconds_add('2023-01-01', idx) as datetime),
+    cast(seconds_add('2023-01-01', idx) as datetime)
 FROM ${case_db}.row_util;
 
 -- Insert t1 rows with some NULLs
@@ -223,11 +223,11 @@ SELECT
     NULL, idx % 32768,
     NULL, idx % 2147483648,
     NULL, idx,
-    NULL, cast(date_add('2023-01-01', interval idx day) as date),
+    NULL, cast(days_add('2023-01-01', idx) as date),
     NULL, idx,
     NULL, concat('str-abc-', idx),
     NULL, concat('str-abc-', idx % 256),
-    NULL, cast(date_add('2023-01-01', interval idx second) as datetime)
+    NULL, cast(seconds_add('2023-01-01', idx) as datetime)
 FROM ${case_db}.row_util
 ORDER BY idx LIMIT 5000, 500;
 

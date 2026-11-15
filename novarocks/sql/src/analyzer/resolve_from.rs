@@ -694,16 +694,6 @@ impl<'a> super::AnalyzerContext<'a> {
                     &resolved_table.catalog.columns,
                     self.control,
                 )?;
-                // If alias differs from table name, also register with table name
-                if let Some(ref a) = alias_name
-                    && !a.eq_ignore_ascii_case(&table_def.name)
-                {
-                    scope.add_table_qualified_only(
-                        &table_def.name,
-                        &resolved_table.catalog.columns,
-                        self.control,
-                    )?;
-                }
                 // Register Iceberg V3 row-lineage pseudo-columns (_row_id,
                 // _last_updated_sequence_number) when the table carries them.
                 // These are hidden from SELECT * but resolvable by explicit name.

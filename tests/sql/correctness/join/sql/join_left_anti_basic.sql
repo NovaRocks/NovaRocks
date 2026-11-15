@@ -46,6 +46,5 @@ INSERT INTO ${case_db}.t_join_left_anti_r VALUES
   (4, 'R4');
 SELECT l.id, l.lv
 FROM ${case_db}.t_join_left_anti_l l
-LEFT ANTI JOIN ${case_db}.t_join_left_anti_r r
-  ON l.id = r.id
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t_join_left_anti_r r WHERE l.id = r.id)
 ORDER BY l.id;

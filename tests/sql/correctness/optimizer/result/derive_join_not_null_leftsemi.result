@@ -34,8 +34,9 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 4
     PARTITION: BROADCAST
-5:SCAN ${case_db}.t_dnn_sr (alias=r) stats={rows=166}
-     TABLE: ${case_db}.t_dnn_sr
-     columns: k
-     min-max stats
-     predicates: r.k IS NOT NULL
+5:PROJECT [r.k] stats={rows=166}
+  6:SCAN ${case_db}.t_dnn_sr (alias=r) stats={rows=166}
+       TABLE: ${case_db}.t_dnn_sr
+       columns: k
+       min-max stats
+       predicates: r.k IS NOT NULL

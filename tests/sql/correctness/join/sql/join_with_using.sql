@@ -119,12 +119,16 @@ SELECT * FROM ${case_db}.left_table LEFT JOIN ${case_db}.right_table USING(id1, 
 -- query 16
 -- RIGHT SEMI JOIN with USING
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table RIGHT SEMI JOIN ${case_db}.right_table USING(id1, id2) ORDER BY id1;
+SELECT right_table.id1, right_table.id2, right_table.dept, right_table.bonus FROM ${case_db}.right_table
+WHERE EXISTS (SELECT 1 FROM ${case_db}.left_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1 AND ${case_db}.left_table.id2 = ${case_db}.right_table.id2)
+ORDER BY id1;
 
 -- query 17
 -- RIGHT ANTI JOIN with USING
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table RIGHT ANTI JOIN ${case_db}.right_table USING(id1, id2) ORDER BY id1;
+SELECT right_table.id1, right_table.id2, right_table.dept, right_table.bonus FROM ${case_db}.right_table
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.left_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1 AND ${case_db}.left_table.id2 = ${case_db}.right_table.id2)
+ORDER BY id1;
 
 -- query 18
 -- CROSS JOIN (no USING, baseline)
@@ -134,12 +138,16 @@ SELECT * FROM ${case_db}.left_table CROSS JOIN ${case_db}.right_table ORDER BY l
 -- query 19
 -- LEFT SEMI JOIN with multi-key USING
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table LEFT SEMI JOIN ${case_db}.right_table USING(id1, id2) ORDER BY id1;
+SELECT left_table.id1, left_table.id2, left_table.name, left_table.age, left_table.city, left_table.salary, left_table.status FROM ${case_db}.left_table
+WHERE EXISTS (SELECT 1 FROM ${case_db}.right_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1 AND ${case_db}.left_table.id2 = ${case_db}.right_table.id2)
+ORDER BY id1;
 
 -- query 20
 -- LEFT ANTI JOIN with multi-key USING
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table LEFT ANTI JOIN ${case_db}.right_table USING(id1, id2) ORDER BY id1;
+SELECT left_table.id1, left_table.id2, left_table.name, left_table.age, left_table.city, left_table.salary, left_table.status FROM ${case_db}.left_table
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.right_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1 AND ${case_db}.left_table.id2 = ${case_db}.right_table.id2)
+ORDER BY id1;
 
 -- query 21
 -- Single-key USING: LEFT JOIN
@@ -159,22 +167,30 @@ SELECT * FROM ${case_db}.left_table FULL OUTER JOIN ${case_db}.right_table USING
 -- query 24
 -- Single-key USING: LEFT SEMI JOIN
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table LEFT SEMI JOIN ${case_db}.right_table USING(id1) ORDER BY id1;
+SELECT left_table.id1, left_table.name, left_table.age, left_table.city, left_table.id2, left_table.salary, left_table.status FROM ${case_db}.left_table
+WHERE EXISTS (SELECT 1 FROM ${case_db}.right_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1)
+ORDER BY id1;
 
 -- query 25
 -- Single-key USING: LEFT ANTI JOIN
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table LEFT ANTI JOIN ${case_db}.right_table USING(id1) ORDER BY id1;
+SELECT left_table.id1, left_table.name, left_table.age, left_table.city, left_table.id2, left_table.salary, left_table.status FROM ${case_db}.left_table
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.right_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1)
+ORDER BY id1;
 
 -- query 26
 -- Single-key USING: RIGHT SEMI JOIN
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table RIGHT SEMI JOIN ${case_db}.right_table USING(id1) ORDER BY id1;
+SELECT right_table.id1, right_table.dept, right_table.bonus, right_table.id2 FROM ${case_db}.right_table
+WHERE EXISTS (SELECT 1 FROM ${case_db}.left_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1)
+ORDER BY id1;
 
 -- query 27
 -- Single-key USING: RIGHT ANTI JOIN
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table RIGHT ANTI JOIN ${case_db}.right_table USING(id1) ORDER BY id1;
+SELECT right_table.id1, right_table.dept, right_table.bonus, right_table.id2 FROM ${case_db}.right_table
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.left_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1)
+ORDER BY id1;
 
 -- query 28
 -- USING column aliasing

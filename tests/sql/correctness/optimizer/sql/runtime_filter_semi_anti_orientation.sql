@@ -36,11 +36,11 @@ ANALYZE TABLE ${case_db}.rf_side_r;
 -- @explain_contains=consumer binding
 SELECT count(*)
 FROM ${case_db}.rf_side_l l
-LEFT SEMI JOIN ${case_db}.rf_side_r r ON r.k = l.k;
+WHERE EXISTS (SELECT 1 FROM ${case_db}.rf_side_r r WHERE r.k = l.k);
 
 -- @explain_contains=HASH JOIN (BROADCAST, LEFT ANTI
 -- @explain_not_contains=producer binding
 -- @explain_not_contains=consumer binding
 SELECT count(*)
 FROM ${case_db}.rf_side_l l
-LEFT ANTI JOIN ${case_db}.rf_side_r r ON r.k = l.k;
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.rf_side_r r WHERE r.k = l.k);

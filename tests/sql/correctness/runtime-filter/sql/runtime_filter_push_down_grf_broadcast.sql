@@ -257,7 +257,8 @@ group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from cte0 LEFT SEMI JOIN t0 on t0.c0 = cte0.c0
+from cte0
+WHERE EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
@@ -276,7 +277,8 @@ group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from cte0 LEFT SEMI JOIN t0 on t0.c0 = cte0.c0
+from cte0
+WHERE EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
@@ -296,7 +298,8 @@ group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from cte0 LEFT ANTI JOIN t0 on t0.c0 = cte0.c0
+from cte0
+WHERE NOT EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
@@ -315,7 +318,8 @@ group by t1.c0
 ),
 cte1 as(
 select  cte0.c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from cte0 LEFT ANTI JOIN t0 on t0.c0 = cte0.c0
+from cte0
+WHERE NOT EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
@@ -335,7 +339,8 @@ group by t1.c0
 ),
 cte1 as(
 select  coalesce(cte0.c0, -1) c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from t0 RIGHT SEMI JOIN cte0 on t0.c0 = cte0.c0
+from cte0
+WHERE EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
@@ -354,7 +359,8 @@ group by t1.c0
 ),
 cte1 as(
 select  coalesce(cte0.c0, -1) c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from t0 RIGHT SEMI JOIN cte0 on t0.c0 = cte0.c0
+from cte0
+WHERE EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
@@ -374,7 +380,8 @@ group by t1.c0
 ),
 cte1 as(
 select  coalesce(cte0.c0, -1) c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from t0 RIGHT ANTI JOIN cte0 on t0.c0 = cte0.c0
+from cte0
+WHERE NOT EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
@@ -393,7 +400,8 @@ group by t1.c0
 ),
 cte1 as(
 select  coalesce(cte0.c0, -1) c0, sum(cte0.c1) c1, sum(cte0.c2) c2
-from t0 RIGHT ANTI JOIN cte0 on t0.c0 = cte0.c0
+from cte0
+WHERE NOT EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(

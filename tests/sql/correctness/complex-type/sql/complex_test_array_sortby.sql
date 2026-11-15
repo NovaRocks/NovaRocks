@@ -122,7 +122,7 @@ select
     array_c1,
     array_map(array_c1, x -> case when idx % 13 != 0 then x % 3 else null end),
     array_map(array_c1, x -> case when idx % 13 != 0 then concat('abc-', x % 5) else null end),
-    array_map(array_c1, x -> case when idx % 13 != 0 then date_sub('2023-11-02', interval cast(x % 2 as int) day) else null end)
+    array_map(array_c1, x -> case when idx % 13 != 0 then days_sub('2023-11-02', cast(x % 2 as int)) else null end)
 from __row_util;
 
 -- query 13
@@ -186,7 +186,7 @@ select
     array_c1,
     case when idx % 11 != 0 then array_map(array_c1, x -> case when idx % 13 != 0 then x % 3 else null end) else null end,
     case when idx % 11 != 0 then array_map(array_c1, x -> case when idx % 13 != 0 then concat('abc-', x % 5) else null end) else null end,
-    case when idx % 11 != 0 then array_map(array_c1, x -> case when idx % 13 != 0 then date_sub('2023-11-02', interval cast(x % 2 as int) day) else null end) else null end
+    case when idx % 11 != 0 then array_map(array_c1, x -> case when idx % 13 != 0 then days_sub('2023-11-02', cast(x % 2 as int)) else null end) else null end
 from __row_util;
 
 -- query 19
@@ -250,7 +250,7 @@ select
     array_c1,
     array_map(array_c1, x -> x % 3),
     array_map(array_c1, x -> concat('abc-', x % 5)),
-    array_map(array_c1, x -> date_sub('2023-11-02', interval cast(x % 2 as int) day))
+    array_map(array_c1, x -> days_sub('2023-11-02', cast(x % 2 as int)))
 from __row_util;
 
 -- query 25

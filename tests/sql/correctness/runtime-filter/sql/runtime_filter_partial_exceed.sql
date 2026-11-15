@@ -66,8 +66,11 @@ set runtime_filter_scan_wait_time = 10000;
 set global_runtime_filter_build_max_size = 3201;
 
 -- query 2
-select count(1) from ${case_db}.t1 left semi join  ${case_db}.t1 t2 on t1.c1 = t2.c1 and t2.c2 < 10;
+select count(1) from ${case_db}.t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c1 = t2.c1 and t2.c2 < 10);
 -- query 3
-select count(1) from ${case_db}.t1 left semi join  ${case_db}.t1 t2 on t1.c1 = t2.c1 and t2.c2 < 10;
+select count(1) from ${case_db}.t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c1 = t2.c1 and t2.c2 < 10);
 -- query 4
-select count(1) from ${case_db}.t1 left semi join  ${case_db}.t1 t2 on t1.c1 = t2.c1 and t2.c2 < 10;
+select count(1) from ${case_db}.t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c1 = t2.c1 and t2.c2 < 10);
