@@ -30,6 +30,7 @@ use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::TableMetadata;
 use crate::iceberg::{Error, ErrorKind, Result};
 use crate::resources::IcebergCatalogRuntime;
+use futures::StreamExt;
 use novarocks_fs::FileCancellation;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -43,7 +44,6 @@ use super::model::{
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CleanupBudget {
     pub time: Duration,
-    pub objects: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -58,7 +58,6 @@ impl Default for OperationLimits {
             io_requests: 8,
             cleanup: CleanupBudget {
                 time: Duration::from_secs(30),
-                objects: 1024,
             },
         }
     }
@@ -139,11 +138,7 @@ impl IcebergCommitOperation {
         limits: OperationLimits,
     ) -> Result<Self> {
         let location = location.into();
-        if location.trim().is_empty()
-            || limits.io_requests == 0
-            || limits.cleanup.time.is_zero()
-            || limits.cleanup.objects == 0
-        {
+        if location.trim().is_empty() || limits.io_requests == 0 || limits.cleanup.time.is_zero() {
             return Err(invalid(
                 "Invalid Iceberg commit operation limits or location",
             ));
@@ -487,84 +482,92 @@ impl IcebergCommitOperation {
         let Ok(Ok(_all_permits)) = all_permits else {
             return partial_budget(0, &records);
         };
+        // The same future drives every deletion. The already-exclusive I/O
+        // window bounds concurrency; no worker outlives this cleanup call.
+        let mut deletions = futures::stream::iter(records.into_iter().map(|record| {
+            let binding = binding.clone();
+            let operation = self.clone();
+            async move {
+                let object = record.object.clone();
+                let result = async {
+                    if crate::catalog_metadata_root::is_catalog_metadata_root(object.path()) {
+                        return Err(CleanupRemainingReason::DeleteFailed(
+                            "catalog metadata discovery root is protected from artifact cleanup"
+                                .into(),
+                        ));
+                    }
+                    let exit_failure = match operation.inner.exit_failures.lock() {
+                        Ok(failures) => failures.get(&object).cloned(),
+                        Err(_) => Some(StreamExitFailure::Unconfirmed),
+                    };
+                    if let Some(reason) = exit_failure {
+                        return Err(CleanupRemainingReason::DeleteFailed(reason.to_string()));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(CleanupRemainingReason::BudgetExhausted);
+                    }
+                    let delete = async {
+                        let access =
+                            crate::fs_io::resolve_access_for_location(object.path(), &binding)
+                                .map_err(|error| {
+                                    invalid(format!("Resolve cleanup object: {error}"))
+                                })?;
+                        let path = access.single_relative_path().map_err(invalid)?;
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        let operator = access.operator().layer(
+                            crate::opendal::layers::TimeoutLayer::new()
+                                .with_timeout(left)
+                                .with_io_timeout(left),
+                        );
+                        #[cfg(test)]
+                        crate::fs_io::note_test_storage_request("delete", object.path());
+                        operator.delete(path).await.map_err(|error| {
+                            Error::new(
+                                ErrorKind::Unexpected,
+                                "Iceberg artifact cleanup delete failed",
+                            )
+                            .with_source(error)
+                        })
+                    };
+                    // Timeout is missing completion evidence. Each deleter is
+                    // discarded here; an external idempotent DELETE may still finish.
+                    match tokio::time::timeout_at(until, delete).await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(_)) if Instant::now() >= deadline => {
+                            Err(CleanupRemainingReason::BudgetExhausted)
+                        }
+                        Ok(Err(error)) => {
+                            Err(CleanupRemainingReason::DeleteFailed(error.to_string()))
+                        }
+                        Err(_) => Err(CleanupRemainingReason::BudgetExhausted),
+                    }
+                }
+                .await;
+                (object, result)
+            }
+        }))
+        .buffer_unordered(self.inner.limits.io_requests as usize);
         let mut deleted = 0;
         let mut remaining = Vec::new();
-        for (index, record) in records.iter().enumerate() {
-            if crate::catalog_metadata_root::is_catalog_metadata_root(record.object.path()) {
-                remaining.push(RemainingArtifact {
-                    object: record.object.clone(),
-                    reason: CleanupRemainingReason::DeleteFailed(
-                        "catalog metadata discovery root is protected from artifact cleanup".into(),
-                    ),
-                });
-                continue;
-            }
-            let exit_failure = match self.inner.exit_failures.lock() {
-                Ok(failures) => failures.get(&record.object).cloned(),
-                Err(_) => Some(StreamExitFailure::Unconfirmed),
-            };
-            if let Some(reason) = exit_failure {
-                remaining.push(RemainingArtifact {
-                    object: record.object.clone(),
-                    reason: CleanupRemainingReason::DeleteFailed(reason.to_string()),
-                });
-                continue;
-            }
-            if index >= self.inner.limits.cleanup.objects || Instant::now() >= deadline {
-                remaining.extend(records[index..].iter().map(|record| RemainingArtifact {
-                    object: record.object.clone(),
-                    reason: CleanupRemainingReason::BudgetExhausted,
-                }));
-                break;
-            }
-            let result = async {
-                let access =
-                    crate::fs_io::resolve_access_for_location(record.object.path(), &binding)
-                        .map_err(|e| invalid(format!("Resolve cleanup object: {e}")))?;
-                let path = access.single_relative_path().map_err(invalid)?;
-                let left = deadline.saturating_duration_since(Instant::now());
-                let operator = access.operator().layer(
-                    crate::opendal::layers::TimeoutLayer::new()
-                        .with_timeout(left)
-                        .with_io_timeout(left),
-                );
-                #[cfg(test)]
-                crate::fs_io::note_test_storage_request("delete", record.object.path());
-                operator.delete(path).await.map_err(|e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "Iceberg artifact cleanup delete failed",
-                    )
-                    .with_source(e)
-                })
-            };
-            // A DELETE timeout is missing completion evidence, not a successful removal. Its
-            // fresh deleter is never reused after TimeoutLayer interrupts RetryWrapper::flush.
-            // No background task is spawned; an external idempotent DELETE may still finish.
-            match tokio::time::timeout_at(until, result).await {
-                Ok(Ok(())) => {
-                    if let Ok(mut ledger) = self.inner.artifacts.lock() {
-                        ledger.ledger.forget_removed(&record.object);
+        while let Some((object, result)) = deletions.next().await {
+            match result {
+                Ok(()) => {
+                    if let Ok(mut artifacts) = self.inner.artifacts.lock() {
+                        artifacts.ledger.forget_removed(&object);
                         deleted += 1;
                     } else {
                         remaining.push(RemainingArtifact {
-                            object: record.object.clone(),
+                            object,
                             reason: CleanupRemainingReason::DeleteFailed(
                                 "Artifact ledger poisoned".into(),
                             ),
                         });
                     }
                 }
-                Ok(Err(error)) => remaining.push(RemainingArtifact {
-                    object: record.object.clone(),
-                    reason: CleanupRemainingReason::DeleteFailed(error.to_string()),
-                }),
-                Err(_) => remaining.push(RemainingArtifact {
-                    object: record.object.clone(),
-                    reason: CleanupRemainingReason::BudgetExhausted,
-                }),
+                Err(reason) => remaining.push(RemainingArtifact { object, reason }),
             }
         }
+        remaining.sort_by(|left, right| left.object.cmp(&right.object));
         if remaining.is_empty() {
             IcebergCleanupReport::Complete { deleted }
         } else {
@@ -1035,11 +1038,10 @@ mod tests {
             &format!("file://{}", dir.path().display()),
             &stop,
             OperationLimits {
+                io_requests: 1,
                 cleanup: CleanupBudget {
-                    time: Duration::from_secs(30),
-                    objects: 1,
+                    time: Duration::from_millis(250),
                 },
-                ..OperationLimits::default()
             },
             Instant::now() + Duration::from_secs(60),
         );
@@ -1054,22 +1056,31 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Hold the only I/O position. Cleanup must consume its own time budget
+        // waiting for real exit, despite the original statement being stopped.
+        let held = operation
+            .inner
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
         stop.request_stop();
         let report = operation.cleanup(CleanupScope::EntireOperation).await;
         let IcebergCleanupReport::Partial { deleted, remaining } = report else {
             panic!("budget remainder");
         };
-        assert_eq!(deleted, 1);
-        assert_eq!(remaining.len(), 2);
+        assert_eq!(deleted, 0);
+        assert_eq!(remaining.len(), 3);
         assert!(
             remaining
                 .iter()
                 .all(|r| r.reason == CleanupRemainingReason::BudgetExhausted)
         );
-        assert_eq!(operation.artifacts().unwrap().len(), 2);
-        for _ in 0..2 {
-            operation.cleanup(CleanupScope::EntireOperation).await;
-        }
+        assert_eq!(operation.artifacts().unwrap().len(), 3);
+        drop(held);
+        let final_cleanup = operation.cleanup(CleanupScope::EntireOperation).await;
+        assert_eq!(final_cleanup, IcebergCleanupReport::Complete { deleted: 3 });
         assert!(operation.artifacts().unwrap().is_empty());
     }
 
@@ -1172,16 +1183,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cleanup_delete_timeout_keeps_unknown_object_without_background_work() {
-        use std::io::{BufRead, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let (request_seen, requests) = std::sync::mpsc::channel();
-        let (release, wait_release) = std::sync::mpsc::channel();
+    fn delete_test_binding(address: std::net::SocketAddr, timeout_ms: u64) -> IcebergReadBinding {
         let runtime = tokio::runtime::Handle::current();
-        let binding = IcebergReadBinding::new(
+        IcebergReadBinding::new(
             Some(novarocks_fs::ObjectStoreConfig {
                 endpoint: format!("http://{address}"),
                 access_key_id: novarocks_fs::SecretValue::new("test"),
@@ -1192,14 +1196,208 @@ mod tests {
                 retry_max_times: Some(3),
                 retry_min_delay_ms: Some(10),
                 retry_max_delay_ms: Some(20),
-                timeout_ms: Some(2000),
-                io_timeout_ms: Some(2000),
+                timeout_ms: Some(timeout_ms),
+                io_timeout_ms: Some(timeout_ms),
             }),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
             novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
-            Arc::new(TokioFileIoSpawner::new(runtime.clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
+        )
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_more_than_a_thousand_owned_objects_without_a_count_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation = operation(
+            &format!("file://{}", directory.path().display()),
+            &ConnectorStopOwner::new(),
+            OperationLimits::default(),
+            Instant::now() + Duration::from_secs(120),
         );
+        let attempt = operation.begin_attempt().unwrap();
+        let mut paths = Vec::new();
+        for _ in 0..1500 {
+            let object = attempt.allocate(ArtifactKind::Manifest).unwrap();
+            attempt
+                .file_io()
+                .new_output(object.path())
+                .unwrap()
+                .write(Bytes::new())
+                .await
+                .unwrap();
+            paths.push(object);
+        }
+        let cleanup = operation.cleanup(CleanupScope::EntireOperation).await;
+        assert_eq!(cleanup, IcebergCleanupReport::Complete { deleted: 1500 });
+        assert!(operation.artifacts().unwrap().is_empty());
+        for object in paths {
+            assert!(!std::path::Path::new(object.path().strip_prefix("file://").unwrap()).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_concurrently_inside_its_original_io_window() {
+        use std::io::{BufRead, Write};
+        use std::sync::Condvar;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        const WINDOW: u32 = 4;
+        const OBJECTS: usize = 9;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (request_seen, requests) = std::sync::mpsc::channel();
+        let server_gate = gate.clone();
+        let server_stop = stop_server.clone();
+        let server_active = active.clone();
+        let server_peak = peak.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let stop = ConnectorStopOwner::new();
+        let operation = IcebergCommitOperation::new(
+            OperationToken::from_write(ConnectorWriteOperationId::new()),
+            "s3://bucket/table",
+            delete_test_binding(address, 15000),
+            ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+            )
+            .unwrap(),
+            IcebergCatalogRuntime::new(runtime),
+            OperationLimits {
+                io_requests: WINDOW,
+                cleanup: CleanupBudget {
+                    time: Duration::from_secs(10),
+                },
+            },
+        )
+        .unwrap();
+        for ordinal in 0..OBJECTS {
+            operation
+                .adopt_session_data(
+                    ObjectIdentity::new(format!("s3://bucket/table/data/owned-{ordinal}.parquet"))
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let server = std::thread::spawn(move || {
+            let mut children = Vec::new();
+            while !server_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        let gate = server_gate.clone();
+                        let active = server_active.clone();
+                        let peak = server_peak.clone();
+                        let request_seen = request_seen.clone();
+                        children.push(std::thread::spawn(move || {
+                            let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+                            let mut reader = std::io::BufReader::new(&socket);
+                            let mut request = String::new();
+                            if reader.read_line(&mut request).is_err() || request.is_empty() {
+                                return;
+                            }
+                            loop {
+                                let mut line = String::new();
+                                if reader.read_line(&mut line).is_err() || line.is_empty() {
+                                    return;
+                                }
+                                if line == "\r\n" {
+                                    break;
+                                }
+                            }
+                            drop(reader);
+                            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(current, Ordering::SeqCst);
+                            let _ = request_seen.send(request);
+                            // All first-window DELETEs remain unanswered until
+                            // the test observes them, so overlap is a fact.
+                            let (released, changed) = &*gate;
+                            let released = released.lock().unwrap();
+                            let _ = changed.wait_timeout_while(
+                                released, Duration::from_secs(8), |released| !*released,
+                            ).unwrap();
+                            // A successor cannot be received before this response.
+                            // End the observed request before making its response visible.
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            let _ = socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Poll only the nonblocking accept, never infer overlap from time.
+                        std::thread::park_timeout(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+            drop(listener);
+            for child in children {
+                child.join().unwrap();
+            }
+        });
+        let cleaning = operation.clone();
+        let cleanup =
+            tokio::spawn(async move { cleaning.cleanup(CleanupScope::EntireOperation).await });
+        // Receiving facts runs off the Tokio thread that drives the request futures.
+        let (first_window, requests) = tokio::task::spawn_blocking(move || {
+            let mut seen = Vec::new();
+            for _ in 0..WINDOW {
+                match requests.recv_timeout(Duration::from_secs(5)) {
+                    Ok(request) => seen.push(request),
+                    Err(_) => break,
+                }
+            }
+            (seen, requests)
+        })
+        .await
+        .unwrap();
+        let (released, changed) = &*gate;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+        let cleanup = cleanup.await;
+        stop_server.store(true, Ordering::SeqCst);
+        // Always release and join the endpoint and its actual children before assertions.
+        let server_exit = server.join();
+        let first_count = first_window.len();
+        let all_requests: Vec<_> = first_window
+            .into_iter()
+            .chain(requests.try_iter())
+            .collect();
+        server_exit.unwrap();
+        assert_eq!(
+            cleanup.unwrap(),
+            IcebergCleanupReport::Complete { deleted: OBJECTS }
+        );
+        assert_eq!(first_count, WINDOW as usize);
+        assert_eq!(all_requests.len(), OBJECTS);
+        assert!(
+            all_requests
+                .iter()
+                .all(|request| request.starts_with("DELETE "))
+        );
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak > 1 && peak <= WINDOW as usize,
+            "observed in-flight DELETEs: {peak}"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(operation.artifacts().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_delete_timeout_keeps_unknown_object_without_background_work() {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (request_seen, requests) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let binding = delete_test_binding(address, 2000);
         let stop = ConnectorStopOwner::new();
         let operation = IcebergCommitOperation::new(
             OperationToken::from_write(ConnectorWriteOperationId::from_bytes([2; 16])),
@@ -1217,7 +1415,6 @@ mod tests {
                 io_requests: 1,
                 cleanup: CleanupBudget {
                     time: Duration::from_millis(250),
-                    objects: 1,
                 },
             },
         )
@@ -1306,7 +1503,6 @@ mod tests {
                 io_requests: 1,
                 cleanup: CleanupBudget {
                     time: Duration::from_millis(250),
-                    objects: 10,
                 },
             },
             Instant::now() + Duration::from_secs(60),

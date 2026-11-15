@@ -199,11 +199,11 @@ async fn real_cleanup_admission_denial_keeps_path_and_same_phase_on_reentry() {
 }
 
 #[tokio::test]
-async fn cleanup_round_yield_does_not_cap_the_original_journal() {
+async fn cleanup_yields_without_capping_the_original_journal() {
     let stop = ConnectorStopOwner::new();
     let directory = tempfile::tempdir().unwrap();
     let journal = StagedPathJournal::default();
-    let total = OperationLimits::default().cleanup.objects + 1;
+    let total = 1500;
     for index in 0..total {
         let path = directory.path().join(format!("staged-{index}.parquet"));
         let location = url::Url::from_file_path(&path).unwrap().to_string();

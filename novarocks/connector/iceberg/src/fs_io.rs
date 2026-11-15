@@ -2738,7 +2738,6 @@ pub(crate) mod manifest_stream_tests {
             io_requests: 1,
             cleanup: CleanupBudget {
                 time: Duration::from_millis(100),
-                objects: 1,
             },
         }
     }
