@@ -291,6 +291,7 @@ fn attempt_sources(scope: ScopeId, mailbox: [usize; 4]) -> Result<AttemptSources
     };
     Ok(AttemptSources {
         actor: source(1),
+        owner: source(1),
         publication: source(2),
         qa: source(3),
         process: source(4),

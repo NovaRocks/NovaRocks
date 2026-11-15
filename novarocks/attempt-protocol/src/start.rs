@@ -136,6 +136,9 @@ impl AttemptStart {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttemptSources {
     pub actor: AttemptSourceId,
+    /// Exact logical owner producer, independent of the attempt actor identity.
+    /// It may share the QA port producer; this field grants no authority.
+    pub owner: AttemptSourceId,
     pub publication: AttemptSourceId,
     pub qa: AttemptSourceId,
     pub process: AttemptSourceId,

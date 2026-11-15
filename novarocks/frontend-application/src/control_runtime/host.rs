@@ -239,6 +239,21 @@ pub(crate) struct FrontendLanePolicy {
     pub(crate) per_step_inventory: usize,
 }
 impl FrontendLanePolicy {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "P12 composes this logical registration route")
+    )]
+    pub(crate) fn logical(per_step_inventory: usize) -> Self {
+        Self {
+            per_step_inventory,
+            lane: |effect| match effect {
+                FrontendEffect::Logical(effect) => {
+                    Some(FrontendLaneKey::Logical(effect.body.lane().into()))
+                }
+                _ => None,
+            },
+        }
+    }
     pub(crate) fn attempt(per_step_inventory: usize) -> Self {
         use novarocks_attempt_protocol::effect::EffectBody;
         Self {
@@ -329,6 +344,12 @@ struct HostMachine {
     timer_source_closed: bool,
 }
 struct HostEntry {
+    logical_identity: Option<novarocks_coordination_contract::LogicalExecutionActorId>,
+    #[expect(
+        dead_code,
+        reason = "P12 Native composition borrows the original installed link inventory"
+    )]
+    logical_links: Option<Arc<super::logical::links::LogicalAttemptLinks>>,
     scope: ScopeHandle,
     registration: ActorRegistration,
     kind: FrontendActorKind,
@@ -363,6 +384,11 @@ pub(crate) struct HostExit {
     exited: watch::Receiver<bool>,
 }
 impl HostExit {
+    /// Read-only observation of the same Actor and Scope removal. A copied
+    /// receiver grants neither closure authority nor a substitute exit fact.
+    pub(crate) fn observe_actual_exit(&self) -> watch::Receiver<bool> {
+        self.exited.clone()
+    }
     pub(crate) fn matches(&self, registration: &ActorRegistration) -> bool {
         self.registration.same_registration(registration)
     }
@@ -410,6 +436,7 @@ pub(crate) struct HostRegistrationRefusal {
 struct RegistryState {
     open: bool,
     entries: BTreeMap<ScopeId, Arc<HostEntry>>,
+    logical_routes: BTreeMap<u64, ScopeId>,
 }
 pub(crate) struct HostRegistry {
     runtime: ActorRuntime<FrontendActor>,
@@ -430,6 +457,7 @@ impl HostRegistry {
             state: Mutex::new(RegistryState {
                 open: true,
                 entries: BTreeMap::new(),
+                logical_routes: BTreeMap::new(),
             }),
             observations,
             changed: Notify::new(),
@@ -447,6 +475,42 @@ impl HostRegistry {
         &self,
         binding: HostBinding,
         funding: &mut Option<AttemptHostFunding>,
+    ) -> Result<HostExit, HostRegistrationRefusal> {
+        self.register_inner(binding, funding, None, None)
+    }
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "P12 composes this logical registration route")
+    )]
+    pub(crate) fn contains_logical(
+        &self,
+        identity: novarocks_coordination_contract::LogicalExecutionActorId,
+    ) -> bool {
+        self.state
+            .lock()
+            .expect("frontend host registry lock")
+            .logical_routes
+            .contains_key(&identity.get())
+    }
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "P12 composes this logical registration route")
+    )]
+    pub(crate) fn register_logical(
+        &self,
+        binding: HostBinding,
+        identity: novarocks_coordination_contract::LogicalExecutionActorId,
+        links: Arc<super::logical::links::LogicalAttemptLinks>,
+    ) -> Result<HostExit, HostRegistrationRefusal> {
+        assert_eq!(binding.kind, FrontendActorKind::Logical);
+        self.register_inner(binding, &mut None, Some(identity), Some(links))
+    }
+    fn register_inner(
+        &self,
+        binding: HostBinding,
+        funding: &mut Option<AttemptHostFunding>,
+        logical_identity: Option<novarocks_coordination_contract::LogicalExecutionActorId>,
+        logical_links: Option<Arc<super::logical::links::LogicalAttemptLinks>>,
     ) -> Result<HostExit, HostRegistrationRefusal> {
         if !binding.registration.matches_scope(&binding.scope)
             || binding.transport.as_ref().is_some_and(|transport| {
@@ -578,7 +642,11 @@ impl HostRegistry {
             });
         }
         let mut state = self.state.lock().expect("frontend host registry lock");
-        if !state.open || state.entries.contains_key(&binding.scope.id()) {
+        if !state.open
+            || state.entries.contains_key(&binding.scope.id())
+            || logical_identity
+                .is_some_and(|identity| state.logical_routes.contains_key(&identity.get()))
+        {
             return Err(HostRegistrationRefusal {
                 reason: "frontend actor registration closed or duplicated",
                 runtime_error: None,
@@ -598,6 +666,8 @@ impl HostRegistry {
             original
         });
         let original = Arc::new(HostEntry {
+            logical_identity,
+            logical_links,
             scope: binding.scope,
             registration: binding.registration,
             kind: binding.kind,
@@ -634,6 +704,14 @@ impl HostRegistry {
             original: Arc::downgrade(&original),
             exited,
         };
+        if let Some(identity) = original.logical_identity {
+            assert!(
+                state
+                    .logical_routes
+                    .insert(identity.get(), original.scope.id())
+                    .is_none()
+            );
+        }
         state.entries.insert(original.scope.id(), original);
         drop(state);
         if start_after_registration {
@@ -720,6 +798,21 @@ impl HostRegistry {
         }
         self.changed.notify_waiters();
     }
+    /// Select only the original installed host's link inventory. It is stored
+    /// in the same registry entry, outside the exclusively loaned host machine.
+    /// A matching identity cannot manufacture a new Work or second registry.
+    #[expect(
+        dead_code,
+        reason = "P12 Native composition borrows the original installed link inventory"
+    )]
+    pub(crate) fn logical_links(
+        &self,
+        identity: novarocks_coordination_contract::LogicalExecutionActorId,
+    ) -> Option<Arc<super::logical::links::LogicalAttemptLinks>> {
+        let state = self.state.lock().expect("frontend host registry lock");
+        let scope = state.logical_routes.get(&identity.get())?;
+        state.entries.get(scope)?.logical_links.clone()
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.state
             .lock()
@@ -792,11 +885,16 @@ impl HostRegistry {
                     eprintln!("Frontend Scope retirement failed: {error:?}");
                     std::process::abort()
                 });
-            self.state
-                .lock()
-                .expect("frontend host registry lock")
-                .entries
-                .remove(&entry.scope.id());
+            {
+                let mut state = self.state.lock().expect("frontend host registry lock");
+                state.entries.remove(&entry.scope.id());
+                if let Some(identity) = entry.logical_identity {
+                    assert_eq!(
+                        state.logical_routes.remove(&identity.get()),
+                        Some(entry.scope.id())
+                    );
+                }
+            }
             entry.exit.send_replace(true);
         } else {
             *entry.machine.lock().expect("frontend host state lock") = Some(machine);
@@ -936,9 +1034,12 @@ impl HostRegistry {
         let mut capacity_more = false;
         let source_closing = machine.source.result_admission_closed();
         let notifications_closing = source_closing || machine.local_sources_closing;
-        let attempt = entry.kind == FrontendActorKind::Attempt;
+        let hosted_timer = matches!(
+            entry.kind,
+            FrontendActorKind::Attempt | FrontendActorKind::Logical
+        );
         let mut timer_more = false;
-        if attempt {
+        if hosted_timer {
             let actor = entry.registration.actor();
             if (failed || source_closing) && !machine.timer_source_closed {
                 if budget == 0 {
@@ -1060,7 +1161,7 @@ impl HostRegistry {
             capacity_more |= machine.capacity.is_some();
             membership_more |= machine.membership.is_some();
             controls_more |= machine.owner_controls.is_some();
-            timer_more |= attempt && !machine.timer_source_closed;
+            timer_more |= hosted_timer && !machine.timer_source_closed;
         }
         if let Some(transport) = transport {
             retired.progressed |= transport.progressed;
@@ -1129,7 +1230,7 @@ impl HostRegistry {
                     });
                 }
             }
-            if attempt
+            if hosted_timer
                 && (!machine.timer_source_closed
                     || self
                         .runtime
@@ -1192,7 +1293,7 @@ impl HostRegistry {
             ));
             budget -= indexed.units;
             indexed_this_turn = !indexed.inputs.is_empty();
-            if attempt
+            if hosted_timer
                 && !indexed.inputs.is_empty()
                 && let Some(timer) = self
                     .runtime

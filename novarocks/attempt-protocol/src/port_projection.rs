@@ -77,6 +77,7 @@ pub fn project_failure(
     resolve_host: &mut impl FnMut(HostFailureRef) -> Option<ExecutionFailureInput>,
 ) -> Result<ProjectedAttemptFailure, FailureProjectionError> {
     let input = match failure {
+        AttemptFailure::Logical(original) => return Ok(original.clone()),
         AttemptFailure::OwnerFailed => owner_failure(),
         AttemptFailure::Protocol(original) => protocol_failure(original),
         AttemptFailure::TaskProtocol(original) => project_task_failure(original, resolve_host)?,
@@ -451,3 +452,339 @@ pub fn local_protocol_refusal(
         ExecutionFailureSite::Coordinator,
     )
 }
+
+/// Reverse the passive logical response without manufacturing a host reference.
+pub fn project_logical_message(
+    message: &novarocks_coordination_contract::logical_port::LogicalToAttempt,
+) -> novarocks_coordination_contract::LogicalToAttempt<AttemptFailure> {
+    use novarocks_coordination_contract::{LogicalToAttemptBody as Out, logical_port as lp};
+    let body = match &message.body {
+        lp::LogicalToAttemptBody::AuthorizationReply { token, decision } => Out::AuthorizationReply {
+            token: *token,
+            decision: decision.clone().map_err(|failure| match failure {
+                lp::AttemptAuthorizationFailure::Rejected(original) => novarocks_coordination_contract::AttemptAuthorizationFailure::Rejected(AttemptFailure::Logical(original)),
+                lp::AttemptAuthorizationFailure::EstablishBudgetExhausted(original) => novarocks_coordination_contract::AttemptAuthorizationFailure::EstablishBudgetExhausted(AttemptFailure::Logical(original)),
+            }),
+        },
+        lp::LogicalToAttemptBody::EstablishSettlementReply { token, authorization, result } => Out::EstablishSettlementReply { token:*token, authorization:*authorization, result:result.clone().map_err(AttemptFailure::Logical) },
+        lp::LogicalToAttemptBody::PreReadyReplacementReply { token, may_observe } => Out::PreReadyReplacementReply { token:*token, may_observe:*may_observe },
+        lp::LogicalToAttemptBody::PreReadyReplacementOwnerFailed { token, failure } => Out::PreReadyReplacementOwnerFailed { token:*token, failure:AttemptFailure::Logical(failure.clone()) },
+        lp::LogicalToAttemptBody::PreReadyReplacementChanged { token } => Out::PreReadyReplacementChanged { token:*token },
+        lp::LogicalToAttemptBody::Abort { action, request } => Out::Abort { action:*action, request:*request },
+        lp::LogicalToAttemptBody::Stop { reason, failure } => Out::Stop { reason:*reason, failure:AttemptFailure::Logical(failure.clone()) },
+        lp::LogicalToAttemptBody::SealRequest { token } => Out::SealRequest { token:*token },
+        lp::LogicalToAttemptBody::TerminalControlDemand { token, root } => Out::TerminalControlDemand { token:*token, root:*root },
+        lp::LogicalToAttemptBody::BeginConvergence { mode, remote_deadline, computation_ready, retain_diagnostics } => Out::BeginConvergence { mode:*mode, remote_deadline:*remote_deadline, computation_ready:*computation_ready, retain_diagnostics:*retain_diagnostics },
+    };
+    novarocks_coordination_contract::LogicalToAttempt {
+        activation: message.activation,
+        body,
+    }
+}
+
+/// Original immutable Establish metadata, resolved from the same retained host request.
+#[derive(Clone, Copy, Debug)]
+pub struct EstablishAuthorizationFacts {
+    pub participation: ParticipationRef,
+    pub operation_id: TaskOperationId,
+    pub ticket_id: novarocks_execution_contract::AdmissionTicketId,
+    pub semantics: novarocks_execution_contract::EstablishSemanticIdentity,
+    pub native_compatibility_id: novarocks_types::NativeCompatibilityId,
+}
+/// A projection of one canonical Worker acknowledgement, with its original
+/// physical send generation. This value conveys no transport or issue authority.
+#[derive(Clone, Debug)]
+pub struct AbortReceiptFact {
+    pub generation: novarocks_coordination_contract::AttemptActionId,
+    pub operation_id: TaskOperationId,
+    pub kind: OperationKind,
+    pub outcome: OperationOutcome,
+    pub receipt: Option<novarocks_execution_contract::ParticipationReceipt>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AbortProjectionError {
+    NotAbortSettlement,
+    MissingOriginalReceipt,
+    WrongReceiptGeneration,
+    WrongOperation,
+    WrongKind,
+    WrongOutcome,
+    MissingParticipationReceipt,
+    WrongParticipation,
+    NonClosingReceipt,
+    NonClosingOutcome,
+    UnexpectedReceiptGeneration,
+}
+/// Only the original closing Worker receipt supplies isolation evidence.
+pub fn abort_worker_closure(
+    participation: ParticipationRef,
+    outcome: OperationOutcome,
+    receipt: &novarocks_execution_contract::ParticipationReceipt,
+) -> Result<novarocks_coordination_contract::logical_port::AbortWorkerClosure, AbortProjectionError>
+{
+    if !matches!(
+        outcome,
+        OperationOutcome::Accepted
+            | OperationOutcome::Idempotent
+            | OperationOutcome::ParticipationTerminalReceipt
+            | OperationOutcome::LeaseExpired
+            | OperationOutcome::Gone
+    ) {
+        return Err(AbortProjectionError::NonClosingOutcome);
+    }
+    if receipt.participation() != participation {
+        return Err(AbortProjectionError::WrongParticipation);
+    }
+    receipt
+        .state()
+        .try_into()
+        .map_err(|_| AbortProjectionError::NonClosingReceipt)
+}
+pub fn project_abort_settlement(
+    message: &novarocks_coordination_contract::AttemptToLogical<AttemptFailure>,
+    resolve: &mut impl FnMut(
+        ParticipationRef,
+        TaskOperationId,
+        novarocks_coordination_contract::AttemptActionId,
+    ) -> Option<AbortReceiptFact>,
+) -> Result<novarocks_coordination_contract::logical_port::AttemptToLogicalBody, AbortProjectionError>
+{
+    use novarocks_coordination_contract::{
+        AbortIssueSettlement as In, AttemptToLogicalBody as Body,
+        logical_port::{AbortIssueSettlement as Out, AttemptToLogicalBody as Projected},
+    };
+    let Body::AbortSettlement {
+        abort_action,
+        receipt_generation,
+        participation,
+        operation_id,
+        settlement,
+        ..
+    } = &message.body
+    else {
+        return Err(AbortProjectionError::NotAbortSettlement);
+    };
+    let settlement = match settlement {
+        In::Worker(outcome) => {
+            let generation =
+                receipt_generation.ok_or(AbortProjectionError::MissingOriginalReceipt)?;
+            let original = resolve(*participation, *operation_id, generation)
+                .ok_or(AbortProjectionError::MissingOriginalReceipt)?;
+            if original.generation != generation {
+                return Err(AbortProjectionError::WrongReceiptGeneration);
+            }
+            if original.operation_id != *operation_id {
+                return Err(AbortProjectionError::WrongOperation);
+            }
+            if original.kind != OperationKind::AbortParticipation {
+                return Err(AbortProjectionError::WrongKind);
+            }
+            if original.outcome != *outcome {
+                return Err(AbortProjectionError::WrongOutcome);
+            }
+            let receipt = original
+                .receipt
+                .as_ref()
+                .ok_or(AbortProjectionError::MissingParticipationReceipt)?;
+            Out::Worker {
+                outcome: *outcome,
+                closure: abort_worker_closure(*participation, *outcome, receipt)?,
+            }
+        }
+        original => {
+            if receipt_generation.is_some() {
+                return Err(AbortProjectionError::UnexpectedReceiptGeneration);
+            }
+            match original {
+                In::DefinitelyUnsent => Out::DefinitelyUnsent,
+                In::TransportUnknown => Out::TransportUnknown,
+                In::FailedClosed => Out::FailedClosed,
+                In::Worker(_) => unreachable!(),
+            }
+        }
+    };
+    Ok(Projected::AbortSettlement {
+        abort_action: *abort_action,
+        participation: *participation,
+        operation_id: *operation_id,
+        settlement,
+    })
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PortProjectionError {
+    Failure(FailureProjectionError),
+    Abort(AbortProjectionError),
+    MissingOriginalEstablish {
+        participation: ParticipationRef,
+        operation_id: TaskOperationId,
+    },
+    MismatchedOriginalEstablish,
+    UnsupportedDetachEstablish,
+}
+impl std::fmt::Display for PortProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "original attempt port projection rejected: {self:?}")
+    }
+}
+impl std::error::Error for PortProjectionError {}
+/// Total passive outbound projection. Rich original lookups remain in the
+/// Source; no missing immutable Establish or physical receipt fact is guessed.
+pub fn project_attempt_message(
+    message: &novarocks_coordination_contract::AttemptToLogical<AttemptFailure>,
+    resolve_host: &mut impl FnMut(HostFailureRef) -> Option<ExecutionFailureInput>,
+    resolve_establish: &mut impl FnMut(
+        ParticipationRef,
+        TaskOperationId,
+    ) -> Option<EstablishAuthorizationFacts>,
+    resolve_abort: &mut impl FnMut(
+        ParticipationRef,
+        TaskOperationId,
+        novarocks_coordination_contract::AttemptActionId,
+    ) -> Option<AbortReceiptFact>,
+) -> Result<novarocks_coordination_contract::logical_port::AttemptToLogical, PortProjectionError> {
+    use novarocks_coordination_contract::{
+        AttemptAuthorization as Auth, AttemptTerminal as Terminal, AttemptToLogicalBody as In,
+        logical_port as lp,
+    };
+    let mut failure = |original: &AttemptFailure| {
+        project_failure(original, resolve_host).map_err(PortProjectionError::Failure)
+    };
+    let body = match &message.body {
+        In::AuthorizationRequest { token, request } => {
+            let request = match request {
+                Auth::BeginAdmission(original) => {
+                    lp::AttemptAuthorization::BeginAdmission(*original)
+                }
+                Auth::SettleAdmission {
+                    issue,
+                    participation,
+                    operation_id,
+                    outcome,
+                    receipt,
+                    prior_transport_unknown,
+                } => lp::AttemptAuthorization::SettleAdmission {
+                    issue: *issue,
+                    participation: *participation,
+                    operation_id: *operation_id,
+                    outcome: *outcome,
+                    receipt: *receipt,
+                    prior_transport_unknown: *prior_transport_unknown,
+                },
+                Auth::Establish {
+                    participation,
+                    operation_id,
+                } => {
+                    let original = resolve_establish(*participation, *operation_id).ok_or(
+                        PortProjectionError::MissingOriginalEstablish {
+                            participation: *participation,
+                            operation_id: *operation_id,
+                        },
+                    )?;
+                    if original.participation != *participation
+                        || original.operation_id != *operation_id
+                    {
+                        return Err(PortProjectionError::MismatchedOriginalEstablish);
+                    }
+                    lp::AttemptAuthorization::Establish {
+                        participation: *participation,
+                        operation_id: *operation_id,
+                        ticket_id: original.ticket_id,
+                        semantics: original.semantics,
+                        native_compatibility_id: original.native_compatibility_id,
+                    }
+                }
+                Auth::ReauthorizeEstablish {
+                    participation,
+                    operation_id,
+                } => lp::AttemptAuthorization::ReauthorizeEstablish {
+                    participation: *participation,
+                    operation_id: *operation_id,
+                },
+            };
+            lp::AttemptToLogicalBody::AuthorizationRequest {
+                token: *token,
+                request,
+            }
+        }
+        In::PreReadyReplacementQuery { token, refusal } => {
+            lp::AttemptToLogicalBody::PreReadyReplacementQuery {
+                token: *token,
+                refusal: failure(refusal)?,
+            }
+        }
+        In::EstablishSettlement {
+            token,
+            authorization,
+            participation,
+            operation_id,
+            settlement,
+        } => lp::AttemptToLogicalBody::EstablishSettlement {
+            token: *token,
+            authorization: *authorization,
+            participation: *participation,
+            operation_id: *operation_id,
+            settlement: *settlement,
+        },
+        In::DetachEstablish { .. } => return Err(PortProjectionError::UnsupportedDetachEstablish),
+        In::AbortSettlement { .. } => {
+            project_abort_settlement(message, resolve_abort).map_err(PortProjectionError::Abort)?
+        }
+        In::RootStatus(original) => lp::AttemptToLogicalBody::RootStatus(original.clone()),
+        In::SealResult { token, result } => lp::AttemptToLogicalBody::SealResult {
+            token: *token,
+            result: match result {
+                Ok(original) => Ok(original.clone()),
+                Err(original) => Err(failure(original)?),
+            },
+        },
+        In::TerminalControlResult { token, result } => {
+            lp::AttemptToLogicalBody::TerminalControlResult {
+                token: *token,
+                result: match result {
+                    Ok(()) => Ok(()),
+                    Err(original) => Err(failure(original)?),
+                },
+            }
+        }
+        In::AttemptTerminal(original) => {
+            lp::AttemptToLogicalBody::AttemptTerminal(match original {
+                Terminal::Completed => lp::AttemptTerminal::Completed,
+                Terminal::Failed(original) => lp::AttemptTerminal::Failed(failure(original)?),
+                Terminal::Stopped {
+                    reason,
+                    failure: original,
+                } => lp::AttemptTerminal::Stopped {
+                    reason: *reason,
+                    failure: failure(original)?,
+                },
+            })
+        }
+        In::AttemptLost {
+            failure: original,
+            unknown_participations,
+            unresolved_actions,
+        } => lp::AttemptToLogicalBody::AttemptLost {
+            failure: failure(original)?,
+            unknown_participations: unknown_participations.clone(),
+            unresolved_actions: unresolved_actions.clone(),
+        },
+        In::ConvergenceProgress {
+            local_exited,
+            closure,
+            lifecycle_runtime_filters,
+        } => lp::AttemptToLogicalBody::ConvergenceProgress {
+            local_exited: *local_exited,
+            closure: closure.clone(),
+            lifecycle_runtime_filters: lifecycle_runtime_filters.clone(),
+        },
+    };
+    Ok(lp::AttemptToLogical {
+        activation: message.activation,
+        action: message.action,
+        body,
+    })
+}
+
+#[cfg(test)]
+#[path = "port_projection/tests.rs"]
+mod tests;

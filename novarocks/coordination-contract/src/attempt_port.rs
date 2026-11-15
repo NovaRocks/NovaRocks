@@ -275,6 +275,10 @@ pub enum LogicalToAttemptBody<F> {
         token: AttemptRequestToken,
         may_observe: bool,
     },
+    PreReadyReplacementOwnerFailed {
+        token: AttemptRequestToken,
+        failure: F,
+    },
     /// Hint from the SAME original QA observation registered with this query.
     /// It never grants permission: ask the original policy owner again before
     /// continuing observation. Query/register itself must not emit this hint.

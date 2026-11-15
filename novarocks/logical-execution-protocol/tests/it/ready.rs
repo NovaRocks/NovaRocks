@@ -16,6 +16,7 @@
 // under the License.
 
 use super::support::*;
+mod replacement;
 use novarocks_coordination_contract::{QueryExecutionError, QueryFailureReason};
 fn original_error() -> QueryExecutionError {
     novarocks_logical_execution_protocol::failure::query_failure(
@@ -23,7 +24,7 @@ fn original_error() -> QueryExecutionError {
         "original consumer verdict",
     )
 }
-fn pending() -> Fixture {
+fn decoded() -> Fixture {
     let mut f = Fixture::new(LogicalOutputMode::InternalResultStream);
     f.begin();
     let status = TaskStatus::try_new(
@@ -57,12 +58,20 @@ fn pending() -> Fixture {
         receipt,
         end: end(0, 27),
     });
+    f
+}
+fn proposal(f: &mut Fixture) -> LogicalRequestToken {
+    let receipt = InternalEndReceiptId(std::num::NonZeroU64::MIN);
     f.internal(InternalRequest::AcceptReady {
         root: root(1),
         plan: PLAN,
         receipt,
         end: end(0, 27),
-    });
+    })
+}
+fn pending() -> Fixture {
+    let mut f = decoded();
+    proposal(&mut f);
     f
 }
 fn accepted() -> Fixture {
@@ -238,4 +247,324 @@ fn convergence_publication_is_independent_and_failure_is_an_explicit_supervision
         Some(&original_error())
     );
     assert_eq!(f.core.next_deadline(), None);
+}
+
+fn original_task_failure() -> novarocks_coordination_contract::ExecutionFailure {
+    use novarocks_coordination_contract::{
+        ExecutionFailure, ExecutionFailureInput, SelectedTaskTermination,
+    };
+    use novarocks_execution_contract::{
+        SafeDetail, TaskFailure, TerminationDetail, failure::FailureProjection,
+    };
+    let producer = TaskIdentity::new(
+        activation(1).execution(),
+        novarocks_types::StageId::new(2).unwrap(),
+        novarocks_types::TaskId::new(1).unwrap(),
+        root(1).backend_process_id(),
+    );
+    let selected = SelectedTaskTermination::new(
+        producer,
+        TerminationDetail::Failed(TaskFailure::new(
+            QueryFailureReason::BackendLost.failure_fact(),
+            SafeDetail::truncating("original frozen internal Task failure"),
+        )),
+    );
+    ExecutionFailure::from_input(ExecutionFailureInput::from_selected_task(&selected).unwrap())
+}
+
+fn assert_no_ready(f: &Fixture) {
+    assert!(f.core.facts().ready_cut().is_none());
+    assert!(!f.effects.iter().any(|e| matches!(
+        e.body,
+        LogicalEffectBody::Consumer(ConsumerEffect::PublishReady { .. })
+            | LogicalEffectBody::Native(NativeEffect::RecordComputationReady { .. })
+    )));
+}
+
+fn seal_reply_without_driving(f: &mut Fixture) {
+    f.finished_root();
+    let seal = f.take(|b| {
+        matches!(
+            b,
+            LogicalEffectBody::AttemptPort(p)
+                if matches!(p.body, LogicalToAttemptBody::SealRequest { .. })
+        )
+    });
+    let LogicalEffectBody::AttemptPort(seal) = seal.body else {
+        unreachable!()
+    };
+    let LogicalToAttemptBody::SealRequest { token } = seal.body else {
+        unreachable!()
+    };
+    f.send_once(
+        LogicalInput::AttemptPort(Box::new(AttemptToLogical {
+            activation: activation(1),
+            action: AttemptActionId::new(std::num::NonZeroU64::new(900).unwrap()),
+            body: AttemptToLogicalBody::SealResult {
+                token,
+                result: Ok(std::sync::Arc::from([])),
+            },
+        })),
+        0,
+    );
+    assert_no_ready(f);
+}
+
+#[test]
+fn queued_authoritative_root_failure_prevents_the_ready_cut_and_keeps_exact_task_input() {
+    use novarocks_coordination_contract::{
+        AttemptRootFailure, AttemptRootProjection, SelectedTaskTermination,
+    };
+    use novarocks_execution_contract::{TaskFailure, TerminationDetail};
+    let mut f = decoded();
+    let request = proposal(&mut f);
+    seal_reply_without_driving(&mut f);
+    let original = original_task_failure();
+    let selected = SelectedTaskTermination::new(
+        match original.input().site() {
+            novarocks_coordination_contract::ExecutionFailureSite::Task { identity, .. } => {
+                identity
+            }
+            _ => panic!("original producer Task site required"),
+        },
+        TerminationDetail::Failed(TaskFailure::new(
+            original.input().fact(),
+            original.input().detail().clone(),
+        )),
+    );
+    let status = TaskStatus::try_new(
+        root(1),
+        TaskStatusVersion::new(6).unwrap(),
+        TaskState::Finished,
+        None,
+        TaskOutputFacts::new(true),
+    )
+    .unwrap();
+    f.port(AttemptToLogicalBody::RootStatus(Box::new(
+        AttemptRootProjection {
+            status,
+            failure: AttemptRootFailure::Authoritative(selected),
+        },
+    )));
+    assert_no_ready(&f);
+    assert_eq!(f.core.facts().conclusion(), Some(LogicalConclusion::Failed));
+    assert_eq!(f.core.facts().failure(), Some(original.error()));
+    assert_eq!(
+        f.core.facts().attempts().next().unwrap().accepted_failure,
+        Some(original.input())
+    );
+    assert!(f.effects.iter().any(|e| matches!(
+        &e.body,
+        LogicalEffectBody::Consumer(ConsumerEffect::InternalReply {
+            token,
+            response: InternalResponse::Rejected(error),
+            ..
+        }) if *token == request && error.execution_failure() == Some(original.input())
+    )));
+}
+
+#[test]
+fn original_internal_end_failure_rejects_the_pending_proof_without_losing_task_identity() {
+    let mut f = decoded();
+    let request = proposal(&mut f);
+    let original = original_task_failure();
+    f.internal(InternalRequest::Failed(FailureReport::from_attempt(
+        &original,
+    )));
+    f.finished_root();
+    assert_no_ready(&f);
+    assert_eq!(f.core.facts().failure(), Some(original.error()));
+    assert_eq!(
+        f.core.facts().attempts().next().unwrap().accepted_failure,
+        Some(original.input())
+    );
+    assert!(f.effects.iter().any(|e| matches!(
+        &e.body,
+        LogicalEffectBody::Consumer(ConsumerEffect::InternalReply {
+            token,
+            response: InternalResponse::Rejected(error),
+            ..
+        }) if *token == request && error.execution_failure() == Some(original.input())
+    )));
+    assert!(f.effects.iter().any(|e| matches!(
+        &e.body,
+        LogicalEffectBody::Consumer(ConsumerEffect::PublishFailure(error))
+            if error.execution_failure() == Some(original.input())
+    )));
+    assert!(!f.core.facts().original_internal_consumer_exited());
+}
+
+#[test]
+fn registry_close_queued_after_seal_waits_for_original_scope_verdict_without_ready() {
+    let mut f = decoded();
+    let request = proposal(&mut f);
+    seal_reply_without_driving(&mut f);
+    f.send(LogicalInput::RegistryClose(RegistryClose::Shutdown));
+    assert_no_ready(&f);
+    assert_eq!(f.core.facts().conclusion(), None);
+    assert!(f.effects.iter().any(|e| matches!(
+        e.body,
+        LogicalEffectBody::Governance(GovernanceEffect::RequestShutdownCancellation)
+    )));
+    f.send(LogicalInput::Cancelled(
+        novarocks_logical_execution_protocol::cancel::LogicalCancellationReason::FrontendDrainDeadlineExceeded,
+    ));
+    let expected = novarocks_logical_execution_protocol::failure::query_failure(
+        QueryFailureReason::DeadlineExceeded,
+        "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded",
+    );
+    assert_no_ready(&f);
+    assert_eq!(f.core.facts().conclusion(), Some(LogicalConclusion::Failed));
+    assert_eq!(f.core.facts().failure(), Some(&expected));
+    assert!(f.effects.iter().any(|e| matches!(
+        &e.body,
+        LogicalEffectBody::Consumer(ConsumerEffect::InternalReply {
+            token,
+            response: InternalResponse::Rejected(error),
+            ..
+        }) if *token == request && error == &expected
+    )));
+}
+
+#[test]
+fn governed_cancellation_rejects_pending_end_with_exact_reason_site_and_detail() {
+    use novarocks_logical_execution_protocol::cancel::LogicalCancellationReason as R;
+    for (reason, expected_reason, detail) in [
+        (
+            R::DeadlineExceeded,
+            QueryFailureReason::DeadlineExceeded,
+            "logical execution deadline expired before success EOF",
+        ),
+        (
+            R::FrontendDrainDeadlineExceeded,
+            QueryFailureReason::DeadlineExceeded,
+            "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded",
+        ),
+        (
+            R::ClientCancelRequested,
+            QueryFailureReason::Cancelled,
+            "logical execution was cancelled before success EOF",
+        ),
+    ] {
+        let mut f = decoded();
+        let request = proposal(&mut f);
+        let expected =
+            novarocks_logical_execution_protocol::failure::query_failure(expected_reason, detail);
+        f.send(LogicalInput::Cancelled(reason));
+        assert_no_ready(&f);
+        assert_eq!(f.core.facts().failure(), Some(&expected));
+        assert!(f.effects.iter().any(|e| matches!(
+            &e.body,
+            LogicalEffectBody::Consumer(ConsumerEffect::InternalReply {
+                token,
+                response: InternalResponse::Rejected(error),
+                ..
+            }) if *token == request && error == &expected
+        )));
+        assert!(!f.core.facts().original_internal_consumer_exited());
+    }
+}
+
+#[test]
+fn conflicting_original_end_receipt_fails_closed_and_cannot_be_repaired_by_ready() {
+    let mut f = decoded();
+    f.internal(InternalRequest::EndDecoded {
+        receipt: InternalEndReceiptId(std::num::NonZeroU64::new(2).unwrap()),
+        end: end(0, 27),
+    });
+    let original = f.core.facts().failure().unwrap().clone();
+    assert_eq!(f.core.facts().conclusion(), Some(LogicalConclusion::Failed));
+    let request = proposal(&mut f);
+    f.finished_root();
+    assert_no_ready(&f);
+    assert_eq!(f.core.facts().failure(), Some(&original));
+    assert!(f.effects.iter().any(|e| matches!(
+        &e.body,
+        LogicalEffectBody::Consumer(ConsumerEffect::InternalReply {
+            token,
+            response: InternalResponse::Rejected(error),
+            ..
+        }) if *token == request && error == &original
+    )));
+}
+
+#[test]
+fn foreign_source_failure_cannot_conclude_or_release_original_pending_consumer() {
+    let mut f = pending();
+    let original = original_task_failure();
+    let request = LogicalRequestToken::new(std::num::NonZeroU64::new(700).unwrap());
+    f.send(LogicalInput::Internal {
+        source: LogicalSourceId::new(std::num::NonZeroU64::new(3).unwrap()),
+        token: request,
+        activation: activation(1),
+        request: InternalRequest::Failed(FailureReport::from_attempt(&original)),
+    });
+    assert_eq!(f.core.facts().conclusion(), None);
+    assert!(f.core.facts().failure().is_none());
+    assert!(
+        f.core
+            .facts()
+            .attempts()
+            .next()
+            .unwrap()
+            .accepted_failure
+            .is_none()
+    );
+    assert!(!f.core.facts().original_internal_consumer_exited());
+    assert!(f.effects.iter().any(|e| matches!(
+        &e.body,
+        LogicalEffectBody::Consumer(ConsumerEffect::InternalReply {
+            token,
+            response: InternalResponse::Rejected(_),
+            ..
+        }) if *token == request
+    )));
+    f.finished_root();
+    f.seal();
+    assert_eq!(
+        f.core.facts().conclusion(),
+        Some(LogicalConclusion::ComputationReady)
+    );
+}
+
+#[test]
+fn ready_handoff_retains_the_exact_full_cut_before_observation_or_actual_exit() {
+    let mut f = pending();
+    f.now = MonotonicInstant::from_origin(std::time::Duration::from_millis(7));
+    f.finished_root();
+    f.seal();
+    let cut = f.core.facts().ready_cut().unwrap();
+    assert_eq!(cut.activation, activation(1));
+    assert_eq!(cut.root, root(1));
+    assert_eq!(cut.end, end(0, 27));
+    assert_eq!(cut.cut, f.now);
+    assert_eq!(
+        cut.diagnostic_deadline,
+        MonotonicInstant::from_origin(std::time::Duration::from_millis(27))
+    );
+    assert_eq!(
+        cut.convergence_deadline,
+        MonotonicInstant::from_origin(std::time::Duration::from_millis(97))
+    );
+    assert!(f.effects.iter().any(|e| matches!(
+        &e.body,
+        LogicalEffectBody::Native(NativeEffect::RecordComputationReady { cut: original })
+            if *original == cut
+    )));
+    assert!(f.effects.iter().any(|e| matches!(
+        &e.body,
+        LogicalEffectBody::Consumer(ConsumerEffect::PublishReady { cut: original, .. })
+            if *original == cut
+    )));
+    assert!(f.effects.iter().any(|e| matches!(
+        &e.body,
+        LogicalEffectBody::AttemptPort(p)
+            if matches!(&p.body, LogicalToAttemptBody::BeginConvergence {
+                computation_ready: Some(original),
+                remote_deadline,
+                ..
+            } if *original == cut && *remote_deadline == cut.convergence_deadline)
+    )));
+    assert!(!f.core.facts().original_internal_consumer_exited());
+    assert!(!f.core.facts().protocol_join_ready());
 }

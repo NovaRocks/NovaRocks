@@ -41,7 +41,8 @@ use crate::{
 };
 use novarocks_coordination_contract::{
     AttemptActionId, AttemptConvergenceMode, AttemptRequestToken, AttemptRootProjection,
-    AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
+    AttemptStopReason, AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody,
+    MonotonicInstant,
 };
 use novarocks_execution_contract::{TaskOperationId, TaskStatus};
 use std::{num::NonZeroU64, sync::Arc};
@@ -216,7 +217,7 @@ impl AttemptCore for Core {
                 )
         );
         let cancelling = self.terminal.stop_reason().is_some()
-            || (claim.source == self.sources.actor
+            || (claim.source == self.sources.owner
                 && matches!(
                     &input,
                     AttemptInput::Port(port) if port.activation == self.activation
@@ -684,6 +685,47 @@ impl Core {
             }
 
             AttemptInput::Port(port) => match &port.body {
+                LogicalToAttemptBody::AuthorizationReply { .. }
+                | LogicalToAttemptBody::EstablishSettlementReply { .. }
+                | LogicalToAttemptBody::EstablishDetachReply { .. } => {
+                    self.verify_source(claim.source, self.sources.qa)?;
+                    // Owner ingress stays reachable beside a frozen primary
+                    // prefix. Only the original gate decides exact/wrong/late
+                    // tokens; accepting a reply does not advance that prefix.
+                    self.accept_qa(port.clone(), result)?;
+                    // Preserve the candidate driver's original same-step
+                    // continuation after its exact authorization reply. The
+                    // other waiting phases deliberately yield their result
+                    // position before driving another settlement.
+                    if self.turn.phase == Phase::Candidates {
+                        self.drive_candidates(context, result)?;
+                    }
+                }
+                LogicalToAttemptBody::PreReadyReplacementReply { token, may_observe } => {
+                    self.verify_source(claim.source, self.sources.qa)?;
+                    if let Phase::Terminal(wake) = self.turn.phase {
+                        return self
+                            .apply_terminal(now, claim, input.clone(), wake, context, result)
+                            .map(|()| true);
+                    }
+                    // A former permission may finish after Stop or another
+                    // continuation won. Preserve the controller's original
+                    // stale verdict without reviving the old observation.
+                    if port.activation == self.activation {
+                        self.terminal.permission_reply(*token, *may_observe);
+                    }
+                }
+                LogicalToAttemptBody::PreReadyReplacementOwnerFailed { token, failure } => {
+                    self.verify_owner_port(claim.source, port.activation)?;
+                    // Consume the same permission token. The failed owner is
+                    // an explicit stop cause, never a healthy denial/retry.
+                    self.terminal.permission_reply(*token, false);
+                    self.observe_owner_stop(
+                        AttemptStopReason::LogicalExecutionFailed,
+                        failure.clone(),
+                        result,
+                    );
+                }
                 LogicalToAttemptBody::PreReadyReplacementChanged { token } => {
                     self.verify_source(claim.source, self.sources.qa)?;
                     if port.activation == self.activation
@@ -720,16 +762,7 @@ impl Core {
                 }
                 LogicalToAttemptBody::Stop { reason, failure } => {
                     self.verify_owner_port(claim.source, port.activation)?;
-                    let first = self.terminal.stop_reason().is_none();
-                    self.terminal.observe_stop(*reason, failure.clone());
-                    if self.terminal.requires_logical_failure_stand_down() {
-                        self.aborts.start_stand_down();
-                        self.turn.convergence_changed |= self.convergence.upgrade_to_cleanup();
-                    }
-                    self.turn.cancellation_due |= first;
-                    self.execution
-                        .with_diagnostics(|collector, _| collector.stop_starting());
-                    self.request_stop(result);
+                    self.observe_owner_stop(*reason, failure.clone(), result);
                 }
                 LogicalToAttemptBody::BeginConvergence {
                     mode,
@@ -834,7 +867,7 @@ impl Core {
         source: AttemptSourceId,
         activation: novarocks_coordination_contract::AttemptActivationIdentity,
     ) -> Result<(), TaskExecutionError> {
-        self.verify_source(source, self.sources.actor)?;
+        self.verify_source(source, self.sources.owner)?;
         if activation != self.activation {
             return Err(schedule(
                 "owner control differs from its original activation",
@@ -843,6 +876,23 @@ impl Core {
         Ok(())
     }
 
+    fn observe_owner_stop(
+        &mut self,
+        reason: AttemptStopReason,
+        failure: AttemptFailure,
+        result: &mut AttemptStep,
+    ) {
+        let first = self.terminal.stop_reason().is_none();
+        self.terminal.observe_stop(reason, failure);
+        if self.terminal.requires_logical_failure_stand_down() {
+            self.aborts.start_stand_down();
+            self.turn.convergence_changed |= self.convergence.upgrade_to_cleanup();
+        }
+        self.turn.cancellation_due |= first;
+        self.execution
+            .with_diagnostics(|collector, _| collector.stop_starting());
+        self.request_stop(result);
+    }
     fn request_stop(&mut self, result: &mut AttemptStep) {
         self.authorizations.request_close();
         if self.stop.request() {

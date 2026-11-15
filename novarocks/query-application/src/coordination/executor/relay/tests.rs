@@ -36,6 +36,7 @@ fn pending() -> (State, oneshot::Receiver<RelayResponse>) {
         attempts: BTreeMap::new(),
         pending: BTreeMap::new(),
         stopped: BTreeSet::new(),
+        supervision: None,
     };
     state.pending.insert(
         LogicalRequestToken::new(id(1)),
@@ -316,6 +317,7 @@ fn state_and_source() -> (Arc<Mutex<State>>, Source) {
         attempts: BTreeMap::new(),
         pending: BTreeMap::new(),
         stopped: BTreeSet::new(),
+        supervision: None,
     }));
     let source = Source {
         state: Arc::clone(&state),
@@ -931,5 +933,50 @@ async fn failed_prefetch_keeps_held_delivery_unsettled_until_independent_stop_cl
         port.requests(),
         vec![(Some(1), 0), (Some(2), 0)],
         "cleanup cannot issue a fresh data read or ACK"
+    );
+}
+
+#[tokio::test]
+async fn supervised_failure_drains_original_relay_reply_once_and_rejects_late_request() {
+    let (state, mut source) = state_and_source();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    struct HoldingSource(Arc<Mutex<Vec<LogicalHostFact>>>);
+    impl LogicalFactSource for HoldingSource {
+        fn id(&self) -> LogicalSourceId {
+            LogicalSourceId::new(id(7))
+        }
+        fn send(
+            &mut self,
+            fact: LogicalHostFact,
+        ) -> LogicalFuture<'_, Result<(), LogicalSourceClosed>> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(fact);
+                Ok(())
+            })
+        }
+    }
+    let mut original = HoldingSource(held.clone());
+    let mut request = Box::pin(relay_request(
+        &state,
+        &mut original,
+        activation(1),
+        RelayRequest::RequestVisibility,
+    ));
+    assert!(poll_once(request.as_mut()).await.is_pending());
+    assert_eq!(held.lock().unwrap().len(), 1);
+    let error = protocol("original relay owner failure");
+    begin_supervised_failure(&state, error.clone());
+    begin_supervised_failure(&state, protocol("secondary relay failure"));
+    assert!(fail_one_supervised_request(&state));
+    assert!(!fail_one_supervised_request(&state));
+    assert!(matches!(request.await, Err(actual) if actual == error));
+    assert!(
+        matches!(relay_request(&state, &mut source, activation(1), RelayRequest::RequestVisibility).await,
+        Err(actual) if actual == error)
+    );
+    assert!(state.lock().unwrap().pending.is_empty());
+    assert!(
+        source.requests.lock().unwrap().is_empty(),
+        "no fresh source send after failure latch"
     );
 }

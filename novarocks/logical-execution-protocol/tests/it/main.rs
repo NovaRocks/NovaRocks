@@ -17,7 +17,10 @@
 
 mod authorization;
 mod convergence;
+mod phase;
 mod ready;
 mod recovery;
 mod support;
 mod visibility;
+
+mod component_remaining;

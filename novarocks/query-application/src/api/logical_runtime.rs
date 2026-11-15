@@ -198,6 +198,20 @@ pub trait InstalledLogicalExecution: Send + Sync {
         &self,
         close_ingress: bool,
     ) -> LogicalFuture<'_, Result<LogicalJoinReadiness, LogicalSourceClosed>>;
+    /// Close only the SAME Registry ingress after the carrier has verified
+    /// its actual original actor failure fence. This grants no join readiness,
+    /// resource exit, actor exit or retirement. Unsupported carriers refuse.
+    fn begin_owner_failed_registry_close(&self) -> Result<(), LogicalSourceClosed> {
+        Err(LogicalSourceClosed)
+    }
+    /// Settle original accepted sends/probes without polling a failed Core.
+    /// Ready certifies ingress only; poll_exit remains independently required.
+    fn poll_owner_failed_registry_closed(
+        &self,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<(), LogicalSourceClosed>> {
+        Poll::Ready(Err(LogicalSourceClosed))
+    }
     fn poll_exit(&self, cx: &mut Context<'_>) -> Poll<LogicalExit>;
 }
 

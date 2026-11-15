@@ -43,7 +43,7 @@ impl LogicalExecutionCore {
         self.attempt_mut(activation)?;
         match message.body {
             AttemptToLogicalBody::AuthorizationRequest { token, request } => {
-                let closed = self.state.conclusion().is_some();
+                let closed = self.business_closed();
                 let now = self.now;
                 let attempt = self.attempt_mut(activation)?;
                 let decision =
@@ -123,7 +123,8 @@ impl LogicalExecutionCore {
                     .attempt_mut(activation)?
                     .establish
                     .correlates(refusal.input());
-                let opportunity = self.pre_ready_opportunity();
+                let mut opportunity = self.pre_ready_opportunity();
+                opportunity.concluded |= self.supervision_failure.is_some();
                 let allowed = self
                     .pre_ready
                     .query(activation, token, refusal.input(), opportunity, correlated)
@@ -169,7 +170,7 @@ impl LogicalExecutionCore {
                         // Even a visible stream waits for the original authoritative
                         // cause. It must not turn a derived placeholder into final failure.
                         let current = self.state.require_running(activation).is_ok();
-                        if current && self.state.conclusion().is_none() {
+                        if current && !self.business_closed() {
                             let _frozen = self.visibility.failure(activation, true, false);
                             self.stop_relay(activation);
                         }
@@ -216,7 +217,7 @@ impl LogicalExecutionCore {
                 AttemptTerminal::Completed => {
                     if self.state.require_running(activation).is_ok()
                         && self.start.policy.finish == LogicalFinishBoundary::TaskCompletion
-                        && self.state.conclusion().is_none()
+                        && !self.business_closed()
                         && !self.scope_cancellation_requested
                     {
                         match self

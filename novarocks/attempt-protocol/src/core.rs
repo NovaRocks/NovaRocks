@@ -158,6 +158,7 @@ impl Core {
         } = plan;
         let AttemptSources {
             actor,
+            owner: _,
             publication: publication_source,
             qa,
             process,
@@ -1148,6 +1149,7 @@ mod tests {
             observe_lifecycle_diagnostics: false,
             sources: AttemptSources {
                 actor: AttemptSourceId(id(3)),
+                owner: AttemptSourceId(id(3)),
                 publication: AttemptSourceId(id(4)),
                 qa: AttemptSourceId(id(5)),
                 process: AttemptSourceId(id(6)),
@@ -1159,6 +1161,78 @@ mod tests {
                 transport: AttemptSourceId(id(12)),
                 mailbox: [4; 4],
             },
+        }
+    }
+
+    #[test]
+    fn logical_owner_port_source_is_independent_of_the_actual_attempt_actor() {
+        use crate::{
+            AttemptCore,
+            input::{AttemptInput, AttemptInputClaim},
+        };
+        use novarocks_coordination_contract::AttemptStopReason;
+        for failed_reply in [false, true] {
+            for use_owner in [false, true] {
+                let mut start = start();
+                start.sources.owner = start.sources.qa;
+                let sources = start.sources;
+                let activation = start.activation.identity;
+                let now = start.initial_now;
+                let mut core = Core::new(start).unwrap();
+                core.handle(
+                    now,
+                    AttemptInputClaim {
+                        source: sources.actor,
+                        input: AttemptInputId(id(300)),
+                        native_cut: None,
+                        selected_cut: None,
+                    },
+                    AttemptInput::Bootstrap,
+                    &mut Units(32),
+                )
+                .unwrap();
+                let result = core.handle(
+                    now,
+                    AttemptInputClaim {
+                        source: if use_owner {
+                            sources.owner
+                        } else {
+                            sources.actor
+                        },
+                        input: AttemptInputId(id(301)),
+                        native_cut: None,
+                        selected_cut: None,
+                    },
+                    AttemptInput::Port(LogicalToAttempt {
+                        activation,
+                        body: if failed_reply {
+                            LogicalToAttemptBody::PreReadyReplacementOwnerFailed {
+                                token: novarocks_coordination_contract::AttemptRequestToken::new(
+                                    id(19),
+                                ),
+                                failure: AttemptFailure::Logical(
+                                    novarocks_coordination_contract::ExecutionFailure::from_input(
+                                        crate::port_projection::owner_failure(),
+                                    ),
+                                ),
+                            }
+                        } else {
+                            LogicalToAttemptBody::Stop {
+                                reason: AttemptStopReason::LogicalExecutionFailed,
+                                failure: AttemptFailure::TaskProtocol(Box::new(schedule(
+                                    "original logical owner stop",
+                                ))),
+                            }
+                        },
+                    }),
+                    &mut Units(32),
+                );
+                assert_eq!(result.is_ok(), use_owner, "{result:?}");
+                if use_owner {
+                    assert!(result.unwrap().stop_producing);
+                    assert!(core.terminal.requires_logical_failure_stand_down());
+                }
+            }
         }
     }
 

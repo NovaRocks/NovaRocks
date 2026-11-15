@@ -136,7 +136,7 @@ impl LogicalExecutionCore {
             .expect("validated recovery retains its original preparation budget");
         let deadline = self.preparation_window.open_once(self.now, valid_for);
         if self.now >= deadline {
-            self.conclude_failure(Self::preparation_expired());
+            self.conclude_setup_failure(Self::preparation_expired(), failure.error().clone());
             return Ok(());
         }
         let topology = failure
@@ -227,7 +227,7 @@ impl LogicalExecutionCore {
         }
         if self.preparation_window.expired(self.now) {
             let preparing = self.recovery.as_ref().is_some_and(|r| r.identity.is_none());
-            self.conclude_failure(if preparing {
+            self.conclude_replacement_failure(if preparing {
                 Self::preparation_expired()
             } else {
                 ReplacementQualificationFailure::Expired.error()
@@ -246,7 +246,7 @@ impl LogicalExecutionCore {
         match result {
             Ok(_) => Ok(()),
             Err(error) => {
-                self.conclude_failure(error);
+                self.conclude_replacement_failure(error);
                 Ok(())
             }
         }

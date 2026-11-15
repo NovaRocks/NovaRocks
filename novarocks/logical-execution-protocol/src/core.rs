@@ -393,6 +393,9 @@ impl LogicalExecutionCore {
             self.scan_dirty = true;
         }
         self.apply(input)?;
+        if let Some(error) = self.supervision_failure.clone() {
+            self.reject_pending_result_requests(error);
+        }
         self.flush(budget, out);
         self.drive(budget)?;
         self.flush(budget, out);
@@ -586,11 +589,21 @@ impl LogicalExecutionCore {
                 self.continuation = true;
                 break;
             }
-            let LogicalEffect { action, body } = self
+            let mut effect = self
                 .outbox
                 .pop_front()
                 .expect("checked nonempty ordered effect intents");
-            if self.state.conclusion().is_some() && Self::cancelled_business(&body) {
+            let failed_business = self.supervision_failure.is_some()
+                && effect.work_kind() == crate::effect::LogicalWorkKind::Business
+                // The original committed success still owes its End handoff.
+                && !matches!(effect.body, LogicalEffectBody::Consumer(ConsumerEffect::EnqueueEnd { .. }));
+            if let Some(error) = self.supervision_failure.as_ref() {
+                Self::reject_unissued_permission(&mut effect.body, error);
+            }
+            let LogicalEffect { action, body } = effect;
+            if failed_business
+                || (self.state.conclusion().is_some() && Self::cancelled_business(&body))
+            {
                 self.discard_unissued_business(&body);
                 continue;
             }
@@ -632,6 +645,52 @@ impl LogicalExecutionCore {
                 );
             }
             out.emit(LogicalEffect { action, body });
+        }
+    }
+    fn business_closed(&self) -> bool {
+        self.state.conclusion().is_some() || self.supervision_failure.is_some()
+    }
+    fn reject_unissued_permission(body: &mut LogicalEffectBody, error: &QueryExecutionError) {
+        use novarocks_coordination_contract::{
+            AttemptAuthorizationDecision,
+            logical_port::{AttemptAuthorizationFailure, LogicalToAttemptBody},
+        };
+        match body {
+            LogicalEffectBody::AttemptPort(message) => match &mut message.body {
+                LogicalToAttemptBody::AuthorizationReply { decision, .. }
+                    if matches!(
+                        decision,
+                        Ok(AttemptAuthorizationDecision::AdmissionStarted(_)
+                            | AttemptAuthorizationDecision::EstablishAuthorized(_))
+                    ) =>
+                {
+                    // Retain any ledger reference already allocated. A rejected
+                    // handoff is not a settlement or proof of physical exit.
+                    *decision = Err(AttemptAuthorizationFailure::Rejected(
+                        crate::establish::EstablishIssueError::IssueAuthorityRevoked.failure(),
+                    ));
+                }
+                LogicalToAttemptBody::PreReadyReplacementReply { may_observe, .. } => {
+                    *may_observe = false
+                }
+                _ => {}
+            },
+            LogicalEffectBody::Relay(RelayEffect::Reply { response, .. })
+                if matches!(
+                    response,
+                    crate::effect::RelayResponse::Opened
+                        | crate::effect::RelayResponse::DeliveryGranted
+                        | crate::effect::RelayResponse::VisibilityGranted
+                ) =>
+            {
+                *response = crate::effect::RelayResponse::Rejected(error.clone());
+            }
+            LogicalEffectBody::Consumer(ConsumerEffect::InternalReply { response, .. })
+                if matches!(response, crate::effect::InternalResponse::SourceRegistered) =>
+            {
+                *response = crate::effect::InternalResponse::Rejected(error.clone());
+            }
+            _ => {}
         }
     }
     fn discard_unissued_business(&mut self, body: &LogicalEffectBody) {

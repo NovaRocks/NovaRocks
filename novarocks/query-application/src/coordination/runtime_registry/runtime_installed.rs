@@ -73,6 +73,7 @@ struct SourceState {
     pending: Option<PendingSend>,
     polling: bool,
     waiting: bool,
+    ingress_closing: bool,
 }
 struct ExitState {
     value: Option<LogicalExit>,
@@ -162,6 +163,7 @@ impl RuntimeCarrier {
                 pending: None,
                 polling: false,
                 waiting: false,
+                ingress_closing: false,
             }),
             exit: Mutex::new(ExitState {
                 value: None,
@@ -176,15 +178,23 @@ impl RuntimeCarrier {
     }
     fn enqueue(&self, command: Command) -> Arc<RuntimeReply> {
         let reply = RuntimeReply::new();
-        self.source
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .queue
-            .push_back(Queued {
-                command,
-                reply: reply.clone(),
-            });
-        std::task::Wake::wake_by_ref(&self.wake);
+        let mut queued = Some(Queued {
+            command,
+            reply: reply.clone(),
+        });
+        {
+            let mut state = self.source.lock().unwrap_or_else(|p| p.into_inner());
+            if !state.ingress_closing {
+                state.queue.push_back(queued.take().unwrap());
+            }
+        }
+        if let Some(queued) = queued {
+            // Original rejected command and notifications leave the custody lock.
+            queued.reply.publish(Err(LogicalSourceClosed));
+            drop(queued);
+        } else {
+            std::task::Wake::wake_by_ref(&self.wake);
+        }
         reply
     }
     pub(super) fn enqueue_fact(&self, fact: LogicalHostFact) -> Arc<RuntimeReply> {
@@ -417,6 +427,35 @@ impl RuntimeCarrier {
             RuntimeReplyValue::Readiness(value) => Ok(value),
             RuntimeReplyValue::Fact => unreachable!("original typed readiness reply"),
         }
+    }
+    /// Close this same original ingress without claiming its explicit Join.
+    /// The installed carrier first qualifies its real owner-failure fence;
+    /// only then may commands be rejected and original pending sends drained.
+    pub(super) async fn close_ingress_after_owner_failure(
+        &self,
+    ) -> Result<(), LogicalSourceClosed> {
+        self.installed.begin_owner_failed_registry_close()?;
+        let queued = {
+            let mut state = self.source.lock().unwrap_or_else(|p| p.into_inner());
+            state.ingress_closing = true;
+            std::mem::take(&mut state.queue)
+        };
+        for queued in queued {
+            queued.reply.publish(Err(LogicalSourceClosed));
+            drop(queued);
+        }
+        std::future::poll_fn(|cx| {
+            // Both original continuations must keep being polled: either may
+            // own the SAME sender/probe that the other is waiting to return.
+            let closed = self.installed.poll_owner_failed_registry_closed(cx);
+            self.poll_source(cx);
+            match closed {
+                Poll::Ready(Ok(())) if self.source_idle() => Poll::Ready(Ok(())),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                _ => Poll::Pending,
+            }
+        })
+        .await
     }
     pub(super) async fn wait_ingress(self: Arc<Self>) {
         let ready = self.readiness(true).await;

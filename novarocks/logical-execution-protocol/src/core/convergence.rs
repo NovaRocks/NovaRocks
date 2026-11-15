@@ -44,6 +44,58 @@ impl LogicalExecutionCore {
         self.commit_failure(decision.conclusion, decision.failure);
     }
     pub(super) fn conclude_failure(&mut self, error: QueryExecutionError) {
+        self.conclude_failure_publishing(error.clone(), error);
+    }
+    pub(super) fn conclude_replacement_failure(&mut self, error: QueryExecutionError) {
+        if self.state.conclusion().is_some() {
+            return;
+        }
+        let original = self
+            .recovery
+            .as_ref()
+            .expect("replacement setup retains its originating attempt failure")
+            .failure
+            .error()
+            .clone();
+        self.conclude_setup_failure(error, original);
+    }
+    pub(super) fn conclude_setup_failure(
+        &mut self,
+        error: QueryExecutionError,
+        original: QueryExecutionError,
+    ) {
+        use novarocks_coordination_contract::AttemptFailureClass;
+        if self.state.conclusion().is_some() {
+            return;
+        }
+        // This closed projection verifies the original coordinator author,
+        // originating evidence and exact scope cancellation/deadline reason.
+        // It is not a guess from a generic Control class or error rendering.
+        let scope_cause = error.execution_failure().is_some_and(|input| {
+            matches!(
+                input.attempt_class(),
+                AttemptFailureClass::Cancelled | AttemptFailureClass::DeadlineExceeded
+            )
+        });
+        if scope_cause {
+            // Native observed the same original latch, but its error cannot
+            // reconstruct the exact reason (for example a drain deadline).
+            // The exclusive observer supplies that reason and its one Stop.
+            self.scope_cancellation_requested = true;
+            return;
+        }
+        let published = if self.start.policy.output == LogicalOutputMode::ResultStream {
+            original
+        } else {
+            error.clone()
+        };
+        self.conclude_failure_publishing(error, published);
+    }
+    fn conclude_failure_publishing(
+        &mut self,
+        error: QueryExecutionError,
+        published: QueryExecutionError,
+    ) {
         if self.state.conclusion().is_some() {
             return;
         }
@@ -54,9 +106,17 @@ impl LogicalExecutionCore {
         } else {
             LogicalConclusion::Failed
         };
-        self.commit_failure(conclusion, error);
+        self.commit_failure_publishing(conclusion, error, published);
     }
     fn commit_failure(&mut self, conclusion: LogicalConclusion, error: QueryExecutionError) {
+        self.commit_failure_publishing(conclusion, error.clone(), error);
+    }
+    fn commit_failure_publishing(
+        &mut self,
+        conclusion: LogicalConclusion,
+        error: QueryExecutionError,
+        published: QueryExecutionError,
+    ) {
         match self.state.phase() {
             ExecutionPhase::Instantiating { activation }
             | ExecutionPhase::Running { activation } => self
@@ -72,7 +132,7 @@ impl LogicalExecutionCore {
         self.logical_failure = Some(error.clone());
         self.reject_pending_result_requests(error.clone());
         self.queue(LogicalEffectBody::Consumer(ConsumerEffect::PublishFailure(
-            error,
+            published,
         )));
         self.begin_conclusion();
     }
@@ -344,6 +404,8 @@ impl LogicalExecutionCore {
                         .root
                         .as_ref()
                         .is_none_or(|r| r.root() != withdrawal.root())
+                    || withdrawal.participation().backend_process_id()
+                        == withdrawal.root().backend_process_id()
                 {
                     return Err(CoreFault::UnexpectedInput);
                 }

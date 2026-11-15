@@ -23,7 +23,8 @@ use crate::actor_turn::StandingInputId;
 use crate::{
     actor::Actor,
     actor_turn::{
-        ActorRegistration, ActorRuntime, ActorTurnError, InputAuthor, StandingInputObligation,
+        ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket, InputAuthor,
+        StandingInputObligation,
     },
     obligation::WorkObligation,
 };
@@ -126,6 +127,43 @@ impl<A: Actor> CausalInputObligation<A> {
     }
     pub fn in_flight(&self) -> Result<[Option<InputId>; 2], ActorTurnError> {
         Ok([self.predecessor.in_flight()?, self.event.in_flight()?])
+    }
+    /// Cross-owner event delivery with a proven-empty prefix. Publication uses
+    /// the original source ticket's ledger fence; a passive identity or an
+    /// earlier successful validation cannot authorize this handoff. The
+    /// optional financial author remains the original request's author.
+    pub fn fill_event_from_effect(
+        &mut self,
+        runtime: &ActorRuntime<A>,
+        ticket: &EffectTicket<A::Effect>,
+        author: Option<&InputAuthor>,
+        event: A::Input,
+    ) -> Result<InputId, (ActorTurnError, A::Input)> {
+        match self.in_flight() {
+            Ok([None, None]) => {}
+            Ok(_) => return Err((ActorTurnError::StandingInputBusy, event)),
+            Err(error) => return Err((error, event)),
+        }
+        match author {
+            Some(author) => {
+                runtime.fill_from_effect_with_author(ticket, &self.event, author, event)
+            }
+            None => runtime.fill_from_effect(ticket, &self.event, event),
+        }
+    }
+    /// The same empty-prefix event handoff under the original failed owner's
+    /// running supervision job. No ordinary effect ticket is reconstructed.
+    pub fn fill_event_from_failure(
+        &mut self,
+        session: &mut crate::publication::FailurePublicationSession<A>,
+        author: Option<&InputAuthor>,
+        event: A::Input,
+    ) -> Result<InputId, (ActorTurnError, A::Input)> {
+        match self.in_flight() {
+            Ok([None, None]) => session.fill_standing(&self.event, author, event),
+            Ok(_) => Err((ActorTurnError::StandingInputBusy, event)),
+            Err(error) => Err((error, event)),
+        }
     }
     /// Called by the original result owner after actual producer exit.
     /// A busy predecessor does not authorize closing either paid position.

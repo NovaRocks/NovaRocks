@@ -47,11 +47,27 @@ impl Clock for FrontendClock {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FrontendActorKind {
     Attempt,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "P12 wires the second actor kind into production composition"
+        )
+    )]
+    Logical,
     #[cfg(test)]
     Test,
 }
 pub(crate) enum FrontendActor {
     Attempt(Box<AttemptActor>),
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "P12 wires the second actor kind into production composition"
+        )
+    )]
+    Logical(Box<super::logical::adapter::LogicalActor>),
     #[cfg(test)]
     Test(Box<dyn TestActor>),
 }
@@ -63,6 +79,30 @@ pub(crate) enum FrontendInput {
     CapacityReleased,
     Membership(super::membership::MembershipUpdate),
     Attempt(Box<AttemptInput>),
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "P12 wires the second actor kind into production composition"
+        )
+    )]
+    Logical(Box<novarocks_logical_execution_protocol::input::LogicalInput>),
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "P12 wires the logical carrier into production composition"
+        )
+    )]
+    LogicalInfrastructureFailed,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "P12 wires the logical carrier into production composition"
+        )
+    )]
+    LogicalHostSettled,
     #[cfg(test)]
     Test(u64),
 }
@@ -73,11 +113,19 @@ pub(crate) enum FrontendEffect {
     Attempt(Arc<AttemptEffectEnvelope>),
     AttemptNotice(Arc<AttemptNotice>),
     AttemptRootControlProcessed(InputId),
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "P12 wires the second actor kind into production composition"
+        )
+    )]
+    Logical(Arc<super::logical::adapter::LogicalEffectEnvelope>),
     #[allow(
         dead_code,
         reason = "The owner failure action retains the exact failed input and its original scope identity."
     )]
-    AttemptOwnerFailed {
+    OwnerFailed {
         scope: ScopeId,
         generation: Generation,
         failed_input: InputEnvelope,
@@ -100,14 +148,48 @@ pub(crate) enum FrontendLaneKey {
     },
     Pump(PayloadRef),
     Publication,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "P12 wires the second actor kind into production composition"
+        )
+    )]
+    Logical(FrontendLogicalLaneKey),
     #[cfg(test)]
     Test(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum FrontendLogicalLaneKey {
+    Attempt(u64, novarocks_types::QueryExecutionId, u64),
+    Native,
+    Relay(u64, novarocks_types::QueryExecutionId, u64),
+    Consumer,
+    Governance,
+    Diagnostics,
+}
+impl From<novarocks_logical_execution_protocol::effect::LogicalLane> for FrontendLogicalLaneKey {
+    fn from(lane: novarocks_logical_execution_protocol::effect::LogicalLane) -> Self {
+        use novarocks_logical_execution_protocol::effect::LogicalLane;
+        match lane {
+            LogicalLane::Attempt(a) => {
+                Self::Attempt(a.actor().get(), a.execution(), a.generation())
+            }
+            LogicalLane::Native => Self::Native,
+            LogicalLane::Relay(a) => Self::Relay(a.actor().get(), a.execution(), a.generation()),
+            LogicalLane::Consumer => Self::Consumer,
+            LogicalLane::Governance => Self::Governance,
+            LogicalLane::Diagnostics => Self::Diagnostics,
+        }
+    }
 }
 #[cfg(test)]
 impl FrontendActor {
     pub(crate) fn kind(&self) -> FrontendActorKind {
         match self {
             Self::Attempt(_) => FrontendActorKind::Attempt,
+            Self::Logical(_) => FrontendActorKind::Logical,
             #[cfg(test)]
             Self::Test(_) => FrontendActorKind::Test,
         }
@@ -128,6 +210,7 @@ impl Actor for FrontendActor {
     ) {
         match self {
             Self::Attempt(actor) => actor.handle(now, input, value, step),
+            Self::Logical(actor) => actor.handle(now, input, value, step),
             #[cfg(test)]
             Self::Test(actor) => actor.handle(now, input, value, step),
         }
@@ -135,6 +218,7 @@ impl Actor for FrontendActor {
     fn next_deadline(&self) -> Option<Tick> {
         match self {
             Self::Attempt(actor) => actor.next_deadline(),
+            Self::Logical(actor) => actor.next_deadline(),
             #[cfg(test)]
             Self::Test(actor) => actor.next_deadline(),
         }
@@ -148,7 +232,7 @@ impl Actor for FrontendActor {
         if let Some(work) = step.failure_work() {
             step.effect(
                 descriptor(1, work, EffectKind::Cleanup),
-                FrontendEffect::AttemptOwnerFailed {
+                FrontendEffect::OwnerFailed {
                     scope,
                     generation,
                     failed_input: input,

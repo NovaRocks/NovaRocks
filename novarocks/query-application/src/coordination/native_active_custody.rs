@@ -82,6 +82,44 @@ struct ActiveSlot {
     consumer: Mutex<ConsumerTailState>,
 }
 
+/// Refusal never consumes the original successful output or its slot owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingNativeCleanupRefusal {
+    Registry(super::LogicalExecutionRuntimeRegistryError),
+    ForeignSource,
+    NotStaged,
+    SlotUnavailable,
+    ForeignSlot,
+    OwnerUnavailable,
+}
+impl PendingNativeCleanupRefusal {
+    pub(crate) fn query_error(self) -> QueryExecutionError {
+        use crate::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        };
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+        let (fact, detail) = match self {
+            Self::Registry(error) => (error.failure_fact(), error.safe_detail()),
+            other => (
+                QueryFailureReason::ResultProtocol.failure_fact(),
+                SafeDetail::truncating(match other {
+                    Self::ForeignSource => "pending Native cleanup has another original Source",
+                    Self::NotStaged => "pending Native cleanup has no original staged output",
+                    Self::SlotUnavailable => "pending Native cleanup lost its original slot",
+                    Self::ForeignSlot => "pending Native cleanup has another original slot",
+                    Self::OwnerUnavailable => "pending Native cleanup has no staged original owner",
+                    Self::Registry(_) => unreachable!("registry refusal projected separately"),
+                }),
+            ),
+        };
+        QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            fact,
+            detail,
+            ExecutionFailureSite::Coordinator,
+        ))
+    }
+}
+
 /// The original slot receives the primary before the borrowed convergence
 /// future is destroyed. A later destructor panic cannot replace this source.
 #[derive(Default)]
@@ -471,6 +509,91 @@ impl NativeActiveCustodyRegistry {
             progress,
             root_ack_ready: Arc::new(RootAckReadyIndex::default()),
         }
+    }
+    /// Take cleanup custody from the original Pending's actual weak slot.
+    /// Numeric keys only validate that original; they cannot select a new one.
+    /// Unlike normal activation handoff, this proves no dormant Drop, business
+    /// activation, remote closure, local resource exit or native-return event.
+    pub(super) fn take_staged_for_cleanup(
+        &self,
+        initial: QueryExecutionId,
+        generation: u64,
+        original_exit: &Arc<super::original_exit::OriginalLogicalExit>,
+        registry: LogicalExecutionRuntimeRegistryHandle,
+        pending: &mut Option<PendingNativeActivation>,
+    ) -> Result<
+        (
+            SupervisedActiveNativeOwner,
+            Option<crate::api::NativeRowsAttemptRuntime>,
+        ),
+        PendingNativeCleanupRefusal,
+    > {
+        let Some(PendingNativeActivation {
+            state: PendingNativeActivationState::Staged { key, slot, .. },
+        }) = pending.as_ref()
+        else {
+            return Err(PendingNativeCleanupRefusal::NotStaged);
+        };
+        let key = *key;
+        if key.initial != initial
+            || key.generation != generation
+            || key.execution.query_id() != initial.query_id()
+        {
+            return Err(PendingNativeCleanupRefusal::ForeignSlot);
+        }
+        let original_slot = slot
+            .upgrade()
+            .ok_or(PendingNativeCleanupRefusal::SlotUnavailable)?;
+        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if !slots
+            .get(&key)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &original_slot))
+            || !original_slot
+                .original_exit
+                .ptr_eq(&Arc::downgrade(original_exit))
+        {
+            return Err(PendingNativeCleanupRefusal::ForeignSlot);
+        }
+        let mut owner = original_slot
+            .owner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !matches!(&*owner, Some(ActiveSlotOwner::Activated(_))) {
+            return Err(PendingNativeCleanupRefusal::OwnerUnavailable);
+        }
+        // All refusal checks precede this same-object transfer. No destructor,
+        // notification or foreign method runs under these metadata locks.
+        let Some(ActiveSlotOwner::Activated(original)) = owner.take() else {
+            unreachable!()
+        };
+        let Some(PendingNativeActivation {
+            state: PendingNativeActivationState::Staged { rows, slot, .. },
+        }) = pending.take()
+        else {
+            unreachable!()
+        };
+        drop(owner);
+        drop(slots);
+        drop(slot);
+        Ok((
+            SupervisedActiveNativeOwner {
+                owner: Some(original),
+                custody: NativeActiveCustodyHandle {
+                    storage: self.clone(),
+                    registry,
+                    key,
+                    slot: original_slot,
+                },
+                terminal_cut: None,
+                remote_deadline: None,
+                computation_ready: None,
+                streamed_success: None,
+                failure_view: None,
+                accepted_failure: None,
+                closed: false,
+            },
+            rows,
+        ))
     }
     pub(super) fn reserve_with_original_exit(
         &self,
@@ -1002,6 +1125,26 @@ impl PendingNativeActivation {
     pub(crate) fn new(original: crate::api::ActivatedNativeAttempt) -> Self {
         Self {
             state: PendingNativeActivationState::Unbound(original),
+        }
+    }
+    pub(crate) fn staged_execution(&self) -> Option<QueryExecutionId> {
+        match self.state {
+            PendingNativeActivationState::Staged { key, .. } => Some(key.execution),
+            PendingNativeActivationState::Unbound(_) => None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn staged_owner_address(&self) -> Option<usize> {
+        let PendingNativeActivationState::Staged { slot, .. } = &self.state else {
+            return None;
+        };
+        let slot = slot.upgrade()?;
+        let held = slot.owner.lock().unwrap_or_else(|e| e.into_inner());
+        match held.as_ref()? {
+            ActiveSlotOwner::Activated(owner) => {
+                Some(owner.as_ref() as *const dyn ActiveNativeAttemptOwner as *const () as usize)
+            }
+            ActiveSlotOwner::Retained(_) => None,
         }
     }
     #[cfg(test)]

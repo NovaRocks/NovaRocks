@@ -62,7 +62,32 @@ enum End {
     Resolved,
     RemoteTrackingEnded,
 }
+/// Read-only original responsibility state. In-flight operations are not
+/// successful settlements, even if a borrowed caller has already disappeared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GovernanceObligationState {
+    Absent,
+    Registering,
+    Held,
+    Settling,
+    Resolved,
+    RemoteTrackingEnded,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GovernanceOwnerState {
+    Held,
+    Completing,
+    Completed,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GovernanceObligationSnapshot {
+    pub activation: AttemptActivationIdentity,
+    pub kind: ObligationKind,
+    pub state: GovernanceObligationState,
+}
 struct OriginalObligation {
+    activation: AttemptActivationIdentity,
+    kind: ObligationKind,
     original: Option<Obligation>,
     ended: Option<End>,
 }
@@ -71,7 +96,8 @@ struct State {
     stage: Option<StagePermit>,
     obligations: BTreeMap<ObligationKey, OriginalObligation>,
     completed: bool,
-    registering: BTreeSet<ObligationKey>,
+    completion_in_flight: bool,
+    registering: BTreeMap<ObligationKey, (AttemptActivationIdentity, ObligationKind)>,
     settling: BTreeSet<ObligationKey>,
 }
 
@@ -109,7 +135,8 @@ impl GovernanceExecutor {
                 stage: Some(stage),
                 obligations: BTreeMap::new(),
                 completed: false,
-                registering: BTreeSet::new(),
+                completion_in_flight: false,
+                registering: BTreeMap::new(),
                 settling: BTreeSet::new(),
             }),
         })
@@ -117,6 +144,73 @@ impl GovernanceExecutor {
 
     pub fn scope(&self) -> WorkScope {
         self.scope.clone()
+    }
+    pub fn obligation_state(
+        &self,
+        activation: AttemptActivationIdentity,
+        kind: ObligationKind,
+    ) -> Result<GovernanceObligationState, QueryExecutionError> {
+        let key = self.key(activation, kind)?;
+        let state = self.lock();
+        Ok(if state.registering.contains_key(&key) {
+            GovernanceObligationState::Registering
+        } else if state.settling.contains(&key) {
+            GovernanceObligationState::Settling
+        } else {
+            match state.obligations.get(&key).map(|original| original.ended) {
+                None => GovernanceObligationState::Absent,
+                Some(None) => GovernanceObligationState::Held,
+                Some(Some(End::Resolved)) => GovernanceObligationState::Resolved,
+                Some(Some(End::RemoteTrackingEnded)) => {
+                    GovernanceObligationState::RemoteTrackingEnded
+                }
+            }
+        })
+    }
+    /// Linear read of SAME original registration arguments and actual phases.
+    /// No identity is reconstructed from encoded keys, and an in-flight
+    /// operation remains UNKNOWN rather than a successful settlement.
+    pub fn cleanup_inventory(&self) -> Vec<GovernanceObligationSnapshot> {
+        let state = self.lock();
+        let mut rows = Vec::with_capacity(state.obligations.len() + state.registering.len());
+        for (key, original) in &state.obligations {
+            rows.push(GovernanceObligationSnapshot {
+                activation: original.activation,
+                kind: original.kind,
+                state: if state.settling.contains(key) {
+                    GovernanceObligationState::Settling
+                } else {
+                    match original.ended {
+                        None => GovernanceObligationState::Held,
+                        Some(End::Resolved) => GovernanceObligationState::Resolved,
+                        Some(End::RemoteTrackingEnded) => {
+                            GovernanceObligationState::RemoteTrackingEnded
+                        }
+                    }
+                },
+            });
+        }
+        for (activation, kind) in state.registering.values() {
+            rows.push(GovernanceObligationSnapshot {
+                activation: *activation,
+                kind: *kind,
+                state: GovernanceObligationState::Registering,
+            });
+        }
+        rows
+    }
+    pub fn owner_state(&self) -> GovernanceOwnerState {
+        let state = self.lock();
+        if state.completion_in_flight {
+            GovernanceOwnerState::Completing
+        } else if state.completed {
+            GovernanceOwnerState::Completed
+        } else {
+            GovernanceOwnerState::Held
+        }
+    }
+    pub fn stage_held(&self) -> bool {
+        self.lock().stage.is_some()
     }
 
     pub fn execute(&self, effect: GovernanceEffect) -> LogicalFuture<'_, GovernanceFact> {
@@ -135,7 +229,7 @@ impl GovernanceExecutor {
                     if state.obligations.contains_key(&key) {
                         return Ok(GovernanceFact::ObligationRegistered { activation, kind });
                     }
-                    if !state.registering.insert(key) {
+                    if state.registering.insert(key, (activation, kind)).is_some() {
                         return Err(protocol_failure(
                             "original obligation registration is already in flight",
                         ));
@@ -151,6 +245,8 @@ impl GovernanceExecutor {
                 state.obligations.insert(
                     key,
                     OriginalObligation {
+                        activation,
+                        kind,
                         original: Some(original),
                         ended: None,
                     },
@@ -185,6 +281,11 @@ impl GovernanceExecutor {
             GovernanceEffect::CompleteWorkOwner => {
                 let owner = {
                     let mut state = self.lock();
+                    if state.completion_in_flight {
+                        return Err(protocol_failure(
+                            "original WorkOwner completion is still in flight",
+                        ));
+                    }
                     if state.stage.is_some()
                         || !state.registering.is_empty()
                         || !state.settling.is_empty()
@@ -195,11 +296,13 @@ impl GovernanceExecutor {
                         ));
                     }
                     state.completed = true;
+                    state.completion_in_flight = true;
                     state.owner.take()
                 };
                 if let Some(owner) = owner {
                     owner.complete_after_terminal_cancel_settled();
                 }
+                self.lock().completion_in_flight = false;
                 Ok(GovernanceFact::WorkOwnerCompleted)
             }
         }

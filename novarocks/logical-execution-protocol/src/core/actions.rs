@@ -285,7 +285,7 @@ impl LogicalExecutionCore {
                     .map_err(|_| CoreFault::UnexpectedInput)?;
             }
             (ConsumerAction::EndSlot(activation), ConsumerFact::EndSlotReady) => {
-                if self.state.conclusion().is_none()
+                if !self.business_closed()
                     && self.state.current_activation() == Some(activation)
                     && !self.scope_cancellation_requested
                     && !self.visibility.frozen(activation)
@@ -340,7 +340,7 @@ impl LogicalExecutionCore {
                 if matches!(kind, ConsumerAction::End(_)) {
                     self.end_settled = true;
                 }
-                if self.state.conclusion().is_some()
+                if self.business_closed()
                     || matches!(
                         kind,
                         ConsumerAction::Output
@@ -361,6 +361,7 @@ impl LogicalExecutionCore {
     pub(super) fn request_error(&self) -> QueryExecutionError {
         self.logical_failure
             .clone()
+            .or_else(|| self.supervision_failure.clone())
             .unwrap_or_else(|| LogicalRequestFailure::ExecutionConcluded.error())
     }
 }

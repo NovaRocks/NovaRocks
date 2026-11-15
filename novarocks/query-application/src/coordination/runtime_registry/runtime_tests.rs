@@ -17,6 +17,7 @@
 
 //! Port-seam tests: the fake reports explicit original Scope exits. It is not
 //! evidence that remote closure or a Ready decision implies actual exit.
+use super::runtime_installed::RuntimeReplyValue;
 use super::*;
 use crate::api::logical_runtime::{
     LogicalFactSource, LogicalFuture, LogicalSourceClosed, LogicalSourceRefusal,
@@ -43,6 +44,8 @@ struct PortState {
     facts: Vec<LogicalHostFact>,
     closes: Vec<novarocks_logical_execution_protocol::input::RegistryClose>,
     readiness_requests: Vec<bool>,
+    owner_failed: bool,
+    failure_ingress_closed: bool,
 }
 #[derive(Default)]
 struct Port {
@@ -68,13 +71,16 @@ impl LogicalFactSource for Source {
         Box::pin(async move {
             std::future::poll_fn(|cx| {
                 self.0.wake.register(cx.waker());
-                if self.0.state.lock().unwrap().allow_fact {
-                    Poll::Ready(())
+                let state = self.0.state.lock().unwrap();
+                if state.failure_ingress_closed {
+                    Poll::Ready(Err(LogicalSourceClosed))
+                } else if state.allow_fact {
+                    Poll::Ready(Ok(()))
                 } else {
                     Poll::Pending
                 }
             })
-            .await;
+            .await?;
             self.0.state.lock().unwrap().facts.push(fact);
             Ok(())
         })
@@ -114,6 +120,28 @@ impl InstalledRuntime for Installed {
             })
             .await
         })
+    }
+    fn begin_owner_failed_registry_close(&self) -> Result<(), LogicalSourceClosed> {
+        {
+            let mut state = self.0.state.lock().unwrap();
+            if !state.owner_failed {
+                return Err(LogicalSourceClosed);
+            }
+            state.failure_ingress_closed = true;
+        }
+        self.request_close(novarocks_logical_execution_protocol::input::RegistryClose::Retire);
+        self.0.progress();
+        Ok(())
+    }
+    fn poll_owner_failed_registry_closed(
+        &self,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<(), LogicalSourceClosed>> {
+        if self.0.state.lock().unwrap().failure_ingress_closed {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
     }
     fn poll_exit(&self, cx: &mut Context<'_>) -> Poll<LogicalExit> {
         self.0.exit_wake.register(cx.waker());
@@ -897,4 +925,55 @@ async fn natural_service_cannot_steal_cancelled_explicit_join_receipt() {
         .shutdown_until(Instant::now() + Duration::from_secs(1))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn failed_owner_ingress_close_returns_original_source_without_waiting_for_actor_exit_or_join()
+{
+    let (carrier, port) = carrier();
+    let first = carrier.enqueue_fact(LogicalHostFact::Cancelled(
+        LogicalCancellationReason::ServerShutdown,
+    ));
+    let mut pending = Box::pin(carrier.wait_reply(&first));
+    assert!(matches!(futures::poll!(pending.as_mut()), Poll::Pending));
+    drop(pending);
+    let second = carrier.enqueue_fact(LogicalHostFact::ConsumerClosed);
+    let readiness = carrier.enqueue_readiness(true);
+    port.state.lock().unwrap().owner_failed = true;
+    carrier.close_ingress_after_owner_failure().await.unwrap();
+    assert!(carrier.source_idle());
+    assert!(!carrier.explicit_join_claimed());
+    for original in [&first, &second, &readiness] {
+        assert!(matches!(
+            carrier.wait_reply(original).await,
+            Err(LogicalSourceClosed)
+        ));
+    }
+    let late = carrier.enqueue_fact(LogicalHostFact::ConsumerClosed);
+    assert!(matches!(
+        carrier.wait_reply(&late).await,
+        Err(LogicalSourceClosed)
+    ));
+    let state = port.state.lock().unwrap();
+    assert_eq!(state.sources, 1);
+    assert!(state.exit.is_none());
+    assert!(state.facts.is_empty());
+    assert!(state.readiness_requests.is_empty());
+}
+
+#[tokio::test]
+async fn failed_owner_close_refuses_healthy_carrier_without_closing_its_original_queue() {
+    let (carrier, port) = carrier();
+    assert_eq!(
+        carrier.close_ingress_after_owner_failure().await,
+        Err(LogicalSourceClosed)
+    );
+    assert!(port.state.lock().unwrap().closes.is_empty());
+    port.state.lock().unwrap().allow_fact = true;
+    let original = carrier.enqueue_fact(LogicalHostFact::ConsumerClosed);
+    assert!(matches!(
+        carrier.wait_reply(&original).await,
+        Ok(RuntimeReplyValue::Fact)
+    ));
+    assert_eq!(port.state.lock().unwrap().facts.len(), 1);
 }

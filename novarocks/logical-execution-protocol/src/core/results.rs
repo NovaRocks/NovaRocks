@@ -62,6 +62,18 @@ impl LogicalExecutionCore {
             token,
             activation,
         };
+        if let Some(error) = self.supervision_failure.clone()
+            && matches!(
+                request,
+                RelayRequest::OpenDelivery { .. }
+                    | RelayRequest::RequestVisibility
+                    | RelayRequest::EndConsumed { .. }
+                    | RelayRequest::RootWithdrawn { .. }
+            )
+        {
+            self.relay_reply(waiter, RelayResponse::Rejected(error));
+            return Ok(());
+        }
         let current = self.state.require_running(activation).is_ok();
         let concluded = self.state.conclusion().is_some();
         match request {
@@ -229,6 +241,15 @@ impl LogicalExecutionCore {
                 activation,
                 InternalResponse::Rejected(LogicalRequestFailure::WrongPhase.error()),
             );
+            return Ok(());
+        }
+        if let Some(error) = self.supervision_failure.clone()
+            && matches!(
+                request,
+                InternalRequest::RegisterSource { .. } | InternalRequest::AcceptReady { .. }
+            )
+        {
+            self.internal_reply(source, token, activation, InternalResponse::Rejected(error));
             return Ok(());
         }
         let current = self.state.require_running(activation).is_ok();
@@ -418,7 +439,7 @@ impl LogicalExecutionCore {
         let Some(activation) = self.state.current_activation() else {
             return Ok(());
         };
-        if self.state.conclusion().is_some() {
+        if self.business_closed() {
             return Ok(());
         }
         let attempt = self
@@ -493,7 +514,7 @@ impl LogicalExecutionCore {
         Ok(())
     }
     pub(super) fn drive_root_control(&mut self, execution: QueryExecutionId) {
-        let pending = self.state.conclusion().is_none()
+        let pending = !self.business_closed()
             && self
                 .attempts
                 .get(&execution)

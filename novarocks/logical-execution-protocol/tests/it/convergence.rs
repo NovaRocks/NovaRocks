@@ -356,3 +356,6 @@ fn failed_original_output_handoff_reports_supervision_instead_of_waiting_forever
     );
     assert_eq!(f.core.next_deadline(), None);
 }
+
+#[path = "convergence/part3.rs"]
+mod part3;

@@ -1086,7 +1086,7 @@ impl EffectSource for SupervisorSource {
         observations: Option<OrderedObservationFailure>,
     ) {
         assert!(context.is_none());
-        let FrontendEffect::AttemptOwnerFailed { failed_input, .. } = &ticket.effect else {
+        let FrontendEffect::OwnerFailed { failed_input, .. } = &ticket.effect else {
             unreachable!()
         };
         assert!(

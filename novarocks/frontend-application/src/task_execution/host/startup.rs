@@ -40,12 +40,19 @@ enum StartupStatus {
 
 /// A passive, cancellation-safe witness of the registered host's startup.
 #[must_use]
+#[derive(Clone)]
 pub(crate) struct AttemptStartup {
     registration: ActorRegistration,
     status: watch::Receiver<StartupStatus>,
 }
 
 impl AttemptStartup {
+    /// Observe only this original startup registration. Cloning the watch
+    /// witness creates no new startup, input, admission or completion fact.
+    pub(crate) fn matches_registration(&self, registration: &ActorRegistration) -> bool {
+        self.registration.same_registration(registration)
+    }
+
     pub(crate) async fn wait_ready(&mut self) -> Result<(), ActorTurnError> {
         let status = self
             .status

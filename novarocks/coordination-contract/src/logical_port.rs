@@ -142,6 +142,12 @@ pub enum LogicalToAttemptBody {
         token: AttemptRequestToken,
         may_observe: bool,
     },
+    /// Canonical negative reply from the original failed logical owner. A
+    /// permission denial alone cannot represent this supervision failure.
+    PreReadyReplacementOwnerFailed {
+        token: AttemptRequestToken,
+        failure: ExecutionFailure,
+    },
     /// Hint from the SAME original QA observation registered with this query.
     /// It never grants permission: ask the original policy owner again before
     /// continuing observation. Query/register itself must not emit this hint.

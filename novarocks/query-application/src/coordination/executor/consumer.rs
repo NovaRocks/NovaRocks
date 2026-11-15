@@ -127,10 +127,54 @@ struct Internal {
     transport: Transport,
     failure: watch::Sender<Option<QueryExecutionError>>,
     ready: watch::Sender<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
+    // The exact accepted token in the original no-await publication tail.
+    // This is not a second payload, authorization or actual-exit fact.
+    ready_issued: Option<ComputationReadyToken>,
+    failure_issued: Option<QueryExecutionError>,
     liveness: Liveness,
     exit: Option<Exit>,
     decoded: Option<(InternalEndReceiptId, RootResultEnd)>,
     end_delivery: Option<InternalEndState>,
+}
+/// The original channel pair and the failure already promised under State.
+/// This tail carries no new result decision and performs no async wait.
+struct InternalFailureNotice {
+    failure: watch::Sender<Option<QueryExecutionError>>,
+    ready: watch::Sender<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
+    error: QueryExecutionError,
+}
+impl InternalFailureNotice {
+    fn reserve(original: &mut Internal, error: QueryExecutionError) -> Self {
+        Self {
+            failure: original.failure.clone(),
+            ready: original.ready.clone(),
+            error: original.failure_issued.get_or_insert(error).clone(),
+        }
+    }
+    fn notify(self) {
+        notify_original_failure(&self.failure, self.error.clone());
+        self.ready.send_if_modified(|value| {
+            if value.is_none() {
+                *value = Some(Err(self.error));
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+fn notify_original_failure(
+    sender: &watch::Sender<Option<QueryExecutionError>>,
+    error: QueryExecutionError,
+) {
+    sender.send_if_modified(|value| {
+        if value.is_none() {
+            *value = Some(error);
+            true
+        } else {
+            false
+        }
+    });
 }
 enum Reply {
     Internal(oneshot::Sender<Result<InternalResponse, QueryExecutionError>>),
@@ -146,6 +190,15 @@ struct Completion {
     reply: Option<oneshot::Sender<Result<ExecutionOutputObligation, QueryExecutionError>>>,
     published: Option<Result<(), QueryExecutionError>>,
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ClientEndPublication {
+    #[default]
+    Owed,
+    // The original no-await handoff tail owns the position and End. Failure
+    // may not guess its outcome from a temporarily absent queue permit.
+    Publishing,
+    HandedOff,
+}
 struct State {
     next: u64,
     source_id: Option<LogicalSourceId>,
@@ -154,6 +207,7 @@ struct State {
     client: Option<Transport>,
     schema: Option<ResultDeliveryReceipt>,
     failure: Option<watch::Sender<Option<QueryExecutionError>>>,
+    client_failure_issued: Option<QueryExecutionError>,
     output: Option<QueryResultStream>,
     exposed: bool,
     end: BTreeMap<Key, RootResultEnd>,
@@ -161,6 +215,23 @@ struct State {
     retired_end: BTreeSet<Key>,
     segments: BTreeMap<Key, SegmentState>,
     completion: Option<Completion>,
+    supervision: Option<QueryExecutionError>,
+    client_end_publication: ClientEndPublication,
+}
+fn reserve_client_failure(
+    state: &mut State,
+    error: QueryExecutionError,
+) -> Option<(
+    watch::Sender<Option<QueryExecutionError>>,
+    QueryExecutionError,
+)> {
+    if state.client_end_publication != ClientEndPublication::Owed {
+        return None;
+    }
+    state.failure.clone().map(|sender| {
+        let original = state.client_failure_issued.get_or_insert(error).clone();
+        (sender, original)
+    })
 }
 
 pub struct ConsumerExecutor {
@@ -254,6 +325,7 @@ impl ConsumerExecutor {
                 client: client.map(Transport::Client),
                 schema,
                 failure,
+                client_failure_issued: None,
                 output,
                 exposed: false,
                 end: BTreeMap::new(),
@@ -261,6 +333,8 @@ impl ConsumerExecutor {
                 retired_end: BTreeSet::new(),
                 segments: BTreeMap::new(),
                 completion: None,
+                supervision: None,
+                client_end_publication: ClientEndPublication::Owed,
             }),
             source: AsyncMutex::new(None),
             observations,
@@ -268,6 +342,69 @@ impl ConsumerExecutor {
     }
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Latch the exact original owner failure separately from normal business
+    /// failure. Actual Ready/completion/End handoffs remain immutable. This
+    /// does not settle a request, delivery, future, capture or original Join.
+    pub fn begin_supervised_failure(&self, error: QueryExecutionError) {
+        let (error, failure, internal, completion) = {
+            let mut state = self.lock();
+            let error = state.supervision.get_or_insert(error).clone();
+            let failure = reserve_client_failure(&mut state, error.clone());
+            let internal = state
+                .internal
+                .values_mut()
+                .filter(|original| original.ready_issued.is_none())
+                .map(|original| InternalFailureNotice::reserve(original, error.clone()))
+                .collect::<Vec<_>>();
+            let completion = state.completion.as_mut().and_then(|original| {
+                if original.published.is_none() {
+                    original.published = Some(Err(error.clone()));
+                    original.reply.take()
+                } else {
+                    None
+                }
+            });
+            (error, failure, internal, completion)
+        };
+        // All notifications and original sender destruction happen outside
+        // the custody lock. New publication checks the same latched level.
+        if let Some((failure, original)) = failure {
+            notify_original_failure(&failure, original);
+        }
+        for original in internal {
+            original.notify();
+        }
+        if let Some(reply) = completion {
+            let _ = reply.send(Err(error));
+        }
+    }
+
+    /// Drain at most one exact original request. A lost caller does not create
+    /// a replacement reply or prove that its producer has actually exited.
+    pub fn fail_one_supervised_request(&self) -> bool {
+        let row = {
+            let mut state = self.lock();
+            let Some(error) = state.supervision.clone() else {
+                return false;
+            };
+            state
+                .pending
+                .pop_first()
+                .map(|(_, original)| (original.reply, error))
+        };
+        let Some((reply, error)) = row else {
+            return false;
+        };
+        match reply {
+            Reply::Internal(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Reply::Ready(reply) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+        true
     }
     /// This controlled observer waits on the actual channel. Scope cancellation
     /// is requested by the logical owner after the passive close observation.
@@ -298,7 +435,13 @@ impl ConsumerExecutor {
         if original.is_some() {
             return Err(protocol("consumer source was already attached"));
         }
-        self.lock().source_id = Some(source.id());
+        {
+            let mut state = self.lock();
+            if let Some(error) = &state.supervision {
+                return Err(error.clone());
+            }
+            state.source_id = Some(source.id());
+        }
         *original = Some(source);
         Ok(())
     }
@@ -316,6 +459,9 @@ impl ConsumerExecutor {
             return Err(protocol("internal consumer activation has another root"));
         }
         let mut state = self.lock();
+        if let Some(error) = &state.supervision {
+            return Err(error.clone());
+        }
         if state.internal.contains_key(&key(activation)) {
             return Err(protocol("internal consumer was already bound"));
         }
@@ -352,6 +498,8 @@ impl ConsumerExecutor {
                 transport: Transport::Internal(transport),
                 failure,
                 ready,
+                ready_issued: None,
+                failure_issued: None,
                 liveness,
                 exit: None,
                 decoded: None,
@@ -799,6 +947,9 @@ impl ConsumerExecutor {
     ) -> Result<LogicalRequestToken, QueryExecutionError> {
         let token = {
             let mut state = self.lock();
+            if let Some(error) = &state.supervision {
+                return Err(error.clone());
+            }
             let source = state
                 .source_id
                 .ok_or_else(|| protocol("original consumer source is not attached"))?;
@@ -827,8 +978,14 @@ impl ConsumerExecutor {
                 .await
         };
         if result.is_err() {
-            self.lock().pending.remove(&token);
-            return Err(protocol("original consumer standing position closed"));
+            let (original, error) = {
+                let mut state = self.lock();
+                (state.pending.remove(&token), state.supervision.clone())
+            };
+            drop(original);
+            return Err(
+                error.unwrap_or_else(|| protocol("original consumer standing position closed"))
+            );
         }
         Ok(token)
     }
@@ -840,9 +997,12 @@ impl ConsumerExecutor {
         let (reply, receiver) = oneshot::channel();
         self.send(activation, request, Reply::Internal(reply))
             .await?;
-        receiver
-            .await
-            .map_err(|_| protocol("original internal request reply closed"))?
+        receiver.await.map_err(|_| {
+            self.lock()
+                .supervision
+                .clone()
+                .unwrap_or_else(|| protocol("original internal request reply closed"))
+        })?
     }
     fn reply(
         &self,
@@ -852,6 +1012,9 @@ impl ConsumerExecutor {
         response: InternalResponse,
     ) -> Result<(), QueryExecutionError> {
         let mut state = self.lock();
+        if let Some(error) = &state.supervision {
+            return Err(error.clone());
+        }
         let p = state
             .pending
             .get(&token)
@@ -865,6 +1028,7 @@ impl ConsumerExecutor {
             .pending
             .remove(&token)
             .expect("validated original request");
+        drop(state);
         match p.reply {
             Reply::Internal(reply) => {
                 let _ = reply.send(Ok(response));
@@ -886,6 +1050,9 @@ impl ConsumerExecutor {
         cut: AttemptComputationCut,
     ) -> Result<(), QueryExecutionError> {
         let mut state = self.lock();
+        if let Some(error) = &state.supervision {
+            return Err(error.clone());
+        }
         let p = state
             .pending
             .get(&token)
@@ -898,17 +1065,26 @@ impl ConsumerExecutor {
         }
         let i = state
             .internal
-            .get(&key(cut.activation))
+            .get_mut(&key(cut.activation))
             .ok_or_else(|| protocol("Ready cut has no original source"))?;
         if i.seal.root != cut.root || i.decoded.map(|(_, e)| e) != Some(cut.end) {
             return Err(protocol("Ready cut differs from the original decoded End"));
         }
+        if let Some(error) = &i.failure_issued {
+            return Err(error.clone());
+        }
         let accepted = ComputationReadyToken::from_runtime_cut(cut);
-        i.ready.send_replace(Some(Ok(accepted)));
+        i.ready_issued = Some(accepted);
+        let ready = i.ready.clone();
         let p = state
             .pending
             .remove(&token)
             .expect("validated original Ready request");
+        drop(state);
+        // The same accepted token and original reply own this no-await tail.
+        // A reentrant failure notification observes that retained tail, while
+        // no callback can run under the consumer custody lock.
+        ready.send_replace(Some(Ok(accepted)));
         if let Reply::Ready(reply) = p.reply {
             let _ = reply.send(Ok(accepted));
         }
@@ -917,6 +1093,14 @@ impl ConsumerExecutor {
     pub fn execute(&self, effect: ConsumerEffect) -> LogicalFuture<'_, ConsumerFact> {
         Box::pin(async move {
             let result: Result<ConsumerFact, QueryExecutionError> = async {
+                if !matches!(
+                    effect,
+                    ConsumerEffect::PublishDiagnostics { .. }
+                        | ConsumerEffect::PublishConvergence { .. }
+                ) && let Some(error) = self.lock().supervision.clone()
+                {
+                    return Err(error);
+                }
                 match effect {
                     ConsumerEffect::WriteSchema { .. } => {
                         let receipt =
@@ -929,6 +1113,9 @@ impl ConsumerExecutor {
                     ConsumerEffect::ReserveEndSlot { activation } => {
                         let slot = self.transport(activation)?.reserve().await?;
                         let mut state = self.lock();
+                        if let Some(error) = &state.supervision {
+                            return Err(error.clone());
+                        }
                         if state.retired_end.contains(&key(activation)) {
                             return Err(protocol(
                                 "original End position was revoked before reservation completed",
@@ -943,16 +1130,38 @@ impl ConsumerExecutor {
                     ConsumerEffect::EnqueueEnd { activation } => {
                         let (transport, slot, end) = {
                             let mut state = self.lock();
+                            if let Some(error) = &state.supervision {
+                                return Err(error.clone());
+                            }
+                            if let Some(error) = &state.client_failure_issued {
+                                return Err(error.clone());
+                            }
+                            if state.client_end_publication != ClientEndPublication::Owed {
+                                return Err(protocol(
+                                    "original successful End handoff already started",
+                                ));
+                            }
+                            if !matches!(
+                                state.end_slots.get(&key(activation)),
+                                Some(ConsumerSlot::Client(_))
+                            ) {
+                                return Err(protocol(
+                                    "successful client EOF has no original client position",
+                                ));
+                            }
+                            let end = *state.end.get(&key(activation)).ok_or_else(|| {
+                                protocol("successful client EOF has no original End")
+                            })?;
+                            let transport = state.client.clone().ok_or_else(|| {
+                                protocol("successful client EOF has no original channel")
+                            })?;
+                            state.client_end_publication = ClientEndPublication::Publishing;
                             (
-                                state.client.clone().ok_or_else(|| {
-                                    protocol("successful client EOF has no original channel")
-                                })?,
+                                transport,
                                 state.end_slots.remove(&key(activation)).ok_or_else(|| {
                                     protocol("successful client EOF has no reserved position")
                                 })?,
-                                *state.end.get(&key(activation)).ok_or_else(|| {
-                                    protocol("successful client EOF has no original End")
-                                })?,
+                                end,
                             )
                         };
                         let (delivery, receipt) = EndDelivery::success_eof_with_root_rows(
@@ -963,6 +1172,8 @@ impl ConsumerExecutor {
                         match (transport, slot) {
                             (Transport::Client(t), ConsumerSlot::Client(s)) => {
                                 t.enqueue(s, ResultDelivery::End(delivery));
+                                self.lock().client_end_publication =
+                                    ClientEndPublication::HandedOff;
                             }
                             _ => {
                                 return Err(protocol(
@@ -975,6 +1186,9 @@ impl ConsumerExecutor {
                     }
                     ConsumerEffect::ExposeOutput { .. } => {
                         let mut state = self.lock();
+                        if let Some(error) = &state.supervision {
+                            return Err(error.clone());
+                        }
                         if state.exposed || state.output.is_none() {
                             return Err(protocol(
                                 "original output was already exposed or is absent",
@@ -985,13 +1199,16 @@ impl ConsumerExecutor {
                     }
                     ConsumerEffect::PublishCompletion => {
                         let mut state = self.lock();
+                        if let Some(error) = &state.supervision {
+                            return Err(error.clone());
+                        }
                         let original = state.completion.as_mut().ok_or_else(|| {
                             protocol("completion publication has no original completion reply")
                         })?;
                         if let Some(Err(error)) = &original.published {
                             return Err(error.clone());
                         }
-                        if original.published.is_none() {
+                        let publication = if original.published.is_none() {
                             let reply = original
                                 .reply
                                 .take()
@@ -1001,35 +1218,69 @@ impl ConsumerExecutor {
                                 original.requester.clone(),
                                 ExecutionOutput::Completion,
                             );
+                            Some((reply, output))
+                        } else {
+                            None
+                        };
+                        drop(state);
+                        if let Some((reply, output)) = publication {
                             let _ = reply.send(Ok(output));
                         }
                         Ok(ConsumerFact::Applied)
                     }
                     ConsumerEffect::PublishAttemptFailure { activation, error } => {
-                        let state = self.lock();
-                        let original = state.internal.get(&key(activation)).ok_or_else(|| {
-                            protocol("attempt failure has no original internal source")
-                        })?;
-                        original.failure.send_replace(Some(error.clone()));
-                        original.ready.send_replace(Some(Err(error)));
+                        let original = {
+                            let mut state = self.lock();
+                            if let Some(error) = &state.supervision {
+                                return Err(error.clone());
+                            }
+                            let original =
+                                state.internal.get_mut(&key(activation)).ok_or_else(|| {
+                                    protocol("attempt failure has no original internal source")
+                                })?;
+                            original
+                                .ready_issued
+                                .is_none()
+                                .then(|| InternalFailureNotice::reserve(original, error))
+                        };
+                        if let Some(original) = original {
+                            original.notify();
+                        }
                         Ok(ConsumerFact::Applied)
                     }
                     ConsumerEffect::PublishFailure(error) => {
-                        let mut state = self.lock();
-                        if let Some(original) = state.completion.as_mut()
-                            && original.published.is_none()
-                        {
-                            original.published = Some(Err(error.clone()));
-                            if let Some(reply) = original.reply.take() {
-                                let _ = reply.send(Err(error.clone()));
+                        let (completion, failure, internal) = {
+                            let mut state = self.lock();
+                            if let Some(error) = &state.supervision {
+                                return Err(error.clone());
                             }
+                            let completion = state.completion.as_mut().and_then(|original| {
+                                if original.published.is_none() {
+                                    original.published = Some(Err(error.clone()));
+                                    original.reply.take()
+                                } else {
+                                    None
+                                }
+                            });
+                            let failure = reserve_client_failure(&mut state, error.clone());
+                            let internal = state
+                                .internal
+                                .values_mut()
+                                .filter(|original| original.ready_issued.is_none())
+                                .map(|original| {
+                                    InternalFailureNotice::reserve(original, error.clone())
+                                })
+                                .collect::<Vec<_>>();
+                            (completion, failure, internal)
+                        };
+                        if let Some(reply) = completion {
+                            let _ = reply.send(Err(error));
                         }
-                        if let Some(failure) = &state.failure {
-                            failure.send_replace(Some(error.clone()));
+                        if let Some((failure, original)) = failure {
+                            notify_original_failure(&failure, original);
                         }
-                        for internal in state.internal.values() {
-                            internal.failure.send_replace(Some(error.clone()));
-                            internal.ready.send_replace(Some(Err(error.clone())));
+                        for original in internal {
+                            original.notify();
                         }
                         Ok(ConsumerFact::Applied)
                     }

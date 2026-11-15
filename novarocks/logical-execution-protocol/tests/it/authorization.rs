@@ -247,3 +247,9 @@ fn buffered_positive_closure_is_not_overwritten_by_end_of_tracking() {
         LogicalEffectBody::Governance(GovernanceEffect::EndRemoteTracking { .. })
     )));
 }
+
+#[path = "authorization/part3.rs"]
+mod part3;
+
+#[path = "authorization/part3_support.rs"]
+pub(crate) mod part3_support;

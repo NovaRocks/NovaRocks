@@ -16,10 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::{
-    input::{FailureReport, NativeFact},
-    replacement::ReplacementQualificationFailure,
-};
+use crate::input::{FailureReport, NativeFact};
 
 impl LogicalExecutionCore {
     pub(super) fn apply_native(
@@ -107,35 +104,26 @@ impl LogicalExecutionCore {
                     settlement,
                 },
             ) => {
-                if expected != identity {
-                    return Err(CoreFault::ForeignActivation);
-                }
                 let now = self.now;
                 let concluded = self.state.conclusion().is_some();
                 let r = self
                     .recovery
                     .as_mut()
-                    .filter(|r| r.identity == Some(identity))
+                    .filter(|r| r.identity == Some(expected))
                     .ok_or(CoreFault::UnexpectedInput)?;
                 let q = r.qualification.as_mut().ok_or(CoreFault::UnexpectedInput)?;
-                if operation_id != q.request().operation_id {
-                    return Err(CoreFault::UnexpectedInput);
-                }
                 if concluded {
-                    self.queue(LogicalEffectBody::Native(
-                        NativeEffect::AbandonReservation { identity },
-                    ));
+                    // The one original cleanup intent also owns a submitted
+                    // action's late grant. Native keeps its closed round slot;
+                    // a receipt cannot mint a second abandon or another owner.
                 } else {
                     let dispatched = dispatched_at
                         .map_or(Ok(()), |at| q.record_dispatched(identity, operation_id, at));
                     match dispatched {
-                        Err(ReplacementQualificationFailure::Expired) => {
-                            self.conclude_failure(ReplacementQualificationFailure::Expired.error())
-                        }
-                        Err(_) => return Err(CoreFault::UnexpectedInput),
+                        Err(error) => self.conclude_replacement_failure(error.error()),
                         Ok(()) => {
                             if let Err(error) = q.settle(identity, operation_id, settlement, now) {
-                                self.conclude_failure(error.error());
+                                self.conclude_replacement_failure(error.error());
                             }
                         }
                     }
@@ -148,14 +136,11 @@ impl LogicalExecutionCore {
                     operation_id,
                 },
             ) => {
-                if expected != identity {
-                    return Err(CoreFault::ForeignActivation);
-                }
                 let now = self.now;
                 let r = self
                     .recovery
                     .as_mut()
-                    .filter(|r| r.identity == Some(identity))
+                    .filter(|r| r.identity == Some(expected))
                     .ok_or(CoreFault::UnexpectedInput)?;
                 let result = r
                     .qualification
@@ -164,7 +149,7 @@ impl LogicalExecutionCore {
                     .activation_completed(identity, operation_id, now);
                 r.reservation_activated = true;
                 if let Err(error) = result {
-                    self.conclude_failure(error.error());
+                    self.conclude_replacement_failure(error.error());
                 }
             }
             (NativeAction::Dormant(expected), NativeFact::DormantConverged { execution }) => {
@@ -252,7 +237,7 @@ impl LogicalExecutionCore {
                     {
                         r.prepare_finished = true;
                     }
-                    self.conclude_failure(failure.error);
+                    self.conclude_replacement_failure(failure.error);
                 }
                 NativeAction::Activate(activation) => {
                     if activation.execution() != execution {
@@ -271,7 +256,7 @@ impl LogicalExecutionCore {
                     if self.state.conclusion().is_some() {
                         self.report_supervision_failure(failure.error);
                     } else {
-                        self.conclude_failure(failure.error);
+                        self.conclude_replacement_failure(failure.error);
                     }
                 }
             },

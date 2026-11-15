@@ -996,6 +996,85 @@ impl LogicalNativeSession {
             .is_some_and(|work| work.prepared.is_some())
     }
 
+    /// Read only the SAME validated successful pending output. None means no
+    /// ready output, never that preparation work or resources have exited.
+    pub(crate) fn pending_prepared_execution_for_cleanup(
+        &self,
+    ) -> Result<Option<QueryExecutionId>, NativeExecutionContractError> {
+        let Some(prepared) = self
+            .pending_work
+            .as_ref()
+            .and_then(|work| work.prepared.as_ref())
+        else {
+            return Ok(None);
+        };
+        if !Arc::ptr_eq(&self.ticket, &prepared.logical_ticket) {
+            return Err(NativeExecutionContractError::ForeignLogicalOpenTicket);
+        }
+        self.pending_acceptance
+            .as_ref()
+            .ok_or(NativeExecutionContractError::ForeignAttemptTicket)?
+            .validate(prepared)?;
+        Ok(Some(prepared.execution))
+    }
+    pub(crate) fn pending_execution_for_cleanup(
+        &self,
+    ) -> Result<Option<QueryExecutionId>, NativeExecutionContractError> {
+        if let Some(execution) = self.pending_prepared_execution_for_cleanup()? {
+            return Ok(Some(execution));
+        }
+        let Some(work) = self.pending_work.as_ref() else {
+            return if self.pending_acceptance.is_none() {
+                Ok(None)
+            } else {
+                Err(NativeExecutionContractError::ForeignAttemptTicket)
+            };
+        };
+        let request = work
+            .request
+            .as_ref()
+            .ok_or(NativeExecutionContractError::ForeignAttemptTicket)?;
+        let acceptance = self
+            .pending_acceptance
+            .as_ref()
+            .ok_or(NativeExecutionContractError::ForeignAttemptTicket)?;
+        if !Arc::ptr_eq(&request.logical_ticket, &self.ticket)
+            || !Arc::ptr_eq(&acceptance.logical_ticket, &request.logical_ticket)
+            || !Arc::ptr_eq(&acceptance.attempt_ticket, &request.attempt_ticket)
+            || acceptance.execution != request.execution
+        {
+            return Err(NativeExecutionContractError::ForeignAttemptTicket);
+        }
+        Ok(Some(request.execution))
+    }
+    pub(crate) fn preparation_retired_for_cleanup(&self) -> bool {
+        !self.retiring
+            && self.attempts.is_none()
+            && self.pending_work.is_none()
+            && self.pending_acceptance.is_none()
+    }
+    pub(crate) fn accept_pending_for_cleanup(
+        &mut self,
+        expected: QueryExecutionId,
+        dormant: &mut NativeDormantCustody,
+    ) -> Result<NativePreparedFacts, NativeExecutionContractError> {
+        if self.pending_prepared_execution_for_cleanup()? != Some(expected) {
+            return Err(NativeExecutionContractError::ForeignAttemptTicket);
+        }
+        self.accept_pending_in(dormant)
+    }
+    #[cfg(test)]
+    pub(crate) fn pending_prepared_owner_address_for_cleanup(&self) -> Option<usize> {
+        self.pending_work
+            .as_ref()?
+            .prepared
+            .as_ref()
+            .map(|prepared| {
+                prepared.owner.as_ref() as *const dyn DormantNativeAttemptOwner as *const ()
+                    as usize
+            })
+    }
+
     pub(crate) fn streamed_computation_cut_handle(
         &self,
     ) -> Option<crate::admitted_query_context::StreamedComputationCutHandle> {
@@ -1105,6 +1184,7 @@ impl LogicalNativeSession {
         } = prepared;
         dormant.owner = Some(owner);
         dormant.convergence_completed = false;
+        dormant.owner_retired = false;
         let facts = NativePreparedFacts {
             execution,
             eligible_backends,
@@ -1390,6 +1470,8 @@ pub(crate) struct NativeDormantCustody {
     activation_panic: Option<Box<dyn std::any::Any + Send>>,
     convergence_failure: Option<DormantConvergenceFailure>,
     convergence_completed: bool,
+    convergence_unproven: bool,
+    owner_retired: bool,
 }
 impl fmt::Debug for NativeDormantCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1430,7 +1512,11 @@ impl NativeDormantCustody {
         &mut (dyn DormantNativeAttemptOwner + 'static),
         &mut Option<DormantConvergenceFailure>,
     )> {
-        if self.retiring || self.convergence_failure.is_some() || self.convergence_completed {
+        if self.retiring
+            || self.convergence_failure.is_some()
+            || self.convergence_unproven
+            || self.convergence_completed
+        {
             return None;
         }
         Some((self.owner.as_mut()?.as_mut(), &mut self.convergence_failure))
@@ -1442,7 +1528,9 @@ impl NativeDormantCustody {
         self.convergence_completed = true;
     }
     pub(crate) fn has_failure(&self) -> bool {
-        self.activation_panic.is_some() || self.convergence_failure.is_some()
+        self.activation_panic.is_some()
+            || self.convergence_failure.is_some()
+            || self.convergence_unproven
     }
     pub(crate) fn activation_panic(&self) -> Option<&(dyn std::any::Any + Send)> {
         self.activation_panic.as_deref()
@@ -1461,16 +1549,56 @@ impl NativeDormantCustody {
     }
     #[must_use = "an unproven original dormant owner must remain in custody"]
     pub(crate) fn retire(&mut self) -> Result<(), ()> {
+        if self.owner_retired {
+            return Ok(());
+        }
         if self.drop_unproven() {
             return Err(());
         }
         self.retiring = true;
         drop(self.owner.take());
         self.retiring = false;
+        self.owner_retired = true;
         Ok(())
     }
+    /// Cleanup may physically converge/drop this original owner despite an
+    /// earlier activation/binding panic. That old raw cause remains untouched.
+    /// A current convergence/Drop uncertainty never authorizes a retry.
+    pub(crate) fn retire_after_convergence_for_cleanup(&mut self) -> Result<(), ()> {
+        if self.owner_retired {
+            return Ok(());
+        }
+        if self.retiring
+            || self.convergence_failure.is_some()
+            || self.convergence_unproven
+            || !self.convergence_completed
+            || self.owner.is_none()
+        {
+            return Err(());
+        }
+        self.retiring = true;
+        drop(self.owner.take());
+        self.retiring = false;
+        self.owner_retired = true;
+        Ok(())
+    }
+    pub(crate) fn record_convergence_unproven(&mut self) {
+        self.convergence_unproven = true;
+    }
+    pub(crate) fn has_owner_for_cleanup(&self) -> bool {
+        self.owner.is_some()
+    }
+    pub(crate) fn owner_retired_for_cleanup(&self) -> bool {
+        self.owner_retired
+    }
+    #[cfg(test)]
+    pub(crate) fn owner_address_for_cleanup(&self) -> Option<usize> {
+        self.owner.as_ref().map(|owner| {
+            owner.as_ref() as *const dyn DormantNativeAttemptOwner as *const () as usize
+        })
+    }
     pub(crate) fn drop_unproven(&self) -> bool {
-        self.retiring || self.has_failure()
+        self.retiring || !self.owner_retired && self.has_failure()
     }
     #[cfg(test)]
     pub(crate) fn test_owner(owner: impl DormantNativeAttemptOwner) -> Self {

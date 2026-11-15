@@ -106,7 +106,7 @@ impl<'a> LogicalFacts<'a> {
                 .attempt(attempt.activation.execution())
                 .and_then(|a| a.accepted_failure.as_ref()),
             native_run_failure: attempt.native_run_failure.as_ref(),
-            authority_open: core.state.conclusion().is_none() && attempt.establish.authority_open(),
+            authority_open: !core.business_closed() && attempt.establish.authority_open(),
             activated: attempt.activated,
             relay_started: attempt.relay_started,
             all_participations_closed: attempt.stand_down.residual_resource_settled(),

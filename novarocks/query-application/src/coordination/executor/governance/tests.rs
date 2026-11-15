@@ -114,6 +114,14 @@ fn both_original_obligation_kinds_have_distinct_lifetimes() {
     register(&executor, ObligationKind::RunningWork);
     register(&executor, ObligationKind::RetiredAttempt);
     assert_eq!(executor.lock().obligations.len(), 2);
+    assert_eq!(executor.owner_state(), GovernanceOwnerState::Held);
+    assert!(executor.stage_held());
+    for kind in [ObligationKind::RunningWork, ObligationKind::RetiredAttempt] {
+        assert_eq!(
+            executor.obligation_state(activation(), kind).unwrap(),
+            GovernanceObligationState::Held
+        );
+    }
     assert!(executor.apply(GovernanceEffect::CompleteWorkOwner).is_err());
     executor
         .apply(GovernanceEffect::ResolveObligation {
@@ -128,6 +136,18 @@ fn both_original_obligation_kinds_have_distinct_lifetimes() {
             kind: ObligationKind::RetiredAttempt,
         })
         .unwrap();
+    assert_eq!(
+        executor
+            .obligation_state(activation(), ObligationKind::RunningWork)
+            .unwrap(),
+        GovernanceObligationState::Resolved
+    );
+    assert_eq!(
+        executor
+            .obligation_state(activation(), ObligationKind::RetiredAttempt)
+            .unwrap(),
+        GovernanceObligationState::RemoteTrackingEnded
+    );
     // Matching replays are idempotent; contradictory endings cannot replace
     // the original positive fact versus the end-of-tracking decision.
     executor
@@ -147,6 +167,8 @@ fn both_original_obligation_kinds_have_distinct_lifetimes() {
     assert!(executor.lock().owner.is_some());
     finish(&executor);
     assert!(executor.lock().owner.is_none());
+    assert_eq!(executor.owner_state(), GovernanceOwnerState::Completed);
+    assert!(!executor.stage_held());
 }
 
 #[test]
@@ -281,4 +303,64 @@ fn successful_original_owner_completion_never_manufactures_cancellation() {
     finish(&executor);
     assert_eq!(cancellation.reason(), None);
     assert_eq!(control.snapshot().root_responsibilities, 0);
+}
+
+#[test]
+fn cleanup_inventory_keeps_original_full_activation_and_independent_settlement_kinds() {
+    let control = control();
+    let executor = executor(&control);
+    let first = activation();
+    let replacement = AttemptActivationIdentity::from_parts(
+        first.actor().get(),
+        QueryExecutionId::new(first.execution().query_id(), AttemptId::new(2).unwrap()).unwrap(),
+        17,
+    );
+    for (activation, kind) in [
+        (first, ObligationKind::RetiredAttempt),
+        (replacement, ObligationKind::RunningWork),
+    ] {
+        executor
+            .apply(GovernanceEffect::RegisterObligation { activation, kind })
+            .unwrap();
+    }
+    let original = executor.cleanup_inventory();
+    assert_eq!(original.len(), 2);
+    assert!(
+        original
+            .iter()
+            .all(|row| row.state == GovernanceObligationState::Held)
+    );
+    assert!(
+        original
+            .iter()
+            .any(|row| row.activation == replacement && row.activation.generation() == 17)
+    );
+    executor
+        .apply(GovernanceEffect::ResolveObligation {
+            activation: first,
+            kind: ObligationKind::RetiredAttempt,
+        })
+        .unwrap();
+    executor
+        .apply(GovernanceEffect::EndRemoteTracking {
+            activation: replacement,
+            kind: ObligationKind::RunningWork,
+        })
+        .unwrap();
+    let settled = executor.cleanup_inventory();
+    assert!(
+        settled
+            .iter()
+            .any(|row| row.activation == first && row.state == GovernanceObligationState::Resolved)
+    );
+    assert!(settled.iter().any(|row| row.activation == replacement
+        && row.state == GovernanceObligationState::RemoteTrackingEnded));
+    assert!(
+        original
+            .iter()
+            .all(|row| row.state == GovernanceObligationState::Held),
+        "a snapshot is no settlement author"
+    );
+    finish(&executor);
+    assert_eq!(executor.owner_state(), GovernanceOwnerState::Completed);
 }

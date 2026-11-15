@@ -38,8 +38,13 @@ pub(crate) mod native;
 
 pub use cancel::CancelObserver;
 pub use consumer::{ConsumerExecutor, ConsumerObservationPort};
-pub use governance::{GovernanceExecutor, GovernanceInstallRefusal};
+pub use governance::{
+    GovernanceExecutor, GovernanceInstallRefusal, GovernanceObligationSnapshot,
+    GovernanceObligationState, GovernanceOwnerState,
+};
 pub use native::{
+    LogicalOwnerFailureObserver, NativeCleanupActive, NativeCleanupInventory,
+    NativeCleanupPreparation, NativeCleanupPreparationPhase, NativeCleanupQualification,
     NativeExecutor, OriginalTailJoinObligation, OriginalTailKind, OriginalTailWorkObligation,
 };
 

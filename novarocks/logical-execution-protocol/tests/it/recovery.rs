@@ -380,3 +380,8 @@ fn cancellation_discards_unissued_qualification_but_converges_the_real_prepared_
     )));
     assert!(f.effects.iter().any(|e|matches!(e.body,LogicalEffectBody::Native(NativeEffect::ConvergeDormant{execution,..})if execution==activation(2).execution())));
 }
+
+#[path = "recovery/contract.rs"]
+pub(crate) mod contract;
+#[path = "recovery/scenarios.rs"]
+mod scenarios;

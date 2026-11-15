@@ -133,12 +133,12 @@ struct Fixture {
     initial: Option<EffectTicket<u64>>,
 }
 fn fixture(start_cleanup: bool) -> Fixture {
-    fixture_with_before_failure(start_cleanup, |_, _| ()).0
+    fixture_with_before_failure(start_cleanup, |_, _, _| ()).0
 }
 
 fn fixture_with_before_failure<T>(
     start_cleanup: bool,
-    before_failure: impl FnOnce(&ActorRuntime<FailingActor>, &WorkObligation) -> T,
+    before_failure: impl FnOnce(&ActorRuntime<FailingActor>, &WorkObligation, &RuntimeLedger) -> T,
 ) -> (Fixture, T) {
     let history = HistoryCapture::new(256);
     let ledger = RuntimeLedger::with_history(vector(2), history.clone());
@@ -213,7 +213,7 @@ fn fixture_with_before_failure<T>(
         .unwrap()
         .fill(77)
         .unwrap();
-    let original = before_failure(&runtime, &business);
+    let original = before_failure(&runtime, &business, &ledger);
     runtime.poll_one(Tick(2)).unwrap();
     let initial = runtime
         .take_effect(aid(), supervisor_input(&runtime), action(17))
@@ -744,7 +744,7 @@ fn failed_input_is_abandoned_once_and_waits_for_its_failure_batch_to_retire() {
 #[test]
 fn failed_source_moves_only_its_exact_fifo_head_and_pins_it_through_disposal() {
     let (fixture, (mut first, first_id, mut second, second_id)) =
-        fixture_with_before_failure(true, |runtime, work| {
+        fixture_with_before_failure(true, |runtime, work, _| {
             let source = ActorId::new(2).unwrap();
             let standing = || {
                 runtime
@@ -807,4 +807,560 @@ fn failed_source_moves_only_its_exact_fifo_head_and_pins_it_through_disposal() {
     first.close_after_exit().unwrap();
     second.close_after_exit().unwrap();
     drain(fixture);
+}
+
+#[test]
+fn failure_session_fills_only_original_negative_roles_and_preserves_the_reply_author() {
+    let target_id = ActorId::new(2).unwrap();
+    let (f, (scope, mut work, mut capacity, mut roles)) =
+        fixture_with_before_failure(true, |runtime, _, ledger| {
+            let scope = ledger.open_scope_next(None, generation()).unwrap();
+            let (mut work, capacity) = scope
+                .reserve_next(
+                    generation(),
+                    ReservationResources::new(
+                        ResourceVector::default(),
+                        OwnedSlotNeed {
+                            inputs: 4,
+                            work_headers: 1,
+                            ..Default::default()
+                        },
+                    ),
+                    WorkKind::Settlement,
+                    WorkAdmission::External,
+                )
+                .unwrap()
+                .bind(WorkKind::Settlement)
+                .unwrap();
+            work.start().unwrap();
+            let registration = runtime
+                .register_bound(
+                    target_id,
+                    scope.clone(),
+                    FailingActor(work.reference()),
+                    ActorConfig {
+                        mailbox: [4; 4],
+                        max_batches: 4,
+                        max_effects_per_step: 1,
+                        max_dependencies_per_effect: 0,
+                        turn_budget: 8,
+                        max_step_work: 1,
+                    },
+                )
+                .unwrap();
+            let roles = [
+                (aid(), InputClass::Control),
+                (aid(), InputClass::Lifecycle),
+                (aid(), InputClass::Ordinary),
+                (target_id, InputClass::Control),
+            ]
+            .map(|(source, class)| {
+                runtime
+                    .reserve_admitted_input_for(&registration, source, class, &work)
+                    .unwrap()
+                    .into_standing_input()
+                    .unwrap()
+            });
+            (scope, work, capacity, roles)
+        });
+    let mut session = f
+        .runtime
+        .claim_failure_publication(f.initial.as_ref().unwrap())
+        .unwrap();
+    assert!(
+        f.runtime
+            .fill_from_effect(f.old.as_ref().unwrap(), &roles[0], 14)
+            .is_err(),
+        "a failed source cannot publish with its former ordinary ticket"
+    );
+    assert_eq!(
+        session.fill_standing(&roles[2], None, 15),
+        Err((ActorTurnError::PublicationTargetMismatch, 15))
+    );
+    assert_eq!(
+        session.fill_standing(&roles[3], None, 16),
+        Err((ActorTurnError::InputAuthorMismatch, 16))
+    );
+    let original_author = roles[0].author().unwrap();
+    let first = session
+        .fill_standing(&roles[0], Some(&original_author), 14)
+        .unwrap();
+    assert_eq!(
+        roles[0].input_author(first).unwrap().work(),
+        original_author.work()
+    );
+    assert_eq!(
+        session.fill_standing(&roles[0], None, 17),
+        Err((ActorTurnError::StandingInputBusy, 17))
+    );
+    let second = session.fill_standing(&roles[1], None, 18).unwrap();
+    assert!(f.runtime.poll_one(Tick(3)).unwrap());
+    for input in [first, second] {
+        assert_eq!(
+            f.runtime
+                .input_custody(target_id, input)
+                .unwrap()
+                .unwrap()
+                .phase,
+            InputPhase::Committed
+        );
+        let ticket = f.runtime.take_effect(target_id, input, action(1)).unwrap();
+        f.runtime.effect_completed(ticket).unwrap();
+    }
+    for role in &mut roles {
+        assert!(role.retire_ready_after_exit().unwrap());
+        role.close_after_exit().unwrap();
+    }
+    work.body_exited().unwrap();
+    work.captures_exited().unwrap();
+    capacity.finish().unwrap();
+    scope.close_external().unwrap();
+    f.ledger.reap_scope_ready(scope.id(), 1).unwrap();
+    while let Some(turn) = f.runtime.claim_host_actor() {
+        turn.release(false).unwrap();
+    }
+    f.runtime.remove_actor(target_id).unwrap();
+    f.ledger.remove_scope(scope.id()).unwrap();
+    drop(session);
+    drain(f);
+}
+
+#[test]
+fn original_failure_proof_time_does_not_follow_later_observation_turns() {
+    let f = std::mem::ManuallyDrop::new(fixture(true));
+    let session = f
+        .runtime
+        .claim_failure_publication(f.initial.as_ref().unwrap())
+        .unwrap();
+    let registration = session.registration().clone();
+    let proof = f.runtime.failure_proof_for(&registration).unwrap();
+    assert_eq!(proof.failed_at(), Tick(2));
+    f.runtime.advance_time(Tick(1000), 8).unwrap();
+    let observed = f.runtime.failure_proof_for(&registration).unwrap();
+    assert_eq!(observed.failed_at(), proof.failed_at());
+    assert_eq!(observed.failed_epoch(), proof.failed_epoch());
+    session.finish().unwrap();
+    drain(std::mem::ManuallyDrop::into_inner(f));
+}
+
+#[test]
+fn failure_time_is_fenced_before_the_original_supervisor_hook_finishes() {
+    struct Hook {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    static HOOK: std::sync::OnceLock<Hook> = std::sync::OnceLock::new();
+    #[derive(Debug)]
+    struct BlockingFailure;
+    impl Actor for BlockingFailure {
+        type Input = ();
+        type Effect = ();
+        fn timer_input(_: Tick) {}
+        fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut ActorStep<'_, ()>) {
+            panic!("controlled original failure before supervisor publication");
+        }
+        fn next_deadline(&self) -> Option<Tick> {
+            None
+        }
+        fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {
+            let hook = HOOK.get().unwrap();
+            hook.entered.send(()).unwrap();
+            hook.release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+    let (entered, observed) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    assert!(
+        HOOK.set(Hook {
+            entered,
+            release: std::sync::Mutex::new(released)
+        })
+        .is_ok()
+    );
+    let ledger = std::mem::ManuallyDrop::new(RuntimeLedger::new(ResourceVector::default()));
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let runtime = std::mem::ManuallyDrop::new(ActorRuntime::new());
+    let registration = runtime
+        .register_bound(
+            aid(),
+            scope.clone(),
+            BlockingFailure,
+            ActorConfig {
+                mailbox: [1; 4],
+                max_batches: 1,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 8,
+                max_step_work: 1,
+            },
+        )
+        .unwrap();
+    let input = runtime
+        .reserve_input(aid(), aid(), InputClass::Ordinary)
+        .unwrap()
+        .fill(())
+        .unwrap();
+    std::thread::scope(|threads| {
+        let worker = threads.spawn(|| runtime.poll_one(Tick(43)).unwrap());
+        observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let proof = runtime.failure_proof_for(&registration).unwrap();
+        assert_eq!(proof.failed_at(), Tick(43));
+        assert_eq!(
+            runtime.snapshot(aid()).unwrap().last_progress,
+            Tick(0),
+            "supervisor publication has not updated the ordinary progress diagnostic"
+        );
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap());
+    });
+    let FailureSourceState::ClosedPending(supervisor) =
+        runtime.failure_source_state(aid()).unwrap()
+    else {
+        panic!("same empty supervisor batch");
+    };
+    runtime.retire_input(aid(), supervisor).unwrap();
+    runtime.retire_input(aid(), input).unwrap();
+    drop(runtime.take_failure_payload(aid()).unwrap());
+    while let Some(turn) = runtime.claim_host_actor() {
+        turn.release(false).unwrap();
+    }
+    runtime.remove_actor(aid()).unwrap();
+    ledger.remove_scope(scope.id()).unwrap();
+    assert!(runtime.is_empty() && ledger.is_empty());
+    drop(std::mem::ManuallyDrop::into_inner(runtime));
+    drop(std::mem::ManuallyDrop::into_inner(ledger));
+}
+
+#[test]
+fn original_publisher_hands_off_custody_only_to_its_exact_failed_receiver() {
+    for use_admitted_work in [false, true] {
+        let sender_id = ActorId::new(2).unwrap();
+        let (
+            f,
+            (
+                scope,
+                mut work,
+                mut capacity,
+                mut role,
+                registration,
+                input,
+                original_snapshot,
+                mut receiver_work,
+                mut receiver_capacity,
+            ),
+        ) = fixture_with_before_failure(true, |runtime, original_work, ledger| {
+            let (mut receiver_work, receiver_capacity) = original_work
+                .scope()
+                .reserve_next(
+                    generation(),
+                    ReservationResources::new(
+                        ResourceVector::default(),
+                        OwnedSlotNeed {
+                            inputs: 3,
+                            work_headers: 1,
+                            ..Default::default()
+                        },
+                    ),
+                    WorkKind::Settlement,
+                    WorkAdmission::External,
+                )
+                .unwrap()
+                .bind(WorkKind::Settlement)
+                .unwrap();
+            receiver_work.start().unwrap();
+            let scope = ledger.open_scope_next(None, generation()).unwrap();
+            let (mut work, capacity) = scope
+                .reserve_next(
+                    generation(),
+                    ReservationResources::new(
+                        ResourceVector::default(),
+                        OwnedSlotNeed {
+                            inputs: 1,
+                            work_headers: 1,
+                            ..Default::default()
+                        },
+                    ),
+                    WorkKind::Settlement,
+                    WorkAdmission::External,
+                )
+                .unwrap()
+                .bind(WorkKind::Settlement)
+                .unwrap();
+            work.start().unwrap();
+            let registration = runtime
+                .register_bound(
+                    sender_id,
+                    scope.clone(),
+                    FailingActor(work.reference()),
+                    ActorConfig {
+                        mailbox: [4; 4],
+                        max_batches: 4,
+                        max_effects_per_step: 1,
+                        max_dependencies_per_effect: 0,
+                        turn_budget: 8,
+                        max_step_work: 1,
+                    },
+                )
+                .unwrap();
+            let turn = runtime.claim_host_actor().unwrap();
+            assert_eq!(turn.actor(), aid());
+            let receiver = turn.registration();
+            turn.release(false).unwrap();
+            let role = runtime
+                .reserve_admitted_input_for(&receiver, sender_id, InputClass::Lifecycle, &work)
+                .unwrap()
+                .into_standing_input()
+                .unwrap();
+            let snapshot = runtime
+                .receiver_failed_snapshot_for(&role, &registration, Arc::new(0_u64))
+                .unwrap();
+            let input = runtime
+                .reserve_input(sender_id, sender_id, InputClass::Ordinary)
+                .unwrap()
+                .fill(42)
+                .unwrap();
+            (
+                scope,
+                work,
+                capacity,
+                role,
+                registration,
+                input,
+                snapshot,
+                receiver_work,
+                receiver_capacity,
+            )
+        });
+        let f = std::mem::ManuallyDrop::new(f);
+        let session = f
+            .runtime
+            .claim_failure_publication(f.initial.as_ref().unwrap())
+            .unwrap();
+        let proof = f.runtime.failure_proof_for(session.registration()).unwrap();
+        let snapshot = if use_admitted_work {
+            original_snapshot.retire();
+            f.runtime
+                .receiver_failed_snapshot_for_admitted_work(
+                    &proof,
+                    &registration,
+                    &receiver_work,
+                    Arc::new(0_u64),
+                )
+                .unwrap()
+        } else {
+            original_snapshot
+        };
+        let reader = snapshot.reader();
+        f.runtime.poll_one(Tick(3)).unwrap();
+        let ticket = f.runtime.take_effect(sender_id, input, action(1)).unwrap();
+        assert!(f.runtime.fill_from_effect(&ticket, &role, 42).is_err());
+        let wrong = std::mem::ManuallyDrop::new(fixture(true));
+        let wrong_session = wrong
+            .runtime
+            .claim_failure_publication(wrong.initial.as_ref().unwrap())
+            .unwrap();
+        let wrong_proof = wrong
+            .runtime
+            .failure_proof_for(wrong_session.registration())
+            .unwrap();
+        assert_eq!(
+            f.runtime
+                .commit_receiver_failed_snapshot(&ticket, &wrong_proof, &snapshot, Arc::new(41),)
+                .unwrap_err()
+                .0,
+            ActorTurnError::PublicationTargetMismatch
+        );
+        assert_eq!(*snapshot.read(), 0);
+        assert_eq!(role.in_flight().unwrap(), None);
+        assert_eq!(
+            *f.runtime
+                .commit_receiver_failed_snapshot(&ticket, &proof, &snapshot, Arc::new(42),)
+                .unwrap(),
+            0
+        );
+        assert_eq!(*snapshot.read(), 42);
+        assert_eq!(
+            role.in_flight().unwrap(),
+            None,
+            "custody is not an input fill"
+        );
+        assert!(
+            f.runtime
+                .commit_receiver_failed_snapshot(&ticket, &proof, &snapshot, Arc::new(43),)
+                .is_err(),
+            "one original current ticket publishes once"
+        );
+        assert!(f.runtime.validate_registration(&registration).is_ok());
+        f.runtime.effect_completed(ticket).unwrap();
+        f.runtime.retire_input(sender_id, input).unwrap();
+        role.close_after_exit().unwrap();
+        snapshot.retire();
+        assert_eq!(
+            *reader.read(),
+            42,
+            "read-only observation grants no header custody"
+        );
+        receiver_work.body_exited().unwrap();
+        receiver_work.captures_exited().unwrap();
+        receiver_capacity.finish().unwrap();
+        assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        capacity.finish().unwrap();
+        scope.close_external().unwrap();
+        f.ledger.reap_scope_ready(scope.id(), 1).unwrap();
+        while let Some(turn) = f.runtime.claim_host_actor() {
+            turn.release(false).unwrap();
+        }
+        f.runtime.remove_actor(sender_id).unwrap();
+        f.ledger.remove_scope(scope.id()).unwrap();
+        session.finish().unwrap();
+        wrong_session.finish().unwrap();
+        drain(std::mem::ManuallyDrop::into_inner(wrong));
+        drain(std::mem::ManuallyDrop::into_inner(f));
+    }
+}
+
+#[test]
+fn failed_publisher_uses_its_original_failure_session_for_failed_receiver_custody() {
+    let sender = ActorId::new(2).unwrap();
+    let (
+        f,
+        (
+            scope,
+            mut work,
+            mut work_capacity,
+            mut cleanup,
+            mut cleanup_capacity,
+            mut role,
+            registration,
+            input,
+            snapshot,
+        ),
+    ) = fixture_with_before_failure(true, |runtime, _, ledger| {
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let admit = |kind, inputs| {
+            let (mut work, capacity) = scope
+                .reserve_next(
+                    generation(),
+                    ReservationResources::new(
+                        ResourceVector::default(),
+                        OwnedSlotNeed {
+                            inputs,
+                            work_headers: 1,
+                            ..Default::default()
+                        },
+                    ),
+                    kind,
+                    WorkAdmission::External,
+                )
+                .unwrap()
+                .bind(kind)
+                .unwrap();
+            work.start().unwrap();
+            (work, capacity)
+        };
+        let (work, work_capacity) = admit(WorkKind::Settlement, 1);
+        let (cleanup, cleanup_capacity) = admit(WorkKind::Cleanup, 0);
+        let registration = runtime
+            .register_supervised_bound(
+                sender,
+                scope.clone(),
+                FailingActor(work.reference()),
+                ActorConfig {
+                    mailbox: [4; 4],
+                    max_batches: 4,
+                    max_effects_per_step: 1,
+                    max_dependencies_per_effect: 0,
+                    turn_budget: 8,
+                    max_step_work: 1,
+                },
+                &cleanup,
+            )
+            .unwrap();
+        let turn = runtime.claim_host_actor().unwrap();
+        assert_eq!(turn.actor(), aid());
+        let receiver = turn.registration();
+        turn.release(false).unwrap();
+        let role = runtime
+            .reserve_admitted_input_for(&receiver, sender, InputClass::Lifecycle, &work)
+            .unwrap()
+            .into_standing_input()
+            .unwrap();
+        let snapshot = runtime
+            .receiver_failed_snapshot_for(&role, &registration, Arc::new(0_u64))
+            .unwrap();
+        let input = runtime
+            .reserve_input(sender, sender, InputClass::Ordinary)
+            .unwrap()
+            .fill(99)
+            .unwrap();
+        (
+            scope,
+            work,
+            work_capacity,
+            cleanup,
+            cleanup_capacity,
+            role,
+            registration,
+            input,
+            snapshot,
+        )
+    });
+    let f = std::mem::ManuallyDrop::new(f);
+    let receiver_session = f
+        .runtime
+        .claim_failure_publication(f.initial.as_ref().unwrap())
+        .unwrap();
+    let failure = f
+        .runtime
+        .failure_proof_for(receiver_session.registration())
+        .unwrap();
+    f.runtime.poll_one(Tick(3)).unwrap();
+    let FailureSourceState::ClosedPending(supervisor) =
+        f.runtime.failure_source_state(sender).unwrap()
+    else {
+        panic!("original publisher failure supervisor");
+    };
+    let ticket = f
+        .runtime
+        .take_effect(sender, supervisor, action(17))
+        .unwrap();
+    let mut session = f.runtime.claim_failure_publication(&ticket).unwrap();
+    assert!(session.registration().same_registration(&registration));
+    assert_eq!(
+        *session
+            .commit_receiver_failed_snapshot(&failure, &snapshot, Arc::new(42))
+            .unwrap(),
+        0
+    );
+    assert_eq!(*snapshot.read(), 42);
+    assert_eq!(role.in_flight().unwrap(), None);
+    session.finish().unwrap();
+    snapshot.retire();
+    role.close_after_exit().unwrap();
+    work.body_exited().unwrap();
+    work.captures_exited().unwrap();
+    work_capacity.finish().unwrap();
+    cleanup.body_exited().unwrap();
+    cleanup.captures_exited().unwrap();
+    cleanup_capacity.finish().unwrap();
+    f.runtime.effect_completed(ticket).unwrap();
+    f.runtime.retire_input(sender, supervisor).unwrap();
+    f.runtime.retire_input(sender, input).unwrap();
+    f.ledger.reap_scope_ready(scope.id(), 2).unwrap();
+    drop(f.runtime.take_failure_payload(sender).unwrap());
+    while let Some(turn) = f.runtime.claim_host_actor() {
+        turn.release(false).unwrap();
+    }
+    f.runtime.remove_actor(sender).unwrap();
+    f.ledger.remove_scope(scope.id()).unwrap();
+    receiver_session.finish().unwrap();
+    drain(std::mem::ManuallyDrop::into_inner(f));
 }

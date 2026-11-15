@@ -103,6 +103,7 @@ pub(super) const OUTPUT_UNITS: usize = 3;
 
 pub(crate) struct AttemptActor {
     actor: ActorId,
+    owner: ActorId,
     core: Core,
     scope: ScopeHandle,
     capacity: NativeTransportCapacity,
@@ -1490,6 +1491,7 @@ impl AttemptActor {
             ));
         }
         let actor = runtime_source(start.sources.actor);
+        let owner = runtime_source(start.sources.owner);
         let native = runtime_source(start.sources.native);
         let transport_source = runtime_source(start.sources.transport);
         let subscription_source = runtime_source(start.sources.subscription);
@@ -1531,6 +1533,7 @@ impl AttemptActor {
         let core = Core::new(start).map_err(AttemptRegistrationError::Core)?;
         let adapter = Self {
             actor,
+            owner,
             core,
             scope: scope.clone(),
             capacity: capacity.clone(),
@@ -1617,6 +1620,11 @@ impl AttemptActor {
             FrontendInput::CapacityReleased => AttemptInput::CapacityReleased,
             FrontendInput::Membership(view) => AttemptInput::Membership(view.0),
             FrontendInput::Attempt(input) => *input,
+            FrontendInput::Logical(_)
+            | FrontendInput::LogicalInfrastructureFailed
+            | FrontendInput::LogicalHostSettled => {
+                panic!("logical input entered the production attempt actor")
+            }
             #[cfg(test)]
             FrontendInput::Test(_) => panic!("test input entered the production attempt actor"),
         };
@@ -1653,10 +1661,10 @@ impl AttemptActor {
         match result.selection {
             InputSelection::Only(source) => context
                 .step
-                .select_input_source(Some(runtime_source(source))),
-            InputSelection::Prefer(source) => {
-                context.step.prefer_input_source(runtime_source(source))
-            }
+                .select_input_source_with_owner(runtime_source(source), self.owner),
+            InputSelection::Prefer(source) => context
+                .step
+                .prefer_input_source_with_owner(runtime_source(source), self.owner),
         }
 
         // A late receipt can produce both a settlement and a cleanup. Commit

@@ -44,9 +44,43 @@ pub(crate) trait ObservationMetadataAuthor: Send + Sync + 'static {
     ) -> Result<Box<dyn ObservationMetadataObligation>, ObservationError>;
 }
 
+/// The original ordered writer consumes passive root references. Canonical
+/// request ownership stays with its endpoint; this projection grants neither
+/// a new request nor a second observation Source.
+pub(crate) trait RootControlProjection: Send + Sync + 'static {
+    fn matches(&self, binding: &RootControlBinding) -> bool;
+    fn close_after_exit(&self) -> Result<(), ObservationError>;
+    fn fence_for_close(&self) -> bool;
+    fn project(
+        &self,
+        reference: &RootControlRef,
+    ) -> Result<LogicalToAttempt<AttemptFailure>, ObservationError>;
+    fn validate_reference(&self, reference: &RootControlRef) -> Result<(), ObservationError>;
+}
+impl RootControlProjection for RootControlRequests {
+    fn matches(&self, binding: &RootControlBinding) -> bool {
+        self.matches(binding)
+    }
+    fn close_after_exit(&self) -> Result<(), ObservationError> {
+        self.close_after_exit()
+    }
+    fn fence_for_close(&self) -> bool {
+        self.fence_for_close()
+    }
+    fn project(
+        &self,
+        reference: &RootControlRef,
+    ) -> Result<LogicalToAttempt<AttemptFailure>, ObservationError> {
+        self.project(reference)
+    }
+    fn validate_reference(&self, reference: &RootControlRef) -> Result<(), ObservationError> {
+        self.validate_reference(reference)
+    }
+}
+
 pub(crate) struct BoundObservationSource {
     binding: RootControlBinding,
-    requests: Arc<RootControlRequests>,
+    requests: Arc<dyn RootControlProjection>,
     original: Arc<SourcePositions>,
     metadata: Arc<dyn ObservationMetadataAuthor>,
 }
@@ -93,9 +127,9 @@ impl BoundObservationSource {
         ])
     }
 
-    pub(crate) fn new(
+    pub(crate) fn new<T: RootControlProjection>(
         binding: RootControlBinding,
-        requests: Arc<RootControlRequests>,
+        requests: Arc<T>,
         credits: Arc<ObservationCredits>,
         progress: BTreeMap<ParticipationRef, ReadProgressInput>,
         metadata: Arc<dyn ObservationMetadataAuthor>,

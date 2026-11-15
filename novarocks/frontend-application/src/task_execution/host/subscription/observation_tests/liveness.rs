@@ -84,6 +84,7 @@ impl Driver {
         let source = |n| AttemptSourceId(positive(n));
         start.sources = AttemptSources {
             actor: source(1),
+            owner: source(1),
             observation: source(2),
             subscription: source(3),
             publication: source(6),

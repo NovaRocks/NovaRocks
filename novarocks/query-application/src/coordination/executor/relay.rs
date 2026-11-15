@@ -71,6 +71,7 @@ struct State {
     attempts: BTreeMap<Key, Attempt>,
     pending: BTreeMap<LogicalRequestToken, Pending>,
     stopped: BTreeSet<Key>,
+    supervision: Option<QueryExecutionError>,
 }
 pub struct RelayExecutor {
     scope: WorkScope,
@@ -93,11 +94,21 @@ impl RelayExecutor {
                 attempts: BTreeMap::new(),
                 pending: BTreeMap::new(),
                 stopped: BTreeSet::new(),
+                supervision: None,
             }),
         }
     }
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Close request admission and stop the same original pump levels. This
+    /// neither drains delivery custody nor supplies the original Start Join.
+    pub fn begin_supervised_failure(&self, error: QueryExecutionError) {
+        begin_supervised_failure(&self.state, error);
+    }
+    /// One original pending reply per continuation step, outside its mutex.
+    pub fn fail_one_supervised_request(&self) -> bool {
+        fail_one_supervised_request(&self.state)
     }
     /// Attaches the one original attempt data position, never an Installed Arc.
     pub fn attach_source(
@@ -109,7 +120,8 @@ impl RelayExecutor {
         if state.attempts.contains_key(&key(activation)) {
             return Err(protocol("original relay source was already attached"));
         }
-        let (stop, _) = watch::channel(state.stopped.contains(&key(activation)));
+        let (stop, _) =
+            watch::channel(state.supervision.is_some() || state.stopped.contains(&key(activation)));
         state.attempts.insert(
             key(activation),
             Attempt {
@@ -589,6 +601,38 @@ fn validate_binding(
 fn lock_state(state: &Mutex<State>) -> MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|e| e.into_inner())
 }
+fn begin_supervised_failure(state: &Mutex<State>, error: QueryExecutionError) {
+    let stops = {
+        let mut state = lock_state(state);
+        state.supervision.get_or_insert(error);
+        state
+            .attempts
+            .values()
+            .map(|original| original.stop.clone())
+            .collect::<Vec<_>>()
+    };
+    for stop in stops {
+        stop.send_replace(true);
+    }
+}
+fn fail_one_supervised_request(state: &Mutex<State>) -> bool {
+    let original = {
+        let mut state = lock_state(state);
+        let Some(error) = state.supervision.clone() else {
+            return false;
+        };
+        state
+            .pending
+            .pop_first()
+            .map(|(_, original)| (original.reply, error))
+    };
+    let Some((reply, error)) = original else {
+        return false;
+    };
+    let _ = reply.send(RelayResponse::Rejected(error));
+    true
+}
+
 async fn relay_request(
     state: &Mutex<State>,
     source: &mut dyn LogicalFactSource,
@@ -598,6 +642,9 @@ async fn relay_request(
     let (reply, receiver) = oneshot::channel();
     let token = {
         let mut state = lock_state(state);
+        if let Some(error) = &state.supervision {
+            return Err(error.clone());
+        }
         let value = NonZeroU64::new(state.next)
             .ok_or_else(|| protocol("relay request identity exhausted"))?;
         state.next = state
@@ -624,13 +671,19 @@ async fn relay_request(
         .await
         .is_err()
     {
-        lock_state(state).pending.remove(&token);
-        return Err(protocol("original relay standing position closed"));
+        let (original, error) = {
+            let mut state = lock_state(state);
+            (state.pending.remove(&token), state.supervision.clone())
+        };
+        drop(original);
+        return Err(error.unwrap_or_else(|| protocol("original relay standing position closed")));
     }
-    match receiver
-        .await
-        .map_err(|_| protocol("original relay reply closed"))?
-    {
+    match receiver.await.map_err(|_| {
+        lock_state(state)
+            .supervision
+            .clone()
+            .unwrap_or_else(|| protocol("original relay reply closed"))
+    })? {
         RelayResponse::Rejected(e) => Err(e),
         other => Ok(other),
     }
@@ -655,6 +708,9 @@ fn consume_reply(
     activation: AttemptActivationIdentity,
     response: RelayResponse,
 ) -> Result<(), QueryExecutionError> {
+    if let Some(error) = &state.supervision {
+        return Err(error.clone());
+    }
     let p = state
         .pending
         .get(&token)

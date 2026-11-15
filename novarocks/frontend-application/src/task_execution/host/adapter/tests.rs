@@ -137,6 +137,7 @@ pub(crate) fn start() -> AttemptStart {
         initial_now: MonotonicInstant::from_origin(Duration::ZERO),
         sources: AttemptSources {
             actor: source(1),
+            owner: source(1),
             publication: source(2),
             qa: source(3),
             process: source(4),
@@ -1085,11 +1086,9 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     let cleanup = runtime.take_effect(actor, *input, descriptor.id).unwrap();
     runtime.validate_failure_effect_ticket(&cleanup).unwrap();
     assert_eq!(cleanup.descriptor.work, failure_work.reference());
-    assert!(
-        matches!(&cleanup.effect, FrontendEffect::AttemptOwnerFailed {
+    assert!(matches!(&cleanup.effect, FrontendEffect::OwnerFailed {
         scope: original_scope, generation: failed, failed_input,
-    } if *original_scope == scope.id() && *failed != generation && failed_input.input == wrong)
-    );
+    } if *original_scope == scope.id() && *failed != generation && failed_input.input == wrong));
     failure_work
         .start_in_generation(cleanup.generation)
         .unwrap();
@@ -1287,3 +1286,5 @@ fn bound_observation_backing_waits_for_actual_strong_weak_and_progress_aliases()
     ledger.remove_scope(control_scope.id()).unwrap();
     assert!(runtime.is_empty() && ledger.is_empty());
 }
+
+mod owner_control;

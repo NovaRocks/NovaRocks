@@ -65,6 +65,12 @@ use std::{
 };
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
+mod cleanup;
+pub use cleanup::{
+    LogicalOwnerFailureObserver, NativeCleanupActive, NativeCleanupInventory,
+    NativeCleanupPreparation, NativeCleanupPreparationPhase, NativeCleanupQualification,
+};
+
 type ActivationKey = (u64, QueryExecutionId, u64);
 fn activation_key(identity: AttemptActivationIdentity) -> ActivationKey {
     (
@@ -209,6 +215,7 @@ struct PreparedAttempt {
     schedule: Arc<AttemptSchedule>,
     preparation_deadline: Option<MonotonicInstant>,
     binding_complete: bool,
+    activation_started: Option<AttemptActivationIdentity>,
     terminal_cut: Option<(
         AttemptActivationIdentity,
         MonotonicInstant,
@@ -223,13 +230,26 @@ struct ActiveOriginal {
     computation_ready: Option<crate::api::ComputationReadyToken>,
     run_started: bool,
     resources_exited: bool,
+    cleanup_adopted: bool,
+    dormant_retired_for_cleanup: bool,
     cleanup_failure: Arc<CleanupFailure>,
 }
+type QualificationClose = (
+    Option<QualifiedReplacementReservation>,
+    Option<ActiveReplacementResources>,
+    watch::Sender<bool>,
+);
 struct QualificationOriginal {
     identity: QualificationIdentity,
     operation: Option<TaskOperationId>,
     // Claims the original local action once; not evidence of transport handoff.
     dispatch_started: bool,
+    // The custody decision precedes the original watch's lock-free wake tail.
+    cancellation_issued: bool,
+    // Empty slots do not prove exit after an opaque operation panics.
+    activation_in_flight: bool,
+    resources_retiring: bool,
+    dispatch_settled: bool,
     cancellation: watch::Sender<bool>,
     qualified: Option<QualifiedReplacementReservation>,
     active: Option<ActiveReplacementResources>,
@@ -248,6 +268,7 @@ struct NativeStorage {
     prepared: BTreeMap<QueryExecutionId, PreparedAttempt>,
     preparations: BTreeMap<QueryExecutionId, PreparationPhase>,
     dormant_execution: Option<QueryExecutionId>,
+    cleaned_dormant_execution: Option<QueryExecutionId>,
     active: BTreeMap<ActivationKey, ActiveOriginal>,
     qualifications: BTreeMap<QueryExecutionId, QualificationOriginal>,
     causes: BTreeMap<(QueryExecutionId, u8), Arc<FutureCauses>>,
@@ -326,6 +347,10 @@ impl NativeStorage {
                     identity,
                     operation,
                     dispatch_started: false,
+                    cancellation_issued: false,
+                    activation_in_flight: false,
+                    resources_retiring: false,
+                    dispatch_settled: false,
                     cancellation,
                     qualified: None,
                     active: None,
@@ -356,20 +381,25 @@ impl NativeStorage {
         identity: QualificationIdentity,
         operation: Option<TaskOperationId>,
         abandon: bool,
-    ) -> Result<
-        (
-            Option<QualifiedReplacementReservation>,
-            Option<ActiveReplacementResources>,
-        ),
-        QueryExecutionError,
-    > {
+    ) -> Result<QualificationClose, QueryExecutionError> {
         let original = self.ensure_qualification(initial, identity, operation)?;
-        original.cancellation.send_replace(true);
+        original.cancellation_issued = true;
+        let cancellation = original.cancellation.clone();
         if abandon {
+            if original.activation_in_flight || original.resources_retiring {
+                return Err(panic_error(
+                    "original qualification resource operation remains unproven",
+                ));
+            }
             original.abandoned = true;
-            Ok((original.qualified.take(), original.active.take()))
+            original.resources_retiring = original.qualified.is_some() || original.active.is_some();
+            Ok((
+                original.qualified.take(),
+                original.active.take(),
+                cancellation,
+            ))
         } else {
-            Ok((None, None))
+            Ok((None, None, cancellation))
         }
     }
     fn begin_qualification_dispatch(
@@ -379,7 +409,7 @@ impl NativeStorage {
         operation: TaskOperationId,
     ) -> Result<watch::Receiver<bool>, QueryExecutionError> {
         let original = self.ensure_qualification(initial, identity, Some(operation))?;
-        if original.abandoned || *original.cancellation.borrow() {
+        if original.abandoned || original.cancellation_issued || *original.cancellation.borrow() {
             return Err(qualification_error(
                 ReplacementQualificationFailure::Rejected,
             ));
@@ -390,6 +420,9 @@ impl NativeStorage {
             ));
         }
         original.dispatch_started = true;
+        // No submitted receipt exists yet. This remains an exact unissued
+        // disposition until the original submit boundary below.
+        original.dispatch_settled = true;
         Ok(original.cancellation.subscribe())
     }
     fn inherited_terminal_cut(
@@ -419,13 +452,141 @@ pub struct NativeExecutor {
     tail_ready: futures::task::AtomicWaker,
 }
 impl NativeExecutor {
+    /// Adopt only an already successful original output for physical cleanup.
+    /// None means no pending output was present, never that resources exited.
+    /// The passive identity comes from the original Activate action, while the
+    /// actual owner/rows come from its same Pending and original custody slot.
+    pub fn adopt_pending_activation_for_cleanup(
+        &self,
+    ) -> LogicalFuture<'_, Result<Option<AttemptActivationIdentity>, QueryExecutionError>> {
+        Box::pin(async move {
+            let mut body = self.body.lock().await;
+            let Some(pending) = body.pending_activated.as_ref() else {
+                return Ok(None);
+            };
+            let execution = pending.staged_execution().ok_or_else(|| {
+                super::super::PendingNativeCleanupRefusal::NotStaged.query_error()
+            })?;
+            let activation = {
+                let storage = self.lock();
+                let activation = storage
+                    .prepared
+                    .get(&execution)
+                    .and_then(|original| original.activation_started)
+                    .ok_or_else(|| {
+                        protocol("staged cleanup has no original Activate action identity")
+                    })?;
+                if storage.active.contains_key(&activation_key(activation)) {
+                    return Err(protocol(
+                        "staged cleanup already has an active original owner",
+                    ));
+                }
+                activation
+            };
+            let original_exit = self.original_exit.upgrade().ok_or_else(|| {
+                super::super::PendingNativeCleanupRefusal::ForeignSource.query_error()
+            })?;
+            let (owner, rows) = self
+                .registry
+                .take_pending_native_for_cleanup(
+                    &self.registration,
+                    &original_exit,
+                    &self.body,
+                    &mut body.pending_activated,
+                )
+                .map_err(super::super::PendingNativeCleanupRefusal::query_error)?;
+            let mut storage = self.lock();
+            let terminal_cut = storage.inherited_terminal_cut(activation);
+            if storage.active.contains_key(&activation_key(activation)) {
+                // The unique original body loan excludes a second transfer.
+                // A carrier invariant must not replace/drop an existing owner.
+                std::mem::forget((owner, rows));
+                std::process::abort();
+            }
+            storage.active.insert(
+                activation_key(activation),
+                ActiveOriginal {
+                    owner: Arc::new(AsyncMutex::new(owner)),
+                    rows,
+                    terminal_cut,
+                    streamed_success: false,
+                    computation_ready: None,
+                    run_started: false,
+                    resources_exited: false,
+                    cleanup_adopted: true,
+                    dormant_retired_for_cleanup: false,
+                    cleanup_failure: Arc::new(CleanupFailure::default()),
+                },
+            );
+            // No AttemptActivated, registry activation, dormant-converged or
+            // local/remote exit fact is emitted by this cleanup-only transfer.
+            Ok(Some(activation))
+        })
+    }
+    /// Physically retire only the original dormant wrapper left beside an
+    /// adopted output. No converge/RPC is rerun and no remote fact is emitted.
+    /// An earlier unproven Drop stays unproven; owner absence is not success.
+    pub fn retire_adopted_dormant_for_cleanup(
+        &self,
+        activation: AttemptActivationIdentity,
+    ) -> LogicalFuture<'_, Result<(), QueryExecutionError>> {
+        Box::pin(async move {
+            let mut body = self.body.lock().await;
+            {
+                let storage = self.lock();
+                let original = storage
+                    .active
+                    .get(&activation_key(activation))
+                    .filter(|original| original.cleanup_adopted)
+                    .ok_or_else(|| {
+                        protocol("dormant cleanup has no exact adopted original owner")
+                    })?;
+                if original.dormant_retired_for_cleanup {
+                    return Ok(());
+                }
+                if storage.dormant_execution != Some(activation.execution()) {
+                    return Err(protocol(
+                        "adopted dormant cleanup has another original execution",
+                    ));
+                }
+            }
+            let causes = self.causes(activation.execution(), 24);
+            match catch_unwind(AssertUnwindSafe(|| body.dormant.retire())) {
+                Ok(Ok(())) => {
+                    let mut storage = self.lock();
+                    storage
+                        .active
+                        .get_mut(&activation_key(activation))
+                        .expect("same original adopted owner")
+                        .dormant_retired_for_cleanup = true;
+                    storage.dormant_execution = None;
+                    Ok(())
+                }
+                Ok(Err(())) => Err(panic_error(
+                    "original adopted dormant Drop remains unproven",
+                )),
+                Err(original) => {
+                    causes.retain(original, true);
+                    Err(panic_error("original adopted dormant Drop panicked"))
+                }
+            }
+        })
+    }
+    /// Notify the same original outer owner without replacing Ready, result
+    /// delivery, a physical Join, or encoding this typed cause as a panic.
+    pub fn record_owner_failure(&self, error: QueryExecutionError) -> bool {
+        self.owner_failure_observer().report(error)
+    }
     #[allow(
         clippy::too_many_arguments,
         reason = "the constructor receives distinct original owners"
     )]
-    #[expect(
-        dead_code,
-        reason = "TST-G9b3 P12 wires original Native executor construction"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "TST-G9b3 P12 wires original Native executor construction"
+        )
     )]
     pub(in crate::coordination) fn new(
         body: Arc<AsyncMutex<OriginalNativePreparation>>,
@@ -452,6 +613,7 @@ impl NativeExecutor {
                 preparation_deadline: None,
                 terminal_cut: None,
                 binding_complete: true,
+                activation_started: None,
             },
         );
         Self {
@@ -643,14 +805,20 @@ impl NativeExecutor {
                     identity,
                     operation_id,
                 } => {
-                    let mut storage = self.lock();
-                    match storage.close_qualification(
-                        self.initial_activation,
-                        identity,
-                        Some(operation_id),
-                        false,
-                    ) {
-                        Ok(_) => NativeFact::Applied,
+                    let closed = {
+                        let mut storage = self.lock();
+                        storage.close_qualification(
+                            self.initial_activation,
+                            identity,
+                            Some(operation_id),
+                            false,
+                        )
+                    };
+                    match closed {
+                        Ok((_, _, cancellation)) => {
+                            cancellation.send_replace(true);
+                            NativeFact::Applied
+                        }
                         Err(error) => failed(identity.replacement, error),
                     }
                 }
@@ -785,6 +953,19 @@ impl NativeExecutor {
                 protocol("Native activation already owns its original active slot"),
             );
         }
+        {
+            let storage = self.lock();
+            let original = storage
+                .prepared
+                .get(&execution)
+                .expect("the original schedule came from this prepared record");
+            if original.activation_started.is_some() {
+                return failed(
+                    execution,
+                    protocol("the original Activate action was already issued"),
+                );
+            }
+        }
         let mut reservation = match self.registry.reserve_active_native_owner(
             &self.registration,
             execution,
@@ -806,7 +987,10 @@ impl NativeExecutor {
                         && original.identity.actor == activation.actor()
                         && original.identity.generation == activation.generation() =>
                 {
-                    if original.abandoned || *original.cancellation.borrow() {
+                    if original.abandoned
+                        || original.cancellation_issued
+                        || *original.cancellation.borrow()
+                    {
                         return failed(
                             execution,
                             qualification_error(ReplacementQualificationFailure::Rejected),
@@ -857,6 +1041,11 @@ impl NativeExecutor {
                 }
             }
         };
+        self.lock()
+            .prepared
+            .get_mut(&execution)
+            .expect("validated original Activate schedule")
+            .activation_started = Some(activation);
         let causes = self.causes(execution, 0);
         let mut body = self.body.lock().await;
         let OriginalNativePreparation {
@@ -943,6 +1132,8 @@ impl NativeExecutor {
                     computation_ready: None,
                     run_started: false,
                     resources_exited: false,
+                    cleanup_adopted: false,
+                    dormant_retired_for_cleanup: false,
                     cleanup_failure: Arc::new(CleanupFailure::default()),
                 },
             );
@@ -1205,6 +1396,7 @@ impl NativeExecutor {
                     preparation_deadline: Some(deadline),
                     terminal_cut: None,
                     binding_complete: false,
+                    activation_started: None,
                 },
             );
         }
@@ -1339,22 +1531,42 @@ impl NativeExecutor {
         let (send, mut receive) = receipt_channel();
         let dispatched_at = self.clock.now();
         let submission = ReplacementQualificationEffectSubmission::new(request, send, cancel_rx);
+        self.lock()
+            .qualifications
+            .get_mut(&identity.replacement)
+            .expect("same original qualification dispatch")
+            .dispatch_settled = false;
         let submit = catch_unwind(AssertUnwindSafe(|| reservation.submit(submission)));
         if let Err(payload) = submit {
             causes.retain(payload, false);
         }
         // A submitted effect always settles its original position; cancellation is
         // requested through its original cell and never drops the receipt receiver.
+        let mut cancellation_error = None;
         let receipt = {
             tokio::select! { biased;
                 receipt=receive.recv()=>receipt,
                 reason=self.cancellation.cancelled()=>{
                     let _=reason;
-                    if let Some(original)=self.lock().qualifications.get(&identity.replacement){original.cancellation.send_replace(true);}
+                    let closed = {
+                        let mut storage = self.lock();
+                        storage.close_qualification(self.initial_activation, identity, Some(operation), false)
+                    };
+                    match closed {
+                        Ok((_, _, cancellation)) => { cancellation.send_replace(true); }
+                        Err(error) => cancellation_error = Some(error),
+                    }
                     receive.recv().await
                 },
                 ()=tokio::time::sleep_until(absolute)=>{
-                    if let Some(original)=self.lock().qualifications.get(&identity.replacement){original.cancellation.send_replace(true);}
+                    let closed = {
+                        let mut storage = self.lock();
+                        storage.close_qualification(self.initial_activation, identity, Some(operation), false)
+                    };
+                    match closed {
+                        Ok((_, _, cancellation)) => { cancellation.send_replace(true); }
+                        Err(error) => cancellation_error = Some(error),
+                    }
                     receive.recv().await
                 },
             }
@@ -1396,12 +1608,18 @@ impl NativeExecutor {
                                 .expect("the exact original qualification remains retained");
                             original.qualified = Some(qualified);
                             let abandoned = if original.abandoned {
+                                original.resources_retiring = true;
                                 original.qualified.take()
                             } else {
                                 None
                             };
                             drop(storage);
                             drop(abandoned);
+                            self.lock()
+                                .qualifications
+                                .get_mut(&identity.replacement)
+                                .expect("same original qualification")
+                                .resources_retiring = false;
                             QualificationSettlement::Qualified(facts)
                         }
                     }
@@ -1409,6 +1627,14 @@ impl NativeExecutor {
             }
             None => QualificationSettlement::OutcomeUnknown,
         };
+        self.lock()
+            .qualifications
+            .get_mut(&identity.replacement)
+            .expect("same settled original qualification")
+            .dispatch_settled = true;
+        // Even a cancellation-contract error cannot discard an already
+        // submitted receipt or the original resources it eventually returns.
+        let settlement = cancellation_error.map_or(settlement, QualificationSettlement::Rejected);
         NativeFact::QualificationSettled {
             identity,
             operation_id: operation,
@@ -1435,40 +1661,85 @@ impl NativeExecutor {
                 qualification_error(ReplacementQualificationFailure::MismatchedReceipt),
             );
         };
-        if original.abandoned || *original.cancellation.borrow() || original.active.is_some() {
+        if original.abandoned
+            || original.cancellation_issued
+            || *original.cancellation.borrow()
+            || original.active.is_some()
+        {
             return failed(
                 identity.replacement,
                 qualification_error(ReplacementQualificationFailure::InvalidReservation),
             );
         }
-        let Some(qualified) = original.qualified.as_mut() else {
+        if original.activation_in_flight || original.resources_retiring {
+            return failed(
+                identity.replacement,
+                panic_error("original qualification operation remains unproven"),
+            );
+        }
+        let Some(qualified) = original.qualified.take() else {
             return failed(
                 identity.replacement,
                 qualification_error(ReplacementQualificationFailure::InvalidReservation),
             );
         };
-        match qualified.activate_retained() {
-            Ok(activated) => {
-                original.active = Some(ActiveReplacementResources::replacement(activated));
-                NativeFact::ReservationActivated {
-                    identity,
-                    operation_id: operation,
+        original.activation_in_flight = true;
+        drop(storage);
+        // Retain the original wrapper through a foreign panic. Rich Drop and
+        // callbacks run outside the original storage lock.
+        let mut qualified = std::mem::ManuallyDrop::new(qualified);
+        let activated = catch_unwind(AssertUnwindSafe(|| qualified.activate_retained()));
+        let qualified = std::mem::ManuallyDrop::into_inner(qualified);
+        let mut storage = self.lock();
+        let original = storage
+            .qualifications
+            .get_mut(&identity.replacement)
+            .expect("same original reservation activation");
+        original.qualified = Some(qualified);
+        match activated {
+            Ok(result) => {
+                original.activation_in_flight = false;
+                match result {
+                    Ok(activated) => {
+                        original.active = Some(ActiveReplacementResources::replacement(activated));
+                        NativeFact::ReservationActivated {
+                            identity,
+                            operation_id: operation,
+                        }
+                    }
+                    Err(reason) => failed(identity.replacement, qualification_error(reason)),
                 }
             }
-            Err(reason) => failed(identity.replacement, qualification_error(reason)),
+            Err(payload) => {
+                drop(storage);
+                self.causes(identity.replacement, 14).retain(payload, false);
+                failed(
+                    identity.replacement,
+                    panic_error("original reservation activation panicked"),
+                )
+            }
         }
     }
+
     fn abandon_qualification(&self, identity: QualificationIdentity) -> NativeFact {
-        let retired = {
+        let (qualified, active, cancellation) = {
             let mut storage = self.lock();
             match storage.close_qualification(self.initial_activation, identity, None, true) {
                 Ok(originals) => originals,
                 Err(error) => return failed(identity.replacement, error),
             }
         };
+        // The exact cancellation and resource transfer were fixed under
+        // storage custody. A reentrant observer can now inspect that decision.
+        cancellation.send_replace(true);
         // Keep the same fixed round slot for an already-submitted action's late
         // original result. Only its original opaque resources retire here.
-        drop(retired);
+        drop((qualified, active));
+        self.lock()
+            .qualifications
+            .get_mut(&identity.replacement)
+            .expect("same retired original qualification")
+            .resources_retiring = false;
         NativeFact::Applied
     }
     async fn finish_resources(
@@ -1611,6 +1882,13 @@ impl NativeExecutor {
                         && original.identity.replacement == activation.execution()
                         && original.identity.generation == activation.generation() =>
                 {
+                    if original.activation_in_flight || original.resources_retiring {
+                        return failed(
+                            activation.execution(),
+                            panic_error("original isolation resource operation remains unproven"),
+                        );
+                    }
+                    original.resources_retiring = original.active.is_some();
                     original.active.take()
                 }
                 None if activation == self.initial_activation => None,
@@ -1628,6 +1906,9 @@ impl NativeExecutor {
             } else {
                 drop(resources);
             }
+        }
+        if let Some(original) = self.lock().qualifications.get_mut(&activation.execution()) {
+            original.resources_retiring = false;
         }
         cleanup
     }
@@ -2454,3 +2735,10 @@ fn consumer_panic() -> QueryExecutionError {
 #[cfg(test)]
 #[path = "native/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "native/qualification_cleanup_tests.rs"]
+mod qualification_cleanup_tests;
+
+#[cfg(test)]
+mod cleanup_tests;

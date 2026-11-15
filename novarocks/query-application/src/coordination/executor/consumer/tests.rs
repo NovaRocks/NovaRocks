@@ -202,6 +202,13 @@ async fn missing_original_observation_owner_is_a_typed_failure() {
 }
 #[tokio::test]
 async fn internal_end_crosses_real_domain_channel_before_ready_proposal() {
+    exercise_original_ready_handoff(false).await;
+}
+#[tokio::test]
+async fn supervised_failure_preserves_the_exact_original_ready_and_payload() {
+    exercise_original_ready_handoff(true).await;
+}
+async fn exercise_original_ready_handoff(supervise: bool) {
     let owner = Arc::new(
         ConsumerExecutor::new_internal(carrier(), plan(), NonZeroUsize::MIN, None).unwrap(),
     );
@@ -293,8 +300,35 @@ async fn internal_end_crosses_real_domain_channel_before_ready_proposal() {
             .await,
         ConsumerFact::ReadyHandedOff
     ));
-    assert_eq!(accept.await.unwrap().end(), end());
-    assert_eq!(owner.wait_internal_ready(a).await.unwrap().root(), r);
+    let accepted = accept.await.unwrap();
+    assert_eq!(accepted.end(), end());
+    if supervise {
+        assert!(matches!(
+            owner
+                .execute(ConsumerEffect::PublishAttemptFailure {
+                    activation: a,
+                    error: protocol("late business failure after original Ready"),
+                })
+                .await,
+            ConsumerFact::Applied
+        ));
+        assert!(
+            owner
+                .lock()
+                .internal
+                .get(&key(a))
+                .unwrap()
+                .failure_issued
+                .is_none()
+        );
+        owner.begin_supervised_failure(protocol("original owner failed after actual Ready"));
+        let state = owner.lock();
+        let original = state.internal.get(&key(a)).unwrap();
+        assert!(original.failure.borrow().is_none());
+        assert!(matches!(*original.ready.borrow(), Some(Ok(token)) if token == accepted));
+    }
+    assert_eq!(owner.wait_internal_ready(a).await.unwrap(), accepted);
+    assert_eq!(accepted.root(), r);
     exit.complete(Ok(()));
 }
 #[tokio::test]
@@ -848,4 +882,569 @@ async fn original_client_dropped_receipt_keeps_query_60_unexpected() {
         error,
         novarocks_logical_execution_protocol::failure::result_delivery_failed()
     );
+}
+
+#[tokio::test]
+async fn supervised_failure_preserves_end_already_handed_to_original_channel() {
+    let owner = client();
+    let a = activation(1);
+    let mut output = exposed(&owner).await;
+    output.begin_schema().unwrap().complete();
+    owner.record_end(a, end()).unwrap();
+    assert!(matches!(
+        owner
+            .execute(ConsumerEffect::ReserveEndSlot { activation: a })
+            .await,
+        ConsumerFact::EndSlotReady
+    ));
+    let mut write = owner.execute(ConsumerEffect::EnqueueEnd { activation: a });
+    assert!(poll_once(write.as_mut()).await.is_pending());
+    owner.begin_supervised_failure(protocol("original logical owner failed after End handoff"));
+    assert_eq!(
+        owner.lock().client_end_publication,
+        ClientEndPublication::HandedOff
+    );
+    let ResultDelivery::End(original) = output.next().await.unwrap().unwrap() else {
+        panic!("the exact original success End must survive supervision failure");
+    };
+    assert_eq!(original.execution_id(), a.execution());
+    assert_eq!(original.root_output_rows(), Some(end().output_rows));
+    assert!(poll_once(write.as_mut()).await.is_pending());
+    original.complete();
+    assert!(matches!(write.await, ConsumerFact::EndSettled));
+}
+
+#[tokio::test]
+async fn supervised_failure_does_not_publish_an_unpolled_original_end() {
+    let owner = client();
+    let a = activation(1);
+    let mut output = exposed(&owner).await;
+    output.begin_schema().unwrap().complete();
+    owner.record_end(a, end()).unwrap();
+    owner
+        .execute(ConsumerEffect::ReserveEndSlot { activation: a })
+        .await;
+    let write = owner.execute(ConsumerEffect::EnqueueEnd { activation: a });
+    let error = protocol("original logical owner failed before End handoff");
+    owner.begin_supervised_failure(error.clone());
+    assert!(matches!(write.await, ConsumerFact::Failed(actual) if actual == error));
+    assert!(matches!(output.next().await, Err(actual) if actual == error));
+    assert_eq!(
+        owner.lock().client_end_publication,
+        ClientEndPublication::Owed
+    );
+    assert!(
+        owner.lock().end_slots.contains_key(&key(a)),
+        "failure does not fake physical retirement of the original unused End position"
+    );
+    owner.retire_pending_end(a);
+}
+
+#[tokio::test]
+async fn supervised_failure_preserves_original_completion_promise() {
+    let (_control, _original, owner, receiver) = completion();
+    assert!(matches!(
+        owner.execute(ConsumerEffect::PublishCompletion).await,
+        ConsumerFact::Applied
+    ));
+    owner.begin_supervised_failure(protocol("original owner failed after completion reply"));
+    let mut output = receiver.await.unwrap().unwrap();
+    assert!(matches!(
+        output.take_output(),
+        Some(ExecutionOutput::Completion)
+    ));
+    assert!(matches!(
+        owner.lock().completion.as_ref().unwrap().published,
+        Some(Ok(()))
+    ));
+    assert!(!owner.fail_one_supervised_request());
+}
+
+#[tokio::test]
+async fn supervised_failure_during_original_end_enqueue_does_not_steal_the_handoff() {
+    struct FailOnWake {
+        owner: std::sync::Weak<ConsumerExecutor>,
+        called: std::sync::atomic::AtomicBool,
+    }
+    impl std::task::Wake for FailOnWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let owner = self.owner.upgrade().unwrap();
+            assert_eq!(
+                owner.lock().client_end_publication,
+                ClientEndPublication::Publishing
+            );
+            self.called
+                .store(true, std::sync::atomic::Ordering::Release);
+            owner.begin_supervised_failure(protocol("owner failure in original End wake"));
+        }
+    }
+    let owner = Arc::new(client());
+    let a = activation(1);
+    let mut output = exposed(&owner).await;
+    output.begin_schema().unwrap().complete();
+    owner.record_end(a, end()).unwrap();
+    owner
+        .execute(ConsumerEffect::ReserveEndSlot { activation: a })
+        .await;
+    let notification = Arc::new(FailOnWake {
+        owner: Arc::downgrade(&owner),
+        called: std::sync::atomic::AtomicBool::new(false),
+    });
+    let wake = std::task::Waker::from(notification.clone());
+    let mut next = Box::pin(output.next());
+    assert!(
+        next.as_mut()
+            .poll(&mut std::task::Context::from_waker(&wake))
+            .is_pending()
+    );
+    drop(next);
+    let mut write = owner.execute(ConsumerEffect::EnqueueEnd { activation: a });
+    assert!(poll_once(write.as_mut()).await.is_pending());
+    assert!(
+        notification
+            .called
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert_eq!(
+        owner.lock().client_end_publication,
+        ClientEndPublication::HandedOff
+    );
+    let ResultDelivery::End(original) = output.next().await.unwrap().unwrap() else {
+        panic!("supervision cannot replace the original in-flight End");
+    };
+    original.complete();
+    assert!(matches!(write.await, ConsumerFact::EndSettled));
+}
+
+#[tokio::test]
+async fn supervised_failure_drains_original_request_once_and_closes_late_admission() {
+    let owner = client();
+    let (facts, mut observed) = mpsc::unbounded_channel();
+    owner.attach_source(Box::new(Source(facts))).await.unwrap();
+    let request = InternalRequest::Failed(report(protocol("original internal fact")));
+    let mut pending = Box::pin(owner.request(activation(1), request.clone()));
+    assert!(poll_once(pending.as_mut()).await.is_pending());
+    assert!(matches!(
+        observed.recv().await,
+        Some(LogicalHostFact::Internal { .. })
+    ));
+    let error = protocol("original owner supervision cause");
+    owner.begin_supervised_failure(error.clone());
+    owner.begin_supervised_failure(protocol("secondary owner failure"));
+    assert!(owner.fail_one_supervised_request());
+    assert!(!owner.fail_one_supervised_request());
+    assert!(matches!(pending.await, Err(actual) if actual == error));
+    assert!(matches!(owner.request(activation(1), request).await, Err(actual) if actual == error));
+    assert!(
+        observed.try_recv().is_err(),
+        "late failure does not create a fresh source request"
+    );
+}
+
+#[tokio::test]
+async fn supervised_failure_preserves_canonical_error_when_original_source_closes() {
+    struct ClosingSource(Option<oneshot::Receiver<()>>);
+    impl LogicalFactSource for ClosingSource {
+        fn id(&self) -> LogicalSourceId {
+            LogicalSourceId::new(NonZeroU64::MIN)
+        }
+        fn send(
+            &mut self,
+            _: LogicalHostFact,
+        ) -> LogicalFuture<'_, Result<(), LogicalSourceClosed>> {
+            Box::pin(async move {
+                self.0.take().unwrap().await.unwrap();
+                Err(LogicalSourceClosed)
+            })
+        }
+    }
+    let owner = client();
+    let (close, closed) = oneshot::channel();
+    owner
+        .attach_source(Box::new(ClosingSource(Some(closed))))
+        .await
+        .unwrap();
+    let mut pending = Box::pin(owner.request(
+        activation(1),
+        InternalRequest::Failed(report(protocol("original internal fact"))),
+    ));
+    assert!(poll_once(pending.as_mut()).await.is_pending());
+    let error = protocol("canonical failure before actual source close");
+    owner.begin_supervised_failure(error.clone());
+    assert!(owner.fail_one_supervised_request());
+    close.send(()).unwrap();
+    assert!(matches!(pending.await, Err(actual) if actual == error));
+    assert!(!owner.fail_one_supervised_request());
+}
+
+#[tokio::test]
+async fn supervised_failure_before_ready_wakes_original_waiter_without_accepting_payload() {
+    let owner = Arc::new(
+        ConsumerExecutor::new_internal(carrier(), plan(), NonZeroUsize::MIN, None).unwrap(),
+    );
+    let a = activation(1);
+    let original = owner.bind_internal(a, root(a)).unwrap();
+    let exit = original.supervise_exit().await.unwrap();
+    let (mut stream, source) = original.into_parts();
+    let mut ready = Box::pin(owner.wait_internal_ready(a));
+    assert!(poll_once(ready.as_mut()).await.is_pending());
+    let error = protocol("original owner failed before Ready handoff");
+    owner.begin_supervised_failure(error.clone());
+    assert!(matches!(ready.await, Err(actual) if actual == error));
+    assert!(matches!(stream.next().await, Err(actual) if actual == error));
+    assert!(
+        owner
+            .lock()
+            .internal
+            .get(&key(a))
+            .unwrap()
+            .decoded
+            .is_none()
+    );
+    let mut actual_exit = Box::pin(
+        owner
+            .lock()
+            .internal
+            .get(&key(a))
+            .unwrap()
+            .exit
+            .clone()
+            .unwrap(),
+    );
+    assert!(
+        poll_once(actual_exit.as_mut()).await.is_pending(),
+        "owner failure is not original source exit"
+    );
+    exit.complete(Ok(()));
+    assert!(matches!(actual_exit.await, Some(Ok(()))));
+    drop(source);
+}
+
+#[derive(Clone, Copy)]
+enum FailureWakeDestination {
+    Client,
+    Internal(AttemptActivationIdentity),
+    Completion,
+}
+struct ReenterOriginalFailureWake {
+    owner: Weak<ConsumerExecutor>,
+    destination: FailureWakeDestination,
+    original: QueryExecutionError,
+    supervision: QueryExecutionError,
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl std::task::Wake for ReenterOriginalFailureWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        let owner = self.owner.upgrade().unwrap();
+        // Fail synchronously on the old implementation instead of hanging a
+        // test worker behind its non-reentrant custody mutex.
+        let state = owner.state.try_lock().unwrap_or_else(|_| {
+            panic!("original failure notification must release Consumer State before waking");
+        });
+        match self.destination {
+            FailureWakeDestination::Client => {
+                assert_eq!(state.client_failure_issued.as_ref(), Some(&self.original));
+            }
+            FailureWakeDestination::Internal(activation) => {
+                let original = state.internal.get(&key(activation)).unwrap();
+                assert_eq!(original.failure_issued.as_ref(), Some(&self.original));
+                assert!(original.ready_issued.is_none());
+            }
+            FailureWakeDestination::Completion => {
+                assert!(matches!(&state.completion.as_ref().unwrap().published,
+                    Some(Err(error)) if error == &self.original));
+            }
+        }
+        drop(state);
+        assert!(
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3,
+            "idempotent original failure notifications must not recurse indefinitely"
+        );
+        owner.begin_supervised_failure(self.supervision.clone());
+    }
+}
+fn reenter_failure_wake(
+    owner: &Arc<ConsumerExecutor>,
+    destination: FailureWakeDestination,
+    original: QueryExecutionError,
+    supervision: QueryExecutionError,
+) -> Arc<ReenterOriginalFailureWake> {
+    Arc::new(ReenterOriginalFailureWake {
+        owner: Arc::downgrade(owner),
+        destination,
+        original,
+        supervision,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+#[tokio::test]
+async fn ordinary_client_failure_notification_reenters_supervision_without_lock_or_cause_replacement()
+ {
+    let owner = Arc::new(client());
+    let mut output = exposed(&owner).await;
+    output.begin_schema().unwrap().complete();
+    let original = protocol("original client business failure");
+    let supervision = protocol("independent supervision failure during client wake");
+    let observer = reenter_failure_wake(
+        &owner,
+        FailureWakeDestination::Client,
+        original.clone(),
+        supervision.clone(),
+    );
+    let waker = std::task::Waker::from(observer.clone());
+    let mut view = output.failure_view().unwrap();
+    let mut pending = Box::pin(view.wait());
+    assert!(
+        pending
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert!(matches!(
+        owner
+            .execute(ConsumerEffect::PublishFailure(original.clone()))
+            .await,
+        ConsumerFact::Applied
+    ));
+    assert_eq!(pending.await, original);
+    assert_eq!(output.next().await.err(), Some(original.clone()));
+    assert_eq!(owner.lock().supervision, Some(supervision));
+    assert_eq!(owner.lock().client_failure_issued, Some(original));
+    assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn ordinary_internal_failure_reentry_completes_same_failure_ready_tail_without_recursion() {
+    let owner = Arc::new(
+        ConsumerExecutor::new_internal(carrier(), plan(), NonZeroUsize::MIN, None).unwrap(),
+    );
+    let a = activation(1);
+    let original_activation = owner.bind_internal(a, root(a)).unwrap();
+    let (mut stream, _source) = original_activation.into_parts();
+    let original = protocol("original internal attempt business failure");
+    let supervision = protocol("independent supervision failure during internal wake");
+    let observer = reenter_failure_wake(
+        &owner,
+        FailureWakeDestination::Internal(a),
+        original.clone(),
+        supervision.clone(),
+    );
+    let waker = std::task::Waker::from(observer.clone());
+    let mut failure = Box::pin(stream.failure());
+    let mut ready = owner
+        .lock()
+        .internal
+        .get(&key(a))
+        .unwrap()
+        .ready
+        .subscribe();
+    let mut ready_changed = Box::pin(ready.changed());
+    assert!(
+        failure
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert!(
+        ready_changed
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert!(matches!(
+        owner
+            .execute(ConsumerEffect::PublishAttemptFailure {
+                activation: a,
+                error: original.clone(),
+            })
+            .await,
+        ConsumerFact::Applied
+    ));
+    assert_eq!(failure.await, original);
+    ready_changed.await.unwrap();
+    assert!(matches!(ready.borrow().as_ref(), Some(Err(error)) if error == &original));
+    assert_eq!(owner.lock().supervision, Some(supervision));
+    assert_eq!(
+        owner.lock().internal.get(&key(a)).unwrap().failure_issued,
+        Some(original)
+    );
+    assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+#[tokio::test]
+async fn ordinary_completion_failure_sends_original_reply_outside_lock_before_reentrant_supervision()
+ {
+    let (_control, _original, owner, mut receiver) = completion();
+    let owner = Arc::new(owner);
+    let original = protocol("original completion business failure");
+    let supervision = protocol("independent supervision failure during completion wake");
+    let observer = reenter_failure_wake(
+        &owner,
+        FailureWakeDestination::Completion,
+        original.clone(),
+        supervision.clone(),
+    );
+    let waker = std::task::Waker::from(observer.clone());
+    assert!(
+        Pin::new(&mut receiver)
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert!(matches!(
+        owner
+            .execute(ConsumerEffect::PublishFailure(original.clone()))
+            .await,
+        ConsumerFact::Applied
+    ));
+    assert!(matches!(receiver.await.unwrap(), Err(error) if error == original));
+    assert_eq!(owner.lock().supervision, Some(supervision));
+    assert!(
+        matches!(&owner.lock().completion.as_ref().unwrap().published,
+        Some(Err(error)) if error == &original)
+    );
+    assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn promised_internal_business_failure_survives_supervision_before_its_notification_tail() {
+    let owner = Arc::new(
+        ConsumerExecutor::new_internal(carrier(), plan(), NonZeroUsize::MIN, None).unwrap(),
+    );
+    let a = activation(1);
+    let activation = owner.bind_internal(a, root(a)).unwrap();
+    let (mut stream, _source) = activation.into_parts();
+    let original = protocol("original failure reserved before notification");
+    let supervision = protocol("supervision races before ordinary no-await notification");
+    // Script the real production promise/notification cut while retaining the
+    // same original channel pair. No watch value has been published yet.
+    let tail = {
+        let mut state = owner.lock();
+        InternalFailureNotice::reserve(state.internal.get_mut(&key(a)).unwrap(), original.clone())
+    };
+    assert!(stream.current_failure().is_none());
+    owner.begin_supervised_failure(supervision.clone());
+    assert_eq!(stream.current_failure(), Some(original.clone()));
+    tail.notify();
+    assert_eq!(stream.failure().await, original.clone());
+    assert!(
+        matches!(owner.lock().internal.get(&key(a)).unwrap().ready.borrow().as_ref(),
+        Some(Err(error)) if error == &original)
+    );
+    assert_eq!(owner.lock().supervision, Some(supervision));
+}
+#[tokio::test]
+async fn later_global_business_failure_keeps_each_original_attempts_first_promise() {
+    let owner = Arc::new(
+        ConsumerExecutor::new_internal(carrier(), plan(), NonZeroUsize::MIN, None).unwrap(),
+    );
+    let a = activation(1);
+    let b = activation(2);
+    let old = owner.bind_internal(a, root(a)).unwrap();
+    let new = owner.bind_internal(b, root(b)).unwrap();
+    let (mut old, _old_source) = old.into_parts();
+    let (mut new, _new_source) = new.into_parts();
+    let original = protocol("original failed attempt A");
+    let later = protocol("later accepted logical failure from B");
+    owner
+        .execute(ConsumerEffect::PublishAttemptFailure {
+            activation: a,
+            error: original.clone(),
+        })
+        .await;
+    owner
+        .execute(ConsumerEffect::PublishFailure(later.clone()))
+        .await;
+    assert_eq!(old.failure().await, original.clone());
+    assert_eq!(new.failure().await, later.clone());
+    assert!(
+        matches!(owner.lock().internal.get(&key(a)).unwrap().ready.borrow().as_ref(),
+        Some(Err(error)) if error == &original)
+    );
+    assert!(
+        matches!(owner.lock().internal.get(&key(b)).unwrap().ready.borrow().as_ref(),
+        Some(Err(error)) if error == &later)
+    );
+}
+#[tokio::test]
+async fn earlier_client_failure_prevents_late_end_without_disposing_the_original_unused_slot() {
+    let owner = client();
+    let a = activation(1);
+    let mut output = exposed(&owner).await;
+    output.begin_schema().unwrap().complete();
+    owner.record_end(a, end()).unwrap();
+    assert!(matches!(
+        owner
+            .execute(ConsumerEffect::ReserveEndSlot { activation: a })
+            .await,
+        ConsumerFact::EndSlotReady
+    ));
+    let original = protocol("original client failure before End tail");
+    owner
+        .execute(ConsumerEffect::PublishFailure(original.clone()))
+        .await;
+    assert!(
+        matches!(owner.execute(ConsumerEffect::EnqueueEnd { activation: a }).await,
+        ConsumerFact::Failed(error) if error == original)
+    );
+    assert_eq!(
+        owner.lock().client_end_publication,
+        ClientEndPublication::Owed
+    );
+    assert!(owner.lock().end_slots.contains_key(&key(a)));
+    assert_eq!(output.next().await.err(), Some(original));
+    owner.retire_pending_end(a);
+}
+#[tokio::test]
+async fn ordinary_late_failure_preserves_actual_success_end_handoff() {
+    let owner = client();
+    let a = activation(1);
+    let mut output = exposed(&owner).await;
+    output.begin_schema().unwrap().complete();
+    owner.record_end(a, end()).unwrap();
+    owner
+        .execute(ConsumerEffect::ReserveEndSlot { activation: a })
+        .await;
+    let mut write = owner.execute(ConsumerEffect::EnqueueEnd { activation: a });
+    assert!(poll_once(write.as_mut()).await.is_pending());
+    assert_eq!(
+        owner.lock().client_end_publication,
+        ClientEndPublication::HandedOff
+    );
+    assert!(matches!(
+        owner
+            .execute(ConsumerEffect::PublishFailure(protocol(
+                "late business failure"
+            )))
+            .await,
+        ConsumerFact::Applied
+    ));
+    assert!(owner.lock().client_failure_issued.is_none());
+    assert!(owner.lock().failure.as_ref().unwrap().borrow().is_none());
+    let ResultDelivery::End(delivery) = output.next().await.unwrap().unwrap() else {
+        panic!("the original successful End promise");
+    };
+    delivery.complete();
+    assert!(matches!(write.await, ConsumerFact::EndSettled));
+}
+
+#[tokio::test]
+async fn promised_client_business_failure_survives_supervision_before_actual_notification() {
+    let owner = Arc::new(client());
+    let mut output = exposed(&owner).await;
+    output.begin_schema().unwrap().complete();
+    let original = protocol("original client failure reserved before notification");
+    let supervision = protocol("supervision before client notification tail");
+    let (sender, promised) = {
+        let mut state = owner.lock();
+        reserve_client_failure(&mut state, original.clone()).unwrap()
+    };
+    assert!(sender.borrow().is_none());
+    owner.begin_supervised_failure(supervision.clone());
+    assert_eq!(*sender.borrow(), Some(original.clone()));
+    notify_original_failure(&sender, promised);
+    assert_eq!(output.next().await.err(), Some(original));
+    assert_eq!(owner.lock().supervision, Some(supervision));
 }

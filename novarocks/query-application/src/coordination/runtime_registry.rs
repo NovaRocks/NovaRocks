@@ -976,6 +976,69 @@ impl LogicalExecutionRuntimeRegistryHandle {
         reserved.ok_or(LogicalExecutionRuntimeRegistryError::InvalidParticipationSet)
     }
 
+    /// Cleanup-only recovery of the same successful activation output. Existing
+    /// custody remains claimable during Closing; no new slot or activation is
+    /// admitted and no original native-return count is incremented.
+    pub(in crate::coordination) fn take_pending_native_for_cleanup(
+        &self,
+        registration: &LogicalExecutionRegistration,
+        original_exit: &Arc<OriginalLogicalExit>,
+        original_body: &Arc<tokio::sync::Mutex<super::original_exit::OriginalNativePreparation>>,
+        pending: &mut Option<super::native_active_custody::PendingNativeActivation>,
+    ) -> Result<
+        (
+            super::SupervisedActiveNativeOwner,
+            Option<crate::api::NativeRowsAttemptRuntime>,
+        ),
+        super::PendingNativeCleanupRefusal,
+    > {
+        use super::PendingNativeCleanupRefusal as Refusal;
+        self.validate_registry(registration)
+            .map_err(Refusal::Registry)?;
+        let state = self.lock();
+        let (initial, generation, source) = match state
+            .entries
+            .get(&registration.initial_execution.query_id())
+        {
+            Some(RegistryEntry::Installed(entry)) => (
+                entry.initial_execution,
+                entry.generation,
+                entry.original_exit.as_ref(),
+            ),
+            Some(RegistryEntry::RuntimeInstalled(entry)) => (
+                entry.registration.initial_execution,
+                entry.registration.generation,
+                entry.original_exit.as_ref(),
+            ),
+            Some(RegistryEntry::Joined(entry)) => (
+                entry.initial_execution,
+                entry.generation,
+                entry.original_exit.as_ref(),
+            ),
+            _ => {
+                return Err(Refusal::Registry(
+                    LogicalExecutionRuntimeRegistryError::UnknownRegistration,
+                ));
+            }
+        };
+        validate_generation(generation, registration.generation).map_err(Refusal::Registry)?;
+        if initial != registration.initial_execution
+            || !source.is_some_and(|source| Arc::ptr_eq(source, original_exit))
+            || !Arc::ptr_eq(&original_exit.native, original_body)
+        {
+            return Err(Refusal::ForeignSource);
+        }
+        // Lock order stays Registry -> original custody map -> original owner.
+        // The caller keeps its unique original-body loan through this transfer.
+        self.inner.active_native.take_staged_for_cleanup(
+            initial,
+            generation,
+            original_exit,
+            self.clone(),
+            pending,
+        )
+    }
+
     pub(crate) async fn record_native_custody_closure(
         &self,
         key: super::NativeActiveCustodyKey,
@@ -1108,7 +1171,13 @@ impl LogicalExecutionRuntimeRegistryHandle {
         let mut custody: Option<Box<dyn std::any::Any + Send>> = Some(Box::new(
             super::original_exit::LogicalExitHealthCustody::new(Arc::clone(source)),
         ));
-        let notice = self.inner.health.record_supervision_panic_in(&mut custody);
+        let notice = if let Some(error) = source.owner_failure() {
+            self.inner
+                .health
+                .record_owner_failure_in(&mut custody, error)
+        } else {
+            self.inner.health.record_supervision_panic_in(&mut custody)
+        };
         if custody.is_none() {
             source.mark_health_published_silent();
         } else {
@@ -1526,6 +1595,63 @@ impl LogicalExecutionRuntimeRegistryHandle {
         } else {
             LogicalExecutionJoinReadiness::WaitingForConvergence
         })
+    }
+
+    /// Close only this original runtime ingress after its actual logical
+    /// owner failed. This never claims the Join or waits for the caller's own
+    /// actor exit; ordinary join/retirement still require the real HostExit.
+    pub(in crate::coordination) async fn close_runtime_ingress_after_owner_failure(
+        &self,
+        registration: &LogicalExecutionRegistration,
+        original: &Arc<OriginalLogicalExit>,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        self.validate_registry(registration)?;
+        if original.owner_failure().is_none() {
+            return Err(LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved);
+        }
+        let carrier = {
+            let state = self.lock();
+            let Some(RegistryEntry::RuntimeInstalled(entry)) = state
+                .entries
+                .get(&registration.initial_execution.query_id())
+            else {
+                return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
+            };
+            validate_generation(entry.registration.generation, registration.generation)?;
+            if !entry
+                .original_exit
+                .as_ref()
+                .is_some_and(|source| Arc::ptr_eq(source, original))
+            {
+                return Err(LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved);
+            }
+            Arc::clone(&entry.carrier)
+        };
+        carrier
+            .close_ingress_after_owner_failure()
+            .await
+            .map_err(|_| LogicalExecutionRuntimeRegistryError::RuntimeSourceClosed)?;
+        let mut state = self.lock();
+        let Some(RegistryEntry::RuntimeInstalled(entry)) = state
+            .entries
+            .get_mut(&registration.initial_execution.query_id())
+        else {
+            return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
+        };
+        validate_generation(entry.registration.generation, registration.generation)?;
+        if !Arc::ptr_eq(&entry.carrier, &carrier)
+            || !entry
+                .original_exit
+                .as_ref()
+                .is_some_and(|source| Arc::ptr_eq(source, original))
+            || !carrier.source_idle()
+        {
+            return Err(LogicalExecutionRuntimeRegistryError::RuntimeSourceClosed);
+        }
+        entry.ingress_closed = true;
+        drop(state);
+        self.inner.progress.notify_waiters();
+        Ok(())
     }
 
     pub(crate) async fn close_ingress_for_join(
@@ -2309,7 +2435,7 @@ impl LogicalExecutionRuntimeReservation {
                 _ => unreachable!("the unique original reservation retains its exact slot"),
             };
             if let Some(original) = &reserved.original_exit {
-                original.installed_silent(OriginalAssociation {
+                original.runtime_installed_silent(OriginalAssociation {
                     registry: self.registry.inner.id,
                     initial: self.initial_execution,
                     generation: self.generation,
@@ -2511,6 +2637,9 @@ impl LogicalExecutionRuntimeRegistryHandle {
         };
         drop(removed);
         if let Some(source) = source {
+            // The install-only role's earlier completion deferred this body.
+            // Actual runtime Actor/Scope exit now permits its original tail.
+            source.retire_native_body_silent();
             if source.has_failure()
                 && let Some(notice) = self.publish_original_exit_health_silent(&source)
             {
@@ -3723,6 +3852,188 @@ mod tests {
             geometry.inline_bytes_for_entries(usize::MAX),
             Err(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,)
         );
+    }
+    #[tokio::test]
+    async fn pending_cleanup_reclaims_same_staged_owner_during_close_without_new_reservation() {
+        use super::super::native_active_custody::{
+            PendingNativeActivation, PendingNativeCleanupRefusal,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct CleanupOnlyOwner {
+            exit: Option<tokio::sync::oneshot::Receiver<()>>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for CleanupOnlyOwner {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl crate::api::ActiveNativeAttemptOwner for CleanupOnlyOwner {
+            fn finish_installed<'a>(
+                &'a mut self,
+                _: crate::api::NativeActiveConvergenceRequest,
+            ) -> crate::api::NativeAttemptConvergenceFuture<'a> {
+                let exit = self.exit.take().unwrap();
+                Box::pin(async move {
+                    exit.await.unwrap();
+                    Ok(())
+                })
+            }
+            fn run<'a>(
+                &'a mut self,
+                _: &'a crate::coordination::NativeAttemptDrive,
+                _: novarocks_workload_control::CancellationView,
+            ) -> crate::api::NativeAttemptRunFuture<'a> {
+                panic!("cleanup adoption must not run a new attempt");
+            }
+            fn converge<'a>(
+                &'a mut self,
+                _: crate::api::NativeActiveConvergenceRequest,
+            ) -> crate::api::NativeActiveAttemptConvergenceFuture<'a> {
+                panic!("cleanup adoption must not choose remote convergence");
+            }
+        }
+        let registry =
+            std::mem::ManuallyDrop::new(LogicalExecutionRuntimeRegistry::new(Handle::current()));
+        let exact = execution(982);
+        let participation = native_test_participation(exact);
+        let source = OriginalLogicalExit::new();
+        let observer =
+            super::super::original_exit::LogicalExecutionExitObserver::new(source.clone());
+        let (actor_config, cancellation) =
+            config_observing_cancellation(exact, vec![participation]);
+        let (capacity, _) = tokio::sync::watch::channel(0);
+        let actor_config = actor_config.with_abort_participation_effect_port(
+            Arc::new(NeverEstablishedAbortPort { capacity }),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let installed = registry
+            .reserve_with_original_exit(exact, vec![participation], Some(source.clone()))
+            .unwrap()
+            .spawn_and_install(actor_config)
+            .unwrap();
+        let (registration, initial, output) = installed.into_parts();
+        let _output = output.into_output();
+        let reservation = registry
+            .reserve_active_native_owner(&registration, exact, &[participation])
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (exit, exited) = tokio::sync::oneshot::channel();
+        let mut body = source.native.lock().await;
+        body.pending_activated = Some(PendingNativeActivation::new(
+            crate::api::ActivatedNativeAttempt::completion(CleanupOnlyOwner {
+                exit: Some(exited),
+                drops: drops.clone(),
+            }),
+        ));
+        reservation
+            .stage_activated_in(&mut body.pending_activated)
+            .unwrap();
+        drop(reservation);
+        let address = body
+            .pending_activated
+            .as_ref()
+            .unwrap()
+            .staged_owner_address()
+            .unwrap();
+        assert_eq!(registry.active_native_custody_count(), 1);
+        assert_eq!(observer.view().unwrap().pending_native_returns(), 1);
+        let foreign = OriginalLogicalExit::new();
+        assert!(matches!(
+            registry.take_pending_native_for_cleanup(
+                &registration,
+                &foreign,
+                &source.native,
+                &mut body.pending_activated
+            ),
+            Err(PendingNativeCleanupRefusal::ForeignSource)
+        ));
+        assert_eq!(
+            body.pending_activated
+                .as_ref()
+                .unwrap()
+                .staged_owner_address(),
+            Some(address)
+        );
+        assert!(matches!(
+            registry.take_pending_native_for_cleanup(
+                &registration,
+                &source,
+                &foreign.native,
+                &mut body.pending_activated
+            ),
+            Err(PendingNativeCleanupRefusal::ForeignSource)
+        ));
+        registry.begin_shutdown();
+        assert!(matches!(
+            registry.reserve_active_native_owner(&registration, exact, &[participation]),
+            Err(LogicalExecutionRuntimeRegistryError::RegistryClosing)
+        ));
+        let (mut owner, rows) = registry
+            .take_pending_native_for_cleanup(
+                &registration,
+                &source,
+                &source.native,
+                &mut body.pending_activated,
+            )
+            .unwrap();
+        assert!(rows.is_none() && body.pending_activated.is_none());
+        assert_eq!(
+            owner.as_mut() as *mut dyn crate::api::ActiveNativeAttemptOwner as *mut () as usize,
+            address
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.active_native_custody_count(), 1);
+        assert_eq!(
+            observer.view().unwrap().pending_native_returns(),
+            1,
+            "adoption creates no second reservation"
+        );
+        assert!(matches!(
+            registry.take_pending_native_for_cleanup(
+                &registration,
+                &source,
+                &source.native,
+                &mut body.pending_activated
+            ),
+            Err(PendingNativeCleanupRefusal::NotStaged)
+        ));
+        drop(body);
+        let mut finish =
+            owner
+                .as_mut()
+                .finish_installed(crate::api::NativeActiveConvergenceRequest::new(
+                    cancellation,
+                    Instant::now() + Duration::from_secs(2),
+                ));
+        assert!(futures::poll!(finish.as_mut()).is_pending());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.active_native_custody_count(), 1);
+        exit.send(()).unwrap();
+        finish.await.unwrap();
+        owner.retire_local();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.active_native_custody_count(), 0);
+        assert_eq!(observer.view().unwrap().pending_native_returns(), 0);
+        drop(owner);
+        registry
+            .actor(&registration)
+            .unwrap()
+            .initialization_failed(initial)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            registry.join_and_retire(registration),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(registry.entry_count(), 0);
+        std::mem::ManuallyDrop::into_inner(registry)
+            .shutdown()
+            .unwrap();
     }
 }
 

@@ -77,9 +77,12 @@ struct State {
     pending_native_returns: u64,
     native_pre_actor_started: bool,
     native_body_exited: bool,
+    runtime_installed: bool,
     native_failure: Option<Box<dyn std::any::Any + Send>>,
+    native_body_cleanup_panic: Option<Box<dyn std::any::Any + Send>>,
     run_panic: Option<Box<dyn std::any::Any + Send>>,
     run_cleanup_panic: Option<Box<dyn std::any::Any + Send>>,
+    owner_failure: Option<QueryExecutionError>,
     consumer_failed: bool,
     native_dormant_failed: bool,
     native_closure_seen: bool,
@@ -89,6 +92,28 @@ struct State {
     role_failed: bool,
     health_published: bool,
     health_disposed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OriginalNativeBodyCloseRefusal {
+    ForeignSource,
+    NotRuntimeFailure,
+    LocalWorkPending,
+    BodyUnproven,
+    BodyDropPanicked,
+}
+impl OriginalNativeBodyCloseRefusal {
+    pub(super) const fn detail(self) -> &'static str {
+        match self {
+            Self::ForeignSource => "Native body cleanup belongs to another original source",
+            Self::NotRuntimeFailure => {
+                "Native body cleanup requires the original runtime owner failure"
+            }
+            Self::LocalWorkPending => "Native body cleanup still owns original local work",
+            Self::BodyUnproven => "original Native body destruction remains unproven",
+            Self::BodyDropPanicked => "original Native body destruction panicked",
+        }
+    }
 }
 pub(super) struct OriginalLogicalExit {
     state: Mutex<State>,
@@ -118,9 +143,12 @@ impl OriginalLogicalExit {
                 pending_native_returns: 0,
                 native_pre_actor_started: false,
                 native_body_exited: true,
+                runtime_installed: false,
                 native_failure: None,
+                native_body_cleanup_panic: None,
                 run_panic: None,
                 run_cleanup_panic: None,
+                owner_failure: None,
                 consumer_failed: false,
                 native_dormant_failed: false,
                 native_closure_seen: false,
@@ -166,7 +194,10 @@ impl OriginalLogicalExit {
     pub(super) fn retire_native_body_silent(&self) {
         {
             let state = self.lock();
-            if !state.role_ended || state.native_body_exited {
+            if !state.role_ended
+                || state.native_body_exited
+                || state.runtime_installed && state.phase != LogicalActorExitPhase::Joined
+            {
                 return;
             }
         }
@@ -174,7 +205,7 @@ impl OriginalLogicalExit {
         let Ok(mut body) = self.native.try_lock() else {
             return;
         };
-        if body.dormant.has_failure() {
+        if body.dormant.has_failure() && !body.dormant.owner_retired_for_cleanup() {
             // The original two causes remain beside their original owner.
             // Publish only this failure fact, never copy into native_failure.
             drop(body);
@@ -215,6 +246,83 @@ impl OriginalLogicalExit {
             }
         }
     }
+
+    /// The original failure job has already closed its SAME Registry ingress.
+    /// Its local-exit qualifier runs under this original body loan, never a
+    /// Registry/state lock. Only a real successful Drop records body exit;
+    /// role/actor joins and retained health remain independent.
+    pub(super) async fn close_runtime_native_body_for_cleanup<F>(
+        &self,
+        original_body: &Arc<tokio::sync::Mutex<OriginalNativePreparation>>,
+        initial: QueryExecutionId,
+        qualify_local_exit: F,
+    ) -> Result<(), OriginalNativeBodyCloseRefusal>
+    where
+        F: FnOnce(&OriginalNativePreparation) -> Result<(), OriginalNativeBodyCloseRefusal> + Send,
+    {
+        use OriginalNativeBodyCloseRefusal as Refusal;
+        if !Arc::ptr_eq(&self.native, original_body) {
+            return Err(Refusal::ForeignSource);
+        }
+        let mut body = self.native.lock().await;
+        {
+            let state = self.lock();
+            if !state
+                .association
+                .is_some_and(|original| original.initial == initial)
+            {
+                return Err(Refusal::ForeignSource);
+            }
+            if !state.runtime_installed
+                || state.owner_failure.is_none()
+                || state.phase != LogicalActorExitPhase::Installed
+            {
+                return Err(Refusal::NotRuntimeFailure);
+            }
+            if !state.role_ended || state.pending_native_returns != 0 {
+                return Err(Refusal::LocalWorkPending);
+            }
+            if state.native_body_exited {
+                return Ok(());
+            }
+            if state.native_body_cleanup_panic.is_some() {
+                return Err(Refusal::BodyUnproven);
+            }
+        }
+        if body.exiting
+            || body.pending_activated.is_some()
+            || body.dormant.has_owner_for_cleanup()
+            || body.dormant.drop_unproven()
+            || body
+                .session
+                .as_ref()
+                .is_some_and(crate::api::LogicalNativeSession::preparation_drop_unproven)
+        {
+            return Err(Refusal::BodyUnproven);
+        }
+        qualify_local_exit(&body)?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.close()));
+        // The same body mutex remains borrowed until its close receipt is
+        // stable, so another caller cannot turn an empty body into success.
+        let mut state = self.lock();
+        match result {
+            Ok(Ok(())) => {
+                state.native_body_exited = true;
+                state.native_pre_actor_started = false;
+            }
+            Ok(Err(())) => return Err(Refusal::BodyUnproven),
+            Err(original) => {
+                // A separate fixed slot preserves an earlier native_failure.
+                // body.exiting stays set and no later call retries its Drop.
+                state.native_body_cleanup_panic = Some(original);
+                return Err(Refusal::BodyDropPanicked);
+            }
+        }
+        drop(state);
+        drop(body);
+        self.notify();
+        Ok(())
+    }
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -235,6 +343,15 @@ impl OriginalLogicalExit {
         let mut s = self.lock();
         assert_eq!(s.association, Some(association));
         assert_eq!(s.phase, LogicalActorExitPhase::Reserved);
+        s.phase = LogicalActorExitPhase::Installed;
+    }
+    /// Commit the SAME source's install-only runtime affiliation. Ending
+    /// its role frame cannot close the Native body still used by that actor.
+    pub(super) fn runtime_installed_silent(&self, association: OriginalAssociation) {
+        let mut s = self.lock();
+        assert_eq!(s.association, Some(association));
+        assert_eq!(s.phase, LogicalActorExitPhase::Reserved);
+        s.runtime_installed = true;
         s.phase = LogicalActorExitPhase::Installed;
     }
     pub(super) fn native_pre_actor_started_silent(&self) {
@@ -350,6 +467,15 @@ impl OriginalLogicalExit {
     pub(super) fn consumer_failed_silent(&self) {
         self.lock().consumer_failed = true;
     }
+    /// Keep the original typed owner failure on the same outer statement/job
+    /// source. This is health only; actual role, Native and actor exits remain
+    /// independently required by disposition().
+    pub(super) fn retain_owner_failure_silent(&self, error: QueryExecutionError) {
+        self.lock().owner_failure.get_or_insert(error);
+    }
+    pub(super) fn owner_failure(&self) -> Option<QueryExecutionError> {
+        self.lock().owner_failure.clone()
+    }
     pub(super) fn run_failed(&self) -> bool {
         let state = self.lock();
         state.run_panic.is_some() || state.run_cleanup_panic.is_some()
@@ -365,7 +491,9 @@ impl OriginalLogicalExit {
         let s = self.lock();
         !s.health_disposed
             && (s.role_failed
+                || s.owner_failure.is_some()
                 || s.native_failure.is_some()
+                || s.native_body_cleanup_panic.is_some()
                 || s.run_panic.is_some()
                 || s.run_cleanup_panic.is_some()
                 || s.consumer_failed
@@ -400,7 +528,9 @@ impl OriginalLogicalExit {
         }
         let s = self.lock();
         s.role_failed
+            || s.owner_failure.is_some()
             || s.native_failure.is_some()
+            || s.native_body_cleanup_panic.is_some()
             || s.run_panic.is_some()
             || s.run_cleanup_panic.is_some()
             || s.consumer_failed
@@ -411,6 +541,7 @@ impl OriginalLogicalExit {
     pub(super) fn pending_actor(&self) -> bool {
         let s = self.lock();
         s.role_ended
+            && !s.runtime_installed
             && matches!(
                 s.phase,
                 LogicalActorExitPhase::Reserved | LogicalActorExitPhase::Installed
@@ -573,6 +704,11 @@ impl LogicalExecutionExitView<'_> {
     /// Diagnostic facts only; none substitutes for an actual local return.
     pub fn native_preparation_failure(&self) -> Option<&(dyn std::any::Any + Send)> {
         self.state.native_failure.as_deref()
+    }
+    /// The SAME body's failed final destructor, separate from an earlier
+    /// preparation cause. This observation never grants a local exit.
+    pub fn native_body_cleanup_panic(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.state.native_body_cleanup_panic.as_deref()
     }
     /// Health fact only; each raw consumer cause stays in its original attempt slot.
     pub fn internal_consumer_failed(&self) -> bool {
