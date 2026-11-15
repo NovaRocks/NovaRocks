@@ -28,7 +28,7 @@ CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows (
   id INT,
   value VARCHAR(16)
 )
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows VALUES
   (1, 'alpha'), (2, 'beta'), (3, 'gamma');
 
@@ -106,7 +106,6 @@ CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutat
 )
 TBLPROPERTIES (
   "format-version" = "3",
-  "write.row-lineage" = "true",
   "novarocks.statistics.collect-on-write" = "true"
 );
 INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutation VALUES

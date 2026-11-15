@@ -53,8 +53,7 @@ CREATE TABLE opt_ice_${uuid0}.ns_${uuid0}.orders (
   user_id INT,
   amount INT
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO opt_ice_${uuid0}.ns_${uuid0}.orders VALUES (1, 10, 100), (2, 20, 200);
 INSERT INTO opt_ice_${uuid0}.ns_${uuid0}.orders VALUES (3, 30, 300), (4, 40, 400);

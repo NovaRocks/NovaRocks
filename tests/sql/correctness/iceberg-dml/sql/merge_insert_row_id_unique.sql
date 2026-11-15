@@ -24,9 +24,9 @@
 DROP TABLE IF EXISTS ${case_db}.t_merge_row_id FORCE;
 DROP TABLE IF EXISTS ${case_db}.s_merge_row_id FORCE;
 CREATE TABLE ${case_db}.t_merge_row_id (id BIGINT, v STRING)
-TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true");
+TBLPROPERTIES ("format-version"="3");
 CREATE TABLE ${case_db}.s_merge_row_id (id BIGINT, v STRING)
-TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true");
+TBLPROPERTIES ("format-version"="3");
 INSERT INTO ${case_db}.t_merge_row_id VALUES (1,'a'),(2,'b'),(3,'c');
 INSERT INTO ${case_db}.s_merge_row_id VALUES (2,'bb'),(4,'d'),(5,'e');
 ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_merge_row_id CREATE TAG before_merge;

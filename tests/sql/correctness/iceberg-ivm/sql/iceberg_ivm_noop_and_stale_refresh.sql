@@ -50,8 +50,7 @@ CREATE TABLE ice_ivm_noop_${uuid0}.ns_${uuid0}.orders (
   amount BIGINT,
   region STRING
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ice_ivm_noop_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 10, 'east'),
   (2, 20, 'west'),

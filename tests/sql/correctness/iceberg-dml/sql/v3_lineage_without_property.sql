@@ -72,7 +72,7 @@ ORDER BY property_value;
 -- query 6
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.lineage_v2_${uuid0} (id BIGINT, v STRING)
-TBLPROPERTIES ('format-version'='2', 'write.row-lineage'='true');
+TBLPROPERTIES ('format-version'='2');
 INSERT INTO ${case_db}.lineage_v2_${uuid0} VALUES (1,'a');
 
 -- query 7

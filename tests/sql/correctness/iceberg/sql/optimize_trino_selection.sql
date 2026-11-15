@@ -32,7 +32,7 @@ PARTITION BY (p);
 CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows (k BIGINT)
 TBLPROPERTIES ('format-version' = '2');
 CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows (k BIGINT)
-TBLPROPERTIES ('format-version' = '3', 'write.row-lineage' = 'true');
+TBLPROPERTIES ('format-version' = '3');
 
 -- query 2
 ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.empty_rows OPTIMIZE;

@@ -55,8 +55,7 @@ CREATE TABLE ice_ivm_empty_delta_${uuid0}.ns_${uuid0}.orders (
   amount BIGINT,
   name STRING
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ice_ivm_empty_delta_${uuid0}.ns_${uuid0}.orders VALUES
   (200, 200, 'keep'),
   (1, 1, 'delete-miss'),

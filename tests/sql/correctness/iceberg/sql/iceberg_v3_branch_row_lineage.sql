@@ -50,7 +50,7 @@ PROPERTIES (
 );
 CREATE DATABASE br_rl_${uuid0}.ns_${uuid0};
 CREATE TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO br_rl_${uuid0}.ns_${uuid0}.brlineage VALUES (1, 10), (2, 20), (3, 30);
 
 -- query 2

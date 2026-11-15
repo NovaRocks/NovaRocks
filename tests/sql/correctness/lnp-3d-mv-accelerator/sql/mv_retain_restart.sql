@@ -40,7 +40,7 @@ PROPERTIES (
 );
 CREATE DATABASE lnp3d_retain_${uuid0}.ns_${uuid0};
 CREATE TABLE lnp3d_retain_${uuid0}.ns_${uuid0}.orders (k1 INT NOT NULL, v1 BIGINT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO lnp3d_retain_${uuid0}.ns_${uuid0}.orders VALUES (1, 10), (2, 20);
 USE lnp3d_retain_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_mv

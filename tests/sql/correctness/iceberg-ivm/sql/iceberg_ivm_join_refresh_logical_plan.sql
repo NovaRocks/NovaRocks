@@ -48,14 +48,12 @@ CREATE TABLE ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_left_${uuid0} (
   region STRING,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_right_${uuid0} (
   id BIGINT NOT NULL,
   category STRING
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 USE ice_ivm_join_logical_${uuid0}.ns_${uuid0};
 
 -- query 2

@@ -26,10 +26,10 @@
 CREATE DATABASE lake_publication_${suite_uuid0}.ns_${uuid0};
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.delete_rows (
   id BIGINT, value BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true", "commit.retry.num-retries" = "3", "commit.retry.min-wait-ms" = "0", "commit.retry.max-wait-ms" = "0");
+) TBLPROPERTIES ("format-version" = "3", "commit.retry.num-retries" = "3", "commit.retry.min-wait-ms" = "0", "commit.retry.max-wait-ms" = "0");
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows (
   id BIGINT, value BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true", "commit.retry.num-retries" = "3", "commit.retry.min-wait-ms" = "0", "commit.retry.max-wait-ms" = "0");
+) TBLPROPERTIES ("format-version" = "3", "commit.retry.num-retries" = "3", "commit.retry.min-wait-ms" = "0", "commit.retry.max-wait-ms" = "0");
 INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.delete_rows VALUES (1, 10), (2, 20);
 INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows VALUES (1, 10);
 INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows VALUES (2, 20);

@@ -26,7 +26,7 @@ CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_ref_db_${uuid0};
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_ref_db_${uuid0}.t_ref_${uuid0} (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

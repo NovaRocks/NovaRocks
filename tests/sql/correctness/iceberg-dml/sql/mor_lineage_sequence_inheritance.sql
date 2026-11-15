@@ -27,7 +27,6 @@ DROP TABLE IF EXISTS ${case_db}.s_mor_lineage_sequence FORCE;
 CREATE TABLE ${case_db}.t_mor_lineage_sequence (id BIGINT, v STRING)
 TBLPROPERTIES (
   "format-version" = "3",
-  "write.row-lineage" = "true",
   "novarocks.update.mode" = "merge-on-read"
 );
 INSERT INTO ${case_db}.t_mor_lineage_sequence VALUES (1, 'a'), (2, 'b'), (3, 'c');
@@ -50,7 +49,7 @@ ORDER BY id;
 -- query 5
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.s_mor_lineage_sequence (id BIGINT, v STRING)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.s_mor_lineage_sequence VALUES (2, 'bbb'), (4, 'd');
 MERGE INTO ${case_db}.t_mor_lineage_sequence AS t
 USING ${case_db}.s_mor_lineage_sequence AS s

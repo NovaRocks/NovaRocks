@@ -29,8 +29,7 @@ CREATE TABLE mv_direct_base_${uuid0} (
   id BIGINT,
   metric INT
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO mv_direct_base_${uuid0} VALUES
   (1, 10),

@@ -47,8 +47,7 @@ CREATE TABLE pir8_mv_cut_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
   v2 BIGINT
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO pir8_mv_cut_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 10),

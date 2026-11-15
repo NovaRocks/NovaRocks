@@ -51,15 +51,13 @@ CREATE TABLE imv_jagg_cut_${uuid0}.ns_${uuid0}.fact (
   dim_id BIGINT,
   amount BIGINT
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 CREATE TABLE imv_jagg_cut_${uuid0}.ns_${uuid0}.dim (
   id BIGINT NOT NULL,
   region STRING
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO imv_jagg_cut_${uuid0}.ns_${uuid0}.dim VALUES
   (10, 'east'),

@@ -52,7 +52,7 @@ PROPERTIES (
 );
 CREATE DATABASE uniq_${uuid0}.ns_${uuid0};
 CREATE TABLE uniq_${uuid0}.ns_${uuid0}.uniq (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true

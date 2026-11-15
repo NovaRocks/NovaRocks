@@ -29,8 +29,7 @@ CREATE TABLE ${case_db}.t_full_overwrite_lineage (
   v INT
 )
 TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.t_full_overwrite_lineage VALUES
   (1, 10),

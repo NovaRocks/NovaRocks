@@ -36,8 +36,7 @@ CREATE TABLE ${case_db}.orders_shape (
   v2 BIGINT
 )
 TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.orders_shape VALUES (1, 10);
 CREATE MATERIALIZED VIEW ${case_db}.orders_shape_mv

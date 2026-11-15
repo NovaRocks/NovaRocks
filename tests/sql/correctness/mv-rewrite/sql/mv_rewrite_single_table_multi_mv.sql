@@ -64,7 +64,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.user_tags (
   user_id INT,
   user_name STRING,
   tag_id INT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true

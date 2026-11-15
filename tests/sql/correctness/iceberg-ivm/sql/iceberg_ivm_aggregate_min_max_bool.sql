@@ -51,8 +51,7 @@ CREATE TABLE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events (
   region STRING,
   flag BOOLEAN
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 USE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0};
 
 -- query 2

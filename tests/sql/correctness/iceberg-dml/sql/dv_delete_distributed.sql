@@ -31,8 +31,7 @@ CREATE TABLE ${case_db}.t_dv_delete_distributed (
 )
 PARTITION BY bucket(g, 4)
 TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.t_dv_delete_distributed VALUES
   (1, 10, 100),

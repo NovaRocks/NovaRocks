@@ -63,7 +63,7 @@ CREATE TABLE mvsc_${uuid0}.ns_${uuid0}.moves (
   account STRING,
   peer STRING,
   amount BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true

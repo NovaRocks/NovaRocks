@@ -24,7 +24,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.src (id INT, name VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true

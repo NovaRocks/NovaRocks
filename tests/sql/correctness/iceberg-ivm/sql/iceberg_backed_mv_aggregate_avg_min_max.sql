@@ -57,8 +57,7 @@ CREATE TABLE mv_agg2_${uuid0}.ns_${uuid0}.measurements (
   s STRING,
   ts DATETIME
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO mv_agg2_${uuid0}.ns_${uuid0}.measurements VALUES
   (1, 10,   100.5000, 'apple',  '2024-01-01 00:00:00'),
   (1, 20,   200.0000, 'banana', '2024-02-01 00:00:00'),

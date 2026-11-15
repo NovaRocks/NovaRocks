@@ -64,15 +64,13 @@ CREATE TABLE ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact (
   dim_id BIGINT,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ice_ivm_ujoin_${uuid0}.ns_${uuid0}.dim (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 USE ice_ivm_ujoin_${uuid0}.ns_${uuid0};
 
 -- query 2

@@ -70,7 +70,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.t1 (
   k3 BIGINT,
   k4 STRING,
   v1 BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- k2 cycles a/b/NULL; k4 covers two months; k3 has 3 buckets

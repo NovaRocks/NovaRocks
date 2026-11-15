@@ -27,15 +27,13 @@ CREATE TABLE ${case_db}.sqlx2_update_from_target (
   id BIGINT,
   v STRING
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 CREATE TABLE ${case_db}.sqlx2_update_from_source (
   id BIGINT,
   new_v STRING
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.sqlx2_update_from_target VALUES (1, 'a'), (2, 'b');
 INSERT INTO ${case_db}.sqlx2_update_from_source VALUES (2, 'bb');

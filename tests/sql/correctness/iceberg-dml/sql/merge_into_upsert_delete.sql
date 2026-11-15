@@ -29,7 +29,7 @@ CREATE TABLE ${case_db}.t_merge_target (
   city_id INT,
   population INT,
   city STRING
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_merge_source (
   city_id INT,
   population INT,

@@ -19,7 +19,7 @@
 -- Exercise the signed narrow domain through row mutation and delete recipes.
 -- query 1
 CREATE TABLE ${case_db}.scalar_integer_mutation(id INT,t TINYINT,age SMALLINT)
-TBLPROPERTIES ("format-version"="3","write.row-lineage"="true");
+TBLPROPERTIES ("format-version"="3");
 INSERT INTO ${case_db}.scalar_integer_mutation VALUES (1,127,32767),(2,-128,-32768),(3,NULL,7);
 SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
 

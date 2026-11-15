@@ -40,7 +40,6 @@ CREATE TABLE ${case_db}.t_v3_merge_mor (
 )
 TBLPROPERTIES (
   "format-version" = "3",
-  "write.row-lineage" = "true",
   "novarocks.update.mode" = "merge-on-read"
 );
 INSERT INTO ${case_db}.t_v3_merge_mor VALUES
@@ -51,8 +50,7 @@ CREATE TABLE ${case_db}.s_v3_merge_mor (
   v STRING
 )
 TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.s_v3_merge_mor VALUES
   (2, 'bb'),

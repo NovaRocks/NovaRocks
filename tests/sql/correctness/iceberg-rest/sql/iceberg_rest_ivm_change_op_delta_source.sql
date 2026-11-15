@@ -32,8 +32,7 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0} (
   customer STRING,
   amount BIGINT
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0} VALUES
   (1, 'Alice', 100),

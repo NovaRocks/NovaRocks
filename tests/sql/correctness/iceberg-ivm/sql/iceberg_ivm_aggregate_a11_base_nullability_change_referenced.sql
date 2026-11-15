@@ -47,8 +47,7 @@ CREATE TABLE ice_ivm_agg_a11_null_${uuid0}.ns_${uuid0}.orders (
   region STRING NOT NULL,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ice_ivm_agg_a11_null_${uuid0}.ns_${uuid0}.orders VALUES ('east', 10), ('west', 5);
 USE ice_ivm_agg_a11_null_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW agg_mv_${uuid0}

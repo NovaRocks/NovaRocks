@@ -55,14 +55,12 @@ CREATE TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders (
   user_id BIGINT,
   order_amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.users (
   id BIGINT NOT NULL,
   user_region STRING
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 USE ice_ivm_jmm_${uuid0}.ns_${uuid0};
 
 -- query 2

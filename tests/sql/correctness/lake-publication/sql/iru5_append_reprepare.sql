@@ -28,7 +28,6 @@ CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows (
   id BIGINT, writer VARCHAR(16)
 ) TBLPROPERTIES (
   "format-version" = "3",
-  "write.row-lineage" = "true",
   "commit.retry.num-retries" = "3",
   "commit.retry.min-wait-ms" = "0",
   "commit.retry.max-wait-ms" = "0",

@@ -38,7 +38,7 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_id (id INT, region VARCHAR(8))
 PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -70,7 +70,7 @@ SELECT id, region FROM ${case_db}.t_id WHERE region = 'us' ORDER BY id;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_empty_sel (id INT, region VARCHAR(8))
 PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 8
 -- @skip_result_check=true
@@ -99,7 +99,7 @@ SELECT region, COUNT(*) AS n FROM ${case_db}.t_empty_sel GROUP BY region ORDER B
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_dv (id INT, region VARCHAR(8))
 PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 12
 -- @skip_result_check=true
@@ -133,7 +133,7 @@ SELECT id, region FROM ${case_db}.t_dv ORDER BY id;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_branch (id INT, region VARCHAR(8))
 PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 18
 -- @skip_result_check=true
@@ -173,7 +173,7 @@ ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_branch DROP BRANCH IF EX
 -- query 25
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_no_part (id INT, v VARCHAR(8))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 26
 -- @expect_error=PARTITIONS

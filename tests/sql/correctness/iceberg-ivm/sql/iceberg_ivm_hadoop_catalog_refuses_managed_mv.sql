@@ -49,8 +49,7 @@ CREATE TABLE ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders (
   region STRING,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- Keep the source logically empty while giving lineage admission a real v3 snapshot.
 INSERT INTO ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders VALUES ('__rwm5_lineage_seed', 0);

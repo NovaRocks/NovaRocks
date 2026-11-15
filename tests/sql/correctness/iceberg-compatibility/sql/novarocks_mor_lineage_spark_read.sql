@@ -24,7 +24,7 @@
 -- @skip_result_check=true
 CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} (id BIGINT, value INT)
-TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true",
+TBLPROPERTIES ("format-version"="3",
   "novarocks.update.mode"="merge-on-read");
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} VALUES (1,10),(2,20),(3,30),(4,40);
 UPDATE iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} SET value = 220 WHERE id = 2;

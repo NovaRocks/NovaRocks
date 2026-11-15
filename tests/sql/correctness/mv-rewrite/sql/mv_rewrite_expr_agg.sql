@@ -68,7 +68,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.t1 (
   k1 STRING,
   k6 INT,
   k9 BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true

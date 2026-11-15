@@ -30,8 +30,7 @@ CREATE TABLE ${case_db}.t_update_assignment_conversion (
   nullable_text STRING,
   required_text STRING NOT NULL
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.t_update_assignment_conversion VALUES
   (1, 0, '2020-01-01', '2020-01-01 00:00:00', 0, 'before', 'required'),
@@ -92,8 +91,7 @@ CREATE TABLE ${case_db}.t_update_assignment_nonfinite (
   required_float FLOAT NOT NULL,
   required_double DOUBLE NOT NULL
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.t_update_assignment_nonfinite VALUES
   (1, 'NaN', 21, 22, 11, 12),

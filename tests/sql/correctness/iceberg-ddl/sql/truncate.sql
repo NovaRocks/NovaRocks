@@ -34,7 +34,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_v3 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -111,7 +111,7 @@ SELECT id, v FROM ${case_db}.t_v2 ORDER BY id;
 -- query 15
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_empty (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 16
 -- Empty before TRUNCATE.
@@ -144,7 +144,7 @@ SELECT id, v FROM ${case_db}.t_empty ORDER BY id;
 -- @skip_result_check=true
 -- v3 + row-lineage required for branch writes.
 CREATE TABLE ${case_db}.t_branch (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 22
 -- @skip_result_check=true
@@ -197,7 +197,7 @@ ALTER TABLE iceberg_ddl_cat_${suite_uuid0}.${case_db}.t_branch DROP BRANCH IF EX
 -- query 30
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_dv (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 31
 -- @skip_result_check=true

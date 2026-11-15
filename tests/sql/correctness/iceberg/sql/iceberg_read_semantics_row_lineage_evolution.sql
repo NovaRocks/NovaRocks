@@ -27,8 +27,7 @@ CREATE TABLE ${case_db}.read_sem_rl (
   id BIGINT NOT NULL,
   amount FLOAT
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.read_sem_rl VALUES
   (1, 10.5),

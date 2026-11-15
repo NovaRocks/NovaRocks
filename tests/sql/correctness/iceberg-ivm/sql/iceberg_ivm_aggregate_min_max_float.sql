@@ -57,8 +57,7 @@ CREATE TABLE ice_ivm_float_db_${uuid0}.ns_${uuid0}.measurements (
   region STRING,
   reading DOUBLE
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 USE ice_ivm_float_db_${uuid0}.ns_${uuid0};
 
 -- query 2

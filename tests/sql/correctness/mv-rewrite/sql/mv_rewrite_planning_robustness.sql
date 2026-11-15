@@ -68,7 +68,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.sales_data (
   order_id BIGINT,
   category_l1 STRING,
   sales_amount BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true
@@ -161,7 +161,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.part_sales (
   amount BIGINT
 )
 PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 19
 -- @skip_result_check=true

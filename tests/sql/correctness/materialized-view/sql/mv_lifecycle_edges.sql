@@ -32,8 +32,7 @@ CREATE TABLE orders_edges_${uuid0} (
   v2 BIGINT
 )
 TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO orders_edges_${uuid0} VALUES
   (1, 10),

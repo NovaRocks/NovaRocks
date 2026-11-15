@@ -45,8 +45,7 @@ CREATE TABLE ice_ivm_policy_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
   v2 BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 -- Establish a real v3 source snapshot before testing MV policy metadata.
 INSERT INTO ice_ivm_policy_${uuid0}.ns_${uuid0}.orders VALUES (1, 1);
 USE ice_ivm_policy_${uuid0}.ns_${uuid0};

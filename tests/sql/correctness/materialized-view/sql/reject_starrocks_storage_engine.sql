@@ -20,7 +20,7 @@ CREATE DATABASE IF NOT EXISTS ${case_db};
 
 -- query 2
 CREATE TABLE ${case_db}.base (id int)
-TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true");
+TBLPROPERTIES ("format-version"="3");
 
 -- query 3
 -- @expect_error=storage_engine='starrocks'

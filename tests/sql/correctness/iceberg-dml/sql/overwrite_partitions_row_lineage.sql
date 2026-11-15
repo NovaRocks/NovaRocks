@@ -29,8 +29,7 @@ CREATE TABLE ${case_db}.t_partition_overwrite_lineage (
 )
 PARTITION BY (region)
 TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.t_partition_overwrite_lineage VALUES
   (1, 'us'),

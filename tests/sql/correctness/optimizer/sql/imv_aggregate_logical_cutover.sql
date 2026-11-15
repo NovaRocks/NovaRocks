@@ -50,8 +50,7 @@ CREATE TABLE imv_agg_cut_${uuid0}.ns_${uuid0}.orders (
   region STRING,
   amount BIGINT
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO imv_agg_cut_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 'east', 10),

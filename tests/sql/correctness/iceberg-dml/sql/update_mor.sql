@@ -34,7 +34,6 @@ CREATE TABLE ${case_db}.t_v3_update_mor (
 )
 TBLPROPERTIES (
   "format-version" = "3",
-  "write.row-lineage" = "true",
   "novarocks.update.mode" = "merge-on-read"
 );
 INSERT INTO ${case_db}.t_v3_update_mor VALUES

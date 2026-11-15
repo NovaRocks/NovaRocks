@@ -57,7 +57,7 @@ CREATE DATABASE mvsc_${uuid0}.ns_${uuid0};
 CREATE TABLE mvsc_${uuid0}.ns_${uuid0}.readings (
   sensor STRING,
   value BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) TBLPROPERTIES ("format-version" = "3");
 -- A source without any snapshot has no exact read point. Leave a current
 -- snapshot whose visible rows are empty, so the first refresh can publish a
 -- proven zero-row result rather than skip an unversioned source.

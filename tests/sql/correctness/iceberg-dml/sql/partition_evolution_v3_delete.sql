@@ -30,8 +30,7 @@ CREATE TABLE ${case_db}.t_partition_evolution_v3_delete (
 )
 PARTITION BY bucket(user_id, 4)
 TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.t_partition_evolution_v3_delete VALUES
   (1, 10, 100),

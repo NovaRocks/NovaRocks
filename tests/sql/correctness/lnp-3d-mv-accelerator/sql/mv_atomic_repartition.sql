@@ -51,7 +51,7 @@ CREATE TABLE lnp3d_repart_${uuid0}.ns_${uuid0}.orders (
   region STRING,
   v1 BIGINT
 )
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO lnp3d_repart_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 'east', 10),
   (2, 'west', 20),

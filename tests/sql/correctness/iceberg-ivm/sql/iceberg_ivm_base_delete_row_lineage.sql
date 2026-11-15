@@ -51,8 +51,7 @@ CREATE TABLE ice_ivm_row_lineage_${uuid0}.ns_${uuid0}.orders_${uuid0} (
   amount BIGINT,
   customer STRING
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ice_ivm_row_lineage_${uuid0}.ns_${uuid0}.orders_${uuid0} VALUES
   (1, 100, 'Alice'),
   (2, 40, 'Bob'),

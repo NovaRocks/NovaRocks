@@ -29,7 +29,7 @@ CREATE DATABASE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0};
 -- @skip_result_check=true
 -- Create v3 row-lineage table (branch writes require v3).
 CREATE TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0} (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

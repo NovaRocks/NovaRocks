@@ -24,7 +24,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_update_ref_sequence (id BIGINT, v STRING)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true",
+TBLPROPERTIES ("format-version" = "3",
  "write.update.mode" = "copy-on-write");
 INSERT INTO ${case_db}.t_update_ref_sequence VALUES (1, 'a'), (2, 'b');
 ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_update_ref_sequence CREATE BRANCH dev;

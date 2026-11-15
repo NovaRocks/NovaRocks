@@ -60,8 +60,7 @@ CREATE TABLE mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0} (
   col_int INT,
   dt DATE
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0} VALUES
   ('1d8cf2a2c0e14fa89d8117792be6eb6f', 2000, '2023-12-01'),
   ('3e82e36e56718dc4abc1168d21ec91ab', 2000, '2023-12-01'),
@@ -121,8 +120,7 @@ CREATE TABLE mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0} (
   col_int INT,
   dt DATE
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0} VALUES
   ('1d8cf2a2c0e14fa89d8117792be6eb6f', 2000, '2023-12-01'),
   ('3e82e36e56718dc4abc1168d21ec91ab', 2000, '2023-12-01');

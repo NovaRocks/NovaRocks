@@ -61,7 +61,6 @@ CREATE TABLE mv_merge_mor_ice_${uuid0}.ns_${uuid0}.orders (
   amount BIGINT
 )
 TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true",
   "novarocks.update.mode" = "merge-on-read");
 INSERT INTO mv_merge_mor_ice_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 'open', 10),
@@ -71,8 +70,7 @@ CREATE TABLE mv_merge_mor_ice_${uuid0}.ns_${uuid0}.staging (
   status STRING,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO mv_merge_mor_ice_${uuid0}.ns_${uuid0}.staging VALUES
   (2, 'open', 25),
   (3, 'open', 30);

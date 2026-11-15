@@ -28,15 +28,13 @@ CREATE TABLE ${case_db}.sqlx2_mor_update_target (
   v STRING
 ) TBLPROPERTIES (
   "format-version" = "3",
-  "write.row-lineage" = "true",
   "novarocks.update.mode" = "merge-on-read"
 );
 CREATE TABLE ${case_db}.sqlx2_mor_update_source (
   id BIGINT,
   new_v STRING
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.sqlx2_mor_update_target VALUES (1, 'a');
 INSERT INTO ${case_db}.sqlx2_mor_update_source VALUES (1, 'x'), (1, 'y');

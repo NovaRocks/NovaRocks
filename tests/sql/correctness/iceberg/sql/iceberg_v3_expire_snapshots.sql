@@ -41,7 +41,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -82,7 +82,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t1;
 -- query 9
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t2 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 10
 -- @skip_result_check=true
@@ -117,7 +117,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t2;
 -- query 16
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t3 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 17
 -- @skip_result_check=true
@@ -145,7 +145,7 @@ SELECT id, v FROM ${case_db}.t3 ORDER BY id;
 -- query 21
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t4 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 22
 -- @skip_result_check=true
@@ -218,7 +218,7 @@ ALTER TABLE ${case_db}.t6 EXPIRE SNAPSHOTS RETAIN LAST 0;
 -- query 34
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t7 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 35
 -- @expect_error=does not support branch
@@ -263,7 +263,7 @@ SELECT id, v FROM ${case_db}.t8 ORDER BY id;
 -- query 42
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t9 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 43
 -- @skip_result_check=true
@@ -292,7 +292,7 @@ SELECT id, v FROM ${case_db}.t9 ORDER BY id;
 -- query 47
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t10 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 48
 -- @expect_error=duplicate
@@ -311,7 +311,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t10;
 -- query 50
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t11 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 51
 -- @skip_result_check=true

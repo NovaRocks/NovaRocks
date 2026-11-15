@@ -54,22 +54,19 @@ CREATE TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 (
   region STRING,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 -- Give every source a real v3 snapshot before testing unrelated UNION shape admission.
 INSERT INTO ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 VALUES (1, 'seed', 1);
 INSERT INTO ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 VALUES (1, 'seed', 1);

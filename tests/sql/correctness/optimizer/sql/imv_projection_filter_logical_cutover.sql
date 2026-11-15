@@ -48,8 +48,7 @@ CREATE TABLE imv_pf_cut_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
   v2 BIGINT
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO imv_pf_cut_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 10), (1, 20), (2, 40), (3, 5);

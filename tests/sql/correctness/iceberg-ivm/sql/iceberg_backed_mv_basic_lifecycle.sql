@@ -49,8 +49,7 @@ CREATE TABLE mv_ice_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
   v2 BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO mv_ice_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 10),
   (2, 20),

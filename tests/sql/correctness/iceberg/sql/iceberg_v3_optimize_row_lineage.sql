@@ -54,7 +54,7 @@ PROPERTIES (
 );
 CREATE DATABASE opt_rl_${uuid0}.ns_${uuid0};
 CREATE TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES (1, 10), (2, 20);
 INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES (3, 30), (4, 40);
 INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES (5, 50), (6, 60);

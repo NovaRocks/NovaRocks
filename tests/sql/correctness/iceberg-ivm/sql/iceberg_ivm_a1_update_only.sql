@@ -53,8 +53,7 @@ CREATE TABLE ice_ivm_upd_${uuid0}.ns_${uuid0}.sales_${uuid0} (
   region STRING,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 USE ice_ivm_upd_${uuid0}.ns_${uuid0};
 
 -- query 2

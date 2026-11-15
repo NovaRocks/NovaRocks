@@ -26,8 +26,7 @@ CREATE TABLE ${case_db}.sqlx2_delete_without_where (
   id BIGINT,
   v STRING
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.sqlx2_delete_without_where VALUES (1, 'a');
 

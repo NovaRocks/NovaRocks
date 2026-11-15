@@ -29,7 +29,7 @@ CREATE TABLE ${case_db}.trc_l7_measurements (
   s STRING,
   ts DATETIME
 )
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @expect_error=Iceberg IMV refresh contract requires exactly one argument for aggregate function `avg`

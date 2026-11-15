@@ -52,8 +52,7 @@ CREATE TABLE ice_ivm_a11_drop_add_${uuid0}.ns_${uuid0}.base_${uuid0} (
   region STRING,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ice_ivm_a11_drop_add_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES
   (1, 'US', 100),
   (2, 'EU', 50);

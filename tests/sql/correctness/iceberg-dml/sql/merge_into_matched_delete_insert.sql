@@ -42,7 +42,6 @@ CREATE TABLE ${case_db}.t_v3_merge_matched_delete_insert (
 )
 TBLPROPERTIES (
   "format-version" = "3",
-  "write.row-lineage" = "true",
   "novarocks.update.mode" = "merge-on-read"
 );
 INSERT INTO ${case_db}.t_v3_merge_matched_delete_insert VALUES
@@ -53,8 +52,7 @@ CREATE TABLE ${case_db}.s_v3_merge_matched_delete_insert (
   v STRING
 )
 TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.s_v3_merge_matched_delete_insert VALUES
   (2, 'b'),

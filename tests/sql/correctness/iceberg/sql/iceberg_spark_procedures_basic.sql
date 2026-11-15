@@ -44,8 +44,7 @@ CREATE TABLE proc_ice_${uuid0}.ns_${uuid0}.orders (
   id INT,
   amount INT
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO proc_ice_${uuid0}.ns_${uuid0}.orders VALUES (1, 10);
 

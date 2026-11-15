@@ -51,8 +51,7 @@ CREATE TABLE ice_ivm_opt_replace_${uuid0}.ns_${uuid0}.fact (
   amount BIGINT
 )
 TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 USE ice_ivm_opt_replace_${uuid0}.ns_${uuid0};
 INSERT INTO fact VALUES (1, 'east', 10);

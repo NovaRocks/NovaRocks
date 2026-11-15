@@ -51,7 +51,7 @@ CREATE DATABASE mvocc_${uuid0}.ns_${uuid0};
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE mvocc_${uuid0}.ns_${uuid0}.fact (k STRING, v BIGINT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO mvocc_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 
 -- query 4

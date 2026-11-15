@@ -68,7 +68,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.lineorder (
   lo_linenumber INT,
   lo_quantity INT,
   lo_revenue INT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true

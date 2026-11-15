@@ -25,7 +25,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE state_base (k BIGINT NOT NULL, v BIGINT)
-TBLPROPERTIES ('format-version' = '3', 'write.row-lineage' = 'true');
+TBLPROPERTIES ('format-version' = '3');
 INSERT INTO state_base VALUES (1, 10), (2, 20);
 CREATE MATERIALIZED VIEW state_manual DISTRIBUTED BY HASH(k) BUCKETS 1
 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg')

@@ -34,8 +34,7 @@ CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.mv_interop_base_${uuid0} (
   id BIGINT,
   amount INT
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 
 -- query 3

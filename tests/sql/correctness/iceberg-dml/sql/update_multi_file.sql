@@ -29,8 +29,7 @@ CREATE TABLE ${case_db}.t_v3_update_multi_file (
   v STRING
 )
 TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO ${case_db}.t_v3_update_multi_file VALUES (1, 'a');
 INSERT INTO ${case_db}.t_v3_update_multi_file VALUES (2, 'b');

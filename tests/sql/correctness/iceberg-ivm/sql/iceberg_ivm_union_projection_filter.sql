@@ -51,15 +51,13 @@ CREATE TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live (
   name STRING,
   amount INT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_archive (
   id INT NOT NULL,
   name STRING,
   amount INT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 USE ice_ivm_union_pf_${uuid0}.ns_${uuid0};
 
 -- query 2

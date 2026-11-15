@@ -51,8 +51,7 @@ CREATE TABLE mv_strategy_ice_${uuid0}.ns_${uuid0}.orders (
   customer STRING,
   amount BIGINT
 )
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO mv_strategy_ice_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 'A', 10),
   (2, 'A', 20),

@@ -31,7 +31,7 @@ SELECT * FROM system.metadata.materialized_views WHERE false;
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE system_base (k1 INT NOT NULL, v2 BIGINT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO system_base VALUES (1, 10);
 CREATE MATERIALIZED VIEW system_mv
 DISTRIBUTED BY HASH(k1) BUCKETS 1

@@ -42,7 +42,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -82,7 +82,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t1;
 -- query 9
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t2 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 10
 -- Table is empty before REMOVE ORPHAN FILES.
@@ -107,7 +107,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t2;
 -- query 13
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t3 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 14
 -- @skip_result_check=true
@@ -162,7 +162,7 @@ ALTER TABLE ${case_db}.t4 REMOVE ORPHAN FILES;
 -- query 23
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t5 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 24
 -- @expect_error=does not support branch
@@ -208,7 +208,7 @@ SELECT id, v FROM ${case_db}.t6 ORDER BY id;
 -- query 31
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t7 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 32
 -- @skip_result_check=true
@@ -250,7 +250,7 @@ ALTER TABLE ${case_db}.t8 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00' W
 -- query 38
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t9 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 39
 -- @skip_result_check=true
@@ -283,7 +283,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t9;
 -- query 44
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t10 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 45
 -- @skip_result_check=true

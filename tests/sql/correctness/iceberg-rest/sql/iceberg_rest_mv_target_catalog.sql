@@ -32,8 +32,7 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0} (
   id INT,
   name STRING
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 INSERT INTO iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0}
 VALUES (1, 'a'), (2, 'b');

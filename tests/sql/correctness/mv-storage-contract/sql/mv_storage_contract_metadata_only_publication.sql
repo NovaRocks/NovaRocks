@@ -49,7 +49,7 @@ CREATE DATABASE mvmeta_${uuid0}.ns_${uuid0};
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE mvmeta_${uuid0}.ns_${uuid0}.fact (k STRING, v BIGINT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true

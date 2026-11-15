@@ -65,7 +65,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.events (
   dt STRING,
   region STRING,
   amount BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- dt in {2021-07-25, 2021-08-05, 2021-08-15, 2021-08-25, 2021-09-01}

@@ -42,8 +42,7 @@ CREATE DATABASE proc_err_${uuid0}.ns_${uuid0};
 CREATE TABLE proc_err_${uuid0}.ns_${uuid0}.orders (
   id INT
 ) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 CREATE TABLE proc_err_${uuid0}.ns_${uuid0}.v2_orders (
   id INT
