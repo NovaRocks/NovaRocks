@@ -1342,16 +1342,18 @@ mod tests {
         let after = publisher.metadata.lock().unwrap().clone();
         let snapshot = after.current_snapshot().unwrap();
         let list_path = snapshot.manifest_list().to_owned();
-        let events = trace.lock().unwrap();
-        assert!(events.iter().any(|event| event.operation == "read"));
-        assert!(
-            events
-                .iter()
-                .filter(|event| event.operation == "read")
-                .all(|event| event.path == old_list || event.path == list_path),
-            "{events:?}"
-        );
-        drop(events);
+        {
+            let events = trace.lock().unwrap();
+            assert!(events.iter().any(|event| event.operation == "read"));
+            assert!(
+                events
+                    .iter()
+                    .filter(|event| event.operation == "read")
+                    .all(|event| event.path == old_list || event.path == list_path),
+                "{events:?}"
+            );
+        }
+
         let reader = fixture.operation.begin_attempt().unwrap();
         let list = crate::manifest::load_manifest_list(snapshot, reader.file_io(), &after)
             .await
@@ -3072,7 +3074,7 @@ mod tests {
                             .unwrap(),
                         source.descriptor.content,
                         entries,
-                        &[self.source_path.clone()],
+                        std::slice::from_ref(&self.source_path),
                     )
                     .await?,
                 );

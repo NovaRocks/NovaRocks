@@ -381,8 +381,9 @@ mod tests {
                 .find_rewrite(&ledger, 0, &[1], &latest)
                 .unwrap()
                 .unwrap()
-                .outputs,
-            [output.clone()]
+                .outputs
+                .as_slice(),
+            std::slice::from_ref(&output)
         );
         assert!(
             index

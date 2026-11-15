@@ -461,6 +461,87 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::DataInvalid, message)
 }
 
+// Iceberg schema identifiers are a set. The SDK serializes the HashSet as
+// an array in iteration order, which must not become a retry dependency.
+fn canonicalize_schema_identifier_ids(schema: &mut serde_json::Value) -> Result<()> {
+    let Some(value) = schema.get_mut("identifier-field-ids") else {
+        return Ok(());
+    };
+    let identifiers = value
+        .as_array_mut()
+        .ok_or_else(|| invalid("Serialized schema identifier fields are not an array"))?;
+    let mut ordered = identifiers
+        .iter()
+        .map(|id| {
+            id.as_i64()
+                .and_then(|id| i32::try_from(id).ok())
+                .ok_or_else(|| invalid("Serialized schema identifier field is not an i32"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ordered.sort_unstable();
+    *identifiers = ordered.into_iter().map(serde_json::Value::from).collect();
+    Ok(())
+}
+
+pub(crate) fn encoding_basis(
+    metadata: &crate::iceberg::spec::TableMetadata,
+) -> crate::iceberg::Result<Vec<u8>> {
+    let mut schemas = metadata.schemas_iter().collect::<Vec<_>>();
+    schemas.sort_by_key(|schema| schema.schema_id());
+    let schemas = schemas
+        .into_iter()
+        .map(|schema| {
+            let mut value = serde_json::to_value(schema).map_err(|error| {
+                invalid("Cannot encode manifest reuse schema").with_source(error)
+            })?;
+            canonicalize_schema_identifier_ids(&mut value)?;
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut specs = metadata.partition_specs_iter().collect::<Vec<_>>();
+    specs.sort_by_key(|spec| spec.spec_id());
+    serde_json::to_vec(&(
+        metadata.format_version(),
+        metadata.current_schema_id(),
+        schemas,
+        specs,
+    ))
+    .map_err(|error| invalid("Cannot encode manifest reuse dependencies").with_source(error))
+}
+
+pub(crate) fn descriptor_owned_bytes(
+    files: &[crate::iceberg::spec::ManifestFile],
+) -> crate::iceberg::Result<u64> {
+    let mut bytes = files
+        .len()
+        .checked_mul(2 * std::mem::size_of::<crate::iceberg::spec::ManifestFile>())
+        .ok_or_else(|| invalid("manifest descriptor overflow"))?;
+    for file in files {
+        bytes = bytes
+            .checked_add(file.manifest_path.len())
+            .and_then(|v| v.checked_add(file.key_metadata.as_ref().map_or(0, Vec::len)))
+            .ok_or_else(|| invalid("manifest descriptor overflow"))?;
+        if let Some(partitions) = &file.partitions {
+            bytes = bytes
+                .checked_add(
+                    partitions
+                        .len()
+                        .checked_mul(2 * std::mem::size_of::<crate::iceberg::spec::FieldSummary>())
+                        .ok_or_else(|| invalid("manifest descriptor overflow"))?,
+                )
+                .ok_or_else(|| invalid("manifest descriptor overflow"))?;
+            for p in partitions {
+                for bound in [&p.lower_bound, &p.upper_bound].into_iter().flatten() {
+                    bytes = bytes
+                        .checked_add(bound.len())
+                        .ok_or_else(|| invalid("manifest descriptor overflow"))?;
+                }
+            }
+        }
+    }
+    u64::try_from(bytes).map_err(|_| invalid("manifest descriptor overflow"))
+}
+
 #[cfg(test)]
 mod tests {
     use apache_avro::{Reader, types::Value};
@@ -957,85 +1038,4 @@ mod tests {
             serde_json::json!([1, 2, 3])
         );
     }
-}
-
-// Iceberg schema identifiers are a set. The SDK serializes the HashSet as
-// an array in iteration order, which must not become a retry dependency.
-fn canonicalize_schema_identifier_ids(schema: &mut serde_json::Value) -> Result<()> {
-    let Some(value) = schema.get_mut("identifier-field-ids") else {
-        return Ok(());
-    };
-    let identifiers = value
-        .as_array_mut()
-        .ok_or_else(|| invalid("Serialized schema identifier fields are not an array"))?;
-    let mut ordered = identifiers
-        .iter()
-        .map(|id| {
-            id.as_i64()
-                .and_then(|id| i32::try_from(id).ok())
-                .ok_or_else(|| invalid("Serialized schema identifier field is not an i32"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    ordered.sort_unstable();
-    *identifiers = ordered.into_iter().map(serde_json::Value::from).collect();
-    Ok(())
-}
-
-pub(crate) fn encoding_basis(
-    metadata: &crate::iceberg::spec::TableMetadata,
-) -> crate::iceberg::Result<Vec<u8>> {
-    let mut schemas = metadata.schemas_iter().collect::<Vec<_>>();
-    schemas.sort_by_key(|schema| schema.schema_id());
-    let schemas = schemas
-        .into_iter()
-        .map(|schema| {
-            let mut value = serde_json::to_value(schema).map_err(|error| {
-                invalid("Cannot encode manifest reuse schema").with_source(error)
-            })?;
-            canonicalize_schema_identifier_ids(&mut value)?;
-            Ok(value)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut specs = metadata.partition_specs_iter().collect::<Vec<_>>();
-    specs.sort_by_key(|spec| spec.spec_id());
-    serde_json::to_vec(&(
-        metadata.format_version(),
-        metadata.current_schema_id(),
-        schemas,
-        specs,
-    ))
-    .map_err(|error| invalid("Cannot encode manifest reuse dependencies").with_source(error))
-}
-
-pub(crate) fn descriptor_owned_bytes(
-    files: &[crate::iceberg::spec::ManifestFile],
-) -> crate::iceberg::Result<u64> {
-    let mut bytes = files
-        .len()
-        .checked_mul(2 * std::mem::size_of::<crate::iceberg::spec::ManifestFile>())
-        .ok_or_else(|| invalid("manifest descriptor overflow"))?;
-    for file in files {
-        bytes = bytes
-            .checked_add(file.manifest_path.len())
-            .and_then(|v| v.checked_add(file.key_metadata.as_ref().map_or(0, Vec::len)))
-            .ok_or_else(|| invalid("manifest descriptor overflow"))?;
-        if let Some(partitions) = &file.partitions {
-            bytes = bytes
-                .checked_add(
-                    partitions
-                        .len()
-                        .checked_mul(2 * std::mem::size_of::<crate::iceberg::spec::FieldSummary>())
-                        .ok_or_else(|| invalid("manifest descriptor overflow"))?,
-                )
-                .ok_or_else(|| invalid("manifest descriptor overflow"))?;
-            for p in partitions {
-                for bound in [&p.lower_bound, &p.upper_bound].into_iter().flatten() {
-                    bytes = bytes
-                        .checked_add(bound.len())
-                        .ok_or_else(|| invalid("manifest descriptor overflow"))?;
-                }
-            }
-        }
-    }
-    u64::try_from(bytes).map_err(|_| invalid("manifest descriptor overflow"))
 }

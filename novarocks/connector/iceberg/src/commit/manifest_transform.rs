@@ -338,7 +338,7 @@ async fn filter_source(
         spec,
         source.descriptor.content,
         output,
-        &[source.descriptor.manifest_path.clone()],
+        std::slice::from_ref(&source.descriptor.manifest_path),
     )
     .await?;
     if !unassigned {

@@ -1413,7 +1413,7 @@ pub struct ConnectorWriteReceipt {
     committed_version: Option<ConnectorCommittedVersion>,
     resulting_row_count: Option<u64>,
     committed_partitioning: Option<ConnectorCommittedPartitioning>,
-    process_local_payload: Option<ConnectorProcessLocalPayload>,
+    process_local_payload: Option<Arc<ConnectorProcessLocalPayload>>,
 }
 
 impl PartialEq for ConnectorWriteReceipt {
@@ -1526,7 +1526,7 @@ impl ConnectorWriteReceipt {
                 "connector write receipt already retains a process-local payload",
             ));
         }
-        self.process_local_payload = Some(payload);
+        self.process_local_payload = Some(Arc::new(payload));
         Ok(self)
     }
 
@@ -1538,7 +1538,7 @@ impl ConnectorWriteReceipt {
         if let Some(payload) = &self.process_local_payload {
             payload.validate_owner(expected_owner)?;
         }
-        Ok(self.process_local_payload.as_ref())
+        Ok(self.process_local_payload.as_deref())
     }
 
     /// Stable durable form for application journals. The provider payload is
