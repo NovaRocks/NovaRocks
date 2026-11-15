@@ -1198,6 +1198,21 @@ impl fmt::Debug for SupervisedActiveNativeOwner {
     }
 }
 impl SupervisedActiveNativeOwner {
+    /// Called only after the original installed local-exit wait succeeded.
+    /// Destruction precedes the local-closed fact; this records no remote proof.
+    pub(crate) fn retire_local(&mut self) {
+        assert!(!self.closed, "the original Native owner retires once");
+        drop(
+            self.owner
+                .take()
+                .expect("local retirement retains the original owner"),
+        );
+        self.custody
+            .storage
+            .record_native_closed(self.custody.key, &self.custody.slot);
+        self.closed = true;
+    }
+
     pub(super) fn original_exit(&self) -> Weak<super::original_exit::OriginalLogicalExit> {
         self.custody.slot.original_exit.clone()
     }

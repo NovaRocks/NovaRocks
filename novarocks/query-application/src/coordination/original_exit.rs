@@ -29,6 +29,23 @@ use tokio::task::JoinError;
 
 type RoleResult = PollCompletion<Result<(), QueryExecutionError>>;
 
+/// The original carrier's actual exit, without fabricating a Tokio task for
+/// runtime-hosted work. Raw runtime failures remain with their original host.
+#[derive(Clone, Debug)]
+pub(super) enum OriginalActorExit {
+    TokioJoin(Result<(), Arc<JoinError>>),
+    Runtime(crate::api::logical_runtime::LogicalExit),
+}
+impl OriginalActorExit {
+    pub(super) fn failed(&self) -> bool {
+        match self {
+            Self::TokioJoin(result) => result.is_err(),
+            Self::Runtime(crate::api::logical_runtime::LogicalExit::Completed) => false,
+            Self::Runtime(crate::api::logical_runtime::LogicalExit::OwnerFailed(_)) => true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalActorExitPhase {
     Unreserved,
@@ -56,7 +73,7 @@ pub(super) struct OriginalAssociation {
 struct State {
     phase: LogicalActorExitPhase,
     association: Option<OriginalAssociation>,
-    actor: Option<Result<(), Arc<JoinError>>>,
+    actor: Option<OriginalActorExit>,
     pending_native_returns: u64,
     native_pre_actor_started: bool,
     native_body_exited: bool,
@@ -270,9 +287,22 @@ impl OriginalLogicalExit {
         assert_eq!(s.association, Some(association));
         assert_eq!(s.phase, LogicalActorExitPhase::Installed);
         assert!(s.actor.is_none());
-        s.actor = Some(result);
+        s.actor = Some(OriginalActorExit::TokioJoin(result));
         s.phase = LogicalActorExitPhase::Joined;
     }
+    pub(super) fn runtime_joined_silent(
+        &self,
+        association: OriginalAssociation,
+        result: crate::api::logical_runtime::LogicalExit,
+    ) {
+        let mut s = self.lock();
+        assert_eq!(s.association, Some(association));
+        assert_eq!(s.phase, LogicalActorExitPhase::Installed);
+        assert!(s.actor.is_none());
+        s.actor = Some(OriginalActorExit::Runtime(result));
+        s.phase = LogicalActorExitPhase::Joined;
+    }
+
     pub(super) fn notify(&self) {
         self.changed.wake();
     }
@@ -339,7 +369,7 @@ impl OriginalLogicalExit {
                 || s.run_panic.is_some()
                 || s.run_cleanup_panic.is_some()
                 || s.consumer_failed
-                || matches!(&s.actor, Some(Err(_))))
+                || s.actor.as_ref().is_some_and(OriginalActorExit::failed))
     }
     pub(super) fn retire_background_after_bank_exit_silent(&self, packet: &RoleResult) {
         let actual_frame_exit = match packet {
@@ -374,8 +404,10 @@ impl OriginalLogicalExit {
             || s.run_panic.is_some()
             || s.run_cleanup_panic.is_some()
             || s.consumer_failed
-            || matches!(&s.actor, Some(Err(_)))
+            || s.actor.as_ref().is_some_and(OriginalActorExit::failed)
     }
+    /// Legacy role-owned actor cleanup only. A runtime install-only role may
+    /// end while its actor is Running; RuntimeInstalled must use core readiness.
     pub(super) fn pending_actor(&self) -> bool {
         let s = self.lock();
         s.role_ended
@@ -515,10 +547,19 @@ impl LogicalExecutionExitView<'_> {
         self.state.phase
     }
     pub fn actor_result(&self) -> Option<Result<(), &JoinError>> {
-        self.state
-            .actor
-            .as_ref()
-            .map(|r| r.as_ref().map(|_| ()).map_err(Arc::as_ref))
+        match self.state.actor.as_ref()? {
+            OriginalActorExit::TokioJoin(result) => {
+                Some(result.as_ref().map(|_| ()).map_err(Arc::as_ref))
+            }
+            OriginalActorExit::Runtime(_) => None,
+        }
+    }
+    /// A runtime exit is not a synthesized Tokio cancellation or panic result.
+    pub fn runtime_actor_result(&self) -> Option<&crate::api::logical_runtime::LogicalExit> {
+        match self.state.actor.as_ref()? {
+            OriginalActorExit::Runtime(result) => Some(result),
+            OriginalActorExit::TokioJoin(_) => None,
+        }
     }
     pub fn role_ended(&self) -> bool {
         self.state.role_ended
@@ -747,3 +788,7 @@ impl LogicalExecutionExitObserver {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "original_exit/tests.rs"]
+mod tests;

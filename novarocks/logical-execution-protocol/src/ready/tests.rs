@@ -192,10 +192,7 @@ fn consumed_end_requires_independent_sequence_and_output_row_equality() {
             .unwrap_err();
         assert_eq!(
             error,
-            query_failure(
-                QueryFailureReason::ResultProtocol,
-                "internal proof has no accepted End receipt"
-            )
+            LogicalRequestFailure::ResultProtocolViolation.error()
         );
         assert!(state.accepted().is_none());
     }

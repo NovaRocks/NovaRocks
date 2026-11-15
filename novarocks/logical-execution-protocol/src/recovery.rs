@@ -17,8 +17,6 @@
 
 //! Closed whole-attempt recovery policy, shared with pre-ready observation.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "wired in the cutover commit"))]
-
 use novarocks_coordination_contract::{
     AttemptFailureClass, ExecutionEffect, PreReadyProcessReplacementWitness, RecoveryMode,
 };

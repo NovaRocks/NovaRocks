@@ -18,8 +18,6 @@
 //! Attempt cleanup consumes independent remote, relay and actual-exit facts.
 //! Neither Worker closure nor the end of finite tracking proves physical exit.
 
-#![expect(dead_code, reason = "wired in the cutover commit")]
-
 use crate::{LogicalActionId, StepBudget, input::ObligationKind, stand_down::RemoteProgress};
 use novarocks_coordination_contract::{
     AttemptActivationIdentity, AttemptConvergenceMode, MonotonicInstant, QueryExecutionError,
@@ -27,7 +25,7 @@ use novarocks_coordination_contract::{
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CleanupPath {
+pub enum CleanupPath {
     ResolveThenFinish,
     EndTrackingThenAbandon,
 }
@@ -176,6 +174,9 @@ pub(crate) struct ConvergenceRecord {
 }
 
 impl ConvergenceRecord {
+    pub(crate) fn running_work_registered(&self) -> bool {
+        self.obligations[index(ObligationKind::RunningWork)].registered
+    }
     pub fn new(
         activation: AttemptActivationIdentity,
         relay_expected: bool,
@@ -245,6 +246,20 @@ impl ConvergenceRecord {
             return Err(ConvergenceError::UnexpectedObligation);
         }
         obligation.registered = true;
+        Ok(())
+    }
+
+    /// A failed registration returned no original Obligation. It cannot be
+    /// settled later as though a registration had succeeded.
+    pub(crate) fn observe_obligation_not_created(
+        &mut self,
+        kind: ObligationKind,
+    ) -> Result<(), ConvergenceError> {
+        let obligation = &mut self.obligations[index(kind)];
+        if !obligation.expected || obligation.registered || obligation.completion.is_some() {
+            return Err(ConvergenceError::UnexpectedObligation);
+        }
+        obligation.expected = false;
         Ok(())
     }
 

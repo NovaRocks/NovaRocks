@@ -80,6 +80,32 @@ pub struct ReplacementQualificationRequest {
 }
 
 impl ReplacementQualificationRequest {
+    /// Preserves the logical core's original operation and absolute deadline.
+    /// Construction neither mints an identity nor restarts a queued window.
+    pub(crate) fn from_logical(
+        operation_id: TaskOperationId,
+        identity: ReplacementQualificationIdentity,
+        failed_participations: Arc<[ParticipationRef]>,
+        replacement_participations: Arc<[ParticipationRef]>,
+        issued_at: MonotonicInstant,
+        conservative_expiry: MonotonicInstant,
+        absolute_expiry: std::time::Instant,
+        native_actions: Option<
+            novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
+        >,
+    ) -> Self {
+        Self {
+            operation_id,
+            identity,
+            failed_participations,
+            replacement_participations,
+            issued_at,
+            conservative_expiry,
+            absolute_expiry,
+            native_actions,
+        }
+    }
+
     pub(crate) fn new(
         identity: ReplacementQualificationIdentity,
         failed_participations: Arc<[ParticipationRef]>,
@@ -280,9 +306,24 @@ pub trait ActiveAttemptIsolationOwner: fmt::Debug + Send {
 pub struct QualifiedReplacementReservation {
     identity: ReplacementQualificationIdentity,
     reservation: Option<Box<dyn AttemptIsolationReservation>>,
+    rejected_active: Option<ActivatedReplacementReservation>,
 }
 
 impl QualifiedReplacementReservation {
+    pub(crate) fn topology_revision(&self) -> u64 {
+        self.reservation
+            .as_deref()
+            .expect("qualified reservation still owns its original grants")
+            .topology_revision()
+    }
+
+    pub(crate) fn admissions(&self) -> &[QualifiedWorkerAdmission] {
+        self.reservation
+            .as_deref()
+            .expect("qualified reservation still owns its original grants")
+            .admissions()
+    }
+
     pub fn try_new(
         request: &ReplacementQualificationRequest,
         reservation: Box<dyn AttemptIsolationReservation>,
@@ -313,6 +354,7 @@ impl QualifiedReplacementReservation {
         Ok(Self {
             identity: request.identity,
             reservation: Some(reservation),
+            rejected_active: None,
         })
     }
 
@@ -378,6 +420,45 @@ impl QualifiedReplacementReservation {
             isolation: Some(isolation),
         })
     }
+
+    /// Failure retains the same returned reservation, or an invalid activated
+    /// owner, until the caller's explicit supervised abandonment path.
+    pub(crate) fn activate_retained(
+        &mut self,
+    ) -> Result<ActivatedReplacementReservation, ReplacementQualificationFailure> {
+        if self.rejected_active.is_some() {
+            return Err(ReplacementQualificationFailure::InvalidReservation);
+        }
+        let reservation = self
+            .reservation
+            .take()
+            .expect("qualified replacement retains its opaque reservation");
+        let admissions = reservation
+            .admissions()
+            .iter()
+            .map(QualifiedWorkerAdmission::copy_for_actor)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let isolation = match reservation.activate() {
+            Ok(isolation) => isolation,
+            Err(failure) => {
+                let (failure, reservation) = failure.into_parts();
+                self.reservation = Some(reservation);
+                return Err(failure);
+            }
+        };
+        let execution = isolation.execution();
+        let activated = ActivatedReplacementReservation {
+            execution,
+            admissions: Some(admissions),
+            isolation: Some(isolation),
+        };
+        if execution != self.identity.replacement() {
+            self.rejected_active = Some(activated);
+            return Err(ReplacementQualificationFailure::InvalidReservation);
+        }
+        Ok(activated)
+    }
 }
 
 impl Drop for QualifiedReplacementReservation {
@@ -388,6 +469,7 @@ impl Drop for QualifiedReplacementReservation {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct ActivatedReplacementReservation {
     execution: QueryExecutionId,
     admissions: Option<Box<[QualifiedWorkerAdmission]>>,
@@ -502,59 +584,7 @@ pub trait ReplacementQualificationEffectPort: fmt::Debug + Send + Sync {
     ) -> ReplacementQualificationEffectAdmission;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReplacementQualificationFailure {
-    Rejected,
-    InvalidReservation,
-    Expired,
-    OutcomeUnknown,
-    EffectOwnerClosed,
-    MismatchedReceipt,
-    DomainRefused(novarocks_execution_contract::failure::FailureFact),
-}
-
-impl novarocks_execution_contract::failure::FailureProjection for ReplacementQualificationFailure {
-    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::{
-            FailureClass, FailureFact, FailureReason, domain,
-        };
-        let (class, code, observed_stop) = match self {
-            Self::Rejected => (FailureClass::Control, 94, false),
-            Self::InvalidReservation => (FailureClass::Invariant, 95, false),
-            Self::Expired => (FailureClass::Control, 96, false),
-            Self::OutcomeUnknown => (FailureClass::Dependency, 97, false),
-            Self::EffectOwnerClosed => (FailureClass::Control, 98, true),
-            Self::MismatchedReceipt => (FailureClass::Invariant, 100, false),
-            Self::DomainRefused(fact) => return *fact,
-        };
-        let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
-        if observed_stop {
-            FailureFact::stop_observation(reason)
-        } else {
-            FailureFact::new(class, reason)
-        }
-    }
-}
-
-impl ReplacementQualificationFailure {
-    /// Bounded diagnostic authored here; no foreign Display becomes safe detail.
-    pub fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
-        let message = match self {
-            Self::Rejected => "attempt replacement qualification was refused",
-            Self::InvalidReservation => {
-                "attempt replacement qualification returned an invalid reservation"
-            }
-            Self::Expired => "attempt replacement qualification expired",
-            Self::OutcomeUnknown => "attempt replacement qualification outcome is unknown",
-            Self::EffectOwnerClosed => "attempt replacement qualification effect owner is closed",
-            Self::MismatchedReceipt => {
-                "attempt replacement receipt does not match its exact operation and identity"
-            }
-            Self::DomainRefused(_) => "owning service refused replacement qualification",
-        };
-        novarocks_execution_contract::SafeDetail::truncating(message)
-    }
-}
+pub use novarocks_logical_execution_protocol::replacement::ReplacementQualificationFailure;
 
 #[derive(Debug)]
 pub(crate) enum ReplacementQualificationSettlement {

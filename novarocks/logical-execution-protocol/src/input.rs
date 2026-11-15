@@ -23,9 +23,8 @@ use crate::{
     start::{LogicalPlanIdentity, RootCarrier},
 };
 use novarocks_coordination_contract::{
-    AttemptActivationIdentity, AttemptConvergenceClosure, ExecutionFailure, ExecutionFailureInput,
-    LogicalExecutionActorId, PreReadyProcessReplacementWitness, QueryExecutionError,
-    logical_port::AttemptToLogical,
+    AttemptActivationIdentity, ExecutionFailure, ExecutionFailureInput, LogicalExecutionActorId,
+    PreReadyProcessReplacementWitness, QueryExecutionError, logical_port::AttemptToLogical,
 };
 use novarocks_execution_contract::{
     AcquireParticipationAdmissionTicket, ParticipationAdmissionTicketReceipt, ParticipationRef,
@@ -95,9 +94,13 @@ pub enum NativeFact {
         activation: AttemptActivationIdentity,
         root: Option<TaskIdentity>,
     },
+    /// The original run returned; protocol terminal decisions still come from AP.
+    RunCompleted {
+        activation: AttemptActivationIdentity,
+    },
     SuccessorPrepared {
         execution: QueryExecutionId,
-        participations: Box<[ParticipationRef]>,
+        participations: std::sync::Arc<[ParticipationRef]>,
     },
     QualificationSettled {
         identity: QualificationIdentity,
@@ -107,7 +110,10 @@ pub enum NativeFact {
         dispatched_at: Option<novarocks_coordination_contract::MonotonicInstant>,
         settlement: QualificationSettlement,
     },
-    ReservationActivated(QualifiedReplacementFacts),
+    ReservationActivated {
+        identity: QualificationIdentity,
+        operation_id: novarocks_execution_contract::TaskOperationId,
+    },
     Failed {
         execution: QueryExecutionId,
         failure: FailureReport,
@@ -119,7 +125,6 @@ pub enum NativeFact {
     },
     DormantConverged {
         execution: QueryExecutionId,
-        closure: AttemptConvergenceClosure,
     },
     Applied,
 }
@@ -181,14 +186,32 @@ pub enum InternalRequest {
 
 #[derive(Clone, Debug)]
 pub enum ConsumerFact {
+    Applied,
     SchemaWritten,
     EndSlotReady,
     EndEnqueued,
+    /// The original End receipt completed, failed or was dropped; actual job
+    /// exit is still reported separately by the carrier.
+    EndSettled,
     OutputExposed,
     ReadyHandedOff,
     DiagnosticsPublished,
     ConvergencePublished,
     Failed(QueryExecutionError),
+}
+
+#[derive(Clone, Debug)]
+pub enum RelayFact {
+    Applied,
+    Stopped {
+        activation: AttemptActivationIdentity,
+        all_deliveries_settled: bool,
+    },
+    Failed {
+        activation: AttemptActivationIdentity,
+        failure: FailureReport,
+        all_deliveries_settled: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -220,6 +243,7 @@ pub enum GovernanceFact {
 #[derive(Clone, Debug)]
 pub enum ActionResult {
     Native(NativeFact),
+    Relay(RelayFact),
     Consumer(ConsumerFact),
     Governance(GovernanceFact),
 }

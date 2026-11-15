@@ -18,8 +18,6 @@
 //! The SAME original refusal's observation window and one latest watch per
 //! activation. Queries never produce hints; only predicate changes do.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "wired in the cutover commit"))]
-
 use crate::recovery::{RecoveryWindowInput, recovery_window_refusal};
 use novarocks_coordination_contract::{
     AttemptActivationIdentity, AttemptRequestToken, ExecutionFailureInput,
@@ -116,6 +114,7 @@ impl PreReadyObservations {
         Ok(allowed)
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.watches.len()
     }

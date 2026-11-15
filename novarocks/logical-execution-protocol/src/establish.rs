@@ -21,12 +21,11 @@
 //! outstanding settlements. An authorized issue already counts as a possible
 //! remote effect; no transport guard, destructor or cross-thread fence is needed.
 
-#![expect(dead_code, reason = "wired in the cutover commit")]
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
 };
 
 use novarocks_coordination_contract::{
@@ -95,6 +94,7 @@ impl AdmissionIssueReceipt {
             && self.admission_epoch_capability == other.admission_epoch_capability
     }
 
+    #[cfg(test)]
     pub(crate) const fn first_sent_at(self) -> MonotonicInstant {
         self.first_sent_at
     }
@@ -156,7 +156,6 @@ pub(crate) enum EstablishIssueError {
     AdmissionIssueBudgetExhausted,
     InvalidAdmissionSettlement,
     AdmissionRejected,
-    ConflictingTicket,
     AdmissionTimeInFuture,
     TicketExpired,
     TicketDoesNotAuthorizeRequest,
@@ -191,7 +190,6 @@ impl fmt::Display for EstablishIssueError {
                 "admission settlement does not match its exact request or outcome shape"
             }
             Self::AdmissionRejected => "Worker rejected participation admission",
-            Self::ConflictingTicket => "participation already holds a different admission ticket",
             Self::AdmissionTimeInFuture => {
                 "admission issue time is later than the actor monotonic time"
             }
@@ -235,9 +233,9 @@ impl FailureProjection for EstablishIssueError {
             | Self::IdentityMismatch
             | Self::TicketDoesNotAuthorizeRequest => (FailureClass::Invariant, 72, false),
             Self::UnknownParticipation => (FailureClass::Invariant, 73, false),
-            Self::ConflictingAdmissionIssue
-            | Self::ConflictingTicket
-            | Self::ConflictingWorkerSettlement => (FailureClass::Invariant, 74, false),
+            Self::ConflictingAdmissionIssue | Self::ConflictingWorkerSettlement => {
+                (FailureClass::Invariant, 74, false)
+            }
             Self::InvalidAdmissionSettlement => (FailureClass::Invariant, 75, false),
             Self::AdmissionTimeInFuture | Self::FutureAuthorization => {
                 (FailureClass::Invariant, 76, false)
@@ -286,7 +284,6 @@ impl EstablishIssueError {
             Self::ConflictingAdmissionIssue => {
                 "participation admission was issued with conflicting immutable facts"
             }
-            Self::ConflictingTicket => "participation already holds a different admission ticket",
             Self::ConflictingWorkerSettlement => {
                 "Establish issue received conflicting Worker settlements"
             }
@@ -403,7 +400,7 @@ enum IssuedAuthorization {
 #[derive(Debug)]
 pub(crate) struct EstablishIssueLedger {
     activation: AttemptActivationIdentity,
-    required: BTreeSet<ParticipationRef>,
+    required: Arc<BTreeSet<ParticipationRef>>,
     withdrawn: BTreeSet<ParticipationRef>,
     authority_open: bool,
     admission_limit: NonZeroUsize,
@@ -420,23 +417,49 @@ pub(crate) struct EstablishIssueLedger {
     establish_rejections: BTreeSet<ParticipationRef>,
 }
 
-impl EstablishIssueLedger {
-    pub(crate) fn new(
-        activation: AttemptActivationIdentity,
-        required: BTreeSet<ParticipationRef>,
-        admission_limit: NonZeroUsize,
-        establish_limit: NonZeroUsize,
-    ) -> Result<Self, EstablishIssueError> {
-        if required
-            .iter()
-            .any(|p| p.query_execution_id() != activation.execution())
-        {
+/// Constructed one charged row at a time for a successor whose topology was
+/// unknown at installation. The two indexes move into the ledger without N-copy.
+pub(crate) struct EstablishLedgerBuilder {
+    execution: novarocks_types::QueryExecutionId,
+    required: BTreeSet<ParticipationRef>,
+    pending: BTreeSet<ParticipationRef>,
+}
+impl EstablishLedgerBuilder {
+    pub(crate) fn new(execution: novarocks_types::QueryExecutionId) -> Self {
+        Self {
+            execution,
+            required: BTreeSet::new(),
+            pending: BTreeSet::new(),
+        }
+    }
+    pub(crate) fn push(
+        &mut self,
+        participation: ParticipationRef,
+    ) -> Result<(), EstablishIssueError> {
+        if participation.query_execution_id() != self.execution {
             return Err(EstablishIssueError::ActivationExecutionMismatch);
         }
-        Ok(Self {
+        if !self.required.insert(participation) {
+            return Err(EstablishIssueError::IdentityMismatch);
+        }
+        self.pending.insert(participation);
+        Ok(())
+    }
+    pub(crate) fn finish(
+        self,
+        activation: AttemptActivationIdentity,
+        admission_limit: NonZeroUsize,
+        establish_limit: NonZeroUsize,
+    ) -> EstablishIssueLedger {
+        assert_eq!(
+            self.execution,
+            activation.execution(),
+            "validated roster belongs to the exact successor activation"
+        );
+        EstablishIssueLedger {
             activation,
-            pending: required.clone(),
-            required,
+            pending: self.pending,
+            required: Arc::new(self.required),
             withdrawn: BTreeSet::new(),
             authority_open: true,
             admission_limit,
@@ -450,7 +473,26 @@ impl EstablishIssueLedger {
             remote_admissions: BTreeMap::new(),
             refusals: BTreeMap::new(),
             establish_rejections: BTreeSet::new(),
-        })
+        }
+    }
+}
+
+impl EstablishIssueLedger {
+    pub(crate) fn new(
+        activation: AttemptActivationIdentity,
+        required: BTreeSet<ParticipationRef>,
+        admission_limit: NonZeroUsize,
+        establish_limit: NonZeroUsize,
+    ) -> Result<Self, EstablishIssueError> {
+        let mut builder = EstablishLedgerBuilder::new(activation.execution());
+        for participation in required {
+            builder.push(participation)?;
+        }
+        Ok(builder.finish(activation, admission_limit, establish_limit))
+    }
+
+    pub(crate) fn shared_required(&self) -> Arc<BTreeSet<ParticipationRef>> {
+        Arc::clone(&self.required)
     }
 
     pub(crate) fn authority_open(&self) -> bool {
@@ -459,6 +501,7 @@ impl EstablishIssueLedger {
     pub(crate) fn close_authority(&mut self) {
         self.authority_open = false;
     }
+    #[cfg(test)]
     pub(crate) fn authorization_limit(&self) -> NonZeroUsize {
         self.establish_limit
     }
@@ -1009,6 +1052,7 @@ impl EstablishIssueLedger {
             .copied()
             .map(EstablishIssueRecord::snapshot)
     }
+    #[cfg(test)]
     pub(crate) fn has_establish_rejection(&self) -> bool {
         !self.establish_rejections.is_empty()
     }

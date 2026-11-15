@@ -18,8 +18,6 @@
 //! Eligibility and visibility only. Payloads, schema and delivery receipts stay
 //! with the original consumer and visibility owners.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "wired in the cutover commit"))]
-
 use novarocks_coordination_contract::AttemptActivationIdentity;
 use novarocks_types::QueryId;
 
@@ -63,10 +61,12 @@ impl DeliveryGate {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn phase(&self) -> DeliveryPhase {
         self.phase
     }
 
+    #[cfg(test)]
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
     }
@@ -75,6 +75,7 @@ impl DeliveryGate {
         self.current
     }
 
+    #[cfg(test)]
     pub(crate) const fn visible_to(&self) -> Option<AttemptActivationIdentity> {
         self.visible_to
     }

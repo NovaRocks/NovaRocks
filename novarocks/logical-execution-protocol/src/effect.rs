@@ -51,7 +51,11 @@ pub enum LogicalLane {
 pub enum NativeEffect {
     ActivateAttempt {
         activation: AttemptActivationIdentity,
-        inherited_admissions: Box<[AttemptInheritedAdmission]>,
+        inherited_admissions: Vec<AttemptInheritedAdmission>,
+    },
+    /// One original installed attempt run, supervised separately from activation.
+    RunAttempt {
+        activation: AttemptActivationIdentity,
     },
     PrepareSuccessor {
         failed: QueryExecutionId,
@@ -95,6 +99,9 @@ pub enum NativeEffect {
     },
     RecordStreamingSuccess {
         activation: AttemptActivationIdentity,
+    },
+    RecordComputationReady {
+        cut: AttemptComputationCut,
     },
     RetirePreparation,
 }
@@ -146,6 +153,14 @@ pub enum ConsumerEffect {
         activation: AttemptActivationIdentity,
     },
     PublishFailure(QueryExecutionError),
+    /// Completion-only success, after the original Task completion boundary.
+    PublishCompletion,
+    /// The original attempt-local stream keeps its accepted failure across a
+    /// successor. This is separate from the logical execution's final result.
+    PublishAttemptFailure {
+        activation: AttemptActivationIdentity,
+        error: QueryExecutionError,
+    },
     InternalReply {
         source: LogicalSourceId,
         token: LogicalRequestToken,
@@ -185,6 +200,7 @@ pub enum GovernanceEffect {
     },
     ReleaseExecutionStage,
     RequestShutdownCancellation,
+    RequestClientCancellation,
     CompleteWorkOwner,
 }
 
@@ -214,6 +230,9 @@ pub enum LogicalEffectBody {
         token: LogicalRequestToken,
         ready: bool,
     },
+    /// A required supervision operation failed. The carrier retains this exact
+    /// typed cause and fills its original infrastructure-failure marker.
+    SupervisionFailed(QueryExecutionError),
     Retirable,
 }
 
@@ -238,6 +257,7 @@ impl LogicalEffect {
                 LogicalLane::Governance
             }
             LogicalEffectBody::AttemptLifecycleDiagnostic(_)
+            | LogicalEffectBody::SupervisionFailed(_)
             | LogicalEffectBody::SnapshotReply { .. } => LogicalLane::Diagnostics,
         }
     }
@@ -246,6 +266,7 @@ impl LogicalEffect {
         match &self.body {
             LogicalEffectBody::Native(
                 NativeEffect::ActivateAttempt { .. }
+                | NativeEffect::RunAttempt { .. }
                 | NativeEffect::PrepareSuccessor { .. }
                 | NativeEffect::DispatchQualification { .. }
                 | NativeEffect::ActivateReservation { .. },
@@ -269,11 +290,14 @@ impl LogicalEffect {
                 | NativeEffect::ConvergeDormant { .. }
                 | NativeEffect::RecordTerminalCut { .. }
                 | NativeEffect::RecordStreamingSuccess { .. }
+                | NativeEffect::RecordComputationReady { .. }
                 | NativeEffect::RetirePreparation,
             )
             | LogicalEffectBody::Relay(RelayEffect::Stop { .. } | RelayEffect::Reply { .. })
             | LogicalEffectBody::Consumer(
                 ConsumerEffect::PublishFailure(_)
+                | ConsumerEffect::PublishCompletion
+                | ConsumerEffect::PublishAttemptFailure { .. }
                 | ConsumerEffect::InternalReply { .. }
                 | ConsumerEffect::PublishReady { .. }
                 | ConsumerEffect::PublishDiagnostics { .. }
@@ -284,9 +308,11 @@ impl LogicalEffect {
                 | GovernanceEffect::EndRemoteTracking { .. }
                 | GovernanceEffect::ReleaseExecutionStage
                 | GovernanceEffect::RequestShutdownCancellation
+                | GovernanceEffect::RequestClientCancellation
                 | GovernanceEffect::CompleteWorkOwner,
             )
             | LogicalEffectBody::AttemptLifecycleDiagnostic(_)
+            | LogicalEffectBody::SupervisionFailed(_)
             | LogicalEffectBody::SnapshotReply { .. }
             | LogicalEffectBody::RegistryJoinReply { .. }
             | LogicalEffectBody::Retirable => LogicalWorkKind::Settlement,

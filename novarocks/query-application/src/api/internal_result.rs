@@ -86,6 +86,19 @@ pub struct ComputationReadyToken {
 }
 
 impl ComputationReadyToken {
+    pub(crate) const fn from_runtime_cut(
+        cut: novarocks_coordination_contract::AttemptComputationCut,
+    ) -> Self {
+        Self {
+            activation: cut.activation,
+            root: cut.root,
+            cut: cut.cut,
+            diagnostic_deadline: cut.diagnostic_deadline,
+            convergence_deadline: cut.convergence_deadline,
+            end: cut.end,
+        }
+    }
+
     pub(crate) fn accepted(
         source: &InternalConsumerSeal,
         cut: MonotonicInstant,
@@ -151,8 +164,47 @@ impl DecodedInternalEndReceipt {
 /// That owner retains this inside its typed proof and calls accept only after
 /// its protocol rules and actual receiving-custody transfer have succeeded.
 pub struct ComputationReadySource {
-    port: InternalReadyActorPort,
+    port: ComputationReadyPort,
     liveness: Option<oneshot::Sender<()>>,
+}
+
+/// Transitional composition only; the Actor arm is removed at the single cutover.
+enum ComputationReadyPort {
+    Actor(InternalReadyActorPort),
+    Runtime(crate::coordination::executor::consumer::RuntimeReadyPort),
+}
+
+impl ComputationReadyPort {
+    fn origin(&self) -> &InternalConsumerSeal {
+        match self {
+            Self::Actor(port) => port.origin(),
+            Self::Runtime(port) => port.origin(),
+        }
+    }
+    async fn accept(
+        &self,
+        decoded: DecodedInternalEndReceipt,
+    ) -> Result<ComputationReadyToken, QueryExecutionError> {
+        match self {
+            Self::Actor(port) => port.accept(decoded).await,
+            Self::Runtime(port) => port.accept(decoded).await,
+        }
+    }
+    async fn fail(&self, error: QueryExecutionError) -> Result<(), QueryExecutionError> {
+        match self {
+            Self::Actor(port) => port.fail(error).await,
+            Self::Runtime(port) => port.fail(error).await,
+        }
+    }
+    async fn supervise_exit(
+        &self,
+        receiver: oneshot::Receiver<Result<(), QueryExecutionError>>,
+    ) -> Result<(), crate::coordination::LogicalExecutionActorError> {
+        match self {
+            Self::Actor(port) => port.supervise_exit(receiver).await,
+            Self::Runtime(port) => port.supervise_exit(receiver).await,
+        }
+    }
 }
 
 impl ComputationReadySource {
@@ -160,7 +212,19 @@ impl ComputationReadySource {
         let (liveness, receiver) = oneshot::channel();
         (
             Self {
-                port,
+                port: ComputationReadyPort::Actor(port),
+                liveness: Some(liveness),
+            },
+            receiver,
+        )
+    }
+    pub(crate) fn issued_runtime(
+        port: crate::coordination::executor::consumer::RuntimeReadyPort,
+    ) -> (Self, oneshot::Receiver<()>) {
+        let (liveness, receiver) = oneshot::channel();
+        (
+            Self {
+                port: ComputationReadyPort::Runtime(port),
                 liveness: Some(liveness),
             },
             receiver,

@@ -17,8 +17,6 @@
 
 //! Ordered root observations and the single in-flight root control request.
 
-#![expect(dead_code, reason = "wired into the logical core in P06")]
-
 use novarocks_coordination_contract::{
     AttemptRequestToken, AttemptRootFailure, AttemptRootProjection, ExecutionFailure,
     ExecutionFailureInput, ObservedTaskTransition, StatusObservation, classify_observation,
@@ -70,6 +68,18 @@ pub(crate) struct RootControl {
 }
 
 impl RootControl {
+    pub(crate) fn has_request(&self) -> bool {
+        self.in_flight.is_none() && (self.want_terminal || self.want_seal)
+    }
+    pub(crate) fn readable(&self) -> bool {
+        self.accepted.as_ref().is_some_and(|a| {
+            a.status.installed()
+                && !a.status.state().is_failure()
+                && !a.status.state().is_cancellation()
+                && !a.status.state().is_abort()
+                && matches!(a.failure, AttemptRootFailure::None)
+        })
+    }
     pub(crate) fn new(root: TaskIdentity) -> Self {
         Self {
             root,
@@ -95,6 +105,7 @@ impl RootControl {
     pub(crate) const fn sealed(&self) -> bool {
         self.sealed
     }
+    #[cfg(test)]
     pub(crate) const fn in_flight(&self) -> Option<RootControlRequest> {
         self.in_flight
     }

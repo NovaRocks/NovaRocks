@@ -18,8 +18,6 @@
 //! Pure qualification identity, bounded fact validation and original horizons.
 //! The isolation reservation and admission grants remain with the Native owner.
 
-#![expect(dead_code, reason = "wired in the cutover commit")]
-
 use crate::input::{
     QualificationIdentity, QualificationSettlement, QualifiedAdmission, QualifiedReplacementFacts,
 };
@@ -51,7 +49,7 @@ impl ReplacementPrerequisites {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReplacementQualificationFailure {
+pub enum ReplacementQualificationFailure {
     Rejected,
     InvalidReservation,
     Expired,
@@ -82,7 +80,7 @@ impl FailureProjection for ReplacementQualificationFailure {
 }
 
 impl ReplacementQualificationFailure {
-    pub(crate) fn safe_detail(self) -> SafeDetail {
+    pub fn safe_detail(self) -> SafeDetail {
         SafeDetail::truncating(match self {
             Self::Rejected => "attempt replacement qualification was refused",
             Self::InvalidReservation => {
@@ -98,7 +96,7 @@ impl ReplacementQualificationFailure {
         })
     }
 
-    pub(crate) fn error(self) -> QueryExecutionError {
+    pub fn error(self) -> QueryExecutionError {
         QueryExecutionError::from_execution(ExecutionFailureInput::new(
             self.failure_fact(),
             self.safe_detail(),

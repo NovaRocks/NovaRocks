@@ -22,6 +22,13 @@
 //! join produces the exact move-only receipt required for retirement.
 
 pub(super) mod health;
+mod runtime_installed;
+use super::original_exit::OriginalActorExit;
+use crate::api::logical_runtime::{
+    InstalledLogicalExecution as InstalledRuntime, LogicalExit, LogicalHostFact,
+    LogicalJoinReadiness, LogicalSourceKind,
+};
+use runtime_installed::{RuntimeCarrier, RuntimeInstalledEntry};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -355,6 +362,7 @@ async fn original_close_wait(mut closed: tokio::sync::watch::Receiver<bool>) {
 enum RegistryEntry {
     Reserved(ReservedEntry),
     Installed(InstalledEntry),
+    RuntimeInstalled(RuntimeInstalledEntry),
     Joined(JoinedEntry),
 }
 
@@ -388,7 +396,7 @@ struct JoinedEntry {
     initial_execution: QueryExecutionId,
     actor_id: LogicalExecutionActorId,
     outcome: LogicalExecutionJoinOutcome,
-    original_result: Result<(), Arc<JoinError>>,
+    original_result: OriginalActorExit,
     original_exit: Option<Arc<OriginalLogicalExit>>,
     internal_health: Option<InternalConsumerHealth>,
 }
@@ -409,6 +417,7 @@ pub enum LogicalExecutionRuntimeRegistryError {
     JoinAlreadyCompleted,
     InternalConsumerHealthUnresolved,
     OriginalExitFailureUnresolved,
+    RuntimeSourceClosed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -470,6 +479,7 @@ impl novarocks_execution_contract::failure::FailureProjection
             Self::ConfigDoesNotMatchReservation => (FailureClass::Invariant, 69, false),
             Self::JoinNotReady => (FailureClass::Control, 70, false),
             Self::JoinAlreadyCompleted => (FailureClass::Control, 71, true),
+            Self::RuntimeSourceClosed => (FailureClass::Control, 92, true),
             Self::InternalConsumerHealthUnresolved => {
                 return crate::execution_error::QueryFailureReason::InternalConsumerPanicked
                     .failure_fact();
@@ -516,6 +526,7 @@ impl LogicalExecutionRuntimeRegistryError {
             }
             Self::JoinNotReady => "logical execution runtime join is not ready",
             Self::JoinAlreadyCompleted => "logical execution runtime join already completed",
+            Self::RuntimeSourceClosed => "original logical runtime Registry source closed",
             Self::InternalConsumerHealthUnresolved => {
                 "logical execution retains an unresolved internal consumer failure"
             }
@@ -539,6 +550,7 @@ pub(crate) struct LogicalExecutionRuntimeReservation {
     initial_execution: QueryExecutionId,
     generation: u64,
     active: bool,
+    runtime_registration: Option<Arc<LogicalExecutionRegistration>>,
 }
 
 impl fmt::Debug for LogicalExecutionRuntimeReservation {
@@ -640,6 +652,7 @@ pub enum LogicalExecutionJoinOutcome {
     Completed,
     Cancelled,
     Panicked,
+    RuntimeOwnerFailed,
 }
 
 impl LogicalExecutionJoinReceipt {
@@ -818,6 +831,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
             let state = self.lock();
             let retained = state.entries.values().any(|entry| match entry {
                 RegistryEntry::Installed(entry) => entry.internal_health.is_some(),
+                RegistryEntry::RuntimeInstalled(entry) => entry.internal_health.is_some(),
                 RegistryEntry::Joined(entry) => entry.internal_health.is_some(),
                 RegistryEntry::Reserved(_) => false,
             });
@@ -875,6 +889,12 @@ impl LogicalExecutionRuntimeRegistryHandle {
             {
                 &mut entry.internal_health
             }
+            Some(RegistryEntry::RuntimeInstalled(entry))
+                if entry.registration.generation == registration.generation
+                    && entry.registration.initial_execution == registration.initial_execution =>
+            {
+                &mut entry.internal_health
+            }
             Some(RegistryEntry::Joined(entry))
                 if entry.generation == registration.generation
                     && entry.initial_execution == registration.initial_execution =>
@@ -921,13 +941,19 @@ impl LogicalExecutionRuntimeRegistryHandle {
         if !state.accepting {
             return Err(LogicalExecutionRuntimeRegistryError::RegistryClosing);
         }
-        let Some(RegistryEntry::Installed(entry)) = state
+        let (generation, original_exit) = match state
             .entries
             .get(&registration.initial_execution.query_id())
-        else {
-            return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
+        {
+            Some(RegistryEntry::Installed(entry)) => {
+                (entry.generation, entry.original_exit.as_ref())
+            }
+            Some(RegistryEntry::RuntimeInstalled(entry)) => {
+                (entry.registration.generation, entry.original_exit.as_ref())
+            }
+            _ => return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration),
         };
-        validate_generation(entry.generation, registration.generation)?;
+        validate_generation(generation, registration.generation)?;
         if execution.query_id() != registration.initial_execution.query_id() {
             return Err(LogicalExecutionRuntimeRegistryError::InvalidParticipationSet);
         }
@@ -939,13 +965,10 @@ impl LogicalExecutionRuntimeRegistryHandle {
             },
             participations,
             self.clone(),
-            entry
-                .original_exit
-                .as_ref()
-                .map_or_else(std::sync::Weak::new, Arc::downgrade),
+            original_exit.map_or_else(std::sync::Weak::new, Arc::downgrade),
         );
         if reserved.is_some()
-            && let Some(source) = &entry.original_exit
+            && let Some(source) = original_exit
         {
             source.native_reserved_silent();
         }
@@ -1030,6 +1053,13 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 state.entries.get(&key.initial.query_id())
             {
                 validate_generation(entry.generation, key.generation)?;
+                if let Some(source) = &entry.original_exit {
+                    source.native_closure_silent();
+                }
+            } else if let Some(RegistryEntry::RuntimeInstalled(entry)) =
+                state.entries.get(&key.initial.query_id())
+            {
+                validate_generation(entry.registration.generation, key.generation)?;
                 if let Some(source) = &entry.original_exit {
                     source.native_closure_silent();
                 }
@@ -1119,6 +1149,22 @@ impl LogicalExecutionRuntimeRegistryHandle {
     }
 
     fn request_close_for_installed(&self) {
+        let runtime = {
+            let state = self.lock();
+            state
+                .entries
+                .values()
+                .filter_map(|entry| match entry {
+                    RegistryEntry::RuntimeInstalled(entry) => Some(entry.carrier.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for carrier in runtime {
+            carrier.installed.request_close(
+                novarocks_logical_execution_protocol::input::RegistryClose::Shutdown,
+            );
+        }
         let actors = {
             let state = self.lock();
             state
@@ -1130,7 +1176,9 @@ impl LogicalExecutionRuntimeRegistryHandle {
                         entry.generation,
                         entry.actor.clone(),
                     )),
-                    RegistryEntry::Reserved(_) | RegistryEntry::Joined(_) => None,
+                    RegistryEntry::Reserved(_)
+                    | RegistryEntry::Joined(_)
+                    | RegistryEntry::RuntimeInstalled(_) => None,
                 })
                 .collect::<Vec<_>>()
         };
@@ -1169,7 +1217,9 @@ impl LogicalExecutionRuntimeRegistryHandle {
                             actor_id: entry.actor_id,
                             outcome: entry.outcome,
                         }),
-                        RegistryEntry::Reserved(_) | RegistryEntry::Installed(_) => None,
+                        RegistryEntry::Reserved(_)
+                        | RegistryEntry::Installed(_)
+                        | RegistryEntry::RuntimeInstalled(_) => None,
                     })
                     .collect::<Vec<_>>();
                 let registrations = state
@@ -1181,6 +1231,13 @@ impl LogicalExecutionRuntimeRegistryHandle {
                             initial_execution: entry.initial_execution,
                             generation: entry.generation,
                         }),
+                        RegistryEntry::RuntimeInstalled(entry) => {
+                            Some(LogicalExecutionRegistration {
+                                registry_id: self.inner.id,
+                                initial_execution: entry.registration.initial_execution,
+                                generation: entry.registration.generation,
+                            })
+                        }
                         RegistryEntry::Reserved(_) | RegistryEntry::Joined(_) => None,
                     })
                     .collect::<Vec<_>>();
@@ -1215,7 +1272,13 @@ impl LogicalExecutionRuntimeRegistryHandle {
             }
 
             let mut close_waiters = Vec::with_capacity(registrations.len());
-            for registration in registrations {
+            for mut registration in registrations {
+                if self.runtime_carrier(&registration)?.is_some() {
+                    self.close_ingress_for_join(&registration).await?;
+                    let receipt = self.join(&mut registration).await?;
+                    self.retire(receipt).map_err(|(error, _)| error)?;
+                    continue;
+                }
                 let actor = self.actor(&registration)?;
                 let closed = actor.request_registry_close_for_join(RegistryClose::Shutdown);
                 close_waiters.push((registration, closed));
@@ -1246,6 +1309,11 @@ impl LogicalExecutionRuntimeRegistryHandle {
         {
             Some(RegistryEntry::Installed(entry)) => {
                 validate_generation(entry.generation, registration.generation)?;
+                entry.ingress_closed = true;
+                Ok(())
+            }
+            Some(RegistryEntry::RuntimeInstalled(entry)) => {
+                validate_generation(entry.registration.generation, registration.generation)?;
                 entry.ingress_closed = true;
                 Ok(())
             }
@@ -1318,6 +1386,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
             initial_execution,
             generation,
             active: true,
+            runtime_registration: None,
         })
     }
 
@@ -1334,6 +1403,10 @@ impl LogicalExecutionRuntimeRegistryHandle {
             Some(RegistryEntry::Installed(entry)) => {
                 validate_generation(entry.generation, registration.generation)?;
                 Ok(entry.actor.clone())
+            }
+            Some(RegistryEntry::RuntimeInstalled(entry)) => {
+                validate_generation(entry.registration.generation, registration.generation)?;
+                Err(LogicalExecutionRuntimeRegistryError::ConfigDoesNotMatchReservation)
             }
             Some(RegistryEntry::Joined(entry)) => {
                 validate_generation(entry.generation, registration.generation)?;
@@ -1407,6 +1480,27 @@ impl LogicalExecutionRuntimeRegistryHandle {
         registration: &LogicalExecutionRegistration,
     ) -> Result<LogicalExecutionJoinReadiness, LogicalExecutionRuntimeRegistryError> {
         self.validate_registry(registration)?;
+        if let Some(carrier) = self.runtime_carrier(registration)? {
+            return carrier
+                .readiness(false)
+                .await
+                .map(|value| match value {
+                    LogicalJoinReadiness::Ready
+                        if self.inner.active_native.blocks_registration(
+                            registration.initial_execution,
+                            registration.generation,
+                        ) =>
+                    {
+                        LogicalExecutionJoinReadiness::WaitingForConvergence
+                    }
+                    LogicalJoinReadiness::Ready => LogicalExecutionJoinReadiness::Ready,
+                    LogicalJoinReadiness::WaitingForConvergence => {
+                        LogicalExecutionJoinReadiness::WaitingForConvergence
+                    }
+                })
+                .map_err(|_| LogicalExecutionRuntimeRegistryError::RuntimeSourceClosed);
+        }
+
         if self
             .inner
             .active_native
@@ -1439,6 +1533,24 @@ impl LogicalExecutionRuntimeRegistryHandle {
         registration: &LogicalExecutionRegistration,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
         self.validate_registry(registration)?;
+        if let Some(carrier) = self.runtime_carrier(registration)? {
+            self.claim_runtime_join(registration)?;
+            {
+                let state = self.lock();
+                if matches!(state.entries.get(&registration.initial_execution.query_id()),
+                    Some(RegistryEntry::RuntimeInstalled(entry)) if entry.ingress_closed)
+                {
+                    return Ok(());
+                }
+            }
+            self.wait_active_native_custody(registration).await;
+            carrier
+                .installed
+                .request_close(novarocks_logical_execution_protocol::input::RegistryClose::Retire);
+            carrier.wait_ingress().await;
+            return self.record_ingress_closed(registration);
+        }
+
         let actor = {
             let mut state = self.lock();
             match state
@@ -1484,6 +1596,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
         &self,
         registration: &mut LogicalExecutionRegistration,
     ) -> Result<LogicalExecutionJoinReceipt, LogicalExecutionRuntimeRegistryError> {
+        self.claim_runtime_join(registration)?;
         self.wait_active_native_custody(registration).await;
         self.close_ingress_for_join(registration).await?;
         let query = registration.initial_execution.query_id();
@@ -1526,6 +1639,12 @@ impl LogicalExecutionRuntimeRegistryHandle {
             LogicalExecutionRuntimeRegistryError,
         >,
     > {
+        if let Some(carrier) = match self.runtime_carrier_for_query(query, generation) {
+            Ok(carrier) => carrier,
+            Err(error) => return Poll::Ready(Err(error)),
+        } {
+            return self.poll_runtime_join(query, generation, carrier, false, cx);
+        }
         let join = {
             let state = self.lock();
             match state.entries.get(&query) {
@@ -1581,7 +1700,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 initial_execution: entry.initial_execution,
                 actor_id: entry.actor.id(),
                 outcome,
-                original_result: result,
+                original_result: OriginalActorExit::TokioJoin(result),
                 original_exit: source.clone(),
                 internal_health: entry.internal_health.take(),
             };
@@ -1615,6 +1734,10 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 .original_exit
                 .as_ref()
                 .is_some_and(|s| s.pending_actor()),
+            // Runtime actor custody belongs to this Registry. Its install-only
+            // role ending cannot keep the old supervisor role loop alive;
+            // process shutdown drains the same runtime entries afterwards.
+            RegistryEntry::RuntimeInstalled(_) => false,
             RegistryEntry::Joined(_) => false,
         })
     }
@@ -1663,6 +1786,10 @@ impl LogicalExecutionRuntimeRegistryHandle {
                                 {
                                     Some((entry.generation, entry.initial_execution))
                                 }
+                                RegistryEntry::RuntimeInstalled(entry) => Some((
+                                    entry.registration.generation,
+                                    entry.registration.initial_execution,
+                                )),
                                 _ => None,
                             },
                         )
@@ -1677,6 +1804,41 @@ impl LogicalExecutionRuntimeRegistryHandle {
             let Some((generation, initial)) = selected else {
                 continue;
             };
+            if let Ok(Some(carrier)) = self.runtime_carrier_for_query(query, generation) {
+                carrier.poll_source(cx);
+                // The installed handle keeps this observer registered for
+                // protocol-ready progress as well as final Scope removal.
+                let actually_exited = carrier.poll_exit(cx).is_ready();
+                if carrier.explicit_join_claimed() {
+                    // The explicit borrower owns the original receipt. Service
+                    // progress may stabilize its actual exit but cannot steal it.
+                    continue;
+                }
+                if !actually_exited {
+                    let may_close = !self
+                        .inner
+                        .active_native
+                        .blocks_registration(initial, generation);
+                    match carrier.poll_natural_retirement(cx, may_close) {
+                        Poll::Pending | Poll::Ready(Err(_)) => continue,
+                        Poll::Ready(Ok(())) => {}
+                    }
+                }
+                if let Poll::Ready(Ok(proof)) =
+                    self.poll_runtime_join(query, generation, carrier, true, cx)
+                {
+                    let receipt = LogicalExecutionJoinReceipt {
+                        registry_id: self.inner.id,
+                        initial_execution: proof.0,
+                        generation: proof.1,
+                        actor_id: proof.2,
+                        outcome: proof.3,
+                    };
+                    let _retained = self.retire(receipt);
+                    return Poll::Ready(());
+                }
+                continue;
+            }
             if self
                 .inner
                 .active_native
@@ -1747,6 +1909,14 @@ impl LogicalExecutionRuntimeRegistryHandle {
         &self,
         mut registration: LogicalExecutionRegistration,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        if self.runtime_carrier(&registration)?.is_some() {
+            self.claim_runtime_join(&registration)?;
+            self.wait_active_native_custody(&registration).await;
+            self.close_ingress_for_join(&registration).await?;
+            let receipt = self.join(&mut registration).await?;
+            return self.retire(receipt).map_err(|(error, _)| error);
+        }
+
         // The close request itself may complete the original actor WorkOwner.
         // Preserve its same Native custody before closing ingress, as on the
         // shutdown path; waiting only inside join() would already be too late.
@@ -1788,14 +1958,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
                     && entry.initial_execution == receipt.initial_execution
                     && entry.actor_id == receipt.actor_id
                     && entry.outcome == receipt.outcome
-                    && entry.outcome
-                        == match &entry.original_result {
-                            Ok(()) => LogicalExecutionJoinOutcome::Completed,
-                            Err(error) if error.is_cancelled() => {
-                                LogicalExecutionJoinOutcome::Cancelled
-                            }
-                            Err(_) => LogicalExecutionJoinOutcome::Panicked,
-                        } =>
+                    && entry.outcome == original_exit_outcome(&entry.original_result) =>
             {
                 if entry.internal_health.is_some() {
                     return fail(
@@ -1823,9 +1986,11 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 LogicalExecutionRuntimeRegistryError::StaleGeneration,
                 receipt,
             ),
-            Some(RegistryEntry::Installed(_) | RegistryEntry::Reserved(_)) => {
-                fail(LogicalExecutionRuntimeRegistryError::JoinNotReady, receipt)
-            }
+            Some(
+                RegistryEntry::Installed(_)
+                | RegistryEntry::RuntimeInstalled(_)
+                | RegistryEntry::Reserved(_),
+            ) => fail(LogicalExecutionRuntimeRegistryError::JoinNotReady, receipt),
             None => fail(
                 LogicalExecutionRuntimeRegistryError::UnknownRegistration,
                 receipt,
@@ -1839,6 +2004,38 @@ impl LogicalExecutionRuntimeRegistryHandle {
         participation: ParticipationRef,
         convergence: RegistryParticipationConvergence,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        if let Some(carrier) = self.runtime_carrier(registration)? {
+            let activation = {
+                let state = self.lock();
+                let Some(RegistryEntry::RuntimeInstalled(entry)) = state
+                    .entries
+                    .get(&registration.initial_execution.query_id())
+                else {
+                    return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
+                };
+                *entry
+                    .activations
+                    .get(&participation.query_execution_id())
+                    .ok_or(LogicalExecutionRuntimeRegistryError::ParticipationNotRegistered)?
+            };
+            let convergence = match convergence {
+                RegistryParticipationConvergence::NeverEstablished => novarocks_logical_execution_protocol::input::RegistryParticipationConvergence::NeverEstablished,
+                RegistryParticipationConvergence::WorkerStoppedAndParticipationFenced => novarocks_logical_execution_protocol::input::RegistryParticipationConvergence::WorkerStoppedAndParticipationFenced,
+                RegistryParticipationConvergence::WorkerProcessReplaced => novarocks_logical_execution_protocol::input::RegistryParticipationConvergence::WorkerProcessReplaced,
+                RegistryParticipationConvergence::RemoteTrackingEnded => novarocks_logical_execution_protocol::input::RegistryParticipationConvergence::RemoteTrackingEnded,
+            };
+            let reply = carrier.enqueue_fact(LogicalHostFact::RegistryParticipation {
+                activation,
+                participation,
+                convergence,
+            });
+            return carrier
+                .wait_reply(&reply)
+                .await
+                .map(|_| ())
+                .map_err(|_| LogicalExecutionRuntimeRegistryError::RuntimeSourceClosed);
+        }
+
         let actor = {
             self.validate_registry(registration)?;
             let state = self.lock();
@@ -1987,6 +2184,342 @@ fn validate_generation(
         Ok(())
     } else {
         Err(LogicalExecutionRuntimeRegistryError::StaleGeneration)
+    }
+}
+
+fn original_exit_outcome(result: &OriginalActorExit) -> LogicalExecutionJoinOutcome {
+    match result {
+        OriginalActorExit::TokioJoin(Ok(()))
+        | OriginalActorExit::Runtime(LogicalExit::Completed) => {
+            LogicalExecutionJoinOutcome::Completed
+        }
+        OriginalActorExit::TokioJoin(Err(error)) if error.is_cancelled() => {
+            LogicalExecutionJoinOutcome::Cancelled
+        }
+        OriginalActorExit::TokioJoin(Err(_)) => LogicalExecutionJoinOutcome::Panicked,
+        OriginalActorExit::Runtime(LogicalExit::OwnerFailed(_)) => {
+            LogicalExecutionJoinOutcome::RuntimeOwnerFailed
+        }
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by P12 runtime cutover")
+)]
+pub(crate) struct RuntimeInstalledLogicalExecution {
+    pub registration: Arc<LogicalExecutionRegistration>,
+    pub installed: Arc<dyn InstalledRuntime>,
+}
+
+/// An unsuccessful commit keeps the exact reserved registration and any
+/// already installed original Scope under its installer, never a fake join.
+pub(crate) struct RuntimeInstallRefusal {
+    pub error: LogicalExecutionRuntimeRegistryError,
+    pub reservation: LogicalExecutionRuntimeReservation,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "returned to P12 runtime installer")
+    )]
+    pub installed: Arc<dyn InstalledRuntime>,
+}
+impl fmt::Debug for RuntimeInstallRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeInstallRefusal")
+            .field("error", &self.error)
+            .field("reservation", &self.reservation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LogicalExecutionRuntimeReservation {
+    /// Mint the original registration allocation once, before building Native
+    /// executors which must retain this SAME allocation across installation.
+    pub(crate) fn runtime_registration(&mut self) -> Arc<LogicalExecutionRegistration> {
+        self.runtime_registration
+            .get_or_insert_with(|| {
+                Arc::new(LogicalExecutionRegistration {
+                    registry_id: self.registry.inner.id,
+                    initial_execution: self.initial_execution,
+                    generation: self.generation,
+                })
+            })
+            .clone()
+    }
+
+    pub(crate) fn actor_instance(&self) -> LogicalExecutionActorId {
+        LogicalExecutionActorId::from_raw(self.generation)
+    }
+
+    /// Commit a previously installed FE carrier to its reserved original slot.
+    /// The installer retains its executors on any refusal and owns cleanup.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by P12 runtime cutover"))]
+    pub(crate) fn install_runtime(
+        mut self,
+        start: &novarocks_logical_execution_protocol::start::LogicalStart,
+        installed: Arc<dyn InstalledRuntime>,
+    ) -> Result<RuntimeInstalledLogicalExecution, RuntimeInstallRefusal> {
+        let invalid = {
+            let state = self.registry.lock();
+            match state.entries.get(&self.initial_execution.query_id()) {
+                Some(RegistryEntry::Reserved(entry)) if entry.generation == self.generation => {
+                    start.validate().is_err()
+                        || start.first_attempt.activation.execution() != self.initial_execution
+                        || start.actor_instance != self.actor_instance()
+                        || start.first_attempt.participations.len() != entry.participations.len()
+                        || start
+                            .first_attempt
+                            .participations
+                            .iter()
+                            .any(|p| !entry.participations.contains(p))
+                }
+                _ => true,
+            }
+        };
+        if invalid {
+            return Err(RuntimeInstallRefusal {
+                error: LogicalExecutionRuntimeRegistryError::ConfigDoesNotMatchReservation,
+                reservation: self,
+                installed,
+            });
+        }
+        let source = match installed.source(LogicalSourceKind::Registry) {
+            Ok(source) => source,
+            Err(_) => {
+                return Err(RuntimeInstallRefusal {
+                    error: LogicalExecutionRuntimeRegistryError::RuntimeSourceClosed,
+                    reservation: self,
+                    installed,
+                });
+            }
+        };
+        let registration = self.runtime_registration();
+        let carrier = RuntimeCarrier::new(
+            installed.clone(),
+            source,
+            Arc::downgrade(&self.registry.inner),
+        );
+        let query = self.initial_execution.query_id();
+        let closing = {
+            let mut state = self.registry.lock();
+            let reserved = match state.entries.remove(&query) {
+                Some(RegistryEntry::Reserved(entry)) if entry.generation == self.generation => {
+                    entry
+                }
+                _ => unreachable!("the unique original reservation retains its exact slot"),
+            };
+            if let Some(original) = &reserved.original_exit {
+                original.installed_silent(OriginalAssociation {
+                    registry: self.registry.inner.id,
+                    initial: self.initial_execution,
+                    generation: self.generation,
+                });
+            }
+            let closing = !state.accepting;
+            state.entries.insert(
+                query,
+                RegistryEntry::RuntimeInstalled(RuntimeInstalledEntry {
+                    registration: registration.clone(),
+                    actor_id: start.actor_instance,
+                    carrier: carrier.clone(),
+                    original_exit: reserved.original_exit,
+                    ingress_closed: false,
+                    internal_health: None,
+                    activations: BTreeMap::from([(
+                        start.first_attempt.activation.execution(),
+                        start.first_attempt.activation,
+                    )]),
+                }),
+            );
+            closing
+        };
+        self.active = false;
+        self.registry.inner.progress.notify_waiters();
+        if closing {
+            installed.request_close(
+                novarocks_logical_execution_protocol::input::RegistryClose::Shutdown,
+            );
+        }
+        Ok(RuntimeInstalledLogicalExecution {
+            registration,
+            installed,
+        })
+    }
+}
+
+impl LogicalExecutionRuntimeRegistryHandle {
+    fn claim_runtime_join(
+        &self,
+        registration: &LogicalExecutionRegistration,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        self.validate_registry(registration)?;
+        let state = self.lock();
+        if let Some(RegistryEntry::RuntimeInstalled(entry)) = state
+            .entries
+            .get(&registration.initial_execution.query_id())
+        {
+            validate_generation(entry.registration.generation, registration.generation)?;
+            entry.carrier.claim_explicit_join();
+        }
+        Ok(())
+    }
+
+    fn runtime_carrier(
+        &self,
+        registration: &LogicalExecutionRegistration,
+    ) -> Result<Option<Arc<RuntimeCarrier>>, LogicalExecutionRuntimeRegistryError> {
+        self.validate_registry(registration)?;
+        self.runtime_carrier_for_query(
+            registration.initial_execution.query_id(),
+            registration.generation,
+        )
+    }
+    fn runtime_carrier_for_query(
+        &self,
+        query: QueryId,
+        generation: u64,
+    ) -> Result<Option<Arc<RuntimeCarrier>>, LogicalExecutionRuntimeRegistryError> {
+        let state = self.lock();
+        match state.entries.get(&query) {
+            Some(RegistryEntry::RuntimeInstalled(entry)) => {
+                validate_generation(entry.registration.generation, generation)?;
+                Ok(Some(entry.carrier.clone()))
+            }
+            Some(RegistryEntry::Installed(entry)) => {
+                validate_generation(entry.generation, generation)?;
+                Ok(None)
+            }
+            Some(RegistryEntry::Reserved(entry)) => {
+                validate_generation(entry.generation, generation)?;
+                Ok(None)
+            }
+            Some(RegistryEntry::Joined(entry)) => {
+                validate_generation(entry.generation, generation)?;
+                Ok(None)
+            }
+            None => Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration),
+        }
+    }
+
+    /// Installation/activation author records the exact activation once. This
+    /// does not freeze a successor to the initial backend participation count.
+    pub(crate) fn register_runtime_activation(
+        &self,
+        registration: &LogicalExecutionRegistration,
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        self.validate_registry(registration)?;
+        let mut state = self.lock();
+        let Some(RegistryEntry::RuntimeInstalled(entry)) = state
+            .entries
+            .get_mut(&registration.initial_execution.query_id())
+        else {
+            return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
+        };
+        validate_generation(entry.registration.generation, registration.generation)?;
+        if activation.actor() != entry.actor_id
+            || activation.execution().query_id() != registration.initial_execution.query_id()
+        {
+            return Err(LogicalExecutionRuntimeRegistryError::ParticipationNotRegistered);
+        }
+        match entry.activations.entry(activation.execution()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(activation);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(slot) if *slot.get() == activation => {
+                Ok(())
+            }
+            _ => Err(LogicalExecutionRuntimeRegistryError::StaleGeneration),
+        }
+    }
+
+    fn poll_runtime_join(
+        &self,
+        query: QueryId,
+        generation: u64,
+        carrier: Arc<RuntimeCarrier>,
+        natural: bool,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<
+        Result<
+            (
+                QueryExecutionId,
+                u64,
+                LogicalExecutionActorId,
+                LogicalExecutionJoinOutcome,
+            ),
+            LogicalExecutionRuntimeRegistryError,
+        >,
+    > {
+        carrier.poll_source(cx);
+        let result = std::task::ready!(carrier.poll_exit(cx));
+        let initial = {
+            let state = self.lock();
+            let Some(RegistryEntry::RuntimeInstalled(entry)) = state.entries.get(&query) else {
+                return Poll::Ready(Err(
+                    LogicalExecutionRuntimeRegistryError::JoinAlreadyCompleted,
+                ));
+            };
+            validate_generation(entry.registration.generation, generation)?;
+            entry.registration.initial_execution
+        };
+        if self
+            .inner
+            .active_native
+            .blocks_registration(initial, generation)
+            || !carrier.source_idle()
+        {
+            return Poll::Pending;
+        }
+        let original_result = OriginalActorExit::Runtime(result.clone());
+        let outcome = original_exit_outcome(&original_result);
+        let (proof, removed, source) = {
+            let mut state = self.lock();
+            let Some(RegistryEntry::RuntimeInstalled(entry)) = state.entries.get_mut(&query) else {
+                return Poll::Ready(Err(
+                    LogicalExecutionRuntimeRegistryError::JoinAlreadyCompleted,
+                ));
+            };
+            validate_generation(entry.registration.generation, generation)?;
+            if natural && carrier.explicit_join_claimed() {
+                return Poll::Pending;
+            }
+            let source = entry.original_exit.clone();
+            let proof = (initial, generation, entry.actor_id, outcome);
+            if let Some(source) = &source {
+                source.runtime_joined_silent(
+                    OriginalAssociation {
+                        registry: self.inner.id,
+                        initial,
+                        generation,
+                    },
+                    result,
+                );
+            }
+            let joined = JoinedEntry {
+                generation,
+                initial_execution: initial,
+                actor_id: entry.actor_id,
+                outcome,
+                original_result,
+                original_exit: source.clone(),
+                internal_health: entry.internal_health.take(),
+            };
+            let removed = state.entries.insert(query, RegistryEntry::Joined(joined));
+            (proof, removed, source)
+        };
+        drop(removed);
+        if let Some(source) = source {
+            if source.has_failure()
+                && let Some(notice) = self.publish_original_exit_health_silent(&source)
+            {
+                notice.notify();
+            }
+            source.notify();
+        }
+        self.inner.progress.notify_waiters();
+        Poll::Ready(Ok(proof))
     }
 }
 
@@ -3273,3 +3806,7 @@ mod process_exit_health_tests {
         assert_eq!(handle.entry_count(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_registry/runtime_tests.rs"]
+mod runtime_tests;

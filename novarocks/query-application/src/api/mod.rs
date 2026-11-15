@@ -47,3 +47,4 @@ pub use crate::execution_error::{
 };
 
 pub mod logical_runtime;
+pub use logical_runtime::*;

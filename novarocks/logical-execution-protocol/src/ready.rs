@@ -18,11 +18,9 @@
 //! The domain's proof stays opaque. This owner validates its original source,
 //! activation, decoded End and common protocol gates, then freezes one cut.
 
-#![expect(dead_code, reason = "wired into the logical core in P06")]
-
 use crate::{
     LogicalRequestToken, LogicalSourceId,
-    failure::query_failure,
+    failure::{LogicalRequestFailure, query_failure},
     input::InternalEndReceiptId,
     start::{LogicalPlanIdentity, ObservationBudgets},
 };
@@ -100,6 +98,23 @@ pub(crate) struct InternalReady {
 }
 
 impl InternalReady {
+    pub(crate) fn is_source(
+        &self,
+        source: LogicalSourceId,
+        activation: AttemptActivationIdentity,
+    ) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|s| s.source == source && s.activation == activation)
+    }
+    pub(crate) fn has_activation(&self, activation: AttemptActivationIdentity) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|s| s.activation == activation)
+    }
+    pub(crate) fn has_pending_proposal(&self) -> bool {
+        self.source.as_ref().is_some_and(|s| s.proposal.is_some())
+    }
     pub(crate) fn new(plan: LogicalPlanIdentity, budgets: ObservationBudgets) -> Self {
         Self {
             plan,
@@ -187,6 +202,7 @@ impl InternalReady {
             .and_then(|source| source.proposal.take())
     }
 
+    #[cfg(test)]
     pub(crate) fn source_matches(
         &self,
         source: LogicalSourceId,
@@ -301,10 +317,7 @@ impl InternalReady {
             return if consumed_end.is_none() {
                 Ok(None)
             } else {
-                Err(query_failure(
-                    QueryFailureReason::ResultProtocol,
-                    "internal proof has no accepted End receipt",
-                ))
+                Err(LogicalRequestFailure::ResultProtocolViolation.error())
             };
         }
         let cut = AttemptComputationCut {

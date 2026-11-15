@@ -78,20 +78,7 @@ pub enum CoreFault {
     UnexpectedInput,
 }
 
-/// The constructor retains already validated immutable start facts.
-/// Decision handling is assembled from the component state machines.
-pub struct LogicalExecutionCore {
-    _start: start::LogicalStart,
-}
-
-impl LogicalExecutionCore {
-    pub fn new(start: start::LogicalStart) -> Self {
-        start
-            .validate()
-            .expect("logical start facts must satisfy the frozen contract");
-        Self { _start: start }
-    }
-}
+pub use core::{InvariantViolation, LogicalExecutionCore};
 
 #[cfg(test)]
 mod test_support;

@@ -1054,20 +1054,34 @@ type ReadFuture =
 /// real delivery/read slots and obtained its final actor success or exact Internal Ready. Moving this
 /// token out is not P retirement: the supervisor consumes it after the pump
 /// and its driver frame have returned normally.
-pub(crate) struct StreamedRowsComputedCut {
+pub struct StreamedRowsComputedCut {
     source: crate::admitted_query_context::StreamedComputationCutHandle,
     _activation: novarocks_coordination_contract::AttemptActivationIdentity,
     _root: TaskIdentity,
     sealing: Result<(), WorkError>,
 }
 impl StreamedRowsComputedCut {
+    pub(crate) fn new(
+        source: crate::admitted_query_context::StreamedComputationCutHandle,
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
+        root: TaskIdentity,
+    ) -> Self {
+        let sealing = source.seal_producer();
+        Self {
+            source,
+            _activation: activation,
+            _root: root,
+            sealing,
+        }
+    }
+
     pub(crate) fn is_for(
         &self,
         source: &crate::admitted_query_context::StreamedComputationCutHandle,
     ) -> bool {
         self.source.same_source(source)
     }
-    pub(super) async fn retire_after_pump_exit(self) -> Result<(), WorkError> {
+    pub async fn retire_after_pump_exit(self) -> Result<(), WorkError> {
         self.sealing.clone()?;
         let source = self.source.clone();
         source.retire_after_pump_exit(self).await

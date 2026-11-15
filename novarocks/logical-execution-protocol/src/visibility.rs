@@ -17,8 +17,6 @@
 
 //! The four logical decisions on the result path. Segments remain in the relay.
 
-#![expect(dead_code, reason = "wired into the logical core in P06")]
-
 use crate::start::{LogicalOutputMode, RootCarrier};
 use novarocks_coordination_contract::AttemptActivationIdentity;
 use novarocks_execution_contract::{TaskIdentity, root_result::RootResultEnd};
@@ -49,7 +47,6 @@ pub(crate) enum ResultPathRefusal {
     ConflictingRoot,
     InvalidEnd,
     EndAlreadyConsumed,
-    EndNotReady,
     EndSlotNotRequested,
 }
 
@@ -102,6 +99,9 @@ pub(crate) struct VisibilityState {
 }
 
 impl VisibilityState {
+    pub(crate) fn frozen(&self, activation: AttemptActivationIdentity) -> bool {
+        self.frozen == Some(activation)
+    }
     pub(crate) fn new(output: LogicalOutputMode, carrier: Option<RootCarrier>) -> Self {
         Self {
             output,

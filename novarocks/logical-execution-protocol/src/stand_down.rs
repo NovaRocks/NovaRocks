@@ -18,8 +18,6 @@
 //! Pure participation cleanup. Worker admission closure, physical resource
 //! evidence and finite observation retirement remain separate facts.
 
-#![expect(dead_code, reason = "wired in the cutover commit")]
-
 use crate::{
     StepBudget, establish::EstablishStandDownFact, input::RegistryParticipationConvergence,
 };
@@ -62,7 +60,7 @@ pub(crate) enum StandDownMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ParticipationClosureState {
+pub enum ParticipationClosureState {
     NoRemoteResponsibility,
     AbortPending,
     AbortIssueExhausted,
@@ -95,7 +93,7 @@ impl ParticipationClosureState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AbortParticipationIssueState {
+pub enum AbortParticipationIssueState {
     AwaitingSettlement,
     DefinitelyUnsent,
     TransportUnknown,
@@ -591,9 +589,7 @@ impl ParticipationStandDownLedger {
         }
     }
 
-    pub fn started(&self) -> bool {
-        self.mode.is_some()
-    }
+    #[cfg(test)]
     pub fn responsibility_settled(&self) -> bool {
         self.progress().responsibility_settled
     }

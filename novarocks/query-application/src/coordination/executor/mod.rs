@@ -31,20 +31,17 @@ pub struct LogicalExecutors {
     pub governance: Arc<GovernanceExecutor>,
 }
 
-// P07 declares concrete owners before P08 supplies their original resource
-// fields and methods in separate module trees. None has a public constructor.
-pub struct NativeExecutor {
-    _private: (),
-}
-pub struct RelayExecutor {
-    _private: (),
-}
-pub struct ConsumerExecutor {
-    _private: (),
-}
-pub struct CancelObserver {
-    _private: (),
-}
-pub struct GovernanceExecutor {
-    _private: (),
-}
+pub(crate) mod cancel;
+pub(crate) mod consumer;
+pub(crate) mod governance;
+pub(crate) mod native;
+
+pub use cancel::CancelObserver;
+pub use consumer::{ConsumerExecutor, ConsumerObservationPort};
+pub use governance::{GovernanceExecutor, GovernanceInstallRefusal};
+pub use native::{
+    NativeExecutor, OriginalTailJoinObligation, OriginalTailKind, OriginalTailWorkObligation,
+};
+
+pub(crate) mod relay;
+pub use relay::RelayExecutor;

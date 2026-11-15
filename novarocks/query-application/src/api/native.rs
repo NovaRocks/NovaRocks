@@ -544,6 +544,44 @@ pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
 /// typed unprovable exit or converge panic keeps that same Box and obligation
 /// under process supervision until explicit process exit.
 pub trait ActiveNativeAttemptOwner: fmt::Debug + Send + 'static {
+    /// Only local installed work and resources. Remote closure is independently
+    /// authored by the attempt/registry protocol and cannot be inferred here.
+    fn finish_installed<'a>(
+        &'a mut self,
+        _request: NativeActiveConvergenceRequest,
+    ) -> NativeAttemptConvergenceFuture<'a> {
+        Box::pin(async {
+            Err(StatementNativeHealthFailure::actual_exit_unproven(
+                "native owner has no installed local exit binding",
+                Arc::new(QueryExecutionError::new(
+                    QueryExecutionErrorKind::InvalidRequest,
+                    "native owner has no installed local exit binding",
+                )),
+            ))
+        })
+    }
+
+    /// Waits for the original already-installed attempt work. Protocol terminal
+    /// facts go directly between cores; this wait cannot reconstruct a driver.
+    fn run_installed<'a>(
+        &'a mut self,
+        _cancellation: CancellationView,
+    ) -> NativeAttemptRunFuture<'a> {
+        Box::pin(async {
+            use novarocks_coordination_contract::{
+                ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+            };
+            use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+            NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
+                ExecutionFailureInput::new(
+                    QueryFailureReason::PreparationProtocol.failure_fact(),
+                    SafeDetail::truncating("native owner has no installed work exit binding"),
+                    ExecutionFailureSite::Coordinator,
+                ),
+            ))
+        })
+    }
+
     fn run<'a>(
         &'a mut self,
         drive: &'a NativeAttemptDrive,
@@ -950,6 +988,14 @@ impl LogicalNativeOpenAcceptance {
 }
 
 impl LogicalNativeSession {
+    /// Observes the SAME pending preparation allocation; no owner is cloned or
+    /// reconstructed and absence alone does not prove the work has exited.
+    pub(crate) fn pending_prepared_present(&self) -> bool {
+        self.pending_work
+            .as_ref()
+            .is_some_and(|work| work.prepared.is_some())
+    }
+
     pub(crate) fn streamed_computation_cut_handle(
         &self,
     ) -> Option<crate::admitted_query_context::StreamedComputationCutHandle> {

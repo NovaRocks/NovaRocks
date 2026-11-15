@@ -18,14 +18,11 @@
 //! Logical phases and exact activation generations. No state value owns work,
 //! a result payload, a host resource or a cancellation-on-Drop authority.
 
-#![expect(dead_code, reason = "wired in the cutover commit")]
-
 use crate::{
     delivery::{DeliveryGate, DeliveryGateError},
     input::QualificationIdentity,
     recovery::{
         RecoveryDecision, RecoveryInput, RecoveryRefusal, RecoveryWindowInput, evaluate_recovery,
-        recovery_window_refusal,
     },
     replacement::ReplacementPrerequisites,
     start::{LogicalConclusion, LogicalOutputMode},
@@ -183,10 +180,6 @@ impl LogicalExecutionState {
         self.attempts.get(&execution)
     }
 
-    pub(crate) fn attempts(&self) -> impl Iterator<Item = &AttemptRecord> {
-        self.attempts.values()
-    }
-
     /// A historical fact can refine only its own exact record. Revoking issue
     /// authority does not erase the original failure author or grant authority
     /// over the successor. Do not call this with a derived logical stop cause.
@@ -278,10 +271,12 @@ impl LogicalExecutionState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn may_observe_pre_ready_replacement(&self, deadline_reached: bool) -> bool {
         self.conclusion.is_none()
             && matches!(self.phase, ExecutionPhase::Running { .. })
-            && recovery_window_refusal(self.recovery_window(deadline_reached)).is_none()
+            && crate::recovery::recovery_window_refusal(self.recovery_window(deadline_reached))
+                .is_none()
     }
 
     /// Called after the successor is prepared and the step owner rechecks the
