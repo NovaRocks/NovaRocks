@@ -26,13 +26,101 @@ use serde::{Deserialize, Serialize};
 use novarocks_spi::connector::{ConnectorCommittedVersion, ConnectorWriteReceipt};
 
 use crate::commit::WrittenFile;
-use crate::commit::report::{
-    IcebergColumnStats, IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
-};
+use crate::commit::report::{IcebergColumnStats, IcebergWriterReport};
 use crate::delete_file::IcebergFileContent;
 use crate::iceberg::spec::TableMetadata;
-use crate::write_descriptor::{IcebergPartitionDescriptor, IcebergPartitionValueDescriptor};
-use crate::write_descriptor::{decode_partition_descriptor, encode_partition_descriptor};
+use crate::write_descriptor::encode_partition_descriptor;
+
+// Provider-owned bounded receipt facts and immutable staged files.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedSealFacts {
+    version: u16,
+    session_id: [u8; 16],
+    file_count: u64,
+    files_digest: [u8; 32],
+}
+
+struct StagedSealFiles {
+    session_id: [u8; 16],
+    files: std::sync::Arc<[WrittenFile]>,
+}
+
+fn staged_files_digest(
+    files: &[WrittenFile],
+    metadata: &TableMetadata,
+) -> Result<[u8; 32], String> {
+    use sha2::{Digest, Sha256};
+    let reports = files
+        .iter()
+        .map(|file| crate::commit::report::writer_report_from_written_file(file, metadata))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Sha256::digest(encode_writer_reports(&reports, metadata)?).into())
+}
+
+pub(crate) fn seal_staged_files(
+    files: Vec<WrittenFile>,
+    metadata: &TableMetadata,
+    session_id: [u8; 16],
+    owner: &novarocks_spi::connector::ConnectorProviderBindingKey,
+) -> Result<ConnectorWriteReceipt, novarocks_spi::connector::ConnectorError> {
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorProcessLocalPayload,
+    };
+    let digest = staged_files_digest(&files, metadata)
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+    let facts = StagedSealFacts {
+        version: 1,
+        session_id,
+        file_count: u64::try_from(files.len()).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "Staged file count is not representable",
+            )
+        })?,
+        files_digest: digest,
+    };
+    let payload = canonical_json(&facts)
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+    ConnectorWriteReceipt::try_new(payload)?.with_process_local_payload(
+        owner,
+        ConnectorProcessLocalPayload::new(
+            owner.clone(),
+            std::sync::Arc::new(StagedSealFiles {
+                session_id,
+                files: files.into(),
+            }),
+        ),
+    )
+}
+
+pub(crate) fn open_staged_files(
+    receipt: &ConnectorWriteReceipt,
+    metadata: &TableMetadata,
+    owner: &novarocks_spi::connector::ConnectorProviderBindingKey,
+) -> Result<std::sync::Arc<[WrittenFile]>, novarocks_spi::connector::ConnectorError> {
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    let corrupt = |message: String| ConnectorError::new(ConnectorErrorKind::CorruptData, message);
+    receipt.validate()?;
+    let facts: StagedSealFacts = serde_json::from_slice(receipt.payload())
+        .map_err(|error| corrupt(format!("Decode staged Iceberg seal: {error}")))?;
+    if facts.version != 1 {
+        return Err(corrupt("Unsupported staged Iceberg seal version".into()));
+    }
+    let payload = receipt.process_local_payload(owner)?.ok_or_else(|| {
+        corrupt("Staged Iceberg seal requires its original process-local file facts".into())
+    })?;
+    let sealed = payload.value::<StagedSealFiles>(owner.instance_id())?;
+    if sealed.session_id != facts.session_id
+        || u64::try_from(sealed.files.len()).ok() != Some(facts.file_count)
+        || staged_files_digest(&sealed.files, metadata).map_err(corrupt)? != facts.files_digest
+    {
+        return Err(corrupt(
+            "Staged Iceberg seal file facts do not match its receipt".into(),
+        ));
+    }
+    Ok(sealed.files.clone())
+}
 
 pub const ICEBERG_WRITE_PAYLOAD_VERSION: u32 = 1;
 
@@ -50,16 +138,6 @@ impl From<IcebergFileContent> for IcebergFileContentV1 {
             IcebergFileContent::Data => Self::Data,
             IcebergFileContent::PositionDeletes => Self::PositionDeletes,
             IcebergFileContent::EqualityDeletes => Self::EqualityDeletes,
-        }
-    }
-}
-
-impl From<IcebergFileContentV1> for IcebergFileContent {
-    fn from(value: IcebergFileContentV1) -> Self {
-        match value {
-            IcebergFileContentV1::Data => Self::Data,
-            IcebergFileContentV1::PositionDeletes => Self::PositionDeletes,
-            IcebergFileContentV1::EqualityDeletes => Self::EqualityDeletes,
         }
     }
 }
@@ -87,11 +165,6 @@ fn ensure_canonical_json<T: Serialize>(
 }
 fn base64_encode(value: impl AsRef<[u8]>) -> String {
     base64::engine::general_purpose::STANDARD.encode(value)
-}
-fn base64_decode(value: &str, subject: &str) -> Result<Vec<u8>, String> {
-    base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .map_err(|error| format!("decode Iceberg {subject} base64 failed: {error}"))
 }
 fn validate_secret_free_text(subject: &str, value: &str) -> Result<(), String> {
     if value.contains('\0') {
@@ -230,82 +303,6 @@ impl IcebergWriterReportV1 {
             is_rewrite: report.is_rewrite,
         })
     }
-
-    fn into_report(self, metadata: &TableMetadata) -> Result<IcebergWriterReport, String> {
-        validate_secret_free_text("staged file path", &self.file.path)?;
-        if let Some(path) = &self.file.referenced_data_file {
-            validate_secret_free_text("referenced data file", path)?;
-        }
-        let values = self
-            .file
-            .partition
-            .values
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| {
-                let datum_bytes = match (value.is_null, value.datum_base64) {
-                    (true, None) => None,
-                    (true, Some(_)) => {
-                        return Err(format!(
-                            "Iceberg partition descriptor value {index} is null but carries a payload"
-                        ));
-                    }
-                    (false, Some(value)) => Some(base64_decode(&value, "partition datum")?),
-                    (false, None) => {
-                        return Err(format!(
-                            "Iceberg partition descriptor value {index} is non-null but has no payload"
-                        ));
-                    }
-                };
-                Ok(IcebergPartitionValueDescriptor {
-                    is_null: value.is_null,
-                    datum_bytes,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let partition_spec_id = self.file.partition.partition_spec_id;
-        let partition_values = decode_partition_descriptor(
-            Some(IcebergPartitionDescriptor { values }),
-            partition_spec_id,
-            metadata,
-        )
-        .map_err(|error| format!("decode Iceberg partition descriptor failed: {error}"))?;
-        Ok(IcebergWriterReport {
-            file: IcebergWrittenFileReport {
-                path: self.file.path,
-                format: self.file.format,
-                content: self.file.content.into(),
-                record_count: self.file.record_count,
-                file_size_in_bytes: self.file.file_size_in_bytes,
-                partition: IcebergPartitionReport {
-                    partition_path: self.file.partition.partition_path,
-                    null_fingerprint: self.file.partition.null_fingerprint,
-                    partition_spec_id,
-                    partition_values,
-                },
-                split_offsets: self.file.split_offsets,
-                column_stats: self
-                    .file
-                    .column_stats
-                    .map(IcebergColumnStatsV1::into_stats)
-                    .transpose()?,
-                referenced_data_file: self.file.referenced_data_file,
-                first_row_id: self.file.first_row_id,
-                equality_ids: self.file.equality_ids,
-                key_metadata: self
-                    .file
-                    .key_metadata_base64
-                    .as_deref()
-                    .map(|value| base64_decode(value, "key metadata"))
-                    .transpose()?,
-                content_offset: self.file.content_offset,
-                content_size_in_bytes: self.file.content_size_in_bytes,
-                cardinality: self.file.cardinality,
-            },
-            is_overwrite: self.is_overwrite,
-            is_rewrite: self.is_rewrite,
-        })
-    }
 }
 
 impl IcebergColumnStatsV1 {
@@ -327,34 +324,10 @@ impl IcebergColumnStatsV1 {
                 .collect(),
         }
     }
-
-    fn into_stats(self) -> Result<IcebergColumnStats, String> {
-        Ok(IcebergColumnStats {
-            column_sizes: self.column_sizes,
-            value_counts: self.value_counts,
-            null_value_counts: self.null_value_counts,
-            nan_value_counts: self.nan_value_counts,
-            lower_bounds: self
-                .lower_bounds_base64
-                .into_iter()
-                .map(|(field_id, value)| {
-                    base64_decode(&value, "lower bound").map(|value| (field_id, value))
-                })
-                .collect::<Result<_, _>>()?,
-            upper_bounds: self
-                .upper_bounds_base64
-                .into_iter()
-                .map(|(field_id, value)| {
-                    base64_decode(&value, "upper bound").map(|value| (field_id, value))
-                })
-                .collect::<Result<_, _>>()?,
-        })
-    }
 }
 
 /// Encode one logical writer's Iceberg file facts. Multiple files are kept in
-/// one logical payload, which the write session carries as the receipt's
-/// provider-private evidence.
+/// one canonical payload used as the staged receipt's file-fact digest input.
 pub fn encode_writer_reports(
     reports: &[IcebergWriterReport],
     metadata: &TableMetadata,
@@ -367,25 +340,6 @@ pub fn encode_writer_reports(
             .collect::<Result<_, _>>()?,
     };
     canonical_json(&payload)
-}
-
-pub fn decode_writer_reports(
-    payload: &[u8],
-    metadata: &TableMetadata,
-) -> Result<Vec<IcebergWriterReport>, String> {
-    let decoded: IcebergStagedReportsPayloadV1 = decode_json(payload, "staged report")?;
-    if decoded.version != ICEBERG_WRITE_PAYLOAD_VERSION {
-        return Err(format!(
-            "unsupported Iceberg staged report payload version {}; expected {}",
-            decoded.version, ICEBERG_WRITE_PAYLOAD_VERSION
-        ));
-    }
-    ensure_canonical_json(payload, &decoded, "staged report")?;
-    decoded
-        .reports
-        .into_iter()
-        .map(|report| report.into_report(metadata))
-        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

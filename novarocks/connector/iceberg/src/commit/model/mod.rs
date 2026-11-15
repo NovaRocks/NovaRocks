@@ -30,9 +30,11 @@ pub use reuse::{
     AddedManifestAuthor, ManifestReuseBasis, ManifestReuseIndex, ManifestRewriteReuse,
 };
 
+#[cfg(test)]
+pub use artifacts::ArtifactWriteState;
 pub use artifacts::{
-    ArtifactKind, ArtifactLedger, ArtifactOrigin, ArtifactRecord, ArtifactWriteState,
-    ArtifactWriter, AttemptArtifacts, CleanupScope, ReceivedPublication,
+    ArtifactKind, ArtifactLedger, ArtifactOrigin, ArtifactRecord, ArtifactWriter, AttemptArtifacts,
+    CleanupScope, ReceivedPublication,
 };
 pub use dependency::Dependency;
 pub(crate) use fields::EntryFacts;

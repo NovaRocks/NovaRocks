@@ -333,6 +333,7 @@ impl IcebergCommitOperation {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn artifacts(&self) -> Result<Vec<ArtifactRecord>> {
         Ok(self
             .inner

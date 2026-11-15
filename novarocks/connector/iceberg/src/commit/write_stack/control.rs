@@ -1220,7 +1220,7 @@ impl IcebergWriteSessionControl {
     ///
     /// What differs is everything after it. Nothing here touches the catalog,
     /// writes a manifest, or creates a snapshot; the validated artifacts are
-    /// folded into the receipt payload and the session settles as sealed. The
+    /// retained by the receipt's process-local attachment and the session settles as sealed. The
     /// single `NotExist` assert-create that makes them visible stays with the
     /// staged-create capability that owns the target.
     ///
@@ -1245,11 +1245,7 @@ impl IcebergWriteSessionControl {
         handle.begin_commit()?;
         let sealed = validated
             .iter()
-            .map(|entry| {
-                let file = written_file_from_fragment(entry.fragment, metadata)?;
-                crate::commit::report::writer_report_from_written_file(&file, metadata)
-                    .map_err(corrupt)
-            })
+            .map(|entry| written_file_from_fragment(entry.fragment, metadata))
             .collect::<Result<Vec<_>, ConnectorError>>();
         let sealed = match sealed {
             Ok(sealed) => sealed,
@@ -1260,16 +1256,12 @@ impl IcebergWriteSessionControl {
                 return Err(error);
             }
         };
-        let payload = match crate::write_codec::encode_writer_reports(&sealed, metadata) {
-            Ok(payload) => payload,
-            Err(error) => {
-                handle.settle(IcebergWriteSessionState::KnownUncommitted {
-                    message: error.clone(),
-                })?;
-                return Err(internal(format!("seal staged Iceberg write set: {error}")));
-            }
-        };
-        let receipt = match ConnectorWriteReceipt::try_new(payload) {
+        let receipt = match crate::write_codec::seal_staged_files(
+            sealed,
+            metadata,
+            handle.session_id().to_bytes(),
+            self.binding_key(),
+        ) {
             Ok(receipt) => receipt,
             Err(error) => {
                 handle.settle(IcebergWriteSessionState::KnownUncommitted {
