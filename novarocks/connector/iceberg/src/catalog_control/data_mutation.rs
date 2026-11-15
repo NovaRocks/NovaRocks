@@ -59,7 +59,7 @@ mod publication;
 
 const PLAN_PAYLOAD_VERSION: u16 = 2;
 const RECEIPT_PAYLOAD_VERSION: u16 = 1;
-const EVIDENCE_PAYLOAD_VERSION: u16 = 2;
+const EVIDENCE_PAYLOAD_VERSION: u16 = 3;
 const MARKER_VALUE_VERSION: u16 = 1;
 const TRUNCATE_OPERATION_KIND: &str = "truncate";
 const MAX_DURABLE_TRUNCATE_EVIDENCE_HEX_BYTES: usize = 16 * 1024;
@@ -98,7 +98,7 @@ struct IcebergDataMutationReceiptV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IcebergDataMutationEvidenceV2 {
+struct IcebergDataMutationEvidenceV3 {
     version: u16,
     namespace: String,
     table: String,
@@ -259,7 +259,7 @@ impl MutationRecoveryTemplate {
         publication: RecoveryPublication,
     ) -> Result<ExternalMutationEvidence, ConnectorError> {
         let summary = self.plan.summary();
-        let payload = IcebergDataMutationEvidenceV2 {
+        let payload = IcebergDataMutationEvidenceV3 {
             version: EVIDENCE_PAYLOAD_VERSION,
             namespace: self.payload.namespace.clone(),
             table: self.payload.table.clone(),
@@ -313,7 +313,7 @@ fn validate_durable_evidence(evidence: &ExternalMutationEvidence) -> Result<(), 
 }
 
 fn validate_recovery_facts(
-    evidence: &IcebergDataMutationEvidenceV2,
+    evidence: &IcebergDataMutationEvidenceV3,
     operation: ConnectorMutationOperationId,
 ) -> Result<(), ConnectorError> {
     let uuid = uuid::Uuid::parse_str(&evidence.table_uuid)
@@ -343,9 +343,6 @@ fn validate_recovery_facts(
                 &evidence.target_ref,
                 crate::commit::model::RequestShape::SnapshotProducing,
             )
-            .map_err(|error| invalid(error.to_string()))?;
-        facts
-            .validate_no_session_data()
             .map_err(|error| invalid(error.to_string()))?;
     }
     Ok(())
@@ -910,7 +907,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
         request: ConnectorDataMutationReconcileRequest,
     ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
         self.ensure_owner(&request.owner)?;
-        let evidence: IcebergDataMutationEvidenceV2 = decode_canonical_json(
+        let evidence: IcebergDataMutationEvidenceV3 = decode_canonical_json(
             request.evidence.provider_payload(),
             "Iceberg data mutation evidence",
         )?;
@@ -1032,7 +1029,7 @@ fn validate_evidence_request(
     descriptor: &ConnectorInstanceDescriptor,
     key: &ConnectorProviderBindingKey,
     request: &ConnectorDataMutationReconcileRequest,
-    evidence: &IcebergDataMutationEvidenceV2,
+    evidence: &IcebergDataMutationEvidenceV3,
 ) -> Result<(), ConnectorError> {
     if request.evidence.schema_version() != EVIDENCE_PAYLOAD_VERSION
         || request.evidence.descriptor() != descriptor
@@ -1958,13 +1955,13 @@ mod tests {
             .unwrap()
             .clone();
         let evidence = adapter.evidence(&plan, cached.private.payload()).unwrap();
-        let mut decoded: IcebergDataMutationEvidenceV2 =
+        let mut decoded: IcebergDataMutationEvidenceV3 =
             decode_canonical_json(evidence.provider_payload(), "recovery").unwrap();
         decoded.base_sequence_number = Some(5);
         assert!(validate_recovery_facts(&decoded, plan.operation_id()).is_err());
         let mut value = serde_json::to_value(&decoded).unwrap();
         value["publication"]["cleanup_authority"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<IcebergDataMutationEvidenceV2>(value).is_err());
+        assert!(serde_json::from_value::<IcebergDataMutationEvidenceV3>(value).is_err());
     }
 
     #[tokio::test]

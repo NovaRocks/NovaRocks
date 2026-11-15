@@ -39,7 +39,6 @@ mod logical_rows;
 mod publication;
 #[cfg(test)]
 pub(crate) use publication::observed_materialized_staging_fixture;
-mod recovery_codec;
 
 // Design: ADR-0177 (docs/adr/ADR-0177-attempt-local-maintenance-inputs-and-single-rewrite-plan.md)
 use std::collections::{BTreeMap, BTreeSet};
@@ -95,7 +94,7 @@ use crate::write_descriptor::decode_partition_descriptor;
 pub const ICEBERG_WRITE_SESSION_MARKER_PROPERTY: &str = "novarocks.write.session.v1";
 
 /// The evidence schema version this control produces and accepts.
-pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 4;
+pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 5;
 
 /// The operation-kind tag on the evidence envelope.
 pub const ICEBERG_WRITE_SESSION_OPERATION_KIND: &str = "iceberg.connector_write_session.v1";
@@ -207,14 +206,15 @@ fn committed_write_receipt(
     }
 }
 
-use publication::RecoveryPayload as IcebergWriteSessionEvidenceV3;
+use publication::RecoveryPayload as IcebergWriteSessionEvidenceV5;
 
 #[cfg(test)]
 pub(crate) fn decode_write_recovery_facts_for_test(
     evidence: &ExternalMutationEvidence,
 ) -> Result<serde_json::Value, ConnectorError> {
-    let payload: IcebergWriteSessionEvidenceV3 =
-        recovery_codec::decode(evidence.provider_payload().as_ref())?;
+    let payload: IcebergWriteSessionEvidenceV5 =
+        serde_json::from_slice(evidence.provider_payload().as_ref())
+            .map_err(|error| corrupt(error.to_string()))?;
     serde_json::to_value(payload).map_err(|error| corrupt(error.to_string()))
 }
 
@@ -1356,7 +1356,7 @@ impl IcebergWriteSessionControl {
         &self,
         handle: &IcebergWriteCommitSession,
         evidence: &ExternalMutationEvidence,
-    ) -> Result<IcebergWriteSessionEvidenceV3, ConnectorError> {
+    ) -> Result<IcebergWriteSessionEvidenceV5, ConnectorError> {
         if evidence.schema_version() != ICEBERG_WRITE_SESSION_EVIDENCE_VERSION
             || evidence.descriptor() != &self.descriptor
             || evidence.incarnation() != self.key.incarnation
@@ -1371,8 +1371,9 @@ impl IcebergWriteSessionControl {
                 "Iceberg write session evidence names a different write session",
             ));
         }
-        let payload: IcebergWriteSessionEvidenceV3 =
-            recovery_codec::decode(evidence.provider_payload().as_ref())?;
+        let payload: IcebergWriteSessionEvidenceV5 =
+            serde_json::from_slice(evidence.provider_payload().as_ref())
+                .map_err(|error| corrupt(error.to_string()))?;
         payload.validate(&self.descriptor, self.key.incarnation, handle)?;
         if handle.recovery_evidence()? != *evidence {
             return Err(corrupt(
@@ -3437,7 +3438,12 @@ pub fn write_control_io_geometry()
         u64::try_from(fixed).map_err(|_| internal("write source geometry overflow"))?,
     )
     .ok_or_else(|| internal("write source geometry is empty"))?;
-    let initial = recovery_codec::initial_owned_backing_bytes()?;
+    // The payload identity strings and their one JSON output buffer can coexist.
+    // The existing SPI carrier limit bounds this encoding estimate; it adds no quota.
+    let initial = novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<IcebergWriteSessionEvidenceV5>()))
+        .ok_or_else(|| internal("write initial evidence geometry overflow"))?;
     let initial = std::num::NonZeroU64::new(
         u64::try_from(initial).map_err(|_| internal("write initial payload geometry overflow"))?,
     )

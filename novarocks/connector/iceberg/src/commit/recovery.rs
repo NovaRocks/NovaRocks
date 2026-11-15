@@ -20,14 +20,10 @@
 //! These records grant no cleanup or I/O authority. Only the live operation
 //! ledger can authorize deletion; decoded facts support read-only adjudication.
 
-use super::model::{
-    ArtifactOrigin, ArtifactWriteState, BaseIdentity, FrozenRequest, OperationAuthority,
-    OperationToken, ReceivedPublication, RequestShape,
-};
+use super::model::{BaseIdentity, FrozenRequest, OperationAuthority, OperationToken, RequestShape};
 use super::operation::IcebergCommitOperation;
 use crate::iceberg::{Error, ErrorKind, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::DataInvalid, message.into())
@@ -71,20 +67,6 @@ enum Base {
         location: String,
     },
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Class {
-    SessionData,
-    Operation,
-    Attempt,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum State {
-    Allocated,
-    Writing,
-    Written,
-}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Attempt {
@@ -101,15 +83,6 @@ impl From<super::model::AttemptToken> for Attempt {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Object {
-    path: String,
-    class: Class,
-    attempt: Option<Attempt>,
-    state: State,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct FrozenPublicationFacts {
     authority: Authority,
     operation_id: [u8; 16],
@@ -122,10 +95,6 @@ pub(crate) struct FrozenPublicationFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     base_facts: Option<super::model::FrozenBaseFacts>,
     published_snapshot_id: Option<i64>,
-    objects: Vec<Object>,
-    attempt_owned: Vec<u32>,
-    operation_references: Vec<u32>,
-    session_references: Vec<u32>,
 }
 
 impl FrozenPublicationFacts {
@@ -153,19 +122,7 @@ impl FrozenPublicationFacts {
         }
         Ok(())
     }
-    pub(crate) fn validate_no_session_data(&self) -> Result<()> {
-        if !self.session_references.is_empty()
-            || self
-                .objects
-                .iter()
-                .any(|object| object.class == Class::SessionData)
-        {
-            return Err(invalid(
-                "This publication cannot own session data artifacts",
-            ));
-        }
-        Ok(())
-    }
+
     pub(crate) fn validate_existing_target(
         &self,
         operation: OperationToken,
@@ -223,61 +180,6 @@ impl FrozenPublicationFacts {
                 }
             }
         };
-        // Transitional envelope projection only; the live ledger remains the sole owner.
-        let current = request.artifacts().attempt();
-        let selected: BTreeSet<_> = request.artifacts().references().iter().collect();
-        let mut index = BTreeMap::new();
-        let mut objects = Vec::new();
-        let mut attempt_owned = Vec::new();
-        let mut operation_references = Vec::new();
-        let mut session_references = Vec::new();
-        for record in operation.artifacts()? {
-            let object_index = u32::try_from(objects.len())
-                .map_err(|_| invalid("Recovery object count overflow"))?;
-            index.insert(record.object.clone(), object_index);
-            let (class, attempt) = match record.origin {
-                ArtifactOrigin::Received {
-                    publishes: ReceivedPublication::ViaManifest,
-                } => (Class::SessionData, None),
-                ArtifactOrigin::Received {
-                    publishes: ReceivedPublication::WithRequest,
-                } => (Class::Operation, None),
-                // REWRITE already carries a previous attempt's selected manifests.
-                // The old envelope can express those only as operation references.
-                ArtifactOrigin::Produced { attempt, .. }
-                    if attempt != current && selected.contains(&record.object) =>
-                {
-                    (Class::Operation, None)
-                }
-                ArtifactOrigin::Produced { attempt, .. } => (Class::Attempt, Some(attempt.into())),
-            };
-            if class == Class::Attempt && attempt.as_ref() == Some(&Attempt::from(current)) {
-                // The old validator requires the whole current attempt, including orphans.
-                attempt_owned.push(object_index);
-            }
-            if selected.contains(&record.object) {
-                match class {
-                    Class::Operation => operation_references.push(object_index),
-                    Class::SessionData => session_references.push(object_index),
-                    Class::Attempt => {}
-                }
-            }
-            objects.push(Object {
-                path: record.object.path().into(),
-                class,
-                attempt,
-                state: match record.write_state {
-                    ArtifactWriteState::Allocated => State::Allocated,
-                    ArtifactWriteState::Writing => State::Writing,
-                    ArtifactWriteState::Written => State::Written,
-                },
-            });
-        }
-        if selected.iter().any(|object| !index.contains_key(*object)) {
-            return Err(invalid(
-                "Frozen publication reference is absent from recovery ledger",
-            ));
-        }
         let facts = Self {
             authority: operation.token().authority().into(),
             operation_id: operation.token().to_bytes(),
@@ -295,10 +197,6 @@ impl FrozenPublicationFacts {
             base,
             base_facts: request.base_facts().cloned(),
             published_snapshot_id: request.ref_snapshot_after(request.target_ref()),
-            attempt_owned,
-            operation_references,
-            session_references,
-            objects,
         };
         facts.validate(operation.token())?;
         Ok(facts)
@@ -343,76 +241,6 @@ impl FrozenPublicationFacts {
                 "Recovery publication has no actual UUIDv7 attempt nonce",
             ));
         }
-        let mut attempts = BTreeMap::from([(self.attempt.ordinal, self.attempt.nonce)]);
-        let mut previous = None;
-        for object in &self.objects {
-            super::write_stack::domain::validate_location("recovery object", &object.path)
-                .map_err(|error| invalid(error.message()))?;
-            if previous.is_some_and(|path| path >= object.path.as_str()) {
-                return Err(invalid(
-                    "Recovery ledger paths must be unique and strictly ordered",
-                ));
-            }
-            previous = Some(object.path.as_str());
-            match (object.class, &object.attempt) {
-                (Class::Attempt, Some(attempt))
-                    if attempt.ordinal <= self.attempt.ordinal && valid_nonce(&attempt.nonce) =>
-                {
-                    if attempts
-                        .insert(attempt.ordinal, attempt.nonce)
-                        .is_some_and(|old| old != attempt.nonce)
-                    {
-                        return Err(invalid("Recovery attempt ordinal has conflicting nonces"));
-                    }
-                }
-                (Class::SessionData, None) if object.state == State::Written => {}
-                (Class::Operation, None) => {}
-                _ => {
-                    return Err(invalid(
-                        "Recovery object lifetime disagrees with its write/attempt facts",
-                    ));
-                }
-            }
-        }
-        let mut referenced = BTreeSet::new();
-        for (references, class) in [
-            (&self.attempt_owned, Class::Attempt),
-            (&self.operation_references, Class::Operation),
-            (&self.session_references, Class::SessionData),
-        ] {
-            let mut previous = None;
-            for index in references {
-                let object = self
-                    .objects
-                    .get(*index as usize)
-                    .ok_or_else(|| invalid("Recovery reference is outside its complete ledger"))?;
-                if previous.is_some_and(|old| old >= *index)
-                    || !referenced.insert(*index)
-                    || object.class != class
-                    || object.state != State::Written
-                    || (class == Class::Attempt && object.attempt.as_ref() != Some(&self.attempt))
-                {
-                    return Err(invalid(
-                        "Recovery reference disagrees with exact ownership/write facts",
-                    ));
-                }
-                previous = Some(*index);
-            }
-        }
-        let current: Vec<_> = self
-            .objects
-            .iter()
-            .enumerate()
-            .filter(|(_, object)| {
-                object.class == Class::Attempt && object.attempt.as_ref() == Some(&self.attempt)
-            })
-            .map(|(i, _)| i as u32)
-            .collect();
-        if current != self.attempt_owned {
-            return Err(invalid(
-                "Recovery publication omits current attempt artifacts",
-            ));
-        }
         Ok(())
     }
 }
@@ -454,10 +282,6 @@ mod tests {
                     next_row_id: 120,
                 }),
                 published_snapshot_id: None,
-                objects: vec![],
-                attempt_owned: vec![],
-                operation_references: vec![],
-                session_references: vec![],
             },
             operation,
             identifier,
@@ -479,7 +303,6 @@ mod tests {
                 RequestShape::RefRetention,
             )
             .unwrap();
-        restored.validate_no_session_data().unwrap();
         assert!(
             restored
                 .validate_existing_target(
@@ -497,23 +320,6 @@ mod tests {
                     ConnectorMutationOperationId::from_bytes([5; 16])
                 ))
                 .is_err()
-        );
-    }
-
-    #[test]
-    fn old_recovery_facts_without_baseline_remain_readable_without_inventing_facts() {
-        let (facts, operation, _) = retention_facts();
-        let mut value = serde_json::to_value(facts).unwrap();
-        value["shape"] = serde_json::json!("metadata_only");
-        value.as_object_mut().unwrap().remove("base_facts");
-        let restored: FrozenPublicationFacts = serde_json::from_value(value).unwrap();
-        restored.validate(operation).unwrap();
-        assert!(restored.base_facts.is_none());
-        assert!(
-            serde_json::to_value(restored)
-                .unwrap()
-                .get("base_facts")
-                .is_none()
         );
     }
 }
@@ -585,7 +391,6 @@ mod document_expiry_recovery_tests {
                 if *uuid == metadata.uuid() && metadata_location == &location
         ));
         decoded.validate(fixture.operation.token()).unwrap();
-        decoded.validate_no_session_data().unwrap();
         decoded
             .validate_existing_target(
                 fixture.operation.token(),

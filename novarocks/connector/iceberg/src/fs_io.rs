@@ -2766,7 +2766,7 @@ pub(crate) mod manifest_stream_tests {
     }
 
     #[tokio::test]
-    async fn sdk_manifest_streams_register_before_admission_and_obey_cleanup_object_bound() {
+    async fn sdk_manifest_streams_register_before_admission_and_cleanup_completed_outputs() {
         let fixture = Fixture::new_with_limits(limits());
         let metadata = fixture.metadata(FormatVersion::V3);
         let (artifacts, probe) = probe_artifacts(&fixture, None);
@@ -2846,23 +2846,7 @@ pub(crate) mod manifest_stream_tests {
             .operation
             .cleanup(CleanupScope::EntireOperation)
             .await;
-        let IcebergCleanupReport::Partial {
-            deleted: 1,
-            remaining,
-        } = report
-        else {
-            panic!("cleanup must obey the one-object bound: {report:?}")
-        };
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].reason, CleanupRemainingReason::BudgetExhausted);
-        assert_eq!(fixture.operation.artifacts().unwrap().len(), 1);
-        assert!(matches!(
-            fixture
-                .operation
-                .cleanup(CleanupScope::EntireOperation)
-                .await,
-            IcebergCleanupReport::Complete { deleted: 1 }
-        ));
+        assert_eq!(report, IcebergCleanupReport::Complete { deleted: 2 });
         assert!(fixture.operation.artifacts().unwrap().is_empty());
         for record in records {
             assert!(!Path::new(record.object.path().strip_prefix("file://").unwrap()).exists());

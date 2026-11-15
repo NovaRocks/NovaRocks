@@ -17,7 +17,7 @@
 
 //! Publication evidence and bounded cleanup are separate results.
 
-use super::{ArtifactRecord, ObjectIdentity, OperationToken};
+use super::{ObjectIdentity, OperationToken};
 use novarocks_spi::connector::ConnectorMutationFailure;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,14 +103,6 @@ pub enum PublicationOutcome<Proof, Evidence> {
             )
         )]
         operation: OperationToken,
-        #[cfg_attr(
-            not(test),
-            expect(
-                dead_code,
-                reason = "Retains the complete owned-object ledger while publication remains unknown."
-            )
-        )]
-        artifacts: Vec<ArtifactRecord>,
     },
 }
 

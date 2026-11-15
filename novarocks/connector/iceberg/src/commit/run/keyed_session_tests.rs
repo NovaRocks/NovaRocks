@@ -226,11 +226,11 @@ fn assert_keyed_evidence(
     prepared: &PreparedKeyed,
 ) -> serde_json::Value {
     let evidence = iceberg_handle(fixture, plan).recovery_evidence().unwrap();
-    assert_eq!(evidence.schema_version(), 4);
+    assert_eq!(evidence.schema_version(), 5);
     let payload =
         crate::commit::write_stack::control::decode_write_recovery_facts_for_test(&evidence)
             .unwrap();
-    assert_eq!(payload["version"], serde_json::json!(4));
+    assert_eq!(payload["version"], serde_json::json!(5));
     assert_eq!(
         payload["document_record_digest"],
         serde_json::json!(expected_record_digest(&prepared.records))
@@ -334,7 +334,7 @@ async fn real_keyed_empty_full_begin_finish_reasserts_closure_with_v4_evidence()
                 .all(|k| !k.starts_with("novarocks.managed.") && k != "novarocks.documents.v1")
         );
         let payload = assert_keyed_evidence(&fixture, &plan, &prepared);
-        assert_eq!(payload["attempt_owned"].as_array().unwrap().len(), 1);
+        assert!(payload.get("attempt_owned").is_none());
         assert_eq!(payload["published_snapshot_id"], serde_json::json!(id));
         let modes = fixture.load_modes.lock().unwrap();
         assert!(!modes.is_empty());
@@ -491,25 +491,32 @@ async fn keyed_unknown_retains_session_data_and_manifest_without_redispatch() {
         panic!("ambiguous dispatch must stay unknown")
     };
     let payload = assert_keyed_evidence(&fixture, &plan, &prepared);
-    let paths: Vec<_> = payload["artifacts"]
-        .as_array()
+    let (operation, _) = iceberg_handle(&fixture, &plan)
+        .retained_publication()
         .unwrap()
+        .unwrap();
+    let records = operation.artifacts().unwrap();
+    let paths: Vec<_> = records
         .iter()
-        .map(|v| v["path"].as_str().unwrap().to_string())
+        .map(|record| record.object.path().to_owned())
         .collect();
     assert!(paths.contains(&data));
     assert!(paths.len() > 1);
-    let session_indices = payload["session_references"].as_array().unwrap();
-    assert_eq!(session_indices.len(), 1);
-    let data_index = session_indices[0].as_u64().unwrap() as usize;
-    assert_eq!(
-        payload["artifacts"][data_index]["path"],
-        serde_json::json!(data)
-    );
-    assert_eq!(
-        payload["artifacts"][data_index]["class"],
-        serde_json::json!("session_data")
-    );
+    let session_objects: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.origin,
+                crate::commit::model::ArtifactOrigin::Received {
+                    publishes: crate::commit::model::ReceivedPublication::ViaManifest,
+                }
+            )
+        })
+        .map(|record| record.object.path())
+        .collect();
+    assert_eq!(session_objects, [data.as_str()]);
+    assert!(payload.get("artifacts").is_none());
+    assert!(payload.get("session_references").is_none());
     for path in &paths {
         assert!(std::path::Path::new(path.strip_prefix("file://").unwrap()).exists());
     }

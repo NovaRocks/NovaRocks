@@ -586,7 +586,7 @@ mod tests {
         async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
-                Behavior::Commit => CatalogOutcome::committed(
+                Behavior::Commit | Behavior::Capacity(_) => CatalogOutcome::committed(
                     CommitProof::applied(request.ref_snapshot_after(request.target_ref())),
                     ExternalMutationEffect::Applied,
                 ),
@@ -599,7 +599,7 @@ mod tests {
                     CatalogCommitEvidence::for_target("db.t"),
                 ),
                 Behavior::PanicAfterIssue => panic!("injected data mutation bridge after issue"),
-                Behavior::PanicBeforeLoad | Behavior::Capacity(_) => {
+                Behavior::PanicBeforeLoad => {
                     panic!("undispatched mutation unexpectedly issued")
                 }
             }
@@ -743,7 +743,7 @@ mod tests {
                 let ExternalMutationOutcome::CommitUnknown { evidence, .. } = outcome else {
                     panic!("issued mutation lost its unknown verdict")
                 };
-                let payload: IcebergDataMutationEvidenceV2 =
+                let payload: IcebergDataMutationEvidenceV3 =
                     decode_canonical_json(evidence.provider_payload(), "actual recovery").unwrap();
                 assert!(matches!(
                     &payload.publication,
@@ -835,9 +835,21 @@ mod tests {
                 assert!(operation.artifacts().unwrap().is_empty());
             }
             Behavior::Capacity(_) => {
-                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
                 assert!(
-                    matches!(outcome, ExternalMutationOutcome::KnownUncommitted { failure, cleanup: ExternalMutationFinalization::Complete } if failure.kind() == ConnectorMutationFailureKind::ResourceExhausted)
+                    matches!(
+                        outcome,
+                        ExternalMutationOutcome::KnownCommitted {
+                            finalization: ExternalMutationFinalization::Complete,
+                            ..
+                        }
+                    ),
+                    "{outcome:?}"
+                );
+                let evidence = checked.lock().unwrap().clone().unwrap();
+                assert!(
+                    evidence.provider_payload().len()
+                        <= novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
                 );
                 assert!(operation.artifacts().unwrap().is_empty());
             }
@@ -861,9 +873,9 @@ mod tests {
     }
 
     #[test]
-    fn mutation_actual_full_ledger_capacity_refuses_before_dispatch() {
-        exercise(Behavior::Capacity(400), false);
-        exercise(Behavior::Capacity(50), true);
+    fn mutation_large_owned_ledger_publishes_with_bounded_recovery() {
+        exercise(Behavior::Capacity(1200), false);
+        exercise(Behavior::Capacity(1200), true);
     }
 
     #[test]

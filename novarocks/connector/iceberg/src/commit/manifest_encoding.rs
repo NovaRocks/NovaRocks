@@ -886,6 +886,99 @@ mod tests {
             BTreeMap::from([(2, 8)])
         );
     }
+
+    #[test]
+    fn schema_identifier_set_order_is_canonical_without_reordering_fields() {
+        // These inputs explicitly differ; no HashSet seed or retry loop is used.
+        let mut first = serde_json::json!({
+            "schema-id":17,"identifier-field-ids":[3,1,2],"type":"struct",
+            "fields":[
+                {"id":3,"name":"third","required":true,"type":"long"},
+                {"id":1,"name":"first","required":true,"type":"long"},
+                {"id":2,"name":"second","required":true,"type":"long"}
+            ]
+        });
+        let mut second = first.clone();
+        second["identifier-field-ids"] = serde_json::json!([2, 3, 1]);
+        assert_ne!(first, second);
+        let fields = first["fields"].clone();
+        canonicalize_schema_identifier_ids(&mut first).unwrap();
+        canonicalize_schema_identifier_ids(&mut second).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first["identifier-field-ids"], serde_json::json!([1, 2, 3]));
+        assert_eq!(first["fields"], fields);
+        assert_eq!(first["schema-id"], 17);
+    }
+
+    #[test]
+    fn real_schema_serde_round_trip_preserves_the_manifest_reuse_basis() {
+        let schema = Schema::builder()
+            .with_schema_id(17)
+            .with_fields([
+                Arc::new(NestedField::required(
+                    1,
+                    "first",
+                    crate::iceberg::spec::Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    "second",
+                    crate::iceberg::spec::Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::required(
+                    3,
+                    "third",
+                    crate::iceberg::spec::Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .with_identifier_field_ids([3, 1, 2])
+            .build()
+            .unwrap();
+        let restored: Schema =
+            serde_json::from_slice(&serde_json::to_vec(&schema).unwrap()).unwrap();
+        assert_eq!(schema, restored);
+        let original = table(schema, PartitionSpec::unpartition_spec());
+        let rebuilt = table(restored, PartitionSpec::unpartition_spec());
+        assert_eq!(
+            encoding_basis(&original).unwrap(),
+            encoding_basis(&rebuilt).unwrap()
+        );
+        let restored_table: TableMetadata =
+            serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+        assert_eq!(original.current_schema(), restored_table.current_schema());
+        assert_eq!(
+            encoding_basis(&original).unwrap(),
+            encoding_basis(&restored_table).unwrap()
+        );
+        let basis: serde_json::Value =
+            serde_json::from_slice(&encoding_basis(&original).unwrap()).unwrap();
+        assert_eq!(
+            basis[2][0]["identifier-field-ids"],
+            serde_json::json!([1, 2, 3])
+        );
+    }
+}
+
+// Iceberg schema identifiers are a set. The SDK serializes the HashSet as
+// an array in iteration order, which must not become a retry dependency.
+fn canonicalize_schema_identifier_ids(schema: &mut serde_json::Value) -> Result<()> {
+    let Some(value) = schema.get_mut("identifier-field-ids") else {
+        return Ok(());
+    };
+    let identifiers = value
+        .as_array_mut()
+        .ok_or_else(|| invalid("Serialized schema identifier fields are not an array"))?;
+    let mut ordered = identifiers
+        .iter()
+        .map(|id| {
+            id.as_i64()
+                .and_then(|id| i32::try_from(id).ok())
+                .ok_or_else(|| invalid("Serialized schema identifier field is not an i32"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ordered.sort_unstable();
+    *identifiers = ordered.into_iter().map(serde_json::Value::from).collect();
+    Ok(())
 }
 
 pub(crate) fn encoding_basis(
@@ -893,6 +986,16 @@ pub(crate) fn encoding_basis(
 ) -> crate::iceberg::Result<Vec<u8>> {
     let mut schemas = metadata.schemas_iter().collect::<Vec<_>>();
     schemas.sort_by_key(|schema| schema.schema_id());
+    let schemas = schemas
+        .into_iter()
+        .map(|schema| {
+            let mut value = serde_json::to_value(schema).map_err(|error| {
+                invalid("Cannot encode manifest reuse schema").with_source(error)
+            })?;
+            canonicalize_schema_identifier_ids(&mut value)?;
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut specs = metadata.partition_specs_iter().collect::<Vec<_>>();
     specs.sort_by_key(|spec| spec.spec_id());
     serde_json::to_vec(&(

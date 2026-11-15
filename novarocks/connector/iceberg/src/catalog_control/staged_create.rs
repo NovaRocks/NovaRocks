@@ -57,7 +57,7 @@ use crate::loaded_table::IcebergRestVendedS3LeaseRefresher;
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
 
-const EVIDENCE_VERSION: u16 = 1;
+const EVIDENCE_VERSION: u16 = 2;
 const CTAS_OPERATION_MARKER: &str = "novarocks.ctas.operation-id";
 const CTAS_PROVENANCE_VERSION: &str = "novarocks.ctas.provenance-version";
 const CTAS_PROVENANCE_TARGET: &str = "novarocks.ctas.target";
@@ -679,7 +679,7 @@ struct PublicationUnknownOperation {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct PublishEvidenceV1 {
+struct PublishEvidenceV2 {
     version: u16,
     operation_marker: String,
     table_uuid: String,
@@ -1924,7 +1924,7 @@ impl IcebergStagedCreateAdapter {
             ));
         }
         let prepared = unknown.prepared;
-        let evidence: PublishEvidenceV1 =
+        let evidence: PublishEvidenceV2 =
             serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
                 invalid(format!(
                     "Iceberg staged-create publish evidence is invalid: {error}"
@@ -2816,7 +2816,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             ));
         }
         let prepared = unknown.prepared;
-        let evidence: PublishEvidenceV1 =
+        let evidence: PublishEvidenceV2 =
             serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
                 invalid(format!(
                     "Iceberg staged-create publish evidence is invalid: {error}"
@@ -2976,7 +2976,7 @@ fn take_abortable(
 }
 
 fn validate_publish_evidence(
-    evidence: &PublishEvidenceV1,
+    evidence: &PublishEvidenceV2,
     prepared: &PreparedOperation,
     dispatch_operation_id: ConnectorStagedCreateOperationId,
 ) -> Result<(), ConnectorError> {

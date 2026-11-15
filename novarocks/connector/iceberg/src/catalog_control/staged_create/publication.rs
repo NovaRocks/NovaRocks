@@ -173,7 +173,7 @@ impl PublicationPreparer for CreatePublisher {
         )?;
         let ident = request.identifier();
         let expected_snapshot_id = request.ref_snapshot_after("main");
-        let payload = serde_json::to_vec(&PublishEvidenceV1 {
+        let payload = serde_json::to_vec(&PublishEvidenceV2 {
             version: EVIDENCE_VERSION,
             operation_marker: publication_marker(self.prepared.publication_id),
             table_uuid: self.prepared.staged.table.metadata().uuid().to_string(),
@@ -1164,7 +1164,7 @@ mod tests {
                 let encoded = serde_json::to_vec(&facts).unwrap();
                 let decoded: FrozenPublicationFacts = serde_json::from_slice(&encoded).unwrap();
                 assert_eq!(facts, decoded);
-                let envelope = PublishEvidenceV1 {
+                let envelope = PublishEvidenceV2 {
                     version: EVIDENCE_VERSION,
                     operation_marker: publication_marker(fixture.prepared.publication_id),
                     table_uuid: original.uuid().to_string(),
@@ -1189,7 +1189,7 @@ mod tests {
                             )
                         }
                     }
-                    let tampered: PublishEvidenceV1 = serde_json::from_value(tampered).unwrap();
+                    let tampered: PublishEvidenceV2 = serde_json::from_value(tampered).unwrap();
                     assert!(
                         validate_publish_evidence(&tampered, &fixture.prepared, operation_id)
                             .is_err(),
@@ -1202,9 +1202,9 @@ mod tests {
                     ))
                     .unwrap();
                 let text = String::from_utf8(encoded).unwrap();
-                assert!(text.contains(CTAS_UNANCHORED_PROVENANCE_FILE));
+                assert!(!text.contains(CTAS_UNANCHORED_PROVENANCE_FILE));
                 if with_data {
-                    assert!(text.contains("data.parquet"));
+                    assert!(!text.contains("data.parquet"));
                     assert_eq!(
                         intent.changes().added[0].file().column_sizes().get(&1),
                         Some(&24)
@@ -1256,7 +1256,41 @@ mod tests {
     }
 
     #[test]
-    fn create_preflight_bounds_the_complete_ledger_before_dispatch() {
+    fn create_large_owned_ledger_passes_preflight_and_dispatches_once() {
+        struct ControlledCreatePublisher {
+            inner: CreatePublisher,
+            dispatches: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl crate::commit::attempt::Publisher for ControlledCreatePublisher {
+            async fn load_target(
+                &self,
+                attempt: &IcebergCommitAttempt,
+            ) -> crate::iceberg::Result<StagingBase> {
+                self.inner.load_target(attempt).await
+            }
+            fn preflight_recovery(
+                &self,
+                request: &FrozenRequest,
+                operation: &IcebergCommitOperation,
+            ) -> crate::iceberg::Result<()> {
+                self.inner.preflight_recovery(request, operation)
+            }
+            async fn dispatch_once(
+                &self,
+                request: FrozenRequest,
+            ) -> crate::catalog::error::CatalogOutcome<crate::catalog::transaction::CommitProof>
+            {
+                self.dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::catalog::error::CatalogOutcome::committed(
+                    crate::catalog::transaction::CommitProof::applied(
+                        request.ref_snapshot_after("main"),
+                    ),
+                    ExternalMutationEffect::Applied,
+                )
+            }
+        }
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let mut fixture = Fixture::new(false);
             let operation_id = fixture.prepared.operation_id();
@@ -1267,39 +1301,53 @@ mod tests {
                 &fixture.context,
             )
             .unwrap();
-            // Unselected produced outputs still belong to recovery, even before their
-            // writer opens. Received data must instead be covered by this CREATE's manifests.
             let abandoned = operation.begin_attempt().unwrap();
-            for _ in 0..350 {
+            for _ in 0..1200 {
                 abandoned
                     .allocate(crate::commit::model::ArtifactKind::Manifest)
                     .unwrap();
             }
             let intent = create_intent(&fixture.prepared, operation.token()).unwrap();
             let journal = PublicationJournal::new(operation.token());
-            let publisher = CreatePublisher {
-                adapter: fixture.adapter.clone(),
-                prepared: Arc::new(fixture.prepared.clone()),
-                operation_id,
-                journal: journal.clone(),
-            };
-            let attempt = operation.begin_attempt().unwrap();
-            let mut engine = StagingEngine::begin(
-                publisher.load_target(&attempt).await.unwrap(),
+            let publisher = Arc::new(ControlledCreatePublisher {
+                inner: CreatePublisher {
+                    adapter: fixture.adapter.clone(),
+                    prepared: Arc::new(fixture.prepared.clone()),
+                    operation_id,
+                    journal: journal.clone(),
+                },
+                dispatches: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let observed = journal.observe(publisher.clone());
+            let report = attempt::run(
+                &operation,
                 &intent,
-                &attempt,
+                &create_prefix(&fixture.prepared),
+                &[],
+                &observed,
+                RetryPolicy::from_properties(fixture.prepared.staged.table.metadata().properties())
+                    .unwrap(),
             )
-            .unwrap();
-            engine
-                .stage_change(create_prefix(&fixture.prepared))
-                .unwrap();
-            let request = engine.freeze().unwrap();
-            assert!(publisher.preflight_recovery(&request, &operation).is_err());
+            .await;
+            assert!(
+                matches!(
+                    report.publication,
+                    crate::commit::model::PublicationOutcome::Committed(_)
+                ),
+                "{report:?}"
+            );
+            assert_eq!(
+                publisher
+                    .dispatches
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
             assert!(matches!(
-                journal.bridge_failure(&operation, "preflight refused".into()),
-                ExternalMutationOutcome::KnownUncommitted { .. }
+                report.cleanup,
+                crate::commit::model::IcebergCleanupReport::Complete { .. }
             ));
-            assert_eq!(operation.artifacts().unwrap().len(), 351);
+            assert!(operation.artifacts().unwrap().is_empty());
+            assert!(fixture.provenance_path().exists());
         });
     }
 }

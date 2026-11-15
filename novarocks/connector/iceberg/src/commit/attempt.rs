@@ -447,7 +447,6 @@ async fn run_in_phase(
                         failure,
                         evidence,
                         operation: operation.token(),
-                        artifacts: operation.recovery_artifacts(),
                     },
                     cleanup: IcebergCleanupReport::NotAttempted,
                 };
@@ -1775,15 +1774,11 @@ mod tests {
                 .unwrap();
             let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Unknown);
             let report = invoke(&fixture, &intent, &publisher).await;
-            let PublicationOutcome::Unknown {
-                artifacts,
-                operation,
-                ..
-            } = report.publication
-            else {
+            let PublicationOutcome::Unknown { operation, .. } = report.publication else {
                 panic!("unknown")
             };
             assert_eq!(operation, fixture.operation.token());
+            let artifacts = fixture.operation.artifacts().unwrap();
             assert_eq!(artifacts.len(), 3);
             assert_eq!(report.cleanup, IcebergCleanupReport::NotAttempted);
             assert_eq!(publisher.requests.lock().unwrap().len(), 1);

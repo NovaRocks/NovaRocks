@@ -242,9 +242,7 @@ impl Projection {
                     "External mutation evidence payload exceeds its original limit",
                 )
             } else {
-                internal(format!(
-                    "Encode complete statistics recovery ledger: {error}"
-                ))
+                internal(format!("Encode statistics recovery facts: {error}"))
             }));
         }
         let bytes = encoded.bytes;
@@ -1013,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn statistics_complete_recovery_capacity_refusal_is_undispatched_and_cleans() {
+    fn statistics_oversized_identity_refuses_dispatch_and_cleans() {
         let rig = Rig::new();
         let publisher = rig.publisher(rig.metadata.clone(), Behavior::RefuseCapacity);
         let outcome = rig.run(publisher.clone(), rig.preparer());
@@ -1022,6 +1020,32 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 0);
+        assert!(rig.operation.artifacts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn statistics_large_owned_ledger_publishes_with_bounded_recovery() {
+        let rig = Rig::new();
+        let abandoned = rig.operation.begin_attempt().unwrap();
+        for _ in 0..1500 {
+            abandoned
+                .allocate(crate::commit::model::ArtifactKind::Statistics)
+                .unwrap();
+        }
+        let publisher = rig.publisher(rig.metadata.clone(), Behavior::Commit);
+        let outcome = rig.run(publisher.clone(), rig.preparer());
+        assert!(
+            matches!(
+                outcome,
+                ExternalMutationOutcome::KnownCommitted {
+                    finalization: ExternalMutationFinalization::Complete,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 1);
+        assert!(exists(&publisher.paths.lock().unwrap()[0]));
         assert!(rig.operation.artifacts().unwrap().is_empty());
     }
 
