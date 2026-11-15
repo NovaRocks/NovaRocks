@@ -519,7 +519,7 @@ mod tests {
     use crate::catalog_control::data_mutation::tests::{
         exact_provider_with_empty_table, register_plan, table_context, write_external_parquet,
     };
-    use crate::commit::model::{ArtifactClass, ArtifactKind};
+    use crate::commit::model::ArtifactKind;
     use novarocks_spi::connector::ConnectorMetadata;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -569,14 +569,6 @@ mod tests {
             request: &FrozenRequest,
             operation: &IcebergCommitOperation,
         ) -> crate::iceberg::Result<()> {
-            if let Behavior::Capacity(count) = self.behavior {
-                // Operation-lifetime allocations are real ledger entries, even
-                // when preparation later rejects before opening their output.
-                let allocation = operation.begin_attempt()?;
-                for _ in 0..count {
-                    allocation.allocate(ArtifactClass::Operation, ArtifactKind::Manifest)?;
-                }
-            }
             let facts = FrozenPublicationFacts::from_request(request, operation)?;
             let evidence = self
                 .template
@@ -686,6 +678,15 @@ mod tests {
             OperationLimits::default(),
         )
         .unwrap();
+        if let Behavior::Capacity(count) = behavior {
+            // Unselected allocations remain owned, including outputs that were never opened.
+            // Prepare them before the publication attempt so the recovery envelope records
+            // an actual earlier attempt, rather than inventing a future attempt in preflight.
+            let allocation = operation.begin_attempt().unwrap();
+            for _ in 0..count {
+                allocation.allocate(ArtifactKind::Manifest).unwrap();
+            }
+        }
         let journal = PublicationJournal::new(operation.token());
         let calls = Arc::new(AtomicUsize::new(0));
         let checked = Arc::new(Mutex::new(None));
@@ -731,8 +732,10 @@ mod tests {
                 .artifacts()
                 .unwrap()
                 .iter()
-                .all(|record| record.class != ArtifactClass::SessionData
-                    && record.object.path() != format!("file://{}", parquet.display()))
+                .all(|record| !matches!(
+                    record.origin,
+                    crate::commit::model::ArtifactOrigin::Received { .. }
+                ) && record.object.path() != format!("file://{}", parquet.display()))
         );
         match behavior {
             Behavior::Unknown | Behavior::PanicAfterIssue => {

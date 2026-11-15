@@ -21,8 +21,8 @@
 //! ledger can authorize deletion; decoded facts support read-only adjudication.
 
 use super::model::{
-    ArtifactClass, ArtifactWriteState, BaseIdentity, FrozenRequest, ObjectIdentity,
-    OperationAuthority, OperationToken, RequestShape,
+    ArtifactOrigin, ArtifactWriteState, BaseIdentity, FrozenRequest, OperationAuthority,
+    OperationToken, ReceivedPublication, RequestShape,
 };
 use super::operation::IcebergCommitOperation;
 use crate::iceberg::{Error, ErrorKind, Result};
@@ -223,27 +223,49 @@ impl FrozenPublicationFacts {
                 }
             }
         };
+        // Transitional envelope projection only; the live ledger remains the sole owner.
+        let current = request.artifacts().attempt();
+        let selected: BTreeSet<_> = request.artifacts().references().iter().collect();
         let mut index = BTreeMap::new();
         let mut objects = Vec::new();
+        let mut attempt_owned = Vec::new();
+        let mut operation_references = Vec::new();
+        let mut session_references = Vec::new();
         for record in operation.artifacts()? {
-            index.insert(
-                record.object.clone(),
-                u32::try_from(objects.len())
-                    .map_err(|_| invalid("Recovery object count overflow"))?,
-            );
+            let object_index = u32::try_from(objects.len())
+                .map_err(|_| invalid("Recovery object count overflow"))?;
+            index.insert(record.object.clone(), object_index);
+            let (class, attempt) = match record.origin {
+                ArtifactOrigin::Received {
+                    publishes: ReceivedPublication::ViaManifest,
+                } => (Class::SessionData, None),
+                ArtifactOrigin::Received {
+                    publishes: ReceivedPublication::WithRequest,
+                } => (Class::Operation, None),
+                // REWRITE already carries a previous attempt's selected manifests.
+                // The old envelope can express those only as operation references.
+                ArtifactOrigin::Produced { attempt, .. }
+                    if attempt != current && selected.contains(&record.object) =>
+                {
+                    (Class::Operation, None)
+                }
+                ArtifactOrigin::Produced { attempt, .. } => (Class::Attempt, Some(attempt.into())),
+            };
+            if class == Class::Attempt && attempt.as_ref() == Some(&Attempt::from(current)) {
+                // The old validator requires the whole current attempt, including orphans.
+                attempt_owned.push(object_index);
+            }
+            if selected.contains(&record.object) {
+                match class {
+                    Class::Operation => operation_references.push(object_index),
+                    Class::SessionData => session_references.push(object_index),
+                    Class::Attempt => {}
+                }
+            }
             objects.push(Object {
                 path: record.object.path().into(),
-                class: match record.class {
-                    ArtifactClass::SessionData => Class::SessionData,
-                    ArtifactClass::Operation => Class::Operation,
-                    ArtifactClass::Attempt => Class::Attempt,
-                    ArtifactClass::ExternalRegistered => {
-                        return Err(invalid(
-                            "External registered object cannot enter owned recovery facts",
-                        ));
-                    }
-                },
-                attempt: record.attempt.map(Attempt::from),
+                class,
+                attempt,
                 state: match record.write_state {
                     ArtifactWriteState::Allocated => State::Allocated,
                     ArtifactWriteState::Writing => State::Writing,
@@ -251,16 +273,11 @@ impl FrozenPublicationFacts {
                 },
             });
         }
-        let references = |paths: &[ObjectIdentity]| -> Result<Vec<u32>> {
-            paths
-                .iter()
-                .map(|path| {
-                    index.get(path).copied().ok_or_else(|| {
-                        invalid("Frozen publication reference is absent from recovery ledger")
-                    })
-                })
-                .collect()
-        };
+        if selected.iter().any(|object| !index.contains_key(*object)) {
+            return Err(invalid(
+                "Frozen publication reference is absent from recovery ledger",
+            ));
+        }
         let facts = Self {
             authority: operation.token().authority().into(),
             operation_id: operation.token().to_bytes(),
@@ -278,9 +295,9 @@ impl FrozenPublicationFacts {
             base,
             base_facts: request.base_facts().cloned(),
             published_snapshot_id: request.ref_snapshot_after(request.target_ref()),
-            attempt_owned: references(request.artifacts().attempt_owned())?,
-            operation_references: references(request.artifacts().operation_references())?,
-            session_references: references(request.artifacts().session_references())?,
+            attempt_owned,
+            operation_references,
+            session_references,
             objects,
         };
         facts.validate(operation.token())?;
@@ -555,7 +572,7 @@ mod document_expiry_recovery_tests {
                 }],
             })
             .unwrap();
-        let request = engine.freeze(&[]).unwrap();
+        let request = engine.freeze().unwrap();
         let facts = FrozenPublicationFacts::from_request(&request, &fixture.operation).unwrap();
         let encoded = serde_json::to_vec(&facts).unwrap();
         let decoded: FrozenPublicationFacts = serde_json::from_slice(&encoded).unwrap();

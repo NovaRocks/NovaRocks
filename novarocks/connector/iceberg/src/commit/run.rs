@@ -134,7 +134,7 @@ pub(crate) async fn append_contents_for_test(
             )
         })?
         .snapshot_id();
-    let request = engine.freeze(&[])?;
+    let request = engine.freeze()?;
     let outcome = crate::catalog::admission_test_support::publish_frozen(
         std::sync::Arc::clone(runtime.novarocks_catalog()),
         provider.descriptor().clone(),

@@ -1010,7 +1010,7 @@ mod tests {
                     .unwrap();
             }
             let metadata = engine.metadata().clone();
-            let request = engine.freeze(&[]).unwrap();
+            let request = engine.freeze().unwrap();
             publisher.preflight_recovery(&request, &operation).unwrap();
             let entry = journal.current_entry().unwrap();
             journal
@@ -1140,18 +1140,7 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                let mut refs = operation.publication_references().unwrap();
-                refs.extend(
-                    fixture
-                        .prepared
-                        .write
-                        .as_ref()
-                        .unwrap()
-                        .files
-                        .iter()
-                        .map(|file| ObjectIdentity::new(file.path.clone()).unwrap()),
-                );
-                let request = engine.freeze(&refs).unwrap();
+                let request = engine.freeze().unwrap();
                 assert_eq!(
                     request.requirements(),
                     &[crate::iceberg::TableRequirement::NotExist]
@@ -1230,12 +1219,10 @@ mod tests {
                 assert!(
                     request
                         .artifacts()
-                        .operation_references()
+                        .references()
                         .contains(&provenance_object)
                 );
-                let mut retained = request.artifacts().attempt_owned().to_vec();
-                retained.extend_from_slice(request.artifacts().operation_references());
-                retained.extend_from_slice(request.artifacts().session_references());
+                let retained = request.artifacts().references().to_vec();
                 assert!(matches!(
                     operation.cleanup_after_commit(&retained).await,
                     crate::commit::model::IcebergCleanupReport::Complete { .. }
@@ -1280,19 +1267,12 @@ mod tests {
                 &fixture.context,
             )
             .unwrap();
-            // Unreferenced owned records still belong to recovery; projection
-            // must not hide them to squeeze an unknown result into the carrier.
-            for ordinal in 0..350 {
-                operation
-                    .adopt_session_data(
-                        ObjectIdentity::new(format!(
-                            "file://{}/{}.{}",
-                            fixture.directory.path().display(),
-                            ordinal,
-                            "x".repeat(240)
-                        ))
-                        .unwrap(),
-                    )
+            // Unselected produced outputs still belong to recovery, even before their
+            // writer opens. Received data must instead be covered by this CREATE's manifests.
+            let abandoned = operation.begin_attempt().unwrap();
+            for _ in 0..350 {
+                abandoned
+                    .allocate(crate::commit::model::ArtifactKind::Manifest)
                     .unwrap();
             }
             let intent = create_intent(&fixture.prepared, operation.token()).unwrap();
@@ -1313,9 +1293,7 @@ mod tests {
             engine
                 .stage_change(create_prefix(&fixture.prepared))
                 .unwrap();
-            let request = engine
-                .freeze(&operation.publication_references().unwrap())
-                .unwrap();
+            let request = engine.freeze().unwrap();
             assert!(publisher.preflight_recovery(&request, &operation).is_err());
             assert!(matches!(
                 journal.bridge_failure(&operation, "preflight refused".into()),

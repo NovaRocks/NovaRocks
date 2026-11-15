@@ -4735,8 +4735,13 @@ mod eager_attempt_io_tests {
             for object in objects {
                 assert!(self.io.exists(object.path()).await.unwrap());
                 let mut ledger = self.ledger.lock().unwrap();
-                ledger.mark_writing(&object).unwrap();
-                ledger.mark_written(&object).unwrap();
+                let written = ledger.records().any(|record| {
+                    record.object == object
+                        && record.write_state == crate::commit::model::ArtifactWriteState::Written
+                });
+                if !written {
+                    ledger.confirm_written_for_test(&object).unwrap();
+                }
             }
         }
     }
@@ -4746,25 +4751,21 @@ mod eager_attempt_io_tests {
         }
         fn allocate(
             &self,
-            class: crate::commit::model::ArtifactClass,
             kind: crate::commit::model::ArtifactKind,
         ) -> crate::iceberg::Result<crate::commit::model::ObjectIdentity> {
-            assert_eq!(class, crate::commit::model::ArtifactClass::Attempt);
             let object = crate::commit::model::ObjectIdentity::new(format!(
                 "memory://warehouse/db/t/metadata/{}-{}.{}",
                 self.attempt.path_component(),
                 self.ordinal.fetch_add(1, Ordering::SeqCst),
                 kind.extension()
             ))?;
-            self.ledger
-                .lock()
-                .unwrap()
-                .register(crate::commit::model::ArtifactRecord {
-                    object: object.clone(),
-                    class,
-                    attempt: Some(self.attempt),
-                    write_state: crate::commit::model::ArtifactWriteState::Allocated,
-                })?;
+            self.ledger.lock().unwrap().register(
+                crate::commit::model::ArtifactRecord::produced(
+                    object.clone(),
+                    self.attempt_token(),
+                    kind,
+                ),
+            )?;
             Ok(object)
         }
         fn file_io(&self) -> &FileIO {
@@ -4775,12 +4776,49 @@ mod eager_attempt_io_tests {
         }
         fn snapshot_artifacts(
             &self,
-            references: &[crate::commit::model::ObjectIdentity],
+            lists: &[crate::commit::model::ObjectIdentity],
+            statistics: &[crate::commit::model::ObjectIdentity],
         ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
-            self.ledger
-                .lock()
-                .unwrap()
-                .snapshot_for_attempt(self.attempt, references.iter().cloned())
+            self.ledger.lock().unwrap().snapshot_for_request(
+                self.attempt_token(),
+                lists,
+                statistics,
+            )
+        }
+
+        fn record_manifest(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            live_paths: &[String],
+            replaces: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest(object, live_paths, replaces)
+        }
+
+        fn record_manifest_list(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            paths: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest_list(object, paths)
         }
     }
 
@@ -4879,7 +4917,7 @@ mod eager_attempt_io_tests {
             .await
             .unwrap();
         writer.confirm_completed_outputs().await;
-        let commit = engine.freeze(&[]).unwrap();
+        let commit = engine.freeze().unwrap();
         let manifest_paths = writer
             .ledger
             .lock()

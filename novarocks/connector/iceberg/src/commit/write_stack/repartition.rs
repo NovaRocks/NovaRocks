@@ -575,7 +575,7 @@ mod tests {
         .unwrap();
         engine.stage_change(first.prepared_change()).unwrap();
         let partitioned = engine.metadata().clone();
-        let request = engine.freeze(&[]).unwrap();
+        let request = engine.freeze().unwrap();
         let json = request.to_rest_json().unwrap();
         let fields = json["updates"]
             .as_array()
@@ -620,7 +620,7 @@ mod tests {
         .unwrap();
         engine.stage_change(middle.prepared_change()).unwrap();
         let bucketed = engine.metadata().clone();
-        engine.freeze(&[]).unwrap();
+        engine.freeze().unwrap();
         let back = preview_managed_repartition(
             &bucketed,
             &replacement(prior_observation(&bucketed), identity_on_id()),
@@ -646,7 +646,7 @@ mod tests {
             engine.metadata().default_partition_spec_id(),
             partitioned.default_partition_spec_id()
         );
-        let request = engine.freeze(&[]).unwrap();
+        let request = engine.freeze().unwrap();
         assert!(
             request
                 .updates()

@@ -17,7 +17,7 @@
 
 //! One logical operation owns its I/O, immutable object registrations, and cleanup.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -35,9 +35,9 @@ use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::model::{
-    ArtifactClass, ArtifactKind, ArtifactLedger, ArtifactRecord, ArtifactWriteState,
-    ArtifactWriter, AttemptArtifacts, AttemptToken, CleanupRemainingReason, CleanupScope,
-    IcebergCleanupReport, ObjectIdentity, OperationToken, RemainingArtifact,
+    ArtifactKind, ArtifactLedger, ArtifactOrigin, ArtifactRecord, ArtifactWriter, AttemptArtifacts,
+    AttemptToken, CleanupRemainingReason, CleanupScope, IcebergCleanupReport, ObjectIdentity,
+    OperationToken, ReceivedPublication, RemainingArtifact,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -81,9 +81,7 @@ struct OperationState {
     permits: Arc<Semaphore>,
     limits: OperationLimits,
     artifacts: Mutex<OperationArtifacts>,
-    publication_references: Mutex<BTreeSet<ObjectIdentity>>,
     exit_failures: Mutex<BTreeMap<ObjectIdentity, StreamExitFailure>>,
-    retired_objects: Mutex<BTreeSet<ObjectIdentity>>,
     attempt_ordinal: AtomicU32,
     object_ordinal: AtomicU64,
     // The original payload pin follows retained journal/artifact backing; the
@@ -171,9 +169,7 @@ impl IcebergCommitOperation {
                     stage_ids: BTreeMap::new(),
                     cleanup_withheld: None,
                 }),
-                publication_references: Mutex::new(BTreeSet::new()),
                 exit_failures: Mutex::new(BTreeMap::new()),
-                retired_objects: Mutex::new(BTreeSet::new()),
                 attempt_ordinal: AtomicU32::new(0),
                 object_ordinal: AtomicU64::new(0),
                 _payload: payload,
@@ -298,52 +294,46 @@ impl IcebergCommitOperation {
         })
     }
 
-    /// An existing session file is adopted explicitly; registration never grants another write.
+    /// Received files are already complete and never gain another write admission.
     pub(crate) fn adopt_session_data(&self, object: ObjectIdentity) -> Result<()> {
         self.inner
             .artifacts
             .lock()
-            .map_err(|_| invalid("Iceberg artifact ledger poisoned"))?
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?
             .ledger
-            .register(ArtifactRecord {
+            .register(ArtifactRecord::received(
                 object,
-                class: ArtifactClass::SessionData,
-                attempt: None,
-                write_state: ArtifactWriteState::Written,
-            })
+                ReceivedPublication::ViaManifest,
+            ))
     }
 
-    /// Adopt one provider-authored publication object with an explicit lifetime
-    /// beyond successful dispatch. External registered data cannot use this API.
+    /// The exact provider publication declares this received object outside manifests.
     pub(crate) fn adopt_operation_reference(&self, object: ObjectIdentity) -> Result<()> {
         self.inner
             .artifacts
             .lock()
-            .map_err(|_| invalid("Iceberg artifact ledger poisoned"))?
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?
             .ledger
-            .register(ArtifactRecord {
-                object: object.clone(),
-                class: ArtifactClass::Operation,
-                attempt: None,
-                write_state: ArtifactWriteState::Written,
-            })?;
-        self.inner
-            .publication_references
-            .lock()
-            .map_err(|_| invalid("Iceberg publication references poisoned"))?
-            .insert(object);
-        Ok(())
+            .register(ArtifactRecord::received(
+                object,
+                ReceivedPublication::WithRequest,
+            ))
     }
 
-    pub(crate) fn publication_references(&self) -> Result<Vec<ObjectIdentity>> {
-        Ok(self
+    /// Conflict withdraws only artifacts tied to this round. Deletion waits for a terminal result.
+    pub(crate) fn retire_attempt_bound_artifacts(&self, attempt: AttemptToken) -> Result<()> {
+        let mut artifacts = self
             .inner
-            .publication_references
+            .artifacts
             .lock()
-            .map_err(|_| invalid("Iceberg publication references poisoned"))?
-            .iter()
-            .cloned()
-            .collect())
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?;
+        let objects: Vec<_>=artifacts.ledger.records().filter(|record| matches!(record.origin,
+            ArtifactOrigin::Produced { attempt: source, kind: ArtifactKind::ManifestList | ArtifactKind::Statistics } if source==attempt))
+            .map(|record|record.object.clone()).collect();
+        for object in objects {
+            artifacts.ledger.retire(&object)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn artifacts(&self) -> Result<Vec<ArtifactRecord>> {
@@ -381,67 +371,65 @@ impl IcebergCommitOperation {
         }
     }
 
-    /// Call after preparation has unwound and publication has proved that this scope is uncommitted.
-    /// Unknown publication must never call this method.
-    pub(crate) async fn cleanup(&self, scope: CleanupScope) -> IcebergCleanupReport {
-        let records = match self.inner.artifacts.lock() {
-            Ok(artifacts) => artifacts.ledger.selected(scope),
-            Err(_) => return IcebergCleanupReport::NotAttempted,
+    fn select_cleanup(
+        &self,
+        retained: Option<&[ObjectIdentity]>,
+    ) -> std::result::Result<Vec<ArtifactRecord>, IcebergCleanupReport> {
+        let mut artifacts = self
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| IcebergCleanupReport::NotAttempted)?;
+        if let Some(reason) = &artifacts.cleanup_withheld {
+            return Err(IcebergCleanupReport::Withheld {
+                reason: reason.clone(),
+            });
+        }
+        let records = match retained {
+            Some(references) => artifacts.ledger.settle_published(references),
+            None => artifacts.ledger.selected(CleanupScope::EntireOperation),
         };
-        self.cleanup_records(records, &self.inner.request).await
+        for record in &records {
+            artifacts
+                .ledger
+                .retire(&record.object)
+                .map_err(|_| IcebergCleanupReport::NotAttempted)?;
+        }
+        Ok(records)
     }
 
-    /// Same selected ledger and cleanup algorithm, borrowing the original
-    /// action's current settlement context. Caller must prove uncommitted.
+    /// Only proven uncommitted operations may delete their complete remaining ledger.
+    pub(crate) async fn cleanup(&self, _scope: CleanupScope) -> IcebergCleanupReport {
+        self.cleanup_in(CleanupScope::EntireOperation, &self.inner.request)
+            .await
+    }
     pub(crate) async fn cleanup_in(
         &self,
-        scope: CleanupScope,
+        _scope: CleanupScope,
         current: &ConnectorRequestContext,
     ) -> IcebergCleanupReport {
-        let records = match self.inner.artifacts.lock() {
-            Ok(artifacts) => artifacts.ledger.selected(scope),
-            Err(_) => return IcebergCleanupReport::NotAttempted,
-        };
-        self.cleanup_records(records, current).await
+        match self.select_cleanup(None) {
+            Ok(records) => self.cleanup_records(records, current).await,
+            Err(report) => report,
+        }
     }
-
-    /// Only a known committed request authorizes deletion of unreachable owned objects.
-    /// Physical identity is used here: a carried blob keeps its entire shared Puffin alive.
+    /// Commit settles received objects and the exact references before deleting produced leftovers.
     pub(crate) async fn cleanup_after_commit(
         &self,
         retained: &[ObjectIdentity],
     ) -> IcebergCleanupReport {
-        let retained: BTreeSet<_> = retained.iter().collect();
-        let records = match self.inner.artifacts.lock() {
-            Ok(artifacts) => artifacts
-                .ledger
-                .records()
-                .filter(|record| !retained.contains(&record.object))
-                .cloned()
-                .collect(),
-            Err(_) => return IcebergCleanupReport::NotAttempted,
-        };
-        self.cleanup_records(records, &self.inner.request).await
+        self.cleanup_after_commit_in(retained, &self.inner.request)
+            .await
     }
-
-    /// A replay uses its current registered Source, never the terminal record's
-    /// old source. Exact operation/object ownership remains unchanged.
     pub(crate) async fn cleanup_after_commit_in(
         &self,
         retained: &[ObjectIdentity],
         current: &ConnectorRequestContext,
     ) -> IcebergCleanupReport {
-        let retained: BTreeSet<_> = retained.iter().collect();
-        let records = match self.inner.artifacts.lock() {
-            Ok(artifacts) => artifacts
-                .ledger
-                .records()
-                .filter(|record| !retained.contains(&record.object))
-                .cloned()
-                .collect(),
-            Err(_) => return IcebergCleanupReport::NotAttempted,
-        };
-        self.cleanup_records(records, current).await
+        match self.select_cleanup(Some(retained)) {
+            Ok(records) => self.cleanup_records(records, current).await,
+            Err(report) => report,
+        }
     }
 
     async fn cleanup_records(
@@ -462,12 +450,7 @@ impl IcebergCommitOperation {
         if records.is_empty() {
             return IcebergCleanupReport::Complete { deleted: 0 };
         }
-        // Revocation precedes waiting: an already-admitted writer waiting for capacity
-        // cannot start writing one of these objects after cleanup releases all permits.
-        match self.inner.retired_objects.lock() {
-            Ok(mut retired) => retired.extend(records.iter().map(|r| r.object.clone())),
-            Err(_) => return IcebergCleanupReport::NotAttempted,
-        }
+        // Selection retired every candidate under the same lock as write admission.
         let deadline = Instant::now() + self.inner.limits.cleanup.time;
         let until = tokio::time::Instant::from_std(deadline);
         // The original stop and deadline cannot cancel cleanup. Preserve only the exact storage
@@ -545,6 +528,8 @@ impl IcebergCommitOperation {
                         .with_timeout(left)
                         .with_io_timeout(left),
                 );
+                #[cfg(test)]
+                crate::fs_io::note_test_storage_request("delete", record.object.path());
                 operator.delete(path).await.map_err(|e| {
                     Error::new(
                         ErrorKind::Unexpected,
@@ -623,14 +608,6 @@ impl IcebergCommitAttempt {
     pub(crate) fn check_stage_snapshot_ids(&self, metadata: &TableMetadata) -> Result<()> {
         self.operation.check_stage_snapshot_ids(metadata)
     }
-
-    pub(crate) fn operation_artifacts(&self) -> Result<Vec<ArtifactRecord>> {
-        self.operation.artifacts()
-    }
-
-    pub(crate) fn publication_references(&self) -> Result<Vec<ObjectIdentity>> {
-        self.operation.publication_references()
-    }
 }
 
 impl ArtifactWriter for IcebergCommitAttempt {
@@ -646,26 +623,15 @@ impl ArtifactWriter for IcebergCommitAttempt {
     fn check_active(&self) -> Result<()> {
         self.operation.check_active()
     }
-    fn allocate(&self, class: ArtifactClass, kind: ArtifactKind) -> Result<ObjectIdentity> {
+    fn allocate(&self, kind: ArtifactKind) -> Result<ObjectIdentity> {
         self.check_active()?;
-        let attempt = match class {
-            ArtifactClass::Attempt => Some(self.token),
-            ArtifactClass::Operation => None,
-            _ => {
-                return Err(invalid(
-                    "Only operation and attempt artifacts may be allocated",
-                ));
-            }
-        };
         let ordinal = self
             .operation
             .inner
             .object_ordinal
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| invalid("Iceberg object ordinal exhausted"))?;
-        let scope = attempt
-            .map(|t| t.path_component())
-            .unwrap_or_else(|| self.operation.token().path_component());
+        let scope = self.token.path_component();
         let object = ObjectIdentity::new(format!(
             "{}/metadata/{}-{}.{}",
             self.operation.inner.location.trim_end_matches('/'),
@@ -679,22 +645,44 @@ impl ArtifactWriter for IcebergCommitAttempt {
             .lock()
             .map_err(|_| invalid("Iceberg artifact ledger poisoned"))?
             .ledger
-            .register(ArtifactRecord {
-                object: object.clone(),
-                class,
-                attempt,
-                write_state: ArtifactWriteState::Allocated,
-            })?;
+            .register(ArtifactRecord::produced(object.clone(), self.token, kind))?;
         Ok(object)
     }
-    fn snapshot_artifacts(&self, owned_references: &[ObjectIdentity]) -> Result<AttemptArtifacts> {
+    fn record_manifest(
+        &self,
+        object: &ObjectIdentity,
+        live_paths: &[String],
+        replaces: &[String],
+    ) -> Result<()> {
         self.operation
             .inner
             .artifacts
             .lock()
-            .map_err(|_| invalid("Iceberg artifact ledger poisoned"))?
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?
             .ledger
-            .snapshot_for_attempt(self.token, owned_references.iter().cloned())
+            .record_manifest(object, live_paths, replaces)
+    }
+    fn record_manifest_list(&self, object: &ObjectIdentity, paths: &[String]) -> Result<()> {
+        self.operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?
+            .ledger
+            .record_manifest_list(object, paths)
+    }
+    fn snapshot_artifacts(
+        &self,
+        lists: &[ObjectIdentity],
+        statistics: &[ObjectIdentity],
+    ) -> Result<AttemptArtifacts> {
+        self.operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?
+            .ledger
+            .snapshot_for_request(self.token, lists, statistics)
     }
 }
 
@@ -719,17 +707,11 @@ impl IcebergWriteAdmission for OperationState {
     }
     fn check_output_active(&self, object: &ObjectIdentity) -> Result<()> {
         self.check_active()?;
-        if self
-            .retired_objects
+        self.artifacts
             .lock()
-            .map_err(|_| invalid("Iceberg retired artifact set poisoned"))?
-            .contains(object)
-        {
-            return Err(invalid(
-                "Iceberg artifact has entered cleanup and cannot start another write",
-            ));
-        }
-        Ok(())
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?
+            .ledger
+            .check_writable(object)
     }
     fn cancellation(&self) -> FileCancellation {
         self.preparation_cancellation()
@@ -796,6 +778,7 @@ impl IcebergCommitOperation {
 
 #[cfg(test)]
 mod tests {
+    use super::super::model::ArtifactWriteState;
     use super::*;
     use bytes::Bytes;
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
@@ -926,24 +909,10 @@ mod tests {
         );
         let attempt = operation.begin_attempt().unwrap();
         let second = operation.begin_attempt().unwrap();
-        let a = attempt
-            .allocate(ArtifactClass::Attempt, ArtifactKind::Manifest)
-            .unwrap();
-        let b = second
-            .allocate(ArtifactClass::Attempt, ArtifactKind::Manifest)
-            .unwrap();
+        let a = attempt.allocate(ArtifactKind::Manifest).unwrap();
+        let b = second.allocate(ArtifactKind::Manifest).unwrap();
         assert_ne!(a, b);
         assert!(a.path().contains(&attempt.attempt_token().path_component()));
-        assert!(
-            attempt
-                .allocate(ArtifactClass::ExternalRegistered, ArtifactKind::Manifest)
-                .is_err()
-        );
-        assert!(
-            attempt
-                .allocate(ArtifactClass::SessionData, ArtifactKind::Manifest)
-                .is_err()
-        );
         let output = attempt.file_io().new_output(a.path()).unwrap();
         output.write(Bytes::from_static(b"manifest")).await.unwrap();
         assert!(
@@ -971,11 +940,7 @@ mod tests {
         );
         stop.request_stop();
         assert!(operation.begin_attempt().is_err());
-        assert!(
-            attempt
-                .allocate(ArtifactClass::Attempt, ArtifactKind::Manifest)
-                .is_err()
-        );
+        assert!(attempt.allocate(ArtifactKind::Manifest).is_err());
         assert!(output.write(Bytes::new()).await.is_err());
     }
 
@@ -993,9 +958,7 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
         );
         let attempt = operation.begin_attempt().unwrap();
-        let path = attempt
-            .allocate(ArtifactClass::Attempt, ArtifactKind::Statistics)
-            .unwrap();
+        let path = attempt.allocate(ArtifactKind::Statistics).unwrap();
         let mut writer = attempt
             .file_io()
             .new_output(path.path())
@@ -1082,9 +1045,7 @@ mod tests {
         );
         let attempt = operation.begin_attempt().unwrap();
         for _ in 0..3 {
-            let path = attempt
-                .allocate(ArtifactClass::Attempt, ArtifactKind::Manifest)
-                .unwrap();
+            let path = attempt.allocate(ArtifactKind::Manifest).unwrap();
             attempt
                 .file_io()
                 .new_output(path.path())
@@ -1123,9 +1084,7 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
         );
         let attempt = operation.begin_attempt().unwrap();
-        let path = attempt
-            .allocate(ArtifactClass::Attempt, ArtifactKind::Statistics)
-            .unwrap();
+        let path = attempt.allocate(ArtifactKind::Statistics).unwrap();
         let writer = attempt
             .file_io()
             .new_output(path.path())
@@ -1165,9 +1124,7 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
         );
         let attempt = operation.begin_attempt().unwrap();
-        let path = attempt
-            .allocate(ArtifactClass::Attempt, ArtifactKind::Manifest)
-            .unwrap();
+        let path = attempt.allocate(ArtifactKind::Manifest).unwrap();
         let held = operation.inner.io_permit().await.unwrap();
         let output = attempt.file_io().new_output(path.path()).unwrap();
         let waiting = tokio::spawn(async move {
@@ -1187,10 +1144,11 @@ mod tests {
         loop {
             if operation
                 .inner
-                .retired_objects
+                .artifacts
                 .lock()
                 .unwrap()
-                .contains(&path)
+                .ledger
+                .is_retired(&path)
             {
                 break;
             }
@@ -1354,9 +1312,7 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
         );
         let attempt = operation.begin_attempt().unwrap();
-        let path = attempt
-            .allocate(ArtifactClass::Attempt, ArtifactKind::Statistics)
-            .unwrap();
+        let path = attempt.allocate(ArtifactKind::Statistics).unwrap();
         let mut writer = attempt
             .file_io()
             .new_output(path.path())

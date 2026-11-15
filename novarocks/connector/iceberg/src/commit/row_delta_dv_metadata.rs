@@ -210,6 +210,7 @@ pub(crate) async fn write_added_entry_groups_with_partitions(
                     spec.as_ref(),
                     ManifestContentType::Deletes,
                     entries,
+                    &[],
                 )
                 .await?,
             );
@@ -290,11 +291,7 @@ mod t8b_tests {
         fn file_io(&self) -> &FileIO {
             &self.io
         }
-        fn allocate(
-            &self,
-            class: ArtifactClass,
-            kind: ArtifactKind,
-        ) -> crate::iceberg::Result<ObjectIdentity> {
+        fn allocate(&self, kind: ArtifactKind) -> crate::iceberg::Result<ObjectIdentity> {
             let mut ledger = self.ledger.lock().unwrap();
             let object = ObjectIdentity::new(format!(
                 "file://{}/{}.{}",
@@ -302,12 +299,11 @@ mod t8b_tests {
                 ledger.records().count(),
                 kind.extension()
             ))?;
-            ledger.register(ArtifactRecord {
-                object: object.clone(),
-                class,
-                attempt: Some(self.attempt),
-                write_state: ArtifactWriteState::Allocated,
-            })?;
+            ledger.register(ArtifactRecord::produced(
+                object.clone(),
+                self.attempt_token(),
+                kind,
+            ))?;
             Ok(object)
         }
         fn attempt_token(&self) -> AttemptToken {
@@ -318,12 +314,49 @@ mod t8b_tests {
         }
         fn snapshot_artifacts(
             &self,
-            refs: &[ObjectIdentity],
-        ) -> crate::iceberg::Result<AttemptArtifacts> {
-            self.ledger
-                .lock()
-                .unwrap()
-                .snapshot_for_attempt(self.attempt, refs.iter().cloned())
+            lists: &[crate::commit::model::ObjectIdentity],
+            statistics: &[crate::commit::model::ObjectIdentity],
+        ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
+            self.ledger.lock().unwrap().snapshot_for_request(
+                self.attempt_token(),
+                lists,
+                statistics,
+            )
+        }
+
+        fn record_manifest(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            live_paths: &[String],
+            replaces: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest(object, live_paths, replaces)
+        }
+
+        fn record_manifest_list(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            paths: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest_list(object, paths)
         }
     }
     fn data(path: &str, count: u64, first: Option<i64>) -> DataFile {
@@ -665,7 +698,7 @@ mod t8b_tests {
             .unwrap();
         assert_eq!(removed.sequence_number, Some(1));
         assert_eq!(removed.file_sequence_number, Some(1));
-        let frozen = engine.freeze(&[]).unwrap();
+        let frozen = engine.freeze().unwrap();
         assert!(frozen.has_updates());
     }
     #[tokio::test]
@@ -745,9 +778,7 @@ mod t8b_tests {
         let mut additions = Vec::new();
         let mut input_paths = Vec::new();
         for position in [0, 2] {
-            let object = writer
-                .allocate(ArtifactClass::Attempt, ArtifactKind::DeletionVector)
-                .unwrap();
+            let object = writer.allocate(ArtifactKind::DeletionVector).unwrap();
             let mut vector = crate::commit::DeletionVector::new();
             vector.insert(position).unwrap();
             let written = crate::commit::write_single_deletion_vector_puffin(

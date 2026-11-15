@@ -550,6 +550,7 @@ mod tests {
             spec,
             ManifestContentType::Data,
             entries,
+            &[],
         )
         .await
         .unwrap();

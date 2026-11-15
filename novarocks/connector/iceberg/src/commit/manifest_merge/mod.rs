@@ -122,6 +122,10 @@ async fn merge_bin(
             "Missing partition spec {spec_id} for manifest merge"
         ))
     })?;
+    let replaces = bin
+        .iter()
+        .map(|candidate| candidate.descriptor.manifest_path.clone())
+        .collect::<Vec<_>>();
     let mut entries = Vec::new();
     for candidate in bin {
         artifacts.check_active()?;
@@ -165,7 +169,16 @@ async fn merge_bin(
             }
         }
     }
-    write_sourced_manifest(artifacts, metadata, snapshot_id, spec, content, entries).await
+    write_sourced_manifest(
+        artifacts,
+        metadata,
+        snapshot_id,
+        spec,
+        content,
+        entries,
+        &replaces,
+    )
+    .await
 }
 
 fn merged_entry(

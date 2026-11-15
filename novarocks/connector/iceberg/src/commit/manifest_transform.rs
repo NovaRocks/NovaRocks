@@ -314,6 +314,7 @@ async fn filter_source(
         spec,
         source.descriptor.content,
         output,
+        &[source.descriptor.manifest_path.clone()],
     )
     .await?;
     if !unassigned {

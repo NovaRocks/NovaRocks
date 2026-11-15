@@ -696,7 +696,7 @@ mod tests {
                     uuid: self.projection.uuid
                 }]
             );
-            assert_eq!(request.artifacts().attempt_owned().len(), 1);
+            assert_eq!(request.artifacts().references().len(), 1);
             if matches!(self.behavior, Behavior::RefuseCapacity) {
                 let mut projection = self.projection.clone();
                 projection.data_version =
@@ -1290,10 +1290,9 @@ mod tests {
         }
         fn allocate(
             &self,
-            class: crate::commit::model::ArtifactClass,
             kind: crate::commit::model::ArtifactKind,
         ) -> crate::iceberg::Result<crate::commit::model::ObjectIdentity> {
-            let object = self.inner.allocate(class, kind)?;
+            let object = self.inner.allocate(kind)?;
             *self.path.lock().unwrap() = Some(object.path().into());
             Ok(object)
         }
@@ -1305,9 +1304,34 @@ mod tests {
         }
         fn snapshot_artifacts(
             &self,
-            references: &[crate::commit::model::ObjectIdentity],
+            lists: &[crate::commit::model::ObjectIdentity],
+            statistics: &[crate::commit::model::ObjectIdentity],
         ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
-            self.inner.snapshot_artifacts(references)
+            self.inner.snapshot_artifacts(lists, statistics)
+        }
+
+        fn record_manifest(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            live_paths: &[String],
+            replaces: &[String],
+        ) -> crate::iceberg::Result<()> {
+            self.inner.record_manifest(object, live_paths, replaces)
+        }
+
+        fn record_manifest_list(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            paths: &[String],
+        ) -> crate::iceberg::Result<()> {
+            self.inner.record_manifest_list(object, paths)
+        }
+        fn stage_snapshot_id(
+            &self,
+            stage: usize,
+            metadata: &crate::iceberg::spec::TableMetadata,
+        ) -> crate::iceberg::Result<i64> {
+            self.inner.stage_snapshot_id(stage, metadata)
         }
     }
 

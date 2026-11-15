@@ -484,10 +484,8 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         }
         let retained = request
             .artifacts()
-            .attempt_owned()
+            .references()
             .iter()
-            .chain(request.artifacts().operation_references())
-            .chain(request.artifacts().session_references())
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -2140,7 +2138,7 @@ mod tests {
 
     #[tokio::test]
     async fn committed_bounded_cleanup_retains_exact_residue_without_failing_business_finalize() {
-        use crate::commit::model::{ArtifactClass, ArtifactKind, ArtifactWriter};
+        use crate::commit::model::{ArtifactKind, ArtifactWriter};
         use crate::commit::operation::{CleanupBudget, OperationLimits};
         use std::time::Duration;
 
@@ -2154,9 +2152,7 @@ mod tests {
             });
             let old = fixture.operation.begin_attempt().unwrap();
             for _ in 0..3 {
-                let object = old
-                    .allocate(ArtifactClass::Attempt, ArtifactKind::Manifest)
-                    .unwrap();
+                let object = old.allocate(ArtifactKind::Manifest).unwrap();
                 old.file_io()
                     .new_output(object.path())
                     .unwrap()
@@ -2293,9 +2289,10 @@ mod tests {
                 Err(error) => executor.block_on(journal.recover_bridge(&operation, error)),
             };
             assert_eq!(dispatches.load(Ordering::SeqCst), 1);
-            assert!(!operation.artifacts().unwrap().is_empty());
+            assert!(provenance.exists());
             match behavior {
                 Behavior::Unknown | Behavior::PanicAfterIssue => {
+                    assert!(!operation.artifacts().unwrap().is_empty());
                     let ExternalMutationOutcome::CommitUnknown { evidence, .. } = outcome else {
                         panic!("issued frontier lost")
                     };
@@ -2316,9 +2313,31 @@ mod tests {
                     };
                     assert_eq!(receipt, "preflight receipt");
                     assert!(provenance.exists());
-                    assert!(operation.artifacts().unwrap().iter().any(
-                        |record| record.class == crate::commit::model::ArtifactClass::Operation
-                    ));
+                    // A committed request settles the ledger. Its published
+                    // objects must remain readable through later bridge recovery.
+                    assert!(operation.artifacts().unwrap().is_empty());
+                    let checked = journal.current_checked().expect("checked request retained");
+                    assert_eq!(checked.retained.len(), 2); // provenance and the empty snapshot's list
+                    for object in &checked.retained {
+                        assert!(
+                            std::path::Path::new(object.path().strip_prefix("file://").unwrap())
+                                .exists()
+                        );
+                    }
+                    let manifest_list = checked
+                        .retained
+                        .iter()
+                        .find(|object| object.path() != format!("file://{}", provenance.display()))
+                        .unwrap();
+                    let list_bytes =
+                        std::fs::read(manifest_list.path().strip_prefix("file://").unwrap())
+                            .unwrap();
+                    let list = crate::iceberg::spec::ManifestList::parse_with_version(
+                        &list_bytes,
+                        FormatVersion::V3,
+                    )
+                    .unwrap();
+                    assert!(list.entries().is_empty());
                     if matches!(behavior, Behavior::CommitFinalizationFailure) {
                         let ExternalMutationFinalization::Failed(failure) = finalization else {
                             panic!("owner failure lost")
@@ -2339,6 +2358,12 @@ mod tests {
                         }
                     ));
                     assert_eq!(operation.artifacts().unwrap(), before);
+                    for object in &checked.retained {
+                        assert!(
+                            std::path::Path::new(object.path().strip_prefix("file://").unwrap())
+                                .exists()
+                        );
+                    }
                 }
                 Behavior::PanicBeforeLoad => unreachable!(),
             }
@@ -2478,7 +2503,7 @@ mod tests {
 
     #[tokio::test]
     async fn postproof_recovery_reports_residue_and_keeps_every_frozen_publication_root() {
-        use crate::commit::model::{AddedContent, ArtifactClass, ArtifactKind, ArtifactWriter};
+        use crate::commit::model::{AddedContent, ArtifactKind, ArtifactWriter};
         use crate::commit::operation::{CleanupBudget, OperationLimits};
         use crate::commit::overwrite::preparer_tests::data;
         use crate::commit::staging::StagingEngine;
@@ -2525,13 +2550,8 @@ mod tests {
             .unwrap();
             let old = operation.begin_attempt().unwrap();
             let mut abandoned = Vec::new();
-            for class in [
-                ArtifactClass::Operation,
-                ArtifactClass::Operation,
-                ArtifactClass::Attempt,
-                ArtifactClass::Attempt,
-            ] {
-                let object = old.allocate(class, ArtifactKind::Manifest).unwrap();
+            for _ in 0..4 {
+                let object = old.allocate(ArtifactKind::Manifest).unwrap();
                 old.file_io()
                     .new_output(object.path())
                     .unwrap()
@@ -2583,12 +2603,8 @@ mod tests {
             )
             .unwrap();
             engine.stage(&FastAppendPreparer).await.unwrap();
-            let request = engine
-                .freeze(&[operation_root.clone(), session_root.clone()])
-                .unwrap();
-            let mut retained = request.artifacts().attempt_owned().to_vec();
-            retained.extend_from_slice(request.artifacts().operation_references());
-            retained.extend_from_slice(request.artifacts().session_references());
+            let request = engine.freeze().unwrap();
+            let retained = request.artifacts().references().to_vec();
             let journal = PublicationJournal::new(operation.token());
             let dispatches = Arc::new(AtomicUsize::new(0));
             let publisher = journal.observe(Arc::new(Fake {
@@ -2650,16 +2666,14 @@ mod tests {
                     3,
                     "bounded cleanup deletes only one abandoned object"
                 );
-                assert!(
-                    residue
-                        .iter()
-                        .any(|record| record.class == ArtifactClass::Operation)
-                );
-                assert!(
-                    residue
-                        .iter()
-                        .any(|record| record.class == ArtifactClass::Attempt)
-                );
+                assert!(residue.iter().any(|record| matches!(
+                    record.origin,
+                    crate::commit::model::ArtifactOrigin::Produced { .. }
+                )));
+                assert!(residue.iter().any(|record| matches!(
+                    record.origin,
+                    crate::commit::model::ArtifactOrigin::Produced { .. }
+                )));
                 for record in &residue {
                     assert!(abandoned.contains(&record.object));
                     assert!(first_cleanup.message().contains(record.object.path()));

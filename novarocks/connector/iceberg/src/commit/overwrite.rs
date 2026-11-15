@@ -1087,7 +1087,7 @@ pub(crate) mod preparer_tests {
             .unwrap();
             engine.stage(preparer).await.unwrap();
             let after = engine.metadata().clone();
-            (after, engine.freeze(&[]).unwrap())
+            (after, engine.freeze().unwrap())
         }
     }
     pub(crate) fn data(path: &str, count: u64, partition: Struct) -> DataFile {
@@ -1976,7 +1976,7 @@ pub(crate) mod preparer_tests {
                 next.current_snapshot().unwrap().summary().operation,
                 Operation::Append
             );
-            assert_eq!(request.artifacts().attempt_owned().len(), 1);
+            assert_eq!(request.artifacts().references().len(), 1);
             base = next;
         }
     }

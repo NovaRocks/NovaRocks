@@ -36,8 +36,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use super::super::manifest_encoding::{ManifestWriteSource, SourcedManifestEntry};
-use super::super::model::{ArtifactClass, ArtifactWriter, FrozenEntry};
-use super::super::staging::{ManifestEntryWrite, write_sourced_manifest_with_class};
+use super::super::model::{ArtifactWriter, FrozenEntry};
+use super::super::staging::{ManifestEntryWrite, write_sourced_manifest};
 use crate::iceberg::spec::{ManifestContentType, ManifestFile, Operation, Snapshot, Summary};
 use crate::iceberg::{TableRequirement, TableUpdate};
 #[cfg(test)]
@@ -193,14 +193,17 @@ async fn merge_manifest_group(
             }
         }
     }
-    write_sourced_manifest_with_class(
+    write_sourced_manifest(
         artifacts,
-        ArtifactClass::Operation,
         metadata,
         snapshot_id,
         spec,
         content,
         entries,
+        &group
+            .iter()
+            .map(|manifest| manifest.manifest_path.clone())
+            .collect::<Vec<_>>(),
     )
     .await
 }
@@ -501,13 +504,18 @@ mod keyed_record_tests {
         fn file_io(&self) -> &FileIO {
             &self.io
         }
-        fn stage_snapshot_id(&self, stage: usize, metadata: &crate::iceberg::spec::TableMetadata) -> crate::iceberg::Result<i64> {
+        fn stage_snapshot_id(
+            &self,
+            stage: usize,
+            metadata: &crate::iceberg::spec::TableMetadata,
+        ) -> crate::iceberg::Result<i64> {
             let mut ids = self.stage_ids.lock().unwrap();
-            Ok(*ids.entry(stage).or_insert_with(|| crate::commit::staging::new_snapshot_id(metadata)))
+            Ok(*ids
+                .entry(stage)
+                .or_insert_with(|| crate::commit::staging::new_snapshot_id(metadata)))
         }
         fn allocate(
             &self,
-            class: crate::commit::model::ArtifactClass,
             kind: crate::commit::model::ArtifactKind,
         ) -> crate::iceberg::Result<crate::commit::model::ObjectIdentity> {
             use crate::commit::model::*;
@@ -517,12 +525,11 @@ mod keyed_record_tests {
                 ledger.records().count(),
                 kind.extension()
             ))?;
-            ledger.register(ArtifactRecord {
-                object: object.clone(),
-                class,
-                attempt: (class == ArtifactClass::Attempt).then_some(self.attempt_token()),
-                write_state: ArtifactWriteState::Allocated,
-            })?;
+            ledger.register(ArtifactRecord::produced(
+                object.clone(),
+                self.attempt_token(),
+                kind,
+            ))?;
             Ok(object)
         }
         fn attempt_token(&self) -> crate::commit::model::AttemptToken {
@@ -533,12 +540,49 @@ mod keyed_record_tests {
         }
         fn snapshot_artifacts(
             &self,
-            references: &[crate::commit::model::ObjectIdentity],
+            lists: &[crate::commit::model::ObjectIdentity],
+            statistics: &[crate::commit::model::ObjectIdentity],
         ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
-            self.ledger
-                .lock()
-                .unwrap()
-                .snapshot_for_attempt(self.attempt_token(), references.iter().cloned())
+            self.ledger.lock().unwrap().snapshot_for_request(
+                self.attempt_token(),
+                lists,
+                statistics,
+            )
+        }
+
+        fn record_manifest(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            live_paths: &[String],
+            replaces: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest(object, live_paths, replaces)
+        }
+
+        fn record_manifest_list(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            paths: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest_list(object, paths)
         }
     }
 
@@ -745,8 +789,20 @@ mod keyed_record_tests {
             paths.push(list.entries()[0].manifest_path.clone());
             lists.push(snapshot.manifest_list().to_string());
             let merged = ObjectIdentity::new(paths.last().unwrap().clone()).unwrap();
-            let request = engine.freeze(std::slice::from_ref(&merged)).unwrap();
-            assert_eq!(request.artifacts().operation_references(), &[merged]);
+            let request = engine.freeze().unwrap();
+            let expected = std::collections::BTreeSet::from([
+                merged,
+                ObjectIdentity::new(snapshot.manifest_list().to_owned()).unwrap(),
+            ]);
+            assert_eq!(
+                request
+                    .artifacts()
+                    .references()
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected
+            );
             assert!(
                 request
                     .requirements()
@@ -775,7 +831,7 @@ mod keyed_record_tests {
         assert_eq!(
             ledger
                 .records()
-                .filter(|entry| entry.class == ArtifactClass::Operation)
+                .filter(|entry| entry.object.path() == paths[0])
                 .count(),
             1
         );
@@ -828,10 +884,7 @@ mod row_id_rewrite_tests {
         let artifacts = crate::commit::staging::TestWriter::new();
         let io = artifacts.file_io();
         let input = artifacts
-            .allocate(
-                ArtifactClass::Operation,
-                crate::commit::model::ArtifactKind::Manifest,
-            )
+            .allocate(crate::commit::model::ArtifactKind::Manifest)
             .unwrap();
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(

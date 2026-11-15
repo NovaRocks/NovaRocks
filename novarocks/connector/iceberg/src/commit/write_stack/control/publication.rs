@@ -35,9 +35,9 @@ use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::dependency::ValidationInputs;
 use crate::commit::model::EntryIdentity;
 use crate::commit::model::{
-    AddedContent, ArtifactClass, BaseIdentity, CleanupScope, FileChanges, FrozenRequest,
+    AddedContent, ArtifactOrigin, BaseIdentity, CleanupScope, FileChanges, FrozenRequest,
     IsolationLevel, ObjectIdentity, OperationIntent, OperationIntentParts, OperationToken,
-    RequestShape, StartSnapshot, TableTarget,
+    ReceivedPublication, RequestShape, StartSnapshot, TableTarget,
 };
 #[cfg(test)]
 use crate::commit::model::{ArtifactWriter, IcebergCleanupReport, PublicationOutcome};
@@ -1066,25 +1066,47 @@ impl RecoveryTemplate {
                 "Recovery envelope target differs from its frozen request",
             ));
         }
-        let records = operation.artifacts().map_err(|e| internal(e.to_string()))?;
+        // Transitional envelope projection only; the live ledger remains the sole owner.
+        let current = request.artifacts().attempt();
+        let selected: BTreeSet<_> = request.artifacts().references().iter().collect();
         let mut index = BTreeMap::new();
         let mut artifacts = Vec::new();
-        for record in records {
-            index.insert(
-                record.object.clone(),
-                u32::try_from(artifacts.len())
-                    .map_err(|_| internal("Recovery object count overflow"))?,
-            );
-            let class = match record.class {
-                ArtifactClass::SessionData => OwnedClass::SessionData,
-                ArtifactClass::Operation => OwnedClass::Operation,
-                ArtifactClass::Attempt => OwnedClass::Attempt,
-                ArtifactClass::ExternalRegistered => {
-                    return Err(internal(
-                        "External registered object entered the owned ledger",
-                    ));
+        let mut attempt_owned = Vec::new();
+        let mut operation_references = Vec::new();
+        let mut session_references = Vec::new();
+        for record in operation.artifacts().map_err(|e| internal(e.to_string()))? {
+            let object_index = u32::try_from(artifacts.len())
+                .map_err(|_| internal("Recovery object count overflow"))?;
+            index.insert(record.object.clone(), object_index);
+            let (class, attempt) = match record.origin {
+                ArtifactOrigin::Received {
+                    publishes: ReceivedPublication::ViaManifest,
+                } => (OwnedClass::SessionData, None),
+                ArtifactOrigin::Received {
+                    publishes: ReceivedPublication::WithRequest,
+                } => (OwnedClass::Operation, None),
+                // Previous selected manifests need the old operation-reference representation.
+                ArtifactOrigin::Produced { attempt, .. }
+                    if attempt != current && selected.contains(&record.object) =>
+                {
+                    (OwnedClass::Operation, None)
+                }
+                ArtifactOrigin::Produced { attempt, .. } => {
+                    (OwnedClass::Attempt, Some(attempt.into()))
                 }
             };
+            if class == OwnedClass::Attempt
+                && attempt.as_ref() == Some(&RecoveryAttempt::from(current))
+            {
+                attempt_owned.push(object_index);
+            }
+            if selected.contains(&record.object) {
+                match class {
+                    OwnedClass::Operation => operation_references.push(object_index),
+                    OwnedClass::SessionData => session_references.push(object_index),
+                    OwnedClass::Attempt => {}
+                }
+            }
             let state = match record.write_state {
                 crate::commit::model::ArtifactWriteState::Allocated => WriteState::Allocated,
                 crate::commit::model::ArtifactWriteState::Writing => WriteState::Writing,
@@ -1093,20 +1115,15 @@ impl RecoveryTemplate {
             artifacts.push(RecoveryObject {
                 path: record.object.path().to_string(),
                 class,
-                attempt: record.attempt.map(RecoveryAttempt::from),
+                attempt,
                 state,
             });
         }
-        let indices = |paths: &[ObjectIdentity]| -> Result<Vec<u32>, ConnectorError> {
-            paths
-                .iter()
-                .map(|object| {
-                    index.get(object).copied().ok_or_else(|| {
-                        internal("Frozen request references an object absent from recovery ledger")
-                    })
-                })
-                .collect()
-        };
+        if selected.iter().any(|object| !index.contains_key(*object)) {
+            return Err(internal(
+                "Frozen request references an object absent from recovery ledger",
+            ));
+        }
         let payload = RecoveryPayload {
             version: ICEBERG_WRITE_SESSION_EVIDENCE_VERSION,
             session_id: self.session_id.to_string(),
@@ -1123,9 +1140,9 @@ impl RecoveryTemplate {
             parent_snapshot_id: *parent,
             metadata_location: metadata_location.clone(),
             published_snapshot_id: request.ref_snapshot_after(&self.target_ref),
-            attempt_owned: indices(request.artifacts().attempt_owned())?,
-            operation_references: indices(request.artifacts().operation_references())?,
-            session_references: indices(request.artifacts().session_references())?,
+            attempt_owned,
+            operation_references,
+            session_references,
             artifacts,
         };
         payload.validate_facts(self)?;
@@ -1323,7 +1340,32 @@ mod recovery_tests {
             }
         }
         fn intent(&self) -> OperationIntent {
-            self.intent_with_files(Vec::new())
+            let added = self
+                .operation
+                .artifacts()
+                .unwrap()
+                .into_iter()
+                .filter_map(|record| {
+                    matches!(
+                        record.origin,
+                        ArtifactOrigin::Received {
+                            publishes: ReceivedPublication::ViaManifest
+                        }
+                    )
+                    .then(|| {
+                        AddedContent::new_logical_data(
+                            crate::commit::overwrite::preparer_tests::data(
+                                record.object.path(),
+                                1,
+                                crate::iceberg::spec::Struct::empty(),
+                            ),
+                            self.metadata.default_partition_spec_id(),
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect();
+            self.intent_with_files(added)
         }
         fn intent_with_files(&self, added: Vec<AddedContent>) -> OperationIntent {
             OperationIntent::new(OperationIntentParts {
@@ -1474,24 +1516,15 @@ mod recovery_tests {
         let fixture = Fixture::new();
         let sessions: Vec<_> = (0..1221).map(|_| fixture.adopt_random_file()).collect();
         let old_attempt = fixture.operation.begin_attempt().unwrap();
-        let old_object = old_attempt
-            .allocate(ArtifactClass::Attempt, ArtifactKind::Statistics)
+        let old_object = old_attempt.allocate(ArtifactKind::Statistics).unwrap();
+        let operation_path = fixture.directory.path().join("operation-metadata.json");
+        std::fs::write(&operation_path, b"operation metadata").unwrap();
+        let operation_object =
+            ObjectIdentity::new(format!("file://{}", operation_path.display())).unwrap();
+        fixture
+            .operation
+            .adopt_operation_reference(operation_object.clone())
             .unwrap();
-        let operation_object = old_attempt
-            .allocate(ArtifactClass::Operation, ArtifactKind::Metadata)
-            .unwrap();
-        let mut writer = old_attempt
-            .file_io()
-            .new_output(operation_object.path())
-            .unwrap()
-            .writer()
-            .await
-            .unwrap();
-        writer
-            .write(Bytes::from_static(b"operation-owned metadata"))
-            .await
-            .unwrap();
-        writer.close().await.unwrap();
         let added = sessions
             .iter()
             .map(|object| {
@@ -1524,9 +1557,7 @@ mod recovery_tests {
             .stage(&crate::commit::fast_append::FastAppendPreparer)
             .await
             .unwrap();
-        let mut references = sessions.clone();
-        references.push(operation_object.clone());
-        let request = engine.freeze(&references).unwrap();
+        let request = engine.freeze().unwrap();
         let evidence = fixture
             .template
             .encode(&request, &fixture.operation)
@@ -1538,15 +1569,18 @@ mod recovery_tests {
         assert_eq!(payload.artifacts.len(), records.len());
         for (object, record) in payload.artifacts.iter().zip(records) {
             assert_eq!(object.path, record.object.path());
-            assert_eq!(object.attempt, record.attempt.map(RecoveryAttempt::from));
-            let class = match record.class {
-                ArtifactClass::SessionData => OwnedClass::SessionData,
-                ArtifactClass::Operation => OwnedClass::Operation,
-                ArtifactClass::Attempt => OwnedClass::Attempt,
-                ArtifactClass::ExternalRegistered => {
-                    panic!("borrowed object entered actual owned test ledger")
+            let (class, attempt) = match record.origin {
+                ArtifactOrigin::Received {
+                    publishes: ReceivedPublication::ViaManifest,
+                } => (OwnedClass::SessionData, None),
+                ArtifactOrigin::Received {
+                    publishes: ReceivedPublication::WithRequest,
+                } => (OwnedClass::Operation, None),
+                ArtifactOrigin::Produced { attempt, .. } => {
+                    (OwnedClass::Attempt, Some(RecoveryAttempt::from(attempt)))
                 }
             };
+            assert_eq!(object.attempt, attempt);
             let state = match record.write_state {
                 crate::commit::model::ArtifactWriteState::Allocated => WriteState::Allocated,
                 crate::commit::model::ArtifactWriteState::Writing => WriteState::Writing,
@@ -1563,18 +1597,22 @@ mod recovery_tests {
                 })
                 .collect()
         };
-        assert_eq!(
-            paths(&payload.attempt_owned),
-            request.artifacts().attempt_owned()
-        );
-        assert_eq!(
-            paths(&payload.operation_references),
-            request.artifacts().operation_references()
-        );
-        assert_eq!(
-            paths(&payload.session_references),
-            request.artifacts().session_references()
-        );
+        let expected_current: Vec<_> = fixture
+            .operation
+            .artifacts()
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                matches!(record.origin, ArtifactOrigin::Produced { attempt, .. }
+                if attempt == current.attempt_token())
+            })
+            .map(|record| record.object)
+            .collect();
+        assert_eq!(paths(&payload.attempt_owned), expected_current);
+        assert_eq!(paths(&payload.operation_references), [operation_object]);
+        let mut expected_sessions = sessions.clone();
+        expected_sessions.sort();
+        assert_eq!(paths(&payload.session_references), expected_sessions);
         assert_eq!(payload.session_references.len(), 1221);
         assert_eq!(payload.operation_references.len(), 1);
         assert!(!payload.attempt_owned.is_empty());
@@ -1615,26 +1653,15 @@ mod recovery_tests {
         let fixture = Fixture::new();
         let session_object = fixture.adopt(0);
         let old_attempt = fixture.operation.begin_attempt().unwrap();
-        let old_object = old_attempt
-            .allocate(ArtifactClass::Attempt, ArtifactKind::Statistics)
+        let old_object = old_attempt.allocate(ArtifactKind::Statistics).unwrap();
+        let operation_path = fixture.directory.path().join("operation-metadata.json");
+        std::fs::write(&operation_path, b"operation metadata").unwrap();
+        let operation_object =
+            ObjectIdentity::new(format!("file://{}", operation_path.display())).unwrap();
+        fixture
+            .operation
+            .adopt_operation_reference(operation_object.clone())
             .unwrap();
-        let operation_object = old_attempt
-            .allocate(ArtifactClass::Operation, ArtifactKind::Metadata)
-            .unwrap();
-        // Leave one old allocated output in the ledger: failed cleanup/recovery
-        // must retain its actual state, rather than claiming all objects written.
-        let mut writer = old_attempt
-            .file_io()
-            .new_output(operation_object.path())
-            .unwrap()
-            .writer()
-            .await
-            .unwrap();
-        writer
-            .write(Bytes::from_static(b"operation metadata"))
-            .await
-            .unwrap();
-        writer.close().await.unwrap();
         let publisher = publisher(&fixture);
         let report = attempt::run(
             &fixture.operation,
@@ -1876,8 +1903,8 @@ mod keyed_preparation_tests {
                 .keys()
                 .any(|key| crate::document_storage::keyed::keys::is_legacy_key(key))
         );
-        let frozen = engine.freeze(&[]).unwrap();
-        assert_eq!(frozen.artifacts().attempt_owned().len(), 1);
+        let frozen = engine.freeze().unwrap();
+        assert_eq!(frozen.artifacts().references().len(), 1);
         let writes: Vec<_> = frozen
             .updates()
             .iter()

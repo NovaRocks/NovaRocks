@@ -96,9 +96,7 @@ async fn validate_dependencies(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::model::{
-        ArtifactClass, ArtifactKind, AttemptArtifacts, AttemptToken, ObjectIdentity, OperationToken,
-    };
+    use super::super::super::model::{ArtifactKind, AttemptToken, ObjectIdentity, OperationToken};
     use super::super::HistoryGap;
     use super::*;
     use crate::iceberg::io::FileIO;
@@ -122,7 +120,7 @@ mod tests {
         fn file_io(&self) -> &FileIO {
             &self.io
         }
-        fn allocate(&self, _: ArtifactClass, _: ArtifactKind) -> Result<ObjectIdentity> {
+        fn allocate(&self, _: ArtifactKind) -> Result<ObjectIdentity> {
             panic!("Validation must not allocate artifacts")
         }
         fn attempt_token(&self) -> AttemptToken {
@@ -136,8 +134,29 @@ mod tests {
         fn check_active(&self) -> Result<()> {
             Ok(())
         }
-        fn snapshot_artifacts(&self, _: &[ObjectIdentity]) -> Result<AttemptArtifacts> {
+        fn snapshot_artifacts(
+            &self,
+            _lists: &[crate::commit::model::ObjectIdentity],
+            _statistics: &[crate::commit::model::ObjectIdentity],
+        ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
             panic!("Validation must not freeze artifacts")
+        }
+
+        fn record_manifest(
+            &self,
+            _object: &crate::commit::model::ObjectIdentity,
+            _live_paths: &[String],
+            _replaces: &[String],
+        ) -> crate::iceberg::Result<()> {
+            panic!("Validation must not record a manifest")
+        }
+
+        fn record_manifest_list(
+            &self,
+            _object: &crate::commit::model::ObjectIdentity,
+            _paths: &[String],
+        ) -> crate::iceberg::Result<()> {
+            panic!("Validation must not record a manifest list")
         }
     }
     fn metadata() -> TableMetadata {
