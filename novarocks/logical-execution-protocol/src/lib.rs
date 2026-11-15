@@ -92,3 +92,6 @@ impl LogicalExecutionCore {
         Self { _start: start }
     }
 }
+
+#[cfg(test)]
+mod test_support;

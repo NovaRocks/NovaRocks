@@ -102,6 +102,9 @@ pub enum NativeFact {
     QualificationSettled {
         identity: QualificationIdentity,
         operation_id: novarocks_execution_contract::TaskOperationId,
+        /// The original handoff time, reported with this action's one result.
+        /// Qualified/unknown outcomes require Some; an unissued rejection does not.
+        dispatched_at: Option<novarocks_coordination_contract::MonotonicInstant>,
         settlement: QualificationSettlement,
     },
     ReservationActivated(QualifiedReplacementFacts),
@@ -155,6 +158,7 @@ pub enum InternalRequest {
     RegisterSource {
         root: TaskIdentity,
         plan: LogicalPlanIdentity,
+        supervised_exit: bool,
     },
     EndDecoded {
         receipt: InternalEndReceiptId,
@@ -167,7 +171,12 @@ pub enum InternalRequest {
         end: RootResultEnd,
     },
     Failed(FailureReport),
-    Exited,
+    /// Closing the source does not replace a reserved supervised exit verdict.
+    SourceClosed,
+    /// Authored by the original consumer supervisor after actual exit.
+    ExitObserved {
+        outcome: Option<Result<(), QueryExecutionError>>,
+    },
 }
 
 #[derive(Clone, Debug)]

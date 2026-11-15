@@ -14,3 +14,37 @@
 // KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+//! Concrete application executors. The FE carrier invokes their methods and
+//! owns the original work exit; executors return passive results only.
+
+use std::sync::Arc;
+
+/// All application owners for one installed logical execution. The carrier
+/// retains this exact set through cleanup; no process-global executor registry.
+#[derive(Clone)]
+pub struct LogicalExecutors {
+    pub native: Arc<NativeExecutor>,
+    pub relay: Arc<RelayExecutor>,
+    pub consumer: Arc<ConsumerExecutor>,
+    pub cancel: Arc<CancelObserver>,
+    pub governance: Arc<GovernanceExecutor>,
+}
+
+// P07 declares concrete owners before P08 supplies their original resource
+// fields and methods in separate module trees. None has a public constructor.
+pub struct NativeExecutor {
+    _private: (),
+}
+pub struct RelayExecutor {
+    _private: (),
+}
+pub struct ConsumerExecutor {
+    _private: (),
+}
+pub struct CancelObserver {
+    _private: (),
+}
+pub struct GovernanceExecutor {
+    _private: (),
+}
