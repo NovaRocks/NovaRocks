@@ -349,7 +349,7 @@ impl<'a> StagingEngine<'a> {
         self.artifacts.check_active()?;
         self.state.stage_change(self.intent, change)
     }
-    // Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
+    // Design: ADR-0234 (docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)
     pub fn freeze(self) -> Result<FrozenRequest> {
         self.artifacts.check_active()?;
         let mut lists = Vec::new();

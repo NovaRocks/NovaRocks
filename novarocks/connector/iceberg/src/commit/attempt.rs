@@ -284,7 +284,7 @@ impl RetryPolicy {
 
 /// Neither cancellation nor elapsed retry time interrupts an already-issued dispatch.
 /// Once publication is possible, its typed outcome alone decides cleanup and retry.
-// Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
+// Design: ADR-0234 (docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)
 #[derive(Clone, Copy)]
 enum CommittedCleanupPhase {
     Inline,

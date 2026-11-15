@@ -64,7 +64,7 @@ impl Default for OperationLimits {
 }
 
 #[derive(Clone)]
-// Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
+// Design: ADR-0234 (docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)
 pub(crate) struct IcebergCommitOperation {
     inner: Arc<OperationState>,
 }

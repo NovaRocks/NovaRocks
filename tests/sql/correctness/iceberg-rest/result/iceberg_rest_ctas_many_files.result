@@ -1,0 +1,14 @@
+-- query 3
+-- types	bigint	bigint	bigint
+row_count	part_sum	value_sum
+240	28920	57840
+
+-- query 4
+-- types	bigint
+partition_count
+240
+
+-- query 5
+-- types	boolean
+enough_files
+true
