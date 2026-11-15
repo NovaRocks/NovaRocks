@@ -122,7 +122,7 @@ pub(crate) async fn write_added_intent_data(
             .push(added.clone());
     }
     let mut manifests = Vec::new();
-    for (spec_id, files) in groups {
+    for (ordinal, (spec_id, files)) in groups.into_iter().enumerate() {
         let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
             crate::iceberg::Error::new(
                 crate::iceberg::ErrorKind::DataInvalid,
@@ -143,20 +143,32 @@ pub(crate) async fn write_added_intent_data(
                 }
             }
         }
-        manifests.push(
-            super::staging::write_manifest(
-                view.artifacts(),
-                metadata.format_version(),
-                snapshot_id,
-                metadata.current_schema().clone(),
-                spec.as_ref().clone(),
-                ManifestContentType::Data,
-                files
-                    .into_iter()
-                    .map(super::staging::ManifestEntryWrite::Added),
-            )
-            .await?,
+        let basis = super::model::ManifestReuseBasis::added(
+            view.stage_key(),
+            super::model::AddedManifestAuthor::IntentData,
+            ordinal,
+            super::manifest_encoding::encoding_basis(metadata)?,
+            files.iter().map(|file| file.file().file_path()),
         );
+        if let Some(manifest) = view.artifacts().find_reusable_manifest(&basis)? {
+            manifests.push(manifest);
+            continue;
+        }
+        let manifest = super::staging::write_manifest(
+            view.artifacts(),
+            metadata.format_version(),
+            snapshot_id,
+            metadata.current_schema().clone(),
+            spec.as_ref().clone(),
+            ManifestContentType::Data,
+            files
+                .into_iter()
+                .map(super::staging::ManifestEntryWrite::Added),
+        )
+        .await?;
+        view.artifacts()
+            .remember_reusable_manifest(basis, manifest.clone())?;
+        manifests.push(manifest);
     }
     Ok(manifests)
 }

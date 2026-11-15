@@ -97,6 +97,7 @@ async fn ordinary_manifests_core(
             view.metadata(),
             view.artifacts(),
             view.preparation().io_window_width,
+            view.stage_key(),
             snapshot_id,
             sources,
             removed.iter().copied(),
@@ -118,6 +119,7 @@ async fn ordinary_manifests_core(
                 view.metadata(),
                 snapshot_id,
                 view.preparation(),
+                view.stage_key(),
                 candidates,
             )
             .await?
@@ -128,6 +130,7 @@ async fn ordinary_manifests_core(
                 view.metadata(),
                 snapshot_id,
                 view.preparation(),
+                view.stage_key(),
                 candidates,
                 Some(scope),
             )
@@ -159,6 +162,7 @@ async fn apply_removals<'a, 'entry>(
     metadata: &TableMetadata,
     artifacts: &dyn ArtifactWriter,
     io_window_width: usize,
+    stage: usize,
     snapshot_id: i64,
     sources: &'a SnapshotSources<'_>,
     removed: impl IntoIterator<Item = &'entry LocatedEntry>,
@@ -208,9 +212,29 @@ async fn apply_removals<'a, 'entry>(
                     list_path,
                 ))
             } else {
-                filter_source(metadata, artifacts, snapshot_id, source, selected, scope)
-                    .await
-                    .map(MergeCandidate::pending)
+                let basis = super::model::ManifestReuseBasis::Filtered {
+                    stage,
+                    source: source.descriptor.clone(),
+                    removed_ordinals: selected.keys().copied().collect(),
+                    encoding: super::manifest_encoding::encoding_basis(metadata)?,
+                };
+                let output = match artifacts.find_reusable_manifest(&basis)? {
+                    Some(output) => output,
+                    None => {
+                        let output = filter_source(
+                            metadata,
+                            artifacts,
+                            snapshot_id,
+                            source,
+                            selected,
+                            scope,
+                        )
+                        .await?;
+                        artifacts.remember_reusable_manifest(basis, output.clone())?;
+                        output
+                    }
+                };
+                Ok(MergeCandidate::pending(output))
             }
         },
     )

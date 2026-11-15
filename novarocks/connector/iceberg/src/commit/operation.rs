@@ -90,6 +90,7 @@ struct OperationState {
 
 struct OperationArtifacts {
     ledger: ArtifactLedger,
+    reuse: super::model::ManifestReuseIndex,
     loop_entered: bool,
     stage_ids: BTreeMap<usize, i64>,
     cleanup_withheld: Option<String>,
@@ -160,6 +161,7 @@ impl IcebergCommitOperation {
                 limits,
                 artifacts: Mutex::new(OperationArtifacts {
                     ledger: ArtifactLedger::new(token),
+                    reuse: super::model::ManifestReuseIndex::default(),
                     loop_entered: false,
                     stage_ids: BTreeMap::new(),
                     cleanup_withheld: None,
@@ -614,6 +616,71 @@ impl IcebergCommitAttempt {
 }
 
 impl ArtifactWriter for IcebergCommitAttempt {
+    fn find_reusable_manifest(
+        &self,
+        basis: &crate::commit::model::ManifestReuseBasis,
+    ) -> Result<Option<crate::iceberg::spec::ManifestFile>> {
+        let mut artifacts = self
+            .operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?;
+        let OperationArtifacts { ledger, reuse, .. } = &mut *artifacts;
+        reuse.find(ledger, basis)
+    }
+    fn remember_reusable_manifest(
+        &self,
+        basis: crate::commit::model::ManifestReuseBasis,
+        output: crate::iceberg::spec::ManifestFile,
+    ) -> Result<()> {
+        let mut artifacts = self
+            .operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?;
+        let OperationArtifacts { ledger, reuse, .. } = &mut *artifacts;
+        reuse.remember(ledger, basis, output)
+    }
+    fn rewrite_reuse_backing_bytes(&self, stage: usize) -> Result<u64> {
+        self.operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?
+            .reuse
+            .rewrite_backing_bytes(stage)
+    }
+    fn find_reusable_rewrite(
+        &self,
+        stage: usize,
+        encoding: &[u8],
+        latest: &[crate::iceberg::spec::ManifestFile],
+    ) -> Result<Option<crate::commit::model::ManifestRewriteReuse>> {
+        let mut artifacts = self
+            .operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?;
+        let OperationArtifacts { ledger, reuse, .. } = &mut *artifacts;
+        reuse.find_rewrite(ledger, stage, encoding, latest)
+    }
+    fn remember_reusable_rewrite(
+        &self,
+        stage: usize,
+        result: crate::commit::model::ManifestRewriteReuse,
+    ) -> Result<()> {
+        let mut artifacts = self
+            .operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?;
+        let OperationArtifacts { ledger, reuse, .. } = &mut *artifacts;
+        reuse.remember_rewrite(ledger, stage, result)
+    }
     fn file_io(&self) -> &FileIO {
         &self.file_io
     }
@@ -1559,5 +1626,114 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+    #[tokio::test]
+    async fn standard_preparation_rewrites_a_retired_manifest_without_dropping_its_record() {
+        use crate::commit::model::{AddedContent, OperationIntent};
+        use crate::commit::overwrite::preparer_tests::{Fixture, data};
+        use crate::commit::staging::{StagingBase, StagingEngine};
+        use crate::iceberg::spec::{FormatVersion, Struct};
+        async fn stage(
+            fixture: &Fixture,
+            base: TableMetadata,
+            intent: &OperationIntent,
+        ) -> TableMetadata {
+            let attempt = fixture.operation.begin_attempt().unwrap();
+            let mut engine = StagingEngine::begin(
+                StagingBase::Existing {
+                    metadata: base,
+                    metadata_location: "file:///test-base.metadata.json".into(),
+                },
+                intent,
+                &attempt,
+            )
+            .unwrap();
+            engine
+                .stage(&crate::commit::FastAppendPreparer)
+                .await
+                .unwrap();
+            let result = engine.metadata().clone();
+            engine.freeze().unwrap();
+            result
+        }
+        fn manifest_path(metadata: &TableMetadata) -> String {
+            let bytes = std::fs::read(
+                metadata
+                    .current_snapshot()
+                    .unwrap()
+                    .manifest_list()
+                    .trim_start_matches("file://"),
+            )
+            .unwrap();
+            let list = crate::iceberg::spec::ManifestList::parse_with_version(
+                &bytes,
+                metadata.format_version(),
+            )
+            .unwrap();
+            assert_eq!(list.entries().len(), 1);
+            list.entries()[0].manifest_path.clone()
+        }
+        let fixture = Fixture::new();
+        let base = fixture.metadata(FormatVersion::V2);
+        let intent = fixture.intent(
+            &base,
+            "main",
+            vec![
+                AddedContent::new_logical_data(
+                    data(
+                        &format!("file://{}/data.parquet", fixture.directory.path().display()),
+                        3,
+                        Struct::empty(),
+                    ),
+                    0,
+                )
+                .unwrap(),
+            ],
+        );
+        let first = stage(&fixture, base.clone(), &intent).await;
+        let first_path = manifest_path(&first);
+        // Revoke eligibility at its actual owner, without a deadline race or a
+        // second cleanup path. This test lives beside that owner's private state.
+        fixture
+            .operation
+            .inner
+            .artifacts
+            .lock()
+            .unwrap()
+            .ledger
+            .retire(&ObjectIdentity::new(&first_path).unwrap())
+            .unwrap();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let second = crate::fs_io::TEST_STORAGE_REQUESTS
+            .scope(trace.clone(), stage(&fixture, base, &intent))
+            .await;
+        let second_path = manifest_path(&second);
+        assert_ne!(first_path, second_path);
+        let events = trace.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.operation == "write" && event.path == second_path)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.operation == "write" && event.path == first_path)
+        );
+        assert!(!events.iter().any(|event| event.operation == "delete"));
+        let records = fixture.operation.artifacts().unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.object.path() == first_path && record.retired)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.object.path() == second_path && !record.retired)
+        );
+        for path in [first_path, second_path] {
+            assert!(std::path::Path::new(path.trim_start_matches("file://")).exists());
+        }
     }
 }

@@ -33,9 +33,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::Mutex;
 
-use super::super::manifest_encoding::{ManifestWriteSource, SourcedManifestEntry};
+use super::super::manifest_encoding::{
+    ManifestWriteSource, SourcedManifestEntry, descriptor_owned_bytes, encoding_basis,
+};
+use super::super::model::ManifestRewriteReuse;
 use super::super::model::{ArtifactWriter, FrozenEntry};
 use super::super::staging::{ManifestEntryWrite, write_sourced_manifest};
 use crate::iceberg::spec::{ManifestContentType, ManifestFile, Operation, Snapshot, Summary};
@@ -230,51 +234,18 @@ fn carried_identity(
     Ok((snapshot, sequence, entry.file_sequence_number))
 }
 
-/// One operation owns reusable merged manifests; each staging attempt owns
-/// only its manifest-list. Reuse requires exact source descriptors in the
-/// latest target snapshot, including sequence/row-lineage facts.
-#[derive(Clone)]
-struct ReusableRewrite {
-    sources: Vec<ManifestFile>,
-    outputs: Vec<ManifestFile>,
-    encoding_basis: Vec<u8>,
-}
-
-fn encoding_basis(
-    metadata: &crate::iceberg::spec::TableMetadata,
-) -> crate::iceberg::Result<Vec<u8>> {
-    let mut schemas = metadata.schemas_iter().collect::<Vec<_>>();
-    schemas.sort_by_key(|schema| schema.schema_id());
-    let mut specs = metadata.partition_specs_iter().collect::<Vec<_>>();
-    specs.sort_by_key(|spec| spec.spec_id());
-    serde_json::to_vec(&(
-        metadata.format_version(),
-        metadata.current_schema_id(),
-        schemas,
-        specs,
-    ))
-    .map_err(|error| {
-        rewrite_error("Cannot encode manifest rewrite dependencies").with_source(error)
-    })
-}
-
 pub(crate) struct RewriteManifestsPreparer {
-    reusable: Mutex<Option<ReusableRewrite>>,
     request: Option<novarocks_spi::connector::ConnectorRequestContext>,
 }
 impl RewriteManifestsPreparer {
     pub(crate) fn for_request(request: novarocks_spi::connector::ConnectorRequestContext) -> Self {
         Self {
-            reusable: Mutex::new(None),
             request: Some(request),
         }
     }
     #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self {
-            reusable: Mutex::new(None),
-            request: None,
-        }
+        Self { request: None }
     }
 }
 
@@ -309,27 +280,9 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
         if let Some(request) = &self.request {
             // These are actual borrowed descriptor facts, not compressed-file
             // bytes or an invented bound for the SDK's decoded DataFile graph.
-            let old = {
-                let cache = self
-                    .reusable
-                    .lock()
-                    .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))?;
-                cache
-                    .as_ref()
-                    .map(|c| {
-                        descriptor_owned_bytes(&c.sources).and_then(|a| {
-                            descriptor_owned_bytes(&c.outputs).and_then(|b| {
-                                a.checked_add(b)
-                                    .and_then(|value| {
-                                        value.checked_add(c.encoding_basis.capacity() as u64)
-                                    })
-                                    .ok_or_else(|| rewrite_error("manifest backing overflow"))
-                            })
-                        })
-                    })
-                    .transpose()?
-                    .unwrap_or(0)
-            };
+            let old = view
+                .artifacts()
+                .rewrite_reuse_backing_bytes(view.stage_key())?;
             let required=descriptor_owned_bytes(latest)?.checked_add(old).and_then(|value| value.checked_add(encoding_basis.capacity() as u64)).and_then(|v|v.checked_mul(8)).and_then(|v|v.checked_add(2*(novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES+novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES) as u64)).and_then(std::num::NonZeroU64::new).ok_or_else(||rewrite_error("manifest backing overflow"))?;
             request
                 .reserve_owned_metadata(required)
@@ -338,15 +291,9 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
                     rewrite_error("original manifest backing admission refused").with_source(e)
                 })?;
         }
-        let cached = self
-            .reusable
-            .lock()
-            .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))?
-            .clone();
-        let cached = cached.filter(|cache| {
-            cache.encoding_basis == encoding_basis
-                && rewrite_sources_are_current(&cache.sources, latest)
-        });
+        let cached =
+            view.artifacts()
+                .find_reusable_rewrite(view.stage_key(), &encoding_basis, latest)?;
         let groups = if cached.is_none() {
             let groups = group_manifests_by_spec_and_content(latest);
             if groups.values().all(|group| group.len() <= 1) {
@@ -378,16 +325,13 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
                     sources.extend(group.iter().cloned());
                     outputs.push(output);
                 }
-                let cache = ReusableRewrite {
+                let cache = ManifestRewriteReuse {
                     sources,
                     outputs,
                     encoding_basis,
                 };
-                *self
-                    .reusable
-                    .lock()
-                    .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))? =
-                    Some(cache.clone());
+                view.artifacts()
+                    .remember_reusable_rewrite(view.stage_key(), cache.clone())?;
                 cache
             }
         };
@@ -443,13 +387,6 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
     }
 }
 
-/// Existence is insufficient: only exact membership of the latest list
-/// preserves a selected manifest's inherited sequence and row-ID meaning.
-fn rewrite_sources_are_current(sources: &[ManifestFile], latest: &[ManifestFile]) -> bool {
-    sources
-        .iter()
-        .all(|source| latest.iter().any(|current| current == source))
-}
 fn rewrite_error(message: &str) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, message)
 }
@@ -485,6 +422,7 @@ mod keyed_record_tests {
         attempt: Mutex<crate::commit::model::AttemptToken>,
         ledger: Mutex<crate::commit::model::ArtifactLedger>,
         stage_ids: Mutex<BTreeMap<usize, i64>>,
+        reuse: Mutex<crate::commit::model::ManifestReuseIndex>,
     }
     impl RewriteArtifacts {
         fn new() -> Self {
@@ -497,10 +435,37 @@ mod keyed_record_tests {
                 attempt: Mutex::new(crate::commit::model::AttemptToken::new(token, 0)),
                 ledger: Mutex::new(crate::commit::model::ArtifactLedger::new(token)),
                 stage_ids: Mutex::new(BTreeMap::new()),
+                reuse: Mutex::new(crate::commit::model::ManifestReuseIndex::default()),
             }
         }
     }
     impl crate::commit::model::ArtifactWriter for RewriteArtifacts {
+        fn rewrite_reuse_backing_bytes(&self, stage: usize) -> crate::iceberg::Result<u64> {
+            self.reuse.lock().unwrap().rewrite_backing_bytes(stage)
+        }
+        fn find_reusable_rewrite(
+            &self,
+            stage: usize,
+            encoding: &[u8],
+            latest: &[ManifestFile],
+        ) -> crate::iceberg::Result<Option<ManifestRewriteReuse>> {
+            self.reuse.lock().unwrap().find_rewrite(
+                &self.ledger.lock().unwrap(),
+                stage,
+                encoding,
+                latest,
+            )
+        }
+        fn remember_reusable_rewrite(
+            &self,
+            stage: usize,
+            result: ManifestRewriteReuse,
+        ) -> crate::iceberg::Result<()> {
+            self.reuse
+                .lock()
+                .unwrap()
+                .remember_rewrite(&self.ledger.lock().unwrap(), stage, result)
+        }
         fn file_io(&self) -> &FileIO {
             &self.io
         }
@@ -967,38 +932,4 @@ mod row_id_rewrite_tests {
         assert_eq!(actual["memory://rewrite/explicit.parquet"], Some(700));
         assert_eq!(actual["memory://rewrite/inherited.parquet"], Some(100));
     }
-}
-
-/// Exact public descriptor payloads used by first-party group/cache/list copies.
-/// The SDK DataFile clone's two owned-only getters are a separate qualification
-/// gap; this quote deliberately does not pretend to observe them without allocation.
-fn descriptor_owned_bytes(files: &[ManifestFile]) -> crate::iceberg::Result<u64> {
-    let mut bytes = files
-        .len()
-        .checked_mul(2 * std::mem::size_of::<ManifestFile>())
-        .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
-    for file in files {
-        bytes = bytes
-            .checked_add(file.manifest_path.len())
-            .and_then(|v| v.checked_add(file.key_metadata.as_ref().map_or(0, Vec::len)))
-            .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
-        if let Some(partitions) = &file.partitions {
-            bytes = bytes
-                .checked_add(
-                    partitions
-                        .len()
-                        .checked_mul(2 * std::mem::size_of::<crate::iceberg::spec::FieldSummary>())
-                        .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?,
-                )
-                .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
-            for p in partitions {
-                for bound in [&p.lower_bound, &p.upper_bound].into_iter().flatten() {
-                    bytes = bytes
-                        .checked_add(bound.len())
-                        .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
-                }
-            }
-        }
-    }
-    u64::try_from(bytes).map_err(|_| rewrite_error("manifest descriptor overflow"))
 }

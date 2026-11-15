@@ -20,9 +20,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{AttemptToken, ObjectIdentity, OperationToken, invalid};
+use super::{ManifestReuseBasis, ManifestRewriteReuse};
 use crate::iceberg::Result;
 use crate::iceberg::io::FileIO;
-use crate::iceberg::spec::TableMetadata;
+use crate::iceberg::spec::{ManifestFile, TableMetadata};
 
 /// A received object's explicit publication contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +78,58 @@ pub trait ArtifactWriter: Send + Sync {
     #[cfg(test)]
     fn stage_snapshot_id(&self, _stage: usize, metadata: &TableMetadata) -> Result<i64> {
         Ok(crate::commit::staging::new_snapshot_id(metadata))
+    }
+    #[cfg(not(test))]
+    fn find_reusable_manifest(&self, basis: &ManifestReuseBasis) -> Result<Option<ManifestFile>>;
+    #[cfg(test)]
+    fn find_reusable_manifest(&self, _basis: &ManifestReuseBasis) -> Result<Option<ManifestFile>> {
+        Ok(None)
+    }
+    #[cfg(not(test))]
+    fn remember_reusable_manifest(
+        &self,
+        basis: ManifestReuseBasis,
+        output: ManifestFile,
+    ) -> Result<()>;
+    #[cfg(test)]
+    fn remember_reusable_manifest(
+        &self,
+        _basis: ManifestReuseBasis,
+        _output: ManifestFile,
+    ) -> Result<()> {
+        Ok(())
+    }
+    #[cfg(not(test))]
+    fn rewrite_reuse_backing_bytes(&self, stage: usize) -> Result<u64>;
+    #[cfg(test)]
+    fn rewrite_reuse_backing_bytes(&self, _stage: usize) -> Result<u64> {
+        Ok(0)
+    }
+    #[cfg(not(test))]
+    fn find_reusable_rewrite(
+        &self,
+        stage: usize,
+        encoding: &[u8],
+        latest: &[ManifestFile],
+    ) -> Result<Option<ManifestRewriteReuse>>;
+    #[cfg(test)]
+    fn find_reusable_rewrite(
+        &self,
+        _stage: usize,
+        _encoding: &[u8],
+        _latest: &[ManifestFile],
+    ) -> Result<Option<ManifestRewriteReuse>> {
+        Ok(None)
+    }
+    #[cfg(not(test))]
+    fn remember_reusable_rewrite(&self, stage: usize, result: ManifestRewriteReuse) -> Result<()>;
+    #[cfg(test)]
+    fn remember_reusable_rewrite(
+        &self,
+        _stage: usize,
+        _result: ManifestRewriteReuse,
+    ) -> Result<()> {
+        Ok(())
     }
     fn record_manifest(
         &self,
@@ -224,7 +277,6 @@ impl ArtifactLedger {
             .retired = true;
         Ok(())
     }
-    #[cfg(test)]
     pub fn is_retired(&self, object: &ObjectIdentity) -> bool {
         self.records.get(object).is_none_or(|record| record.retired)
     }
@@ -246,6 +298,9 @@ impl ArtifactLedger {
             )));
         }
         Ok(record)
+    }
+    pub fn check_reusable_manifest(&self, object: &ObjectIdentity) -> Result<()> {
+        self.produced(object, ArtifactKind::Manifest).map(|_| ())
     }
     pub fn record_manifest(
         &mut self,

@@ -24,7 +24,11 @@ mod identity;
 mod intent;
 mod outcome;
 mod request;
+mod reuse;
 pub(crate) use request::validate_document_expiry_update;
+pub use reuse::{
+    AddedManifestAuthor, ManifestReuseBasis, ManifestReuseIndex, ManifestRewriteReuse,
+};
 
 pub use artifacts::{
     ArtifactKind, ArtifactLedger, ArtifactOrigin, ArtifactRecord, ArtifactWriteState,

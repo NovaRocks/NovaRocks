@@ -74,9 +74,19 @@ pub(crate) async fn merge_manifests(
     metadata: &TableMetadata,
     snapshot_id: i64,
     context: PreparationContext,
+    stage: usize,
     candidates: Vec<MergeCandidate<'_>>,
 ) -> Result<Vec<ManifestFile>> {
-    merge_manifests_scoped(artifacts, metadata, snapshot_id, context, candidates, None).await
+    merge_manifests_scoped(
+        artifacts,
+        metadata,
+        snapshot_id,
+        context,
+        stage,
+        candidates,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn merge_manifests_scoped(
@@ -84,6 +94,7 @@ pub(crate) async fn merge_manifests_scoped(
     metadata: &TableMetadata,
     snapshot_id: i64,
     context: PreparationContext,
+    stage: usize,
     candidates: Vec<MergeCandidate<'_>>,
     scope: Option<&crate::manifest::target_query::ManifestReadScope>,
 ) -> Result<Vec<ManifestFile>> {
@@ -98,9 +109,28 @@ pub(crate) async fn merge_manifests_scoped(
                     .into_iter()
                     .map(|candidate| candidate.descriptor)
                     .collect::<Vec<_>>()),
-                packing::Layout::Merge(bin) => Ok(vec![
-                    merge_bin(artifacts, metadata, snapshot_id, bin, scope).await?,
-                ]),
+                packing::Layout::Merge(bin) => {
+                    let basis = super::model::ManifestReuseBasis::Merged {
+                        stage,
+                        inputs: bin
+                            .iter()
+                            .map(|candidate| {
+                                (candidate.committed.is_some(), candidate.descriptor.clone())
+                            })
+                            .collect(),
+                        encoding: super::manifest_encoding::encoding_basis(metadata)?,
+                    };
+                    let output = match artifacts.find_reusable_manifest(&basis)? {
+                        Some(output) => output,
+                        None => {
+                            let output =
+                                merge_bin(artifacts, metadata, snapshot_id, bin, scope).await?;
+                            artifacts.remember_reusable_manifest(basis, output.clone())?;
+                            output
+                        }
+                    };
+                    Ok(vec![output])
+                }
             }
         },
     )

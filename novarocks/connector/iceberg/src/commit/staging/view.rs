@@ -54,6 +54,9 @@ impl<'a> StagedView<'a> {
     pub fn metadata(&self) -> &TableMetadata {
         self.metadata
     }
+    pub(crate) fn stage_key(&self) -> usize {
+        self.stage
+    }
     pub(crate) fn stage_snapshot_id(&self) -> Result<i64> {
         self.artifacts.stage_snapshot_id(self.stage, self.metadata)
     }

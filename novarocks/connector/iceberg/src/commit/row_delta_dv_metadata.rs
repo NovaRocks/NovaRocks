@@ -173,7 +173,18 @@ pub(crate) async fn write_added_entry_groups_with_partitions(
             .push(added);
     }
     let mut out = Vec::new();
-    for ((spec_id, deletes, assigned), files) in grouped {
+    for (ordinal, ((spec_id, deletes, assigned), files)) in grouped.into_iter().enumerate() {
+        let basis = crate::commit::model::ManifestReuseBasis::added(
+            view.stage_key(),
+            crate::commit::model::AddedManifestAuthor::EntryGroups,
+            ordinal,
+            crate::commit::manifest_encoding::encoding_basis(view.metadata())?,
+            files.iter().map(|file| file.file().file_path()),
+        );
+        if let Some(manifest) = view.artifacts().find_reusable_manifest(&basis)? {
+            out.push(manifest);
+            continue;
+        }
         let first = files.iter().filter_map(|a| a.file().first_row_id()).min();
         let spec = partition_spec_by_id(view.metadata(), spec_id)?;
         if deletes && let Some(historical) = historical {
@@ -202,18 +213,19 @@ pub(crate) async fn write_added_entry_groups_with_partitions(
                     entry: ManifestEntryWrite::Added(added),
                 })
                 .collect();
-            out.push(
-                write_sourced_manifest(
-                    view.artifacts(),
-                    view.metadata(),
-                    snapshot_id,
-                    spec.as_ref(),
-                    ManifestContentType::Deletes,
-                    entries,
-                    &[],
-                )
-                .await?,
-            );
+            let manifest = write_sourced_manifest(
+                view.artifacts(),
+                view.metadata(),
+                snapshot_id,
+                spec.as_ref(),
+                ManifestContentType::Deletes,
+                entries,
+                &[],
+            )
+            .await?;
+            view.artifacts()
+                .remember_reusable_manifest(basis, manifest.clone())?;
+            out.push(manifest);
             continue;
         }
         let mut mf = write_manifest(
@@ -238,6 +250,8 @@ pub(crate) async fn write_added_entry_groups_with_partitions(
                 to_iceberg_unexpected("Added file has a negative source row ID".into())
             })?;
         }
+        view.artifacts()
+            .remember_reusable_manifest(basis, mf.clone())?;
         out.push(mf);
     }
     Ok(out)
