@@ -60,6 +60,10 @@ pub use value_identity::{
     ValueSemanticVisit, value_types_equal_observed, value_types_equal_weighted_observed,
     visit_value_type_observed,
 };
+mod write_input_projection;
+pub use write_input_projection::{
+    CheckedWriteInputProjection, WriteInputDeclaration, WriteInputLeafProjection,
+};
 mod value_schema;
 pub use value_schema::{TypedValueBinding, ValueSchema, validate_value_layout_observed};
 mod value_construction;

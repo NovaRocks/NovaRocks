@@ -180,8 +180,6 @@ impl IcebergSystemRelation {
 }
 
 type RequestPinnedPhysicalTables = Arc<Mutex<HashMap<SchemaTableName, IcebergPhysicalTable>>>;
-type FrozenCowSource = Arc<crate::typed_read::frozen_source::IcebergCowPendingReadSource>;
-type FrozenCowSources = Arc<Mutex<BTreeMap<[u8; 32], FrozenCowSource>>>;
 use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::{
     IcebergObservedSourceReadFacts, IcebergPreparedSourceRead, PreparedRelations,
 };
@@ -221,9 +219,6 @@ pub struct IcebergTypedBoundary {
     /// reopen REST metadata after the attempt's credential manifest is sealed.
     request_pinned_physical_tables: Option<RequestPinnedPhysicalTables>,
     split_source_options: IcebergSplitSourceOptions,
-    /// Exact COW observations adopted by this request's actual generation.
-    /// Keyed by original source identity, never a SQL name or projection set.
-    frozen_cow_sources: Option<FrozenCowSources>,
     prepared_source_accesses: Option<PreparedSourceAccesses>,
 }
 
@@ -264,7 +259,6 @@ impl IcebergTypedBoundary {
             request_context: None,
             request_pinned_physical_tables: None,
             split_source_options: IcebergSplitSourceOptions::default(),
-            frozen_cow_sources: None,
             prepared_source_accesses: None,
         }
     }
@@ -282,7 +276,6 @@ impl IcebergTypedBoundary {
             request_context: Some(request_context),
             request_pinned_physical_tables: Some(Arc::new(Mutex::new(HashMap::new()))),
             split_source_options: self.split_source_options,
-            frozen_cow_sources: Some(Arc::new(Mutex::new(BTreeMap::new()))),
             prepared_source_accesses: Some(Arc::new(Mutex::new(Vec::new()))),
         }
     }
@@ -303,7 +296,6 @@ impl IcebergTypedBoundary {
             request_context: Some(request_context),
             request_pinned_physical_tables: Some(tables),
             split_source_options: self.split_source_options,
-            frozen_cow_sources: Some(Arc::new(Mutex::new(BTreeMap::new()))),
             prepared_source_accesses: Some(Arc::new(Mutex::new(Vec::new()))),
         }
     }
@@ -344,7 +336,6 @@ impl IcebergTypedBoundary {
                 "frozen write target",
             )?;
         if payload.metadata_table_type.is_some()
-            || payload.row_mutation_frozen_source
             || payload.explicit_files.is_some()
             || !payload.prepared_files.is_empty()
             || payload.namespace != name.schema_name()
@@ -473,36 +464,6 @@ impl IcebergTypedBoundary {
             ));
         }
         Ok(None)
-    }
-    fn adopted_cow_source(
-        &self,
-        handle: &IcebergTableHandle,
-    ) -> Result<Option<FrozenCowSource>, ConnectorError> {
-        let Some(proof) = handle.frozen_cow_source() else {
-            return Ok(None);
-        };
-        let sources = self
-            .frozen_cow_sources
-            .as_ref()
-            .ok_or_else(|| corrupt("Iceberg COW source is not bound to a read request"))?;
-        let source = sources
-            .lock()
-            .expect("request Iceberg COW source lock")
-            .get(proof.source_digest())
-            .cloned()
-            .ok_or_else(|| corrupt("Iceberg COW handle has no adopted original source"))?;
-        if source.signed_base != *proof.signed_base()
-            || Some(source.pinned.version_ordinal()) != handle.snapshot_id()
-            || source.read_file.path != proof.data_file_path()
-            || !handle
-                .read_domain()
-                .is_some_and(|domain| domain == source.read_file.read_domain())
-        {
-            return Err(corrupt(
-                "Iceberg COW handle differs from its adopted original source",
-            ));
-        }
-        Ok(Some(source))
     }
 
     pub(crate) fn pinned_table_for_attempt(
@@ -1150,22 +1111,11 @@ impl ConnectorReadAttemptAccessSealer for IcebergAttemptAccessSealer {
     ) -> Result<ConnectorReadAttemptAccessSource, ConnectorError> {
         let relation = self.adapter.table(frozen)?;
         let name = relation.schema_table_name().clone();
-        let frozen_cow_source = match &relation {
-            crate::typed_read::IcebergRuntimeRelation::Table(table) => {
-                self.boundary.adopted_cow_source(table)?
-            }
-            _ => None,
-        };
-        let prepared = self.boundary.prepared_source_access(relation)?;
-        let access = match (prepared, frozen_cow_source) {
-            (Some(receipt), None) => IcebergAttemptAccessRecipe::PreparedSource(receipt),
-            (Some(_), Some(_)) => {
-                return Err(invalid("read relation has two source provenance authors"));
-            }
-            (None, Some(source)) => IcebergAttemptAccessRecipe::Cow(source),
-            (None, None) => IcebergAttemptAccessRecipe::Original(
-                IcebergAttemptTableAccess::freeze(self.boundary.pinned_table_for_attempt(&name)?),
-            ),
+        let access = match self.boundary.prepared_source_access(relation)? {
+            Some(receipt) => IcebergAttemptAccessRecipe::PreparedSource(receipt),
+            None => IcebergAttemptAccessRecipe::Original(IcebergAttemptTableAccess::freeze(
+                self.boundary.pinned_table_for_attempt(&name)?,
+            )),
         };
         Ok(mint.seal(Arc::new(IcebergAttemptAccessReacquirer {
             template: Arc::clone(&self.template),
@@ -1175,19 +1125,16 @@ impl ConnectorReadAttemptAccessSealer for IcebergAttemptAccessSealer {
     }
 }
 
-// A COW attempt borrows the ONE original access recipe through its source.
-// Ordinary attempts keep the original owned recipe and allocation behavior.
+// Attempt retries retain the original source access recipe.
 enum IcebergAttemptAccessRecipe {
     Original(IcebergAttemptTableAccess),
     PreparedSource(PreparedSourceAccess),
-    Cow(Arc<crate::typed_read::frozen_source::IcebergCowPendingReadSource>),
 }
 
 impl IcebergAttemptAccessRecipe {
     fn access(&self) -> &IcebergAttemptTableAccess {
         match self {
             Self::Original(access) => access,
-            Self::Cow(source) => source.access.as_ref(),
             Self::PreparedSource(receipt) => receipt.source.access.as_ref(),
         }
     }
@@ -1317,18 +1264,7 @@ impl ConnectorReadAttemptAccessReacquirer for IcebergAttemptAccessReacquirer {
                 self.name.clone(),
                 physical,
             ));
-            if let IcebergAttemptAccessRecipe::Cow(source) = &self.access {
-                use sha2::Digest;
-                let digest: [u8; 32] =
-                    sha2::Sha256::digest(source.original_source.payload()).into();
-                boundary
-                    .frozen_cow_sources
-                    .as_ref()
-                    .ok_or_else(|| corrupt("Iceberg COW retry lost its request source owner"))?
-                    .lock()
-                    .expect("request Iceberg COW source lock")
-                    .insert(digest, source.clone());
-            }
+
             if let IcebergAttemptAccessRecipe::PreparedSource(receipt) = &self.access {
                 boundary
                     .prepared_source_accesses
@@ -1897,82 +1833,6 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         }))
     }
 
-    type FrozenSource = Arc<crate::typed_read::frozen_source::IcebergCowPendingReadSource>;
-
-    fn adopt_frozen_source(
-        &self,
-        _session: &ConnectorSession,
-        owner: &novarocks_spi::connector::ConnectorProviderBindingKey,
-        source: &Self::FrozenSource,
-    ) -> Result<crate::typed_read::IcebergRuntimeRelation, ConnectorError> {
-        use sha2::Digest;
-        self.check_request_active()?;
-        if owner != &source.owner
-            || owner.instance_id != self.descriptor.instance_id
-            || owner.incarnation != self.incarnation
-        {
-            return Err(invalid(
-                "Iceberg COW source belongs to a different provider incarnation",
-            ));
-        }
-        let sources = self.frozen_cow_sources.as_ref().ok_or_else(|| {
-            invalid("Iceberg COW source adoption requires an admitted read request")
-        })?;
-        let snapshot = source.pinned.version_ordinal();
-        let schema = pinned_schema(source.metadata.as_ref(), Some(snapshot))?;
-        let name = SchemaTableName::try_new(source.pinned.namespace(), source.pinned.table())?;
-        let files = IcebergPinnedDataFileSet::try_new(source.pinned.files())?;
-        let mut columns = Vec::new();
-        for metadata in ALWAYS_BOUND_METADATA_COLUMNS
-            .into_iter()
-            .chain(ROW_LINEAGE_METADATA_COLUMNS)
-        {
-            let Ok(signed) = source
-                .signed_source
-                .scan_schema()
-                .field_with_name(metadata.column_name())
-            else {
-                if ALWAYS_BOUND_METADATA_COLUMNS.contains(&metadata) {
-                    return Err(corrupt(
-                        "Iceberg COW signed source lost an identity metadata field",
-                    ));
-                }
-                continue;
-            };
-            let column = pseudo_column_with_nullable(metadata, signed.is_nullable())?;
-            let authored =
-                crate::typed_read::schema_binding::metadata_target_field(&column, metadata)?;
-            if authored.data_type() != signed.data_type() {
-                return Err(corrupt(
-                    "Iceberg COW signed metadata type differs from the original field author",
-                ));
-            }
-            columns.push(column);
-        }
-        let digest: [u8; 32] = sha2::Sha256::digest(source.original_source.payload()).into();
-        let proof = crate::typed_read::cow_source_proof::IcebergCowSourceProof::try_new(
-            digest,
-            source.signed_base,
-            source.read_file.path.clone(),
-            columns,
-        )?;
-        let table = pinned_table_handle_with_schema_and_domain(
-            &name,
-            source.metadata.as_ref(),
-            Some(snapshot),
-            schema,
-            Some(files),
-            || Ok(Some(Arc::clone(source.read_file.read_domain()))),
-        )?
-        .with_frozen_cow_source(Some(proof))?;
-        // No SDK load, manifest walk, current-name rebind, or fresh observation.
-        sources
-            .lock()
-            .expect("request Iceberg COW source lock")
-            .insert(digest, source.clone());
-        Ok(crate::typed_read::IcebergRuntimeRelation::Table(table))
-    }
-
     fn get_table_handle(
         &self,
         _session: &ConnectorSession,
@@ -2186,30 +2046,22 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                         false,
                     ));
                 }
-                if let Some(source) = handle.frozen_cow_source() {
-                    for column in source.metadata_columns() {
+
+                for (name, column) in
+                    metadata_pseudo_columns(self.relation_has_row_lineage(handle)?)?
+                {
+                    columns.push((name.to_string(), column, true));
+                }
+                if let Some(mutation) = handle.mutation_metadata()? {
+                    for field in [mutation.spec_field(), mutation.partition_field()] {
                         columns.push((
-                            column.base_column_identity().name().to_string(),
-                            column.clone(),
+                            field.name.clone(),
+                            IcebergColumnHandle::base_column(field)?,
                             true,
                         ));
                     }
-                } else {
-                    for (name, column) in
-                        metadata_pseudo_columns(self.relation_has_row_lineage(handle)?)?
-                    {
-                        columns.push((name.to_string(), column, true));
-                    }
-                    if let Some(mutation) = handle.mutation_metadata()? {
-                        for field in [mutation.spec_field(), mutation.partition_field()] {
-                            columns.push((
-                                field.name.clone(),
-                                IcebergColumnHandle::base_column(field)?,
-                                true,
-                            ));
-                        }
-                    }
                 }
+
                 columns
             }
             crate::typed_read::IcebergRuntimeRelation::TableFunction(_) => {
@@ -2839,29 +2691,9 @@ impl IcebergTypedBoundary {
         constraint: &Constraint<IcebergColumnHandle>,
         dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
     ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
-        let schema = handle.parse_table_schema()?;
-        if let Some(source) = self.adopted_cow_source(handle)? {
-            self.check_request_active()?;
-            let read_file = source.read_file.as_ref().clone();
-            let partition_spec = read_file
-                .partition_spec_id
-                .map(|id| handle.parse_partition_spec(id))
-                .transpose()?;
-            validate_scalar_integer_manifest_facts(
-                handle.scalar_integer_domains(),
-                read_file.manifest.as_ref(),
-                partition_spec.as_ref(),
-                read_file.partition_values.as_ref(),
-            )?;
-            let planned = planned_data_file(
-                read_file,
-                &schema,
-                partition_spec.as_ref(),
-                dynamic_filter_columns,
-            )?;
-            self.check_request_active()?;
-            return Ok(vec![planned]);
-        }
+        // Keep the original schema validation before predicate pruning and I/O.
+        let _schema = handle.parse_table_schema()?;
+
         if handle.pinned_data_files().is_none()
             && handle
                 .effective_predicate()?

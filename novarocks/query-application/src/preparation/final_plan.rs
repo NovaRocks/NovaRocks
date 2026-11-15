@@ -554,9 +554,6 @@ impl<A> std::error::Error for FinalPlanCompletionFailure<A> {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FinalPlanCompletionError {
-    Governance {
-        message: Arc<str>,
-    },
     Cancelled {
         reason: Arc<str>,
     },
@@ -565,7 +562,7 @@ pub enum FinalPlanCompletionError {
     Compiler {
         message: Arc<str>,
     },
-    /// The original compiler domain cause, without reclassifying its fact.
+    /// The original typed domain cause, without reclassifying its fact.
     Source {
         source: novarocks_execution_contract::failure::SharedFailureCause,
     },
@@ -593,8 +590,7 @@ pub enum FinalPlanCompletionError {
 impl fmt::Display for FinalPlanCompletionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Governance { message }
-            | Self::Compiler { message }
+            Self::Compiler { message }
             | Self::FactSource { message }
             | Self::InvalidPlan { message }
             | Self::AccessCoverage { message } => formatter.write_str(message),
@@ -629,8 +625,11 @@ fn access_error(error: FinalPlanAccessError) -> FinalPlanCompletionError {
 }
 
 fn governance_error(error: novarocks_workload_control::WorkError) -> FinalPlanCompletionError {
-    FinalPlanCompletionError::Governance {
-        message: Arc::from(error.to_string()),
+    FinalPlanCompletionError::Source {
+        source: novarocks_execution_contract::failure::SharedFailureCause::from_static_detail(
+            error,
+            "final plan original workload operation refused",
+        ),
     }
 }
 
@@ -836,6 +835,68 @@ mod tests {
             SqlCompileControl::unbounded(),
             SqlCompileIntent::Query,
         )
+    }
+
+    #[tokio::test]
+    async fn cancelled_root_keeps_original_work_cause_through_final_plan_completion() {
+        use crate::cancellation::QueryCancellationView;
+        use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
+        use novarocks_execution_contract::failure::FailureEvidence;
+        use novarocks_workload_control::{CancellationReason, WorkError};
+
+        let source = Arc::new(NoFactSource {
+            calls: AtomicUsize::new(0),
+        });
+        let driver = FinalPlanCompletionDriver::new(source.clone());
+        let (root, scope) = scope();
+        let cancellation =
+            QueryCancellationView::governed(scope.cancellation().unwrap(), Some(5_000));
+        root.owner.cancel(CancellationReason::DeadlineExceeded);
+        let expected =
+            crate::session_outcome::cancellation_failure_input(cancellation.reason().unwrap());
+        let completed = driver.complete_for_test(values_request(), &scope).await;
+        let observed = match completed {
+            Err(failure) => {
+                let (error, taken) = failure.into_parts();
+                let taken_count = taken.len();
+                drop(taken);
+                match error {
+                    FinalPlanCompletionError::Source { source } => {
+                        let service = QueryServiceError::from_failure_cause(source.clone());
+                        let evidence = service
+                            .execution_failure()
+                            .map(|input| input.fact().evidence());
+                        let selected = service.reconcile_local_stop_observation(&cancellation);
+                        Some((taken_count, source, evidence, selected))
+                    }
+                    _ => None,
+                }
+            }
+            Ok(completed) => {
+                drop(completed);
+                None
+            }
+        };
+        let fact_calls = source.calls.load(Ordering::Relaxed);
+        // Retire the actual cancelled Root before asserting the completion
+        // contract. Its entry check must not launch CPU work or provider IO.
+        drop((driver, source, cancellation, scope));
+        // Both calls consume their Root fields, including the owner pin.
+        root.owner.complete_after_terminal_cancel_settled();
+        root.business.release();
+
+        let (taken_count, cause, evidence, selected) =
+            observed.expect("completion must retain the original workload cause");
+        assert_eq!(taken_count, 0);
+        assert_eq!(fact_calls, 0);
+        assert!(matches!(
+            cause.downcast_ref::<WorkError>(),
+            Some(WorkError::Cancelled(CancellationReason::DeadlineExceeded)),
+        ));
+        assert_eq!(evidence, Some(FailureEvidence::StopObservation));
+        assert_eq!(selected.kind(), QueryServiceErrorKind::Timeout);
+        assert_eq!(selected.execution_failure(), Some(&expected));
+        assert_eq!(selected.failure_cause(), Some(&cause));
     }
 
     #[tokio::test]

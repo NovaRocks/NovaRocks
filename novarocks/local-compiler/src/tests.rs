@@ -288,6 +288,24 @@ fn add_writer(
         })
         .collect::<Vec<_>>();
     let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
+    let projected_target_fields_0: Box<[novarocks_physical_plan::WriterTargetField]> =
+        Box::from([WriterTargetField {
+            storage_type: None,
+            projected: builder
+                .add_value(
+                    (integer()).clone(),
+                    novarocks_physical_plan::ValueOrigin::WriterDerived {
+                        writer_node: node,
+                        kind: novarocks_physical_plan::WriterDerivedKind::ProjectedInput,
+                    },
+                )
+                .unwrap(),
+            provider_name: "v".into(),
+            token,
+            input,
+            ty: integer(),
+            hidden: false,
+        }]);
     builder
         .add_row_consuming(
             node,
@@ -301,13 +319,7 @@ fn add_writer(
                     write_target_ordinal: ordinal,
                     input: Box::from([input]),
                     required_distribution: Distribution::Unconstrained,
-                    target_fields: Box::from([WriterTargetField {
-                        provider_name: "v".into(),
-                        token,
-                        input,
-                        ty: integer(),
-                        hidden: false,
-                    }]),
+                    target_fields: projected_target_fields_0,
                     output_schema: WriterRelationSchema {
                         revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
                         fields: fields.clone().into_boxed_slice(),

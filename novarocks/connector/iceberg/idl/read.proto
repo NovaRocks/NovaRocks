@@ -175,15 +175,6 @@ message IcebergReadDomain {
   map<int32, string> partition_type_jsons = 7;
 }
 
-// Proof of the original signed COW source, adopted by its read generation.
-// No manifest/delete/access capability is carried here.
-message IcebergCowSourceProof {
-  bytes source_digest = 1;
-  bytes signed_base = 2;
-  string data_file_path = 3;
-  repeated IcebergColumnHandle metadata_columns = 4;
-}
-
 message IcebergTableHandle {
   SchemaTableName schema_table_name = 1;
   optional int64 snapshot_id = 2;
@@ -201,7 +192,8 @@ message IcebergTableHandle {
   IcebergPinnedDataFileSet pinned_data_files = 14;
   optional IcebergReadDomain read_domain = 15;
   map<int32, string> scalar_integer_domains = 16;
-  optional IcebergCowSourceProof frozen_cow_source = 17;
+  reserved 17;
+  reserved "frozen_cow_source";
   map<int32, string> nominal_declarations = 18;
   optional string mutation_partition_type_json = 19;
 }

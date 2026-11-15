@@ -198,6 +198,83 @@ impl RootResultObserver {
     }
 }
 
+/// A bound read-only view of one attempt's already accepted pure failure.
+/// The cell cannot keep a permit, actor, Work or mailbox alive and never wakes.
+#[derive(Clone)]
+pub(crate) struct AcceptedAttemptFailureView {
+    activation: AttemptActivationIdentity,
+    cell: Arc<std::sync::Mutex<Option<Arc<crate::api::AcceptedAttemptFailure>>>>,
+}
+
+impl std::fmt::Debug for AcceptedAttemptFailureView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Formatting must not lock the cell or invoke payload formatting there.
+        formatter
+            .debug_struct("AcceptedAttemptFailureView")
+            .field("activation", &self.activation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AcceptedAttemptFailureView {
+    pub(crate) const fn activation(&self) -> AttemptActivationIdentity {
+        self.activation
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        activation: AttemptActivationIdentity,
+    ) -> Result<Option<crate::api::AcceptedAttemptFailure>, LogicalExecutionActorError> {
+        verify_actor_activation(self.activation, activation)?;
+        let snapshot = {
+            let cell = self
+                .cell
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cell.clone()
+        };
+        // Payload clone and any allocation happen after releasing the cell.
+        Ok(snapshot.map(|failure| (*failure).clone()))
+    }
+}
+
+#[derive(Debug)]
+struct AcceptedAttemptFailurePublisher {
+    view: AcceptedAttemptFailureView,
+}
+
+impl AcceptedAttemptFailurePublisher {
+    fn new(activation: AttemptActivationIdentity) -> Self {
+        Self {
+            view: AcceptedAttemptFailureView {
+                activation,
+                cell: Arc::new(std::sync::Mutex::new(None)),
+            },
+        }
+    }
+
+    fn view(&self) -> AcceptedAttemptFailureView {
+        self.view.clone()
+    }
+
+    fn publish(&self, input: &crate::execution_error::ExecutionFailureInput) {
+        let next = Arc::new(crate::api::AcceptedAttemptFailure {
+            activation: self.view.activation,
+            input: input.clone(),
+        });
+        let previous = {
+            let mut cell = self
+                .view
+                .cell
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cell.replace(next)
+        };
+        // Final payload destruction and allocator callbacks stay outside the lock.
+        drop(previous);
+    }
+}
+
 /// Coalesced, actor-local abandonment signal shared by every typestate form of
 /// one attempt authority. It uses constant memory and never waits for mailbox
 /// capacity from `Drop`.
@@ -230,11 +307,19 @@ fn abandon_on_drop(lifetime: &mut Option<Arc<PermitLifetime>>) {
 #[must_use = "attempt instantiation must report readiness, failure, or cancellation"]
 pub struct AttemptInstantiationPermit {
     capability: Option<AttemptCapability>,
+    accepted_failure: Option<AcceptedAttemptFailureView>,
     lifetime: Option<Arc<PermitLifetime>>,
     mailbox_liveness: Option<mpsc::Sender<ActorCommand>>,
 }
 
 impl AttemptInstantiationPermit {
+    pub(crate) fn accepted_failure_view(&self) -> AcceptedAttemptFailureView {
+        self.accepted_failure
+            .as_ref()
+            .expect("the original attempt retains its failure view")
+            .clone()
+    }
+
     pub fn identity(&self) -> AttemptActivationIdentity {
         identity_of(
             self.capability
@@ -247,6 +332,7 @@ impl AttemptInstantiationPermit {
     /// actor's activation transition.
     pub fn ready(mut self) -> AttemptReadinessReceipt {
         AttemptReadinessReceipt {
+            accepted_failure: self.accepted_failure.take(),
             capability: self.capability.take(),
             lifetime: self.lifetime.take(),
             mailbox_liveness: self.mailbox_liveness.take(),
@@ -305,11 +391,19 @@ impl Drop for AttemptInstantiationPermit {
 #[must_use = "attempt readiness must be consumed by its owning actor"]
 pub struct AttemptReadinessReceipt {
     capability: Option<AttemptCapability>,
+    accepted_failure: Option<AcceptedAttemptFailureView>,
     lifetime: Option<Arc<PermitLifetime>>,
     mailbox_liveness: Option<mpsc::Sender<ActorCommand>>,
 }
 
 impl AttemptReadinessReceipt {
+    pub(crate) fn accepted_failure_view(&self) -> AcceptedAttemptFailureView {
+        self.accepted_failure
+            .as_ref()
+            .expect("the original attempt retains its failure view")
+            .clone()
+    }
+
     pub fn identity(&self) -> AttemptActivationIdentity {
         identity_of(
             self.capability
@@ -352,6 +446,7 @@ impl Drop for AttemptReadinessReceipt {
 #[must_use = "a running attempt must report completion or failure"]
 pub struct RunningAttemptPermit {
     capability: Option<AttemptCapability>,
+    accepted_failure: Option<AcceptedAttemptFailureView>,
     lifetime: Option<Arc<PermitLifetime>>,
     mailbox_liveness: Option<mpsc::Sender<ActorCommand>>,
     authorization_limits: AttemptAuthorizationLimits,
@@ -471,6 +566,14 @@ impl RunningAttemptDriveAuthority {
 }
 
 impl RunningAttemptPermit {
+    #[cfg(test)]
+    pub(crate) fn accepted_failure_view(&self) -> AcceptedAttemptFailureView {
+        self.accepted_failure
+            .as_ref()
+            .expect("the original attempt retains its failure view")
+            .clone()
+    }
+
     pub fn identity(&self) -> AttemptActivationIdentity {
         identity_of(
             self.capability
@@ -484,8 +587,10 @@ impl RunningAttemptPermit {
         lifetime: Arc<PermitLifetime>,
         mailbox_liveness: mpsc::Sender<ActorCommand>,
         authorization_limits: AttemptAuthorizationLimits,
+        accepted_failure: AcceptedAttemptFailureView,
     ) -> Self {
         Self {
+            accepted_failure: Some(accepted_failure),
             capability: Some(capability),
             lifetime: Some(lifetime),
             mailbox_liveness: Some(mailbox_liveness),
@@ -744,6 +849,8 @@ impl RunningAttemptPermit {
             .mailbox_liveness
             .take()
             .expect("live running permit retains actor liveness");
+        // The original active owner already holds its independent pure view.
+        drop(self.accepted_failure.take());
         (capability, lifetime, mailbox_liveness)
     }
 }
@@ -1409,6 +1516,9 @@ struct AttemptLedgers {
     attempt_obligation: Option<Obligation>,
     active_resources: Option<ActiveReplacementResources>,
     pre_ready_observation: Option<PreReadyObservationSource>,
+    // A later preparation may choose another logical terminal cause. This
+    // original attempt's accepted diagnostic input stays with its own ledger.
+    accepted_failure: AcceptedAttemptFailurePublisher,
 }
 
 impl AttemptLedgers {
@@ -1704,6 +1814,7 @@ enum ActorCommand {
     Failed {
         permit: RunningAttemptPermit,
         error: Option<QueryExecutionError>,
+        original_failure: Option<crate::execution_error::ExecutionFailureInput>,
         reply: ActorReply<LogicalConclusion>,
     },
     DeliverRootSegment {
@@ -1977,6 +2088,7 @@ impl LogicalExecutionActor {
         request(&self.sender, |reply| ActorCommand::Failed {
             permit,
             error: None,
+            original_failure: None,
             reply,
         })
         .await
@@ -1990,9 +2102,24 @@ impl LogicalExecutionActor {
         permit: RunningAttemptPermit,
         error: QueryExecutionError,
     ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
+        let original_failure = error.execution_failure().cloned();
+        self.fail_attempt_preserving_original_failure(permit, error, original_failure)
+            .await
+    }
+
+    /// A later preparation verdict may end the logical execution while its
+    /// predecessor retains its own original attempt failure for diagnostics.
+    /// Both values are accepted by the same original terminal transaction.
+    pub(crate) async fn fail_attempt_preserving_original_failure(
+        &self,
+        permit: RunningAttemptPermit,
+        error: QueryExecutionError,
+        original_failure: Option<crate::execution_error::ExecutionFailureInput>,
+    ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
         request(&self.sender, |reply| ActorCommand::Failed {
             permit,
             error: Some(error),
+            original_failure,
             reply,
         })
         .await
@@ -2516,6 +2643,8 @@ pub(crate) fn spawn_logical_execution_actor(
             return Err(LogicalExecutionActorError::InvariantViolation);
         }
     };
+    let accepted_failure = AcceptedAttemptFailurePublisher::new(capability_identity);
+    let initial_failure_view = accepted_failure.view();
     let attempts = BTreeMap::from([(
         config.initial_execution,
         AttemptLedgers {
@@ -2530,6 +2659,7 @@ pub(crate) fn spawn_logical_execution_actor(
             attempt_obligation: Some(attempt_obligation),
             active_resources: None,
             pre_ready_observation: None,
+            accepted_failure,
         },
     )]);
     let clock = Arc::clone(&config.clock);
@@ -2576,6 +2706,7 @@ pub(crate) fn spawn_logical_execution_actor(
             join,
         },
         initial_attempt: AttemptInstantiationPermit {
+            accepted_failure: Some(initial_failure_view),
             capability: Some(capability),
             lifetime: Some(lifetime),
             mailbox_liveness: Some(sender),
@@ -2631,6 +2762,7 @@ async fn run_actor(
             revoke_all_establish_authority(&mut attempts);
             conclude_for_work_cancellation(
                 state,
+                &mut attempts,
                 replacement.as_ref(),
                 result_runtime.as_mut(),
                 &reason,
@@ -2718,6 +2850,7 @@ async fn run_actor(
             revoke_all_establish_authority(&mut attempts);
             conclude_for_work_cancellation(
                 state,
+                &mut attempts,
                 replacement.as_ref(),
                 result_runtime.as_mut(),
                 &reason,
@@ -2752,6 +2885,7 @@ async fn run_actor(
             }
             conclude_result_failure(
                 state,
+                &mut attempts,
                 runtime,
                 "the root attempt could not be driven to success",
                 result_actor_failure(error),
@@ -2841,6 +2975,7 @@ async fn run_actor(
                 revoke_all_establish_authority(&mut attempts);
                 conclude_for_work_cancellation(
                     state,
+                    &mut attempts,
                     replacement.as_ref(),
                     result_runtime.as_mut(),
                     &reason,
@@ -3638,8 +3773,10 @@ fn try_activate_qualified_replacement(
                 })
             }
             .map(|ledgers| {
+                let accepted_failure = ledgers.accepted_failure.view();
                 attempts.insert(active.identity.replacement(), ledgers);
                 Ok(AttemptInstantiationPermit {
+                    accepted_failure: Some(accepted_failure),
                     capability: Some(capability),
                     lifetime: Some(Arc::clone(&pending_activation.lifetime)),
                     mailbox_liveness: Some(pending_activation.mailbox_liveness.clone()),
@@ -3723,6 +3860,7 @@ fn conclude_failed(state: &mut LogicalExecutionState, reason: impl Into<String>)
 /// cannot be replaced by a later protocol rejection.
 fn conclude_result_failure(
     state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     runtime: &mut ResultRuntime,
     context: &'static str,
     error: QueryExecutionError,
@@ -3730,10 +3868,28 @@ fn conclude_result_failure(
     if state.conclusion().is_some() {
         return;
     }
+    let activation = current_attempt_activation(state);
     conclude_failed(state, context);
     if state.conclusion() == Some(LogicalConclusion::Failed) {
+        if let Some(activation) = activation {
+            remember_accepted_attempt_failure(attempts, activation, &error);
+        }
         runtime.accepted_error = Some(error);
     }
+}
+
+// Capture the original capability before a terminal transition retires it.
+// Replacing is a logical preparation phase, not the failed predecessor's source.
+fn current_attempt_activation(state: &LogicalExecutionState) -> Option<AttemptActivationIdentity> {
+    let execution = match state.phase() {
+        ExecutionPhase::Instantiating { execution, .. }
+        | ExecutionPhase::Running { execution, .. } => execution,
+        _ => return None,
+    };
+    state
+        .attempt_capability(execution)
+        .ok()
+        .map(|capability| identity_of(&capability))
 }
 
 fn result_protocol_failure(detail: &'static str) -> QueryExecutionError {
@@ -3911,7 +4067,8 @@ fn settle_finish_establish_readiness(
     let Some(finish) = runtime.finish_waiter.as_ref() else {
         return true;
     };
-    let execution = finish.permit.identity().execution();
+    let activation = finish.permit.identity();
+    let execution = activation.execution();
     let result = attempts
         .get_mut(&execution)
         .ok_or(EstablishIssueError::UnknownParticipation)
@@ -3927,13 +4084,15 @@ fn settle_finish_establish_readiness(
             conclude_failed(state, "Establish settlement failed before success EOF");
             if state.conclusion() == Some(LogicalConclusion::Failed) {
                 use novarocks_execution_contract::failure::FailureProjection;
-                runtime.accepted_error = Some(QueryExecutionError::from_execution(
+                let error = QueryExecutionError::from_execution(
                     crate::execution_error::ExecutionFailureInput::new(
                         error.failure_fact(),
                         error.safe_detail(),
                         crate::execution_error::ExecutionFailureSite::Coordinator,
                     ),
-                ));
+                );
+                remember_accepted_attempt_failure(attempts, activation, &error);
+                runtime.accepted_error = Some(error);
             }
             false
         }
@@ -4028,6 +4187,7 @@ fn apply_result_capacity(
             }
             conclude_result_failure(
                 state,
+                attempts,
                 runtime,
                 "no result delivery slot could be reserved",
                 error,
@@ -4063,6 +4223,7 @@ fn apply_result_capacity(
                     drop(pending.delivery);
                     conclude_result_failure(
                         state,
+                        attempts,
                         runtime,
                         "a reserved result delivery slot could not be started",
                         result_actor_failure(ActorStateError::Delivery(error.error()).into()),
@@ -4085,7 +4246,9 @@ fn apply_result_capacity(
                 if runtime.internal.is_some() {
                     revoke_all_establish_authority(attempts);
                 }
-                let _ = state.fail_result_delivery(permit);
+                if state.fail_result_delivery(permit).is_ok() {
+                    remember_accepted_attempt_failure(attempts, pending.activation, &error);
+                }
                 runtime.accepted_error = Some(error);
                 reply_result_failure(state, pending.reply);
                 return;
@@ -4178,6 +4341,7 @@ fn apply_result_receipt(
         return;
     };
     let was_unconcluded = state.conclusion().is_none();
+    let schema_activation = current_attempt_activation(state);
     let disposition = match outcome {
         ResultReceiptOutcome::SourceExited(source) => {
             internal_ready::source_exited(state, attempts, Some(runtime), source);
@@ -4191,6 +4355,9 @@ fn apply_result_receipt(
                 }
                 conclude_with(state, replacement, LogicalConclusion::Failed);
                 if was_unconcluded && state.conclusion() == Some(LogicalConclusion::Failed) {
+                    if let Some(activation) = schema_activation {
+                        remember_accepted_attempt_failure(attempts, activation, &error);
+                    }
                     runtime.accepted_error = Some(error);
                 }
             } else {
@@ -4223,6 +4390,12 @@ fn apply_result_receipt(
     let Some(in_flight) = runtime.in_flight.take() else {
         return;
     };
+    let receipt_activation = match &in_flight {
+        InFlightResult::Schema { permit, .. } => state.attempt_capability(permit.execution()).ok(),
+        InFlightResult::Batch { permit, .. } => state.attempt_capability(permit.execution()).ok(),
+        InFlightResult::End { .. } | InFlightResult::InternalEnd(_) => None,
+    }
+    .map(|capability| identity_of(&capability));
     let mut failure = result_receipt_failure(disposition.clone());
     let completed = failure.is_none();
     // Settle the original state transition before installing a failure or
@@ -4291,6 +4464,9 @@ fn apply_result_receipt(
         && state.conclusion() == Some(LogicalConclusion::Failed)
         && let Some(error) = failure
     {
+        if let Some(activation) = receipt_activation {
+            remember_accepted_attempt_failure(attempts, activation, &error);
+        }
         runtime.accepted_error = Some(error);
     }
     if let Some((reply, delivered)) = reply {
@@ -4477,11 +4653,13 @@ fn settle_failed_in_flight_result(
 
 fn conclude_for_work_cancellation(
     state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     replacement: Option<&ReplacementRuntime>,
     runtime: Option<&mut ResultRuntime>,
     reason: &CancellationReason,
 ) {
     let was_unconcluded = state.conclusion().is_none();
+    let activation = current_attempt_activation(state);
     let conclusion = match reason {
         CancellationReason::DeadlineExceeded
         | CancellationReason::FrontendDrainDeadlineExceeded => LogicalConclusion::Failed,
@@ -4492,7 +4670,7 @@ fn conclude_for_work_cancellation(
         && state.conclusion() == Some(conclusion)
         && let Some(runtime) = runtime
     {
-        runtime.accepted_error = Some(match reason {
+        let error = match reason {
             CancellationReason::FrontendDrainDeadlineExceeded => {
                 QueryExecutionError::from_execution(
                     crate::session_outcome::governed_cancellation_failure_input(
@@ -4514,7 +4692,11 @@ fn conclude_for_work_cancellation(
                 crate::execution_error::QueryFailureReason::Cancelled,
                 "logical execution was cancelled before success EOF",
             ),
-        });
+        };
+        if let Some(activation) = activation {
+            remember_accepted_attempt_failure(attempts, activation, &error);
+        }
+        runtime.accepted_error = Some(error);
     }
 }
 
@@ -4654,6 +4836,7 @@ fn handle_command(
             }
         }
         ActorCommand::Activate { readiness, reply } => {
+            let accepted_failure = readiness.accepted_failure_view();
             let (capability, lifetime, mailbox_liveness) = readiness.into_parts();
             match validate_attempt_command(state, &capability).and_then(|()| {
                 let activation = identity_of(&capability);
@@ -4669,8 +4852,13 @@ fn handle_command(
                 Ok(limits)
             }) {
                 Ok(limits) => {
-                    let running =
-                        RunningAttemptPermit::new(capability, lifetime, mailbox_liveness, limits);
+                    let running = RunningAttemptPermit::new(
+                        capability,
+                        lifetime,
+                        mailbox_liveness,
+                        limits,
+                        accepted_failure,
+                    );
                     if let Err(response) = reply.send(Ok(running)) {
                         drop(response);
                     }
@@ -4686,11 +4874,15 @@ fn handle_command(
             error,
             reply,
         } => {
+            let activation = permit.identity();
             settle_terminal(
                 state,
                 permit.into_parts(),
                 LogicalConclusion::Failed,
                 || {
+                    if let Some(error) = error.as_ref() {
+                        remember_accepted_attempt_failure(attempts, activation, error);
+                    }
                     if let (Some(runtime), Some(error)) = (result_runtime, error) {
                         runtime.accepted_error = Some(error);
                     }
@@ -4735,9 +4927,11 @@ fn handle_command(
         ActorCommand::Failed {
             permit,
             error,
+            original_failure,
             reply,
         } => {
-            let execution = permit.identity().execution();
+            let activation = permit.identity();
+            let execution = activation.execution();
             let parts = permit.into_parts();
             if result_runtime
                 .as_ref()
@@ -4753,6 +4947,9 @@ fn handle_command(
                 || {
                     if let Some(attempt) = attempts.get_mut(&execution) {
                         attempt.establish.revoke_issue_authority();
+                    }
+                    if let Some(input) = original_failure.as_ref() {
+                        remember_accepted_attempt_input(attempts, activation, input);
                     }
                     if let (Some(runtime), Some(error)) = (result_runtime.as_deref_mut(), error) {
                         runtime.accepted_error = Some(error);
@@ -4799,6 +4996,7 @@ fn handle_command(
                 drop(segment);
                 conclude_result_failure(
                     state,
+                    attempts,
                     runtime,
                     "a root segment arrived outside its delivery gate",
                     result_protocol_failure("a root segment arrived outside its delivery gate"),
@@ -4828,6 +5026,7 @@ fn handle_command(
                 drop(segment);
                 conclude_result_failure(
                     state,
+                    attempts,
                     runtime,
                     "a root segment sequence overflowed",
                     result_protocol_failure("a root segment sequence overflowed"),
@@ -4846,6 +5045,7 @@ fn handle_command(
                 drop(segment);
                 conclude_result_failure(
                     state,
+                    attempts,
                     runtime,
                     "a root segment does not match the row carrier this result declared",
                     result_protocol_failure(
@@ -4869,6 +5069,7 @@ fn handle_command(
                     }
                     conclude_result_failure(
                         state,
+                        attempts,
                         runtime,
                         "a root segment could not be prepared for delivery",
                         error,
@@ -4885,6 +5086,7 @@ fn handle_command(
                 drop(delivery);
                 conclude_result_failure(
                     state,
+                    attempts,
                     runtime,
                     "schema delivery could not be started",
                     result_actor_failure(error),
@@ -4940,6 +5142,7 @@ fn handle_command(
                     }
                     conclude_result_failure(
                         state,
+                        attempts,
                         runtime,
                         "the delivery gate was closed while its activation was still current",
                         result_protocol_failure(
@@ -4981,6 +5184,7 @@ fn handle_command(
                 let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
                 return;
             }
+            remember_accepted_attempt_failure(attempts, activation, &error);
             runtime.attempt_error = Some(AttemptResultFailure { activation, error });
             if runtime.internal.is_some() {
                 runtime.attempt_decision_pending = Some(activation);
@@ -5182,6 +5386,7 @@ fn handle_command(
                     revoke_all_establish_authority(attempts);
                     conclude_for_work_cancellation(
                         state,
+                        attempts,
                         replacement.as_ref(),
                         result_runtime.as_deref_mut(),
                         &reason,
@@ -5243,6 +5448,7 @@ fn handle_command(
                 revoke_all_establish_authority(attempts);
                 conclude_for_work_cancellation(
                     state,
+                    attempts,
                     replacement.as_ref(),
                     result_runtime.as_deref_mut(),
                     &reason,
@@ -5308,18 +5514,28 @@ fn handle_command(
                     if state
                         .conclude(&capability, LogicalConclusion::Failed)
                         .is_ok()
-                        && let (Some(runtime), Some(error)) = (result_runtime, terminal_error)
                     {
-                        runtime.accepted_error = Some(error);
+                        if let Some(error) = terminal_error.as_ref() {
+                            remember_accepted_attempt_failure(attempts, activation, error);
+                        }
+                        if let (Some(runtime), Some(error)) = (result_runtime, terminal_error) {
+                            runtime.accepted_error = Some(error);
+                        }
                     }
                     lifetime.settle();
                     let _ = reply.send(Err(error.into()));
                     return;
                 }
             };
+            if result_runtime.is_none()
+                && let Some(error) = terminal_error.as_ref()
+            {
+                remember_accepted_attempt_failure(attempts, activation, error);
+            }
             if let Some(runtime) = result_runtime.as_deref_mut() {
                 internal_ready::retire(runtime, activation);
                 if let Some(error) = terminal_error {
+                    remember_accepted_attempt_failure(attempts, activation, &error);
                     runtime.attempt_error = Some(AttemptResultFailure { activation, error });
                 }
                 runtime.root_success = None;
@@ -5529,6 +5745,7 @@ fn handle_command(
                     if let Some(runtime) = result_runtime {
                         conclude_result_failure(
                             state,
+                            attempts,
                             runtime,
                             "settling this attempt's admission issue failed",
                             result_actor_failure(error.into()),
@@ -5724,6 +5941,7 @@ fn new_attempt_ledgers(
         attempt_obligation: Some(attempt_obligation),
         active_resources,
         pre_ready_observation: None,
+        accepted_failure: AcceptedAttemptFailurePublisher::new(activation),
     })
 }
 
@@ -5960,6 +6178,28 @@ fn verify_running_activation(
     Ok(())
 }
 
+fn remember_accepted_attempt_failure(
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
+    activation: AttemptActivationIdentity,
+    error: &QueryExecutionError,
+) {
+    if let Some(input) = error.execution_failure() {
+        remember_accepted_attempt_input(attempts, activation, input);
+    }
+}
+
+fn remember_accepted_attempt_input(
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
+    activation: AttemptActivationIdentity,
+    input: &crate::execution_error::ExecutionFailureInput,
+) {
+    if let Some(attempt) = attempts.get_mut(&activation.execution())
+        && attempt.activation == activation
+    {
+        attempt.accepted_failure.publish(input);
+    }
+}
+
 fn apply_root_status_observation(
     state: &mut LogicalExecutionState,
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
@@ -6031,6 +6271,7 @@ fn apply_root_status_observation(
             return;
         }
         if let RootTerminalFailure::Authoritative(error) = terminal_failure {
+            remember_accepted_attempt_failure(attempts, activation, &error);
             runtime.attempt_error = Some(AttemptResultFailure {
                 activation,
                 error: *error,
@@ -6090,6 +6331,7 @@ fn apply_root_status_observation(
     if terminal_state {
         let cause_pending = matches!(&terminal_failure, RootTerminalFailure::Pending);
         if let RootTerminalFailure::Authoritative(error) = terminal_failure {
+            remember_accepted_attempt_failure(attempts, activation, &error);
             runtime.attempt_error = Some(AttemptResultFailure {
                 activation,
                 error: *error,
@@ -11375,10 +11617,35 @@ mod tests {
                     process: BackendProcessId::new_v7(),
                 },
             ));
+            let original_activation = running.identity();
+            let accepted_view = running.accepted_failure_view();
+            let original_lifetime = Arc::downgrade(running.lifetime.as_ref().unwrap());
+            let before_acceptance = accepted_view.snapshot(original_activation).unwrap();
+            let original_input = original.execution_failure().unwrap();
+            let earlier = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+                original_input.fact(),
+                SafeDetail::truncating("the same original actor's earlier accepted detail"),
+                original_input.site(),
+            ));
+            running
+                .freeze_result_attempt_failure(earlier.clone())
+                .await
+                .unwrap();
+            let earlier_snapshot = accepted_view.snapshot(original_activation).unwrap();
             running
                 .freeze_result_attempt_failure(original.clone())
                 .await
                 .unwrap();
+            let accepted = accepted_view
+                .snapshot(original_activation)
+                .unwrap()
+                .map(|failure| (failure.activation, failure.input));
+            let foreign_activation = AttemptActivationIdentity::from_parts(
+                original_activation.actor().get(),
+                first,
+                original_activation.generation() + 1,
+            );
+            let foreign = accepted_view.snapshot(foreign_activation);
             let qualification = actor
                 .begin_replacement_with_error(
                     running,
@@ -11390,6 +11657,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let retained_during_replacement = accepted_view
+                .snapshot(original_activation)
+                .unwrap()
+                .map(|failure| (failure.activation, failure.input));
+            let mut successor_failure = None;
             let submission = submissions.lock().unwrap().pop().unwrap();
             let mut observed_failure = None;
             if outcome == 0 {
@@ -11413,6 +11685,10 @@ mod tests {
                 let successor = actor
                     .activate(activation.await.unwrap().ready())
                     .await
+                    .unwrap();
+                successor_failure = successor
+                    .accepted_failure_view()
+                    .snapshot(successor.identity())
                     .unwrap();
                 if outcome == 1 {
                     actor.fail_attempt(successor).await.unwrap();
@@ -11456,6 +11732,37 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), scope.wait_released())
                 .await
                 .expect("the original work scope releases after actor exit");
+            // The view remains readable after actual actor/Work exit. It must
+            // not retain PermitLifetime, a mailbox or the original Root.
+            let after_actor_exit = accepted_view
+                .snapshot(original_activation)
+                .unwrap()
+                .map(|failure| (failure.activation, failure.input));
+            assert!(original_lifetime.upgrade().is_none());
+            // Assert the metadata only after the original actor and Work exit.
+            assert!(before_acceptance.is_none());
+            assert_eq!(
+                earlier_snapshot.as_ref().map(|failure| &failure.input),
+                earlier.execution_failure()
+            );
+            // The same serialized author may update its accepted pure input;
+            // the view is not a first-Some latch or a OnceLock.
+            assert_ne!(
+                earlier_snapshot.as_ref().map(|failure| &failure.input),
+                original.execution_failure()
+            );
+            let expected = Some((
+                original_activation,
+                original.execution_failure().unwrap().clone(),
+            ));
+            assert_eq!(accepted, expected);
+            assert_eq!(retained_during_replacement, expected);
+            assert_eq!(after_actor_exit, expected);
+            assert!(matches!(
+                foreign,
+                Err(LogicalExecutionActorError::StaleAuthority)
+            ));
+            assert!(successor_failure.is_none());
             if outcome == 0 {
                 assert_eq!(observed_failure, Some(original));
             } else if outcome == 1 {
@@ -12187,6 +12494,7 @@ mod tests {
                 attempt_obligation: None,
                 active_resources: None,
                 pre_ready_observation: None,
+                accepted_failure: AcceptedAttemptFailurePublisher::new(activation),
             }
         };
         let mut attempts = BTreeMap::from([
@@ -12938,6 +13246,11 @@ mod tests {
                 establish_per_participation: config.max_establish_authorizations_per_participation,
                 abort_per_participation: config.max_abort_authorizations_per_participation,
             },
+            attempts
+                .get(&activation.execution())
+                .unwrap()
+                .accepted_failure
+                .view(),
         );
         let mut establish_error = None;
         let mut stand_down_error = None;

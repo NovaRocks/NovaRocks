@@ -750,12 +750,18 @@ fn change_program() -> Arc<LocalProgram> {
                     ChangeEventSpec {
                         predicate: Some(flag),
                         effect: ConnectorRowMutationEffect::Delete,
-                        assignments: Box::from([(k_out, Some(delete_k)), (v_out, None)]),
+                        assignments: Box::from([
+                            novarocks_physical_plan::ChangeAssignment::exact(k_out, Some(delete_k)),
+                            novarocks_physical_plan::ChangeAssignment::exact(v_out, None),
+                        ]),
                     },
                     ChangeEventSpec {
                         predicate: None,
                         effect: ConnectorRowMutationEffect::Insert,
-                        assignments: Box::from([(k_out, Some(insert_k)), (v_out, Some(insert_v))]),
+                        assignments: Box::from([
+                            novarocks_physical_plan::ChangeAssignment::exact(k_out, Some(insert_k)),
+                            novarocks_physical_plan::ChangeAssignment::exact(v_out, Some(insert_v)),
+                        ]),
                     },
                 ]),
                 effect_output: effect,
@@ -885,6 +891,384 @@ fn compiled_change_event_steps_keep_one_input_until_each_event_is_delivered() {
     drop(operator);
     drop(factory);
     assert_eq!(tracker.current(), 0);
+}
+
+fn nested_change_program(
+    children: Vec<Option<i64>>,
+    parents: Vec<bool>,
+    selected: Vec<bool>,
+) -> Arc<LocalProgram> {
+    use arrow::{array::StructArray, buffer::NullBuffer};
+    assert_eq!(children.len(), parents.len());
+    assert_eq!(children.len(), selected.len());
+    let array = StructArray::try_new(
+        vec![Field::new("f", DataType::Int64, true)].into(),
+        vec![Arc::new(Int64Array::from(children))],
+        Some(NullBuffer::from(parents)),
+    )
+    .unwrap();
+    let source_ty = FunctionValueType::new(array.data_type().clone(), true);
+    let target_ty = FunctionValueType::new(
+        DataType::Struct(vec![Field::new("f", DataType::Int64, false)].into()),
+        true,
+    );
+    let pool = ConstantPool::try_new(
+        Arc::new(source_ty.try_to_field("nullable-source").unwrap()),
+        source_ty.clone(),
+        array.to_data(),
+        constant_policy(),
+        CompilePhase::Validate,
+        &FixtureControl,
+    )
+    .unwrap();
+    let pool_id = ConstantPoolId::new(903);
+    let mut constants = ConstantPools::empty();
+    constants.insert(pool_id, pool).unwrap();
+    let mut builder = FragmentBuilder::new(FragmentId::new(65));
+    let source = NodeId::new(0);
+    let expand = NodeId::new(1);
+    let value = node_output(&mut builder, source, 0, source_ty.clone());
+    let flag = node_output(&mut builder, source, 1, boolean(false));
+    let cells = selected
+        .iter()
+        .enumerate()
+        .map(|(row, selected)| {
+            vec![
+                builder
+                    .add_expression(
+                        source,
+                        source_ty.clone(),
+                        ExprKind::Constant(ConstantReference {
+                            pool: pool_id,
+                            ordinal: u32::try_from(row).unwrap(),
+                        }),
+                    )
+                    .unwrap(),
+                builder
+                    .add_expression(
+                        source,
+                        boolean(false),
+                        ExprKind::Literal(LiteralValue::Boolean(*selected)),
+                    )
+                    .unwrap(),
+            ]
+            .into_boxed_slice()
+        })
+        .collect::<Vec<_>>();
+    builder
+        .add_values(source, cells.into_boxed_slice(), Box::from([value, flag]))
+        .unwrap();
+    let predicate = builder
+        .add_expression(expand, boolean(false), ExprKind::Value(flag))
+        .unwrap();
+    let assignment = builder
+        .add_expression(expand, source_ty, ExprKind::Value(value))
+        .unwrap();
+    let output = node_output(&mut builder, expand, 0, target_ty);
+    let effect = node_output(
+        &mut builder,
+        expand,
+        1,
+        FunctionValueType::new(DataType::Int8, false),
+    );
+    builder
+        .add_row_rewriting(
+            expand,
+            source,
+            None,
+            Box::from([output, effect]),
+            NodeKind::ChangeEventExpand {
+                events: Box::from([ChangeEventSpec {
+                    predicate: Some(predicate),
+                    effect: ConnectorRowMutationEffect::Insert,
+                    assignments: Box::from([novarocks_physical_plan::ChangeAssignment::exact(
+                        output,
+                        Some(assignment),
+                    )]),
+                }]),
+                effect_output: effect,
+            },
+        )
+        .unwrap();
+    compile(package(builder, expand, constants, 1), 1)
+}
+
+// The existing whole-pipeline fixture projects failures to String. Drive the
+// real compiled processor here to keep the original Data fact inspectable.
+fn run_nested_change(program: Arc<LocalProgram>) -> crate::runtime::task::ExecutionResult<Chunk> {
+    use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
+        input::RawInput,
+        operator_factory::OperatorFactory,
+        step::InputResult,
+    };
+    use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeState};
+    let runtime = RuntimeState::default();
+    let control = runtime.error_state();
+    let tracker = MemTracker::new_root("nested change-event target obligation");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let input = super::family_fixture::paid_input(&program, &tracker);
+    let factory = CompiledChangeEventProcessorFactory::try_new(
+        program,
+        ProgramNodeId::new(1),
+        control.clone(),
+    )?;
+    let mut operator = factory.create(1, 0);
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker,
+        control.clone(),
+    ));
+    operator.prepare()?;
+    operator.bind_runtime_state(&runtime)?;
+    let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = DriverStep::new(&control, &mut turn, &mut conversions);
+    let step = operator.as_mut();
+    assert!(matches!(
+        step.try_push(&mut ctx, RawInput::for_test(input)),
+        InputResult::Accepted(Ok(_))
+    ));
+    let installed = step.drive(&mut ctx)?;
+    assert!(installed.output.is_none());
+    step.finish(&mut ctx)?;
+    let output = step.drive(&mut ctx)?.output.expect("one selected event");
+    assert!(matches!(step.drive(&mut ctx)?.next, NextStep::Finished));
+    Ok(output)
+}
+
+#[test]
+fn compiled_change_required_nested_null_preserves_data_and_original_selected_row() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    // Row 0 is an unselected NULL; the selected NULL is original input row 2,
+    // not row 1 of the compact assignment result.
+    let program = nested_change_program(
+        vec![None, Some(7), None],
+        vec![true, true, true],
+        vec![false, true, true],
+    );
+    let error = run_nested_change(program).expect_err("active required child is NULL");
+    assert_eq!(error.failure_fact().class(), FailureClass::Data);
+    assert_eq!(error.failure_fact().reason().code(), 498);
+    assert!(error.detail().contains(".f'"), "{error}");
+    assert!(error.detail().contains("column=0"), "{error}");
+    assert!(error.detail().contains("row=Some(2)"), "{error}");
+}
+
+#[test]
+fn compiled_change_nullable_source_constructs_exact_target_and_masks_null_parent() {
+    use arrow::array::StructArray;
+    let program = nested_change_program(vec![Some(7), None], vec![true, false], vec![true, true]);
+    let output = run_nested_change(program).expect("present child and NULL parent are legal");
+    assert_eq!(output.len(), 2);
+    let values = output.columns()[0]
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert_eq!(
+        values.data_type(),
+        &DataType::Struct(vec![Field::new("f", DataType::Int64, false)].into())
+    );
+    assert!(values.is_valid(0));
+    assert!(values.is_null(1));
+    let child = values
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(child.value(0), 7);
+    assert_eq!(child.null_count(), 0, "required target carrier is legal");
+    let effects = output.columns()[1]
+        .as_any()
+        .downcast_ref::<Int8Array>()
+        .unwrap();
+    assert!(
+        effects
+            .values()
+            .iter()
+            .all(|effect| *effect == ConnectorRowMutationEffect::Insert as i8)
+    );
+}
+
+fn licensed_change_program(
+    children: Vec<Option<[u8; 4]>>,
+    parents: Vec<bool>,
+    selected: Vec<bool>,
+    root_required: bool,
+) -> Arc<LocalProgram> {
+    use arrow::{array::StructArray, buffer::NullBuffer};
+    assert_eq!(children.len(), parents.len());
+    assert_eq!(children.len(), selected.len());
+    let array = StructArray::try_new(
+        vec![Field::new("f", DataType::FixedSizeBinary(4), true)].into(),
+        vec![Arc::new(
+            arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                children.into_iter(),
+                4,
+            )
+            .unwrap(),
+        )],
+        Some(NullBuffer::from(parents)),
+    )
+    .unwrap();
+    let source_ty = FunctionValueType::new(array.data_type().clone(), true);
+    let target_ty = FunctionValueType::new(
+        DataType::Struct(vec![Field::new("f", DataType::Binary, false)].into()),
+        true,
+    );
+    let pool = ConstantPool::try_new(
+        Arc::new(source_ty.try_to_field("nullable-source").unwrap()),
+        source_ty.clone(),
+        array.to_data(),
+        constant_policy(),
+        CompilePhase::Validate,
+        &FixtureControl,
+    )
+    .unwrap();
+    let pool_id = ConstantPoolId::new(903);
+    let mut constants = ConstantPools::empty();
+    constants.insert(pool_id, pool).unwrap();
+    let mut builder = FragmentBuilder::new(FragmentId::new(65));
+    let source = NodeId::new(0);
+    let expand = NodeId::new(1);
+    let value = node_output(&mut builder, source, 0, source_ty.clone());
+    let flag = node_output(&mut builder, source, 1, boolean(false));
+    let cells = selected
+        .iter()
+        .enumerate()
+        .map(|(row, selected)| {
+            vec![
+                builder
+                    .add_expression(
+                        source,
+                        source_ty.clone(),
+                        ExprKind::Constant(ConstantReference {
+                            pool: pool_id,
+                            ordinal: u32::try_from(row).unwrap(),
+                        }),
+                    )
+                    .unwrap(),
+                builder
+                    .add_expression(
+                        source,
+                        boolean(false),
+                        ExprKind::Literal(LiteralValue::Boolean(*selected)),
+                    )
+                    .unwrap(),
+            ]
+            .into_boxed_slice()
+        })
+        .collect::<Vec<_>>();
+    builder
+        .add_values(source, cells.into_boxed_slice(), Box::from([value, flag]))
+        .unwrap();
+    let predicate = builder
+        .add_expression(expand, boolean(false), ExprKind::Value(flag))
+        .unwrap();
+    let assignment = builder
+        .add_expression(expand, source_ty, ExprKind::Value(value))
+        .unwrap();
+    let input = FunctionValueType::new(target_ty.data_type().clone(), !root_required);
+    let storage = FunctionValueType::new(
+        DataType::Struct(vec![Field::new("f", DataType::FixedSizeBinary(8), false)].into()),
+        !root_required,
+    );
+    let output = node_output(&mut builder, expand, 0, target_ty);
+    let effect = node_output(
+        &mut builder,
+        expand,
+        1,
+        FunctionValueType::new(DataType::Int8, false),
+    );
+    builder
+        .add_row_rewriting(
+            expand,
+            source,
+            None,
+            Box::from([output, effect]),
+            NodeKind::ChangeEventExpand {
+                events: Box::from([ChangeEventSpec {
+                    predicate: Some(predicate),
+                    effect: ConnectorRowMutationEffect::Insert,
+                    assignments: Box::from([novarocks_physical_plan::ChangeAssignment {
+                        output,
+                        expression: Some(assignment),
+                        write_input: Some(novarocks_type_contract::WriteInputDeclaration {
+                            input,
+                            storage: Some(storage),
+                        }),
+                    }]),
+                }]),
+                effect_output: effect,
+            },
+        )
+        .unwrap();
+    compile(package(builder, expand, constants, 1), 1)
+}
+
+#[test]
+fn licensed_change_materializes_only_selected_values_and_keeps_original_data_row() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let program = licensed_change_program(
+        vec![None, Some([0, 255, 128, 1]), None],
+        vec![true, true, true],
+        vec![false, true, true],
+        false,
+    );
+    let error = run_nested_change(program).expect_err("selected required NULL");
+    assert_eq!(error.failure_fact().class(), FailureClass::Data);
+    assert_eq!(error.failure_fact().reason().code(), 498);
+    assert!(error.detail().contains(".f"), "{error}");
+    assert!(error.detail().contains("row=Some(2)"), "{error}");
+}
+
+#[test]
+fn licensed_change_keeps_non_utf8_bytes_and_legal_null_parent() {
+    let program = licensed_change_program(
+        vec![Some([0, 255, 128, 1]), None],
+        vec![true, false],
+        vec![true, true],
+        false,
+    );
+    let output = run_nested_change(program).expect("legal parent masking");
+    let outer = output.columns()[0]
+        .as_any()
+        .downcast_ref::<arrow::array::StructArray>()
+        .unwrap();
+    assert!(outer.is_valid(0));
+    assert!(outer.is_null(1));
+    let bytes = outer
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::BinaryArray>()
+        .unwrap();
+    assert_eq!(bytes.value(0), &[0, 255, 128, 1]);
+    assert_eq!(bytes.null_count(), 0);
+    assert!(!outer.fields()[0].is_nullable());
+}
+
+#[test]
+fn licensed_change_strict_assignment_root_is_independent_of_nullable_global_output() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let program = licensed_change_program(
+        vec![None, Some([0, 255, 128, 1])],
+        vec![false, true],
+        vec![false, true],
+        true,
+    );
+    let output =
+        run_nested_change(program).expect("unselected NULL root has no assignment obligation");
+    assert_eq!(output.len(), 1);
+    let program = licensed_change_program(
+        vec![Some([0, 255, 128, 1]), None],
+        vec![true, false],
+        vec![true, true],
+        true,
+    );
+    let error = run_nested_change(program)
+        .expect_err("selected NULL root violates W despite nullable global slot");
+    assert_eq!(error.failure_fact().class(), FailureClass::Data);
+    assert_eq!(error.failure_fact().reason().code(), 498);
+    assert!(error.detail().contains("row=Some(1)"), "{error}");
 }
 
 #[test]

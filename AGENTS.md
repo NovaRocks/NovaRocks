@@ -225,7 +225,7 @@ SQL client
   命令完成经 Query Application 的 `StatementCommandCompletion` / `GovernedCompletionStatementResult`
   保留原领域的 Counted/NoCount；Query Application 从原 AST 冻结静态完成形状，Trino 只投影
   `columns`、`data`、`updateType` 与 `updateCount`。普通/MOR 取同 Session 完整冻结的 Root
-  计数，COW 取原 selection，CTAS 等最终 CREATE；无真实计数时为 NULL，不能填零。
+  计数，CTAS 等取最终 CREATE；无真实计数时为 NULL，不能填零。
   计数数据页之后仍须请求终页确认；完成数据不替代原 visibility、取消与实际退出。见 ADR-0217。
 
 - `novarocks/frontend-application/src/statistics/{application,attempt_executor,service,read,publication}.rs`
@@ -343,17 +343,21 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   有符号 IN helper/recipe 在 `novarocks/functions/src/native_inlist.rs`；UTF8 借用比较在
   `compiled_program/utf8_inlist.rs`。不得恢复旧 evaluator 或用函数名重建调用。
 
-- COW 赋值转换属于选择查询：`query_execution/dml/mutation_flow.rs` 提交完整根输出声明，
-  SQL `analyzer/root_output_declaration.rs` 复用原 value-conversion 作者，执行前核对 signed 根类型。
-  FE `query_execution/row_mutation/signed_layout.rs` 只规范化布局/metadata 并准确展开允许的 dictionary，
-  不做值 cast，也不以 carrier 推测逻辑领域或放宽 signed NULL/width 约束。
-  STRING→FLOAT/DOUBLE 解析出的 NaN、±Inf（含过大指数文本）按普通 CAST 变为 NULL；
-  可空目标签名接收 NULL，必填目标保留原 Connector Data fact，经安全错误投影拒绝且写入不能完成。
-  不加 COW 专用 cast mode；原本就是浮点的非有限值不属于文本解析规则。
+- Iceberg UPDATE 与所有 MERGE 形状在原 v3/类型/ref 准入后只走 MOR，legacy write-mode
+  属性不选算法。Provider 同一作者签发规范输入 W 与可选完整存储 T；仅对应 T 的 plain
+  physical Fixed 叶允许 W Binary，W 保留 T 各层 required 和其余完整事实，不能从 carrier
+  或原 Field 注释猜 nominal。SQL 的原 value-conversion 作者在完整 source query 外层完成
+  普通 S→V，V 保留 source NULL 与获准 Fixed(m)；普通 CAST/MAP/ROW 能力不扩大。
+  原 event/writer assignment 在实际选行后以 CheckedWriteInputProjection 保留 V/W/T，
+  Execution 在 Provider I/O 前将可达嵌套 required NULL 作为 Data 拒绝，再由原 scoped hydrate
+  构造 W；父 NULL/偏移不可达槽不误拒绝。Provider 按 T 检查可达非 NULL 原 bytes 的定长
+  宽度，坏宽度为 typed Data，required NULL 兜底仍 Internal；控制/契约错误保留原分类。
+  V 与 W 保留独立 projected ValueId，统计消费实际 W。设计接受不代表最终验证完成。
+  见 [ADR-0233](docs/adr/ADR-0233-iceberg-mor-only-and-provider-owned-write-validation.md)。
 
 - `novarocks/execution/src/runtime/function_set.rs`
   只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
-  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 12、test-only 为 13；旧执行实现摘要不再参与，
+  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 15、test-only 为 13；旧执行实现摘要不再参与，
   函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`

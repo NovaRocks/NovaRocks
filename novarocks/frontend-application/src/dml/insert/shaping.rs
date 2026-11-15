@@ -27,18 +27,27 @@ use novarocks_type_contract::FunctionValueType;
 
 /// Type direct row sources before their VALUES/UNION common-type analysis.
 /// General query sources keep the original output projection boundary.
+#[cfg(test)]
 pub(crate) fn shape_insert_source(
     source: &ast::Query,
     insert_columns: &[String],
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
 ) -> Result<Option<ast::Query>, String> {
-    shape_insert_source_in(source, insert_columns, source_columns, write_columns, None)
-        .map(|source| source.map(|(query, _)| query))
+    shape_insert_source_in(
+        source,
+        insert_columns,
+        source_columns,
+        write_columns,
+        None,
+        false,
+    )
+    .map(|source| source.map(|(query, _)| query))
 }
 
 /// Preserve constants from every leaf of the original eligible source.
 /// Other expressions and the SELECT/UNION structure retain their old body.
+#[cfg(test)]
 pub(crate) fn shape_insert_source_with_constants(
     source: &ast::Query,
     insert_columns: &[String],
@@ -59,10 +68,12 @@ pub(crate) fn shape_insert_source_with_constants(
         source_columns,
         write_columns,
         Some((policy, control)),
+        false,
     )
 }
 
 struct ConstantSource<'a> {
+    typed_write: bool,
     capture: Option<(
         novarocks_functions::ConstantPolicy,
         &'a dyn novarocks_type_contract::PureCompileControl,
@@ -109,6 +120,7 @@ fn shape_insert_source_in(
         novarocks_functions::ConstantPolicy,
         &dyn novarocks_type_contract::PureCompileControl,
     )>,
+    typed_write: bool,
 ) -> Result<
     Option<(
         ast::Query,
@@ -122,7 +134,7 @@ fn shape_insert_source_in(
         && source.limit.is_none()
         && source.offset.is_none()
         && source.fetch.is_none();
-    if !uncontrolled_values && !literal_query(source) {
+    if (typed_write && !uncontrolled_values) || (!uncontrolled_values && !literal_query(source)) {
         return Ok(None);
     }
     if body_has_distinct_set(&source.body) {
@@ -137,6 +149,7 @@ fn shape_insert_source_in(
     let mut query = source.clone();
     let mut constants = ConstantSource {
         capture,
+        typed_write,
         path: Vec::new(),
         constants: Vec::new(),
     };
@@ -207,8 +220,14 @@ fn shape_body(
     match body {
         ast::SetExpr::Values(values) => {
             for (row_index, row) in values.rows.iter_mut().enumerate() {
-                let (syntax, authored) =
-                    shape_row_in(row, mapping, width, columns, constants.capture)?;
+                let (syntax, authored) = shape_row_in(
+                    row,
+                    mapping,
+                    width,
+                    columns,
+                    constants.capture,
+                    constants.typed_write,
+                )?;
                 *row = syntax;
                 constants.publish(authored, |column| {
                     novarocks_sql::compiler::SqlConstantExpressionSite::ValuesCell {
@@ -228,8 +247,14 @@ fn shape_body(
                     _ => Err("INSERT literal SELECT source only supports expressions".to_string()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let (expressions, authored) =
-                shape_row_in(&row, mapping, width, columns, constants.capture)?;
+            let (expressions, authored) = shape_row_in(
+                &row,
+                mapping,
+                width,
+                columns,
+                constants.capture,
+                constants.typed_write,
+            )?;
             // The eligible source projections are self-contained constants. Keep
             // the original SELECT as the row-producing relation so HAVING aliases,
             // filters and DISTINCT observe source types before sink conversion.
@@ -333,6 +358,7 @@ fn shape_row_in(
         novarocks_functions::ConstantPolicy,
         &dyn novarocks_type_contract::PureCompileControl,
     )>,
+    typed_write: bool,
 ) -> Result<ShapedInsertRow, String> {
     if row.len() != width {
         return Err(format!(
@@ -355,7 +381,9 @@ fn shape_row_in(
             let capture_variant = capture.is_some()
                 && target.logical_type() == novarocks_type_contract::ValueLogicalType::Variant;
             let mut encoded = None;
-            let syntax = if capture_variant {
+            let syntax = if typed_write {
+                typed_write_literal_source(expr, &target, capture_variant.then_some(&mut encoded))?
+            } else if capture_variant {
                 constrain_literal_in(expr, &target, Some(&mut encoded))?
             } else {
                 constrain_literal(expr, &target)?
@@ -893,3 +921,573 @@ fn format_timestamp_nanos(value: i64) -> String {
 #[cfg(test)]
 #[path = "shaping_tests.rs"]
 mod tests;
+
+/// Direct uncontrolled VALUES can reorder cells/defaults without changing their
+/// row/common-type semantics. General sources are wrapped after their complete
+/// query by the existing writer projection author.
+pub(crate) fn shape_typed_write_source(
+    source: &ast::Query,
+    insert_columns: &[String],
+    source_columns: &[ColumnDef],
+    write_columns: &[ColumnDef],
+    capture: Option<(
+        novarocks_functions::ConstantPolicy,
+        &dyn novarocks_type_contract::PureCompileControl,
+    )>,
+) -> Result<
+    Option<(
+        ast::Query,
+        Option<novarocks_sql::compiler::SqlExpressionConstants>,
+    )>,
+    String,
+> {
+    shape_insert_source_in(
+        source,
+        insert_columns,
+        source_columns,
+        write_columns,
+        capture,
+        true,
+    )
+}
+fn typed_write_literal_source(
+    mut expression: ast::Expr,
+    target: &FunctionValueType,
+    encoded: Option<&mut Option<Vec<u8>>>,
+) -> Result<ast::Expr, String> {
+    match &mut expression {
+        ast::Expr::Nested(nested) => {
+            *nested.expression =
+                typed_write_literal_source((*nested.expression).clone(), target, encoded)?;
+        }
+        ast::Expr::Cast(cast)
+            if is_variant_cast(cast)
+                && target.logical_type() == novarocks_type_contract::ValueLogicalType::Variant =>
+        {
+            if let Some(syntax) = constant_variant_in(&cast.expr, encoded)? {
+                *cast.expr = syntax;
+            }
+        }
+        _ => {}
+    }
+    Ok(expression)
+}
+
+/// Attach context only along the exact projection/derived-alias geometry
+/// authored by the INSERT wrapper above the complete source query.
+pub(crate) fn attach_write_literal_contexts(
+    query: &ast::Query,
+    assignments: std::sync::Arc<novarocks_sql::compiler::SqlWriteAssignments>,
+    control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<
+    std::sync::Arc<novarocks_sql::compiler::SqlWriteAssignments>,
+    novarocks_sql::compiler::SqlCompileError,
+> {
+    use novarocks_sql::compiler::{SqlCompileError, SqlConstantQueryStep};
+    use novarocks_type_contract::PureCompileControl;
+    if source_assignment_before_common_type(query) {
+        let mut contexts = Vec::new();
+        for site in assignments.sites() {
+            append_write_literal_sites(
+                &query.body,
+                site.output_ordinal(),
+                site.output_ordinal(),
+                &mut Vec::new(),
+                &mut contexts,
+                control,
+                true,
+            )?;
+        }
+        let assignments = std::sync::Arc::try_unwrap(assignments).map_err(|_| {
+            SqlCompileError::InvalidRequest(
+                "INSERT source assignments require their original declaration owner".into(),
+            )
+        })?;
+        return Ok(std::sync::Arc::new(
+            assignments.with_literal_contexts(contexts.into_boxed_slice()),
+        ));
+    }
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(assignments);
+    };
+    let assignments = if select.projection.iter().all(|item| {
+        matches!(
+            item,
+            ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
+        )
+    }) {
+        let mut sites = Vec::new();
+        sites
+            .try_reserve_exact(assignments.sites().len())
+            .map_err(|cause| {
+                SqlCompileError::CompilationSource(
+                    novarocks_failure_contract::SharedFailureCause::new(
+                        novarocks_functions::allocation_failure::AllocationRefusal::new(
+                            "INSERT source assignment sites",
+                            cause,
+                        ),
+                    ),
+                )
+            })?;
+        for site in assignments.sites() {
+            control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
+            let site = match select.projection.get(site.output_ordinal()) {
+                Some(
+                    ast::SelectItem::UnnamedExpr(expr)
+                    | ast::SelectItem::ExprWithAlias { expr, .. },
+                ) => site.clone().with_source_span(expr.span()),
+                _ => site.clone(),
+            };
+            sites.push(site);
+        }
+        std::sync::Arc::new(novarocks_sql::compiler::SqlWriteAssignments::try_new(
+            sites.into_boxed_slice(),
+            control,
+        )?)
+    } else {
+        assignments
+    };
+
+    let [from] = select.from.as_slice() else {
+        return Ok(assignments);
+    };
+    if !from.joins.is_empty() {
+        return Ok(assignments);
+    }
+    let ast::TableFactor::Derived {
+        subquery,
+        alias: Some(alias),
+        ..
+    } = &from.relation
+    else {
+        return Ok(assignments);
+    };
+    if alias.name.value != "__nr_insert_src" {
+        return Ok(assignments);
+    }
+    let mut contexts = Vec::new();
+    for site in assignments.sites() {
+        control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
+        let Some(ast::SelectItem::ExprWithAlias { expr, .. } | ast::SelectItem::UnnamedExpr(expr)) =
+            select.projection.get(site.output_ordinal())
+        else {
+            continue;
+        };
+        let ast::Expr::CompoundIdentifier(parts) = expr else {
+            continue;
+        };
+        let [qualifier, name] = parts.parts.as_slice() else {
+            continue;
+        };
+        if qualifier.value != alias.name.value {
+            continue;
+        }
+        let ordinal = alias
+            .columns
+            .iter()
+            .position(|column| column.value == name.value)
+            .ok_or_else(|| {
+                SqlCompileError::InvalidRequest(
+                    "INSERT source reference lost its original alias ordinal".into(),
+                )
+            })?;
+        let mut path = vec![SqlConstantQueryStep::SelectFromDerived { from: 0 }];
+        append_write_literal_sites(
+            &subquery.body,
+            ordinal,
+            site.output_ordinal(),
+            &mut path,
+            &mut contexts,
+            control,
+            source_assignment_before_common_type(subquery),
+        )?;
+    }
+    if contexts.is_empty() {
+        return Ok(assignments);
+    }
+    let assignments = std::sync::Arc::try_unwrap(assignments).map_err(|_| {
+        SqlCompileError::InvalidRequest(
+            "INSERT literal contexts require their newly projected declaration owner".into(),
+        )
+    })?;
+    Ok(std::sync::Arc::new(
+        assignments.with_literal_contexts(contexts.into_boxed_slice()),
+    ))
+}
+/// Keep early assignment within the original literal INSERT sources. Source
+/// controls retain their independent inference above this boundary.
+fn source_assignment_before_common_type(query: &ast::Query) -> bool {
+    if query.with.is_some()
+        || !query.order_by.is_empty()
+        || query.limit.is_some()
+        || query.offset.is_some()
+        || query.fetch.is_some()
+    {
+        return false;
+    }
+    fn eligible(body: &ast::SetExpr) -> bool {
+        match body {
+            ast::SetExpr::Values(_) => true,
+            ast::SetExpr::Select(select) => {
+                select.from.is_empty()
+                    && !matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. })
+                    && select.selection.is_none()
+                    && matches!(select.group_by, ast::GroupBy::None)
+                    && select.having.is_none()
+                    && select.qualify.is_none()
+                    && select.windows.is_empty()
+                    && select.projection.iter().all(|item| match item {
+                        ast::SelectItem::UnnamedExpr(expr)
+                        | ast::SelectItem::ExprWithAlias { expr, .. } => {
+                            super::command::is_literal_expr(expr)
+                        }
+                        _ => false,
+                    })
+            }
+            ast::SetExpr::Query(query) => source_assignment_before_common_type(query),
+            ast::SetExpr::SetOperation(operation) => {
+                matches!(operation.operator, ast::SetOperator::Union)
+                    && operation.quantifier == ast::SetQuantifier::All
+                    && eligible(&operation.left)
+                    && eligible(&operation.right)
+            }
+        }
+    }
+    eligible(&query.body)
+}
+
+fn append_write_literal_sites(
+    body: &ast::SetExpr,
+    source_ordinal: usize,
+    output_ordinal: usize,
+    path: &mut Vec<novarocks_sql::compiler::SqlConstantQueryStep>,
+    contexts: &mut Vec<novarocks_sql::compiler::SqlWriteLiteralContext>,
+    control: &novarocks_sql::compiler::SqlCompileControl,
+    assignment_before_common_type: bool,
+) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
+    use novarocks_sql::compiler::{
+        SqlConstantExpressionSite as Site, SqlConstantQueryStep as Step, SqlWriteLiteralContext,
+    };
+    use novarocks_type_contract::PureCompileControl;
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
+    match body {
+        ast::SetExpr::Values(values) => {
+            for (row, values) in values.rows.iter().enumerate() {
+                if source_ordinal >= values.len() {
+                    continue;
+                }
+                let context = SqlWriteLiteralContext::new(
+                    path.clone(),
+                    Site::ValuesCell {
+                        row,
+                        column: source_ordinal,
+                    },
+                    output_ordinal,
+                );
+                contexts.push(if assignment_before_common_type {
+                    context.with_source_assignment()
+                } else {
+                    context
+                });
+            }
+        }
+        ast::SetExpr::Select(select) => {
+            if select.projection.iter().all(|item| {
+                matches!(
+                    item,
+                    ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
+                )
+            }) && source_ordinal < select.projection.len()
+            {
+                let context = SqlWriteLiteralContext::new(
+                    path.clone(),
+                    Site::SelectProjection {
+                        column: source_ordinal,
+                    },
+                    output_ordinal,
+                );
+                contexts.push(if assignment_before_common_type {
+                    context.with_source_assignment()
+                } else {
+                    context
+                });
+            }
+        }
+        ast::SetExpr::Query(query) => {
+            path.push(Step::NestedQuery);
+            append_write_literal_sites(
+                &query.body,
+                source_ordinal,
+                output_ordinal,
+                path,
+                contexts,
+                control,
+                assignment_before_common_type,
+            )?;
+            path.pop();
+        }
+        ast::SetExpr::SetOperation(operation) => {
+            for (step, child) in [
+                (Step::UnionLeft, &operation.left),
+                (Step::UnionRight, &operation.right),
+            ] {
+                path.push(step);
+                append_write_literal_sites(
+                    child,
+                    source_ordinal,
+                    output_ordinal,
+                    path,
+                    contexts,
+                    control,
+                    assignment_before_common_type,
+                )?;
+                path.pop();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Keep original explicit VARIANT constants in the existing holder even when
+/// column selection wraps a complete non-VALUES query. This is no implicit
+/// source-to-target conversion; only the source's own explicit CAST authorizes it.
+pub(crate) fn capture_typed_write_constants(
+    query: &mut ast::Query,
+    insert_columns: &[String],
+    source_columns: &[ColumnDef],
+    write_columns: &[ColumnDef],
+    policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<novarocks_sql::compiler::SqlExpressionConstants>, String> {
+    use novarocks_sql::compiler::SqlConstantQueryStep as Step;
+    let mapping = column_mapping(insert_columns, source_columns, write_columns)?;
+    let mut source = ConstantSource {
+        typed_write: true,
+        capture: Some((policy, control)),
+        path: Vec::new(),
+        constants: Vec::new(),
+    };
+    if let ast::SetExpr::Select(select) = query.body.as_mut()
+        && select.from.len() == 1
+        && let ast::TableFactor::Derived {
+            subquery,
+            alias: Some(alias),
+            ..
+        } = &mut select.from[0].relation
+        && alias.name.value == "__nr_insert_src"
+    {
+        source.path.push(Step::SelectFromDerived { from: 0 });
+        capture_typed_write_body(&mut subquery.body, &mapping, write_columns, &mut source)?;
+    } else {
+        capture_typed_write_body(&mut query.body, &mapping, write_columns, &mut source)?;
+    }
+    Ok((!source.constants.is_empty()).then(|| source.constants.into()))
+}
+fn capture_typed_write_body(
+    body: &mut ast::SetExpr,
+    mapping: &[Option<usize>],
+    columns: &[ColumnDef],
+    source: &mut ConstantSource<'_>,
+) -> Result<(), String> {
+    use novarocks_sql::compiler::{
+        SqlConstantExpressionSite as Site, SqlConstantQueryStep as Step, SqlExpressionConstant,
+    };
+    let Some((policy, control)) = source.capture else {
+        return Ok(());
+    };
+    control
+        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+        .map_err(|error| error.to_string())?;
+    let mut capture =
+        |expression: &mut ast::Expr, site, target: &ColumnDef| -> Result<(), String> {
+            let target = target
+                .declared_value_type()
+                .map_err(|error| error.to_string())?;
+            if target.logical_type() != novarocks_type_contract::ValueLogicalType::Variant
+                || explicit_variant_source_path(expression).is_none()
+            {
+                return Ok(());
+            }
+            let mut encoded = None;
+            *expression =
+                typed_write_literal_source(expression.clone(), &target, Some(&mut encoded))?;
+            if let Some(encoded) = encoded {
+                source.constants.push(SqlExpressionConstant::new(
+                    source.path.clone(),
+                    site,
+                    variant_constant_value(&encoded, target, policy, control)?,
+                ));
+            }
+            Ok(())
+        };
+    match body {
+        ast::SetExpr::Values(values) => {
+            for (row_index, row) in values.rows.iter_mut().enumerate() {
+                for (target, source_index) in columns.iter().zip(mapping) {
+                    if let Some(index) = source_index
+                        && let Some(expression) = row.get_mut(*index)
+                    {
+                        capture(
+                            expression,
+                            Site::ValuesCell {
+                                row: row_index,
+                                column: *index,
+                            },
+                            target,
+                        )?;
+                    }
+                }
+            }
+        }
+        ast::SetExpr::Select(select) => {
+            if select.projection.iter().any(|item| {
+                !matches!(
+                    item,
+                    ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
+                )
+            }) {
+                return Ok(());
+            }
+            for (target, source_index) in columns.iter().zip(mapping) {
+                if let Some(index) = source_index
+                    && let Some(
+                        ast::SelectItem::UnnamedExpr(expression)
+                        | ast::SelectItem::ExprWithAlias {
+                            expr: expression, ..
+                        },
+                    ) = select.projection.get_mut(*index)
+                {
+                    capture(
+                        expression,
+                        Site::SelectProjection { column: *index },
+                        target,
+                    )?;
+                }
+            }
+        }
+        ast::SetExpr::Query(query) => {
+            source.push(Step::NestedQuery);
+            capture_typed_write_body(&mut query.body, mapping, columns, source)?;
+            source.pop();
+        }
+        ast::SetExpr::SetOperation(operation)
+            if matches!(operation.operator, ast::SetOperator::Union)
+                && matches!(operation.quantifier, ast::SetQuantifier::All) =>
+        {
+            source.push(Step::UnionLeft);
+            capture_typed_write_body(&mut operation.left, mapping, columns, source)?;
+            source.pop();
+            source.push(Step::UnionRight);
+            capture_typed_write_body(&mut operation.right, mapping, columns, source)?;
+            source.pop();
+        }
+        // The existing constant holder never admitted DISTINCT set paths.
+        ast::SetExpr::SetOperation(_) => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod typed_write_source_tests {
+    use super::*;
+    fn query(sql: &str) -> ast::Query {
+        let statements = novarocks_parser::parse(sql).unwrap();
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query");
+        };
+        query.clone()
+    }
+    fn column(name: &str, ty: DataType) -> ColumnDef {
+        ColumnDef::from_value_type(name.into(), FunctionValueType::new(ty, true), None).unwrap()
+    }
+    #[test]
+    fn write_source_values_keep_real_literal_bytes_and_default_coefficients_without_target_cast() {
+        let mut columns = vec![
+            column("payload", DataType::Binary),
+            column("amount", DataType::Int64),
+        ];
+        columns[1].write_default = Some(ColumnDefault::Int64(9007199254740993));
+        let (query, constants) = shape_typed_write_source(
+            &query("VALUES ('abc')"),
+            &["payload".into()],
+            &columns,
+            &columns,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(constants.is_none());
+        let ast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!("VALUES");
+        };
+        assert!(
+            matches!(&values.rows[0][0], ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::String(bytes), .. }) if bytes == "abc")
+        );
+        assert!(
+            matches!(&values.rows[0][1], ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::Number(coefficient), .. }) if coefficient == "9007199254740993")
+        );
+    }
+    #[test]
+    fn write_source_general_distinct_union_limit_keeps_its_complete_semantics() {
+        use ast::SyntaxEq;
+        let columns = vec![column("p", DataType::Int64)];
+        for sql in [
+            "SELECT DISTINCT '1' AS p ORDER BY p LIMIT 1",
+            "SELECT '1' AS p UNION SELECT '01' AS p",
+        ] {
+            let source = query(sql);
+            assert!(
+                shape_typed_write_source(&source, &[], &columns, &columns, None)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(source.syntax_eq(&query(sql)));
+        }
+    }
+    #[test]
+    fn explicit_variant_capture_keeps_source_domain_and_constant_holder() {
+        use novarocks_sql::compiler::SqlCompileControl;
+        let target = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Variant,
+        )
+        .unwrap();
+        let columns = vec![ColumnDef::from_value_type("p".into(), target, None).unwrap()];
+        let mut source = query("SELECT CAST(parse_json('{\"a\":1}') AS VARIANT) AS p");
+        let constants = capture_typed_write_constants(
+            &mut source,
+            &[],
+            &columns,
+            &columns,
+            crate::application::test_constant_policy(),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(constants.len(), 1);
+        assert_eq!(
+            constants[0].value().value_type().logical_type(),
+            novarocks_type_contract::ValueLogicalType::Variant
+        );
+        assert!(!constants[0].value().value_type().nullable());
+        let ast::SetExpr::Select(select) = source.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let ast::SelectItem::ExprWithAlias {
+            expr: ast::Expr::Cast(cast),
+            ..
+        } = &select.projection[0]
+        else {
+            panic!("original explicit CAST");
+        };
+        assert!(is_variant_cast(cast));
+        assert!(matches!(
+            cast.expr.as_ref(),
+            ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::HexString(_),
+                ..
+            })
+        ));
+    }
+}

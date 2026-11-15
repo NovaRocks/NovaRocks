@@ -454,7 +454,7 @@ mod tests {
         command
             .args([
                 "-c",
-                "printf '%s\\n' \"$$\" > \"$1\"; exec /bin/sleep 60",
+                "trap '' TERM; printf '%s\\n' \"$$\" > \"$1\"; exec /bin/sleep 60",
                 "fencing-timeout-child",
             ])
             .arg(pid_file);

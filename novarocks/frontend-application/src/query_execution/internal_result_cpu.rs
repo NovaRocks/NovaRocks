@@ -64,10 +64,6 @@ use scoped_statistics::ClosedCreatorInput;
 pub(crate) use scoped_statistics::StatisticsPlanCpuJob;
 pub(crate) use scoped_statistics::scoped_mv_refresh::{MvCpuJob, MvRefreshCpuTurn};
 
-// Historical COW coexistence envelope. This is not a generic Root, Statistics
-// or CPU factory minimum; actual domain byte receipts are separate.
-pub(crate) const INTERNAL_PEAK_BYTES: u64 = (2 * 336 + 256 + 32 + 32 + 8 + 8) * 1024 * 1024;
-
 /// Coverage check for closed first-party factories which embed the supplied
 /// alias into their actual payload backing before handing it off.
 pub(crate) fn require_internal_result_capacity(
@@ -1995,6 +1991,9 @@ pub(crate) fn admitted_internal_fixture() -> (
 
 #[cfg(test)]
 mod tests {
+    // Preserve the existing synthetic payload amount within this test fixture.
+    const TEST_PAYLOAD_BYTES: u64 = 1008 * 1024 * 1024;
+
     use super::*;
     use crate::wake::TestIntakeWake;
     use novarocks_query_application::cancellation::{
@@ -2078,7 +2077,7 @@ mod tests {
                 &root.owner,
                 JointLane::Custody,
                 JointResource::PayloadBytes,
-                INTERNAL_PEAK_BYTES,
+                TEST_PAYLOAD_BYTES,
                 &mut driver,
             ));
             let mut payload = None;
@@ -2683,7 +2682,7 @@ mod tests {
             all_objects_bytes: [
                 8 * 1024 * 1024,
                 96 * 1024 * 1024,
-                INTERNAL_PEAK_BYTES,
+                TEST_PAYLOAD_BYTES,
                 8 * 1024 * 1024,
             ],
             ..ResultCapacityConfig::V1
@@ -2710,13 +2709,13 @@ mod tests {
         assert!(
             window
                 .retain_alias()
-                .check_backing_total(INTERNAL_PEAK_BYTES)
+                .check_backing_total(TEST_PAYLOAD_BYTES)
                 .is_ok()
         );
         assert!(
             window
                 .retain_alias()
-                .check_backing_total(INTERNAL_PEAK_BYTES + 1)
+                .check_backing_total(TEST_PAYLOAD_BYTES + 1)
                 .is_err()
         );
         let mut owner = InternalResultCpuOwner::new_workers(QueryBlockingExecutorConfig::new(

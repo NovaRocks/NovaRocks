@@ -557,8 +557,11 @@ impl ResultPumpDecision {
         actor: &LogicalExecutionActor,
         error: QueryExecutionError,
     ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
+        let original_failure = self.failure.error().execution_failure().cloned();
         let permit = self.permit;
-        let result = actor.fail_attempt_with_error(permit, error).await;
+        let result = actor
+            .fail_attempt_preserving_original_failure(permit, error, original_failure)
+            .await;
         drop(self.observer);
         result
     }

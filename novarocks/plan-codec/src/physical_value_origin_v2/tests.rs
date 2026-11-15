@@ -381,6 +381,7 @@ fn value_origin_all_four_aggregate_phases_and_seven_writer_kinds_are_exact() {
         physical::WriterDerivedKind::RelationAuxiliary,
         physical::WriterDerivedKind::WriteTargetOrdinal,
         physical::WriterDerivedKind::GroupingKey,
+        physical::WriterDerivedKind::ProjectedInput,
     ];
     for (at, kind) in kinds.into_iter().enumerate() {
         let source = physical::ValueOrigin::WriterDerived {
@@ -563,7 +564,7 @@ fn value_origin_every_required_reference_kind_phase_and_writer_enum_refuses_with
             },
         )),
     ];
-    for kind in [0, -1, 8, i32::MAX] {
+    for kind in [0, -1, 9, i32::MAX] {
         invalids.push(wrap(wire::value_origin::Kind::WriterDerived(
             wire::WriterDerivedOrigin {
                 writer_node_id: Some(0),

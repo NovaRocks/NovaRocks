@@ -235,7 +235,10 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             .map(|effect| ChangeEventSpec {
                 predicate: None,
                 effect,
-                assignments: Box::from([(data, Some(expression))]),
+                assignments: Box::from([novarocks_physical_plan::ChangeAssignment::exact(
+                    data,
+                    Some(expression),
+                )]),
             })
             .into(),
         },
@@ -326,6 +329,29 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
         let receiver_distribution = distribution(mode, inputs[0]);
         let writer = builder.reserve_node_id().unwrap();
         let fields = relation_fields(&mut builder, writer, false);
+        let projected_target_fields_0: Box<[novarocks_physical_plan::WriterTargetField]> = drafts
+            [index]
+            .input()
+            .fields_iter()
+            .zip(&inputs)
+            .map(|(binding, value)| WriterTargetField {
+                storage_type: None,
+                projected: builder
+                    .add_value(
+                        binding.execution_type().unwrap().clone(),
+                        novarocks_physical_plan::ValueOrigin::WriterDerived {
+                            writer_node: writer,
+                            kind: novarocks_physical_plan::WriterDerivedKind::ProjectedInput,
+                        },
+                    )
+                    .unwrap(),
+                provider_name: binding.field().name().clone().into(),
+                token: binding.token(),
+                input: *value,
+                ty: binding.execution_type().unwrap().clone(),
+                hidden: false,
+            })
+            .collect();
         insert(
             &mut builder,
             writer,
@@ -337,18 +363,7 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
                     write_target_ordinal: ordinals[index],
                     input: inputs.clone().into(),
                     required_distribution: receiver_distribution.clone(),
-                    target_fields: drafts[index]
-                        .input()
-                        .fields_iter()
-                        .zip(&inputs)
-                        .map(|(binding, value)| WriterTargetField {
-                            provider_name: binding.field().name().clone().into(),
-                            token: binding.token(),
-                            input: *value,
-                            ty: binding.execution_type().unwrap().clone(),
-                            hidden: false,
-                        })
-                        .collect(),
+                    target_fields: projected_target_fields_0,
                     output_schema: WriterRelationSchema {
                         revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
                         fields: fields.clone(),

@@ -20,12 +20,6 @@ use super::*;
 use std::sync::atomic::AtomicBool;
 
 type BeginOutcome = Result<Arc<ConnectorWriteSession>, ConnectorError>;
-type CowBeginOutcome =
-    Result<Arc<ConnectorWriteSession>, novarocks_spi::connector::ConnectorCowBeginFailure>;
-type CowPlanOutcome = Result<
-    novarocks_spi::connector::ConnectorCowBeginPlan,
-    novarocks_spi::connector::ConnectorCowBeginFailure,
->;
 struct BeginInput {
     write_stack_pin: ConnectorWriteStackPin,
     catalog_properties: novarocks_spi::connector::CatalogProperties,
@@ -50,8 +44,6 @@ pub(crate) struct WriteBeginReceiving {
     completed: AtomicBool,
     outcome: Mutex<Option<BeginOutcome>>,
     plan: Mutex<Option<Result<ConnectorWriteSessionPlan, ConnectorError>>>,
-    cow_plan: Mutex<Option<CowPlanOutcome>>,
-    cow_outcome: Mutex<Option<CowBeginOutcome>>,
     input: Mutex<Option<BeginInput>>,
     original: Arc<Mutex<Option<Arc<ConnectorWriteSession>>>>,
     health: novarocks_query_application::api::StatementNativeHealthFailure,
@@ -64,8 +56,6 @@ impl WriteBeginReceiving {
             completed: AtomicBool::new(false),
             outcome: Mutex::new(None),
             plan: Mutex::new(None),
-            cow_plan: Mutex::new(None),
-            cow_outcome: Mutex::new(None),
             input: Mutex::new(None),
             original,
             health:
@@ -196,69 +186,6 @@ impl WriteBeginReceiving {
             *slot = Some(session);
         }
     }
-    pub(super) fn publish_cow_plan(
-        &self,
-        outcome: Result<
-            novarocks_spi::connector::ConnectorCowBeginPlan,
-            novarocks_spi::connector::ConnectorCowBeginFailure,
-        >,
-    ) {
-        let mut slot = self.cow_plan.lock().unwrap_or_else(|p| p.into_inner());
-        assert!(
-            slot.is_none(),
-            "same checked COW plan can be received only once"
-        );
-        *slot = Some(outcome);
-    }
-    pub(super) fn adopt_cow_session(&self) {
-        let plan = self
-            .cow_plan
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-            .expect("same received checked COW plan");
-        let outcome = match plan {
-            Ok(plan) => {
-                let input = self
-                    .input
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .take()
-                    .expect("same retained checked COW input");
-                ConnectorWriteSession::from_checked_cow_plan(
-                    input.write_stack_pin,
-                    input.catalog_properties,
-                    plan,
-                )
-                .map(Arc::new)
-            }
-            Err(cause) => Err(cause),
-        };
-        let session = outcome.as_ref().ok().cloned();
-        *self.cow_outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(outcome);
-        if let Some(session) = session {
-            let mut slot = self.original.lock().unwrap_or_else(|p| p.into_inner());
-            assert!(
-                slot.is_none(),
-                "original session changed during checked COW begin"
-            );
-            *slot = Some(session);
-        }
-    }
-    pub(super) fn completed_cow_result(&self) -> CowBeginOutcome {
-        assert!(
-            self.completed.load(Ordering::Acquire) && !self.in_poll_or_drop.load(Ordering::Acquire),
-            "checked COW begin requires actual Provider exit"
-        );
-        let mut slot = self.cow_outcome.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(Ok(session)) = slot.as_ref() {
-            return Ok(Arc::clone(session));
-        }
-        match slot.take().expect("same received checked COW result") {
-            Err(cause) => Err(cause),
-            Ok(_) => unreachable!("checked COW success is retained above"),
-        }
-    }
     pub(super) fn finish_drop(&self) {
         self.completed.store(true, Ordering::Release);
         self.in_poll_or_drop.store(false, Ordering::Release);
@@ -282,13 +209,6 @@ impl WriteBeginReceiving {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .and_then(|outcome| outcome.as_ref().ok().cloned())
-            .or_else(|| {
-                self.cow_outcome
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .as_ref()
-                    .and_then(|outcome| outcome.as_ref().ok().cloned())
-            })
     }
     pub(crate) fn local_health_failure(
         &self,
@@ -296,28 +216,6 @@ impl WriteBeginReceiving {
         self.in_poll_or_drop
             .load(Ordering::Acquire)
             .then(|| self.health.clone())
-    }
-    #[cfg(test)]
-    pub(super) fn retains_cow_error(&self) -> bool {
-        self.cow_plan
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .is_some_and(Result::is_err)
-            || self
-                .cow_outcome
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .as_ref()
-                .is_some_and(Result::is_err)
-    }
-    #[cfg(test)]
-    pub(super) fn retains_cow_plan(&self) -> bool {
-        self.cow_plan
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .is_some_and(Result::is_ok)
     }
     #[cfg(test)]
     pub(super) fn retains_plan(&self) -> bool {

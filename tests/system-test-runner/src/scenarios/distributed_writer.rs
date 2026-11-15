@@ -2247,8 +2247,8 @@ impl Scenario for DistributedWriterOverwrite {
 
 /// Row-level mutations write more than one branch of one relation.
 ///
-/// A merge-on-read DELETE stages deletion vectors, a copy-on-write UPDATE
-/// stages rewritten data files, and a MERGE stages both. Each is still one
+/// DELETE stages deletion vectors; UPDATE and MERGE stage both deletions and
+/// after-image data files. Each is still one
 /// statement, one prepared write set, and one snapshot -- which is the claim
 /// that makes a multi-branch mutation atomic rather than two publications that
 /// happen to run next to each other.
@@ -2490,21 +2490,21 @@ impl Scenario for DistributedWriterRowLevel {
             bail!("position-delete DELETE left {remaining:?}");
         }
 
-        // A copy-on-write UPDATE takes the data branch: it rewrites data files
-        // rather than staging a delete artifact.
-        let cow = format!("{CATALOG}.{DATABASE}.row_level_cow");
+        // The legacy property does not select the write strategy. UPDATE
+        // stages both deletions and after-image data through merge-on-read.
+        let update_table = format!("{CATALOG}.{DATABASE}.row_level_update");
         control
             .execute(format!(
-                "CREATE TABLE {cow} (id BIGINT, v BIGINT) TBLPROPERTIES \
+                "CREATE TABLE {update_table} (id BIGINT, v BIGINT) TBLPROPERTIES \
                  (\"format-version\" = \"3\", \"write.row-lineage\" = \"true\", \
                  \"novarocks.update.mode\" = \"copy-on-write\")"
             ))
-            .context("create copy-on-write mutation table")?;
+            .context("create UPDATE table with legacy mode property")?;
         for file in 0..3 {
             let base = file * 4;
             control
                 .execute(format!(
-                    "INSERT INTO {cow} VALUES ({}, {}), ({}, {}), ({}, {}), ({}, {})",
+                    "INSERT INTO {update_table} VALUES ({}, {}), ({}, {}), ({}, {}), ({}, {})",
                     base + 1,
                     base + 1,
                     base + 2,
@@ -2514,42 +2514,49 @@ impl Scenario for DistributedWriterRowLevel {
                     base + 4,
                     base + 4
                 ))
-                .with_context(|| format!("seed copy-on-write file {file}"))?;
+                .with_context(|| format!("seed UPDATE file {file}"))?;
         }
-        context.action("update rows through the copy-on-write data branch");
+        context.action("update rows through merge-on-read with a legacy mode property");
         let before = all_write_counters(context)?;
         let before_terminals = publication_terminals(context, MUTATION_FAMILY)?;
-        let cow_snapshots_before = snapshot_count(&mut control, &cow)?;
+        let update_snapshots_before = snapshot_count(&mut control, &update_table)?;
         let mutation_result = control
             .execute(format!(
-                "UPDATE {cow} SET v = v + 100 WHERE id IN (1, 5, 9)"
+                "UPDATE {update_table} SET v = v + 100 WHERE id IN (1, 5, 9)"
             ))
-            .context("copy-on-write UPDATE")?;
-        row_level_contract::assert_affected(&mutation_result, 3, "copy-on-write UPDATE")?;
+            .context("merge-on-read UPDATE")?;
+        row_level_contract::assert_affected(&mutation_result, 3, "merge-on-read UPDATE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
         if delta.writing_backends.is_empty() {
-            bail!("copy-on-write UPDATE opened no writer: before={before:?} after={after:?}");
+            bail!("merge-on-read UPDATE opened no writer: before={before:?} after={after:?}");
         }
         if delta.commit_fragments < 1.0 {
-            bail!("copy-on-write UPDATE produced no commit fragment: {delta:?}");
+            bail!("merge-on-read UPDATE produced no commit fragment: {delta:?}");
         }
-        assert_committed_once(before_terminals, after_terminals, "copy-on-write UPDATE")?;
-        let cow_snapshots_after = snapshot_count(&mut control, &cow)?;
-        if cow_snapshots_after != cow_snapshots_before + 1 {
+        assert_committed_once(before_terminals, after_terminals, "merge-on-read UPDATE")?;
+        let update_snapshots_after = snapshot_count(&mut control, &update_table)?;
+        if update_snapshots_after != update_snapshots_before + 1 {
             bail!(
-                "copy-on-write UPDATE moved {cow} from {cow_snapshots_before} to \
-                 {cow_snapshots_after} snapshots; expected exactly one"
+                "merge-on-read UPDATE moved {update_table} from {update_snapshots_before} to \
+                 {update_snapshots_after} snapshots; expected exactly one"
             );
         }
+        let delete_artifacts = writer_bigint(&control.execute(format!(
+            "SELECT count(*) FROM {update_table}$files WHERE content=1"
+        ))?)?;
+        anyhow::ensure!(
+            delete_artifacts > 0,
+            "UPDATE with the legacy mode property published no deletion artifact"
+        );
         let updated: Vec<i64> = sql::integer_column(
             &control
-                .execute(format!("SELECT v FROM {cow} ORDER BY id"))
-                .context("read the table after the copy-on-write UPDATE")?,
+                .execute(format!("SELECT v FROM {update_table} ORDER BY id"))
+                .context("read the table after the merge-on-read UPDATE")?,
         )?;
         if updated != vec![101, 2, 3, 4, 105, 6, 7, 8, 109, 10, 11, 12] {
-            bail!("copy-on-write UPDATE left {updated:?}");
+            bail!("merge-on-read UPDATE left {updated:?}");
         }
 
         // MERGE folds a delete branch and a data branch into one statement.

@@ -505,6 +505,7 @@ pub(crate) struct ChangeEventSpec {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeEventOutputExpr {
+    pub(crate) write_input: Option<novarocks_type_contract::WriteInputDeclaration>,
     pub(crate) output_column_id: ColumnId,
     pub(crate) expr: Option<ScalarId>,
 }

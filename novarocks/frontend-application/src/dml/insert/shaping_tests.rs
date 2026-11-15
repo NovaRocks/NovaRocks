@@ -203,50 +203,6 @@ fn map_type(key: DataType, value: DataType) -> DataType {
 }
 
 #[test]
-fn values_constrain_each_decimal_before_mixed_row_type_inference() {
-    let query = shape(
-        "VALUES (123456789.123456789), (1.25e2), (NULL)",
-        &[column("d", decimal_type())],
-    );
-    let exact = number_text(cast_input(&rows(&query)[0][0], "DECIMAL(18, 9)"));
-    assert_eq!(exact, "123456789.123456789");
-    assert_eq!(
-        exact.replace('.', "").parse::<i128>().unwrap(),
-        123456789123456789
-    );
-    assert_eq!(
-        number_text(cast_input(&rows(&query)[1][0], "DECIMAL(18, 9)")),
-        "1.25e2"
-    );
-    assert!(matches!(
-        cast_input(&rows(&query)[2][0], "DECIMAL(18, 9)"),
-        ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Null,
-            ..
-        })
-    ));
-}
-
-#[test]
-fn constant_union_branches_are_typed_before_their_common_type() {
-    let query = shape(
-        "SELECT 123456789.123456789 UNION ALL SELECT 1.25e2",
-        &[column("d", decimal_type())],
-    );
-    let ast::SetExpr::SetOperation(operation) = query.body.as_ref() else {
-        panic!("expected retained UNION");
-    };
-    assert_eq!(operation.quantifier, ast::SetQuantifier::All);
-    for (body, expected) in [
-        (&operation.left, "123456789.123456789"),
-        (&operation.right, "1.25e2"),
-    ] {
-        let expr = projection_expr(select(body), 0);
-        assert_eq!(number_text(cast_input(expr, "DECIMAL(18, 9)")), expected);
-    }
-}
-
-#[test]
 fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
     let decimal_array = array_type(decimal_type());
     let structure = DataType::Struct(Fields::from(vec![

@@ -142,13 +142,11 @@ pub(crate) struct ConnectorWriteSession {
     /// nor reconciles cannot pin credential material.
     terminal_storage:
         Mutex<Option<Arc<crate::query_execution::lifecycle_plan::SessionTerminalCredentialRouter>>>,
-    // Last holder retires after every session-owned plan and storage field.
-    cow_original: Option<novarocks_spi::connector::ConnectorOriginalResultScope>,
 }
 
 /// What a session has collected so far across the queries it drives.
 ///
-/// Most writes are one query, but a copy-on-write mutation and a distributed
+/// Most writes are one query, but a distributed
 /// rewrite drive several against one session and commit once at the end. Each
 /// query still produces a set that is complete for its own execution graph;
 /// what accumulates here is the statement's union.
@@ -224,7 +222,7 @@ impl ConnectorWriteSession {
         receiving.claim()?;
         let declaration = match &request.flavor {
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } => {
-                declaration.clone()
+                declaration.as_ref().clone()
             }
             _ => {
                 return Err(ConnectorError::new(
@@ -546,54 +544,7 @@ impl ConnectorWriteSession {
             terminal: Mutex::new(None),
             finish_invocations: AtomicUsize::new(0),
             terminal_storage: Mutex::new(None),
-            cow_original: None,
         }
-    }
-
-    fn from_checked_cow_plan(
-        write_stack_pin: ConnectorWriteStackPin,
-        catalog_properties: novarocks_spi::connector::CatalogProperties,
-        checked: novarocks_spi::connector::ConnectorCowBeginPlan,
-    ) -> Result<Self, novarocks_spi::connector::ConnectorCowBeginFailure> {
-        let (plan, original) = checked.into_parts();
-        // Reject a stop between the original Provider return and FE adoption.
-        if let Err(cause) = original.check_active() {
-            // Plan destruction precedes return of the guarded original cause.
-            drop(plan);
-            return Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
-                cause.into(),
-                original,
-            ));
-        }
-        Ok(Self {
-            decode_origin: Arc::new(()),
-            productions: Mutex::new(production::WriteProductionReceiving::default()),
-            statistics_expected: Arc::new(
-                plan.targets()
-                    .iter()
-                    .flat_map(|target| {
-                        target
-                            .statistics()
-                            .requirements()
-                            .iter()
-                            .map(move |requirement| {
-                                (target.ordinal(), requirement.artifact().clone())
-                            })
-                    })
-                    .collect(),
-            ),
-            write_stack_pin,
-            plan,
-            metadata_only_publication: false,
-            finish_publication: Mutex::new(WritePublicationState::Ordinary),
-            catalog_properties,
-            accumulated: Mutex::new(AccumulatedWriteSet::default()),
-            publication_input: Mutex::new(None),
-            terminal: Mutex::new(None),
-            finish_invocations: AtomicUsize::new(0),
-            terminal_storage: Mutex::new(None),
-            cow_original: Some(original),
-        })
     }
 
     /// The declaration this session opened with, for the statement that must
@@ -653,20 +604,8 @@ impl ConnectorWriteSession {
         self.plan.expected_targets()
     }
 
-    pub(crate) fn cow_original(
-        &self,
-    ) -> Option<&novarocks_spi::connector::ConnectorOriginalResultScope> {
-        self.cow_original.as_ref()
-    }
-
     pub(crate) fn targets(&self) -> &[ConnectorWriteTargetPlan] {
         self.plan.targets()
-    }
-
-    pub(crate) const fn copy_on_write_routing(
-        &self,
-    ) -> Option<&novarocks_spi::connector::write_stack::ConnectorWriteCopyOnWriteRoutingPlan> {
-        self.plan.copy_on_write()
     }
 
     /// How many times this session actually asked the connector to commit.
@@ -1026,7 +965,6 @@ fn ensure_finish_context_active(context: &ConnectorRequestContext) -> Result<(),
 
 /// Bind only an already-admitted attempt sink to the retained write generation.
 /// The owned context preserves its deadline, stop and request/storage capabilities.
-/// COW callers must cover this properties clone before entering this helper.
 pub(super) fn context_for_write_begin(
     context: ConnectorRequestContext,
     catalog_properties: &novarocks_spi::connector::CatalogProperties,
@@ -1036,83 +974,6 @@ pub(super) fn context_for_write_begin(
     } else {
         Ok(context)
     }
-}
-
-fn prepare_cow_begin_input(
-    write_lease: &novarocks_spi::connector::ConnectorWrite,
-    mut request: ConnectorWriteBeginRequest,
-    original: novarocks_spi::connector::ConnectorOriginalResultScope,
-) -> Result<
-    (
-        novarocks_spi::connector::CatalogProperties,
-        ConnectorWriteBeginRequest,
-        novarocks_spi::connector::ConnectorOriginalResultScope,
-    ),
-    crate::query_execution::dml::mutation_flow::CowFailure,
-> {
-    use crate::query_execution::dml::mutation_flow::CowFailure;
-    if let Err(cause) = original.check_active() {
-        return Err(CowFailure::checked_begin(
-            novarocks_spi::connector::ConnectorCowBeginFailure::new(cause.into(), original),
-        ));
-    }
-    let Some(properties) = write_lease.catalog_properties() else {
-        return Err(CowFailure::missing_catalog_identity_bound(original));
-    };
-    // Original catalog identity and attempt collection stay with the same
-    // session. Layout prediction does not authorize these Provider requests.
-    request.context = match context_for_write_begin(request.context, properties) {
-        Ok(context) => context,
-        Err(error) => {
-            return Err(CowFailure::checked_begin(
-                novarocks_spi::connector::ConnectorCowBeginFailure::new(error.into(), original),
-            ));
-        }
-    };
-    Ok((properties.clone(), request, original))
-}
-
-/// The exact checked COW plan and typed cause enter the original receiving
-/// source before the Provider child Future is destroyed.
-pub(crate) async fn begin_cow_connector_write_session_async_in(
-    write_stack_pin: ConnectorWriteStackPin,
-    write_lease: &novarocks_spi::connector::ConnectorWrite,
-    request: ConnectorWriteBeginRequest,
-    original: novarocks_spi::connector::ConnectorOriginalResultScope,
-    receiving: &WriteBeginReceiving,
-) -> Result<Arc<ConnectorWriteSession>, crate::query_execution::dml::mutation_flow::CowFailure> {
-    use crate::query_execution::dml::mutation_flow::CowFailure;
-    let (catalog_properties, request, original) =
-        prepare_cow_begin_input(write_lease, request, original)?;
-    receiving.claim().map_err(|cause| {
-        CowFailure::checked_begin(novarocks_spi::connector::ConnectorCowBeginFailure::new(
-            cause.into(),
-            original.clone(),
-        ))
-    })?;
-    receiving.install_input(write_stack_pin, catalog_properties);
-    let control = receiving.control();
-    receiving.enter_factory();
-    let mut child = control.begin_cow_write_checked_async(request, original);
-    receiving.leave_pending();
-    let outcome = std::future::poll_fn(|cx| {
-        if !receiving.enter_poll() {
-            return std::task::Poll::Pending;
-        }
-        let polled = std::future::Future::poll(child.as_mut(), cx);
-        if polled.is_pending() {
-            receiving.leave_pending();
-        }
-        polled
-    })
-    .await;
-    receiving.publish_cow_plan(outcome);
-    drop(child);
-    receiving.adopt_cow_session();
-    receiving.finish_drop();
-    receiving
-        .completed_cow_result()
-        .map_err(CowFailure::checked_begin)
 }
 
 /// Borrow the original asynchronous begin while retaining its exact declaration.
@@ -1697,54 +1558,6 @@ pub(crate) mod tests {
             })
         }
 
-        fn begin_cow_write_checked_async(
-            &self,
-            request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
-            original: novarocks_spi::connector::ConnectorOriginalResultScope,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<
-                            novarocks_spi::connector::ConnectorCowBeginPlan,
-                            novarocks_spi::connector::ConnectorCowBeginFailure,
-                        >,
-                    > + Send
-                    + '_,
-            >,
-        > {
-            // This original test control's checked author is pure and performs no I/O.
-            Box::pin(FakeBeginFuture {
-                original: Box::pin(async move { self.begin_cow_write_checked(request, original) }),
-                recorded: Arc::clone(&self.recorded),
-            })
-        }
-
-        fn begin_cow_write_checked(
-            &self,
-            request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
-            original: novarocks_spi::connector::ConnectorOriginalResultScope,
-        ) -> Result<
-            novarocks_spi::connector::ConnectorCowBeginPlan,
-            novarocks_spi::connector::ConnectorCowBeginFailure,
-        > {
-            // Test-only scripted provider: the fixture owns its finite graph.
-            if let Err(cause) = original.check_active() {
-                return Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
-                    cause.into(),
-                    original,
-                ));
-            }
-            match self.begin_write(request) {
-                Ok(plan) => Ok(novarocks_spi::connector::ConnectorCowBeginPlan::new(
-                    plan, original,
-                )),
-                Err(cause) => Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
-                    cause.into(),
-                    original,
-                )),
-            }
-        }
-
         fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.binding_key
         }
@@ -1761,7 +1574,7 @@ pub(crate) mod tests {
                     ..
                 } = &request.flavor
                 {
-                    recorded.begin_declaration = Some(declaration.clone());
+                    recorded.begin_declaration = Some(declaration.as_ref().clone());
                 }
                 if recorded.capture_begin_context {
                     recorded.begin_context = Some(request.context);
@@ -2379,7 +2192,7 @@ pub(crate) mod tests {
             },
             base: Some(declaration.expected_base().clone()),
             flavor: ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-                declaration,
+                declaration: Box::new(declaration),
                 shape:
                     novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
             },
@@ -3595,7 +3408,7 @@ pub(crate) mod tests {
         assert_eq!(fixture.session.finish_invocations(), 1);
     }
 
-    /// A copy-on-write mutation and a distributed rewrite drive several
+    /// A distributed rewrite can drive several
     /// queries against one session and commit once. Each query's set is
     /// complete for its own graph; the statement commits their union.
     #[test]
@@ -4673,133 +4486,6 @@ pub(crate) mod tests {
         assert!(call.take_abort_outcome_in(&mut result).is_err());
         assert_eq!(fixture.recorded.lock().unwrap().abort, 1);
         assert_eq!(fixture.recorded.lock().unwrap().abort_future_drops, 1);
-    }
-
-    /// The existing scripted checked Provider returns a real plan and original
-    /// scope. The actual receiving author must adopt both before returning.
-    #[tokio::test]
-    async fn checked_begin_receiving_preserves_the_same_scope_and_session() {
-        let (_control, _root, binding, _capacity) =
-            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
-        let context = request_context();
-        let original = crate::query_execution::original_cow_result_scope::from_original_binding(
-            &binding, &context,
-        )
-        .unwrap();
-        let same_original = original.clone();
-        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
-        let session_receiving = Arc::new(Mutex::new(None));
-        let receiving = WriteBeginReceiving::new(Arc::clone(&session_receiving));
-        receiving.claim().unwrap();
-        receiving.install_input(write_stack_pin, catalog_properties());
-        let control = receiving.control();
-        receiving.enter_factory();
-        let mut child = control.begin_cow_write_checked_async(begin_request(), original);
-        receiving.leave_pending();
-        let outcome = std::future::poll_fn(|cx| {
-            assert!(receiving.enter_poll());
-            let result = std::future::Future::poll(child.as_mut(), cx);
-            if result.is_pending() {
-                receiving.leave_pending();
-            }
-            result
-        })
-        .await;
-        receiving.publish_cow_plan(outcome);
-        assert!(receiving.retains_cow_plan());
-        assert!(session_receiving.lock().unwrap().is_none());
-        drop(child);
-        receiving.adopt_cow_session();
-        receiving.finish_drop();
-        let session = receiving.completed_cow_result().unwrap();
-        assert!(Arc::ptr_eq(
-            &session,
-            session_receiving.lock().unwrap().as_ref().unwrap()
-        ));
-        assert!(
-            session
-                .cow_original()
-                .unwrap()
-                .is_same_original(&same_original)
-        );
-        assert_eq!(recorded.lock().unwrap().begin_future_drops, 1);
-    }
-
-    #[test]
-    fn checked_begin_drop_panic_retains_the_actual_checked_plan() {
-        let (_control, _root, binding, _capacity) =
-            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
-        let context = request_context();
-        let original = crate::query_execution::original_cow_result_scope::from_original_binding(
-            &binding, &context,
-        )
-        .unwrap();
-        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
-        recorded.lock().unwrap().panic_begin_future_drop = true;
-        let slot = Arc::new(Mutex::new(None));
-        let receiving = WriteBeginReceiving::new(Arc::clone(&slot));
-        receiving.claim().unwrap();
-        receiving.install_input(write_stack_pin, catalog_properties());
-        let control = receiving.control();
-        receiving.enter_factory();
-        let mut child = control.begin_cow_write_checked_async(begin_request(), original);
-        receiving.leave_pending();
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(receiving.enter_poll());
-        let std::task::Poll::Ready(outcome) = std::future::Future::poll(child.as_mut(), &mut cx)
-        else {
-            panic!("finite checked fixture must be ready");
-        };
-        receiving.publish_cow_plan(outcome);
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(child))).is_err());
-        assert!(receiving.retains_cow_plan());
-        assert!(receiving.retains_input());
-        assert!(receiving.local_health_failure().is_some());
-        assert!(slot.lock().unwrap().is_none());
-        assert_eq!(recorded.lock().unwrap().begin_future_drops, 1);
-    }
-
-    #[test]
-    fn checked_begin_failure_survives_the_original_child_drop_panic() {
-        let (_control, _root, binding, _capacity) =
-            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
-        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
-        let context = ConnectorRequestContext::try_new(
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            stop.view(),
-            4096,
-            65536,
-        )
-        .unwrap();
-        let original = crate::query_execution::original_cow_result_scope::from_original_binding(
-            &binding, &context,
-        )
-        .unwrap();
-        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
-        recorded.lock().unwrap().panic_begin_future_drop = true;
-        let receiving = WriteBeginReceiving::new(Arc::new(Mutex::new(None)));
-        receiving.claim().unwrap();
-        receiving.install_input(write_stack_pin, catalog_properties());
-        let control = receiving.control();
-        receiving.enter_factory();
-        // The same original control authors the typed stop failure.
-        stop.request_stop();
-        let mut child = control.begin_cow_write_checked_async(begin_request(), original);
-        receiving.leave_pending();
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(receiving.enter_poll());
-        let std::task::Poll::Ready(outcome) = std::future::Future::poll(child.as_mut(), &mut cx)
-        else {
-            panic!("finite checked failure fixture must be ready");
-        };
-        assert!(matches!(&outcome, Err(error) if matches!(error.cause(),
-            novarocks_spi::connector::ConnectorCowBeginCause::OriginalResult(_))));
-        receiving.publish_cow_plan(outcome);
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(child))).is_err());
-        assert!(receiving.retains_cow_error());
-        assert!(receiving.retains_input());
-        assert!(receiving.local_health_failure().is_some());
-        assert_eq!(recorded.lock().unwrap().begin_future_drops, 1);
     }
 
     #[tokio::test]

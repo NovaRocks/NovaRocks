@@ -769,7 +769,6 @@ fn prepare_read_opening(
 
 enum ReadObservation {
     Physical(novarocks_spi::connector::read_stack::ConnectorReadRelationPreparation),
-    OriginalFrozenSource,
     OriginalPreparedSource,
 }
 
@@ -834,9 +833,6 @@ async fn prepare_observation(
     } else if let AdmittedRead::Cohort(cohort) = &opening.admitted {
         match (need.relation(),cohort) {
             (ProviderReadRelationNeed::PinnedFileSet { .. },QueryFrozenCohortRead::PinnedFileSet(read)) => {
-                if read.frozen_source.is_some() {
-                    *observation=Some(ReadObservation::OriginalFrozenSource); return Ok(());
-                }
                 K::PinnedFileSet { pinned:read.pinned.clone() }
             },
             (ProviderReadRelationNeed::TableExecute { .. },QueryFrozenCohortRead::TableExecute(read)) => {
@@ -1077,16 +1073,14 @@ fn finish_prepared_read_borrowed(
     })?;
     let metadata = opening.request_control.metadata();
     let opened = match observation {
-        ReadObservation::OriginalFrozenSource | ReadObservation::OriginalPreparedSource => {
-            open_relation(
-                metadata.as_ref(),
-                session,
-                &opening.table,
-                need.relation(),
-                &opening.admitted,
-                &opening.name,
-            )?
-        }
+        ReadObservation::OriginalPreparedSource => open_relation(
+            metadata.as_ref(),
+            session,
+            &opening.table,
+            need.relation(),
+            &opening.admitted,
+            &opening.name,
+        )?,
         ReadObservation::Physical(prepared) => {
             let relation = metadata
                 .create_prepared_relation(prepared)
@@ -1448,14 +1442,6 @@ fn open_relation(
                 ProviderReadRelationNeed::PinnedFileSet { .. },
                 QueryFrozenCohortRead::PinnedFileSet(read),
             ) => {
-                if let Some(source) = &read.frozen_source {
-                    // The actual read generation adopts the provider's source;
-                    // FE neither interprets it nor substitutes generic reopening.
-                    return metadata
-                        .adopt_frozen_source(session, source)
-                        .map(|handle| (handle, None, None))
-                        .map_err(|error| ProviderReadError::from(error).context(format!("provider read of {name} cannot adopt its original frozen source")));
-                }
                 metadata
                 .get_pinned_file_set_handle(session, table, &read.pinned)
                 .map_err(|error| ProviderReadError::from(error).context(format!(

@@ -3,3 +3,9 @@
 id	v
 1	a
 2	bb
+
+-- query 6
+-- types	bigint	varchar
+id	v
+1	a
+2	bb

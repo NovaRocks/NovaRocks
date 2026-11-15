@@ -43,7 +43,7 @@ use novarocks_execution_contract::root_lifetime::{RootResultLifetime, RootRetent
 use novarocks_execution_contract::root_result::{
     RootReadOutcome, RootResultData, RootResultEnd, RootResultRead, RootResultReply,
 };
-use novarocks_result_contract::{InternalResultDomain, RootOutputKind, RootProfileV1};
+use novarocks_result_contract::{RootOutputKind, RootProfileV1};
 use tokio::sync::Notify;
 
 use crate::WorkerResultRetainedLimits;
@@ -845,29 +845,6 @@ impl Drop for PhysicalReservationPosition {
         }
     }
 }
-/// The COW producer's single normalization scope. Its real byte liability
-/// survives input retirement until the last retained normalized owner exits.
-/// Nested requests extend the existing budget, never a recursive credit list.
-pub struct RootConstructionReservation {
-    scope: crate::result_buffer::ResultConstructionScope,
-    _position: PhysicalReservationPosition,
-}
-impl RootConstructionReservation {
-    pub fn try_grow(&mut self, bytes: usize) -> Result<(), RootChannelError> {
-        if self
-            .scope
-            .try_grow(bytes)
-            .map_err(RootChannelError::Funding)?
-        {
-            Ok(())
-        } else {
-            Err(RootChannelError::Capacity(
-                RootCapacityRefusal::unavailable(bytes),
-            ))
-        }
-    }
-}
-
 struct RetainedReservationOwner {
     credit: Mutex<ResultWriteCredit>,
     _position: PhysicalReservationPosition,
@@ -1042,22 +1019,15 @@ impl RootResultChannel {
     // readiness lives in the separate RootInputAuthority registry.
     const WRITABLE_CALLBACK_CAPACITY: usize = ROOT_WRITABLE_ENTRIES;
 
-    fn retained_reservation_positions(kind: RootOutputKind) -> usize {
+    fn retained_reservation_positions() -> usize {
         let geometry = NativeResultSupportGeometry::V1;
-        let normalization = usize::from(
-            kind == RootOutputKind::InternalFacts(InternalResultDomain::CowSelectionArrowV1),
-        );
-        2 + normalization
-            + (geometry.root_live_send_holders * geometry.root_independent_payload_copies_per_send)
-                as usize
+        2 + (geometry.root_live_send_holders * geometry.root_independent_payload_copies_per_send)
+            as usize
     }
 
-    fn credit_control_backing_bytes(
-        task: novarocks_execution_contract::TaskIdentity,
-        kind: RootOutputKind,
-    ) -> usize {
+    fn credit_control_backing_bytes(task: novarocks_execution_contract::TaskIdentity) -> usize {
         let geometry = NativeResultSupportGeometry::V1;
-        let positions = Self::retained_reservation_positions(kind);
+        let positions = Self::retained_reservation_positions();
         let segments = (geometry.root_active_segment_positions
             + geometry.root_queued_segment_positions
             + geometry.root_retired_segment_tail_positions) as usize;
@@ -1104,7 +1074,6 @@ impl RootResultChannel {
 
     fn core_metadata_layout(
         task: novarocks_execution_contract::TaskIdentity,
-        kind: RootOutputKind,
     ) -> Result<RootCoreMetadataLayout, RootChannelError> {
         use std::alloc::Layout;
         let fixed =
@@ -1148,7 +1117,7 @@ impl RootResultChannel {
             Observable::unbounded_subscription_backing_bytes()
                 .map_err(RootChannelError::Observable)?,
             callback_arc_bytes(&budget_wake),
-            Self::credit_control_backing_bytes(task, kind),
+            Self::credit_control_backing_bytes(task),
             Self::bytes_owner_metadata_bytes(),
             // The first failure retains one bounded neutral diagnostic, never
             // its original source. Its text backing belongs to this root.
@@ -1188,7 +1157,7 @@ impl RootResultChannel {
             NativeResultSupportGeometry::V1.root_fixed_schema_cursor_driver_capacity_bytes as usize;
         // Admit the sealed owner/queue layouts before constructing any of the
         // root's retained metadata. The wire frame envelope is independent.
-        let layout = Self::core_metadata_layout(spec.task, spec.contract.kind())?;
+        let layout = Self::core_metadata_layout(spec.task)?;
         let schema_bytes = match spec.contract.output() {
             novarocks_result_contract::FrozenRootOutput::ClientRows(schema) => {
                 schema.backing_bytes()
@@ -1338,14 +1307,9 @@ impl RootResultChannel {
             });
         }
         let geometry = NativeResultSupportGeometry::V1;
-        // Driver metadata, actual send holders, session and frozen COW recipe.
-        let recipe = usize::from(
-            self.spec.contract.kind()
-                == RootOutputKind::InternalFacts(InternalResultDomain::CowSelectionArrowV1),
-        );
-        let positions = (geometry.root_maximum_root_drivers + geometry.root_live_send_holders + 1)
-            as usize
-            + recipe;
+        // Driver metadata, actual send holders and the original session.
+        let positions =
+            (geometry.root_maximum_root_drivers + geometry.root_live_send_holders + 1) as usize;
         self.physical
             .fixed_metadata_holders
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -1390,37 +1354,6 @@ impl RootResultChannel {
                 .map_err(RootChannelError::Funding)
         })
     }
-    /// One cursor scratch, one source input, one COW normalization scope and
-    /// the frozen independent send copies determine the physical holder bound.
-    /// A scope is admitted under the same close fence as ordinary credits.
-    pub fn begin_cow_construction(&self) -> Result<RootConstructionReservation, RootChannelError> {
-        let state = self.state.lock().unwrap();
-        if !state.lifetime.allows_read() {
-            return Err(RootChannelError::Closed);
-        }
-        if self.spec.contract.kind()
-            != RootOutputKind::InternalFacts(InternalResultDomain::CowSelectionArrowV1)
-        {
-            return Err(RootChannelError::Payload);
-        }
-        let positions = Self::retained_reservation_positions(self.spec.contract.kind());
-        if !self.physical.retained_reservations.try_admit(positions) {
-            return Err(RootChannelError::Capacity(RootCapacityRefusal::positions(
-                positions,
-                self.physical.retained_reservations.count(),
-            )));
-        }
-        let position = PhysicalReservationPosition(Arc::clone(&self.physical), true);
-        let scope = self.budget.construction_scope(
-            ResultBufferKey::Task(self.spec.task),
-            self.limits.per_root().get(),
-        );
-        drop(state);
-        Ok(RootConstructionReservation {
-            scope,
-            _position: position,
-        })
-    }
     fn try_reserve_funding(
         &self,
         bytes: usize,
@@ -1434,9 +1367,9 @@ impl RootResultChannel {
             if !state.lifetime.allows_read() {
                 return Err(RootChannelError::Closed);
             }
-            // Scratch, input, COW normalization and exact independent send copies.
+            // Scratch, input and exact independent send copies.
             // Small reservations cannot grow an unbounded list of credit objects.
-            let positions = Self::retained_reservation_positions(self.spec.contract.kind());
+            let positions = Self::retained_reservation_positions();
             if !self.physical.retained_reservations.try_admit(positions) {
                 return Ok(ResultWriteAdmission::Blocked);
             }
@@ -2650,30 +2583,6 @@ mod tests {
         (channel, budget)
     }
     #[test]
-    fn cow_construction_keeps_one_physical_scope_until_actual_exit() {
-        let (channel, budget) = channel(FrozenRootOutput::InternalFacts(
-            InternalResultDomain::CowSelectionArrowV1,
-        ));
-        let base = budget.retained_bytes_for_test();
-        let mut scope = channel.begin_cow_construction().unwrap();
-        for _ in 0..64 {
-            scope.try_grow(8).unwrap();
-        }
-        assert_eq!(channel.physical.retained_reservations.count(), 1);
-        assert_eq!(budget.retained_bytes_for_test(), base + 512);
-        let observation = channel.physical_exit_observation();
-        channel.close(RootRetentionClose::ParticipationAborted);
-        assert!(!observation.output_exited());
-        assert!(matches!(
-            channel.begin_cow_construction(),
-            Err(RootChannelError::Closed)
-        ));
-        drop(scope);
-        assert_eq!(budget.retained_bytes_for_test(), base);
-        assert!(observation.output_exited());
-    }
-
-    #[test]
     fn metadata_growth_uses_one_holder_and_failed_growth_never_mutates_coverage() {
         let (channel, _) = channel(FrozenRootOutput::CountOnly);
         let baseline = channel
@@ -2847,8 +2756,7 @@ mod tests {
         assert!(channel.state.try_lock().is_ok());
         assert!(channel.physical.notification.try_lock().is_ok());
         let geometry = NativeResultSupportGeometry::V1;
-        let reservations =
-            RootResultChannel::retained_reservation_positions(channel.spec.contract.kind());
+        let reservations = RootResultChannel::retained_reservation_positions();
         let segments = (geometry.root_active_segment_positions
             + geometry.root_queued_segment_positions
             + geometry.root_retired_segment_tail_positions) as usize;
@@ -2865,10 +2773,7 @@ mod tests {
             root_mutexes.len() * std::alloc::Layout::new::<(isize, [u8; 56])>().size();
         let root_condvar_backing = std::alloc::Layout::new::<(isize, [u8; 40])>().size();
         assert_eq!(
-            RootResultChannel::credit_control_backing_bytes(
-                channel.spec.task,
-                channel.spec.contract.kind()
-            ),
+            RootResultChannel::credit_control_backing_bytes(channel.spec.task),
             funded_controls
                 + reservation_owners
                 + private_mutexes
@@ -2880,11 +2785,7 @@ mod tests {
     #[test]
     fn healthy_writable_epochs_reuse_original_slots_without_retaining_metadata() {
         let (channel, budget) = channel(FrozenRootOutput::CountOnly);
-        let layout = RootResultChannel::core_metadata_layout(
-            channel.spec.task,
-            channel.spec.contract.kind(),
-        )
-        .unwrap();
+        let layout = RootResultChannel::core_metadata_layout(channel.spec.task).unwrap();
         let initial = channel
             .try_ownership_snapshot()
             .unwrap()
@@ -3260,9 +3161,7 @@ mod tests {
             ClientRenderSchema, NativeRenderType, RenderColumn, RenderField, RenderPresentation,
         };
         let root = task();
-        let core = RootResultChannel::core_metadata_layout(root, RootOutputKind::ClientRows)
-            .unwrap()
-            .bytes;
+        let core = RootResultChannel::core_metadata_layout(root).unwrap().bytes;
         let fixed =
             NativeResultSupportGeometry::V1.root_fixed_schema_cursor_driver_capacity_bytes as usize;
         let name_capacity = fixed.checked_sub(core).unwrap().checked_add(1).unwrap();

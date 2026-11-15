@@ -898,23 +898,6 @@ impl IcebergAttemptTableAccess {
         }
     }
 
-    /// The COW author borrows the loaded SDK table and shares its metadata.
-    /// The original operation remains active while its access facts are frozen.
-    pub(crate) fn freeze_with_original_scope(
-        table: &IcebergPhysicalTable,
-        scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
-    ) -> Result<Arc<Self>, novarocks_spi::connector::ConnectorCowBeginCause> {
-        scope.active()?;
-        let id = table.table.identifier();
-        Ok(Arc::new(Self {
-            identifier: id.clone(),
-            metadata: table.table.metadata_ref(),
-            metadata_location: table.table.metadata_location().map(str::to_owned),
-            readonly: table.table.readonly(),
-            renewal: table.attempt_access_if_vended(),
-        }))
-    }
-
     pub(crate) fn identifier(&self) -> &crate::iceberg::TableIdent {
         &self.identifier
     }

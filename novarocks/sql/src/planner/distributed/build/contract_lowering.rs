@@ -2461,7 +2461,11 @@ impl<'a> ContractLoweringVisitor<'a> {
                                 self.lower_expression(node, expression, &child.columns)
                             })
                             .transpose()?;
-                        Ok((value, expression))
+                        Ok(novarocks_physical_plan::ChangeAssignment {
+                            output: value,
+                            expression,
+                            write_input: assignment.write_input.clone(),
+                        })
                     })
                     .collect::<Result<Vec<_>, ContractLoweringError>>()?;
                 Ok(ChangeEventSpec {
@@ -3360,14 +3364,24 @@ impl<'a> ContractLoweringVisitor<'a> {
                         "write target field {field_ordinal} type differs from its input contract"
                     )));
                 }
+                let ty = column_value_type(input, self.control)?;
+                let projected_value = self.fragment_mut().add_value(
+                    ty.clone(),
+                    ValueOrigin::WriterDerived {
+                        writer_node: node,
+                        kind: WriterDerivedKind::ProjectedInput,
+                    },
+                )?;
                 Ok(WriterTargetField {
+                    storage_type: target.storage_type.clone(),
                     token: target.token,
                     provider_name: target.column.name.clone().into(),
                     input: *value,
+                    projected: projected_value,
                     // Stated in the plan's own vocabulary, like every other
                     // type it carries: the provider's decoration belongs to
                     // the contract the field was frozen from, not to the plan.
-                    ty: column_value_type(input, self.control)?,
+                    ty,
                     hidden: target.is_hidden,
                 })
             })
@@ -3384,12 +3398,15 @@ impl<'a> ContractLoweringVisitor<'a> {
                 if call.input_slot_id() == 0 {
                     return Err(invalid_write("writer input slot is zero".into()));
                 }
-                let input = projected.output.get(input_index).copied().ok_or_else(|| {
-                    invalid_write(format!(
-                        "writer aggregate input slot {} is outside the exact input",
-                        call.input_slot_id()
-                    ))
-                })?;
+                let input = target_fields
+                    .get(input_index)
+                    .map(|field| field.projected)
+                    .ok_or_else(|| {
+                        invalid_write(format!(
+                            "writer aggregate input slot {} is outside the exact input",
+                            call.input_slot_id()
+                        ))
+                    })?;
                 let output = output_slots
                     .get(&call.intermediate_slot_id())
                     .copied()
@@ -3529,19 +3546,43 @@ impl<'a> ContractLoweringVisitor<'a> {
         write: &SqlWritePlanInput,
     ) -> Result<LoweredNode, ContractLoweringError> {
         let width = write.contract.input_columns.len();
-        // A writer publishes rows the target accepts. Nullability is checked
-        // there for each row; it does not change the value carried across a
-        // router edge. A different data type needs an explicit conversion.
+        // Preserve V when the original W/T declaration permits assignment.
+        // The writer checks reachable required values and constructs W. Only
+        // an ordinary value conversion needs another source projection.
         let mut source_matches_target = source.output.len() == width;
         if source_matches_target {
-            for (value, column) in source.output.iter().zip(&write.contract.input_columns) {
+            for (field_ordinal, (value, column)) in source
+                .output
+                .iter()
+                .zip(&write.contract.input_columns)
+                .enumerate()
+            {
                 let ty = self.value_declared_type_in(source.fragment, *value)?;
                 let target = column_value_type(column, self.control)?;
-                if !ty.same_physical_binding_ignoring_root_nullability_observed(&target, || {
-                    self.control
-                        .checkpoint(CompilePhase::LowerProgram, 1)
-                        .map_err(ContractLoweringError::from)
-                })? {
+                let field = write
+                    .contract
+                    .target
+                    .fields
+                    .get(field_ordinal)
+                    .ok_or_else(|| {
+                        invalid_write("writer projection has no original target occurrence".into())
+                    })?;
+                let related =
+                    novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+                        ty.typed_binding().borrowed(),
+                        target.typed_binding().borrowed(),
+                        field
+                            .storage_type
+                            .as_ref()
+                            .map(|storage| storage.typed_binding().borrowed()),
+                        || {
+                            self.control
+                                .checkpoint(CompilePhase::LowerProgram, 1)
+                                .map_err(ContractLoweringError::from)
+                        },
+                    )?
+                    .is_some();
+                if !related {
                     source_matches_target = false;
                     break;
                 }
@@ -3571,7 +3612,25 @@ impl<'a> ContractLoweringVisitor<'a> {
             {
                 let expected = column_value_type(column, self.control)?;
                 let actual = expression_type(expression);
-                if actual != expected {
+                let field = write.contract.target.fields.get(ordinal).ok_or_else(|| {
+                    invalid_write("writer root expression has no original target occurrence".into())
+                })?;
+                let related =
+                    novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+                        actual.typed_binding().borrowed(),
+                        expected.typed_binding().borrowed(),
+                        field
+                            .storage_type
+                            .as_ref()
+                            .map(|storage| storage.typed_binding().borrowed()),
+                        || {
+                            self.control
+                                .checkpoint(CompilePhase::LowerProgram, 1)
+                                .map_err(ContractLoweringError::from)
+                        },
+                    )?
+                    .is_some();
+                if !related {
                     return Err(ContractLoweringError::ExpressionTypeMismatch {
                         context: format!("TableWriter root projection {ordinal}"),
                         expected,
@@ -3628,13 +3687,40 @@ impl<'a> ContractLoweringVisitor<'a> {
                 let ty =
                     column_value_type(&write.contract.input_columns[field_ordinal], self.control)?;
                 let source_ty = self.value_declared_type_in(source.fragment, value)?;
-                // A conversion is where the two types meet, whichever of them
-                // differs: a column that admits a null the value never holds
-                // is stated the same way a narrower one is.
-                if source_ty == ty {
+                // Compare this exact target occurrence with actual V before
+                // considering ordinary conversion. W stays independently
+                // declared at the writer.
+                let field = write
+                    .contract
+                    .target
+                    .fields
+                    .get(field_ordinal)
+                    .ok_or_else(|| {
+                        invalid_write(
+                            "writer ordinal projection has no original target occurrence".into(),
+                        )
+                    })?;
+                let related =
+                    novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+                        source_ty.typed_binding().borrowed(),
+                        ty.typed_binding().borrowed(),
+                        field
+                            .storage_type
+                            .as_ref()
+                            .map(|storage| storage.typed_binding().borrowed()),
+                        || {
+                            self.control
+                                .checkpoint(CompilePhase::LowerProgram, 1)
+                                .map_err(ContractLoweringError::from)
+                        },
+                    )?
+                    .is_some();
+                if related {
+                    // The selected writer assignment owns V -> W construction.
+                    // Keep both the real source promise and its original ID.
                     let expression = self.fragment_mut().add_expression(
                         node,
-                        ty,
+                        source_ty.clone(),
                         ContractExprKind::Value(value),
                     )?;
                     expressions.push((expression, value));
@@ -14914,62 +15000,6 @@ mod tests {
     }
 
     #[test]
-    fn external_count_owner_keeps_writer_validation_without_a_summary_input() {
-        use crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input;
-        let input = column(1, "order_id", DataType::Int64, false);
-        let source = values(vec![input], Vec::new());
-        let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
-        let auxiliary = WriterAuxiliaryPlan::without_requirements([ordinal]).unwrap();
-        let mut write =
-            simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal);
-        write.finish_count_mode = novarocks_physical_plan::FinishCountMode::ExternalOwner;
-        let plan = lower_final_physical_write_plan(
-            &source,
-            version(),
-            dop(),
-            FinalWriteLowering {
-                reads: None,
-                write,
-                write_target_ordinal: ordinal,
-                auxiliary: &auxiliary,
-                targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
-            },
-            crate::functions::builtin_sql_function_catalog().snapshot(),
-            false,
-            crate::constant::test_constant_policy(),
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .unwrap()
-        .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .unwrap()
-        .plan()
-        .clone();
-        let (node, finish) = plan
-            .fragments()
-            .values()
-            .flat_map(|fragment| fragment.nodes().values())
-            .find_map(|node| match &node.kind {
-                NodeKind::TableFinish(spec) => Some((node, spec)),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(
-            finish.count_mode,
-            novarocks_physical_plan::FinishCountMode::ExternalOwner
-        );
-        assert_eq!(finish.expected_target_ordinals.as_ref(), &[ordinal]);
-        assert_eq!(node.inputs.len(), 1);
-        assert_eq!(finish.inputs.writer_results, 0);
-        assert!(finish.inputs.summaries.write_counts.is_none());
-        assert!(finish.summaries.write_counts.is_none());
-        assert_eq!(
-            finish.input_schema.fields.len(),
-            novarocks_spi::connector::write_stack::WRITE_RELATION_COLUMN_COUNT
-        );
-        assert_eq!(finish.output_schema.fields.len(), 12);
-    }
-
-    #[test]
     fn ordinary_write_preserves_repeated_source_output_occurrences() {
         use crate::planner::distributed::write::contract::test_support::repeated_source_sql_write_plan_input;
 
@@ -15013,6 +15043,29 @@ mod tests {
         assert_eq!(target.input.len(), 2);
         assert_eq!(target.input[0], target.input[1]);
         assert_eq!(target.target_fields[0].input, target.target_fields[1].input);
+        assert_ne!(
+            target.target_fields[0].projected,
+            target.target_fields[1].projected
+        );
+        for field in &target.target_fields {
+            assert_ne!(field.projected, field.input);
+            let value = plan
+                .fragments()
+                .values()
+                .find_map(|fragment| {
+                    fragment.values().get(&field.projected).filter(|value| {
+                        matches!(
+                            value.origin,
+                            ValueOrigin::WriterDerived {
+                                kind: WriterDerivedKind::ProjectedInput,
+                                ..
+                            }
+                        )
+                    })
+                })
+                .expect("each field owns its distinct projected declaration");
+            assert_eq!(value.ty, field.ty);
+        }
     }
 
     #[test]
@@ -15213,7 +15266,6 @@ mod tests {
                     colocation: ConnectorWriteColocation::ByKey(vec![raw_fields[0].token()]),
                     layout: ConnectorWriteLayoutPreference::None,
                 },
-                Vec::new(),
             )
             .unwrap()
         })
@@ -15246,6 +15298,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, column)| SqlWriteTargetField {
+                storage_type: None,
                 token: token(i as u8 + 11),
                 column: column.clone(),
                 is_hidden: false,
@@ -15317,11 +15370,13 @@ mod tests {
                         .iter()
                         .zip(&inputs)
                         .map(|(out, input)| DistributedChangeEventOutputExpr {
+                            write_input: None,
                             output_column_id: out.column_id,
                             expr: (effect != ConnectorRowMutationEffect::Insert)
                                 .then(|| column_ref(input)),
                         })
                         .chain([DistributedChangeEventOutputExpr {
+                            write_input: None,
                             output_column_id: data.column_id,
                             expr: Some(column_ref(&inputs[1])),
                         }])
@@ -15478,6 +15533,7 @@ mod tests {
                     predicate: None,
                     effect,
                     assignments: vec![DistributedChangeEventOutputExpr {
+                        write_input: None,
                         output_column_id: data.column_id,
                         expr: Some(column_ref(&input)),
                     }],
@@ -15748,6 +15804,7 @@ mod tests {
                     predicate: None,
                     effect: ConnectorRowMutationEffect::Replace,
                     assignments: vec![DistributedChangeEventOutputExpr {
+                        write_input: None,
                         output_column_id: data.column_id,
                         expr: Some(column_ref(&input)),
                     }],

@@ -677,7 +677,8 @@ impl PhysicalExpressionRoots {
                             if let Some(expr) = item.predicate {
                                 collector.add(id, ChangePredicate { event }, expr, TruthOnly)?;
                             }
-                            for (assignment, (_, expr)) in item.assignments.iter().enumerate() {
+                            for (assignment, item) in item.assignments.iter().enumerate() {
+                                let expr = &item.expression;
                                 collector.before()?;
                                 if let Some(expr) = expr {
                                     collector.add(

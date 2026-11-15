@@ -5,6 +5,10 @@ domain: [pipeline-execution, sql-compiler]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0233
+    scope: "Only COW result purpose, CSA2 recipe/encoding/custody and COW-specific record policy retire; shared BatchRecipe/NRU1, requiredness, ordinary root IPC and resource/exit rules remain active"
+    link: "ADR-0233-iceberg-mor-only-and-provider-owned-write-validation.md"
 date: 2026-11-03
 provenance:
   - "discussion: 2026-11-03 preparation-bound Arrow units, logical requiredness and evidence-based capacity limits"

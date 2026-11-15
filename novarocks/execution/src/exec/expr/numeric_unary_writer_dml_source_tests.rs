@@ -110,6 +110,7 @@ fn source(
             namespace: "fixture".into(),
             table: "target".into(),
             fields: vec![DmlWriteTargetField {
+                storage_type: None,
                 token: ConnectorWriteFieldToken::from_bytes([1; 32]),
                 column: column.clone(),
                 is_hidden: false,
@@ -422,6 +423,7 @@ fn wide_collect_true_source() -> (
                 .iter()
                 .enumerate()
                 .map(|(i, column)| DmlWriteTargetField {
+                    storage_type: None,
                     token: token(i),
                     column: column.clone(),
                     is_hidden: false,

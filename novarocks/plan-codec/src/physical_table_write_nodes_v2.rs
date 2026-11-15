@@ -58,6 +58,7 @@ pub struct TableWriteNodeProjectionLimits {
 #[derive(Clone, Copy, Debug)]
 pub enum TableWriteTypeIds<'a> {
     Writer {
+        /// Flat original type IDs: each field's W, then its optional T.
         target_fields: &'a [u32],
         output_schema: &'a [u32],
     },
@@ -240,7 +241,6 @@ fn finish_mode(value: i32) -> Result<p::FinishCountMode, Error> {
     match wire::FinishCountMode::try_from(value) {
         Ok(wire::FinishCountMode::LogicalChanges) => Ok(p::FinishCountMode::LogicalChanges),
         Ok(wire::FinishCountMode::WriterReported) => Ok(p::FinishCountMode::WriterReported),
-        Ok(wire::FinishCountMode::ExternalOwner) => Ok(p::FinishCountMode::ExternalOwner),
         _ => Err(invalid("finish count mode is absent or unknown")),
     }
 }
@@ -367,7 +367,7 @@ fn encode_model(n: &p::PhysicalNode, b: &Body<'_>) -> Result<(Model, usize), Err
         Body::Writer(t) => (
             add(t.input.len(), c)?,
             add(
-                add(t.input.len(), t.target_fields.len())?,
+                add(t.input.len(), mul(2, t.target_fields.len())?)?,
                 add(t.output_schema.fields.len(), mul(2, c)?)?,
             )?,
             add(
@@ -439,7 +439,7 @@ fn decode_model(
             (
                 add(t.input_value_ids.len(), c)?,
                 add(
-                    add(t.input_value_ids.len(), t.target_fields.len())?,
+                    add(t.input_value_ids.len(), mul(2, t.target_fields.len())?)?,
                     add(s.fields.len(), mul(2, c)?)?,
                 )?,
                 add(
@@ -794,6 +794,7 @@ fn prepare_encode_core(
             }
             for f in &t.target_fields {
                 reference(f.input.get(), values, w)?;
+                reference(f.projected.get(), values, w)?;
                 w.step()?;
             }
             for f in &t.output_schema.fields {
@@ -1242,6 +1243,7 @@ fn prepare_decode_core(
             }
             for f in &t.target_fields {
                 reference(required(f.input_value_id, w)?, e.values(), w)?;
+                reference(required(f.projected_value_id, w)?, e.values(), w)?;
                 w.step()?;
             }
             for f in &raw_schema(t.output_schema.as_ref(), w)?.fields {
@@ -1376,9 +1378,6 @@ fn emit_encode(
                     }
                     p::FinishCountMode::WriterReported => {
                         wire::FinishCountMode::WriterReported as i32
-                    }
-                    p::FinishCountMode::ExternalOwner => {
-                        wire::FinishCountMode::ExternalOwner as i32
                     }
                 },
                 writer_results_input: Some(t.inputs.writer_results),

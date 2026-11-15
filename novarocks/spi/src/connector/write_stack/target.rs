@@ -35,10 +35,9 @@ use crate::connector::{ConnectorError, ConnectorErrorKind};
 ///
 /// This is deliberately weaker than [`validate_dense_target_ordinals`], and the
 /// two must not be merged. Denseness from zero is a property of the *session's*
-/// sealed target set, not of any single query: a copy-on-write statement drives
-/// several queries against one session and compiles exactly one writer per
-/// query, at that group's own ordinal. Query `k` therefore legitimately expects
-/// `[k]`, which is not dense from zero and never will be. What a query can still
+/// sealed target set, not of any single query. A query may compile exactly one
+/// writer at its own ordinal within the same sealed session. Query `k` therefore
+/// legitimately expects `[k]`, which is not dense from zero and never will be. What a query can still
 /// assert is that it feeds at least one target, names none of them twice, and
 /// stays inside the bound the session sealed -- the caller supplies the sealed
 /// set that bounds it.
@@ -142,8 +141,7 @@ mod tests {
         assert!(validate_dense_target_ordinals(&ordinals(&[1, 2])).is_err());
     }
 
-    /// A copy-on-write statement drives one query per rewritten file against a
-    /// single session, and query `k` compiles exactly one writer -- the one at
+    /// A query within a sealed session may compile exactly one writer at
     /// ordinal `k`. Its expected set is `[k]`, which the session-level check
     /// rejects and the query-level check must accept.
     #[test]

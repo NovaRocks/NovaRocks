@@ -194,6 +194,8 @@ fn expected_schema() -> wire::WriterRelationSchema {
 fn source_targets(roots: &[(u32, FunctionValueType)]) -> Box<[p::WriterTargetField]> {
     Box::from([
         p::WriterTargetField {
+            storage_type: None,
+            projected: p::ValueId::new(1),
             token: ConnectorWriteFieldToken::from_bytes([0; 32]),
             provider_name: "first / é".into(),
             input: p::ValueId::new(0),
@@ -201,6 +203,8 @@ fn source_targets(roots: &[(u32, FunctionValueType)]) -> Box<[p::WriterTargetFie
             hidden: false,
         },
         p::WriterTargetField {
+            storage_type: None,
+            projected: p::ValueId::new(4294967294),
             token: ConnectorWriteFieldToken::from_bytes([255; 32]),
             provider_name: "second / 值".into(),
             input: p::ValueId::new(u32::MAX),
@@ -212,6 +216,8 @@ fn source_targets(roots: &[(u32, FunctionValueType)]) -> Box<[p::WriterTargetFie
 fn expected_targets() -> Vec<wire::WriterTargetField> {
     vec![
         wire::WriterTargetField {
+            storage_value_type_id: None,
+            projected_value_id: Some(1),
             token: vec![0; 32],
             provider_name: "first / é".into(),
             input_value_id: Some(0),
@@ -219,6 +225,8 @@ fn expected_targets() -> Vec<wire::WriterTargetField> {
             hidden: false,
         },
         wire::WriterTargetField {
+            storage_value_type_id: None,
+            projected_value_id: Some(4294967294),
             token: vec![255; 32],
             provider_name: "second / 值".into(),
             input_value_id: Some(u32::MAX),
@@ -306,6 +314,8 @@ fn writer_target_fields_complete_independent_wire_preserves_tokens_hidden_and_nu
         // Input membership and its nullability are not rebound by this component:
         // the declared target field type comes only from its authored type ID.
         let input = vec![wire::WriterTargetField {
+            storage_value_type_id: None,
+            projected_value_id: Some(4294967294),
             token: vec![7; 32],
             provider_name: "".into(),
             input_value_id: Some(u32::MAX),
@@ -591,6 +601,8 @@ fn small_raw() -> wire::WriterRelationSchema {
 }
 fn small_target() -> Box<[p::WriterTargetField]> {
     Box::from([p::WriterTargetField {
+        storage_type: None,
+        projected: p::ValueId::new(1),
         token: ConnectorWriteFieldToken::from_bytes([7; 32]),
         provider_name: "a".into(),
         input: p::ValueId::new(0),
@@ -600,6 +612,8 @@ fn small_target() -> Box<[p::WriterTargetField]> {
 }
 fn small_raw_target() -> Vec<wire::WriterTargetField> {
     vec![wire::WriterTargetField {
+        storage_value_type_id: None,
+        projected_value_id: Some(1),
         token: vec![7; 32],
         provider_name: "a".into(),
         input_value_id: Some(0),
@@ -1729,6 +1743,133 @@ fn writer_schema_captured_comparison_prefix_numeric_first_and_final_peak() {
                 Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
             assert_eq!(c.trace(), vec![(CompilePhase::Decode, 0)]);
+        }
+    }
+}
+
+#[test]
+fn writer_target_decode_requires_its_projected_value_identity() {
+    let control = Control::default();
+    with_types(&control, |_, _, read| {
+        let mut raw = small_raw_target();
+        raw[0].projected_value_id = None;
+        assert!(decode_writer_target_fields(&raw, read, SOURCE, limits(), &control).is_err());
+    });
+}
+
+fn projected_target() -> Box<[p::WriterTargetField]> {
+    Box::from([p::WriterTargetField {
+        token: ConnectorWriteFieldToken::from_bytes([17; 32]),
+        provider_name: "raw".into(),
+        input: p::ValueId::new(0),
+        projected: p::ValueId::new(1),
+        ty: FunctionValueType::new(DataType::Binary, false),
+        storage_type: Some(FunctionValueType::new(DataType::FixedSizeBinary(16), false)),
+        hidden: false,
+    }])
+}
+fn projected_roots() -> Vec<(u32, FunctionValueType)> {
+    vec![
+        (0, FunctionValueType::new(DataType::Binary, false)),
+        (
+            1,
+            FunctionValueType::new(DataType::FixedSizeBinary(16), false),
+        ),
+    ]
+}
+
+#[test]
+fn writer_target_storage_roundtrips_and_counts_types_without_duplicating_names_or_tokens() {
+    let c = Control::default();
+    let roots = projected_roots();
+    let types = encode_type_table_sources(&roots, &[], type_limits(), &c).unwrap();
+    let read = decode_type_table(types.as_wire(), type_limits(), &c).unwrap();
+    let source = projected_target();
+    c.arm(None);
+    let (wire, facts) =
+        encode_writer_target_fields(&source, &[0, 1], &types, SOURCE, limits(), &c).unwrap();
+    assert_eq!(wire[0].value_type_id, Some(0));
+    assert_eq!(wire[0].storage_value_type_id, Some(1));
+    assert_eq!(wire[0].token, vec![17; 32]);
+    assert_eq!(&wire[0].provider_name, "raw");
+    assert_eq!(facts.field_count, 1);
+    assert_eq!(facts.type_reference_count, 2);
+    assert_eq!(facts.name_bytes, 3);
+    c.arm(None);
+    assert_eq!(
+        decode_writer_target_fields(&wire, &read, SOURCE, limits(), &c)
+            .unwrap()
+            .0,
+        source
+    );
+    let mut exact = source.clone();
+    exact[0].storage_type = None;
+    c.arm(None);
+    let (_, old) = encode_writer_target_fields(&exact, &[0], &types, SOURCE, limits(), &c).unwrap();
+    assert_eq!(facts.name_bytes, old.name_bytes);
+    assert_eq!(
+        facts.allocation_requests_upper_bound,
+        old.allocation_requests_upper_bound
+    );
+    assert_eq!(
+        facts.allocation_request_bytes_upper_bound,
+        old.allocation_request_bytes_upper_bound
+    );
+    c.arm(None);
+    assert!(matches!(
+        encode_writer_target_fields(&source, &[0, 0], &types, SOURCE, limits(), &c),
+        Err(Error::InvalidShape(_))
+    ));
+    let mut unknown = wire.clone();
+    unknown[0].storage_value_type_id = Some(99);
+    c.arm(None);
+    assert!(matches!(
+        decode_writer_target_fields(&unknown, &read, SOURCE, limits(), &c),
+        Err(Error::InvalidShape(_))
+    ));
+    c.arm(None);
+    let narrow = WriterSchemaProjectionLimits {
+        max_type_references: 1,
+        ..limits()
+    };
+    assert!(matches!(
+        encode_writer_target_fields(&source, &[0, 1], &types, SOURCE, narrow, &c),
+        Err(Error::Control(CompileControlError::ResourceExhausted))
+    ));
+}
+
+fn projected_target_control_case(
+    decode: bool,
+    stop: Option<(usize, CompileControlError)>,
+) -> (Result<(), Error>, Vec<(CompilePhase, u32)>) {
+    let c = Control::default();
+    let roots = projected_roots();
+    let types = encode_type_table_sources(&roots, &[], type_limits(), &c).unwrap();
+    let read = decode_type_table(types.as_wire(), type_limits(), &c).unwrap();
+    let source = projected_target();
+    let wire = encode_writer_target_fields(&source, &[0, 1], &types, SOURCE, limits(), &c)
+        .unwrap()
+        .0;
+    c.arm(stop);
+    let result = if decode {
+        decode_writer_target_fields(&wire, &read, SOURCE, limits(), &c).map(|_| ())
+    } else {
+        encode_writer_target_fields(&source, &[0, 1], &types, SOURCE, limits(), &c).map(|_| ())
+    };
+    (result, c.trace())
+}
+#[test]
+fn writer_target_storage_keeps_every_original_control_refusal_prefix() {
+    for decode in [false, true] {
+        let (result, trace) = projected_target_control_case(decode, None);
+        assert!(result.is_ok());
+        for stop in 0..trace.len() {
+            for cause in CAUSES {
+                let (result, actual) =
+                    projected_target_control_case(decode, Some((stop, cause.clone())));
+                assert!(matches!(result,Err(Error::Control(error)) if error==cause));
+                assert_eq!(actual, trace[..=stop]);
+            }
         }
     }
 }

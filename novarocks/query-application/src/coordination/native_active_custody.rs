@@ -1130,6 +1130,8 @@ impl NativeActiveCustodyReservation {
             remote_deadline: None,
             computation_ready: None,
             streamed_success: None,
+            failure_view: None,
+            accepted_failure: None,
             closed: false,
         };
         Ok((original, rows))
@@ -1150,6 +1152,8 @@ impl NativeActiveCustodyReservation {
             remote_deadline: None,
             computation_ready: None,
             streamed_success: None,
+            failure_view: None,
+            accepted_failure: None,
             closed: false,
         }
     }
@@ -1181,6 +1185,8 @@ pub(crate) struct SupervisedActiveNativeOwner {
     remote_deadline: Option<Instant>,
     computation_ready: Option<crate::api::ComputationReadyToken>,
     streamed_success: Option<AttemptActivationIdentity>,
+    failure_view: Option<super::actor::AcceptedAttemptFailureView>,
+    accepted_failure: Option<crate::api::AcceptedAttemptFailure>,
     closed: bool,
 }
 impl fmt::Debug for SupervisedActiveNativeOwner {
@@ -1225,6 +1231,53 @@ impl SupervisedActiveNativeOwner {
             root,
         )
     }
+    pub(crate) fn bind_failure_view(&mut self, view: super::actor::AcceptedAttemptFailureView) {
+        let activation = view.activation();
+        if activation.execution() == self.custody.key.execution
+            && self
+                .failure_view
+                .as_ref()
+                .is_none_or(|original| original.activation() == activation)
+        {
+            self.failure_view = Some(view);
+        }
+    }
+
+    fn capture_accepted_failure(&mut self) {
+        let Some(view) = self.failure_view.as_ref() else {
+            return;
+        };
+        let activation = view.activation();
+        // Read only the independently held pure cell. No actor command,
+        // mailbox, cancellation or owner exit is required for this snapshot.
+        if let Ok(Some(failure)) = view.snapshot(activation) {
+            let matches_original = failure.activation == activation
+                && match failure.input.site() {
+                    crate::execution_error::ExecutionFailureSite::Task { identity, .. }
+                    | crate::execution_error::ExecutionFailureSite::TaskControl { identity } => {
+                        identity.query_execution_id() == activation.execution()
+                    }
+                    crate::execution_error::ExecutionFailureSite::RootRead { root } => {
+                        root.query_execution_id() == activation.execution()
+                    }
+                    crate::execution_error::ExecutionFailureSite::Operation {
+                        participation,
+                        ..
+                    } => participation.query_execution_id() == activation.execution(),
+                    crate::execution_error::ExecutionFailureSite::Backend { process } => self
+                        .custody
+                        .slot
+                        .participations
+                        .iter()
+                        .any(|p| p.backend_process_id() == process),
+                    crate::execution_error::ExecutionFailureSite::Coordinator => true,
+                };
+            if matches_original {
+                self.accepted_failure = Some(failure);
+            }
+        }
+    }
+
     pub(crate) fn begin_terminal_cut(&mut self, cut: Instant) {
         self.terminal_cut.get_or_insert(cut);
     }
@@ -1238,9 +1291,11 @@ impl SupervisedActiveNativeOwner {
         // preparation or client/cleanup waits can lend a new observation budget.
         let cut = *self.terminal_cut.get_or_insert_with(Instant::now);
         let deadline = *self.remote_deadline.get_or_insert_with(|| cut + budget);
+        self.capture_accepted_failure();
         NativeActiveConvergenceRequest::new(cancellation, deadline)
             .with_computation_ready(self.computation_ready)
             .with_streamed_success(self.streamed_success)
+            .with_accepted_failure(self.accepted_failure.clone())
     }
     pub(crate) fn retain_streamed_success(
         &mut self,

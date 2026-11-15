@@ -697,16 +697,23 @@ impl ProgramTypedChannels {
                             role: Role::WriterProjection,
                             ordinal: ordinal_id(ordinal)?,
                         };
-                        same_value(
-                            self.channel_type(site)
-                                .ok_or(ProgramChannelTypeError::WrongShape)?,
-                            self.definition(
-                                ProgramExpressionArena::WriterProjection(node_id),
-                                *id,
-                            )?,
-                            false,
-                            work,
-                        )?;
+                        let output = self
+                            .channel_type(site)
+                            .ok_or(ProgramChannelTypeError::WrongShape)?;
+                        let source = self
+                            .definition(ProgramExpressionArena::WriterProjection(node_id), *id)?;
+                        let storage = projection
+                            .storage_types
+                            .get(ordinal)
+                            .ok_or(ProgramChannelTypeError::WrongShape)?;
+                        if let Some(storage) = storage {
+                            if novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+                                source.typed_binding().borrowed(), output.typed_binding().borrowed(),
+                                Some(storage.typed_binding().borrowed()), || work.step().map_err(ProgramChannelTypeError::from),
+                            )?.is_none() { return Err(ProgramChannelTypeError::TypeMismatch); }
+                        } else {
+                            same_write_assignment(output, source, work)?;
+                        }
                     }
                     for (ordinal, source) in partial_aggregates.iter().enumerate() {
                         let contract = self.aggregate(ProgramCallSite::WriterPartial {
@@ -1144,6 +1151,24 @@ fn same_value(
         return Err(ProgramChannelTypeError::TypeMismatch);
     };
     same_carrier(actual.data_type(), expected.data_type(), work)
+}
+
+// Writer output has the target's nested NULL requirements. The expression
+// retains its source declaration until the writer checks the actual values.
+// Every other logical and physical binding fact must remain identical.
+fn same_write_assignment(
+    output: &FunctionValueType,
+    source: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramChannelTypeError> {
+    work.step()?;
+    if output.same_physical_binding_ignoring_nullability_observed(source, || {
+        work.step().map_err(ProgramChannelTypeError::from)
+    })? {
+        Ok(())
+    } else {
+        Err(ProgramChannelTypeError::TypeMismatch)
+    }
 }
 
 #[cfg(test)]

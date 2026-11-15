@@ -1150,6 +1150,121 @@ class MachineOwner:
         finally:
             self.backend.operation_deadline = previous
 
+    def resolve_owned_container_cleanup(self, journal, creation_journal):
+        """Settle one proven cleanup obligation; retain its original timeout FAIL."""
+        deadline = time.monotonic() + self.timeout
+        previous = getattr(self.backend, "operation_deadline", None)
+        deadline = min(deadline, previous) if previous is not None else deadline
+        self.backend.operation_deadline = deadline
+        try:
+            with self.maintenance_lock(deadline):
+                self.assert_live_daemon()
+                state = self.read_saved_state()
+                journal, creation_journal = Path(journal), Path(creation_journal)
+                if (state is None or state.get("phase") != "ready"
+                        or state.get("namespace") != self.base.name
+                        or not isinstance(state.get("generation"), str)
+                        or not re.fullmatch(r"[0-9a-f]{32}", state["generation"])
+                        or not isinstance(state.get("version"), str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", state["version"])
+                        or not isinstance(state.get("images"), dict)
+                        or not isinstance(state["images"].get("mc"), dict)
+                        or not journal.is_absolute() or journal.parent != self.base / "operations"
+                        or not re.fullmatch(r"control-[0-9a-f]{32}\.json", journal.name)
+                        or not creation_journal.is_absolute()
+                        or creation_journal.parent != self.base / "activations" / state["generation"] / "operations"
+                        or not re.fullmatch(PROJECT + r"-mc-[0-9a-f]{32}\.json", creation_journal.name)
+                        or any(path.is_symlink() for path in (self.base, journal.parent,
+                            self.base / "activations", creation_journal.parent.parent,
+                            creation_journal.parent))):
+                    raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "cleanup has no exact current machine intent")
+                files = {"control": journal, "request": journal.with_suffix(".request"),
+                         "state": self.base / "state.json", "creation": creation_journal,
+                         "creation_request": creation_journal.with_suffix(".request"),
+                         "stdout": journal.with_suffix(".stdout"),
+                         "stderr": Path(str(journal.with_suffix(".stdout")) + ".stderr")}
+                try:
+                    material = {key: self.backend._terminal_material(path) for key, path in files.items()}
+                    fact, request, frozen_state, creation, created_request = (
+                        json.loads(material[key][0]) for key in
+                        ("control", "request", "state", "creation", "creation_request"))
+                    if not all(isinstance(value, dict) for value in
+                               (fact, request, frozen_state, creation, created_request)):
+                        raise ValueError("invalid cleanup material")
+                except (OSError, ValueError, TypeError) as error:
+                    raise runtime.RuntimeFailure("RuntimeStateUnreadable", "cleanup material is unavailable") from error
+                args = request.get("args")
+                expected_labels = {**self.backend.labels(state),
+                    "novarocks.fixture.version": state["version"],
+                    "novarocks.fixture.activation": state["generation"]}
+                if (frozen_state != state or state.get("kind") != "machine"
+                        or state.get("id") != self.base.name or state.get("project") != PROJECT
+                        or type(fact.get("schema")) is not int or fact["schema"] != 1 or fact.get("kind") != "control"
+                        or fact.get("phase") != "command-unknown" or fact.get("mutating") is not True
+                        or fact.get("control_root") != str(self.root) or fact.get("machine") != self.base.name
+                        or fact.get("command_dispatched") is not True
+                        or type(fact.get("command_exit")) is not int or fact["command_exit"] != 0
+                        or fact.get("command_succeeded") is not False or fact.get("timed_out") is not True
+                        or fact.get("interrupted") is not False
+                        or type(fact.get("cli_pid")) is not int or fact["cli_pid"] <= 0
+                        or not all(fact.get(key) is True for key in
+                                   ("leader_waited", "group_exit_confirmed", "group_exit_observed"))
+                        or any(key in fact for key in ("error", "cleanup_error", "cleanup_failed",
+                            "leader_observation_error", "group_observation_error"))
+                        or set(request) != {"operation", "args", "environment", "deadline_monotonic"}
+                        or request.get("operation") != "control"
+                        or type(request.get("deadline_monotonic")) not in (int, float)
+                        or not math.isfinite(request["deadline_monotonic"])
+                        or type(fact.get("group_exit_observed_monotonic")) not in (int, float)
+                        or not math.isfinite(fact["group_exit_observed_monotonic"])
+                        or fact["group_exit_observed_monotonic"] < request["deadline_monotonic"]
+                        or request.get("environment") != self.backend.environment
+                        or not isinstance(args, list) or len(args) != 4
+                        or args[:3] != ["container", "rm", "--force"]
+                        or not isinstance(args[3], str) or not re.fullmatch(r"[0-9a-f]{64}", args[3])
+                        or material["stdout"][0] != b"" or material["stderr"][0] != b""
+                        or type(creation.get("schema")) is not int or creation["schema"] != 1 or creation.get("phase") != "settled"
+                        or creation.get("container_absent") is not True
+                        or creation.get("container_name") != creation_journal.stem
+                        or creation.get("generation") != state["generation"]
+                        or creation.get("labels") != expected_labels
+                        or creation.get("image_id") != state.get("images", {}).get("mc", {}).get("image_id")
+                        or not isinstance(creation.get("image_id"), str)
+                        or not re.fullmatch(r"sha256:[0-9a-f]{64}", creation["image_id"])
+                        or creation.get("create_dispatched") is not True
+                        or type(creation.get("create_exit")) is not int or creation["create_exit"] != 0
+                        or creation.get("create_reply_id") != args[3] or creation.get("container_id") != args[3]
+                        or set(created_request) != {"environment", "network", "env_file", "script", "deadline_monotonic"}
+                        or created_request.get("environment") != request["environment"]
+                        or created_request.get("network") != state.get("network")
+                        or created_request.get("env_file") != str(creation_journal.with_suffix(".env"))):
+                    raise runtime.RuntimeFailure("MachineOperationUnconfirmed", "cleanup lacks exact original ownership or exit facts")
+                # This never dispatches another rm, start, volume or catalog operation.
+                # Existing inspect policy distinguishes native absence from daemon errors.
+                if self.backend.inspect("container", args[3], absent_ok=True) is not None:
+                    raise runtime.RuntimeFailure("ResourcesStillPresent", "original cleanup container is still present")
+                self.assert_live_daemon()
+                try:
+                    if any(self.backend._terminal_material(path) != material[key] for key, path in files.items()):
+                        raise ValueError("cleanup material changed")
+                except (OSError, ValueError) as error:
+                    raise runtime.RuntimeFailure("RuntimeStateUnreadable", "cleanup material changed during observation") from error
+                if time.monotonic() >= deadline:
+                    raise runtime.RuntimeFailure("RunBudgetExpired", "cleanup settlement deadline expired")
+                settled = dict(fact, phase="settled", container_absent=True,
+                    terminal_failure="owned-container-cleanup-deadline",
+                    reconciled_same_cleanup_intent=True,
+                    terminal_evidence={key: hashlib.sha256(value[0]).hexdigest()
+                                       for key, value in material.items()})
+                runtime.atomic_json(journal, settled)
+                return dict(journal=str(journal), creation_journal=str(creation_journal),
+                    cleanup_obligation="settled", container_absent=True,
+                    original_completion={key: settled[key] for key in ("command_exit", "command_succeeded",
+                        "timed_out", "leader_waited", "group_exit_confirmed", "group_exit_observed")},
+                    terminal_failure=settled["terminal_failure"])
+        finally:
+            self.backend.operation_deadline = previous
+
     def load_config(self):
         state = self.read_saved_state()
         if state:
@@ -1611,6 +1726,9 @@ def main(argv=None):
     commands.add_parser("sweep")
     resolve = commands.add_parser("resolve-readonly-observation")
     resolve.add_argument("--journal", type=Path, required=True)
+    cleanup = commands.add_parser("resolve-owned-container-cleanup")
+    cleanup.add_argument("--journal", type=Path, required=True)
+    cleanup.add_argument("--creation-journal", type=Path, required=True)
     args = parser.parse_args(argv)
     runtime.install_signal_handlers()
     try:
@@ -1637,6 +1755,8 @@ def main(argv=None):
             result = owner.activate(owner.required_definition(config, prepared), upgrade=True)
         elif args.operation == "resolve-readonly-observation":
             result = owner.resolve_readonly_observation(args.journal)
+        elif args.operation == "resolve-owned-container-cleanup":
+            result = owner.resolve_owned_container_cleanup(args.journal, args.creation_journal)
         elif args.operation == "sweep":
             result = owner.sweep()
         else:

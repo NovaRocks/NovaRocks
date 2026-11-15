@@ -33,7 +33,7 @@ pub struct SqlDmlCatalogPreparation {
     session: SqlSessionContext,
     control: SqlCompileControl,
     intent: SqlCompileIntent,
-    root_output_declaration: Option<Vec<novarocks_type_contract::FunctionValueType>>,
+    write_assignments: Option<std::sync::Arc<super::SqlWriteAssignments>>,
 }
 
 impl SqlDmlCatalogPreparation {
@@ -48,28 +48,22 @@ impl SqlDmlCatalogPreparation {
             session,
             control,
             SqlCompileIntent::IcebergWrite { root_distribution },
-            None,
         )
     }
 
-    /// The same catalog prepass for the closed DML computation families. An
-    /// internal COW read retains its complete signed root declaration here.
+    /// The same catalog prepass for the closed DML write computation families.
     pub fn try_new_for_intent(
         statement: SqlStatementInput,
         session: SqlSessionContext,
         control: SqlCompileControl,
         intent: SqlCompileIntent,
-        root_output_declaration: Option<Vec<novarocks_type_contract::FunctionValueType>>,
     ) -> Result<Self, SqlCompileError> {
         if !matches!(
             &intent,
-            SqlCompileIntent::IcebergWrite { .. }
-                | SqlCompileIntent::ChangeStreamWrite
-                | SqlCompileIntent::DmlInternalRead
-        ) || (root_output_declaration.is_some() && intent != SqlCompileIntent::DmlInternalRead)
-        {
+            SqlCompileIntent::IcebergWrite { .. } | SqlCompileIntent::ChangeStreamWrite
+        ) {
             return Err(SqlCompileError::InvalidRequest(
-                "DML catalog preparation requires its exact write or internal-read contract".into(),
+                "DML catalog preparation requires its exact write contract".into(),
             ));
         }
         control.check()?;
@@ -105,8 +99,22 @@ impl SqlDmlCatalogPreparation {
             session,
             control,
             intent,
-            root_output_declaration,
+            write_assignments: None,
         })
+    }
+
+    pub fn with_write_assignments(
+        mut self,
+        assignments: std::sync::Arc<super::SqlWriteAssignments>,
+    ) -> Result<Self, SqlCompileError> {
+        self.control.check()?;
+        if self.write_assignments.is_some() {
+            return Err(SqlCompileError::InvalidRequest(
+                "DML source already has write assignments".into(),
+            ));
+        }
+        self.write_assignments = Some(assignments);
+        Ok(self)
     }
 
     pub fn continue_catalog(
@@ -160,8 +168,8 @@ impl SqlDmlCatalogPreparation {
             policy,
             self.control,
         );
-        let request = match self.root_output_declaration {
-            Some(declaration) => request.with_root_output_declaration(declaration)?,
+        let request = match self.write_assignments {
+            Some(assignments) => request.with_write_assignments(assignments)?,
             None => request,
         };
         SqlCompiler::analyze(request)?.into_pending()
@@ -343,91 +351,552 @@ mod tests {
     }
 
     #[test]
-    fn complete_materialized_rows_retain_the_original_checked_values() {
-        let control = SqlCompileControl::unbounded();
-        let value = variant(&control);
-        let mut query = query("SELECT v.payload FROM (VALUES (0)) AS v(payload)");
-        let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_mut() else {
-            panic!("SELECT fixture")
-        };
-        let novarocks_parser::ast::TableFactor::Derived { subquery, .. } =
-            &mut select.from[0].relation
-        else {
-            panic!("derived fixture")
-        };
-        let novarocks_parser::ast::SetExpr::Values(values) = subquery.body.as_mut() else {
-            panic!("VALUES fixture")
-        };
-        values.rows.clear();
-        let input = SqlStatementInput::materialized_values_query(
-            Box::new(query),
-            super::super::SqlMaterializedValuesSite::SelectFromDerived { from: 0 },
-            vec![vec![value.clone()].into_boxed_slice()].into(),
-            &control,
-        )
-        .unwrap();
-        let analyzed = analyze(prepare(input), &[]).unwrap();
-        assert_original_constant(&analyzed, &value);
-    }
-
-    #[test]
-    fn internal_read_preserves_its_signed_root_declaration_through_async_catalog_preparation() {
-        let declaration = vec![novarocks_type_contract::FunctionValueType::new(
-            arrow::datatypes::DataType::Int16,
-            true,
-        )];
-        let source = SqlDmlCatalogPreparation::try_new_for_intent(
-            SqlStatementInput::parsed_query(Box::new(query("SELECT 1 AS __nr_sel_0"))),
-            session(),
-            SqlCompileControl::unbounded(),
-            SqlCompileIntent::DmlInternalRead,
-            Some(declaration.clone()),
-        )
-        .unwrap();
-        assert!(source.needs().is_empty());
-        assert_eq!(source.root_output_declaration.as_ref(), Some(&declaration));
-        let analyzed = analyze(source, &[]).expect("signed internal read analyzes");
-        assert_eq!(analyzed.intent, SqlCompileIntent::DmlInternalRead);
-        let output = crate::planner::plan_output_columns(&analyzed.logical_plan).unwrap();
-        assert_eq!(output.len(), 1);
-        // The declaration changes the original integer width. Analysis may
-        // retain a stronger non-NULL promise; every other type fact stays exact.
-        assert_eq!(
-            output[0].value_type.data_type(),
-            &arrow::datatypes::DataType::Int16
-        );
-        assert_eq!(
-            output[0].value_type.with_nullable(true).unwrap(),
-            declaration[0]
-        );
-    }
-
-    #[test]
-    fn change_stream_preserves_its_compile_intent_and_refuses_internal_read_declarations() {
+    fn change_stream_preserves_its_compile_intent() {
         let source = SqlDmlCatalogPreparation::try_new_for_intent(
             SqlStatementInput::parsed_query(Box::new(query("SELECT 1"))),
             session(),
             SqlCompileControl::unbounded(),
             SqlCompileIntent::ChangeStreamWrite,
-            None,
         )
         .unwrap();
         assert_eq!(
             analyze(source, &[]).unwrap().intent,
             SqlCompileIntent::ChangeStreamWrite
         );
+    }
+
+    fn write_sites(
+        types: Vec<(FunctionValueType, Option<FunctionValueType>)>,
+    ) -> Arc<super::super::SqlWriteAssignments> {
+        let control = SqlCompileControl::unbounded();
+        let sites = types
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (input, storage))| {
+                super::super::SqlWriteAssignmentSite::try_new(ordinal, input, storage, &control)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Arc::new(super::super::SqlWriteAssignments::try_new(sites, &control).unwrap())
+    }
+
+    fn cast_count(node: &LogicalPlanNode, target: &arrow::datatypes::DataType) -> usize {
+        let here = match &node.kind {
+            LogicalPlanKind::Project(project) => project.items.iter().filter(|item| {
+                matches!(&item.expr.kind, ExprKind::Cast { target: actual, .. } if actual == target)
+            }).count(),
+            _ => 0,
+        };
+        here + node
+            .children
+            .iter()
+            .map(|child| cast_count(child, target))
+            .sum::<usize>()
+    }
+    fn has_limit(node: &LogicalPlanNode) -> bool {
+        matches!(node.kind, LogicalPlanKind::Limit(_)) || node.children.iter().any(has_limit)
+    }
+    fn has_union(node: &LogicalPlanNode) -> bool {
+        matches!(node.kind, LogicalPlanKind::Union(_)) || node.children.iter().any(has_union)
+    }
+
+    fn numeric_source_assignments(
+        paths: Vec<(
+            Vec<super::super::SqlConstantQueryStep>,
+            super::super::SqlConstantExpressionSite,
+        )>,
+    ) -> Arc<super::super::SqlWriteAssignments> {
+        let control = SqlCompileControl::unbounded();
+        let site = super::super::SqlWriteAssignmentSite::try_new(
+            0,
+            FunctionValueType::new(arrow::datatypes::DataType::Decimal128(18, 9), true),
+            None,
+            &control,
+        )
+        .unwrap();
+        Arc::new(
+            super::super::SqlWriteAssignments::try_new(vec![site].into_boxed_slice(), &control)
+                .unwrap()
+                .with_literal_contexts(
+                    paths
+                        .into_iter()
+                        .map(|(path, site)| {
+                            super::super::SqlWriteLiteralContext::new(path, site, 0)
+                                .with_source_assignment()
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
+        )
+    }
+
+    #[test]
+    fn values_constrain_each_decimal_before_mixed_row_type_inference() {
+        use super::super::SqlConstantExpressionSite::ValuesCell;
+        use arrow::datatypes::DataType;
+        let text = "VALUES (123456789.123456789), (CAST(2.5 AS DOUBLE)), (NULL)";
+        let assignments = numeric_source_assignments(
+            (0..3)
+                .map(|row| (vec![], ValuesCell { row, column: 0 }))
+                .collect(),
+        );
+        let analyzed = analyze(
+            prepare(SqlStatementInput::parsed_query(Box::new(query(text))))
+                .with_write_assignments(assignments)
+                .unwrap(),
+            &[],
+        )
+        .unwrap();
+        fn values(node: &LogicalPlanNode) -> Option<&crate::planner::payload::PlanValuesNode> {
+            if let LogicalPlanKind::Values(values) = &node.kind
+                && !values.columns.is_empty()
+            {
+                return Some(values);
+            }
+            node.children.iter().find_map(values)
+        }
+        let rows = values(&analyzed.logical_plan).expect("original VALUES source");
+        assert_eq!(
+            rows.columns[0].value_type.data_type(),
+            &DataType::Decimal128(18, 9)
+        );
         assert!(
-            SqlDmlCatalogPreparation::try_new_for_intent(
-                SqlStatementInput::parsed_query(Box::new(query("SELECT 1"))),
-                session(),
-                SqlCompileControl::unbounded(),
-                SqlCompileIntent::ChangeStreamWrite,
-                Some(vec![novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Int64,
-                    false
-                )]),
+            rows.rows
+                .iter()
+                .all(|row| row[0].value_type.data_type() == &DataType::Decimal128(18, 9))
+        );
+        assert!(matches!(&rows.rows[0][0].kind,
+            ExprKind::Literal(crate::analysis::LiteralValue::Decimal(text))
+            if text.replace('.', "").parse::<i128>().unwrap() == 123456789123456789));
+        assert!(matches!(&rows.rows[1][0].kind,
+            ExprKind::Cast { expr, target: DataType::Decimal128(18, 9), .. }
+            if expr.value_type.data_type() == &DataType::Float64));
+    }
+
+    #[test]
+    fn constant_union_branches_are_typed_before_their_common_type() {
+        use super::super::{SqlConstantExpressionSite::SelectProjection, SqlConstantQueryStep};
+        use arrow::datatypes::DataType;
+        let text = "SELECT 123456789.123456789 UNION ALL SELECT 1e0";
+        let assignments = numeric_source_assignments(vec![
+            (
+                vec![SqlConstantQueryStep::UnionLeft],
+                SelectProjection { column: 0 },
+            ),
+            (
+                vec![SqlConstantQueryStep::UnionRight],
+                SelectProjection { column: 0 },
+            ),
+        ]);
+        let analyzed = analyze(
+            prepare(SqlStatementInput::parsed_query(Box::new(query(text))))
+                .with_write_assignments(assignments)
+                .unwrap(),
+            &[],
+        )
+        .unwrap();
+        fn union(node: &LogicalPlanNode) -> Option<&crate::planner::logical::LogicalUnionNode> {
+            if let LogicalPlanKind::Union(union) = &node.kind {
+                return Some(union);
+            }
+            node.children.iter().find_map(union)
+        }
+        let union = union(&analyzed.logical_plan).expect("original UNION ALL source");
+        assert!(union.all);
+        assert_eq!(
+            union.output_columns[0].value_type.data_type(),
+            &DataType::Decimal128(18, 9)
+        );
+    }
+
+    #[test]
+    fn typed_literal_array_children_keep_decimal_coefficients_before_common_typing() {
+        use super::super::SqlConstantExpressionSite::ValuesCell;
+        use arrow::datatypes::{DataType, Field};
+        let decimal = DataType::Decimal128(18, 9);
+        for (text, input) in [
+            (
+                "VALUES ([123456789.123456789, 1e0])",
+                DataType::List(Arc::new(Field::new("item", decimal.clone(), true))),
+            ),
+            (
+                "VALUES ([[123456789.123456789, 1e0], [NULL]])",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::List(Arc::new(Field::new("item", decimal.clone(), true))),
+                    true,
+                ))),
+            ),
+        ] {
+            let control = SqlCompileControl::unbounded();
+            let site = super::super::SqlWriteAssignmentSite::try_new(
+                0,
+                FunctionValueType::new(input.clone(), true),
+                None,
+                &control,
+            )
+            .unwrap();
+            let assignments = Arc::new(
+                super::super::SqlWriteAssignments::try_new(vec![site].into_boxed_slice(), &control)
+                    .unwrap()
+                    .with_literal_contexts(
+                        vec![
+                            super::super::SqlWriteLiteralContext::new(
+                                vec![],
+                                ValuesCell { row: 0, column: 0 },
+                                0,
+                            )
+                            .with_source_assignment(),
+                        ]
+                        .into_boxed_slice(),
+                    ),
+            );
+            let analyzed = analyze(
+                prepare(SqlStatementInput::parsed_query(Box::new(query(text))))
+                    .with_write_assignments(assignments)
+                    .unwrap(),
+                &[],
+            )
+            .unwrap();
+            fn values(node: &LogicalPlanNode) -> Option<&crate::planner::payload::PlanValuesNode> {
+                if let LogicalPlanKind::Values(values) = &node.kind
+                    && !values.columns.is_empty()
+                {
+                    return Some(values);
+                }
+                node.children.iter().find_map(values)
+            }
+            let values = values(&analyzed.logical_plan).expect("original literal VALUES");
+            let expected = FunctionValueType::new(input, true);
+            assert!(
+                values.columns[0]
+                    .value_type
+                    .same_physical_binding_ignoring_nullability_observed(&expected, || Ok::<
+                        _,
+                        std::convert::Infallible,
+                    >(
+                        ()
+                    ),)
+                    .unwrap()
+            );
+            // Inspect the real constructor, not a whole-array CAST that could
+            // conceal a Float64 common element. Explicit scalar casts remain.
+            fn literal_arrays(expression: &crate::analysis::TypedExpr) -> bool {
+                match &expression.kind {
+                    ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => {
+                        args.iter().all(literal_arrays)
+                    }
+                    ExprKind::Cast { expr, target, .. } => {
+                        !matches!(target, DataType::List(_) | DataType::LargeList(_))
+                            && literal_arrays(expr)
+                    }
+                    _ => true,
+                }
+            }
+            assert!(literal_arrays(&values.rows[0][0]));
+        }
+    }
+
+    #[test]
+    fn typed_write_assignment_cast_stays_outside_source_distinct_union_and_limit() {
+        use arrow::datatypes::DataType;
+        for text in [
+            "SELECT DISTINCT x FROM (VALUES ('1'), ('01')) AS s(x) ORDER BY x LIMIT 1",
+            "SELECT '1' AS x UNION SELECT '01' AS x",
+        ] {
+            let assignments =
+                write_sites(vec![(FunctionValueType::new(DataType::Int64, false), None)]);
+            let source = prepare(SqlStatementInput::parsed_query(Box::new(query(text))))
+                .with_write_assignments(assignments)
+                .unwrap();
+            let analyzed = analyze(source, &[]).unwrap();
+            let LogicalPlanKind::Project(project) = &analyzed.logical_plan.kind else {
+                panic!("assignment has its own typed outer projection");
+            };
+            assert!(matches!(
+                &project.items[0].expr.kind,
+                ExprKind::Cast {
+                    target: DataType::Int64,
+                    ..
+                }
+            ));
+            assert_eq!(cast_count(&analyzed.logical_plan, &DataType::Int64), 1);
+            assert_eq!(
+                cast_count(&analyzed.logical_plan.children[0], &DataType::Int64),
+                0
+            );
+            if text.contains("LIMIT") {
+                assert!(has_limit(&analyzed.logical_plan.children[0]));
+            } else {
+                assert!(has_union(&analyzed.logical_plan.children[0]));
+            }
+        }
+    }
+
+    #[test]
+    fn typed_write_assignment_context_constructs_null_and_empty_sources_before_inference() {
+        use arrow::array::{Array, ListArray, MapArray};
+        use arrow::datatypes::{DataType, Field};
+        let list = DataType::List(Arc::new(Field::new("item", DataType::Binary, false)));
+        let map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int64, false)),
+                        Arc::new(Field::new("value", DataType::Binary, false)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let assignments = write_sites(vec![
+            (FunctionValueType::new(DataType::Int64, false), None),
+            (FunctionValueType::new(list.clone(), false), None),
+            (FunctionValueType::new(map.clone(), false), None),
+        ]);
+        let source = prepare(SqlStatementInput::parsed_query(Box::new(query(
+            "VALUES (NULL, [], MAP{})",
+        ))))
+        .with_write_assignments(assignments.clone())
+        .unwrap();
+        let analyzed = analyze(source, &[]).unwrap();
+        let values = constants(&analyzed.logical_plan);
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].value_type().data_type(), &DataType::Int64);
+        assert!(
+            values[0].value_type().nullable(),
+            "required target must not harden actual NULL"
+        );
+        assert!(
+            values[0]
+                .is_null_observed(CompilePhase::Validate, &SqlCompileControl::unbounded())
+                .unwrap()
+        );
+        let array = values[1]
+            .pool()
+            .array()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(array.value_offsets(), &[0, 0]);
+        assert_eq!(array.values().len(), 0);
+        assert_eq!(array.null_count(), 0);
+        let map_array = values[2]
+            .pool()
+            .array()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_eq!(map_array.value_offsets(), &[0, 0]);
+        assert_eq!(map_array.keys().len(), 0);
+        assert_eq!(map_array.values().len(), 0);
+        assert_eq!(map_array.null_count(), 0);
+        assert_eq!(values[1].value_type().data_type(), &list);
+        assert_eq!(values[2].value_type().data_type(), &map);
+        assert!(!assignments.sites()[0].input().nullable());
+    }
+
+    #[test]
+    fn typed_write_assignment_retains_fixed_source_pool_and_bad_width_bytes() {
+        use arrow::array::{Array, FixedSizeBinaryArray};
+        use arrow::datatypes::{DataType, Field};
+        let control = SqlCompileControl::unbounded();
+        let array = FixedSizeBinaryArray::try_from_iter([b"abc".as_slice()].into_iter()).unwrap();
+        let value = ConstantValue::from_scalar_array(
+            Arc::new(Field::new("source", DataType::FixedSizeBinary(3), false)),
+            FunctionValueType::new(DataType::FixedSizeBinary(3), false),
+            array.to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let statement = || {
+            SqlStatementInput::query_with_expression_constants(
+                Box::new(query("VALUES (NULL)")),
+                vec![super::super::SqlExpressionConstant::new(
+                    Vec::new(),
+                    super::super::SqlConstantExpressionSite::ValuesCell { row: 0, column: 0 },
+                    value.clone(),
+                )]
+                .into(),
+                &control,
+            )
+            .unwrap()
+        };
+        let assignments = write_sites(vec![(
+            FunctionValueType::new(DataType::Binary, false),
+            Some(FunctionValueType::new(DataType::FixedSizeBinary(4), false)),
+        )]);
+        let analyzed = analyze(
+            prepare(statement())
+                .with_write_assignments(assignments)
+                .unwrap(),
+            &[],
+        )
+        .unwrap();
+        let original = constants(&analyzed.logical_plan);
+        assert_eq!(original.len(), 1);
+        assert_eq!(
+            original[0].pool().backing_identity(),
+            value.pool().backing_identity()
+        );
+        assert_eq!(original[0].ordinal(), value.ordinal());
+        assert_eq!(
+            original[0].value_type().data_type(),
+            &DataType::FixedSizeBinary(3)
+        );
+        let bytes = original[0]
+            .pool()
+            .array()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(bytes.value(0), b"abc");
+        let fields = crate::planner::plan_output_columns(&analyzed.logical_plan).unwrap();
+        assert_eq!(
+            fields[0].value_type.data_type(),
+            &DataType::FixedSizeBinary(3)
+        );
+        // An original checked source authors CASE/VALUES NULL inference. W
+        // must not turn that source into Binary before the selected assignment.
+        for (sql, path) in [
+            ("VALUES (NULL), (NULL)", Vec::new()),
+            (
+                "SELECT CASE WHEN TRUE THEN x ELSE NULL END FROM (VALUES (NULL)) s(x)",
+                vec![super::super::SqlConstantQueryStep::SelectFromDerived { from: 0 }],
+            ),
+        ] {
+            let statement = SqlStatementInput::query_with_expression_constants(
+                Box::new(query(sql)),
+                vec![super::super::SqlExpressionConstant::new(
+                    path,
+                    super::super::SqlConstantExpressionSite::ValuesCell { row: 0, column: 0 },
+                    value.clone(),
+                )]
+                .into(),
+                &control,
+            )
+            .unwrap();
+            let assignments = write_sites(vec![(
+                FunctionValueType::new(DataType::Binary, false),
+                Some(FunctionValueType::new(DataType::FixedSizeBinary(4), false)),
+            )]);
+            let analyzed = analyze(
+                prepare(statement)
+                    .with_write_assignments(assignments)
+                    .unwrap(),
+                &[],
+            )
+            .unwrap();
+            let fields = crate::planner::plan_output_columns(&analyzed.logical_plan).unwrap();
+            assert_eq!(
+                fields[0].value_type.data_type(),
+                &DataType::FixedSizeBinary(3),
+                "{sql}"
+            );
+            assert!(fields[0].value_type.nullable(), "{sql}");
+            assert!(
+                constants(&analyzed.logical_plan)
+                    .iter()
+                    .any(|original| original.pool().backing_identity()
+                        == value.pool().backing_identity()),
+                "original pool retained: {sql}"
+            );
+        }
+        let exact = write_sites(vec![(
+            FunctionValueType::new(DataType::FixedSizeBinary(4), false),
+            None,
+        )]);
+        assert!(
+            analyze(
+                prepare(statement()).with_write_assignments(exact).unwrap(),
+                &[]
+            )
+            .is_err(),
+            "unlicensed fixed target must not get a successful-NULL ordinary CAST"
+        );
+    }
+
+    #[test]
+    fn typed_write_assignment_literal_context_is_scoped_to_its_actual_derived_site() {
+        use arrow::datatypes::{DataType, Field};
+        let control = SqlCompileControl::unbounded();
+        let ty = FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("item", DataType::Binary, false))),
+            false,
+        );
+        let site = super::super::SqlWriteAssignmentSite::try_new(0, ty, None, &control).unwrap();
+        let assignments = Arc::new(
+            super::super::SqlWriteAssignments::try_new(vec![site].into_boxed_slice(), &control)
+                .unwrap()
+                .with_literal_contexts(
+                    vec![super::super::SqlWriteLiteralContext::new(
+                        vec![super::super::SqlConstantQueryStep::SelectFromDerived { from: 0 }],
+                        super::super::SqlConstantExpressionSite::SelectProjection { column: 0 },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                ),
+        );
+        let source = prepare(SqlStatementInput::parsed_query(Box::new(query(
+            "SELECT s.x FROM (SELECT [] AS x) AS s",
+        ))))
+        .with_write_assignments(assignments)
+        .unwrap();
+        let analyzed = analyze(source, &[]).unwrap();
+        assert!(
+            crate::planner::plan_output_columns(&analyzed.logical_plan).unwrap()[0]
+                .value_type
+                .data_type()
+                == &DataType::List(Arc::new(Field::new("item", DataType::Binary, false)))
+        );
+        let invalid = super::super::SqlWriteAssignmentSite::try_new(
+            4,
+            FunctionValueType::new(DataType::Int64, false),
+            None,
+            &control,
+        )
+        .unwrap();
+        let bad = Arc::new(
+            super::super::SqlWriteAssignments::try_new(vec![invalid].into_boxed_slice(), &control)
+                .unwrap(),
+        );
+        assert!(
+            analyze(
+                prepare(SqlStatementInput::parsed_query(Box::new(query("SELECT 1"))))
+                    .with_write_assignments(bad)
+                    .unwrap(),
+                &[]
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn typed_write_assignment_context_reaches_case_results_without_hardening_null() {
+        use arrow::datatypes::{DataType, Field};
+        let list = DataType::List(Arc::new(Field::new("item", DataType::Binary, false)));
+        let assignments = write_sites(vec![(FunctionValueType::new(list.clone(), false), None)]);
+        let source = prepare(SqlStatementInput::parsed_query(Box::new(query(
+            "SELECT CASE WHEN TRUE THEN [] ELSE NULL END AS x",
+        ))))
+        .with_write_assignments(assignments)
+        .unwrap();
+        let analyzed = analyze(source, &[]).unwrap();
+        let fields = crate::planner::plan_output_columns(&analyzed.logical_plan).unwrap();
+        assert_eq!(fields[0].value_type.data_type(), &list);
+        assert!(
+            fields[0].value_type.nullable(),
+            "unselected NULL keeps a truthful source declaration"
+        );
+        let LogicalPlanKind::Project(project) = &analyzed.logical_plan.kind else {
+            panic!("typed outer projection");
+        };
+        assert!(!matches!(project.items[0].expr.kind, ExprKind::Cast { .. }));
     }
 }

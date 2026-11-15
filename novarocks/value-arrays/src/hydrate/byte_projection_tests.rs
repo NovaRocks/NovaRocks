@@ -396,3 +396,359 @@ fn explicit_byte_layout_projection_preserves_original_growth_and_inside_value_co
     assert!(matches!(error, ValueFailure::Caller("byte-copy-stop")));
     assert_eq!(blocks, 2);
 }
+
+fn assignment_plan(
+    source: &ArrayRef,
+    original: &TypedValueBinding,
+    input: &TypedValueBinding,
+    storage: &TypedValueBinding,
+) -> Result<HydratePlan, ValueFailure<Infallible>> {
+    let proof = novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+        original.borrowed(),
+        input.borrowed(),
+        Some(storage.borrowed()),
+        || Ok::<_, Infallible>(()),
+    )
+    .unwrap()
+    .expect("licensed assignment");
+    HydratePlan::plan_assignment_projection_with_storage_observed(
+        source,
+        input,
+        proof,
+        &mut ValueConversionContext::default(),
+        &ValueTypeStorageLifetime::pure(),
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+    )
+}
+
+#[test]
+fn licensed_fixed_assignment_keeps_sliced_bytes_and_nulls_without_storage_width_validation() {
+    let source: ArrayRef = Arc::new(
+        arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [
+                Some([9, 9, 9, 9]),
+                Some([0, 255, 128, 1]),
+                None,
+                Some([2, 0, 254, 3]),
+            ]
+            .into_iter(),
+            4,
+        )
+        .unwrap(),
+    );
+    let source = source.slice(1, 3);
+    let original = binding(DataType::FixedSizeBinary(4), true);
+    let input = binding(DataType::Binary, true);
+    let storage = binding(DataType::FixedSizeBinary(8), true);
+    let planned = assignment_plan(&source, &original, &input, &storage).unwrap();
+    let output = execute(&planned);
+    assert_eq!(
+        binary_values(&output),
+        vec![Some(vec![0, 255, 128, 1]), None, Some(vec![2, 0, 254, 3])]
+    );
+    output.to_data().validate_full().unwrap();
+    for mode in [
+        HydrateProjection::Exact,
+        HydrateProjection::FrozenNamesAndNullability,
+        HydrateProjection::ExactByteLayouts,
+    ] {
+        assert!(plan(&source, &input, mode).is_err());
+    }
+}
+
+#[test]
+fn licensed_fixed_assignment_observes_null_parent_and_list_slice_coordinates() {
+    let child: ArrayRef = Arc::new(
+        arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [
+                Some([9, 9, 9, 9]),
+                None,
+                Some([0, 255, 128, 1]),
+                Some([2, 0, 254, 3]),
+            ]
+            .into_iter(),
+            4,
+        )
+        .unwrap(),
+    );
+    let list: ArrayRef = Arc::new(
+        ListArray::try_new(
+            Arc::new(Field::new("item", DataType::FixedSizeBinary(4), true)),
+            OffsetBuffer::new(vec![0i32, 1, 2, 4].into()),
+            child,
+            None,
+        )
+        .unwrap()
+        .slice(1, 2),
+    );
+    let source: ArrayRef = Arc::new(
+        StructArray::try_new(
+            vec![Arc::new(Field::new(
+                "payload",
+                list.data_type().clone(),
+                true,
+            ))]
+            .into(),
+            vec![list],
+            Some(NullBuffer::from(vec![false, true])),
+        )
+        .unwrap(),
+    );
+    let nested = |ty, nullable| {
+        DataType::Struct(
+            vec![Arc::new(Field::new(
+                "payload",
+                DataType::List(Arc::new(Field::new("item", ty, nullable))),
+                true,
+            ))]
+            .into(),
+        )
+    };
+    let original = binding(nested(DataType::FixedSizeBinary(4), true), true);
+    let input = binding(nested(DataType::Binary, false), true);
+    let storage = binding(nested(DataType::FixedSizeBinary(8), false), true);
+    let output = execute(&assignment_plan(&source, &original, &input, &storage).unwrap());
+    let outer = output.as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(outer.is_null(0));
+    assert!(outer.is_valid(1));
+    let lists = outer
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(lists.value_offsets(), &[1, 2, 4]);
+    assert_eq!(
+        binary_values(lists.values()),
+        vec![
+            Some(vec![]),
+            Some(vec![]),
+            Some(vec![0, 255, 128, 1]),
+            Some(vec![2, 0, 254, 3])
+        ]
+    );
+    output.to_data().validate_full().unwrap();
+
+    let active: ArrayRef = Arc::new(
+        StructArray::try_new(
+            match source.data_type() {
+                DataType::Struct(fields) => fields.clone(),
+                _ => unreachable!(),
+            },
+            vec![
+                source
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap()
+                    .column(0)
+                    .clone(),
+            ],
+            None,
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        assignment_plan(&active, &original, &input, &storage),
+        Err(ValueFailure::Value(ValueError::Invariant(
+            ValueViolation::RequiredNull
+        )))
+    ));
+}
+
+#[test]
+fn licensed_fixed_assignment_keeps_caller_refusal_and_source_custody() {
+    let source: ArrayRef = Arc::new(
+        arrow_array::FixedSizeBinaryArray::try_from_iter([[0, 255, 128, 1]].into_iter()).unwrap(),
+    );
+    let weak = Arc::downgrade(&source);
+    let original = binding(DataType::FixedSizeBinary(4), false);
+    let input = binding(DataType::Binary, false);
+    let storage = binding(DataType::FixedSizeBinary(8), false);
+    let proof = novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+        original.borrowed(),
+        input.borrowed(),
+        Some(storage.borrowed()),
+        || Ok::<_, u8>(()),
+    )
+    .unwrap()
+    .unwrap();
+    let result = HydratePlan::plan_assignment_projection_with_storage_observed(
+        &source,
+        &input,
+        proof,
+        &mut ValueConversionContext::default(),
+        &ValueTypeStorageLifetime::pure(),
+        &mut |_| Err(71u8),
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+    );
+    assert!(matches!(result, Err(ValueFailure::Caller(71))));
+    let result = HydratePlan::plan_assignment_projection_with_storage_observed(
+        &source,
+        &input,
+        proof,
+        &mut ValueConversionContext::default(),
+        &ValueTypeStorageLifetime::pure(),
+        &mut |_| Ok(()),
+        &mut |_| Err(72u8),
+        &mut |_| Ok(()),
+    );
+    assert!(matches!(result, Err(ValueFailure::Caller(72))));
+    let result = HydratePlan::plan_assignment_projection_with_storage_observed(
+        &source,
+        &input,
+        proof,
+        &mut ValueConversionContext::default(),
+        &ValueTypeStorageLifetime::pure(),
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+        &mut |_| Err(73u8),
+    );
+    assert!(matches!(result, Err(ValueFailure::Caller(73))));
+    let planned = assignment_plan(&source, &original, &input, &storage).unwrap();
+    let result = planned.execute_observed(
+        &mut ValueConversionContext::default(),
+        &mut |_| Err(74u8),
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+    );
+    assert!(matches!(result, Err(ValueFailure::Caller(74))));
+    drop(source);
+    assert!(weak.upgrade().is_some());
+    let output = execute(&planned);
+    drop(planned);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(binary_values(&output), vec![Some(vec![0, 255, 128, 1])]);
+}
+
+#[test]
+fn licensed_fixed_assignment_uses_the_existing_binary_extent_boundary() {
+    let limit = i32::MAX as u128;
+    assert!(
+        super::tree::check_extent(ByteLayout::Binary, limit - 4, 4, 4, 1)
+            .unwrap()
+            .is_none()
+    );
+    let crossing = super::tree::check_extent(ByteLayout::Binary, limit - 3, 4, 4, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crossing.boundary,
+        novarocks_failure_contract::RepresentationBoundary::SingleOutput
+    );
+    assert_eq!(crossing.representable_prefix, Some(1));
+    let minimum = super::tree::check_extent(ByteLayout::Binary, 0, limit + 1, limit as u64 + 1, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        minimum.boundary,
+        novarocks_failure_contract::RepresentationBoundary::MinimumUnit
+    );
+}
+
+#[test]
+fn licensed_fixed_assignment_keeps_map_mask_offsets_keys_and_sortedness() {
+    let values: ArrayRef = Arc::new(
+        arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [Some([9, 9, 9, 9]), None, Some([0, 255, 128, 1])].into_iter(),
+            4,
+        )
+        .unwrap(),
+    );
+    let fields: arrow_schema::Fields = vec![
+        Arc::new(Field::new("key", DataType::Int32, false)),
+        Arc::new(Field::new("value", DataType::FixedSizeBinary(4), true)),
+    ]
+    .into();
+    let entries = StructArray::try_new(
+        fields.clone(),
+        vec![Arc::new(Int32Array::from(vec![10, 20, 30])), values],
+        None,
+    )
+    .unwrap();
+    let source: ArrayRef = Arc::new(
+        arrow_array::MapArray::try_new(
+            Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+            OffsetBuffer::new(vec![0i32, 1, 2, 3].into()),
+            entries,
+            Some(NullBuffer::from(vec![true, false, true])),
+            true,
+        )
+        .unwrap()
+        .slice(1, 2),
+    );
+    let map = |ty, nullable| {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int32, false)),
+                        Arc::new(Field::new("value", ty, nullable)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            true,
+        )
+    };
+    let original = binding(map(DataType::FixedSizeBinary(4), true), true);
+    let input = binding(map(DataType::Binary, false), true);
+    let storage = binding(map(DataType::FixedSizeBinary(8), false), true);
+    let output = execute(&assignment_plan(&source, &original, &input, &storage).unwrap());
+    let result = output
+        .as_any()
+        .downcast_ref::<arrow_array::MapArray>()
+        .unwrap();
+    assert!(result.is_null(0));
+    assert!(result.is_valid(1));
+    assert_eq!(result.value_offsets(), &[1, 2, 3]);
+    assert!(matches!(result.data_type(), DataType::Map(_, true)));
+    assert_eq!(
+        result
+            .keys()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .as_ref(),
+        &[10, 20, 30]
+    );
+    assert_eq!(
+        binary_values(result.values()),
+        vec![Some(vec![]), Some(vec![]), Some(vec![0, 255, 128, 1])]
+    );
+    output.to_data().validate_full().unwrap();
+}
+
+#[test]
+fn licensed_fixed_assignment_does_not_invent_encoded_fixed_decoding() {
+    let original = binding(DataType::FixedSizeBinary(4), false);
+    let input = binding(DataType::Binary, false);
+    let storage = binding(DataType::FixedSizeBinary(8), false);
+    let values =
+        arrow_array::FixedSizeBinaryArray::try_from_iter([[0, 255, 128, 1]].into_iter()).unwrap();
+    let dictionary: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), Arc::new(values.clone()))
+            .unwrap(),
+    );
+    let ends = arrow_array::Int16Array::from(vec![1]);
+    let run: ArrayRef = Arc::new(
+        arrow_array::RunArray::<arrow_array::types::Int16Type>::try_new(&ends, &values).unwrap(),
+    );
+    for source in [dictionary, run] {
+        assert!(matches!(
+            assignment_plan(&source, &original, &input, &storage),
+            Err(ValueFailure::Value(ValueError::Invariant(_)))
+        ));
+    }
+    let wrong: ArrayRef = Arc::new(
+        arrow_array::FixedSizeBinaryArray::try_from_iter([[1, 2, 3]].into_iter()).unwrap(),
+    );
+    assert!(matches!(
+        assignment_plan(&wrong, &original, &input, &storage),
+        Err(ValueFailure::Value(ValueError::Invariant(_)))
+    ));
+}

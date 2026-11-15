@@ -102,6 +102,12 @@ fn output(format: IcebergFileFormat) -> IcebergWriterOutput {
     .unwrap()
 }
 fn data_handle(fields: Option<Vec<IcebergSchemaFieldDef>>) -> dto::IcebergWriterHandle {
+    data_handle_for(fields, &data_input())
+}
+fn data_handle_for(
+    fields: Option<Vec<IcebergSchemaFieldDef>>,
+    input: &ConnectorWriteInputShape,
+) -> dto::IcebergWriterHandle {
     let handle = IcebergWriterHandle::try_new_data(
         table_facts(),
         output(IcebergFileFormat::Parquet),
@@ -112,7 +118,7 @@ fn data_handle(fields: Option<Vec<IcebergSchemaFieldDef>>) -> dto::IcebergWriter
             vec![],
             false,
         )
-        .unwrap(),
+        .unwrap().with_write_input_identity(super::super::domain::data_write_input_identity(input).unwrap()),
     )
     .unwrap();
     encode(&handle)
@@ -262,7 +268,6 @@ fn assert_provider_failure(draft: &ConnectorWriteRecipeDraft, text: &str) {
 
 #[test]
 fn data_private_recipe_keeps_all_actual_public_flavors_and_exact_fields() {
-    let raw = data_handle(Some(vec![source("k1", 1), source("v1", 2)]));
     let shapes = [
         data_input(),
         ConnectorWriteInputShape::RowLineage {
@@ -292,9 +297,116 @@ fn data_private_recipe_keeps_all_actual_public_flavors_and_exact_fields() {
         },
     ];
     for shape in shapes {
+        let raw = data_handle_for(Some(vec![source("k1", 1), source("v1", 2)]), &shape);
         assert_unchanged(&draft(&raw, shape));
     }
     assert_unchanged(&draft(&equality_handle(), equality_input()));
+}
+
+#[test]
+fn data_identity_rejects_public_storage_permission_forgery_before_sdk_adaptation() {
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+    let input = |width: Option<i32>, nullable| {
+        let value = FunctionValueType::new(DataType::Binary, nullable);
+        let binding = ConnectorWriteFieldBinding::try_new_typed(
+            ConnectorWriteFieldToken::from_bytes([7; 32]),
+            Field::new("payload", DataType::Binary, nullable),
+            value,
+        )
+        .unwrap();
+        let binding = match width {
+            Some(width) => binding
+                .with_storage_type(FunctionValueType::new(
+                    DataType::FixedSizeBinary(width),
+                    nullable,
+                ))
+                .unwrap(),
+            None => binding,
+        };
+        ConnectorWriteInputShape::Data {
+            fields: vec![binding],
+        }
+    };
+    let original = input(Some(4), true);
+    let mut raw = data_handle_for(Some(vec![source("payload", 1)]), &original);
+    raw.data.as_mut().unwrap().target_schema_json = Some(
+        serde_json::json!({
+            "type":"struct", "schema-id":1, "fields":[
+                {"id":1,"name":"payload","required":false,"type":"fixed[4]"}
+            ]
+        })
+        .to_string(),
+    );
+    assert_unchanged(&draft(&raw, original));
+    for forged in [
+        input(None, true),
+        input(Some(8), true),
+        input(Some(4), false),
+    ] {
+        assert_provider_failure(&draft(&raw, forged), "frozen complete write input identity");
+    }
+    let nominal = ConnectorWriteFieldBinding::try_new_typed(
+        ConnectorWriteFieldToken::from_bytes([7; 32]),
+        Field::new("payload", DataType::Binary, true),
+        FunctionValueType::try_with_logical_type(DataType::Binary, true, ValueLogicalType::Hll)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_provider_failure(
+        &draft(
+            &raw,
+            ConnectorWriteInputShape::Data {
+                fields: vec![nominal],
+            },
+        ),
+        "frozen complete write input identity",
+    );
+    let altered_token = ConnectorWriteFieldBinding::try_new_typed(
+        ConnectorWriteFieldToken::from_bytes([8; 32]),
+        Field::new("payload", DataType::Binary, true),
+        FunctionValueType::new(DataType::Binary, true),
+    )
+    .unwrap()
+    .with_storage_type(FunctionValueType::new(DataType::FixedSizeBinary(4), true))
+    .unwrap();
+    assert_provider_failure(
+        &draft(
+            &raw,
+            ConnectorWriteInputShape::Data {
+                fields: vec![altered_token],
+            },
+        ),
+        "frozen complete write input identity",
+    );
+}
+
+#[test]
+fn data_identity_binds_order_and_rejects_missing_or_malformed_private_seal() {
+    let input = ConnectorWriteInputShape::Data {
+        fields: vec![
+            field("k1", DataType::Int64, false, 900, 1),
+            field("v1", DataType::Int64, true, 901, 2),
+        ],
+    };
+    let raw = data_handle_for(Some(vec![source("k1", 1), source("v1", 2)]), &input);
+    assert_unchanged(&draft(&raw, input.clone()));
+    let mut reversed = input;
+    let ConnectorWriteInputShape::Data { fields } = &mut reversed else {
+        unreachable!()
+    };
+    fields.reverse();
+    assert_provider_failure(
+        &draft(&raw, reversed),
+        "frozen complete write input identity",
+    );
+    for size in [0, 31, 33] {
+        let mut malformed = data_handle(Some(vec![source("k1", 1)]));
+        malformed.data.as_mut().unwrap().write_input_identity = vec![0; size];
+        assert!(matches!(
+            compile(&draft(&malformed, data_input()), &Control::default()),
+            Err(ConnectorWriteRecipeCompileError::Provider(_))
+        ));
+    }
 }
 
 #[test]
@@ -464,28 +576,26 @@ fn data_requires_real_private_source_and_keeps_shared_schema_refusals() {
         "absent from frozen target schema",
     );
     let mut raw = data_handle(Some(vec![source("k1", 1)]));
-    assert_provider_failure(
-        &draft(
-            &raw,
-            ConnectorWriteInputShape::Data {
-                fields: vec![field(
-                    "k1",
-                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-                    false,
-                    900,
-                    1,
-                )],
-            },
-        ),
-        "unsupported",
-    );
+    let dictionary = ConnectorWriteInputShape::Data {
+        fields: vec![field(
+            "k1",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+            900,
+            1,
+        )],
+    };
+    let dictionary_handle = data_handle_for(Some(vec![source("k1", 1)]), &dictionary);
+    assert_provider_failure(&draft(&dictionary_handle, dictionary), "unsupported");
     raw.data.as_mut().unwrap().target_schema_json=Some(serde_json::json!({"type":"struct","schema-id":1,"fields":[{"id":1,"name":"k1","required":false,"type":"int"}]}).to_string());
-    assert_unchanged(&draft(
-        &raw,
-        ConnectorWriteInputShape::Data {
-            fields: vec![field("k1", DataType::Int8, false, 900, 1)],
-        },
-    ));
+    let narrow = ConnectorWriteInputShape::Data {
+        fields: vec![field("k1", DataType::Int8, false, 900, 1)],
+    };
+    raw.data.as_mut().unwrap().write_input_identity =
+        super::super::domain::data_write_input_identity(&narrow)
+            .unwrap()
+            .to_vec();
+    assert_unchanged(&draft(&raw, narrow));
 }
 
 #[test]
@@ -543,10 +653,8 @@ fn wide_data() -> ConnectorWriteRecipeDraft {
         ));
         source_fields.push(source(&name, i + 1));
     }
-    draft(
-        &data_handle(Some(source_fields)),
-        ConnectorWriteInputShape::Data { fields },
-    )
+    let input = ConnectorWriteInputShape::Data { fields };
+    draft(&data_handle_for(Some(source_fields), &input), input)
 }
 
 #[test]

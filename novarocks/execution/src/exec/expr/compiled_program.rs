@@ -235,9 +235,7 @@ impl Value<'_> {
                 let (_, array, errors) = output.into_parts();
                 let array = owner.retain(array, work.control)?;
                 return Ok(MaterializedValue {
-                    value: SelectedValues::try_new_observed(selection, ty, array, errors, || {
-                        work.step()
-                    })?,
+                    value: materialized_source_values(selection, ty, array, errors, work)?,
                     continuation: Some(owner),
                 });
             }
@@ -263,10 +261,36 @@ impl Value<'_> {
             }
         };
         Ok(MaterializedValue {
-            value: SelectedValues::try_new_observed(selection, ty, array, errors, || work.step())?,
+            value: materialized_source_values(selection, ty, array, errors, work)?,
             continuation: None,
         })
     }
+}
+
+// Source carriers may widen physical child NULL flags without changing their
+// frozen logical binding. Materializing or gathering such a value keeps that
+// carrier and its original custody; the final port's construction owner authors
+// any required layout rebuild. Kernel result authors remain exact.
+fn materialized_source_values<'a>(
+    selection: Selection<'a>,
+    expected: &DataType,
+    array: ArrayRef,
+    errors: Box<[RowDataError]>,
+    work: &mut Work<'_, '_>,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    if !novarocks_type_contract::arrow_data_types_exact_with_profile_and_nullability_observed::<
+        KernelFailure,
+    >(
+        expected,
+        array.data_type(),
+        novarocks_type_contract::ArrowTypeProfile::Physical,
+        novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
+        || work.step(),
+    )? {
+        return Err(novarocks_functions::EvaluationContractError::ResultType.into());
+    }
+    let actual = array.data_type().clone();
+    SelectedValues::try_new_observed(selection, &actual, array, errors, || work.step())
 }
 
 impl CompiledExpressionInstance {
@@ -1006,8 +1030,7 @@ fn finish_root_value<'a, E: scalar_invocation::FrameFailure>(
     let result = result.materialize(selection, ty.data_type(), work)?;
     let (_, array, errors) = result.into_parts();
     let array = input_source::retain_result_type(array, ty, allocator, work.control)?;
-    let result =
-        SelectedValues::try_new_observed(selection, ty.data_type(), array, errors, || work.step())?;
+    let result = materialized_source_values(selection, ty.data_type(), array, errors, work)?;
     if !ty.nullable() {
         let mut errors = result.errors().iter().peekable();
         work.flush()?;

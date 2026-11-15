@@ -357,6 +357,7 @@ impl From<DmlWriteSinkMode> for crate::planner::distributed::write::contract::Sq
 /// One provider-signed input field retained in a SQL terminal contract.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DmlWriteTargetField {
+    pub storage_type: Option<novarocks_type_contract::FunctionValueType>,
     pub token: novarocks_spi::connector::ConnectorWriteFieldToken,
     pub column: novarocks_types::schema::ColumnDef,
     pub is_hidden: bool,
@@ -498,19 +499,76 @@ impl DmlFinalWritePlanContext {
 }
 
 impl DmlWritePlanInput {
+    /// Project every signed field of an ordinal root writer into its own
+    /// ordinary source-assignment occurrence. Explicit output selections are
+    /// already authored typed inputs; their per-field W/T normalization still
+    /// belongs to each selected writer occurrence.
+    pub fn root_write_assignments(
+        &self,
+        control: &crate::compiler::SqlCompileControl,
+    ) -> Result<
+        Option<std::sync::Arc<crate::compiler::SqlWriteAssignments>>,
+        crate::compiler::SqlCompileError,
+    > {
+        use crate::compiler::{SqlCompileError, SqlWriteAssignmentSite, SqlWriteAssignments};
+        if matches!(&self.0.input, ConnectorWriteInputBinding::OutputOrdinals(_)) {
+            return Ok(None);
+        }
+        let mut sites = Vec::new();
+        sites
+            .try_reserve_exact(self.0.contract.target.fields.len())
+            .map_err(|cause| {
+                SqlCompileError::CompilationSource(
+                    novarocks_failure_contract::SharedFailureCause::new(
+                        novarocks_functions::allocation_failure::AllocationRefusal::new(
+                            "root write assignment sites",
+                            cause,
+                        ),
+                    ),
+                )
+            })?;
+        for (ordinal, field) in self.0.contract.target.fields.iter().enumerate() {
+            let input = field.column.declared_value_type_observed::<crate::planner::distributed::build::ContractLoweringError>(|| {
+                novarocks_type_contract::PureCompileControl::checkpoint(control, novarocks_type_contract::CompilePhase::Validate, 1).map_err(Into::into)
+            }).map_err(final_lowering_error)?;
+            sites.push(SqlWriteAssignmentSite::try_new(
+                ordinal,
+                input,
+                field.storage_type.clone(),
+                control,
+            )?);
+        }
+        Ok(Some(std::sync::Arc::new(SqlWriteAssignments::try_new(
+            sites.into_boxed_slice(),
+            control,
+        )?)))
+    }
+    /// Original signed field facts, borrowed without recovering a Provider
+    /// declaration from the source expression or an Arrow carrier.
+    pub fn write_field_declarations(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &str,
+            &novarocks_types::schema::ColumnDef,
+            Option<&novarocks_type_contract::FunctionValueType>,
+        ),
+    > {
+        self.0.contract.target.fields.iter().map(|field| {
+            (
+                field.column.name.as_str(),
+                &field.column,
+                field.storage_type.as_ref(),
+            )
+        })
+    }
+
     /// Bind this final shard writer to the Provider's exact raw contribution group.
     pub fn with_position_materialization(
         mut self,
         group: novarocks_spi::connector::write_stack::ConnectorMutationContributionGroup,
     ) -> Self {
         self.0.position_materialization = Some(std::sync::Arc::new(group));
-        self
-    }
-
-    /// Preserve the admitted application's logical affected-row owner.
-    /// The physical writer's row and artifact checks still apply.
-    pub fn with_external_count_owner(mut self) -> Self {
-        self.0.finish_count_mode = novarocks_physical_plan::FinishCountMode::ExternalOwner;
         self
     }
 
@@ -559,6 +617,7 @@ impl DmlWritePlanInput {
                 .fields
                 .into_iter()
                 .map(|field| SqlWriteTargetField {
+                    storage_type: field.storage_type,
                     token: field.token,
                     column: field.column,
                     is_hidden: field.is_hidden,
@@ -928,81 +987,6 @@ fn complete_connector_write_plan(
     draft
         .finish_with_dependency_observer_observed(control)
         .map_err(final_plan_publication_error)
-}
-
-/// One internal DML read, optimized and waiting for its provider facts.
-pub struct DmlReadCompletion {
-    constant_policy: novarocks_functions::ConstantPolicy,
-    root_allow_throw_exception: bool,
-    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
-    root_semantics: crate::compiler::root_output::RootOutputSemantics,
-    query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
-    physical: crate::planner::physical::PhysicalPlanNode,
-}
-
-pub fn begin_final_dml_read_plan(
-    request: crate::compiler::SqlOptimizeRequest<'_>,
-    settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<
-    (DmlReadCompletion, Box<[crate::compiler::ProviderReadNeed]>),
-    crate::compiler::SqlCompileError,
-> {
-    let constant_policy = request.constant_policy();
-    let control = request.control().clone();
-    let compiled = crate::compiler::SqlCompiler::optimize(request)?
-        .into_optimized_output()
-        .map_err(|_| "DML read intent did not produce optimized SQL facts".to_string())?;
-    let mut physical =
-        crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_compiled(
-        &mut physical,
-        settings,
-    );
-    let (physical, needs) = crate::compiler::collect_provider_needs(
-        physical,
-        0,
-        settings.connector_static_predicate_pushdown_enabled(),
-        &control,
-    )?;
-    Ok((
-        DmlReadCompletion {
-            constant_policy,
-            root_allow_throw_exception: compiled.root_allow_throw_exception,
-            functions: compiled.function_catalog,
-            root_semantics: compiled.root_semantics,
-            physical,
-            query_statistics: compiled.statistics.snapshot,
-        },
-        needs,
-    ))
-}
-
-impl DmlReadCompletion {
-    pub fn finish(
-        self,
-        version: novarocks_physical_plan::PlanVersionId,
-        dop_domain: novarocks_physical_plan::PipelineDopDomain,
-        reads: DmlFinalizedProviderReadSet,
-        control: &crate::compiler::SqlCompileControl,
-    ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
-        let mut draft =
-            crate::planner::distributed::build::lower_final_physical_plan_with_root_semantics(
-                &self.physical,
-                version,
-                dop_domain,
-                reads.into_optional(),
-                self.root_semantics,
-                self.functions,
-                self.root_allow_throw_exception,
-                self.constant_policy,
-                control,
-            )
-            .map_err(final_lowering_error)?;
-        self.query_statistics.annotate_final_plan(&mut draft);
-        draft
-            .finish_with_dependency_observer_observed(control)
-            .map_err(final_plan_publication_error)
-    }
 }
 
 /// SQL-owned, immutable CTAS source artifact. Its optimizer graph never
@@ -1484,7 +1468,7 @@ pub fn begin_final_dml_change_stream(
         .into_optimized_output()
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
     let mut keyed_assert = request.pre_expand_keyed_assert;
-    let producer = match request.kind {
+    let mut producer = match request.kind {
         DmlChangeStreamKind::Delete { position_input } => {
             if keyed_assert.is_some() {
                 return Err("plain DELETE does not accept a matched-row assertion".into());
@@ -1522,6 +1506,7 @@ pub fn begin_final_dml_change_stream(
             producer
         }
     };
+    attach_change_write_inputs(&mut producer, &request.routes, &control)?;
     let effect_output_ordinal = producer
         .output_columns
         .len()
@@ -1611,7 +1596,7 @@ pub fn compile_final_dml_change_stream(
 }
 
 pub(crate) fn seal_final_change_stream_producer(
-    producer: crate::optimizer::OptimizedOperatorNode,
+    mut producer: crate::optimizer::OptimizedOperatorNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     routes: Vec<DmlChangeStreamRoute>,
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
@@ -1622,6 +1607,7 @@ pub(crate) fn seal_final_change_stream_producer(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
+    attach_change_write_inputs(&mut producer, &routes, control)?;
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
     else {
         return Err(
@@ -1940,6 +1926,67 @@ fn bind_route_layout(
     })
 }
 
+/// The already signed writer route supplies the selected assignment's W/T.
+/// Global event slots retain their nullable placeholders independently.
+fn attach_change_write_inputs(
+    producer: &mut crate::optimizer::OptimizedOperatorNode,
+    routes: &[DmlChangeStreamRoute],
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<(), crate::compiler::SqlCompileError> {
+    use crate::planner::distributed::build::ContractLoweringError;
+    use novarocks_type_contract::{CompilePhase, PureCompileControl};
+    let mut declarations = std::collections::BTreeMap::new();
+    for route in routes {
+        if !matches!(
+            route.sink.0.contract.mode,
+            crate::planner::distributed::write::contract::SqlWriteSinkMode::Data
+                | crate::planner::distributed::write::contract::SqlWriteSinkMode::RowLineageData
+        ) {
+            continue;
+        }
+        for field in &route.sink.0.contract.target.fields {
+            let input = field
+                .column
+                .declared_value_type_observed::<ContractLoweringError>(|| {
+                    control
+                        .checkpoint(CompilePhase::Validate, 1)
+                        .map_err(Into::into)
+                })
+                .map_err(final_lowering_error)?;
+            let declaration = novarocks_type_contract::WriteInputDeclaration {
+                input,
+                storage: field.storage_type.clone(),
+            };
+            if let Some(original) =
+                declarations.insert(field.column.name.as_str(), declaration.clone())
+                && original != declaration
+            {
+                return Err("change-stream routes disagree on their complete write input".into());
+            }
+        }
+    }
+    let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &mut producer.op
+    else {
+        return Err("generated change stream lost its original event expansion".into());
+    };
+    for event in &mut expand.events {
+        for assignment in &mut event.assignments {
+            if assignment.expr.is_none() {
+                continue;
+            }
+            let output = expand
+                .output_columns
+                .iter()
+                .find(|output| output.column_id == assignment.output_column_id)
+                .ok_or_else(|| "change-stream assignment lost its original output".to_owned())?;
+            if let Some(declaration) = declarations.get(output.name.as_str()) {
+                assignment.write_input = Some(declaration.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_delete_change_event_expand(
     child: crate::optimizer::OptimizedOperatorNode,
     ordinals: [usize; 4],
@@ -1982,6 +2029,7 @@ fn build_delete_change_event_expand(
             is_internal: true,
         });
         assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+            write_input: None,
             output_column_id: output,
             expr: Some(intern_column(&mut arena, source, control)?),
         });
@@ -2047,6 +2095,7 @@ fn append_old_file_metadata(
             is_internal: true,
         });
         assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+            write_input: None,
             output_column_id: output,
             expr: Some(intern_column(arena, source, control)?),
         });
@@ -2099,6 +2148,7 @@ fn build_update_change_event_expand(
             )?,
         };
         assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+            write_input: None,
             output_column_id: output.column_id,
             expr: Some(expr),
         });
@@ -2222,12 +2272,14 @@ fn build_merge_change_event_expand(
             )?,
         };
         reuse_assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+            write_input: None,
             output_column_id: output.column_id,
             expr: Some(reuse),
         });
         let insert_name = format!("__nr_ins_{name}");
         if let Some(column) = maybe_output_column_by_name(&child_outputs, &insert_name)? {
             fresh_assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+                write_input: None,
                 output_column_id: output.column_id,
                 expr: Some(intern_column(&mut arena, &column, control)?),
             });
@@ -2503,6 +2555,7 @@ fn output_expr(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::optimizer::operator::ChangeEventOutputExpr, crate::compiler::SqlCompileError> {
     Ok(crate::optimizer::operator::ChangeEventOutputExpr {
+        write_input: None,
         output_column_id,
         expr: Some(child_expr(arena, columns, name, label, control)?),
     })
@@ -4094,6 +4147,7 @@ mod tests {
                 namespace: "db".into(),
                 table: "t".into(),
                 fields: vec![DmlWriteTargetField {
+                    storage_type: None,
                     token: ConnectorWriteFieldToken::from_bytes([4; 32]),
                     column: column.clone(),
                     is_hidden: false,
@@ -5143,7 +5197,7 @@ mod tests {
     }
 
     #[test]
-    fn dml_read_and_ctas_keep_actual_analyzed_root_allow_across_move_handoffs() {
+    fn ctas_keeps_actual_analyzed_root_allow_across_move_handoffs() {
         use crate::compiler::{
             SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
             SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
@@ -5209,14 +5263,6 @@ mod tests {
                 assert_eq!(request.root_allow_throw_exception(), expected);
                 request
             };
-            let (completion, reads) = super::begin_final_dml_read_plan(
-                request(SqlCompileIntent::DmlInternalRead),
-                &SessionOptimizerSettings::default(),
-            )
-            .unwrap();
-            assert!(reads.is_empty());
-            assert_eq!(completion.root_allow_throw_exception, expected);
-            assert_eq!(completion.constant_policy, constant_policy);
             let source = super::compile_ctas_source(request(SqlCompileIntent::Query)).unwrap();
             assert_eq!(source.root_allow_throw_exception, expected);
             assert_eq!(source.constant_policy, constant_policy);
@@ -5486,5 +5532,46 @@ mod tests {
             erased.private_output_domain = false;
             assert_ne!(source.capture_fingerprint(), erased.capture_fingerprint());
         }
+    }
+    #[test]
+    fn root_write_assignments_keep_independent_storage_widths_and_explicit_selection_boundary() {
+        use super::ConnectorWriteInputBinding;
+        use crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input;
+        use arrow::datatypes::DataType;
+        use novarocks_type_contract::FunctionValueType;
+        let mut input =
+            simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal);
+        let first = &mut input.contract.target.fields[0];
+        first.column.data_type = DataType::Binary;
+        first.storage_type = Some(FunctionValueType::new(DataType::FixedSizeBinary(4), false));
+        let mut second = first.clone();
+        second.token = novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([2; 32]);
+        second.column.name = "copy".into();
+        second.storage_type = Some(FunctionValueType::new(DataType::FixedSizeBinary(8), false));
+        input.contract.target.fields.push(second);
+        let input = DmlWritePlanInput(input);
+        let assignments = input
+            .root_write_assignments(&crate::compiler::SqlCompileControl::unbounded())
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignments.sites().len(), 2);
+        for (ordinal, width) in [(0, 4), (1, 8)] {
+            let site = &assignments.sites()[ordinal];
+            assert_eq!(site.output_ordinal(), ordinal);
+            assert_eq!(site.input().data_type(), &DataType::Binary);
+            assert!(!site.input().nullable());
+            assert_eq!(
+                site.storage().unwrap().data_type(),
+                &DataType::FixedSizeBinary(width)
+            );
+        }
+        let mut repeated = input;
+        repeated.0.input = ConnectorWriteInputBinding::OutputOrdinals(vec![0, 0]);
+        assert!(
+            repeated
+                .root_write_assignments(&crate::compiler::SqlCompileControl::unbounded())
+                .unwrap()
+                .is_none()
+        );
     }
 }

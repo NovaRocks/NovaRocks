@@ -19,64 +19,37 @@
 //! pass through without copies, and declared lengths are bounded before any
 //! assembly buffer is reserved.
 
-use std::sync::Arc;
-
-use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use novarocks_native_adapter::root_cow_selection_codec::{
-    COW_SELECTION_HEADER_BYTES, CowSelectionEncoder, CowSelectionTotals,
-};
 use novarocks_native_adapter::root_record_assembly::{
     RootRecordAssembly, RootRecordAssemblyError, RootRecordDomain,
 };
-use novarocks_result_render::RenderTurnStatus;
+use novarocks_native_adapter::root_statistics_codec::STATISTICS_HEADER_BYTES;
 
-mod support {
-    include!("common/cow_recipe.rs");
+// Author two valid StatisticsArtifactV1 records directly from the documented
+// framing contract. This assembly oracle does not depend on a producer cursor.
+fn statistics_records() -> Vec<Vec<u8>> {
+    [&b"aa"[..], &b"bbb"[..]]
+        .into_iter()
+        .map(|body| {
+            let mut record = Vec::new();
+            let record_bytes = STATISTICS_HEADER_BYTES + 4 + 1 + body.len();
+            record.extend_from_slice(b"STA1");
+            for word in [record_bytes as u32, 1, 1, body.len() as u32, 0] {
+                record.extend_from_slice(&word.to_le_bytes());
+            }
+            record.extend_from_slice(&1_i32.to_le_bytes());
+            record.extend_from_slice(b"x");
+            record.extend_from_slice(body);
+            record
+        })
+        .collect()
 }
 
-fn cow_stream() -> Vec<u8> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("_file", DataType::Utf8, false),
-        Field::new("_pos", DataType::Int64, false),
-    ]));
-    let batch = |files: Vec<&str>, positions: Vec<i64>| {
-        RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(files)) as ArrayRef,
-                Arc::new(Int64Array::from(positions)) as ArrayRef,
-            ],
-        )
-        .unwrap()
-    };
-    let mut totals = CowSelectionTotals::default();
-    let mut stream = Vec::new();
-    // Both batches use the same prepared root declaration; their records
-    // carry data only and never introduce a separate Schema record.
-    let recipe = support::recipe(&schema);
-    for input in [
-        batch(vec!["s3://a", "s3://bb"], vec![1, 2]),
-        batch(vec!["s3://ccc"], vec![7]),
-    ] {
-        let input = support::normalized(&input, &recipe);
-        let mut encoder =
-            CowSelectionEncoder::try_new(&input, &recipe, totals, usize::MAX).unwrap();
-        let mut output = vec![0_u8; 1 << 16];
-        loop {
-            let turn = encoder.step(&mut output);
-            stream.extend_from_slice(&output[..turn.emitted_bytes]);
-            if turn.status == RenderTurnStatus::InputComplete {
-                break;
-            }
-        }
-        totals = encoder.totals();
-    }
-    stream
+fn statistics_stream() -> Vec<u8> {
+    statistics_records().concat()
 }
 
 fn records(stream: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
-    let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, 1 << 20);
+    let mut assembly = RootRecordAssembly::new(RootRecordDomain::Statistics, 1 << 20);
     let mut out = Vec::new();
     let mut start = 0;
     for &cut in cuts.iter().chain(std::iter::once(&stream.len())) {
@@ -94,8 +67,13 @@ fn records(stream: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
 
 #[test]
 fn every_cut_position_reassembles_the_same_records() {
-    let stream = cow_stream();
+    let expected = statistics_records();
+    let stream = expected.concat();
     let whole = records(&stream, &[]);
+    assert_eq!(
+        whole, expected,
+        "whole input retains the authored record boundaries"
+    );
     assert_eq!(
         whole.len(),
         2,
@@ -111,9 +89,9 @@ fn every_cut_position_reassembles_the_same_records() {
 
 #[test]
 fn whole_records_in_one_body_are_not_copied() {
-    let stream = cow_stream();
+    let stream = statistics_stream();
     let range = stream.as_ptr_range();
-    let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, 1 << 20);
+    let mut assembly = RootRecordAssembly::new(RootRecordDomain::Statistics, 1 << 20);
     assembly
         .push::<std::convert::Infallible>(&stream, |record| {
             assert!(range.contains(&record.as_ptr()), "record was copied");
@@ -125,35 +103,35 @@ fn whole_records_in_one_body_are_not_copied() {
 
 #[test]
 fn declared_length_is_bounded_before_assembly_reserves_it() {
-    let stream = cow_stream();
-    let first = records(&stream, &[])[0].len();
-    let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, first - 1);
+    let stream = statistics_stream();
+    let first = statistics_records()[0].len();
+    let mut assembly = RootRecordAssembly::new(RootRecordDomain::Statistics, first - 1);
     // The header arrives alone; the oversized declaration is refused at once.
     let error = assembly
-        .push::<std::convert::Infallible>(&stream[..COW_SELECTION_HEADER_BYTES], |_| Ok(()))
+        .push::<std::convert::Infallible>(&stream[..STATISTICS_HEADER_BYTES], |_| Ok(()))
         .unwrap_err();
     assert!(error.to_string().contains("assembly bound"), "{error}");
-    assert!(assembly.retained_bytes() <= COW_SELECTION_HEADER_BYTES);
+    assert!(assembly.retained_bytes() <= STATISTICS_HEADER_BYTES);
 }
 
 #[test]
 fn end_inside_a_record_and_forged_headers_are_refused() {
-    let stream = cow_stream();
-    let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, 1 << 20);
+    let stream = statistics_stream();
+    let mut assembly = RootRecordAssembly::new(RootRecordDomain::Statistics, 1 << 20);
     assembly
-        .push::<std::convert::Infallible>(&stream[..40], |_| Ok(()))
+        .push::<std::convert::Infallible>(&stream[..statistics_records()[0].len() - 1], |_| Ok(()))
         .unwrap();
     assert!(assembly.finish().is_err());
     let mut forged = stream.clone();
     forged[0] = b'X';
-    let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, 1 << 20);
+    let mut assembly = RootRecordAssembly::new(RootRecordDomain::Statistics, 1 << 20);
     assert!(
         assembly
             .push::<std::convert::Infallible>(&forged, |_| Ok(()))
             .is_err()
     );
     // A decoder refusal stops assembly with its own message.
-    let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, 1 << 20);
+    let mut assembly = RootRecordAssembly::new(RootRecordDomain::Statistics, 1 << 20);
     let error = assembly
         .push(&stream, |_| Err("decoder refused".to_string()))
         .unwrap_err();

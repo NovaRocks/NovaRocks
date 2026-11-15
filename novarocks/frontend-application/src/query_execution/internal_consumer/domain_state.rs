@@ -20,12 +20,11 @@
 use std::sync::Arc;
 
 use crate::query_execution::{
-    row_mutation::CowMatchRootConsumer, statistics::StatisticsRootResultDecoder,
-    write_result::RootWriteResultDecoder,
+    statistics::StatisticsRootResultDecoder, write_result::RootWriteResultDecoder,
 };
 use novarocks_execution_contract::root_result::RootResultEnd;
 use novarocks_query_application::api::{RetainedRootReply, RootReplyView};
-use novarocks_spi::connector::{ConnectorRowMutationSelection, StatisticsArtifactDraft};
+use novarocks_spi::connector::StatisticsArtifactDraft;
 
 /// The actual Internal domain retains typed sources through its CPU result.
 /// Legacy diagnostic-only domains keep their original projection separately.
@@ -107,13 +106,11 @@ pub(crate) enum InternalDomainState {
         decoder: RootWriteResultDecoder,
         decode: crate::query_execution::write_session::WriteComputationDecode,
     },
-    Cow(Box<CowMatchRootConsumer>),
 }
 
 pub(crate) enum InternalDomainCompletion {
     Statistics(StatisticsRootResultDecoder),
     WriteDecoded(crate::query_execution::write_session::SessionDecodedWriteSegment),
-    Cow(ConnectorRowMutationSelection),
 }
 
 pub(crate) struct InternalDomainEof {
@@ -177,9 +174,6 @@ impl InternalDomainSlot {
             InternalDomainState::WriteComputation { decoder, .. } => decoder
                 .apply_relay_body(body)
                 .map_err(InternalDomainFailure::from),
-            InternalDomainState::Cow(consumer) => consumer
-                .push_body(body)
-                .map_err(InternalDomainFailure::from),
         };
         // Receipt contains no body alias. Relinquish this job's original reply
         // before CPU completion, local consumption and the remote ACK.
@@ -209,10 +203,6 @@ impl InternalDomainSlot {
                 decoder.observe_root_eof()?;
                 let prepared = decode.interpret(decoder.finish()?)?;
                 InternalDomainCompletion::WriteDecoded(prepared)
-            }
-            InternalDomainState::Cow(consumer) => {
-                consumer.check_end(end.output_rows)?;
-                InternalDomainCompletion::Cow((*consumer).finish()?)
             }
         };
         Ok(Self::Eof(Box::new(InternalDomainEof {
@@ -259,18 +249,6 @@ impl InternalDomainSlot {
             _ => Err("write domain has no original accepted segment".into()),
         }
     }
-    pub(crate) fn into_cow(self) -> Result<ConnectorRowMutationSelection, String> {
-        match self {
-            Self::Eof(eof) => match *eof {
-                InternalDomainEof {
-                    completion: InternalDomainCompletion::Cow(selection),
-                    ..
-                } => Ok(selection),
-                _ => Err("COW lost its CPU-validated selection".into()),
-            },
-            _ => Err("COW lost its CPU-validated selection".into()),
-        }
-    }
     pub(crate) fn into_statistics(self) -> Result<Vec<StatisticsArtifactDraft>, String> {
         match self {
             Self::StatisticsFinished(artifacts) => Ok(artifacts),
@@ -294,51 +272,6 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    #[test]
-    fn cow_source_keeps_its_fact_and_safe_public_data_projection() {
-        use novarocks_failure_contract::{FailureClass, FailureProjection};
-        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-        let source = ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "signed COW required field contains NULL at row 0",
-        );
-        let expected = source.failure_fact();
-        let failure = InternalDomainFailure::from(source.clone());
-        let InternalDomainFailure::Source(original) = &failure else {
-            panic!("the actual domain source is required")
-        };
-        assert_eq!(original.downcast_ref::<ConnectorError>(), Some(&source));
-        assert_eq!(expected.class(), FailureClass::Data);
-        let input = failure.execution_input().unwrap();
-        assert_eq!(input.fact(), expected);
-        assert_eq!(
-            input.user_error().code().as_str(),
-            "query.execution.invalid_data"
-        );
-        assert_eq!(
-            input.user_error().to_string(),
-            "[query.execution.invalid_data] statement execution failed in its coordinator"
-        );
-        assert!(
-            InternalDomainFailure::from("signed COW required field contains NULL at row 0")
-                .execution_input()
-                .is_none()
-        );
-        for kind in [
-            ConnectorErrorKind::ResourceExhausted,
-            ConnectorErrorKind::Cancelled,
-        ] {
-            let source = ConnectorError::new(kind, "actual source diagnostic");
-            let expected = source.failure_fact();
-            let failure = InternalDomainFailure::from(source.clone());
-            assert_eq!(failure.execution_input().unwrap().fact(), expected);
-            let InternalDomainFailure::Source(original) = failure else {
-                panic!("the actual domain source is required")
-            };
-            assert_eq!(original.downcast_ref::<ConnectorError>(), Some(&source));
-        }
-    }
-
     async fn claim(
         job: &mut crate::query_execution::internal_result_cpu::InternalResultCpuJob<
             Result<InternalDomainSlot, InternalDomainFailure>,
@@ -359,54 +292,6 @@ mod tests {
         })
         .await
         .expect("domain CPU watchdog")
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cow_source_survives_the_actual_cpu_result_without_a_success_receipt() {
-        use novarocks_failure_contract::FailureProjection;
-        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-        let (_control, root, binding, capacity) = admitted_internal_fixture();
-        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
-        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
-        let cancellation = QueryCancellationSource::new();
-        let source = ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "signed COW required field contains NULL at row 0",
-        );
-        let expected = source.failure_fact();
-        let input =
-            InternalResultValue::try_produce(binding.scope(), binding.window_alias(), |_| {
-                Ok(source.clone())
-            })
-            .unwrap()
-            .track_actual_exit(&binding)
-            .unwrap();
-        let mut job = owner.runtime().submit(
-            input,
-            cancellation.view(),
-            &runtime,
-            Arc::new(TestIntakeWake::default()),
-            |source, _| Err::<InternalDomainSlot, _>(InternalDomainFailure::from(source)),
-        );
-        let failure = match claim(&mut job).await {
-            Err(failure) => failure,
-            Ok(_) => panic!("a rejected COW body cannot yield a receipt domain"),
-        };
-        assert_eq!(failure.execution_input().unwrap().fact(), expected);
-        let InternalDomainFailure::Source(original) = failure else {
-            panic!("the actual domain source is required")
-        };
-        assert_eq!(original.downcast_ref::<ConnectorError>(), Some(&source));
-        drop(original);
-        binding.wait_result_activities_exited();
-        drop(binding);
-        root.owner.complete();
-        root.business.release();
-        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
-        owner
-            .shutdown_until(Instant::now() + Duration::from_secs(2))
-            .await
-            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

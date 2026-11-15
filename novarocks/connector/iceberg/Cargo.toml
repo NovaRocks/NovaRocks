@@ -69,6 +69,7 @@ novarocks-proto-models.workspace = true
 novarocks-spi.workspace = true
 novarocks-types.workspace = true
 novarocks-type-contract.workspace = true
+novarocks-value-arrays.workspace = true
 
 [dev-dependencies]
 novarocks-cluster-harness.workspace = true

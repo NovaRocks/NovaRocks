@@ -23,27 +23,19 @@
 //! side is pinned to one snapshot, while the write side describes where new
 //! files go.
 //!
-//! The copy-on-write *source* is deliberately not a third wire object. A merge
-//! source is an ordinary pinned scan: the same table handle, the same ordered
-//! columns, the same predicate. [`IcebergMergeSourcePlan`] therefore stays on
-//! the frontend and adds no reader branch, and it carries no source digest --
-//! a page source and an ordinary scan produce no content digest at all, and
-//! inventing one here would create a second identity for facts the pinned
-//! snapshot already fixes.
-
 use std::sync::Arc;
 
 use crate::wire::dto;
-use novarocks_proto_codec::connector_read::{MAX_JSON_BYTES, MAX_PATH_BYTES, MAX_SCAN_ASSIGNMENTS};
+use novarocks_proto_codec::connector_read::{MAX_JSON_BYTES, MAX_PATH_BYTES};
+use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
     ConnectorMergeTableHandle as ConnectorMergeTableHandleMarker, ConnectorTableHandle,
-    SchemaTableName, TupleDomain,
+    SchemaTableName,
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use crate::iceberg::spec::Schema;
 
-use super::column_handle::{IcebergColumnHandle, invalid};
+use super::column_handle::invalid;
 use super::table_handle::IcebergTableHandle;
 
 /// The exact facts one insert target is frozen from.
@@ -233,100 +225,8 @@ impl ConnectorMergeTableHandleMarker for IcebergMergeTableHandle {
     }
 }
 
-/// The exact facts one copy-on-write merge source is composed from.
-#[derive(Clone, Debug)]
-pub struct IcebergMergeSourcePlanParams {
-    pub table_handle: IcebergTableHandle,
-    /// Ordered output columns of the source scan.
-    pub columns: Vec<IcebergColumnHandle>,
-    /// The match predicate the source scan is narrowed by.
-    pub predicate: TupleDomain<IcebergColumnHandle>,
-}
-
-/// The frontend's composition of a copy-on-write merge source.
-///
-/// This type never crosses the wire and adds no reader branch: everything a
-/// worker needs is already an [`IcebergTableHandle`], an ordered column list,
-/// and a predicate -- exactly what an ordinary scan carries. Keeping the
-/// composition frontend-local is what lets the merge source stay an ordinary
-/// scan instead of becoming a fourth relation kind.
-///
-/// It carries no `sourceDigest`. A digest would claim to identify the content
-/// a page source produced, but a page source produces no content object: the
-/// pinned snapshot plus the frozen predicate already determine the rows
-/// exactly. Only writer preparation and commit state -- which do own separate
-/// content objects -- may derive an identity of their own.
-#[derive(Clone, Debug)]
-pub struct IcebergMergeSourcePlan {
-    table_handle: IcebergTableHandle,
-    columns: Vec<IcebergColumnHandle>,
-    predicate: TupleDomain<IcebergColumnHandle>,
-}
-
-impl IcebergMergeSourcePlan {
-    pub fn try_new(params: IcebergMergeSourcePlanParams) -> Result<Self, ConnectorError> {
-        let IcebergMergeSourcePlanParams {
-            table_handle,
-            columns,
-            predicate,
-        } = params;
-
-        if table_handle.snapshot_id().is_none() {
-            return Err(invalid(
-                "an iceberg merge source requires a pinned snapshot",
-            ));
-        }
-        if columns.is_empty() {
-            return Err(invalid(
-                "an iceberg merge source requires at least one output column",
-            ));
-        }
-        if columns.len() > MAX_SCAN_ASSIGNMENTS {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "iceberg merge source column count exceeds the hard limit",
-            ));
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        for column in &columns {
-            if !seen.insert(column.clone()) {
-                return Err(invalid(
-                    "iceberg merge source output columns must be unique",
-                ));
-            }
-        }
-
-        Ok(Self {
-            table_handle,
-            columns,
-            predicate,
-        })
-    }
-
-    pub const fn table_handle(&self) -> &IcebergTableHandle {
-        &self.table_handle
-    }
-
-    pub fn columns(&self) -> &[IcebergColumnHandle] {
-        &self.columns
-    }
-
-    pub const fn predicate(&self) -> &TupleDomain<IcebergColumnHandle> {
-        &self.predicate
-    }
-
-    /// The predicate a source scan must satisfy: the merge's own match
-    /// predicate intersected with whatever the pinned handle already carries.
-    pub fn effective_predicate(&self) -> Result<TupleDomain<IcebergColumnHandle>, ConnectorError> {
-        self.table_handle
-            .effective_predicate()?
-            .intersect(&self.predicate)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::table_execute::IcebergRewriteArtifactContentId;
     use super::super::table_handle::tests::{
         identity_partition_spec, partitioned_handle, partitioned_schema, table_handle_params,
     };
@@ -341,10 +241,6 @@ mod tests {
             spec_id: Some(7),
         })
         .expect("insert handle")
-    }
-
-    fn column(field_id: i32) -> IcebergColumnHandle {
-        IcebergColumnHandle::base_column_of(&partitioned_schema(), field_id).expect("column")
     }
 
     #[test]
@@ -399,15 +295,7 @@ mod tests {
         params.snapshot_id = None;
         params.read_domain = None;
         let unpinned = IcebergTableHandle::try_new(params).expect("handle");
-        assert!(IcebergMergeTableHandle::try_new(unpinned.clone(), insert_handle()).is_err());
-        assert!(
-            IcebergMergeSourcePlan::try_new(IcebergMergeSourcePlanParams {
-                table_handle: unpinned,
-                columns: vec![column(1)],
-                predicate: TupleDomain::all(),
-            })
-            .is_err()
-        );
+        assert!(IcebergMergeTableHandle::try_new(unpinned, insert_handle()).is_err());
     }
 
     #[test]
@@ -426,59 +314,6 @@ mod tests {
         let decoded =
             IcebergMergeTableHandle::from_proto(&handle.to_proto()).expect("decoded merge handle");
         assert_eq!(decoded, handle);
-    }
-
-    #[test]
-    fn the_merge_source_plan_is_frontend_local_and_carries_no_digest() {
-        let plan = IcebergMergeSourcePlan::try_new(IcebergMergeSourcePlanParams {
-            table_handle: partitioned_handle(),
-            columns: vec![column(1), column(2)],
-            predicate: TupleDomain::all(),
-        })
-        .expect("merge source plan");
-        assert_eq!(plan.columns().len(), 2);
-        assert_eq!(plan.table_handle().snapshot_id(), Some(11));
-        assert!(plan.predicate().is_all());
-        assert!(plan.effective_predicate().expect("predicate").is_all());
-
-        // The one content identity in this stack belongs to an external
-        // immutable rewrite artifact, and it is entirely independent of a
-        // merge source: it names an object the source never produces.
-        let artifact = IcebergRewriteArtifactContentId::try_new(
-            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]),
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        )
-        .expect("artifact content id");
-        assert_eq!(
-            artifact.artifact_digest_hex(),
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        );
-        // A page source and an ordinary scan produce no content digest at all,
-        // so nothing about the plan can be derived from the artifact.
-        assert_ne!(
-            artifact.operation_id().to_string(),
-            plan.table_handle().table_location()
-        );
-    }
-
-    #[test]
-    fn the_merge_source_plan_rejects_an_empty_or_duplicated_projection() {
-        assert!(
-            IcebergMergeSourcePlan::try_new(IcebergMergeSourcePlanParams {
-                table_handle: partitioned_handle(),
-                columns: Vec::new(),
-                predicate: TupleDomain::all(),
-            })
-            .is_err()
-        );
-        assert!(
-            IcebergMergeSourcePlan::try_new(IcebergMergeSourcePlanParams {
-                table_handle: partitioned_handle(),
-                columns: vec![column(1), column(1)],
-                predicate: TupleDomain::all(),
-            })
-            .is_err()
-        );
     }
 
     #[test]

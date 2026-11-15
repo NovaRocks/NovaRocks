@@ -19,13 +19,16 @@
 
 use super::*;
 use crate::commit::write_stack::domain::{
-    IcebergCreationScope, IcebergWriteSessionId, IcebergWriteTableFacts, IcebergWriterOutput,
+    IcebergCreationScope, IcebergDataBranchRecipe, IcebergEqualityDeleteColumnFacts,
+    IcebergEqualityDeleteRecipe, IcebergWriteSessionId, IcebergWriteTableFacts,
+    IcebergWriterOutput,
 };
 use crate::commit::write_stack::test_support::{
     data_branch_plan, equality_delete_recipe, position_rewrite_target, writer_resources,
 };
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{BinaryArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::{
     CatalogVersion, ConnectorInstanceId, ConnectorProviderId, ConnectorStopOwner,
@@ -74,6 +77,17 @@ impl Fixture {
         RecordBatch,
         ConnectorStopOwner,
     ) {
+        self.writer_with_data_input(branch, None).await
+    }
+    async fn writer_with_data_input(
+        &self,
+        branch: IcebergWriteBranch,
+        data_input: Option<(String, RecordBatch)>,
+    ) -> (
+        Box<dyn ConnectorBatchWriter>,
+        RecordBatch,
+        ConnectorStopOwner,
+    ) {
         let root = format!("file://{}", self.directory.path().display());
         let table = IcebergWriteTableFacts::try_new(
             "6f7c3a0e-0000-4000-8000-000000000001".into(),
@@ -101,34 +115,81 @@ impl Fixture {
         let output =
             IcebergWriterOutput::try_new(format, parquet::basic::Compression::SNAPPY, None)
                 .unwrap();
-        let data = data_branch_plan();
+        let mut data = data_branch_plan();
+        let mut equality = equality_delete_recipe();
+        let data_batch = if let Some((schema, batch)) = data_input {
+            data.recipe = IcebergDataBranchRecipe::try_new(
+                Some(schema.clone()),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            )
+            .unwrap();
+            equality = IcebergEqualityDeleteRecipe::try_new(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        IcebergEqualityDeleteColumnFacts::try_new(
+                            field.name().clone(),
+                            index as i32 + 1,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+                schema,
+            )
+            .unwrap();
+            Some(batch)
+        } else {
+            None
+        };
         let (handle, batch) = match branch {
             IcebergWriteBranch::Data | IcebergWriteBranch::EqualityDelete => {
                 let handle = if branch == IcebergWriteBranch::Data {
-                    IcebergWriterHandle::try_new_data(table, output, data.recipe)
-                        .unwrap()
-                        .with_creation_scope(
-                            IcebergCreationScope::try_new(
-                                IcebergWriteSessionId::new(),
-                                [1; 16],
-                                [2; 32],
-                            )
-                            .unwrap(),
-                        )
-                } else {
-                    IcebergWriterHandle::try_new_equality_delete(
+                    if let Some(batch) = data_batch.as_ref() {
+                        data.input = novarocks_spi::connector::ConnectorWriteInputShape::Data {
+                            fields: batch.schema().fields().iter().enumerate().map(|(ordinal, field)| {
+                                let mut token = [0; 32];
+                                token[..8].copy_from_slice(&(ordinal as u64).to_be_bytes());
+                                novarocks_spi::connector::ConnectorWriteFieldBinding::try_new_typed(
+                                    novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes(token),
+                                    field.as_ref().clone(),
+                                    novarocks_type_contract::FunctionValueType::new(field.data_type().clone(), field.is_nullable()),
+                                ).unwrap()
+                            }).collect(),
+                        };
+                    }
+                    let identity =
+                        crate::commit::write_stack::domain::data_write_input_identity(&data.input)
+                            .unwrap();
+                    IcebergWriterHandle::try_new_data(
                         table,
                         output,
-                        equality_delete_recipe(),
+                        data.recipe.with_write_input_identity(identity),
                     )
                     .unwrap()
-                };
-                let schema = Arc::new(Schema::new(vec![Field::new("k1", DataType::Int64, true)]));
-                (
-                    handle,
-                    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![10, 20]))])
+                    .with_creation_scope(
+                        IcebergCreationScope::try_new(
+                            IcebergWriteSessionId::new(),
+                            [1; 16],
+                            [2; 32],
+                        )
                         .unwrap(),
-                )
+                    )
+                } else {
+                    IcebergWriterHandle::try_new_equality_delete(table, output, equality).unwrap()
+                };
+                let batch = data_batch.unwrap_or_else(|| {
+                    let schema =
+                        Arc::new(Schema::new(vec![Field::new("k1", DataType::Int64, true)]));
+                    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![10, 20]))])
+                        .unwrap()
+                });
+                (handle, batch)
             }
             IcebergWriteBranch::DeletionVector => {
                 let source = format!("{root}/a-source.parquet");
@@ -379,4 +440,91 @@ async fn maintenance_vector_repacks_full_coverage_with_an_owned_puffin() {
     assert!(fragment.creation().is_some());
     let [path]: [_; 1] = fixture.files().try_into().unwrap();
     assert!(std::fs::read(path).unwrap().starts_with(b"PFA1"));
+}
+
+#[tokio::test]
+async fn writer_append_preserves_width_data_failures_and_internal_contract_failures_before_staging()
+{
+    for branch in [IcebergWriteBranch::Data, IcebergWriteBranch::EqualityDelete] {
+        for (case, required, expected_kind, expected_class) in [
+            (
+                "width",
+                false,
+                ConnectorErrorKind::InvalidRequest,
+                FailureClass::Data,
+            ),
+            (
+                "required",
+                true,
+                ConnectorErrorKind::Internal,
+                FailureClass::Unexpected,
+            ),
+            (
+                "field-name",
+                false,
+                ConnectorErrorKind::Internal,
+                FailureClass::Unexpected,
+            ),
+            (
+                "column-count",
+                false,
+                ConnectorErrorKind::Internal,
+                FailureClass::Unexpected,
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let target = serde_json::json!({"type":"struct","schema-id":1,"fields":[{"id":1,"name":"raw","required":required,"type":"fixed[4]"}]}).to_string();
+            let source_schema =
+                Arc::new(Schema::new(vec![Field::new("raw", DataType::Binary, true)]));
+            let valid = RecordBatch::try_new(
+                source_schema.clone(),
+                vec![Arc::new(BinaryArray::from(vec![Some(&b"abcd"[..])]))],
+            )
+            .unwrap();
+            let (mut writer, _, _stop) = fixture
+                .writer_with_data_input(branch, Some((target, valid)))
+                .await;
+            let batch = match case {
+                "width" => RecordBatch::try_new(
+                    source_schema.clone(),
+                    vec![Arc::new(BinaryArray::from(vec![Some(&b"x"[..])]))],
+                )
+                .unwrap(),
+                "required" => RecordBatch::try_new(
+                    source_schema.clone(),
+                    vec![Arc::new(BinaryArray::from(vec![None::<&[u8]>]))],
+                )
+                .unwrap(),
+                "field-name" => RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new(
+                        "other",
+                        DataType::Binary,
+                        true,
+                    )])),
+                    vec![Arc::new(BinaryArray::from(vec![Some(&b"abcd"[..])]))],
+                )
+                .unwrap(),
+                "column-count" => RecordBatch::try_new_with_options(
+                    Arc::new(Schema::empty()),
+                    vec![],
+                    &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(1)),
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            };
+            let failure = writer.append(batch).await.unwrap_err();
+            assert_eq!(failure.kind(), expected_kind, "{case}: {failure}");
+            assert_eq!(
+                failure.failure_fact().class(),
+                expected_class,
+                "{case}: {failure}"
+            );
+            assert!(
+                fixture.files().is_empty(),
+                "{case} staged bytes before rejecting the value"
+            );
+            writer.abort().await.unwrap();
+            assert!(fixture.files().is_empty());
+        }
+    }
 }

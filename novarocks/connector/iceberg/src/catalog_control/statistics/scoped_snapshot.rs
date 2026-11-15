@@ -22,7 +22,7 @@
 //! and original MIO before the CPU continuation allocates it.
 use super::*;
 use crate::iceberg::{io::FileIO, table::Table};
-use crate::read_snapshot::cow_capture::ReadFailure;
+use crate::read_snapshot::scoped_capture::ReadFailure;
 use novarocks_spi::connector::{
     ConnectorOriginalResultScope, ConnectorPayloadRetentionGuard, ConnectorRequestContext,
     ProviderMetadataCpuInput, ProviderMetadataCpuPort,
@@ -783,7 +783,7 @@ mod tests {
         let failure = inventory
             .finish(|| Err(ReadFailure::Original(original.clone().into())))
             .unwrap_err();
-        let ReadFailure::Original(novarocks_spi::connector::ConnectorCowBeginCause::Provider(
+        let ReadFailure::Original(novarocks_spi::connector::ConnectorScopedBeginCause::Provider(
             actual,
         )) = failure
         else {
@@ -821,7 +821,7 @@ mod tests {
             loan.state = Some(IoState::SpecsReserved(Err(original.clone())));
         }
         let Poll::Ready(Err(ReadFailure::Original(
-            novarocks_spi::connector::ConnectorCowBeginCause::Provider(actual),
+            novarocks_spi::connector::ConnectorScopedBeginCause::Provider(actual),
         ))) = borrowed.as_mut().poll(&mut cx)
         else {
             panic!("same original reservation refusal");

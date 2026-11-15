@@ -5,6 +5,10 @@ domain: [provider-spi, frontend-dml]
 status: active
 supersedes: [ADR-0045]
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0233
+    scope: "COW selection, activation routes and cohorts retire; Provider strategy/identity ownership and remaining MOR write-stack routes remain active"
+    link: "ADR-0233-iceberg-mor-only-and-provider-owned-write-validation.md"
 date: 2026-08-10
 provenance:
   - "discussion: 2026-08-09 provider-owned row-mutation boundary"

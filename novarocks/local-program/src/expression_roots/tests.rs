@@ -293,6 +293,7 @@ fn scoped_program(shared: bool) -> LocalProgramGraph {
                 target: WriteTargetOrdinal::try_new(0).unwrap(),
                 expected_layout: layout.clone(),
                 projection: StaticWriterProjection {
+                    storage_types: vec![None; 2],
                     arena: writer,
                     expressions: vec![ProgramExprId::new(0); 2],
                     layout: layout.clone(),

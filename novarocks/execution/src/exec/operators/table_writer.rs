@@ -2780,6 +2780,24 @@ pub(crate) mod tests {
             row_multiplicity: RowMultiplicity::SingleCopy,
             ordering: Box::default(),
         };
+        let projected_target_fields_0: Box<[novarocks_physical_plan::WriterTargetField]> =
+            Box::from([WriterTargetField {
+                storage_type: None,
+                projected: builder
+                    .add_value(
+                        (ty.clone()).clone(),
+                        novarocks_physical_plan::ValueOrigin::WriterDerived {
+                            writer_node: writer,
+                            kind: novarocks_physical_plan::WriterDerivedKind::ProjectedInput,
+                        },
+                    )
+                    .unwrap(),
+                token,
+                provider_name: provider_schema.fields()[0].name().clone().into(),
+                input: projected,
+                ty: ty.clone(),
+                hidden: false,
+            }]);
         builder
             .insert_node_unchecked(PhysicalNode {
                 id: writer,
@@ -2796,13 +2814,7 @@ pub(crate) mod tests {
                         write_target_ordinal: ordinal,
                         input: Box::from([projected]),
                         required_distribution: Distribution::Singleton,
-                        target_fields: Box::from([WriterTargetField {
-                            token,
-                            provider_name: provider_schema.fields()[0].name().clone().into(),
-                            input: projected,
-                            ty: ty.clone(),
-                            hidden: false,
-                        }]),
+                        target_fields: projected_target_fields_0,
                         output_schema: WriterRelationSchema {
                             revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
                             fields: fields.clone().into_boxed_slice(),

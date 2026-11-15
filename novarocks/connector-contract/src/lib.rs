@@ -102,7 +102,8 @@ pub use value::{ConnectorValue, ConnectorValueType, MAX_CONNECTOR_DECIMAL_PRECIS
 pub use write::{ConnectorWriteFieldToken, MAX_CONNECTOR_WRITE_TARGETS, WriteTargetOrdinal};
 pub use write_input::{
     ConnectorWriteBinding, ConnectorWriteFieldBinding, ConnectorWriteFieldRef,
-    ConnectorWriteInputRef, ConnectorWriteInputShape, write_field_matches_execution_type_observed,
+    ConnectorWriteInputRef, ConnectorWriteInputShape, validate_write_input_projection_observed,
+    write_field_matches_execution_type_observed, write_input_projection_identity_observed,
 };
 pub use write_recipe::{
     ConnectorWriteRecipe, ConnectorWriteRecipeCompileError, ConnectorWriteRecipeCompiler,

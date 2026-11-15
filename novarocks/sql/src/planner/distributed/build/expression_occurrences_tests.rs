@@ -298,7 +298,10 @@ fn occurrence_shared_sparse_if_definition_keeps_value_truth_domains_and_ignores_
                 events: Box::from([ChangeEventSpec {
                     predicate: Some(root),
                     effect: novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
-                    assignments: Box::from([(value, Some(root))]),
+                    assignments: Box::from([novarocks_physical_plan::ChangeAssignment::exact(
+                        value,
+                        Some(root),
+                    )]),
                 }]),
                 effect_output: effect,
             },

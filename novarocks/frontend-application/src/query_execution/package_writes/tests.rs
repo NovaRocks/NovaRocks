@@ -316,6 +316,34 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
         .expect("values");
     let writer = builder.reserve_node_id().expect("writer id");
     let fields = relation_fields(&mut builder, writer, false);
+    let projected_target_fields_0: Box<[novarocks_physical_plan::WriterTargetField]> =
+        input_shape()
+            .fields_iter()
+            .zip(&values)
+            .map(|(binding, value)| p::WriterTargetField {
+                storage_type: None,
+                projected: builder
+                    .add_value(
+                        binding
+                            .execution_type()
+                            .expect("provider complete target declaration")
+                            .clone(),
+                        novarocks_physical_plan::ValueOrigin::WriterDerived {
+                            writer_node: writer,
+                            kind: novarocks_physical_plan::WriterDerivedKind::ProjectedInput,
+                        },
+                    )
+                    .unwrap(),
+                provider_name: binding.field().name().clone().into(),
+                token: binding.token(),
+                input: *value,
+                ty: binding
+                    .execution_type()
+                    .expect("provider complete target declaration")
+                    .clone(),
+                hidden: false,
+            })
+            .collect();
     builder
         .insert_node_unchecked(p::PhysicalNode {
             id: writer,
@@ -332,20 +360,7 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
                     write_target_ordinal: ordinal,
                     input: values.clone().into_boxed_slice(),
                     required_distribution: p::Distribution::Singleton,
-                    target_fields: input_shape()
-                        .fields_iter()
-                        .zip(&values)
-                        .map(|(binding, value)| p::WriterTargetField {
-                            provider_name: binding.field().name().clone().into(),
-                            token: binding.token(),
-                            input: *value,
-                            ty: binding
-                                .execution_type()
-                                .expect("provider complete target declaration")
-                                .clone(),
-                            hidden: false,
-                        })
-                        .collect(),
+                    target_fields: projected_target_fields_0,
                     output_schema: p::WriterRelationSchema {
                         revision: p::WRITER_MULTIPLEX_SCHEMA_REVISION,
                         fields: fields.clone(),

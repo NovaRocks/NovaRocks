@@ -954,11 +954,7 @@ mod tests {
         let (shuffle, sink) = super::delete_write_mode(Strategy::PositionDelete).unwrap();
         assert!(!shuffle);
         assert!(matches!(sink, DmlWriteSinkMode::PositionDeletes));
-        for strategy in [
-            Strategy::MergeOnRead,
-            Strategy::CopyOnWrite,
-            Strategy::EqualityDelete,
-        ] {
+        for strategy in [Strategy::MergeOnRead, Strategy::EqualityDelete] {
             assert_eq!(
                 super::delete_write_mode(strategy).unwrap_err(),
                 format!("DELETE cannot be served by row-mutation strategy {strategy:?}"),

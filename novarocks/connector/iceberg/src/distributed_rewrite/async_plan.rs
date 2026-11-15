@@ -21,7 +21,7 @@ use crate::catalog_control::statistics::scoped_cpu::{
     IcebergMetadataCpuOriginal,
     scoped_snapshot::{ScopedReadSnapshot, SnapshotReadKind, drive_read_snapshot},
 };
-use crate::read_snapshot::cow_capture::{CaptureScope, ReadFailure};
+use crate::read_snapshot::scoped_capture::{CaptureScope, ReadFailure};
 use novarocks_spi::connector::ProviderMetadataCpuPort;
 use novarocks_spi::connector::{
     ConnectorMetadata, ConnectorOriginalResultScope, ConnectorRewritePlanSource,
@@ -59,7 +59,7 @@ struct PlanBody {
     metadata: Option<novarocks_spi::connector::ConnectorTableMetadata>,
     table: Option<crate::iceberg::table::Table>,
     capture: Option<ConnectorOriginalResultScope>,
-    files: Option<crate::manifest::CheckedCowDataFiles>,
+    files: Option<crate::manifest::CheckedDataFiles>,
     snapshot_result: Option<ScopedReadSnapshot>,
     deletes: Vec<Arc<crate::delete_semantics::DeleteFact>>,
     phase: CpuPhase,
@@ -91,12 +91,12 @@ impl Drop for BodyLoan<'_> {
     }
 }
 pub(crate) fn formation_failure(
-    cause: novarocks_spi::connector::ConnectorCowBeginCause,
+    cause: novarocks_spi::connector::ConnectorScopedBeginCause,
 ) -> ConnectorError {
-    use novarocks_spi::connector::{ConnectorCowBeginCause, OriginalResultCheckClass};
+    use novarocks_spi::connector::{ConnectorScopedBeginCause, OriginalResultCheckClass};
     let kind = match &cause {
-        ConnectorCowBeginCause::Provider(error) => error.kind(),
-        ConnectorCowBeginCause::OriginalResult(error) => match error.class() {
+        ConnectorScopedBeginCause::Provider(error) => error.kind(),
+        ConnectorScopedBeginCause::OriginalResult(error) => match error.class() {
             OriginalResultCheckClass::Coverage => ConnectorErrorKind::ResourceExhausted,
             OriginalResultCheckClass::Control => ConnectorErrorKind::Interrupted,
             _ => ConnectorErrorKind::Internal,
@@ -210,7 +210,7 @@ impl RewritePlanCpuSource for RewritePlanOriginal {
                             .current_snapshot_id()
                             .ok_or_else(|| internal("Rewrite original snapshot disappeared"))?;
                         let checked =
-                            crate::manifest::finish_checked_cow_data_files_from_original_files(
+                            crate::manifest::finish_checked_data_files_from_original_files(
                                 table.metadata(),
                                 snapshot_id,
                                 snapshot.files,
@@ -221,7 +221,7 @@ impl RewritePlanCpuSource for RewritePlanOriginal {
                         body.deletes = snapshot.all_deletes;
                         checked
                     } else {
-                        crate::manifest::CheckedCowDataFiles {
+                        crate::manifest::CheckedDataFiles {
                             files: Vec::new(),
                             _retention_guard: capture.retention_guard(),
                         }

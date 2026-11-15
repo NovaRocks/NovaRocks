@@ -1252,7 +1252,13 @@ fn expected_counts(package: &p::FragmentPackage) -> [usize; 11] {
         match &node.kind {
             p::NodeKind::TableWriter { target } => {
                 writers += 1;
-                writer_fields += target.target_fields.len() + target.output_schema.fields.len();
+                writer_fields += target.target_fields.len()
+                    + target
+                        .target_fields
+                        .iter()
+                        .filter(|f| f.storage_type.is_some())
+                        .count()
+                    + target.output_schema.fields.len();
             }
             p::NodeKind::TableFinish(finish) => {
                 writers += 1;
@@ -1524,10 +1530,19 @@ fn verify_roots(
                 },
                 p::NodeKind::TableWriter { target },
             ) => {
-                assert_eq!(target_fields.len(), target.target_fields.len());
-                for (id, field) in target_fields.iter().zip(target.target_fields.iter()) {
-                    same(types, *id, &field.ty, work)?;
+                let occurrences = target.target_fields.iter().flat_map(|field| {
+                    std::iter::once(&field.ty).chain(field.storage_type.as_ref())
+                });
+                let mut ids = target_fields.iter();
+                for ty in occurrences {
+                    same(
+                        types,
+                        *ids.next().expect("original W/T occurrence"),
+                        ty,
+                        work,
+                    )?;
                 }
+                assert!(ids.next().is_none(), "no extra W/T occurrence");
                 assert_eq!(output_schema.len(), target.output_schema.fields.len());
                 for (id, field) in output_schema.iter().zip(target.output_schema.fields.iter()) {
                     same(types, *id, &field.ty, work)?;
@@ -2135,4 +2150,49 @@ fn first_known_root_buffers_refuse_before_any_new_callback() {
             assert_eq!(*control.trace.lock().unwrap(), trace);
         }
     }
+}
+
+#[test]
+fn original_definition_sources_keep_storage_field_occurrences_after_each_input() {
+    let original = writer_recipe();
+    let recipe = c::ConnectorWriteRecipeDraft::try_new(
+        original.binding().clone(),
+        original.payload().clone(),
+        c::ConnectorWriteInputShape::Data {
+            fields: original
+                .input()
+                .fields_iter()
+                .map(|field| {
+                    field
+                        .clone()
+                        .with_storage_type(field.execution_type().unwrap().clone())
+                        .unwrap()
+                })
+                .collect(),
+        },
+    )
+    .unwrap();
+    // The existing checked producer must propagate its original recipe T into
+    // WriterTargetField; it must never synthesize T from the field carrier.
+    let package = crate::physical_type_v2::sender_tests::checked_writer_package(recipe);
+    let target = package
+        .fragment()
+        .nodes()
+        .values()
+        .find_map(|node| match &node.kind {
+            p::NodeKind::TableWriter { target } => Some(target),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        target.target_fields[0].storage_type.is_some(),
+        "checked fixture must preserve the Provider's explicit T"
+    );
+    let projected = project(&package, &Control::default(), view_limits(), wide()).unwrap();
+    assert_eq!(projected.counts, expected_counts(&package));
+    let exact = writer_package();
+    assert_eq!(
+        expected_counts(&package)[10],
+        expected_counts(&exact)[10] + 1
+    );
 }

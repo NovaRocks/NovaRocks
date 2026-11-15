@@ -204,15 +204,6 @@ pub fn parse_time_travel_overlay_identity(table: &str) -> Option<(&str, i64)> {
         .map(|snapshot_id| (base_table, snapshot_id))
 }
 
-/// Mint the query-local analyzer identity that names one relation at one exact
-/// snapshot.  This is the inverse of [`parse_time_travel_overlay_identity`]:
-/// both spellings live here so a generated statement that must read a pinned
-/// relation reuses the admitted frozen-snapshot lane instead of inventing a
-/// second way to say the same thing.
-pub fn time_travel_overlay_identity(table: &str, snapshot_id: i64) -> String {
-    format!("__sqlx1_tt_{table}_{snapshot_id}")
-}
-
 /// One successful application materialization.  Opaque connector authority
 /// stays here; neither the SQL scan vocabulary nor SQL catalog facts contain
 /// a provider table, files, cloud properties, or serialized metadata.
@@ -997,7 +988,7 @@ mod tests {
     use super::{
         ConnectorReadSourceProjection, ConnectorReadSourceSelection, QueryPreparedSourceSelector,
         QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
-        parse_time_travel_overlay_identity, prepared_source_selector, time_travel_overlay_identity,
+        parse_time_travel_overlay_identity, prepared_source_selector,
     };
 
     #[test]
@@ -1033,18 +1024,21 @@ mod tests {
     }
 
     #[test]
-    fn minted_snapshot_identity_parses_back_to_its_relation_and_snapshot() {
-        for (table, snapshot_id) in [("orders", 42_i64), ("sales_orders", -7), ("v3", i64::MIN)] {
-            let identity = time_travel_overlay_identity(table, snapshot_id);
+    fn snapshot_identity_resolves_to_its_relation_and_snapshot() {
+        for (table, snapshot_id, identity) in [
+            ("orders", 42_i64, "__sqlx1_tt_orders_42"),
+            ("sales_orders", -7, "__sqlx1_tt_sales_orders_-7"),
+            ("v3", i64::MIN, "__sqlx1_tt_v3_-9223372036854775808"),
+        ] {
             assert_eq!(
-                parse_time_travel_overlay_identity(&identity),
+                parse_time_travel_overlay_identity(identity),
                 Some((table, snapshot_id)),
-                "minted identity `{identity}` must parse back to its own relation"
+                "snapshot identity `{identity}` must resolve to its own relation"
             );
             assert_eq!(
-                QueryTableBindingKey::analysis_lookup("ICE", "DB", &identity),
+                QueryTableBindingKey::analysis_lookup("ICE", "DB", identity),
                 QueryTableBindingKey::snapshot("ice", "db", table, snapshot_id),
-                "a minted snapshot identity must resolve to the physical snapshot binding key"
+                "a snapshot identity must resolve to the physical snapshot binding key"
             );
         }
     }

@@ -1163,3 +1163,167 @@ mod integral_decimal128_profile_tests;
 
 #[path = "compiled_float64_decimal128_tests.rs"]
 mod float64_decimal128_profile_tests;
+
+#[test]
+fn identity_cast_keeps_a_required_child_binding_and_permissive_source_carrier() {
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::exec::expr::compiled_program::input_source::CompiledInputLoan;
+    use crate::exec::pipeline::operator::input_construction::{
+        ConstructionFailure, try_runtime_input_construction_factory,
+    };
+    use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
+    use arrow::array::{ArrayRef, FixedSizeBinaryArray, StructArray};
+    use arrow::buffer::NullBuffer;
+    use arrow::datatypes::Field;
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+
+    let expected =
+        DataType::Struct(vec![Field::new("f", DataType::FixedSizeBinary(4), false)].into());
+    let ty = FunctionValueType::new(expected, true);
+    let program = compiled(
+        ty.clone(),
+        ty,
+        Source::Column,
+        Wrap::Bare,
+        DecimalOverflowPolicy::OutputNull,
+        false,
+    );
+    let snapshot = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot();
+    let occurrence = snapshot.bindings()[&root()];
+    assert!(
+        program
+            .cast_recipe(novarocks_local_program::ProgramUseRef {
+                arena: root().arena(),
+                use_id: occurrence,
+            })
+            .unwrap()
+            .is_identity()
+    );
+    let layout = program.graph().nodes()[1].output_layout();
+    let binding = layout.value_binding_at(0).unwrap();
+    let expected = binding.data_type().clone();
+    let DataType::Struct(fields) = &expected else {
+        panic!("frozen source Struct")
+    };
+    assert!(!fields[0].is_nullable());
+    let actual: ArrayRef = Arc::new(
+        StructArray::try_new(
+            vec![Arc::new(fields[0].as_ref().clone().with_nullable(true))].into(),
+            vec![Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    [Some(b"abcd".as_slice()), None].into_iter(),
+                    4,
+                )
+                .unwrap(),
+            )],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap(),
+    );
+    let actual_type = actual.data_type().clone();
+    let columns: Vec<ArrayRef> = vec![
+        actual,
+        Arc::new(Int64Array::from(vec![Some(42), Some(42)])),
+        Arc::new(BooleanArray::from(vec![Some(true), Some(true)])),
+    ];
+    let pure = ValueTypeStorageLifetime::pure();
+    let slots = columns
+        .iter()
+        .enumerate()
+        .map(|(ordinal, column)| {
+            ChunkSlotSchema::try_new_typed(
+                layout.slots()[ordinal],
+                Arc::new(
+                    layout
+                        .schema()
+                        .field(ordinal)
+                        .clone()
+                        .with_data_type(column.data_type().clone()),
+                ),
+                layout.value_binding_at(ordinal).unwrap().clone(),
+                None,
+                pure.clone(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let schema = Arc::new(ChunkSchema::try_new_typed(slots, pure).unwrap());
+    assert_eq!(schema.slots()[0].typed_binding(), binding);
+    let factory = try_runtime_input_construction_factory(
+        crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        MemTracker::new_root("permissive identity Cast source construction"),
+        Arc::new(RuntimeErrorState::default()),
+    )
+    .unwrap();
+    let owner = factory.begin_typed_construction(&schema).unwrap();
+    owner
+        .observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns { channels: 3 },
+        )
+        .unwrap();
+    let mut chunk = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+        schema,
+        columns,
+        2,
+        owner.storage_lifetime(),
+        |step| owner.observe(0, &[], step),
+    )
+    .unwrap();
+    let source_tracker = MemTracker::new_root("permissive identity Cast source payload");
+    chunk.try_transfer_to(&source_tracker).unwrap();
+    for selected in [vec![0, 1], vec![1]] {
+        let selection = if selected.len() == 2 {
+            Selection::all(2)
+        } else {
+            Selection::try_sparse(2, &selected).unwrap()
+        };
+        let host = crate::runtime::tracked_state_allocator::expression_allocation_host(
+            MemTracker::new_root("permissive identity Cast result"),
+        );
+        let mut evaluator = CompiledExpressionInstance::try_new_with_allocator(
+            program.clone(),
+            root(),
+            &Control,
+            Some(host),
+        )
+        .unwrap();
+        let result: crate::runtime::task::ExecutionResult<_> = evaluator.evaluate_input_controlled(
+            CompiledInputLoan::from_chunk(&chunk),
+            selection,
+            selection,
+            novarocks_functions::ScalarInvocationActivation::Activated,
+            &Control,
+            None,
+        );
+        let result = result.expect("an existing identity Cast preserves the legal source carrier");
+        assert_eq!(result.values().data_type(), &actual_type);
+        assert!(result.errors().is_empty());
+        let values = result
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let child = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        for (ordinal, source_row) in selected.iter().copied().enumerate() {
+            assert_eq!(values.is_null(ordinal), source_row == 1);
+            if source_row == 0 {
+                assert_eq!(child.value(ordinal), b"abcd");
+            } else {
+                assert!(child.is_null(ordinal));
+            }
+        }
+    }
+    drop(chunk);
+    assert_eq!(source_tracker.current(), 0);
+}

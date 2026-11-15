@@ -185,6 +185,7 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
                     predicate: None,
                     effect: ConnectorRowMutationEffect::Insert,
                     assignments: vec![ChangeEventOutputExpr {
+                        write_input: None,
                         output_slot_id: SlotId::new(2),
                         expr: Some(ProgramExprId::new(0)),
                     }],

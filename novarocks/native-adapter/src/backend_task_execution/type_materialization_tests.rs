@@ -228,6 +228,7 @@ fn type_materialization_real_pending_requalifies_without_replaying_the_original_
                 kind: Some(package::connector_write_input_shape::Kind::Data(
                     package::ConnectorWriteDataInput {
                         fields: vec![package::ConnectorWriteFieldBinding {
+                            storage_value_type_id: None,
                             source_field_id: Some(2),
                             value_type_id: Some(0),
                             field_token: vec![37; 32],

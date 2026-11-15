@@ -139,6 +139,12 @@ pub fn arrow_type_dynamic_bytes(data_type: &DataType) -> Option<usize> {
 /// Count the original Arc<Field> backing and dynamic metadata text. Spare
 /// HashMap/String capacity does not become serialized protocol payload.
 pub fn arrow_field_retained_bytes(field: &FieldRef) -> Option<usize> {
+    arrow_field_value_retained_bytes(field.as_ref())
+}
+
+/// The same original Field representation borrowed without allocating an Arc
+/// just to inspect its protocol payload geometry.
+pub fn arrow_field_value_retained_bytes(field: &arrow_schema::Field) -> Option<usize> {
     sum([
         arc_slice_bytes::<arrow_schema::Field>(1),
         Some(field.name().len()),

@@ -87,8 +87,8 @@ impl StreamingStagedDataFileWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let annotated =
-            adapt_batch(&batch, &self.context.annotated_schema).map_err(anyhow::Error::msg)?;
+        let annotated = adapt_batch(&batch, &self.context.annotated_schema)
+            .map_err(super::WriteAdaptationError::into_connector_error)?;
         if let Some(splitter) = &self.splitter {
             let partitioned = splitter
                 .split(&annotated)

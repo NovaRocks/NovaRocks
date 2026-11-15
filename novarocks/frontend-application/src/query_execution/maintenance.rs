@@ -691,9 +691,7 @@ fn prepare_rewrite_cohort_recipe(
         ConnectorRewriteCohortRead::PinnedFileSet(pinned) => {
             let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
                 pinned: pinned.clone(),
-                frozen_source: None,
                 planning_pin: session.rewrite().planning_pin(),
-                _original: None,
             };
             let source_binding =
                 crate::query_execution::distributed_rewrite::admit_pinned_rewrite_scan_binding(

@@ -102,7 +102,7 @@ impl Work {
     fn run_phase(&mut self) -> Result<(), ConnectorError> {
         self.original.check_active().map_err(|e| {
             super::scoped_read::checked_read(
-                crate::read_snapshot::cow_capture::ReadFailure::Original(e.into()),
+                crate::read_snapshot::scoped_capture::ReadFailure::Original(e.into()),
             )
         })?;
         self.context.check_active()?;
@@ -157,7 +157,6 @@ impl Work {
             crate::metadata_json::from_slice(self.request.observed_table().payload())
                 .map_err(|e| invalid(format!("decode original source observation: {e}")))?;
         if payload.metadata_table_type.is_some()
-            || payload.row_mutation_frozen_source
             || payload.explicit_files.is_some()
             || !payload.prepared_files.is_empty()
             || payload.namespace != self.request.name().schema_name()

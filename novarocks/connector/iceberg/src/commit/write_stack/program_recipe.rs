@@ -111,7 +111,7 @@ fn compile(
             | ConnectorWriteInputShape::DeletionVector { .. },
         ) => {
             let schema = data_input_schema(draft.input(), work)?;
-            validate_data(&value, &schema, control, work)?;
+            validate_data(&value, draft.input(), &schema, control, work)?;
         }
         (IcebergWriteBranch::EqualityDelete, ConnectorWriteInputShape::EqualityDelete { .. }) => {
             let schema = input_schema(draft.input(), work)?;
@@ -314,6 +314,7 @@ fn data_input_schema(
 
 fn validate_data(
     handle: &IcebergWriterHandle,
+    input: &ConnectorWriteInputShape,
     schema: &SchemaRef,
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
@@ -324,6 +325,15 @@ fn validate_data(
             "Iceberg data writer handle carries no data branch recipe",
         )
     })?;
+    let identity = super::domain::data_write_input_identity_observed(input, || {
+        work.step().map_err(Failure::Control)
+    })?;
+    if recipe.write_input_identity() != Some(&identity) {
+        return Err(invalid(
+            "data.write_input_identity",
+            "Iceberg data writer public W/T differs from its frozen complete write input identity",
+        ));
+    }
     let source = recipe.target_schema_json().ok_or_else(|| {
         invalid(
             "data",

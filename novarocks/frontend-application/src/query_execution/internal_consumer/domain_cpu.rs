@@ -54,20 +54,23 @@ enum LocalClosePhase {
 enum CloseObserver {
     Consumer,
     Supervisor,
+    Statement,
 }
 
-// One fixed fanout for the two named close observers. The job's registered
+// One fixed fanout for the three named close observers. The job's registered
 // waker owns only this wake header, never Domain/State/job/compute custody.
 // Cancelling the last poller cannot replace the other observer's join wake.
 #[derive(Default)]
 struct LocalCloseWake {
     consumer: futures::task::AtomicWaker,
     supervisor: futures::task::AtomicWaker,
+    statement: futures::task::AtomicWaker,
 }
 impl futures::task::ArcWake for LocalCloseWake {
     fn wake_by_ref(original: &Arc<Self>) {
         original.consumer.wake();
         original.supervisor.wake();
+        original.statement.wake();
     }
 }
 
@@ -474,7 +477,7 @@ impl DomainCpuCustody {
         debug_assert!(state.local_close == LocalClosePhase::Retiring);
         state.local_close = next;
         drop(state);
-        // These are the two fixed close callers and the original result waiter.
+        // These are the three fixed close callers and the original result waiter.
         // Actual original Drop and State publication precede foreign callbacks.
         self.receipt_wake.wake();
         self.wake_close_observers();
@@ -494,6 +497,15 @@ impl DomainCpuCustody {
         self.poll_original_closed(cx, CloseObserver::Supervisor)
     }
 
+    /// The governed statement's own fixed close position. Its Native exit
+    /// wait must not replace the logical supervisor's local-close observer.
+    pub(crate) fn poll_statement_closed(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Arc<dyn std::error::Error + Send + Sync>>> {
+        self.poll_original_closed(cx, CloseObserver::Statement)
+    }
+
     fn poll_original_closed(
         &self,
         cx: &mut Context<'_>,
@@ -502,6 +514,7 @@ impl DomainCpuCustody {
         match observer {
             CloseObserver::Consumer => self.close_wake.consumer.register(cx.waker()),
             CloseObserver::Supervisor => self.close_wake.supervisor.register(cx.waker()),
+            CloseObserver::Statement => self.close_wake.statement.register(cx.waker()),
         }
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if !state.closing || state.busy || state.local_close == LocalClosePhase::Retiring {
@@ -531,7 +544,7 @@ impl DomainCpuCustody {
             return Poll::Ready(Ok(()));
         };
         let retired = job.close_delivery();
-        // Both fixed callers poll the one original JoinHandle with the same
+        // All fixed callers poll the one original JoinHandle with the same
         // pure fanout waker, so a cancelled waiter cannot steal its wake.
         let original_wake = futures::task::waker_ref(&self.close_wake);
         let result = job.poll_forwarder_closed(&mut Context::from_waker(&original_wake));
@@ -934,10 +947,11 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod root_action_tests {
+    // Preserve the existing synthetic payload amount within this test fixture.
+    const TEST_PAYLOAD_BYTES: u64 = 1008 * 1024 * 1024;
+
     use super::*;
-    use crate::query_execution::internal_result_cpu::{
-        INTERNAL_PEAK_BYTES, InternalResultCpuOwner,
-    };
+    use crate::query_execution::internal_result_cpu::InternalResultCpuOwner;
     use crate::query_execution::statistics::StatisticsRootResultDecoder;
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
@@ -1092,6 +1106,7 @@ pub(crate) mod root_action_tests {
         StartPublication,
         EarlyResultWhileWorkerRuns,
         TwoCloseObservers,
+        SupervisorAndStatement,
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1114,6 +1129,11 @@ pub(crate) mod root_action_tests {
         root_case_with_local_close(false, Some(LocalCloseCase::TwoCloseObservers)).await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn statement_close_preserves_the_original_logical_supervisor_wake() {
+        root_case_with_local_close(false, Some(LocalCloseCase::SupervisorAndStatement)).await;
+    }
+
     async fn root_case(cancel_before_proof: bool) {
         root_case_with_local_close(cancel_before_proof, None).await;
     }
@@ -1122,6 +1142,7 @@ pub(crate) mod root_action_tests {
         cancel_before_proof: bool,
         local_close: Option<LocalCloseCase>,
     ) {
+        let mut competing_supervisor_wake = None;
         let mut cpu_owner = InternalResultCpuOwner::try_new_for_test().unwrap();
         let (control, handle, mut driver) = root_control(&mut cpu_owner);
         let cpu = cpu_owner.runtime();
@@ -1137,7 +1158,7 @@ pub(crate) mod root_action_tests {
             &work.owner,
             JointLane::Custody,
             JointResource::PayloadBytes,
-            INTERNAL_PEAK_BYTES,
+            TEST_PAYLOAD_BYTES,
             &mut driver,
         ));
         let mut payload = None;
@@ -1256,7 +1277,9 @@ pub(crate) mod root_action_tests {
                     .await
                     .unwrap();
                 }
-                LocalCloseCase::EarlyResultWhileWorkerRuns | LocalCloseCase::TwoCloseObservers => {
+                LocalCloseCase::EarlyResultWhileWorkerRuns
+                | LocalCloseCase::TwoCloseObservers
+                | LocalCloseCase::SupervisorAndStatement => {
                     // This existing test-only injection uses the original
                     // real worker/forwarder and original computation activity.
                     // It does not certify arbitrary FnOnce as finite or joint.
@@ -1320,7 +1343,77 @@ pub(crate) mod root_action_tests {
                             .poll(&mut Context::from_waker(Waker::noop()))
                             .is_pending()
                     );
-                    if matches!(case, LocalCloseCase::TwoCloseObservers) {
+                    if matches!(case, LocalCloseCase::SupervisorAndStatement) {
+                        use std::sync::atomic::{AtomicUsize, Ordering};
+                        struct CountWake {
+                            count: Arc<AtomicUsize>,
+                            forward: Option<Waker>,
+                        }
+                        impl std::task::Wake for CountWake {
+                            fn wake(self: Arc<Self>) {
+                                self.wake_by_ref();
+                            }
+                            fn wake_by_ref(self: &Arc<Self>) {
+                                self.count.fetch_add(1, Ordering::AcqRel);
+                                if let Some(waker) = &self.forward {
+                                    waker.wake_by_ref();
+                                }
+                            }
+                        }
+                        // Retain the two real application waiters on the SAME
+                        // CPU custody while its original worker is still live.
+                        // QA polls via InternalComputationConsumer; Statement
+                        // subsequently polls its output's identical CPU Arc.
+                        let supervisor_count = Arc::new(AtomicUsize::new(0));
+                        let supervisor_waker = Waker::from(Arc::new(CountWake {
+                            count: Arc::clone(&supervisor_count),
+                            forward: None,
+                        }));
+                        assert!(
+                            custody
+                                .poll_join_closed(&mut Context::from_waker(&supervisor_waker))
+                                .is_pending()
+                        );
+                        let statement_count = Arc::new(AtomicUsize::new(0));
+                        let statement_waker = Waker::from(Arc::new(CountWake {
+                            count: Arc::clone(&statement_count),
+                            forward: None,
+                        }));
+                        assert!(
+                            custody
+                                .poll_statement_closed(&mut Context::from_waker(&statement_waker))
+                                .is_pending()
+                        );
+                        let before_close = supervisor_count.load(Ordering::Acquire);
+                        let before_statement_close = statement_count.load(Ordering::Acquire);
+                        release.send(()).unwrap();
+                        // Let Statement win the actual forwarder join and
+                        // publish Closed. It now proceeds to NativeExit and
+                        // stops polling this CPU, exactly as the governed path.
+                        with_driver(
+                            &control,
+                            &mut driver,
+                            std::future::poll_fn(|cx| {
+                                let original_statement = Waker::from(Arc::new(CountWake {
+                                    count: Arc::clone(&statement_count),
+                                    forward: Some(cx.waker().clone()),
+                                }));
+                                custody.poll_statement_closed(&mut Context::from_waker(
+                                    &original_statement,
+                                ))
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(matches!(
+                            custody.state.lock().unwrap().local_close,
+                            LocalClosePhase::Closed
+                        ));
+                        competing_supervisor_wake = Some((
+                            (supervisor_count, before_close),
+                            (statement_count, before_statement_close),
+                        ));
+                    } else if matches!(case, LocalCloseCase::TwoCloseObservers) {
                         use std::sync::atomic::{AtomicUsize, Ordering};
                         struct CountWake(AtomicUsize);
                         impl std::task::Wake for CountWake {
@@ -1424,7 +1517,7 @@ pub(crate) mod root_action_tests {
             // responsibility quantity is not a new resource authorization.
             binding
                 .window_alias()
-                .check_backing_total(INTERNAL_PEAK_BYTES)
+                .check_backing_total(TEST_PAYLOAD_BYTES)
                 .unwrap();
             drop(original_payload);
             let next = paid_claim(
@@ -1488,5 +1581,17 @@ pub(crate) mod root_action_tests {
             .shutdown_until(Instant::now() + Duration::from_secs(5))
             .await
             .unwrap();
+        if let Some(((supervisor_count, before_close), (statement_count, before_statement_close))) =
+            competing_supervisor_wake
+        {
+            assert!(
+                statement_count.load(std::sync::atomic::Ordering::Acquire) > before_statement_close,
+                "the actual Statement close waiter was not notified"
+            );
+            assert!(
+                supervisor_count.load(std::sync::atomic::Ordering::Acquire) > before_close,
+                "Statement stole the original logical supervisor's CPU close wake"
+            );
+        }
     }
 }

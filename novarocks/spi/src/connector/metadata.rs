@@ -18,7 +18,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -64,9 +64,6 @@ pub const MAX_CONNECTOR_COLUMN_DEFAULT_NODES: usize = 16_384;
 pub const MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH: usize = 64;
 
 const TABLE_PLANNING_FACT_COLUMN_BYTES: usize = 16;
-/// Flat charge for one declared write-target Arrow type. The type is a bounded
-/// enum here, not a nested value tree, so a fixed charge is honest.
-const TABLE_PLANNING_FACT_WRITE_TARGET_TYPE_BYTES: usize = 32;
 const TABLE_PLANNING_FACT_CONSTRAINT_BYTES: usize = 16;
 const TABLE_DEFINITION_COLUMN_BYTES: usize = 24;
 const TABLE_DEFINITION_TYPE_NODE_BYTES: usize = 16;
@@ -297,7 +294,7 @@ pub struct ConnectorTableColumnPlanningFact {
     semantic_kind: ConnectorTableColumnSemanticKind,
     role: ConnectorTableColumnRole,
     write_default: Option<ConnectorColumnDefault>,
-    write_target_type: Option<DataType>,
+    write_input: Option<super::ConnectorWriteFieldRequest>,
 }
 
 impl ConnectorTableColumnPlanningFact {
@@ -313,7 +310,7 @@ impl ConnectorTableColumnPlanningFact {
             semantic_kind,
             role,
             write_default: None,
-            write_target_type: None,
+            write_input: None,
         }
     }
 
@@ -344,26 +341,23 @@ impl ConnectorTableColumnPlanningFact {
         self.role
     }
 
-    /// Declare the Arrow type this column takes when it is a row-DML write
-    /// target, for the case where it differs from the frozen read schema.
-    ///
-    /// `None` means "identical to the frozen schema field", which is the only
-    /// shape a provider needs unless its physical write encoding for a type is
-    /// deliberately not the same as its read encoding.
+    /// Preserve a complete Provider-authored writer input separately from the
+    /// read schema. None explicitly retains the complete read declaration.
     #[must_use]
-    pub fn with_write_target_type(mut self, write_target_type: Option<DataType>) -> Self {
-        self.write_target_type = write_target_type;
+    pub fn with_write_input(
+        mut self,
+        write_input: Option<super::ConnectorWriteFieldRequest>,
+    ) -> Self {
+        self.write_input = write_input;
         self
+    }
+
+    pub const fn write_input(&self) -> Option<&super::ConnectorWriteFieldRequest> {
+        self.write_input.as_ref()
     }
 
     pub const fn write_default(&self) -> Option<&ConnectorColumnDefault> {
         self.write_default.as_ref()
-    }
-
-    /// The write-target Arrow type override, or `None` when the frozen read
-    /// schema field already describes the write target.
-    pub const fn write_target_type(&self) -> Option<&DataType> {
-        self.write_target_type.as_ref()
     }
 }
 
@@ -587,6 +581,42 @@ fn validate_column_facts(
                 super::ConnectorErrorKind::CorruptData,
                 "connector table planning facts contain a duplicate or misaligned schema ordinal",
             ));
+        }
+        if let Some(input) = &fact.write_input {
+            let field = schema.field(expected as usize);
+            let value = input.execution_type().ok_or_else(|| {
+                corrupt_definition(
+                    "connector planning write input lacks a complete value declaration",
+                )
+            })?;
+            if input.field().name() != field.name()
+                || input.field().is_nullable() != field.is_nullable()
+            {
+                return Err(corrupt_definition(
+                    "connector planning write input differs from its source field identity or requiredness",
+                ));
+            }
+            if !novarocks_connector_contract::write_field_matches_execution_type_observed::<
+                novarocks_type_contract::ValueTypeError,
+            >(input.field(), value, |_| Ok(()))
+            .map_err(|error| corrupt_definition(error.to_string()))?
+            {
+                return Err(corrupt_definition(
+                    "connector planning write input differs from its complete Field declaration",
+                ));
+            }
+            novarocks_connector_contract::validate_write_input_projection_observed(
+                value,
+                input.storage_type(),
+                || Ok::<_, ConnectorError>(()),
+            )?;
+            let bytes = write_input_representation_bytes(input).ok_or_else(|| {
+                ConnectorError::new(
+                    super::ConnectorErrorKind::ResourceExhausted,
+                    "connector planning write input representation overflowed",
+                )
+            })?;
+            write_default_bytes = write_default_bytes.saturating_add(bytes);
         }
         if let Some(write_default) = fact.write_default.as_ref() {
             if matches!(write_default, ConnectorColumnDefault::Null) {
@@ -903,6 +933,20 @@ fn compare_foreign_key_constraints(
         })
 }
 
+fn write_input_representation_bytes(input: &super::ConnectorWriteFieldRequest) -> Option<usize> {
+    use novarocks_type_contract::owned_resources::type_representation as representation;
+    let mut bytes = std::mem::size_of::<super::ConnectorWriteFieldRequest>().checked_add(
+        representation::arrow_field_value_retained_bytes(input.field())?,
+    )?;
+    for value in [input.execution_type(), input.storage_type()]
+        .into_iter()
+        .flatten()
+    {
+        bytes = bytes.checked_add(representation::function_value_type_retained_bytes(value)?)?;
+    }
+    Some(bytes)
+}
+
 fn planning_facts_bytes(
     column_facts: &[ConnectorTableColumnPlanningFact],
     unique_constraints: &[ConnectorTableUniqueConstraint],
@@ -912,13 +956,6 @@ fn planning_facts_bytes(
     column_facts
         .len()
         .saturating_mul(TABLE_PLANNING_FACT_COLUMN_BYTES)
-        .saturating_add(
-            column_facts
-                .iter()
-                .filter(|fact| fact.write_target_type.is_some())
-                .count()
-                .saturating_mul(TABLE_PLANNING_FACT_WRITE_TARGET_TYPE_BYTES),
-        )
         .saturating_add(
             partition_source_column_ordinals
                 .len()
@@ -1291,6 +1328,31 @@ impl ConnectorTableMetadata {
                     "catalog source/execution field name or NULL contract differs",
                 )
                 .into());
+            }
+            if let Some(input) = header
+                .planning_facts
+                .column_facts()
+                .get(ordinal)
+                .and_then(|fact| fact.write_input())
+            {
+                let input_value = input.execution_type().ok_or_else(|| {
+                    ConnectorError::new(
+                        super::ConnectorErrorKind::InvalidRequest,
+                        "catalog write input lacks its complete declaration",
+                    )
+                })?;
+                let original = input.storage_type().unwrap_or(input_value);
+                let matches = original
+                    .typed_binding()
+                    .borrowed()
+                    .exactly_equals_observed(binding.typed_binding().borrowed(), || {
+                        creation.work(1).map_err(CatalogLayoutError::Caller)
+                    })
+                    .map_err(CatalogLayoutError::into_failure)?;
+                if !matches {
+                    return Err(ConnectorError::new(super::ConnectorErrorKind::InvalidRequest,
+                        "catalog write input storage declaration differs from its original complete read binding").into());
+                }
             }
             let same = novarocks_type_contract::value_layout_matches_carrier_observed(
                 binding.typed_binding().layout(),
@@ -2903,13 +2965,26 @@ mod tests {
         );
     }
 
+    fn test_write_input() -> super::super::ConnectorWriteFieldRequest {
+        let source = planning_schema();
+        let field = source
+            .field(1)
+            .clone()
+            .with_data_type(DataType::LargeBinary);
+        let value = novarocks_type_contract::FunctionValueType::new(
+            DataType::LargeBinary,
+            field.is_nullable(),
+        );
+        super::super::ConnectorWriteFieldRequest::try_new_typed(field, value).unwrap()
+    }
+
     #[test]
-    fn spi5h_write_target_type_round_trips_and_is_charged_to_the_budget() {
+    fn spi5h_complete_write_input_round_trips_and_is_charged_to_the_budget() {
         let facts = ConnectorTablePlanningFacts::try_new(
             &planning_schema(),
             vec![
                 ordinary_fact(0),
-                ordinary_fact(1).with_write_target_type(Some(DataType::LargeBinary)),
+                ordinary_fact(1).with_write_input(Some(test_write_input())),
                 ordinary_fact(2),
             ],
             Vec::new(),
@@ -2919,10 +2994,10 @@ mod tests {
         )
         .expect("write-target type override must be accepted");
 
-        assert_eq!(facts.column_facts()[0].write_target_type(), None);
+        assert_eq!(facts.column_facts()[0].write_input(), None);
         assert_eq!(
-            facts.column_facts()[1].write_target_type(),
-            Some(&DataType::LargeBinary)
+            facts.column_facts()[1].write_input(),
+            Some(&test_write_input())
         );
 
         // Same facts, but a budget that only covers the three plain column
@@ -2937,7 +3012,7 @@ mod tests {
             &planning_schema(),
             vec![
                 ordinary_fact(0),
-                ordinary_fact(1).with_write_target_type(Some(DataType::LargeBinary)),
+                ordinary_fact(1).with_write_input(Some(test_write_input())),
                 ordinary_fact(2),
             ],
             Vec::new(),

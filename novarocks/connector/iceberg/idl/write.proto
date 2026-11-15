@@ -111,6 +111,7 @@ message IcebergDataBranchRecipe {
   repeated string partition_column_names = 3;
   repeated string transform_exprs = 4;
   bool row_lineage = 5;
+  bytes write_input_identity = 6;
 }
 
 message IcebergEqualityDeleteColumn {

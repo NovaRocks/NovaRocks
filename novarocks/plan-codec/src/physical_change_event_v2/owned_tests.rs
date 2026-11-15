@@ -284,7 +284,7 @@ fn caller_owned_all_actual_small_prefixes_and_wide_nested_quantum() {
             }}
         }}
         let mut node = small_source();
-        events(&mut node)[0].assignments = vec![(p::ValueId::new(0), None); 320].into_boxed_slice();
+        events(&mut node)[0].assignments = vec![p::ChangeAssignment::exact(p::ValueId::new(0), None); 320].into_boxed_slice();
         // Independent actual first nested request Layout, before any source
         // counting callback: the full node header and the captured child list.
         let captured_bytes = std::mem::size_of::<u32>()

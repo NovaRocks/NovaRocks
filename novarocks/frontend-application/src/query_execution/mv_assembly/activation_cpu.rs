@@ -464,10 +464,6 @@ pub(crate) enum MvWriteActivationRequest {
     PreparePublication(MvWritePreparePublicationInput),
     Create(super::create_publication::CreatePublicationInput),
 }
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The complete result is retained in the original Arc-backed activation Body before its existing receiving transfer; inline variants avoid an additional variant allocation."
-)]
 pub(crate) enum MvWriteActivationOutput {
     Analyzed(MvWriteAnalysis),
     ProviderNeeds(MvWriteProviderNeeds),

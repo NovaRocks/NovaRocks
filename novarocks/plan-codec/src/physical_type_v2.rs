@@ -615,6 +615,89 @@ impl DecodedTypeTable {
     }
 }
 
+/// Numerical facts of one locator over original type loans. The caller admits
+/// this allocation/work into its existing model before the first insertion.
+#[derive(Clone, Copy)]
+pub(crate) struct OriginalValueTypeSourceIndexFacts {
+    pub(crate) node_layout: std::alloc::Layout,
+    pub(crate) allocation_requests_upper_bound: usize,
+    pub(crate) cumulative_work_upper_bound: usize,
+}
+
+/// Addresses locate original roots; they establish neither value semantics nor
+/// permission. Aliased occurrences use the first ID in stable source order.
+pub(crate) struct OriginalValueTypeSourceIndex<'a> {
+    roots: BTreeMap<usize, (u32, &'a FunctionValueType)>,
+}
+impl<'a> OriginalValueTypeSourceIndex<'a> {
+    pub(crate) fn prepare<E: From<TypeCodecError>>(
+        types: &EncodedTypeTable<'a>,
+        lookups: usize,
+        admit: &mut impl FnMut(OriginalValueTypeSourceIndexFacts) -> Result<(), E>,
+        source_error: &mut impl FnMut(&'static str) -> E,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, E> {
+        use crate::btree_resources_v2 as tree;
+        type Entry<'source> = (u32, &'source FunctionValueType);
+        let mut tree_error = |error| match error {
+            tree::BTreeResourceError::Arithmetic(_) => E::from(TypeCodecError::Control(
+                CompileControlError::ResourceExhausted,
+            )),
+            tree::BTreeResourceError::SourceModel(message) => source_error(message),
+        };
+        let count = types.source_counts().0;
+        let facts = tree::insertion_only::<usize, Entry<'a>>(count).map_err(&mut tree_error)?;
+        let layout = tree::node_layout_typed::<usize, Entry<'a>>().map_err(&mut tree_error)?;
+        let lookup = tree::lookup_work_typed(count).map_err(&mut tree_error)?;
+        let lookup_work = lookups
+            .checked_mul(lookup)
+            .and_then(|n| n.checked_add(facts.cumulative_work_upper_bound))
+            .ok_or_else(|| {
+                E::from(TypeCodecError::Control(
+                    CompileControlError::ResourceExhausted,
+                ))
+            })?;
+        admit(OriginalValueTypeSourceIndexFacts {
+            node_layout: layout,
+            allocation_requests_upper_bound: facts.allocation_requests_upper_bound,
+            cumulative_work_upper_bound: lookup_work,
+        })?;
+        let mut roots = BTreeMap::new();
+        types.visit_value_type_sources(
+            &mut |id, value, work| -> Result<(), E> {
+                work.flush().map_err(TypeCodecError::from)?;
+                match roots.entry(std::ptr::from_ref(value).addr()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((id, value));
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        if !std::ptr::eq(entry.get().1, value) {
+                            return Err(source_error("storage locator source identity changed"));
+                        }
+                    }
+                }
+                work.step().map_err(TypeCodecError::from)?;
+                work.flush().map_err(TypeCodecError::from)?;
+                Ok(())
+            },
+            work,
+        )?;
+        Ok(Self { roots })
+    }
+
+    pub(crate) fn source_id_observed(
+        &self,
+        original: &FunctionValueType,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<u32>, CompileControlError> {
+        work.flush()?;
+        let found = self.roots.get(&std::ptr::from_ref(original).addr());
+        work.step()?;
+        work.flush()?;
+        Ok(found.and_then(|(id, value)| std::ptr::eq(*value, original).then_some(*id)))
+    }
+}
+
 /// Explicit pure author: no source invoice or receiving memory grant is minted.
 /// The caller retains its original control and borrowed source field owners.
 pub fn encode_source_field_table_pure_in(
@@ -1098,6 +1181,39 @@ impl<'source> EncodedTypeTable<'source> {
         }
         Ok(None)
     }
+    /// Visit the original complete root loans once for a caller-admitted source
+    /// identity index. Addresses only locate these authors; they grant no type
+    /// semantics, allocation capacity, or provider permission.
+    pub(crate) fn visit_value_type_sources<E>(
+        &self,
+        capture: &mut impl FnMut(
+            u32,
+            &'source FunctionValueType,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), E>
+    where
+        E: From<TypeCodecError>,
+    {
+        for (position, (id, value)) in self.values.iter().enumerate() {
+            let emitted = self.table.value_types.get(position).ok_or_else(|| {
+                E::from(TypeCodecError::InvalidShape(
+                    "encoded root value definition is absent",
+                ))
+            })?;
+            if emitted.id != id {
+                return Err(TypeCodecError::InvalidShape(
+                    "encoded root value definition differs from its source",
+                )
+                .into());
+            }
+            capture(id, value, work)?;
+            work.step().map_err(TypeCodecError::from)?;
+        }
+        Ok(())
+    }
+
     /// Borrow the complete explicitly paired execution author retained by the
     /// immutable emission. Source-only fields return None rather than deriving
     /// semantics from Arrow facts.

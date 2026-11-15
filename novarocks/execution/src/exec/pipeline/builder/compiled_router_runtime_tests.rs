@@ -146,7 +146,7 @@ mod router_runtime_tests {
                         .map(|effect| p::ChangeEventSpec {
                             predicate: None,
                             effect,
-                            assignments: Box::from([(data, Some(assignment))]),
+                            assignments: Box::from([novarocks_physical_plan::ChangeAssignment::exact(data, Some(assignment))]),
                         })
                         .into(),
                 },

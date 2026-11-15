@@ -110,6 +110,20 @@ docker/iceberg-rest/fixture-runtime.sh resolve-readonly-observation --journal /a
 
 此命令只在原机器维护锁内核对当前 daemon、机器身份和该 journal 的原请求，以原 owner 共用的只读命令分类验证后记录处置；重复调用返回已验证的原处置，不重写记录。它不运行 start、upgrade、sweep，不遍历或结算其他操作。原失败、phase 及原进程退出事实完整保留，缺少退出证明仍为 Unknown；status 分别展示失败和处置。未知 mutation、外来或不可信请求继续报错。该处置不证明 CLI 或远程 writer 已退出，不提供 scratch 清理权限，也不改写旧运行的 cleanup violation；后续运行清理仍须满足原 context、期限、writer 退出及准确 scope 条件。
 
+原自有临时 mc 容器的 cleanup 若因 Docker CLI 超时保留为 `command-unknown`，可由维护者显式调用以下精确结算入口。两个参数均为原 journal 的绝对路径；若原 control-root 不是默认目录，仍须在子命令前传同一 `--root`。示例中的占位符须替换为原材料，不能按容器名字猜测身份。这是受限 mutation cleanup 结算，不适用上面的 readonly resolver：
+
+```bash
+docker/iceberg-rest/fixture-runtime.sh resolve-owned-container-cleanup \
+  --journal "/absolute/control-root/machine-id/operations/control-<32hex>.json" \
+  --creation-journal "/absolute/control-root/machine-id/activations/<generation>/operations/nr-fixture-machine-mc-<32hex>.json"
+```
+
+原 `MachineOwner` 在同一维护锁内核对当前 daemon、当前 ready activation generation 和原请求。仅接受原已派发的 `container rm --force <64hex ID>`：原 CLI exit 为 0、timeout 为 true，且原 leader 已 wait、原进程组实际退出已确认；不以当前 PID 不存在代替原退出证明。creator 必须属于同一原 machine/generation，其完整 `create_reply_id`、`container_id` 与 rm ID 一致，原创建 exit 为 0，完整 image ID、machine/version/generation labels 及请求归属准确。随后须由原 inspect 作者新观察该完整 ID 已不存在，再确认同一 daemon，并复核全部原材料的字节及文件身份未变。跨代、外来身份、容器仍存在、daemon 或材料变化以及缺少退出证据均拒绝结算。
+
+成功只将这一项 control journal 的 cleanup 义务记为 `phase=settled`，新增 `container_absent`、`terminal_failure=owned-container-cleanup-deadline`、`reconciled_same_cleanup_intent` 与原材料 hashes；原 `timed_out=true`、`command_succeeded=false` 和 CLI/group 退出事实保留，原请求仍为 FAIL。此入口会通过原 owner 创建新的 daemon/inspect 观察 journals，但不重写其他旧 journal；已 settled 后重复调用保守拒绝。它不重放 rm，不删除 volume/catalog，不扩大 TTL 或期限，不自动处理其他 unknown，也不运行 start、upgrade 或 sweep。
+
+保存维护调用的命令、实际退出、新观察与结算收据，以及原 journal 前后 hashes。结算这一项 cleanup 不直接声明整个 machine ready，不补造远程 writer 退出或改写旧运行的 cleanup FAILED/UNKNOWN。后续正常 sweep 和消费者仍沿原 owner 执行，分别记录其实际结果；后续成功不能回填旧测试为 PASS。
+
 `start` 对已有 ready 机器直接返回保存记录，缺失时才构建并创建；不恢复已有不完整状态，也不因推荐版本变化升级。已有机器切换须显式 `upgrade`。首次维护可在 start 后传 `--config /absolute/machine.json`；本地 MinIO JSON 字段为 `ports`、`policy`、`benchmark_root`、`minio_volume`；OSS 使用上述 `object_store`，不接受 `minio_volume`。端口是准确固定配置，默认 MinIO API/console=28000/28001、REST/rest-mv=28002/28003、Spark UI=28004、HMS接入槽=28005；冲突报错，不扫描替代端口。FE/BE listener 仍由 worktree/harness 分配。`shared.env` 属于 worktree/private 输入，不是机器端口、root凭证或维护状态的权威。
 
 机器 version 是创建时实际 image ID、模板和配置的定义标识，不再与当前推荐版本比较后决定消费资格；generation 标记一次实际激活。原运行仍绑定准确 daemon、generation 和 scope，避免操作换代后的其他目标。以下 root/IAM 维护步骤属于本地 MinIO；OSS 的维护与保留范围见上节。MinIO 升级先持稳定维护锁并保存maintenance，再停止共享writer、持久化新材料并轮换旧root、撤销run IAM/STS；确认旧root被真实拒绝后，先移除准确旧REST实例及数据库卷，原生确认absence并持久记录catalog屏障，再保持准确MinIO在线清理scratch。benchmark全部对象保留；切换服务、记录实际创建目标后才提交 ready，不附加全栈健康预检。固定REST恢复后旧请求仍可能成功重建scratch，不承诺这些请求失效。失败留maintenance；未知mutation不伪结算。明确的daemon端口终态失败也须在同一保存的维护意图下重新检查准确资源才可重试。

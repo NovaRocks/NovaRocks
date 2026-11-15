@@ -545,3 +545,332 @@ fn collection_factory_long_unicode_bytes_and_wide_list_have_actual_quantum_obser
         Some(159)
     );
 }
+
+use crate::{ConstantCreationFailure, ConstantSourceOwner};
+
+fn assert_zero_children(data: &ArrayData) {
+    for child in data.child_data() {
+        assert_eq!(child.len(), 0, "an empty root has no stored child values");
+        assert_eq!(child.offset(), 0);
+        assert_eq!(child.null_count(), 0);
+        assert_zero_children(child);
+    }
+}
+
+#[test]
+fn empty_collection_constructs_real_rows_with_zero_offsets_and_no_child_values() {
+    let item = Arc::new(Field::new(
+        "source_item",
+        DataType::FixedSizeBinary(7),
+        false,
+    ));
+    for carrier in [DataType::List(item.clone()), DataType::LargeList(item)] {
+        let (field, ty) = source(carrier, true);
+        let value = ConstantValue::from_empty_collection(
+            field.clone(),
+            ty.clone(),
+            policy(),
+            PHASE,
+            &Control::default(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(value.pool().field_ref(), &field));
+        assert_eq!(value.value_type(), &ty);
+        assert_eq!(value.ordinal(), 0);
+        let data = value.pool().data();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data.offset(), 0);
+        assert_eq!(data.null_count(), 0);
+        assert_eq!(data.data_type(), field.data_type());
+        match field.data_type() {
+            DataType::List(_) => assert_eq!(data.buffers()[0].as_slice(), &[0; 8]),
+            DataType::LargeList(_) => assert_eq!(data.buffers()[0].as_slice(), &[0; 16]),
+            _ => unreachable!(),
+        }
+        assert_zero_children(data);
+        assert_eq!(value.pool().resource_facts().rows, 1);
+        assert_eq!(value.pool().resource_facts().array_nodes, 2);
+        assert_eq!(
+            value.pool().resource_facts().logical_elements_upper_bound,
+            1
+        );
+    }
+    let nested = DataType::Struct(
+        vec![
+            Arc::new(Field::new(
+                "payload",
+                DataType::List(Arc::new(Field::new("item", DataType::Binary, false))),
+                false,
+            )),
+            Arc::new(Field::new("raw", DataType::FixedSizeBinary(19), true)),
+        ]
+        .into(),
+    );
+    let (field, ty) = source(
+        DataType::Map(
+            Arc::new(Field::new(
+                "authored_entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("authored_key", DataType::Int64, false)),
+                        Arc::new(Field::new("authored_value", nested, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            true,
+        ),
+        true,
+    );
+    let value = ConstantValue::from_empty_collection(
+        field.clone(),
+        ty.clone(),
+        policy(),
+        PHASE,
+        &Control::default(),
+    )
+    .unwrap();
+    let array = value
+        .pool()
+        .array()
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .unwrap();
+    assert_eq!(array.value_offsets(), &[0, 0]);
+    assert_eq!(array.len(), 1);
+    assert!(!array.is_null(0));
+    assert_eq!(array.entries().len(), 0);
+    assert_eq!(array.keys().len(), 0);
+    assert_eq!(array.values().len(), 0);
+    assert!(Arc::ptr_eq(value.pool().field_ref(), &field));
+    assert_eq!(value.value_type(), &ty);
+    assert_zero_children(value.pool().data());
+}
+
+#[test]
+fn empty_collection_preserves_explicit_nested_nominal_binding_without_annotations() {
+    use novarocks_type_contract::{
+        ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let json =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+            .unwrap();
+    let field = Arc::new(Field::new(
+        "explicit",
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+        true,
+    ));
+    let semantic = ValueTypeRef::try_new(
+        ValueKind::List(json.value_type().clone()),
+        true,
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let layout = ValueLayout::try_new(field.data_type(), ValueTypeStorageLifetime::pure()).unwrap();
+    let ty = FunctionValueType::try_from_value(semantic, layout).unwrap();
+    let value = ConstantValue::from_empty_collection(
+        field.clone(),
+        ty.clone(),
+        policy(),
+        PHASE,
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(value.value_type(), &ty);
+    assert_eq!(
+        value.value_type().child_at(0).unwrap().logical_type(),
+        ValueLogicalType::Json
+    );
+    assert!(field.metadata().is_empty());
+    assert!(value.pool().data().child_data()[0].data_type() == &DataType::Utf8);
+    assert_eq!(value.pool().data().child_data()[0].len(), 0);
+    assert!(!value.is_null_observed(PHASE, &Control::default()).unwrap());
+}
+
+#[test]
+fn empty_collection_control_prefixes_preserve_first_cause_and_policy_pre_array_refusal() {
+    let (field, ty) = list_source(true);
+    prefixes(
+        |control| {
+            ConstantValue::from_empty_collection(
+                field.clone(),
+                ty.clone(),
+                policy(),
+                PHASE,
+                control,
+            )
+        },
+        false,
+    );
+    let control = Control::default();
+    let denied = ConstantValue::from_empty_collection(
+        field,
+        ty,
+        ConstantPolicy {
+            max_rows: 0,
+            ..policy()
+        },
+        PHASE,
+        &control,
+    );
+    assert!(matches!(denied, Err(ConstantError::Limit(_))));
+    assert_eq!(*control.trace.lock().unwrap(), vec![0]);
+    let (field, ty) = source(DataType::Int64, false);
+    assert!(matches!(
+        ConstantValue::from_empty_collection(field, ty, policy(), PHASE, &Control::default()),
+        Err(ConstantError::Invalid(_))
+    ));
+}
+
+fn empty_created_source(field: &Arc<Field>) -> ConstantSourceOwner {
+    use novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace;
+    use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
+    let mut request = |_: Layout| Ok::<_, &'static str>(());
+    let mut opaque = |_: usize| Ok::<_, &'static str>(());
+    let mut creation =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+    let namespace = MaterializedFieldNamespace::from_original_loans(Vec::new().into());
+    ConstantSourceOwner::try_new_with_creator_in(
+        field,
+        &namespace,
+        0,
+        ValueTypeStorageLifetime::pure(),
+        &mut creation,
+        &mut work,
+    )
+    .unwrap()
+}
+
+#[test]
+fn empty_collection_creator_and_admit_refusals_are_original_and_have_no_tail() {
+    use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Guard<'a>(&'a AtomicBool);
+    impl PureCompileControl for Guard<'_> {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            assert!(
+                !self.0.load(Ordering::SeqCst),
+                "control after original creator refusal"
+            );
+            Ok(())
+        }
+    }
+    let field = Arc::new(Field::new(
+        "",
+        DataType::List(Arc::new(Field::new("item", DataType::Binary, false))),
+        false,
+    ));
+    let ty = FunctionValueType::new(field.data_type().clone(), false);
+    let source = empty_created_source(&field);
+    let invoke = |stop, max_rows| {
+        let refused = AtomicBool::new(false);
+        let calls = Cell::new(0usize);
+        let event = || {
+            assert!(
+                !refused.load(Ordering::SeqCst),
+                "callback after original creator refusal"
+            );
+            let at = calls.get() + 1;
+            calls.set(at);
+            if stop == Some(at) {
+                refused.store(true, Ordering::SeqCst);
+                Err("original empty creator")
+            } else {
+                Ok(())
+            }
+        };
+        let mut request = |_: Layout| event();
+        let mut opaque = |_: usize| event();
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+        let control = Guard(&refused);
+        let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
+        let result = ConstantValue::from_empty_collection_with_creator_in(
+            field.clone(),
+            ty.clone(),
+            ConstantPolicy {
+                max_rows,
+                ..policy()
+            },
+            source.clone(),
+            &mut creation,
+            &mut |_| event().map_err(ConstantCreationFailure::Creator),
+            &mut work,
+        );
+        (result, calls.get())
+    };
+    let (good, calls) = invoke(None, 1);
+    assert!(good.is_ok());
+    assert!(calls > 0);
+    for stop in 1..=calls {
+        let (failure, actual) = invoke(Some(stop), 1);
+        assert!(matches!(
+            failure,
+            Err(ConstantCreationFailure::Creator("original empty creator"))
+        ));
+        assert_eq!(actual, stop);
+    }
+    let (failure, calls) = invoke(None, 0);
+    assert!(matches!(
+        failure,
+        Err(ConstantCreationFailure::Constant(ConstantError::Limit(_)))
+    ));
+    assert_eq!(calls, 0, "policy refusal precedes array/creator requests");
+}
+
+#[test]
+fn empty_collection_retains_original_creator_storage_until_last_pool_exit() {
+    use novarocks_type_contract::{
+        ValueSchemaCreation, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Hold(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Hold {}
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let held = ValueTypeStorageLifetime::held(Arc::new(Hold(drops.clone())));
+    let field = Arc::new(Field::new(
+        "",
+        DataType::List(Arc::new(Field::new("item", DataType::Binary, true))),
+        true,
+    ));
+    let weak = Arc::downgrade(&field);
+    let source = empty_created_source(&field);
+    let ty = FunctionValueType::new(field.data_type().clone(), true);
+    let mut request = |_: Layout| Ok::<_, ()>(());
+    let mut opaque = |_: usize| Ok::<_, ()>(());
+    let mut creation = ValueSchemaCreation::new(held.clone(), &mut request, &mut opaque);
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
+    let value = ConstantValue::from_empty_collection_with_creator_in(
+        field.clone(),
+        ty,
+        policy(),
+        source,
+        &mut creation,
+        &mut |_| Ok(()),
+        &mut work,
+    )
+    .unwrap();
+    drop(creation);
+    drop(held);
+    drop(field);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(weak.upgrade().is_some());
+    let retained = value.clone();
+    drop(value);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(weak.upgrade().is_some());
+    assert_eq!(retained.pool().array().len(), 1);
+    drop(retained);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}

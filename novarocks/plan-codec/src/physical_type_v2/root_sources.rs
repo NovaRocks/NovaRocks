@@ -453,6 +453,7 @@ mod tests {
     }
     fn field(id: Option<u32>) -> raw::ConnectorWriteFieldBinding {
         raw::ConnectorWriteFieldBinding {
+            storage_value_type_id: None,
             field_token: vec![],
             source_field_id: id,
             value_type_id: None,

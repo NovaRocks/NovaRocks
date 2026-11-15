@@ -3598,9 +3598,8 @@ mod tests {
         );
     }
 
-    /// A copy-on-write statement drives one query per rewritten file against a
-    /// single write session, and each of those queries compiles exactly one
-    /// writer -- the one at that group's own ordinal. Query `k` therefore
+    /// A query within one sealed write session may compile exactly one
+    /// writer at its own ordinal. Query `k` therefore
     /// expects `[k]`, which is correctly not dense from zero. Denseness belongs
     /// to the session's sealed target set, not to any one query.
     #[test]
@@ -5516,6 +5515,46 @@ mod tests {
                     })
                     .collect::<Box<[_]>>();
                 let recipe = draft(channel_count);
+                let projected_target_fields_0: Box<[novarocks_physical_plan::WriterTargetField]> = recipe
+                    .input()
+                    .fields_iter()
+                    .zip(&input)
+                    .map(|(binding, value)| WriterTargetField {
+ storage_type: None,
+                        projected: producer
+                            .add_value(
+                                binding
+                                    .execution_type()
+                                    .expect("typed provider input")
+                                    .clone(),
+                                novarocks_physical_plan::ValueOrigin::WriterDerived {
+                                    writer_node: writer,
+                                    kind: novarocks_physical_plan::WriterDerivedKind::ProjectedInput,
+                                },
+                            )
+                            .unwrap(),
+                        provider_name: binding.field().name().clone().into(),
+                        token: binding.token(),
+                        input: *value,
+                        ty: binding
+                            .execution_type()
+                            .expect("typed provider input")
+                            .clone(),
+                        hidden: false,
+                    })
+                    .collect();
+                let partial = partial
+                    .iter()
+                    .cloned()
+                    .map(|mut call| {
+                        call.input = projected_target_fields_0
+                            .iter()
+                            .find(|field| field.input == call.input)
+                            .expect("fixture aggregate reads a projected field")
+                            .projected;
+                        call
+                    })
+                    .collect::<Box<[_]>>();
                 producer
                     .insert_node_unchecked(PhysicalNode {
                         id: writer,
@@ -5532,21 +5571,7 @@ mod tests {
                                 write_target_ordinal: ordinal,
                                 input: input.clone().into_boxed_slice(),
                                 required_distribution: Distribution::Singleton,
-                                target_fields: recipe
-                                    .input()
-                                    .fields_iter()
-                                    .zip(&input)
-                                    .map(|(binding, value)| WriterTargetField {
-                                        provider_name: binding.field().name().clone().into(),
-                                        token: binding.token(),
-                                        input: *value,
-                                        ty: binding
-                                            .execution_type()
-                                            .expect("typed provider input")
-                                            .clone(),
-                                        hidden: false,
-                                    })
-                                    .collect(),
+                                target_fields: projected_target_fields_0,
                                 output_schema: WriterRelationSchema {
                                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
                                     fields: fields.clone().into_boxed_slice(),

@@ -192,7 +192,6 @@ pub struct IcebergTableHandle {
     table_location: Arc<str>,
     storage_properties: BTreeMap<String, String>,
     pinned_data_files: Option<IcebergPinnedDataFileSet>,
-    frozen_cow_source: Option<super::cow_source_proof::IcebergCowSourceProof>,
     mutation_partition_type_json: Option<Arc<str>>,
 }
 
@@ -337,7 +336,6 @@ impl IcebergTableHandle {
             table_location: Arc::from(table_location.as_str()),
             storage_properties,
             pinned_data_files,
-            frozen_cow_source: None,
             mutation_partition_type_json: None,
         })
     }
@@ -422,10 +420,6 @@ impl IcebergTableHandle {
             .transpose()
     }
 
-    pub fn frozen_cow_source(&self) -> Option<&super::cow_source_proof::IcebergCowSourceProof> {
-        self.frozen_cow_source.as_ref()
-    }
-
     pub(crate) fn with_nominal_declarations(
         mut self,
         declarations: crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
@@ -442,17 +436,6 @@ impl IcebergTableHandle {
         &self,
     ) -> &crate::schema_mapping::nominal_declaration::NominalSourceDeclarations {
         &self.nominal_declarations
-    }
-
-    pub(crate) fn with_frozen_cow_source(
-        mut self,
-        source: Option<super::cow_source_proof::IcebergCowSourceProof>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(source) = &source {
-            source.check_table(&self)?;
-        }
-        self.frozen_cow_source = source;
-        Ok(self)
     }
 
     pub const fn snapshot_id(&self) -> Option<i64> {
@@ -770,10 +753,6 @@ impl IcebergTableHandle {
                 table_name: self.schema_table_name.table_name().to_string(),
             }),
             snapshot_id: self.snapshot_id,
-            frozen_cow_source: self
-                .frozen_cow_source
-                .as_ref()
-                .map(super::cow_source_proof::IcebergCowSourceProof::to_proto),
             read_domain: self
                 .read_domain
                 .as_deref()
@@ -866,12 +845,6 @@ impl IcebergTableHandle {
                 .transpose()?,
         })?
         .with_mutation_partition_type(raw.mutation_partition_type_json.clone())?
-        .with_frozen_cow_source(
-            raw.frozen_cow_source
-                .as_ref()
-                .map(super::cow_source_proof::IcebergCowSourceProof::from_proto)
-                .transpose()?,
-        )?
         .with_scalar_integer_domains(
             raw.scalar_integer_domains
                 .iter()

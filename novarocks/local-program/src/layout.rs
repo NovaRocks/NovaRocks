@@ -577,7 +577,7 @@ impl StaticLayout {
                     .ok_or(LayoutError::ValueBindingMismatch)?;
                 if !source
                     .borrowed()
-                    .same_physical_binding_ignoring_root_nullability_observed(
+                    .same_physical_binding_ignoring_nullability_observed(
                         target.borrowed(),
                         || work.step(),
                     )?

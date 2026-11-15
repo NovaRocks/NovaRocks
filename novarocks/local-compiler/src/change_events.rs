@@ -146,7 +146,8 @@ fn lower_core_with_creation<H>(
         let predicate = predicate?;
         let mut assignments = Vec::new();
         reserve_vec(&mut assignments, event.assignments.len(), work)?;
-        for (value, expression) in &event.assignments {
+        for assignment in &event.assignments {
+            let (value, expression) = (&assignment.output, &assignment.expression);
             let output_slot_id =
                 addresses
                     .get(value)
@@ -157,6 +158,22 @@ fn lower_core_with_creation<H>(
             let expr = expression.map(resolve).transpose();
             work.step()?;
             assignments.push(ChangeEventOutputExpr {
+                write_input: assignment
+                    .write_input
+                    .as_ref()
+                    .map(|declaration| {
+                        Ok::<_, crate::FragmentCreationError<H>>(
+                            novarocks_type_contract::WriteInputDeclaration {
+                                input: declaration.input.clone_observed(|| work.step())?,
+                                storage: declaration
+                                    .storage
+                                    .as_ref()
+                                    .map(|storage| storage.clone_observed(|| work.step()))
+                                    .transpose()?,
+                            },
+                        )
+                    })
+                    .transpose()?,
                 output_slot_id: output_slot_id?,
                 expr: expr?,
             });

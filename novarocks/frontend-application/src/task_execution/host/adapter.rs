@@ -362,6 +362,11 @@ pub(crate) enum AttemptRegistrationError {
 }
 
 impl AttemptActorRegistration {
+    #[cfg(test)]
+    pub(crate) fn subscription_source_for_test(&self) -> ActorId {
+        self.subscription_source
+    }
+
     pub(crate) fn prepare_auxiliary_source(
         &self,
         runtime: &ActorRuntime<FrontendActor>,

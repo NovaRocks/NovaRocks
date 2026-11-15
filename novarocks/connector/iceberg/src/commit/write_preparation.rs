@@ -678,6 +678,22 @@ pub(crate) fn validate_session_write_input_request(
                         "Iceberg session target field has no authoritative complete declaration",
                     )
                 })?;
+                let storage_matches = match (source.storage_type(), target.storage_type()) {
+                    (None, None) => true,
+                    (Some(actual), Some(expected)) => {
+                        actual.exactly_equals_checked_observed(expected, || {
+                            creation
+                                .work(1)
+                                .map_err(crate::metadata::metadata_creation_error)
+                        })?
+                    }
+                    _ => false,
+                };
+                if !storage_matches {
+                    return Err(invalid_write_activation(
+                        "Iceberg session source differs from its authoritative complete storage declaration",
+                    ));
+                }
                 if actual.nullable() && !expected.nullable() {
                     return Err(invalid_write_activation(
                         "Iceberg session nullable source cannot satisfy a required target field",
@@ -789,20 +805,7 @@ fn exact_data_write_fields(
             )));
         }
     }
-    let requested_all = metadata
-        .current_schema()
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|field| {
-            ConnectorWriteFieldRequest::new(Field::new(
-                &field.name,
-                DataType::Null,
-                !field.required,
-            ))
-        })
-        .collect::<Vec<_>>();
-    exact_requested_write_fields(metadata, &requested_all, creation)
+    crate::commit::write_shared::canonical_data_write_fields(metadata, creation)
 }
 
 /// Rebuild a row-lineage after-image's data fields from the frozen schema.
@@ -813,7 +816,7 @@ fn exact_data_write_fields(
 /// frozen schema has nothing to rebuild them from and their absence from it is
 /// the specification, not a defect in the request. They pass through exactly
 /// as proposed -- which is what the write stack signs, and what the
-/// copy-on-write rewrite branch carries through unchanged.
+/// row-lineage data branch carries through unchanged.
 fn exact_row_lineage_data_write_fields(
     metadata: &TableMetadata,
     requested: &[ConnectorWriteFieldRequest],
@@ -930,7 +933,7 @@ fn bind_write_fields(
         .enumerate()
         .map(|(ordinal, request)| {
             let mut hasher = Sha256::new();
-            hasher.update(b"novarocks.iceberg.write-field-token.v1\0");
+            hasher.update(b"novarocks.iceberg.write-field-token.v2\0");
             hasher.update(owner.instance_id.as_str().as_bytes());
             hasher.update(owner.incarnation.to_bytes());
             hasher.update(table.payload());
@@ -943,11 +946,23 @@ fn bind_write_fields(
                     "Iceberg writer field has no complete provider declaration",
                 )
             })?;
-            ConnectorWriteFieldBinding::try_new_typed(
+            novarocks_connector_contract::write_input_projection_identity_observed(
+                Some(value),
+                request.storage_type(),
+                |bytes| {
+                    hasher.update(bytes);
+                    Ok::<(), ConnectorError>(())
+                },
+            )?;
+            let binding = ConnectorWriteFieldBinding::try_new_typed(
                 ConnectorWriteFieldToken::from_bytes(hasher.finalize().into()),
                 request.field().clone(),
                 value.clone(),
-            )
+            )?;
+            match request.storage_type() {
+                Some(storage) => binding.with_storage_type(storage.clone()),
+                None => Ok(binding),
+            }
         })
         .collect()
 }
@@ -1037,7 +1052,6 @@ mod tests {
             metadata_table_type: None,
             prepared_files: Vec::new(),
             explicit_files: None,
-            row_mutation_frozen_source: false,
             hidden_columns: Vec::new(),
         }
     }
@@ -2263,6 +2277,57 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn canonical_session_requires_exact_storage_and_tokens_bind_its_width() {
+        use novarocks_type_contract::FunctionValueType;
+        let request = |width: Option<i32>| {
+            let input = declared_session_field(FunctionValueType::new(DataType::Binary, false));
+            match width {
+                Some(width) => input
+                    .with_storage_type(FunctionValueType::new(
+                        DataType::FixedSizeBinary(width),
+                        false,
+                    ))
+                    .unwrap(),
+                None => input,
+            }
+        };
+        let target = ConnectorWriteInputRequest::Data {
+            fields: vec![request(Some(4))],
+        };
+        validate_session_write_input_request(&target, &target, &context()).unwrap();
+        for width in [None, Some(8)] {
+            let forged = ConnectorWriteInputRequest::Data {
+                fields: vec![request(width)],
+            };
+            let error =
+                validate_session_write_input_request(&forged, &target, &context()).unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert!(error.message().contains("complete storage declaration"));
+        }
+        let owner = owner();
+        let table = table_handle(&owner, &table_payload(Some(table_info(&metadata()))));
+        let bound = |width| {
+            bind_write_fields(
+                &[request(Some(width))],
+                &owner,
+                &table,
+                ConnectorWriteIntent::Append,
+                1,
+            )
+            .unwrap()
+            .remove(0)
+        };
+        let first = bound(4);
+        let other = bound(8);
+        assert_eq!(first.execution_type(), other.execution_type());
+        assert_ne!(first.token(), other.token());
+        assert_eq!(
+            first.storage_type(),
+            Some(&FunctionValueType::new(DataType::FixedSizeBinary(4), false))
         );
     }
 

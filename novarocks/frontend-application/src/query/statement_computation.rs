@@ -22,8 +22,7 @@ use crate::query_execution::{
     compiler::PreparedDmlWriteAssembly,
     internal_consumer::{
         decoded::{
-            CowComputationOutput, DecodedConsumerRuntime, ReadyCowComputation,
-            ReadyStatisticsComputation, StatisticsComputationOutput,
+            DecodedConsumerRuntime, ReadyStatisticsComputation, StatisticsComputationOutput,
         },
         domain_cpu::DomainCpuCustody,
         write::{ReadyWriteComputation, WriteComputationOutput},
@@ -49,6 +48,15 @@ use novarocks_workload_control::{
     },
 };
 use std::task::{Context, Poll};
+
+pub(super) fn statement_work_error(error: WorkError) -> QueryServiceError {
+    QueryServiceError::from_failure_cause(
+        novarocks_failure_contract::SharedFailureCause::from_static_detail(
+            error,
+            "statement original workload operation refused",
+        ),
+    )
+}
 
 pub(crate) struct StatementStageAdmission {
     client_window: Option<novarocks_workload_control::ResultWindowAlias>,
@@ -129,7 +137,7 @@ impl StatementStageAdmission {
         if let Some(wait) = self.q_wait.as_mut() {
             match Pin::new(wait).poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(result) => result.map_err(|e| internal_error(e.to_string()))?,
+                Poll::Ready(result) => result.map_err(statement_work_error)?,
             }
             drop(self.q_wait.take());
         }
@@ -138,7 +146,7 @@ impl StatementStageAdmission {
                 match self
                     .root
                     .try_request_joint_child()
-                    .map_err(|e| internal_error(e.to_string()))?
+                    .map_err(statement_work_error)?
                 {
                     novarocks_workload_control::joint_admission::JointTryBegin::Started(
                         request,
@@ -149,7 +157,7 @@ impl StatementStageAdmission {
                         match Pin::new(wait).poll(cx) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(result) => {
-                                result.map_err(|e| internal_error(e.to_string()))?;
+                                result.map_err(statement_work_error)?;
                                 drop(self.q_wait.take());
                                 cx.waker().wake_by_ref();
                                 return Poll::Pending;
@@ -161,7 +169,7 @@ impl StatementStageAdmission {
             if self.child_receipt.is_none() {
                 let batch = match Pin::new(self.child.as_mut().unwrap()).poll(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(r) => r.map_err(|e| internal_error(e.error.to_string()))?,
+                    Poll::Ready(r) => r.map_err(|failure| statement_work_error(failure.error))?,
                 };
                 self.child_receipt = batch.adjustment;
                 if !batch.new_claims.is_empty() {
@@ -176,7 +184,7 @@ impl StatementStageAdmission {
                 .as_mut()
                 .unwrap()
                 .install_child_in(&self.root, &mut self.owner)
-                .map_err(|e| internal_error(e.to_string()))?;
+                .map_err(statement_work_error)?;
             notice.notify();
             drop(self.child_receipt.take());
         }
@@ -184,16 +192,16 @@ impl StatementStageAdmission {
             if self.owner_admission.is_none() && self.owner_ready.is_none() {
                 let source = io
                     .root_stage_source(self.owner.as_ref().unwrap())
-                    .map_err(|e| internal_error(e.to_string()))?;
+                    .map_err(statement_work_error)?;
                 let source = match self.client_window.as_ref() {
                     Some(window) => source
                         .for_client_window(window)
-                        .map_err(|error| internal_error(error.to_string()))?,
+                        .map_err(statement_work_error)?,
                     None => source,
                 };
                 let mut proposal = match source
                     .try_begin(self.peak_bytes, JointLane::Foreground)
-                    .map_err(|e| internal_error(e.to_string()))?
+                    .map_err(statement_work_error)?
                 {
                     novarocks_workload_control::joint_admission::JointTryBegin::Started(
                         proposal,
@@ -204,7 +212,7 @@ impl StatementStageAdmission {
                         match Pin::new(wait).poll(cx) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(result) => {
-                                result.map_err(|e| internal_error(e.to_string()))?;
+                                result.map_err(statement_work_error)?;
                                 drop(self.q_wait.take());
                                 cx.waker().wake_by_ref();
                                 return Poll::Pending;
@@ -212,22 +220,18 @@ impl StatementStageAdmission {
                         }
                     }
                 };
-                proposal
-                    .end_payload()
-                    .map_err(|e| internal_error(e.to_string()))?;
-                proposal
-                    .end_stage()
-                    .map_err(|e| internal_error(e.to_string()))?;
+                proposal.end_payload().map_err(statement_work_error)?;
+                proposal.end_stage().map_err(statement_work_error)?;
                 self.owner_admission = Some(
                     proposal
                         .submit()
-                        .map_err(|e| internal_error(e.error.to_string()))?,
+                        .map_err(|failure| statement_work_error(failure.error))?,
                 );
             }
             if self.owner_ready.is_none() {
                 let ready = match Pin::new(self.owner_admission.as_mut().unwrap()).poll(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(r) => r.map_err(|e| internal_error(e.error.to_string()))?,
+                    Poll::Ready(r) => r.map_err(|failure| statement_work_error(failure.error))?,
                 };
                 self.owner_ready = Some(ready);
                 drop(self.owner_admission.take());
@@ -238,7 +242,7 @@ impl StatementStageAdmission {
                     self.owner.as_ref().unwrap(),
                     &mut self.compute,
                 )
-                .map_err(|e| internal_error(e.to_string()))?;
+                .map_err(statement_work_error)?;
             notice.notify();
             drop(self.owner_ready.take());
         }
@@ -257,7 +261,7 @@ impl StatementStageAdmission {
         if self.capacity.is_none() {
             self.capacity = Some(
                 io.stage_capacity(self.owner.as_ref().unwrap(), self.compute.as_ref().unwrap())
-                    .map_err(|error| internal_error(error.to_string()))?,
+                    .map_err(statement_work_error)?,
             );
         }
         Ok(())
@@ -282,7 +286,7 @@ impl StatementStageAdmission {
             &mut self.compute,
             target,
         )
-        .map_err(|error| internal_error(error.to_string()))?;
+        .map_err(statement_work_error)?;
         self.capacity_transferred = true;
         Ok(())
     }
@@ -306,7 +310,7 @@ impl StatementStageAdmission {
             &mut self.compute,
             target,
         )
-        .map_err(|error| internal_error(error.to_string()))?;
+        .map_err(statement_work_error)?;
         self.capacity_transferred = true;
         // The exact Client computation and its window are now stable in target.
         // This preparation-only alias must not follow unrelated residual work.
@@ -351,18 +355,6 @@ pub(crate) trait StatementComputationOutput: Send + 'static {
 }
 impl StatementComputationOutput for WriteComputationOutput {
     type Ready = ReadyWriteComputation;
-    fn cpu_custody(&self) -> Arc<DomainCpuCustody> {
-        self.cpu_custody()
-    }
-    fn take_ready(
-        &mut self,
-        token: ComputationReadyToken,
-    ) -> Result<Self::Ready, QueryExecutionError> {
-        self.take_ready(token)
-    }
-}
-impl StatementComputationOutput for CowComputationOutput {
-    type Ready = ReadyCowComputation;
     fn cpu_custody(&self) -> Arc<DomainCpuCustody> {
         self.cpu_custody()
     }
@@ -470,26 +462,8 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
             crate::preparation_diagnostics::StatementObservationHandle,
         >,
     ) -> Self {
-        Self::new_with_peak(
-            root,
-            initial,
-            launcher,
-            0,
-            #[cfg(novarocks_dev_controls)]
-            observation,
-        )
-    }
-    pub(crate) fn new_with_peak(
-        root: WorkScope,
-        initial: InitialComputationReservation,
-        launcher: Arc<dyn LogicalExecutionLauncher>,
-        peak_bytes: u64,
-        #[cfg(novarocks_dev_controls)] observation: Option<
-            crate::preparation_diagnostics::StatementObservationHandle,
-        >,
-    ) -> Self {
         Self {
-            admission: StatementStageAdmission::new(root, peak_bytes),
+            admission: StatementStageAdmission::new(root, 0),
             initial: Some(initial),
             assembly: None,
             computation: None,
@@ -735,7 +709,7 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
         if let Some(output) = &self.output {
             let cpu = output.cpu_custody();
             cpu.begin_close();
-            match cpu.poll_join_closed(cx) {
+            match cpu.poll_statement_closed(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(cause)) => {
                     self.close_failure = Some(StatementNativeHealthFailure::actual_exit_unproven(
@@ -868,13 +842,6 @@ pub(crate) struct StatementNativeTail {
     failed: bool,
 }
 impl StatementNativeTail {
-    pub(crate) fn retained_heap_bytes() -> Result<usize, WorkError> {
-        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
-            SourceExitUnproven,
-        >())
-        .map(|layout| layout.size())
-        .map_err(|_| WorkError::ArithmeticOverflow)
-    }
     pub(crate) fn poll_exit(
         &mut self,
         cx: &mut Context<'_>,
@@ -1031,10 +998,7 @@ mod tests {
         // The Ready boundary is already recorded; this test exercises its
         // distinct actual local-CPU join and the absent Native-observer guard.
         let mut helper = StatementComputation::<OriginalCpuAssembly> {
-            admission: StatementStageAdmission::new(
-                root.owner.scope(),
-                crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES,
-            ),
+            admission: StatementStageAdmission::new(root.owner.scope(), 0),
             initial: None,
             assembly: None,
             computation: None,

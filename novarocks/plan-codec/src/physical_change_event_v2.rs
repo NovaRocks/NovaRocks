@@ -27,6 +27,7 @@ use crate::{
     physical_expression_v2::{DecodedExpressions, EncodedExpressions},
     physical_node_v2::*,
     physical_properties_v2 as properties,
+    physical_type_v2::{self, OriginalValueTypeSourceIndex},
     physical_value_v2::EncodedValues,
 };
 use novarocks_connector_contract::ConnectorRowMutationEffect;
@@ -106,15 +107,21 @@ fn wire_payload(input: &wire::PhysicalNode) -> Result<&wire::ChangeEventExpandNo
         _ => Err(invalid("wire node is not change-event expansion")),
     }
 }
-fn prepare_encode(
+fn prepare_encode<'source>(
     input: &p::PhysicalNode,
-    values: &EncodedValues<'_, '_, '_>,
+    values: &EncodedValues<'_, 'source, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
     l: ChangeEventNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
-) -> Result<ChangeEventNodeProjectionFacts, Error> {
+) -> Result<
+    (
+        ChangeEventNodeProjectionFacts,
+        Option<OriginalValueTypeSourceIndex<'source>>,
+    ),
+    Error,
+> {
     let namespace_floor = if parent.is_some() {
         values
             .retained_floor_header()?
@@ -174,12 +181,13 @@ fn prepare_encode(
     encode_header_requests(input, &mut model)?;
     model.request::<wire::ChangeEvent>(events.len(), 1)?;
     let mut occurrences = 0;
+    let mut type_occurrences = 0;
     for event in events {
         model.items = add(model.items, event.assignments.len())?;
         model.refs = add(model.refs, event.assignments.len())?;
         known = add(
             known,
-            bytes::<(p::ValueId, Option<p::ExprId>)>(event.assignments.len())?,
+            bytes::<p::ChangeAssignment>(event.assignments.len())?,
         )?;
         model.request::<wire::ChangeAssignment>(event.assignments.len(), 1)?;
         if parent.is_some() {
@@ -193,7 +201,16 @@ fn prepare_encode(
         }
         gate(&model, known, &mut parent)?;
         w.step()?;
-        for (_, expression) in &event.assignments {
+        for assignment in &event.assignments {
+            let expression = &assignment.expression;
+            let count = assignment
+                .write_input
+                .as_ref()
+                .map_or(0, |d| 1 + usize::from(d.storage.is_some()));
+            type_occurrences = add(type_occurrences, count)?;
+            // W/T are TypeIds, not fragment ValueIds. Their bounded
+            // occurrences feed the original type-index/clone work below;
+            // assignment/list and raw scalar charges retain their owners.
             occurrences = add(occurrences, usize::from(expression.is_some()))?;
             if parent.is_some() {
                 model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
@@ -231,6 +248,26 @@ fn prepare_encode(
         gate(&model, known, &mut parent)?;
         w.step()?;
     }
+    let type_sources = if type_occurrences == 0 {
+        None
+    } else {
+        Some(OriginalValueTypeSourceIndex::prepare(
+            values.types(),
+            mul(type_occurrences, 2)?,
+            &mut |facts| {
+                model.layout_request(facts.node_layout, facts.allocation_requests_upper_bound)?;
+                model.delegated_work =
+                    add(model.delegated_work, facts.cumulative_work_upper_bound)?;
+                gate(&model, known, &mut parent)?;
+                if parent.is_none() {
+                    model.numerical_facts(source, values.count(), l)?;
+                }
+                Ok::<(), Error>(())
+            },
+            &mut invalid,
+            w,
+        )?)
+    };
     let facts = if let Some(admit) = parent {
         model.facts_in(source, values.count(), l, admit, w)?
     } else {
@@ -244,7 +281,11 @@ fn prepare_encode(
         if let Some(predicate) = event.predicate {
             expression_encode(predicate, expressions, w)?;
         }
-        for (output, expression) in &event.assignments {
+        for assignment in &event.assignments {
+            let (output, expression) = (&assignment.output, &assignment.expression);
+            if let Some(declaration) = &assignment.write_input {
+                encode_type_ids(declaration, type_sources.as_ref(), w)?;
+            }
             reference(output.get(), values, w)?;
             if let Some(expression) = expression {
                 expression_encode(*expression, expressions, w)?;
@@ -260,7 +301,7 @@ fn prepare_encode(
     {
         physical_property_refs(property, values, w)?;
     }
-    Ok(facts)
+    Ok((facts, type_sources))
 }
 fn prepare_decode(
     input: &wire::PhysicalNode,
@@ -330,6 +371,7 @@ fn prepare_decode(
     decode_header_requests(input, port, &mut model)?;
     model.request::<p::ChangeEventSpec>(payload.events.len(), 2)?;
     let mut occurrences = 0;
+    let mut type_work = 0;
     for event in &payload.events {
         model.items = add(model.items, event.assignments.len())?;
         model.refs = add(model.refs, event.assignments.len())?;
@@ -337,10 +379,13 @@ fn prepare_decode(
             known,
             bytes::<wire::ChangeAssignment>(event.assignments.capacity())?,
         )?;
-        model.request::<(p::ValueId, Option<p::ExprId>)>(event.assignments.len(), 2)?;
+        model.request::<p::ChangeAssignment>(event.assignments.len(), 2)?;
         if parent.is_some() {
             occurrences = add(occurrences, usize::from(event.predicate_expr_id.is_some()))?;
-            model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
+            model.delegated_work = add(
+                mul(occurrences, expressions.lookup_work_upper_bound()?)?,
+                type_work,
+            )?;
         }
         gate(&model, known, &mut parent)?;
         count_prefix(model.inputs, model.items, source, known, l, w)?;
@@ -350,15 +395,89 @@ fn prepare_decode(
         gate(&model, known, &mut parent)?;
         w.step()?;
         for assignment in &event.assignments {
+            let type_count = usize::from(assignment.write_input_value_type_id.is_some())
+                + usize::from(assignment.storage_value_type_id.is_some());
+            // Type lookups/clones charge their original work and request
+            // contribution; only the assignment output increments Value refs.
+            if type_count != 0 {
+                let lookup =
+                    crate::btree_resources_v2::lookup_work_typed(values.types().value_type_count())
+                        .map_err(|error| match error {
+                            crate::btree_resources_v2::BTreeResourceError::Arithmetic(_) => {
+                                Error::from(
+                                    novarocks_type_contract::CompileControlError::ResourceExhausted,
+                                )
+                            }
+                            crate::btree_resources_v2::BTreeResourceError::SourceModel(message) => {
+                                invalid(message)
+                            }
+                        })?;
+                type_work = add(
+                    type_work,
+                    mul(
+                        type_count,
+                        add(
+                            mul(lookup, 2)?,
+                            mul(
+                                physical_type_v2::value_type_clone_preflight_work_upper_bound(),
+                                2,
+                            )?,
+                        )?,
+                    )?,
+                )?;
+                model.delegated_work = add(
+                    mul(occurrences, expressions.lookup_work_upper_bound()?)?,
+                    type_work,
+                )?;
+            }
             occurrences = add(occurrences, usize::from(assignment.expr_id.is_some()))?;
             if parent.is_some() {
-                model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
+                model.delegated_work = add(
+                    mul(occurrences, expressions.lookup_work_upper_bound()?)?,
+                    type_work,
+                )?;
             }
             gate(&model, known, &mut parent)?;
+            if type_count != 0 && parent.is_none() {
+                model.numerical_facts(source, values.count(), l)?;
+            }
             w.step()?;
+            for id in decode_type_ids(assignment, w)?.into_iter().flatten() {
+                let ty = values
+                    .types()
+                    .value_type_observed(id, w)?
+                    .ok_or_else(|| invalid("change-event type reference is absent"))?;
+                physical_type_v2::preflight_value_type_clone_admitted(
+                    ty,
+                    &mut |facts, _| {
+                        model.requests =
+                            add(model.requests, facts.allocation_requests_upper_bound())?;
+                        model.requested = add(
+                            model.requested,
+                            facts.allocation_request_bytes_upper_bound(),
+                        )?;
+                        if facts.work_upper_bound()
+                            > physical_type_v2::value_type_clone_preflight_work_upper_bound()
+                        {
+                            return Err(Error::from(
+                                novarocks_type_contract::CompileControlError::ResourceExhausted,
+                            ));
+                        }
+                        gate(&model, known, &mut parent)?;
+                        if parent.is_none() {
+                            model.numerical_facts(source, values.count(), l)?;
+                        }
+                        Ok::<(), Error>(())
+                    },
+                    w,
+                )?;
+            }
         }
     }
-    model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
+    model.delegated_work = add(
+        mul(occurrences, expressions.lookup_work_upper_bound()?)?,
+        type_work,
+    )?;
     if parent.is_some() {
         gate(&model, known, &mut parent)?;
         count_prefix(model.inputs, model.items, source, known, l, w)?;
@@ -419,8 +538,49 @@ fn prepare_decode(
     }
     Ok(facts)
 }
+fn encode_type_ids(
+    declaration: &novarocks_type_contract::WriteInputDeclaration,
+    sources: Option<&OriginalValueTypeSourceIndex<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(u32, Option<u32>), Error> {
+    let sources = sources.ok_or_else(|| invalid("change-event original type locator is absent"))?;
+    let input = sources
+        .source_id_observed(&declaration.input, work)?
+        .ok_or_else(|| invalid("change-event input type has no original source author"))?;
+    let storage = declaration
+        .storage
+        .as_ref()
+        .map(|storage| {
+            sources
+                .source_id_observed(storage, work)?
+                .ok_or_else(|| invalid("change-event storage type has no original source author"))
+        })
+        .transpose()?;
+    Ok((input, storage))
+}
+fn decode_type_ids(
+    assignment: &wire::ChangeAssignment,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<[Option<u32>; 2], Error> {
+    let result = if assignment.write_input_value_type_id.is_none()
+        && assignment.storage_value_type_id.is_some()
+    {
+        Err(invalid("change-event storage type requires an input type"))
+    } else {
+        Ok([
+            assignment.write_input_value_type_id,
+            assignment.storage_value_type_id,
+        ])
+    };
+    if assignment.write_input_value_type_id.is_some() || assignment.storage_value_type_id.is_some()
+    {
+        work.step()?;
+    }
+    result
+}
 fn emit_encode(
     input: &p::PhysicalNode,
+    type_sources: Option<&OriginalValueTypeSourceIndex<'_>>,
     source: usize,
     limits: ChangeEventNodeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
@@ -431,10 +591,18 @@ fn emit_encode(
     let mut emitted = reserve(events.len(), work)?;
     for event in events {
         let mut assignments = reserve(event.assignments.len(), work)?;
-        for (value, expression) in &event.assignments {
+        for assignment in &event.assignments {
+            let types = assignment
+                .write_input
+                .as_ref()
+                .map(|declaration| encode_type_ids(declaration, type_sources, work))
+                .transpose()?;
+            let (value, expression) = (&assignment.output, &assignment.expression);
             assignments.push(wire::ChangeAssignment {
                 value_id: Some(value.get()),
                 expr_id: expression.map(p::ExprId::get),
+                write_input_value_type_id: types.map(|(input, _)| input),
+                storage_value_type_id: types.and_then(|(_, storage)| storage),
             });
             work.step()?;
         }
@@ -463,6 +631,7 @@ fn emit_encode(
 }
 fn emit_decode(
     input: &wire::PhysicalNode,
+    expressions: &DecodedExpressions<'_, '_, '_>,
     source: usize,
     limits: ChangeEventNodeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
@@ -474,10 +643,34 @@ fn emit_decode(
     for event in &payload.events {
         let mut assignments = reserve(event.assignments.len(), work)?;
         for assignment in &event.assignments {
-            assignments.push((
-                p::ValueId::new(required(assignment.value_id, work)?),
-                assignment.expr_id.map(p::ExprId::new),
-            ));
+            let [input, storage] = decode_type_ids(assignment, work)?;
+            let write_input = input
+                .map(|id| -> Result<_, Error> {
+                    let types = expressions.values().types();
+                    let input = physical_type_v2::clone_value_type_observed(
+                        types
+                            .value_type_observed(id, work)?
+                            .ok_or_else(|| invalid("change-event type reference is absent"))?,
+                        work,
+                    )?;
+                    let storage = storage
+                        .map(|id| -> Result<_, Error> {
+                            Ok(physical_type_v2::clone_value_type_observed(
+                                types.value_type_observed(id, work)?.ok_or_else(|| {
+                                    invalid("change-event type reference is absent")
+                                })?,
+                                work,
+                            )?)
+                        })
+                        .transpose()?;
+                    Ok(novarocks_type_contract::WriteInputDeclaration { input, storage })
+                })
+                .transpose()?;
+            assignments.push(p::ChangeAssignment {
+                output: p::ValueId::new(required(assignment.value_id, work)?),
+                expression: assignment.expr_id.map(p::ExprId::new),
+                write_input,
+            });
             work.step()?;
         }
         emitted.push(p::ChangeEventSpec {
@@ -511,6 +704,7 @@ pub struct PreparedChangeEventNodeEncode<'node, 'namespace, 'loan, 'source, 'con
     source: usize,
     limits: ChangeEventNodeProjectionLimits,
     facts: ChangeEventNodeProjectionFacts,
+    type_sources: Option<OriginalValueTypeSourceIndex<'source>>,
 }
 impl PreparedChangeEventNodeEncode<'_, '_, '_, '_, '_> {
     pub fn facts(&self) -> &ChangeEventNodeProjectionFacts {
@@ -524,8 +718,14 @@ impl PreparedChangeEventNodeEncode<'_, '_, '_, '_, '_> {
             self.values.original_control(),
             self.expressions.original_control()
         ));
-        let result = emit_encode(self.input, self.source, self.limits, &mut work)
-            .map(|node| (node, self.facts));
+        let result = emit_encode(
+            self.input,
+            self.type_sources.as_ref(),
+            self.source,
+            self.limits,
+            &mut work,
+        )
+        .map(|node| (node, self.facts));
         finish(work, result)
     }
 
@@ -541,7 +741,13 @@ impl PreparedChangeEventNodeEncode<'_, '_, '_, '_, '_> {
             ));
         }
         admit(&self.facts)?;
-        let node = emit_encode(self.input, self.source, self.limits, work)?;
+        let node = emit_encode(
+            self.input,
+            self.type_sources.as_ref(),
+            self.source,
+            self.limits,
+            work,
+        )?;
         Ok((node, self.facts))
     }
 }
@@ -562,8 +768,9 @@ pub fn prepare_change_event_node_encode<'node, 'namespace, 'loan, 'source, 'cont
         &mut work,
         None,
     );
-    let facts = finish(work, result)?;
+    let (facts, type_sources) = finish(work, result)?;
     Ok(PreparedChangeEventNodeEncode {
+        type_sources,
         input,
         values,
         expressions,
@@ -587,7 +794,7 @@ pub fn prepare_change_event_node_encode_in<'node, 'namespace, 'loan, 'source, 'c
             "node caller does not borrow the original controller",
         ));
     }
-    let facts = prepare_encode(
+    let (facts, type_sources) = prepare_encode(
         input,
         values,
         expressions,
@@ -597,6 +804,7 @@ pub fn prepare_change_event_node_encode_in<'node, 'namespace, 'loan, 'source, 'c
         Some(admit),
     )?;
     Ok(PreparedChangeEventNodeEncode {
+        type_sources,
         input,
         values,
         expressions,
@@ -620,8 +828,14 @@ impl PreparedChangeEventNodeDecode<'_, '_, '_, '_, '_> {
     pub fn emit(self) -> Result<(p::PhysicalNode, ChangeEventNodeProjectionFacts), Error> {
         let mut work =
             CompileCheckpoints::try_new(self.expressions.original_control(), CompilePhase::Decode)?;
-        let result = emit_decode(self.input, self.source, self.limits, &mut work)
-            .map(|node| (node, self.facts));
+        let result = emit_decode(
+            self.input,
+            self.expressions,
+            self.source,
+            self.limits,
+            &mut work,
+        )
+        .map(|node| (node, self.facts));
         finish(work, result)
     }
 
@@ -637,7 +851,7 @@ impl PreparedChangeEventNodeDecode<'_, '_, '_, '_, '_> {
             ));
         }
         admit(&self.facts)?;
-        let node = emit_decode(self.input, self.source, self.limits, work)?;
+        let node = emit_decode(self.input, self.expressions, self.source, self.limits, work)?;
         Ok((node, self.facts))
     }
 }
@@ -706,7 +920,7 @@ pub fn encode_change_event_node(
 ) -> Result<(wire::PhysicalNode, ChangeEventNodeProjectionFacts), Error> {
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = (|| {
-        let facts = prepare_encode(
+        let (facts, type_sources) = prepare_encode(
             input,
             values,
             expressions,
@@ -715,7 +929,13 @@ pub fn encode_change_event_node(
             &mut work,
             None,
         )?;
-        let node = emit_encode(input, source_retained_bytes, limits, &mut work)?;
+        let node = emit_encode(
+            input,
+            type_sources.as_ref(),
+            source_retained_bytes,
+            limits,
+            &mut work,
+        )?;
         Ok((node, facts))
     })();
     finish(work, result)
@@ -737,7 +957,7 @@ pub fn decode_change_event_node(
             &mut work,
             None,
         )?;
-        let node = emit_decode(input, source_retained_bytes, limits, &mut work)?;
+        let node = emit_decode(input, expressions, source_retained_bytes, limits, &mut work)?;
         Ok((node, facts))
     })();
     finish(work, result)

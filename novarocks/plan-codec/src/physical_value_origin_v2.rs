@@ -313,6 +313,7 @@ fn encode_writer(kind: physical::WriterDerivedKind) -> i32 {
             wire::WriterDerivedKind::WriteTargetOrdinal
         }
         physical::WriterDerivedKind::GroupingKey => wire::WriterDerivedKind::GroupingKey,
+        physical::WriterDerivedKind::ProjectedInput => wire::WriterDerivedKind::ProjectedInput,
     }) as i32
 }
 fn decode_writer(kind: i32) -> Result<physical::WriterDerivedKind, Error> {
@@ -328,6 +329,7 @@ fn decode_writer(kind: i32) -> Result<physical::WriterDerivedKind, Error> {
             physical::WriterDerivedKind::WriteTargetOrdinal
         }
         Ok(wire::WriterDerivedKind::GroupingKey) => physical::WriterDerivedKind::GroupingKey,
+        Ok(wire::WriterDerivedKind::ProjectedInput) => physical::WriterDerivedKind::ProjectedInput,
         Ok(wire::WriterDerivedKind::Unspecified) | Err(_) => {
             return Err(invalid(
                 "value origin writer kind is unknown or unspecified",

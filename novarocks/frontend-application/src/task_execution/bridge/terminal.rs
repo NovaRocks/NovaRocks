@@ -403,6 +403,17 @@ impl RegisteredActiveAttempt {
         }
     }
 
+    /// Test-only view of the already-published original protocol terminal.
+    /// Formatting borrows the existing OnceLock; it creates no work or input.
+    #[cfg(test)]
+    pub(crate) fn original_terminal_debug_for_test(&self) -> Option<String> {
+        self.terminal
+            .normal
+            .terminal
+            .get()
+            .map(|original| format!("{:?}", original.port.body))
+    }
+
     pub(crate) fn lifecycle_runtime_filter_diagnostic(&self) -> Option<&RuntimeFilterDiagnostic> {
         self.terminal.lifecycle_runtime_filter_diagnostic()
     }

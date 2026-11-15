@@ -16,53 +16,9 @@
 //! Explicit source ownership for one already-materialized VALUES relation.
 //! No parser token, literal content, alias or provider attribute is an identity.
 use super::SqlCompileError;
-use novarocks_parser::ast::{self, Visit};
+use novarocks_parser::ast;
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
-/// An exact structural edge in the owned query. These variants add no SQL
-/// syntax; they name the existing derived relations used by closed producers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SqlMaterializedValuesSite {
-    SelectFromDerived { from: usize },
-    SelectJoinDerived { from: usize, join: usize },
-}
-impl SqlMaterializedValuesSite {
-    fn resolve(self, query: &ast::Query) -> Result<(&ast::Values, usize), SqlCompileError> {
-        let ast::SetExpr::Select(select) = query.body.as_ref() else {
-            return Err(invalid(
-                "materialized VALUES site requires its actual SELECT owner",
-            ));
-        };
-        let factor = match self {
-            Self::SelectFromDerived { from } => select.from.get(from).map(|item| &item.relation),
-            Self::SelectJoinDerived { from, join } => select
-                .from
-                .get(from)
-                .and_then(|item| item.joins.get(join))
-                .map(|item| &item.relation),
-        }
-        .ok_or_else(|| invalid("materialized VALUES site is outside its owned query"))?;
-        let ast::TableFactor::Derived {
-            subquery, alias, ..
-        } = factor
-        else {
-            return Err(invalid(
-                "materialized VALUES site is not a derived relation",
-            ));
-        };
-        let ast::SetExpr::Values(values) = subquery.body.as_ref() else {
-            return Err(invalid(
-                "materialized VALUES site does not own a VALUES relation",
-            ));
-        };
-        let columns = alias
-            .as_ref()
-            .ok_or_else(|| invalid("materialized VALUES lacks its declared relation columns"))?
-            .columns
-            .len();
-        Ok((values, columns))
-    }
-}
 fn invalid(detail: &'static str) -> SqlCompileError {
     SqlCompileError::InvalidRequest(detail.to_owned())
 }
@@ -119,125 +75,182 @@ impl SqlExpressionConstant {
         query: &'a ast::Query,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<&'a ast::Expr, SqlCompileError> {
-        let mut body = query.body.as_ref();
-        for step in &self.body_path {
-            work.step()?;
-            body = match (step, body) {
-                (SqlConstantQueryStep::NestedQuery, ast::SetExpr::Query(query)) => {
-                    query.body.as_ref()
-                }
-                (SqlConstantQueryStep::UnionLeft, ast::SetExpr::SetOperation(op))
-                    if matches!(op.operator, ast::SetOperator::Union)
-                        && matches!(op.quantifier, ast::SetQuantifier::All) =>
-                {
-                    op.left.as_ref()
-                }
-                (SqlConstantQueryStep::UnionRight, ast::SetExpr::SetOperation(op))
-                    if matches!(op.operator, ast::SetOperator::Union)
-                        && matches!(op.quantifier, ast::SetQuantifier::All) =>
-                {
-                    op.right.as_ref()
-                }
-                (
-                    SqlConstantQueryStep::SelectFromDerived { from },
-                    ast::SetExpr::Select(select),
-                ) => {
-                    let Some(ast::TableFactor::Derived { subquery, .. }) =
-                        select.from.get(*from).map(|from| &from.relation)
-                    else {
-                        return Err(invalid(
-                            "constant source path differs from its owned derived relation",
-                        ));
-                    };
-                    subquery.body.as_ref()
-                }
-                _ => {
-                    return Err(invalid(
-                        "constant source path differs from its owned query body",
-                    ));
-                }
-            };
-        }
+        resolve_expression_site(
+            query,
+            &self.body_path,
+            self.site,
+            &self.expression_path,
+            false,
+            work,
+        )
+    }
+}
+
+pub(crate) fn resolve_expression_site<'a>(
+    query: &'a ast::Query,
+    body_path: &[SqlConstantQueryStep],
+    site: SqlConstantExpressionSite,
+    expression_path: &[SqlConstantExpressionStep],
+    allow_set_operations: bool,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<&'a ast::Expr, SqlCompileError> {
+    let mut body = query.body.as_ref();
+    for step in body_path {
         work.step()?;
-        let mut expression = match (self.site, body) {
-            (
-                SqlConstantExpressionSite::ValuesCell { row, column },
-                ast::SetExpr::Values(values),
-            ) => values.rows.get(row).and_then(|row| row.get(column)),
-            (
-                SqlConstantExpressionSite::SelectProjection { column },
-                ast::SetExpr::Select(select),
-            ) => select.projection.get(column).and_then(|item| match item {
+        body = match (step, body) {
+            (SqlConstantQueryStep::NestedQuery, ast::SetExpr::Query(query)) => query.body.as_ref(),
+            (SqlConstantQueryStep::UnionLeft, ast::SetExpr::SetOperation(op))
+                if allow_set_operations
+                    || (matches!(op.operator, ast::SetOperator::Union)
+                        && matches!(op.quantifier, ast::SetQuantifier::All)) =>
+            {
+                op.left.as_ref()
+            }
+            (SqlConstantQueryStep::UnionRight, ast::SetExpr::SetOperation(op))
+                if allow_set_operations
+                    || (matches!(op.operator, ast::SetOperator::Union)
+                        && matches!(op.quantifier, ast::SetQuantifier::All)) =>
+            {
+                op.right.as_ref()
+            }
+            (SqlConstantQueryStep::SelectFromDerived { from }, ast::SetExpr::Select(select)) => {
+                let Some(ast::TableFactor::Derived { subquery, .. }) =
+                    select.from.get(*from).map(|from| &from.relation)
+                else {
+                    return Err(invalid(
+                        "constant source path differs from its owned derived relation",
+                    ));
+                };
+                subquery.body.as_ref()
+            }
+            _ => {
+                return Err(invalid(
+                    "constant source path differs from its owned query body",
+                ));
+            }
+        };
+    }
+    work.step()?;
+    let mut expression = match (site, body) {
+        (SqlConstantExpressionSite::ValuesCell { row, column }, ast::SetExpr::Values(values)) => {
+            values.rows.get(row).and_then(|row| row.get(column))
+        }
+        (SqlConstantExpressionSite::SelectProjection { column }, ast::SetExpr::Select(select)) => {
+            select.projection.get(column).and_then(|item| match item {
                 ast::SelectItem::UnnamedExpr(expr)
                 | ast::SelectItem::ExprWithAlias { expr, .. } => Some(expr),
                 _ => None,
-            }),
-            _ => None,
+            })
         }
-        .ok_or_else(|| invalid("constant source expression is outside its owned query"))?;
-        for step in &self.expression_path {
-            work.step()?;
-            expression = match (step, expression) {
-                (SqlConstantExpressionStep::Nested, ast::Expr::Nested(nested)) => {
-                    &nested.expression
-                }
-                _ => {
-                    return Err(invalid(
-                        "constant source expression path differs from its owned syntax",
-                    ));
-                }
-            };
-        }
-        Ok(expression)
+        _ => None,
     }
+    .ok_or_else(|| invalid("constant source expression is outside its owned query"))?;
+    for step in expression_path {
+        work.step()?;
+        expression = match (step, expression) {
+            (SqlConstantExpressionStep::Nested, ast::Expr::Nested(nested)) => &nested.expression,
+            _ => {
+                return Err(invalid(
+                    "constant source expression path differs from its owned syntax",
+                ));
+            }
+        };
+    }
+    Ok(expression)
 }
+
 pub type SqlExpressionConstants = std::sync::Arc<[SqlExpressionConstant]>;
 
 /// Each constant retains its actual immutable pool and complete value type.
-/// Complete COW rows and producer-authored expressions are distinct roles.
 #[derive(Clone, Debug)]
 pub(crate) enum MaterializedValues {
-    Complete {
-        site: SqlMaterializedValuesSite,
-        rows: std::sync::Arc<[Box<[novarocks_functions::ConstantValue]>]>,
-    },
-    Expressions {
-        constants: SqlExpressionConstants,
-    },
+    Expressions { constants: SqlExpressionConstants },
 }
 /// The lookup is local to one actual analysis/query borrow. It stores no
 /// process-global pointer identity, query owner, provider or capability.
 pub(crate) struct MaterializedSourceBorrow<'a> {
-    complete: Option<(
-        &'a ast::Values,
-        &'a [Box<[novarocks_functions::ConstantValue]>],
-    )>,
+    // Expression addresses belong to this exact query borrow.
+    _query: std::marker::PhantomData<&'a ast::Query>,
     expressions: std::collections::BTreeMap<usize, novarocks_functions::ConstantValue>,
+    write_assignments:
+        std::collections::BTreeMap<usize, std::borrow::Cow<'a, super::SqlWriteAssignmentSite>>,
 }
+
+impl<'a> MaterializedSourceBorrow<'a> {
+    pub(crate) fn empty(_query: &'a ast::Query) -> Self {
+        Self {
+            _query: std::marker::PhantomData,
+            expressions: std::collections::BTreeMap::new(),
+            write_assignments: std::collections::BTreeMap::new(),
+        }
+    }
+    pub(crate) fn insert_write_assignment(
+        &mut self,
+        expression: &'a ast::Expr,
+        assignment: std::borrow::Cow<'a, super::SqlWriteAssignmentSite>,
+        control: &super::SqlCompileControl,
+    ) -> Result<(), SqlCompileError> {
+        control.checkpoint(CompilePhase::Validate, 1)?;
+        if self
+            .write_assignments
+            .insert(std::ptr::from_ref(expression) as usize, assignment)
+            .is_some()
+        {
+            return Err(invalid(
+                "write source assignment repeats an original occurrence",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_expression(&self, expression: &ast::Expr) -> bool {
+        self.expressions
+            .contains_key(&(std::ptr::from_ref(expression) as usize))
+    }
+    pub(crate) fn insert_context_constant(
+        &mut self,
+        expression: &'a ast::Expr,
+        value: novarocks_functions::ConstantValue,
+        control: &super::SqlCompileControl,
+    ) -> Result<(), SqlCompileError> {
+        control.checkpoint(CompilePhase::Validate, 1)?;
+        if self
+            .expressions
+            .insert(std::ptr::from_ref(expression) as usize, value)
+            .is_some()
+        {
+            return Err(invalid(
+                "write literal context repeats an original constant occurrence",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl MaterializedSourceBorrow<'_> {
     pub(crate) fn view(&self) -> MaterializedValuesLoan<'_> {
         MaterializedValuesLoan {
-            complete: self.complete,
             expressions: &self.expressions,
+            write_assignments: &self.write_assignments,
         }
     }
 }
 #[derive(Clone, Copy)]
 pub(crate) struct MaterializedValuesLoan<'a> {
-    complete: Option<(
-        &'a ast::Values,
-        &'a [Box<[novarocks_functions::ConstantValue]>],
-    )>,
     expressions: &'a std::collections::BTreeMap<usize, novarocks_functions::ConstantValue>,
+    write_assignments:
+        &'a std::collections::BTreeMap<usize, std::borrow::Cow<'a, super::SqlWriteAssignmentSite>>,
 }
 impl<'a> MaterializedValuesLoan<'a> {
-    pub(crate) fn rows_at(
+    pub(crate) fn write_assignment_at(
         self,
-        values: &ast::Values,
-    ) -> Option<&'a [Box<[novarocks_functions::ConstantValue]>]> {
-        self.complete
-            .and_then(|(original, rows)| std::ptr::eq(original, values).then_some(rows))
+        expression: &ast::Expr,
+    ) -> Option<&'a super::SqlWriteAssignmentSite> {
+        self.write_assignments
+            .get(&(std::ptr::from_ref(expression) as usize))
+            .map(std::borrow::Cow::as_ref)
     }
+
     pub(crate) fn constant_at(
         self,
         expr: &ast::Expr,
@@ -246,16 +259,6 @@ impl<'a> MaterializedValuesLoan<'a> {
     }
 }
 impl MaterializedValues {
-    pub(crate) fn try_new(
-        query: &ast::Query,
-        site: SqlMaterializedValuesSite,
-        rows: std::sync::Arc<[Box<[novarocks_functions::ConstantValue]>]>,
-        control: &dyn PureCompileControl,
-    ) -> Result<Self, SqlCompileError> {
-        let source = Self::Complete { site, rows };
-        source.loan(query, control)?;
-        Ok(source)
-    }
     pub(crate) fn try_new_expressions(
         query: &ast::Query,
         constants: SqlExpressionConstants,
@@ -270,114 +273,36 @@ impl MaterializedValues {
         query: &'a ast::Query,
         control: &dyn PureCompileControl,
     ) -> Result<MaterializedSourceBorrow<'a>, SqlCompileError> {
-        match self {
-            Self::Complete { site, rows } => Self::complete_loan(query, *site, rows, control),
-            Self::Expressions { constants } => {
-                let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-                work.step()?;
-                if constants.is_empty() {
-                    return Err(invalid("constant source has no authored expressions"));
-                }
-                let mut expressions = std::collections::BTreeMap::new();
-                for constant in constants.iter() {
-                    let expr = constant.resolve(query, &mut work)?;
-                    novarocks_type_contract::visit_value_type_observed(
-                        constant.value().value_type().value_type(),
-                        |_| work.step().map_err(SqlCompileError::from),
-                    )?;
-                    if expressions
-                        .insert(std::ptr::from_ref(expr) as usize, constant.value().clone())
-                        .is_some()
-                    {
-                        return Err(invalid(
-                            "constant source repeats its owned expression occurrence",
-                        ));
-                    }
-                }
-                work.finish()?;
-                Ok(MaterializedSourceBorrow {
-                    complete: None,
-                    expressions,
-                })
-            }
-        }
-    }
-    fn complete_loan<'a>(
-        query: &'a ast::Query,
-        site: SqlMaterializedValuesSite,
-        rows: &'a [Box<[novarocks_functions::ConstantValue]>],
-        control: &dyn PureCompileControl,
-    ) -> Result<MaterializedSourceBorrow<'a>, SqlCompileError> {
+        let Self::Expressions { constants } = self;
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         work.step()?;
-        let (values, declared_width) = site.resolve(query)?;
-        work.flush()?;
-        // The original AST visitor is one opaque, read-only operation. Control
-        // is observed before and after; no cooperative visitor claim is made.
-        let mut count = ValuesPresence::default();
-        count.visit_query(query);
-        work.flush()?;
-        if !count.found || count.repeated {
-            return Err(invalid(
-                "materialized query must own exactly one VALUES source",
-            ));
+        if constants.is_empty() {
+            return Err(invalid("constant source has no authored expressions"));
         }
-        if !values.rows.is_empty() || rows.is_empty() {
-            return Err(invalid(
-                "materialized VALUES requires an empty owned syntax relation and checked rows",
-            ));
-        }
-        let width = rows[0].len();
-        if width == 0 || declared_width != width {
-            return Err(invalid("materialized VALUES relation has no columns"));
-        }
-        for row in rows.iter() {
-            work.step()?;
-            if row.len() != width {
-                return Err(invalid("materialized VALUES rows have inconsistent width"));
-            }
-            for value in row.iter() {
-                novarocks_type_contract::visit_value_type_observed(
-                    value.value_type().value_type(),
-                    |_| work.step().map_err(SqlCompileError::from),
-                )?;
+        let mut expressions = std::collections::BTreeMap::new();
+        for constant in constants.iter() {
+            let expr = constant.resolve(query, &mut work)?;
+            novarocks_type_contract::visit_value_type_observed(
+                constant.value().value_type().value_type(),
+                |_| work.step().map_err(SqlCompileError::from),
+            )?;
+            if expressions
+                .insert(std::ptr::from_ref(expr) as usize, constant.value().clone())
+                .is_some()
+            {
+                return Err(invalid(
+                    "constant source repeats its owned expression occurrence",
+                ));
             }
         }
         work.finish()?;
         Ok(MaterializedSourceBorrow {
-            complete: Some((values, rows)),
-            expressions: std::collections::BTreeMap::new(),
+            _query: std::marker::PhantomData,
+            expressions,
+            write_assignments: std::collections::BTreeMap::new(),
         })
     }
 }
-#[derive(Default)]
-struct ValuesPresence {
-    found: bool,
-    repeated: bool,
-}
-impl ValuesPresence {
-    fn body(&mut self, body: &ast::SetExpr) {
-        match body {
-            ast::SetExpr::Values(_) => {
-                self.repeated |= self.found;
-                self.found = true;
-            }
-            ast::SetExpr::SetOperation(op) => {
-                self.body(&op.left);
-                self.body(&op.right);
-            }
-            // Nested Query is visited by the same original visitor exactly once.
-            _ => {}
-        }
-    }
-}
-impl Visit for ValuesPresence {
-    fn visit_query(&mut self, query: &ast::Query) {
-        self.body(&query.body);
-        ast::walk_query(self, query);
-    }
-}
-
 #[cfg(test)]
 #[path = "materialized_values_tests.rs"]
 mod tests;

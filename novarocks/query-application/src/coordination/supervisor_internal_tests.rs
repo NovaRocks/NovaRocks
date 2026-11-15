@@ -56,6 +56,9 @@ mod internal_supervisor_tests {
         final_ack_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         final_ack_entered: AtomicBool,
         native_failure: std::sync::Mutex<Option<ExecutionFailureInput>>,
+        native_activation:
+            std::sync::Mutex<Option<novarocks_coordination_contract::AttemptActivationIdentity>>,
+        convergence_failures: std::sync::Mutex<Vec<AcceptedFailureObservation>>,
         replacement_failure: std::sync::Mutex<Option<ExecutionFailureInput>>,
         preparations: AtomicU64,
         convergence_ready: std::sync::Mutex<Option<Option<ComputationReadyToken>>>,
@@ -63,6 +66,11 @@ mod internal_supervisor_tests {
         release_run: tokio::sync::Notify,
         release_cleanup: tokio::sync::Notify,
     }
+
+    type AcceptedFailureObservation = (
+        Option<ExecutionFailureInput>,
+        Option<novarocks_coordination_contract::AttemptActivationIdentity>,
+    );
 
     type ReadyObservation =
         watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>;
@@ -403,7 +411,9 @@ mod internal_supervisor_tests {
                     std::future::pending::<NativeAttemptTerminal>().await
                 });
             }
+            let activation = drive.identity();
             Box::pin(async move {
+                *self.signals.native_activation.lock().unwrap() = Some(activation);
                 let mut admissions = SuccessfulCompletionActiveOwner {
                     participations: self.participations.clone(),
                 };
@@ -444,6 +454,10 @@ mod internal_supervisor_tests {
             request: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async move {
+                self.signals.convergence_failures.lock().unwrap().push((
+                    request.accepted_failure().cloned(),
+                    request.accepted_failure_activation(),
+                ));
                 {
                     let mut original = self.signals.convergence_ready.lock().unwrap();
                     let ready = request.computation_ready();
@@ -815,7 +829,7 @@ mod internal_supervisor_tests {
 
     #[tokio::test]
     async fn internal_replacement_preparation_failure_keeps_its_actual_source() {
-        let mut control = {
+        let (mut control, assertions) = {
             use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason};
 
             let (control, root) = governance().await;
@@ -873,42 +887,80 @@ mod internal_supervisor_tests {
                 FrontendProcessId::new_v7(),
                 supervisor_config(),
             );
+            // Collect observations without asserting while original Native
+            // cleanup is held. Release and join every original owner first.
             let result =
                 tokio::time::timeout(Duration::from_secs(2), client.start(request, root.owner))
-                    .await
-                    .expect("replacement failure must be delivered while prior cleanup is held");
-            let error = match result {
-                Err(error) => error,
-                Ok(_) => panic!("failed replacement preparation cannot produce internal Ready"),
+                    .await;
+            let reply_error = match result {
+                Ok(Err(error)) => Some(error),
+                Ok(Ok(handle)) => {
+                    drop(handle);
+                    None
+                }
+                Err(_) => None,
             };
-            assert_eq!(signals.preparations.load(Ordering::SeqCst), 2);
-            assert_eq!(error.execution_failure(), Some(&replacement));
-            assert_ne!(error.execution_failure(), Some(&original));
-            assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
-            assert!(!signals.active_dropped.load(Ordering::SeqCst));
-
+            let preparations = signals.preparations.load(Ordering::SeqCst);
+            let cleanup_was_held = !signals.cleanup_completed.load(Ordering::SeqCst);
+            let active_was_retained = !signals.active_dropped.load(Ordering::SeqCst);
             signals.release_cleanup.notify_one();
             root.business.release();
             let shutdown = supervisor
                 .shutdown_until(Instant::now() + Duration::from_secs(5))
                 .await;
-            let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) = shutdown
-            else {
-                panic!("replacement preparation failure must retain its existing shutdown receipt");
-            };
-            assert_eq!(error.execution_failure(), Some(&replacement));
             acknowledge_all_control(&control);
-            tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
-                .await
-                .unwrap();
-            assert!(signals.cleanup_completed.load(Ordering::SeqCst));
-            assert!(signals.active_dropped.load(Ordering::SeqCst));
-            assert!(consumer.accepted.lock().unwrap().is_none());
+            let settled = tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await;
 
-            control
+            let assertions = move || {
+                assert!(
+                    settled.is_ok(),
+                    "the original scope must settle before assertions"
+                );
+                let reply_error = reply_error.expect(
+                    "replacement preparation must return its original error while cleanup is held",
+                );
+                assert_eq!(preparations, 2);
+                assert_eq!(reply_error.execution_failure(), Some(&replacement));
+                assert_ne!(reply_error.execution_failure(), Some(&original));
+                assert!(cleanup_was_held);
+                assert!(active_was_retained);
+                let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) =
+                    shutdown
+                else {
+                    panic!(
+                        "replacement preparation failure must retain its existing shutdown receipt"
+                    );
+                };
+                assert_eq!(error.execution_failure(), Some(&replacement));
+                assert!(signals.cleanup_completed.load(Ordering::SeqCst));
+                assert!(signals.active_dropped.load(Ordering::SeqCst));
+                assert!(consumer.accepted.lock().unwrap().is_none());
+                let activation = signals
+                    .native_activation
+                    .lock()
+                    .unwrap()
+                    .expect("the actual predecessor Native run must enter");
+                let observations = signals.convergence_failures.lock().unwrap();
+                assert!(
+                    !observations.is_empty(),
+                    "original convergence must observe the request"
+                );
+                for (failure, observed_activation) in observations.iter() {
+                    assert_eq!(
+                        failure.as_ref(),
+                        Some(&original),
+                        "later logical preparation failure must not replace the predecessor attempt fact"
+                    );
+                    assert_ne!(failure.as_ref(), Some(&replacement));
+                    assert_eq!(*observed_activation, Some(activation));
+                }
+                drop(observations);
+            };
+            (control, assertions)
         };
         acknowledge_all_control(&control);
         control.finish().await;
+        assertions();
     }
 
     #[tokio::test]

@@ -33,9 +33,9 @@ use super::{
     ActorCommand, ActorReply, AttemptLedgers, DeferredInternalDelivery, DeliveryObligation,
     EstablishIssueError, InFlightResult, LogicalConclusion, LogicalExecutionActorError,
     LogicalExecutionState, PendingResult, PermitLifetime, ResultRuntime, ResultSlot,
-    ResultTransport, conclude_result_failure, identity_of, logical_owner_failure, request,
-    result_actor_failure, result_receipt_failure, revoke_all_establish_authority,
-    root_success_facts_complete, verify_running_activation,
+    ResultTransport, conclude_result_failure, identity_of, logical_owner_failure,
+    remember_accepted_attempt_failure, request, result_actor_failure, result_receipt_failure,
+    revoke_all_establish_authority, root_success_facts_complete, verify_running_activation,
 };
 
 /// Concrete QA mailbox capability. Application consumers cannot construct a
@@ -262,6 +262,7 @@ pub(super) fn propose(
         revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
+            attempts,
             runtime,
             "internal proof has no accepted End receipt",
             result_actor_failure(LogicalExecutionActorError::ResultProtocolViolation),
@@ -330,6 +331,7 @@ pub(super) fn try_accept(
         revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
+            attempts,
             runtime,
             "internal proof source exited before its cut",
             logical_owner_failure(
@@ -350,6 +352,7 @@ pub(super) fn try_accept(
             revoke_all_establish_authority(attempts);
             conclude_result_failure(
                 state,
+                attempts,
                 runtime,
                 "internal proof has invalid Establish settlement",
                 result_actor_failure(LogicalExecutionActorError::Establish(error)),
@@ -368,6 +371,7 @@ pub(super) fn try_accept(
     if let Err(error) = state.accept_computation_ready(&capability) {
         conclude_result_failure(
             state,
+            attempts,
             runtime,
             "internal computation cut could not be accepted",
             result_actor_failure(error.into()),
@@ -411,6 +415,7 @@ pub(super) fn fail(
         revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
+            attempts,
             runtime,
             "the internal domain rejected its computation",
             error,
@@ -507,6 +512,7 @@ pub(super) fn source_exited(
         revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
+            attempts,
             runtime,
             "the internal consumer exited before readiness",
             error,
@@ -747,7 +753,9 @@ pub(super) fn enqueue_end(
         InternalEndDelivery::new(Arc::clone(&pending.source), pending.end);
     if let Err(error) = runtime.transport.enqueue_internal_end(slot, delivery) {
         revoke_all_establish_authority(attempts);
-        let _ = state.fail_result_delivery(permit);
+        if state.fail_result_delivery(permit).is_ok() {
+            remember_accepted_attempt_failure(attempts, pending.source.activation, &error);
+        }
         runtime.accepted_error = Some(error);
         let _ = pending
             .reply
@@ -792,7 +800,9 @@ pub(super) fn settle_end(
     let failure = result_receipt_failure(disposition);
     if let Some(error) = failure {
         revoke_all_establish_authority(attempts);
-        let _ = state.fail_result_delivery(end.permit);
+        if state.fail_result_delivery(end.permit).is_ok() {
+            remember_accepted_attempt_failure(attempts, end.source.activation, &error);
+        }
         runtime.accepted_error = Some(error.clone());
         let _ = end.checked.send(Err(error));
         let _ = end
@@ -805,6 +815,7 @@ pub(super) fn settle_end(
         revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
+            attempts,
             runtime,
             "internal End consumption could not be completed",
             error.clone(),
@@ -836,6 +847,7 @@ pub(super) fn settle_end(
         revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
+            attempts,
             runtime,
             "internal End acknowledgement was abandoned",
             logical_owner_failure(

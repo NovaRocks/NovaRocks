@@ -47,7 +47,6 @@ use parquet::basic::Compression;
 
 use crate::commit::CommitOpKind;
 use crate::commit::report::IcebergColumnStats;
-use crate::commit::write_stack::copy_on_write::IcebergCowBranchInput;
 use crate::delete_file::IcebergFileFormat;
 use crate::write_descriptor::IcebergPartitionDescriptor;
 
@@ -131,7 +130,7 @@ impl IcebergWriteBranch {
 ///
 /// This enum is provider-private on purpose: the neutral write stack never
 /// learns that Iceberg distinguishes a dynamic partition overwrite from a
-/// static one, or a copy-on-write mutation from a merge-on-read one.
+/// static one, or a row mutation from a distributed rewrite.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum IcebergWriteFlavor {
     /// `INSERT INTO`.
@@ -147,8 +146,6 @@ pub enum IcebergWriteFlavor {
     /// `ALTER TABLE ... ADD EQUALITY DELETE`: append Parquet equality-delete
     /// files matched on column values.
     EqualityDelete,
-    /// Copy-on-write row mutation rewriting whole data files.
-    RowMutationCopyOnWrite,
     /// `CREATE TABLE AS SELECT` publishing into a staged table.
     StagedCreate,
     /// Materialized-view refresh publication.
@@ -179,7 +176,6 @@ impl IcebergWriteFlavor {
                 CatalogOperation::RowMutation
             }
             Self::EqualityDelete => CatalogOperation::RowDelta,
-            Self::RowMutationCopyOnWrite => CatalogOperation::CopyOnWrite,
             Self::StagedCreate => CatalogOperation::CreateTable(
                 crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
             ),
@@ -209,7 +205,6 @@ impl IcebergWriteFlavor {
             // delta is file-based only when the artifacts are Puffin, and an
             // equality delete's are not.
             Self::EqualityDelete => CommitOpKind::RowDelta,
-            Self::RowMutationCopyOnWrite => CommitOpKind::CowUpdate,
             // Both rewrites commit as one selected replacement of a frozen
             // input set; what differs is which half of that set they replace,
             // and the commit reads that off the session's flavor.
@@ -221,7 +216,6 @@ impl IcebergWriteFlavor {
     }
 
     /// These row deltas can change table state only through produced artifacts.
-    /// COW is excluded: removing frozen input files may legitimately produce none.
     pub(crate) const fn is_artifact_row_delta(self) -> bool {
         matches!(
             self,
@@ -266,7 +260,6 @@ impl IcebergWriteFlavor {
             Self::Append
             | Self::Overwrite
             | Self::PartitionOverwrite
-            | Self::RowMutationCopyOnWrite
             | Self::StagedCreate
             | Self::ManagedPublication
             | Self::DistributedRewrite
@@ -301,17 +294,13 @@ impl IcebergWriteFlavor {
     /// Whether one sealed session may seal the same physical branch more than
     /// once.
     ///
-    /// Only the two distributed rewrites and a copy-on-write mutation may.
-    /// Their logical targets are all one branch kind — one per frozen rewrite
-    /// group, one per rewritten data file — and the ordinal, not the branch, is
-    /// what tells them apart. Position-delete rewrite groups each select a
-    /// distinct data file.
+    /// Only the two distributed rewrites may. Their targets are one per frozen
+    /// rewrite group, distinguished by ordinal. Position-delete rewrite groups
+    /// each select a distinct data file.
     pub const fn seals_one_target_per_branch(self) -> bool {
         !matches!(
             self,
-            Self::DistributedRewrite
-                | Self::DistributedRewritePositionDeletes
-                | Self::RowMutationCopyOnWrite
+            Self::DistributedRewrite | Self::DistributedRewritePositionDeletes
         )
     }
 
@@ -528,7 +517,6 @@ impl IcebergWriteFlavor {
             Self::PartitionOverwrite => "partition-overwrite",
             Self::RowMutationPositionDelete => "row-mutation-position-delete",
             Self::RowMutationDeletionVector => "row-mutation-deletion-vector",
-            Self::RowMutationCopyOnWrite => "row-mutation-copy-on-write",
             Self::StagedCreate => "staged-create",
             Self::ManagedPublication => "managed-publication",
             Self::DistributedRewrite => "distributed-rewrite",
@@ -552,7 +540,6 @@ impl IcebergWriteFlavor {
             // the same neutral intent every other delete-staging write does.
             Self::RowMutationPositionDelete
             | Self::RowMutationDeletionVector
-            | Self::RowMutationCopyOnWrite
             | Self::DistributedRewritePositionDeletes
             | Self::EqualityDelete => ConnectorWriteIntent::RowDelta,
         }
@@ -834,18 +821,18 @@ impl IcebergWriterOutput {
     }
 }
 
-/// Complete provider schema JSON; its allocation retains the original COW holder.
+/// Complete provider schema JSON; its allocation retains the original scoped holder.
 #[derive(Clone, Debug)]
 pub(crate) enum IcebergDataSchema {
     Owned(String),
-    CowShared(Arc<IcebergCowTargetSchemaBacking>),
+    Shared(Arc<IcebergSharedTargetSchemaBacking>),
 }
 #[derive(Debug)]
-pub(crate) struct IcebergCowTargetSchemaBacking {
+pub(crate) struct IcebergSharedTargetSchemaBacking {
     schema: String,
     _original: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
 }
-impl IcebergCowTargetSchemaBacking {
+impl IcebergSharedTargetSchemaBacking {
     pub(crate) fn from_checked(
         schema: String,
         original: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
@@ -860,21 +847,105 @@ impl IcebergDataSchema {
     pub(crate) fn schema(&self) -> &str {
         match self {
             Self::Owned(schema) => schema,
-            Self::CowShared(owner) => &owner.schema,
+            Self::Shared(owner) => &owner.schema,
         }
     }
+}
+
+/// Canonical private identity of the actual DATA input. Flavor-only delete
+/// identities are excluded; reserved row-lineage data fields remain included.
+/// This is not an identity of the independent raw Field attribute namespace.
+/// No alternate semantic table or inferred nominal domain is constructed.
+pub(crate) fn data_write_input_identity_observed<E>(
+    input: &novarocks_connector_contract::ConnectorWriteInputShape,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<[u8; 32], E> {
+    use novarocks_connector_contract::{ConnectorWriteFieldBinding, ConnectorWriteInputShape};
+    use sha2::{Digest, Sha256};
+    let (data, identities): (&[ConnectorWriteFieldBinding], &[ConnectorWriteFieldBinding]) =
+        match input {
+            ConnectorWriteInputShape::Data { fields } => (fields, &[]),
+            ConnectorWriteInputShape::RowLineage {
+                data_fields,
+                row_identity_fields,
+            } => (data_fields, row_identity_fields),
+            ConnectorWriteInputShape::PositionDelete {
+                partition_source_fields,
+                ..
+            }
+            | ConnectorWriteInputShape::DeletionVector {
+                partition_source_fields,
+                ..
+            } => (partition_source_fields, &[]),
+            ConnectorWriteInputShape::EqualityDelete { .. } => (&[], &[]),
+        };
+    let is_lineage = |field: &&ConnectorWriteFieldBinding| {
+        field
+            .field()
+            .name()
+            .eq_ignore_ascii_case(crate::row_lineage_synth::ICEBERG_ROW_ID_COL)
+            || field
+                .field()
+                .name()
+                .eq_ignore_ascii_case(crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL)
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.data-write-input-identity.v1\0");
+    let mut count = data.len();
+    for field in identities {
+        observe()?;
+        if is_lineage(&field) {
+            count += 1;
+        }
+    }
+    hasher.update((count as u64).to_be_bytes());
+    for (ordinal, field) in data
+        .iter()
+        .chain(identities.iter().filter(is_lineage))
+        .enumerate()
+    {
+        observe()?;
+        hasher.update((ordinal as u64).to_be_bytes());
+        hasher.update(field.token().to_bytes());
+        let name = field.field().name().as_bytes();
+        hasher.update((name.len() as u64).to_be_bytes());
+        for bytes in name.chunks(1024) {
+            observe()?;
+            hasher.update(bytes);
+        }
+        novarocks_connector_contract::write_input_projection_identity_observed(
+            field.execution_type(),
+            field.storage_type(),
+            |bytes| {
+                for chunk in bytes.chunks(1024) {
+                    observe()?;
+                    hasher.update(chunk);
+                }
+                Ok::<(), E>(())
+            },
+        )?;
+    }
+    observe()?;
+    Ok(hasher.finalize().into())
+}
+
+pub(crate) fn data_write_input_identity(
+    input: &novarocks_connector_contract::ConnectorWriteInputShape,
+) -> Result<[u8; 32], ConnectorError> {
+    data_write_input_identity_observed(input, || Ok(()))
 }
 
 /// Complete frozen target schema and partition facts for the data branch.
 #[derive(Clone, Debug)]
 pub struct IcebergDataBranchRecipe {
     target_schema: Option<IcebergDataSchema>,
+    write_input_identity: Option<[u8; 32]>,
     partition_source_column_names: Vec<String>,
     partition_column_names: Vec<String>,
     transform_exprs: Vec<String>,
     /// Descriptive only. Input lineage columns select the reserved definitions.
     row_lineage: bool,
-    _cow_original: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
+    _source_retention: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
 }
 impl IcebergDataBranchRecipe {
     pub fn try_new(
@@ -892,15 +963,15 @@ impl IcebergDataBranchRecipe {
             row_lineage,
         )
     }
-    pub(crate) fn try_new_cow(
-        target_schema: Arc<IcebergCowTargetSchemaBacking>,
+    pub(crate) fn try_new_shared(
+        target_schema: Arc<IcebergSharedTargetSchemaBacking>,
         partition_source_column_names: Vec<String>,
         partition_column_names: Vec<String>,
         transform_exprs: Vec<String>,
         row_lineage: bool,
     ) -> Result<Self, ConnectorError> {
         Self::try_new_schema_backing(
-            Some(IcebergDataSchema::CowShared(target_schema)),
+            Some(IcebergDataSchema::Shared(target_schema)),
             partition_source_column_names,
             partition_column_names,
             transform_exprs,
@@ -931,17 +1002,27 @@ impl IcebergDataBranchRecipe {
             ));
         }
         let original = match &target_schema {
-            Some(IcebergDataSchema::CowShared(owner)) => Some(owner._original.clone()),
+            Some(IcebergDataSchema::Shared(owner)) => Some(owner._original.clone()),
             _ => None,
         };
         Ok(Self {
+            write_input_identity: None,
             target_schema,
             partition_source_column_names,
             partition_column_names,
             transform_exprs,
             row_lineage,
-            _cow_original: original,
+            _source_retention: original,
         })
+    }
+    /// The private seal covers ordered field tokens/names and complete W/T.
+    /// Raw Field attributes retain their independent original-schema authors.
+    pub fn with_write_input_identity(mut self, identity: [u8; 32]) -> Self {
+        self.write_input_identity = Some(identity);
+        self
+    }
+    pub fn write_input_identity(&self) -> Option<&[u8; 32]> {
+        self.write_input_identity.as_ref()
     }
     pub fn target_schema_json(&self) -> Option<&str> {
         self.target_schema.as_ref().map(IcebergDataSchema::schema)
@@ -984,6 +1065,11 @@ impl IcebergWriterHandle {
     ) -> Result<Self, ConnectorError> {
         if output.file_format() != IcebergFileFormat::Parquet {
             return Err(invalid("Iceberg data writer must produce Parquet"));
+        }
+        if data.write_input_identity().is_none() {
+            return Err(invalid(
+                "Iceberg data writer requires its complete write input identity",
+            ));
         }
         Ok(Self {
             branch: IcebergWriteBranch::Data,
@@ -2266,15 +2352,6 @@ pub struct IcebergWriteCommitSession {
     /// order. Present exactly on a distributed rewrite, which is the one flavor
     /// whose commit replaces files it named before any writer ran.
     rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
-    /// What every sealed copy-on-write branch replaces, in ordinal order.
-    /// Present exactly on a copy-on-write mutation.
-    ///
-    /// It stays on the session because the single external commit needs it and
-    /// nothing on the data plane carries it: a writer produces replacement
-    /// rows, and which old file those rows supersede — together with the row
-    /// ids inside it that were matched — is a planning fact the session froze
-    /// before any writer ran.
-    copy_on_write: Vec<IcebergCowBranchInput>,
     /// The partition replacement this session's single external commit applies
     /// ahead of its snapshot. Present only on a managed publication that was
     /// admitted with one.
@@ -2339,9 +2416,6 @@ pub struct IcebergSessionFacts {
     /// Present exactly on the distributed-rewrite flavor, one entry per sealed
     /// branch and in the same order.
     pub rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
-    /// Present exactly on the copy-on-write flavor, one entry per sealed branch
-    /// and in the same order.
-    pub copy_on_write: Vec<IcebergCowBranchInput>,
     /// Present only on a managed publication that replaces the target's default
     /// partitioning in the same external commit that publishes its rows.
     pub(crate) repartition:
@@ -2361,7 +2435,6 @@ impl IcebergSessionFacts {
             document_publication: None,
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
-            copy_on_write: Vec::new(),
             repartition: None,
         }
     }
@@ -2470,7 +2543,6 @@ impl IcebergWriteCommitSession {
             document_publication,
             staged_metadata,
             rewrite_inputs,
-            copy_on_write,
             repartition,
         } = facts;
         if document_publication.is_some() && flavor != IcebergWriteFlavor::ManagedPublication {
@@ -2507,25 +2579,6 @@ impl IcebergWriteCommitSession {
             return Err(invalid(format!(
                 "Iceberg {} write session cannot carry an atomic partition replacement",
                 flavor.as_str()
-            )));
-        }
-        // A copy-on-write session's branch count follows the files its match
-        // selection touched, so both directions are errors: a copy-on-write
-        // session with no frozen branch would have nothing to replace, and any
-        // other flavor carrying one would retire a live file no writer
-        // superseded.
-        if copy_on_write.is_empty() == (flavor == IcebergWriteFlavor::RowMutationCopyOnWrite) {
-            return Err(invalid(format!(
-                "Iceberg {} write session must carry a frozen copy-on-write branch per target exactly when it rewrites matched files",
-                flavor.as_str()
-            )));
-        }
-        if !copy_on_write.is_empty() && copy_on_write.len() != targets.len() {
-            return Err(invalid(format!(
-                "Iceberg {} write session froze {} copy-on-write branches for {} sealed targets",
-                flavor.as_str(),
-                copy_on_write.len(),
-                targets.len()
             )));
         }
         if !rewrite_inputs.is_empty() && rewrite_inputs.len() != targets.len() {
@@ -2598,7 +2651,6 @@ impl IcebergWriteCommitSession {
             staged_metadata,
             source_metadata: None,
             rewrite_inputs,
-            copy_on_write,
             repartition,
             statistics_expectations: BTreeMap::new(),
             document_records: std::sync::Mutex::new(None),
@@ -2782,15 +2834,6 @@ impl IcebergWriteCommitSession {
         &self.targets
     }
 
-    /// What every sealed copy-on-write branch replaces, in ordinal order.
-    ///
-    /// Empty on every other flavor. The commit joins entry `i` with the
-    /// fragments the backends staged for write target `i`, which is the only
-    /// key involved: no cohort, operation, or attempt identity takes part.
-    pub(crate) fn copy_on_write(&self) -> &[IcebergCowBranchInput] {
-        &self.copy_on_write
-    }
-
     /// The single external commit op this session performs.
     ///
     /// A managed publication decides it from its technique — a full refresh
@@ -2829,7 +2872,7 @@ impl IcebergWriteCommitSession {
     ///
     /// Artifact-only row deltas with zero logical actions, distributed rewrites
     /// with no input, and managed publications explicitly declaring abort can
-    /// finish without publishing. COW/overwrite may remove frozen old data even
+    /// finish without publishing. Overwrite may remove frozen old data even
     /// when they produce no artifact; zero-row append still publishes. A managed
     /// publication's own declared disposition remains authoritative.
     pub fn empty_write_decision(&self) -> IcebergEmptyWriteDecision {
@@ -3291,7 +3334,6 @@ mod tests {
             IcebergWriteFlavor::PartitionOverwrite,
             IcebergWriteFlavor::RowMutationPositionDelete,
             IcebergWriteFlavor::RowMutationDeletionVector,
-            IcebergWriteFlavor::RowMutationCopyOnWrite,
             IcebergWriteFlavor::StagedCreate,
             IcebergWriteFlavor::ManagedPublication,
             IcebergWriteFlavor::DistributedRewrite,

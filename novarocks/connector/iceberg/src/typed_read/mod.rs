@@ -35,9 +35,7 @@ pub mod change_window;
 pub mod change_window_page_source;
 pub mod codec;
 pub mod column_handle;
-pub mod cow_source_proof;
 pub mod delete_manager;
-pub mod frozen_source;
 pub mod merge;
 pub mod page_source;
 pub mod page_source_provider;
@@ -78,8 +76,7 @@ pub use column_handle::{
 };
 pub use delete_manager::{DeleteEvaluationMode, DeleteManager, SplitDeleteFilter};
 pub use merge::{
-    IcebergInsertTableHandle, IcebergInsertTableHandleParams, IcebergMergeSourcePlan,
-    IcebergMergeSourcePlanParams, IcebergMergeTableHandle,
+    IcebergInsertTableHandle, IcebergInsertTableHandleParams, IcebergMergeTableHandle,
 };
 pub use page_source::{
     DynamicFilterCheckpoint, DynamicFilterObservation, DynamicFilterVerdict,

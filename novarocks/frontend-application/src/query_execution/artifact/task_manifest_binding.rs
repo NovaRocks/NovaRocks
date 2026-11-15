@@ -504,8 +504,36 @@ impl TaskManifestBinding {
             std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
         >,
     ) -> Result<Self, DistributedQueryError> {
-        let (template, scheduled, topology) =
-            protocol_fixture_inputs(execution, frontend, schedule, edges, processes, fragments)?;
+        let (template, scheduled, topology) = protocol_fixture_inputs(
+            execution, frontend, schedule, edges, processes, fragments, None,
+        )?;
+        Self::bind(template, &scheduled, topology)
+    }
+
+    /// Bind the same finite protocol grammar to the caller's actual test peer
+    /// descriptors. This creates no Root, request ticket or runtime authority.
+    #[cfg(test)]
+    pub(crate) fn protocol_fixture_with_topology_for_test(
+        execution: QueryExecutionId,
+        frontend: novarocks_types::FrontendProcessId,
+        schedule: &crate::query_execution::schedule::SchedulingPlan,
+        edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+        processes: &BTreeMap<usize, BackendProcessId>,
+        fragments: BTreeMap<
+            FragmentId,
+            std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+        >,
+        descriptors: &BTreeMap<usize, novarocks_execution_contract::BackendProcessDescriptor>,
+    ) -> Result<Self, DistributedQueryError> {
+        let (template, scheduled, topology) = protocol_fixture_inputs(
+            execution,
+            frontend,
+            schedule,
+            edges,
+            processes,
+            fragments,
+            Some(descriptors),
+        )?;
         Self::bind(template, &scheduled, topology)
     }
 
@@ -523,8 +551,9 @@ impl TaskManifestBinding {
         >,
         missing: usize,
     ) -> Result<Self, DistributedQueryError> {
-        let (template, scheduled, topology) =
-            protocol_fixture_inputs(execution, frontend, schedule, edges, processes, fragments)?;
+        let (template, scheduled, topology) = protocol_fixture_inputs(
+            execution, frontend, schedule, edges, processes, fragments, None,
+        )?;
         let (revision, mut backends, eligible) = topology.into_parts();
         let process = processes
             .get(&missing)
@@ -1650,6 +1679,7 @@ fn protocol_fixture_inputs(
         FragmentId,
         std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
     >,
+    descriptors: Option<&BTreeMap<usize, novarocks_execution_contract::BackendProcessDescriptor>>,
 ) -> Result<
     (
         RequestBoundNativeTemplate,
@@ -1666,6 +1696,18 @@ fn protocol_fixture_inputs(
         SchedulingStreamKind,
     };
     use std::sync::Arc;
+    if let Some(descriptors) = descriptors
+        && (descriptors.len() != processes.len()
+            || processes.iter().any(|(index, process)| {
+                descriptors
+                    .get(index)
+                    .is_none_or(|descriptor| descriptor.process_id() != *process)
+            }))
+    {
+        return Err(contract_error(
+            "protocol fixture topology differs from its exact backend process map",
+        ));
+    }
     let order = schedule.by_fragment.keys().copied().collect::<Vec<_>>();
     let scheduling = FragmentSchedulingFacts {
         handoff_id: 9,
@@ -1782,30 +1824,46 @@ fn protocol_fixture_inputs(
     let targets = processes
         .iter()
         .map(|(&index, &process)| {
-            let endpoint = placed_endpoints.get(&index).cloned().unwrap_or_else(|| {
-                RuntimeEndpoint::new("127.0.0.1", 9000 + index as i32)
-                    .expect("declared unused protocol endpoint")
-            });
-            let control_endpoint = RuntimeEndpoint::new("127.0.0.1", 11000 + index as i32)
-                .expect("declared protocol control endpoint");
-            let descriptor = novarocks_execution_contract::BackendProcessDescriptor::try_new(
-                process,
-                endpoint,
-                control_endpoint.clone(),
-                "test-deployment",
-                "test-build",
-                NativeCompatibilityId::new([0x71; 32]),
-                4096,
-            )
-            .map_err(|error| contract_error(error.to_string()))?;
-            let descriptor = descriptor
-                .with_bounded_root_support(
-                    novarocks_execution_contract::native_result_support::BoundedRootSupport::new(
-                        control_endpoint,
-                        novarocks_result_contract::RootProfileId::V1,
-                    ),
+            let descriptor = if let Some(descriptors) = descriptors {
+                let descriptor = descriptors.get(&index).ok_or_else(|| {
+                    contract_error("protocol fixture omitted its exact backend descriptor")
+                })?;
+                if placed_endpoints.get(&index).is_some_and(|endpoint| {
+                    descriptor.endpoint() != endpoint
+                }) {
+                    return Err(contract_error(
+                        "protocol fixture placement differs from its actual backend endpoint",
+                    ));
+                }
+                // Preserve control endpoint, compatibility, bounded-root support
+                // and all other actual peer descriptor facts without rebuilding.
+                descriptor.clone()
+            } else {
+                let endpoint = placed_endpoints.get(&index).cloned().unwrap_or_else(|| {
+                    RuntimeEndpoint::new("127.0.0.1", 9000 + index as i32)
+                        .expect("declared unused protocol endpoint")
+                });
+                let control_endpoint = RuntimeEndpoint::new("127.0.0.1", 11000 + index as i32)
+                    .expect("declared protocol control endpoint");
+                let descriptor = novarocks_execution_contract::BackendProcessDescriptor::try_new(
+                    process,
+                    endpoint,
+                    control_endpoint.clone(),
+                    "test-deployment",
+                    "test-build",
+                    NativeCompatibilityId::new([0x71; 32]),
+                    4096,
                 )
                 .map_err(|error| contract_error(error.to_string()))?;
+                descriptor
+                    .with_bounded_root_support(
+                        novarocks_execution_contract::native_result_support::BoundedRootSupport::new(
+                            control_endpoint,
+                            novarocks_result_contract::RootProfileId::V1,
+                        ),
+                    )
+                    .map_err(|error| contract_error(error.to_string()))?
+            };
             Ok(LiveBackendTarget::new(
                 index,
                 descriptor,

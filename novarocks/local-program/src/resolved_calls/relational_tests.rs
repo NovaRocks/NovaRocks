@@ -1476,6 +1476,7 @@ pub(crate) fn writer_program(
                 target,
                 expected_layout: data.clone(),
                 projection: StaticWriterProjection {
+                    storage_types: vec![None],
                     arena: arena.clone(),
                     expressions: vec![ProgramExprId::new(0)],
                     layout: data,

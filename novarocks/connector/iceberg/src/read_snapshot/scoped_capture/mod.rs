@@ -1,0 +1,114 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Prospective request-layout receipts for the actual scoped capture pipeline.
+
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorOriginalResultScope, ConnectorScopedBeginCause,
+};
+#[derive(Debug)]
+pub(crate) enum ReadFailure {
+    Semantic(String),
+    Original(ConnectorScopedBeginCause),
+}
+impl From<String> for ReadFailure {
+    fn from(error: String) -> Self {
+        Self::Semantic(error)
+    }
+}
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Semantic(message) => f.write_str(message),
+            Self::Original(_) => f.write_str("original scoped capture check failed"),
+        }
+    }
+}
+impl ReadFailure {
+    /// Preserve provider classification and original source custody through
+    /// ordinary scan preparation without formatting either domain cause.
+    pub(crate) fn into_connector(self) -> ConnectorError {
+        match self {
+            Self::Original(ConnectorScopedBeginCause::Provider(error)) => error,
+            Self::Original(ConnectorScopedBeginCause::OriginalResult(error)) => {
+                ConnectorError::from_domain_static(
+                    ConnectorErrorKind::Internal,
+                    error,
+                    "Iceberg original result check failed",
+                )
+            }
+            Self::Semantic(message) => {
+                ConnectorError::new(ConnectorErrorKind::Unavailable, message)
+                    .with_retryable_before_progress()
+            }
+        }
+    }
+
+    pub(crate) fn into_cause(self) -> ConnectorScopedBeginCause {
+        match self {
+            Self::Original(cause) => cause,
+            Self::Semantic(message) => {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, message).into()
+            }
+        }
+    }
+}
+
+/// Borrows the original operation; identity does not grant object-graph bytes.
+pub(crate) struct CaptureScope<'a> {
+    pub(crate) scope: &'a ConnectorOriginalResultScope,
+}
+impl<'a> CaptureScope<'a> {
+    pub(crate) fn new(scope: &'a ConnectorOriginalResultScope) -> Result<Self, ReadFailure> {
+        let value = Self { scope };
+        value.active()?;
+        Ok(value)
+    }
+    pub(crate) fn active(&self) -> Result<(), ReadFailure> {
+        self.scope
+            .check_active()
+            .map_err(|e| ReadFailure::Original(e.into()))
+    }
+}
+pub(crate) fn active(scope: Option<&CaptureScope<'_>>) -> Result<(), ReadFailure> {
+    if let Some(scope) = scope {
+        scope.active()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_read_keeps_the_original_unsupported_provider_error() {
+        let original = ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            crate::schema_capability::UNSUPPORTED_SCHEMA,
+        );
+        let actual = ReadFailure::Original(original.clone().into()).into_connector();
+        assert_eq!(actual, original);
+    }
+
+    #[test]
+    fn semantic_snapshot_failure_retains_existing_unavailable_classification() {
+        let error = ReadFailure::Semantic("snapshot is absent".to_owned()).into_connector();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
+        assert_eq!(error.message(), "snapshot is absent");
+    }
+}

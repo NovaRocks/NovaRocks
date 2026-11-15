@@ -559,6 +559,17 @@ impl FunctionValueType {
             .layout()
             .equals_observed(other.binding.layout(), observe)
     }
+    /// Compare the complete immutable binding while ignoring NULL declarations
+    /// at every level. Every other semantic and plain layout fact remains exact;
+    /// this does not perform runtime carrier or encoding compatibility.
+    pub fn same_physical_binding_ignoring_nullability_observed<E>(
+        &self,
+        other: &Self,
+        observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        self.binding
+            .same_physical_binding_ignoring_nullability_observed(&other.binding, observe)
+    }
     /// Compare borrowed child semantics without allocating a child binding.
     /// Only the selected child root nullability is ignored.
     pub fn borrowed_value_domains_equal_observed<E: From<crate::ValueTypeError>>(

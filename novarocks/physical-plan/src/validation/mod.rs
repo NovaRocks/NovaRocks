@@ -599,6 +599,23 @@ fn validate_fragment_structure_into_core<S: FragmentStructureScratch>(
         }
     }
     let indexes = scratch.indexes(fragment)?;
+    for value in fragment.values().values() {
+        if let crate::ValueOrigin::WriterDerived {
+            writer_node,
+            kind: crate::WriterDerivedKind::ProjectedInput,
+        } = value.origin
+            && indexes.projected_inputs.get(&value.id) != Some(&(writer_node, 1))
+        {
+            errors.push(ValidationError::new(
+                format!("{prefix}.values[{}]", value.id.get()),
+                "writer projected value has no unique field in its exact writer",
+            ));
+            if errors.is_saturated() {
+                errors.mark_truncated();
+                return Ok(());
+            }
+        }
+    }
     let window_roots = fragment
         .nodes()
         .values()
@@ -778,6 +795,33 @@ fn value_bindings_match_ignoring_root_nullability(
     right: &crate::ValueType,
 ) -> bool {
     left.same_value_domain(right) && left.typed_binding().layout() == right.typed_binding().layout()
+}
+
+/// A write assignment keeps its actual source declaration separately from the
+/// target requirement. Its constructing operator checks required values before
+/// publishing the exact target carrier; every fact except NULL remains exact.
+fn write_assignment_bindings_match(left: &crate::ValueType, right: &crate::ValueType) -> bool {
+    left.typed_binding()
+        .borrowed()
+        .same_physical_binding_ignoring_nullability_observed(
+            right.typed_binding().borrowed(),
+            || Ok::<(), std::convert::Infallible>(()),
+        )
+        .unwrap_or(false)
+}
+
+fn write_assignment_projection_matches(
+    source: &crate::ValueType,
+    input: &crate::ValueType,
+    storage: Option<&crate::ValueType>,
+) -> bool {
+    novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+        source.typed_binding().borrowed(),
+        input.typed_binding().borrowed(),
+        storage.map(|value| value.typed_binding().borrowed()),
+        || Ok::<(), std::convert::Infallible>(()),
+    )
+    .is_ok_and(|proof| proof.is_some())
 }
 
 /// Borrow a canonical primitive requirement without allocating a fake source

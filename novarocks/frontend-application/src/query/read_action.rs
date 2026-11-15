@@ -17,7 +17,7 @@
 
 //! Ordinary ClientRows preparation and start in the original registered action.
 pub(crate) mod io_source;
-use super::statement_computation::StatementStageAdmission;
+use super::statement_computation::{StatementStageAdmission, statement_work_error};
 use super::*;
 use crate::query_execution::completion_facts::{
     FrontendCompletionCustody, FrontendCompletionPorts, FrontendPlanningCpuSource,
@@ -88,7 +88,7 @@ pub(super) async fn prepare_read(
             },
         );
         let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
-            .map_err(|e| internal_error(e.to_string()))?;
+            .map_err(statement_work_error)?;
         let context = RequestContext::admit(RequestAdmission::new(
             catalog,
             database,
@@ -101,7 +101,7 @@ pub(super) async fn prepare_read(
             presentation,
         ))
         .with_result_capacity(capacity)
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(statement_work_error)?;
         #[cfg(novarocks_dev_controls)]
         let context = match input.observation.as_ref().and_then(|h| h.nomination()) {
             Some(nomination) => context
@@ -840,7 +840,7 @@ impl FrontendQuerySession {
         let stage = if window.class() == novarocks_workload_control::ResultWindowClass::Client {
             stage
                 .with_client_window(&window)
-                .map_err(|error| internal_error(error.to_string()))?
+                .map_err(statement_work_error)?
         } else {
             stage
         };
@@ -1051,6 +1051,61 @@ mod tests {
         drop((request, source));
         finish(control, root, driver);
     }
+    #[test]
+    fn read_stage_deadline_stop_retains_original_cause_before_protocol_reconciliation() {
+        use novarocks_execution_contract::failure::FailureEvidence;
+        use novarocks_query_application::session_error::QueryServiceErrorKind;
+        use novarocks_workload_control::{CancellationReason, WorkError};
+
+        let (control, driver, _) = fixture();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = root.owner.scope();
+        let cancellation =
+            QueryCancellationView::governed(scope.cancellation().unwrap(), Some(5_000));
+        let profile = local_preparation_profile().unwrap();
+        let source = ReadMetadataIoSource::new(scope.clone(), profile.clone());
+        source.configure_read_source(&profile).unwrap();
+        let io = source.original().unwrap();
+        let mut stage = StatementStageAdmission::new(scope, 0);
+        root.owner.cancel(CancellationReason::DeadlineExceeded);
+        let expected = novarocks_query_application::session_outcome::cancellation_failure_input(
+            cancellation.reason().unwrap(),
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        let observed = match stage.poll_admit(&io, &root.owner, &mut cx) {
+            Poll::Ready(Err(error)) => {
+                let cause = error.failure_cause().cloned();
+                let evidence = error
+                    .execution_failure()
+                    .map(|input| input.fact().evidence());
+                let selected = error.reconcile_local_stop_observation(&cancellation);
+                Some((cause, evidence, selected))
+            }
+            Poll::Pending | Poll::Ready(Ok(())) => None,
+        };
+        // No Native work is launched. Retire the real stage inputs and MIO
+        // before reporting any contract assertion.
+        stage.retire_unlaunched();
+        stage.release_capacity_alias();
+        drop((stage, io, source, cancellation));
+        finish(control, root, driver);
+
+        let (cause, evidence, selected) =
+            observed.expect("the original cancelled stage must refuse its first real request");
+        assert!(matches!(
+            cause
+                .as_ref()
+                .and_then(|cause| cause.downcast_ref::<WorkError>()),
+            Some(WorkError::Cancelled(CancellationReason::DeadlineExceeded)),
+        ));
+        assert_eq!(evidence, Some(FailureEvidence::StopObservation));
+        assert_eq!(selected.kind(), QueryServiceErrorKind::Timeout);
+        assert_eq!(selected.execution_failure(), Some(&expected));
+        assert_eq!(selected.failure_cause(), cause.as_ref());
+    }
+
     #[test]
     fn read_source_configuration_retains_cancellation_before_and_after_install() {
         use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};

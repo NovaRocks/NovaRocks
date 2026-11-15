@@ -2560,7 +2560,6 @@ where
 pub(crate) struct FrontendTaskProtocolActiveBehavior {
     attempt: DormantManifestHost,
     registered: Option<InstalledAttemptHost>,
-    observed_failure: Option<ExecutionFailureInput>,
     rows: Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
     _prepared: Option<TaskExecutionPreparedQuery>,
     _credential_storage:
@@ -2599,7 +2598,6 @@ impl FrontendTaskProtocolActiveBehavior {
         Self {
             attempt: host,
             registered: None,
-            observed_failure: None,
             rows,
             _prepared: prepared,
             _credential_storage: credential_storage,
@@ -2642,23 +2640,15 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
             if self.registered.is_none() {
                 match self.attempt.install(drive) {
                     Ok(original) => self.registered = Some(original),
-                    Err(error) => {
-                        self.observed_failure = Some(error.input().clone());
-                        return NativeAttemptTerminal::Failed(error);
-                    }
+                    Err(error) => return NativeAttemptTerminal::Failed(error),
                 }
             }
-            let original = self
-                .registered
+            self.registered
                 .as_mut()
                 .unwrap()
                 .bridge
                 .run(cancellation)
-                .await;
-            if let NativeAttemptTerminal::Failed(failure) = &original {
-                self.observed_failure = Some(failure.input().clone());
-            }
-            original
+                .await
         })
     }
 
@@ -2668,6 +2658,9 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
         request: NativeActiveConvergenceRequest,
     ) -> NativeActiveAttemptConvergenceFuture<'a> {
         let execution_id = inputs.execution_id();
+        // The original logical actor accepted this exact attempt's failure.
+        // Dropping the borrowed run cannot erase it or select another cause.
+        let accepted_failure = request.accepted_failure().cloned();
         Box::pin(async move {
             if let Some(handoff) = self.handoff.as_mut() {
                 handoff.retire_unclaimed();
@@ -2687,7 +2680,7 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
                     crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
                         execution_id,
                         primary_error: None,
-                        failure: self.observed_failure.clone(),
+                        failure: accepted_failure,
                         worker_participations_converged: matches!(&convergence, NativeActiveConvergenceClosure::Evidence(_)),
                         runtime_filter,
                     },

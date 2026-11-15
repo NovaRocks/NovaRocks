@@ -262,7 +262,10 @@ fn optional_and_non_scalar_fields_keep_original_multidimensional_positions() {
             ChangeEventSpec {
                 predicate: None,
                 effect: novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
-                assignments: Box::from([(ValueId::new(0), None), (ValueId::new(1), Some(expr()))]),
+                assignments: Box::from([
+                    crate::ChangeAssignment::exact(ValueId::new(0), None),
+                    crate::ChangeAssignment::exact(ValueId::new(1), Some(expr())),
+                ]),
             },
             ChangeEventSpec {
                 predicate: Some(alternate()),

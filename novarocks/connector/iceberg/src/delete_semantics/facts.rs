@@ -252,7 +252,7 @@ impl TypedPartition {
         }
     }
 
-    /// Private COW hook: the original validator precedes prospective own growth
+    /// Private scoped hook: the original validator precedes prospective own growth
     /// authorization, and every original cell checks the same active owner.
     /// Callers retain their original activity/window through all output holders.
     pub(crate) fn bind_type_checked<E>(

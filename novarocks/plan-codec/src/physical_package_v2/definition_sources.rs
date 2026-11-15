@@ -601,8 +601,12 @@ impl<'source> Visitor<'source> for CountPass<'_, 'source, '_> {
     ) -> Result<(), Error> {
         match &n.kind {
             p::NodeKind::TableWriter { target } => {
-                for _ in &target.target_fields {
+                for field in &target.target_fields {
                     self.completed(2, budget, work)?;
+                    if field.storage_type.is_some() {
+                        self.counts.writer_fields = add(self.counts.writer_fields, 1)?;
+                        self.completed(2, budget, work)?;
+                    }
                 }
                 for _ in &target.output_schema.fields {
                     self.completed(2, budget, work)?;
@@ -908,6 +912,17 @@ impl<'source> Visitor<'source> for FillPass<'_, '_, '_, 'source> {
                     )?;
                     self.sources.writer_fields.push(root);
                     work.step()?;
+                    if let Some(storage) = &field.storage_type {
+                        let root = self.root(
+                            Owner::WriterTarget(id),
+                            Channel::StorageField(ordinal),
+                            storage,
+                            budget,
+                            work,
+                        )?;
+                        self.sources.writer_fields.push(root);
+                        work.step()?;
+                    }
                 }
                 let middle = self.sources.writer_fields.len();
                 for (ordinal, field) in target.output_schema.fields.iter().enumerate() {

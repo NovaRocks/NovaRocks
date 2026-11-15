@@ -53,7 +53,6 @@ fn contract_source(
     };
     let table = ConnectorTableHandle::try_new(instance, Bytes::from_static(b"table")).unwrap();
     let base = ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).unwrap();
-    let token = ConnectorWriteFieldToken::from_bytes([1; 32]);
     ConnectorMutationMatchContract::try_new(
         owner,
         table,
@@ -61,7 +60,6 @@ fn contract_source(
         vec![source],
         Vec::new(),
         Vec::new(),
-        vec![token],
         ConnectorMutationEffectField::try_new(
             ConnectorWriteFieldToken::from_bytes([2; 32]),
             Field::new("effect", DataType::Int8, false),
@@ -114,7 +112,7 @@ fn refused_corrupted_source(field: Field) {
 
 fn formatted_source_typed_digest(contract: &ConnectorMutationMatchContract) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"novarocks.connector-row-mutation-match.v2\0");
+    h.update(b"novarocks.connector-row-mutation-match.v3\0");
     digest_owner(&mut h, &contract.owner);
     digest_bytes(&mut h, contract.table.payload());
     h.update(contract.base_version.digest());
@@ -157,9 +155,30 @@ fn formatted_source_typed_digest(contract: &ConnectorMutationMatchContract) -> [
             },
         )
         .unwrap();
-    }
-    for token in &contract.uniqueness_tokens {
-        h.update(token.to_bytes());
+        // Independent spelling of the complete W/T stream, separate from the
+        // production match and projection identity wrappers.
+        h.update(b"novarocks-write-input-projection-v1");
+        for value in [f.execution_type(), f.storage_type()] {
+            h.update([u8::from(value.is_some())]);
+            if let Some(value) = value {
+                novarocks_type_contract::write_value_type_identity_observed(
+                    value.value_type(),
+                    |part| {
+                        h.update(part);
+                        Ok::<_, std::convert::Infallible>(())
+                    },
+                )
+                .unwrap();
+                novarocks_type_contract::write_value_layout_identity_observed(
+                    value.typed_binding().layout(),
+                    |part| {
+                        h.update(part);
+                        Ok::<_, std::convert::Infallible>(())
+                    },
+                )
+                .unwrap();
+            }
+        }
     }
     h.update(contract.effect_field.token.to_bytes());
     h.update(contract.effect_field.target_ordinal.to_be_bytes());
@@ -342,7 +361,6 @@ fn match_bounds_actual_vec_capacity_is_checked_before_layout_allocation() {
         identities,
         Vec::new(),
         Vec::new(),
-        c.uniqueness_tokens,
         c.effect_field,
     )
     .unwrap_err();
@@ -362,7 +380,6 @@ fn match_bounds_field_count_refused_before_layout_allocation() {
         identities,
         Vec::new(),
         Vec::new(),
-        c.uniqueness_tokens,
         c.effect_field,
     )
     .unwrap_err();
@@ -414,7 +431,6 @@ fn match_bounds_before_after_order_and_effect_keep_formatted_source_and_typed_di
         c.identity_fields,
         before,
         after,
-        c.uniqueness_tokens,
         c.effect_field,
     )
     .unwrap();

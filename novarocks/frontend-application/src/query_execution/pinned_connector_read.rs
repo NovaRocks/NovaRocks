@@ -32,7 +32,6 @@ use crate::catalog_application::query_bindings::{
     QueryFrozenCohortRead, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
     QueryTableBindingStore,
 };
-use crate::catalog_application::query_materializer::QueryLocalTableOverlay;
 use crate::query_execution::cohort_read::QueryPinnedFileSetRead;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
@@ -55,44 +54,6 @@ pub(crate) fn admit_pinned_file_set_scan_binding(
     bindings.resolve_or_insert_with_id(pinned_file_set_binding_key(identity), move |binding| {
         pinned_file_set_query_table_binding(identity.clone(), input_schema.clone(), binding, read)
     })
-}
-
-/// Build the request-local catalog overlay a SQL-shaped cohort read resolves
-/// through. The overlay and the resolver must be created from the same identity
-/// and binding store; neither is published to shared catalog state.
-pub(crate) fn pinned_file_set_query_local_overlay(
-    identity: &FrozenConnectorScanIdentity,
-    input_schema: &ConnectorReadExecutionSchema,
-    read: QueryPinnedFileSetRead,
-) -> QueryLocalTableOverlay {
-    let retained = PinnedFileSetOverlay {
-        identity: identity.clone(),
-        schema: input_schema.clone(),
-        read,
-    };
-    QueryLocalTableOverlay::new(
-        retained.identity.namespace().to_string(),
-        retained.identity.table().to_string(),
-        pinned_file_set_binding_key(&retained.identity),
-        move |binding| retained.materialize(binding),
-    )
-}
-
-// One captured owner fixes field destruction order across schema aliases.
-pub(crate) struct PinnedFileSetOverlay {
-    identity: FrozenConnectorScanIdentity,
-    schema: ConnectorReadExecutionSchema,
-    read: QueryPinnedFileSetRead,
-}
-impl PinnedFileSetOverlay {
-    fn materialize(&self, binding: SqlTableBindingId) -> Result<QueryTableBinding, String> {
-        pinned_file_set_query_table_binding(
-            self.identity.clone(),
-            self.schema.clone(),
-            binding,
-            self.read.clone(),
-        )
-    }
 }
 
 /// Build the minimal physical scan carrier for one pinned cohort read.

@@ -233,6 +233,28 @@ impl ConnectorWriteRecipeDraft {
                     Ok(())
                 },
             )?;
+            if let Some(input_type) = field.execution_type() {
+                let matches = crate::write_field_matches_execution_type_observed::<
+                    WriteFieldValidationFailure<O::Error>,
+                >(field.field(), input_type, |units| {
+                    observer
+                        .work(units)
+                        .map_err(WriteFieldValidationFailure::Caller)
+                })
+                .map_err(|error| match error {
+                    WriteFieldValidationFailure::Caller(cause) => cause,
+                    WriteFieldValidationFailure::Value(error) => invalid(format!(
+                        "writer input Field has an invalid execution layout: {error}"
+                    ))
+                    .into(),
+                })?;
+                if !matches {
+                    return Err(invalid(
+                        "writer input Field conflicts with its complete execution declaration",
+                    )
+                    .into());
+                }
+            }
         }
         // Preserve the original structural retained charge. Actual cumulative
         // request/work upper bounds are a separate parent contribution.
@@ -421,6 +443,16 @@ impl ConnectorWriteRecipe {
     }
 }
 
+enum WriteFieldValidationFailure<E> {
+    Caller(E),
+    Value(novarocks_type_contract::ValueTypeError),
+}
+impl<E> From<novarocks_type_contract::ValueTypeError> for WriteFieldValidationFailure<E> {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Value(error)
+    }
+}
+
 fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
 }
@@ -512,6 +544,15 @@ mod tests {
                             equality_fields: fields.clone(),
                         }
                     }
+                    6 => {
+                        fields[0] = fields[0]
+                            .clone()
+                            .with_storage_type(novarocks_type_contract::FunctionValueType::new(
+                                DataType::FixedSizeBinary(8),
+                                false,
+                            ))
+                            .unwrap();
+                    }
                     _ => {}
                 }
             }
@@ -562,6 +603,60 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn pure_writer_seal_rejects_changed_storage_with_identical_input_bytes() {
+        let value = novarocks_type_contract::FunctionValueType::new(DataType::Binary, false);
+        let field = ConnectorWriteFieldBinding::try_new_typed(
+            ConnectorWriteFieldToken::from_bytes([7; 32]),
+            Field::new("fixed", DataType::Binary, false),
+            value,
+        )
+        .unwrap()
+        .with_storage_type(novarocks_type_contract::FunctionValueType::new(
+            DataType::FixedSizeBinary(4),
+            false,
+        ))
+        .unwrap();
+        let draft = draft(ConnectorWriteInputShape::Data {
+            fields: vec![field],
+        });
+        assert!(
+            ConnectorWriteRecipe::try_compile_with_provider(&draft, &Compiler(0), &Control).is_ok()
+        );
+        assert!(matches!(
+            ConnectorWriteRecipe::try_compile_with_provider(&draft, &Compiler(6), &Control),
+            Err(ConnectorWriteRecipeCompileError::Contract(_)),
+        ));
+    }
+
+    #[test]
+    fn borrowed_writer_projection_checks_its_real_source_field_layout() {
+        let header = draft(ConnectorWriteInputShape::Data {
+            fields: vec![field(1)],
+        });
+        let source_field = Field::new("payload", DataType::FixedSizeBinary(4), false);
+        let input_type = novarocks_type_contract::FunctionValueType::new(DataType::Binary, false);
+        let storage_type =
+            novarocks_type_contract::FunctionValueType::new(DataType::FixedSizeBinary(4), false);
+        let fields = [crate::ConnectorWriteFieldRef::new_typed_with_storage(
+            ConnectorWriteFieldToken::from_bytes([9; 32]),
+            &source_field,
+            &input_type,
+            Some(&storage_type),
+        )];
+        let input = crate::ConnectorWriteInputRef::Data { fields: &fields };
+        let result = ConnectorWriteRecipeDraft::try_new_core(
+            header.binding(),
+            header.payload(),
+            &input,
+            &mut crate::owned_copy::PlainCopy,
+        );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+
     #[test]
     fn writer_shape_roles_survive_pure_compilation() {
         for input in [

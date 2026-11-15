@@ -287,6 +287,7 @@ pub(super) fn original_source_package(
         fields
             .iter()
             .map(|field| raw::ConnectorWriteFieldBinding {
+                storage_value_type_id: None,
                 field_token: field.token().to_bytes().to_vec(),
                 source_field_id: Some(next.next().expect("original writer source ordinal")),
                 value_type_id: Some(0),
@@ -985,7 +986,10 @@ fn change_stream_source(
                 events: Box::from([p::ChangeEventSpec {
                     predicate: None,
                     effect: c::ConnectorRowMutationEffect::Insert,
-                    assignments: Box::from([(routed, Some(assignment))]),
+                    assignments: Box::from([novarocks_physical_plan::ChangeAssignment::exact(
+                        routed,
+                        Some(assignment),
+                    )]),
                 }]),
                 effect_output: effect,
             },
@@ -1140,6 +1144,28 @@ fn checked_writer_plan_packages_inner(
     };
     let writer = builder.reserve_node_id().unwrap();
     let fields = relation_fields(&mut builder, writer, false);
+    let projected_target_fields_0: Box<[novarocks_physical_plan::WriterTargetField]> = recipe
+        .input()
+        .fields_iter()
+        .zip(&values)
+        .map(|(field, value)| p::WriterTargetField {
+            storage_type: field.storage_type().cloned(),
+            projected: builder
+                .add_value(
+                    (FunctionValueType::new(DataType::Int64, false)).clone(),
+                    novarocks_physical_plan::ValueOrigin::WriterDerived {
+                        writer_node: writer,
+                        kind: novarocks_physical_plan::WriterDerivedKind::ProjectedInput,
+                    },
+                )
+                .unwrap(),
+            provider_name: field.field().name().clone().into(),
+            token: field.token(),
+            input: *value,
+            ty: FunctionValueType::new(DataType::Int64, false),
+            hidden: false,
+        })
+        .collect();
     builder
         .insert_node_unchecked(p::PhysicalNode {
             id: writer,
@@ -1156,18 +1182,7 @@ fn checked_writer_plan_packages_inner(
                     write_target_ordinal: ordinal,
                     input: values.clone().into_boxed_slice(),
                     required_distribution: p::Distribution::Singleton,
-                    target_fields: recipe
-                        .input()
-                        .fields_iter()
-                        .zip(&values)
-                        .map(|(field, value)| p::WriterTargetField {
-                            provider_name: field.field().name().clone().into(),
-                            token: field.token(),
-                            input: *value,
-                            ty: FunctionValueType::new(DataType::Int64, false),
-                            hidden: false,
-                        })
-                        .collect(),
+                    target_fields: projected_target_fields_0,
                     output_schema: p::WriterRelationSchema {
                         revision: p::WRITER_MULTIPLEX_SCHEMA_REVISION,
                         fields: fields.clone(),

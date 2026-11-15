@@ -79,12 +79,12 @@ use crate::commit::write_stack::domain::{
 };
 use crate::commit::write_stack::flavor::{
     IcebergFrozenRewriteBranch, IcebergSessionFlavorPlan, IcebergSessionMaterial,
-    plan_copy_on_write_branches, plan_distributed_rewrite_branches,
-    plan_document_publication_branches, plan_ordinary_branches, plan_row_mutation_branches,
+    plan_distributed_rewrite_branches, plan_document_publication_branches, plan_ordinary_branches,
+    plan_row_mutation_branches,
 };
 use crate::commit::write_stack::planning::{IcebergBranchSessionPlanInput, plan_branch_session};
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
-use crate::commit::{CommitOpKind, CowUpdateRewriteSet, CowUpdateTouchedFile, WrittenFile};
+use crate::commit::{CommitOpKind, WrittenFile};
 use crate::iceberg::spec::{DataContentType, DataFileFormat, TableMetadata};
 use crate::metadata_context::IcebergMetadataContext;
 use crate::write_descriptor::decode_partition_descriptor;
@@ -295,7 +295,6 @@ pub(crate) fn validate_context(context: &ConnectorRequestContext) -> Result<(), 
 /// One typed fragment resolved against the sealed target set.
 #[derive(Debug)]
 pub(crate) struct ValidatedFragment<'a> {
-    ordinal: WriteTargetOrdinal,
     fragment: &'a IcebergCommitFragment,
 }
 
@@ -409,10 +408,7 @@ pub(crate) fn validate_prepared_set<'a>(
                         ));
                     }
                 }
-                validated.push(ValidatedFragment {
-                    ordinal: *ordinal,
-                    fragment,
-                });
+                validated.push(ValidatedFragment { fragment });
                 continue;
             }
             let rewrite = target.position_rewrite().ok_or_else(|| {
@@ -441,10 +437,7 @@ pub(crate) fn validate_prepared_set<'a>(
                 fragment.path()
             )));
         }
-        validated.push(ValidatedFragment {
-            ordinal: *ordinal,
-            fragment,
-        });
+        validated.push(ValidatedFragment { fragment });
     }
     Ok(validated)
 }
@@ -884,72 +877,6 @@ fn session_snapshot_properties_for_commit(
         handle.session_id().to_string(),
     );
     Ok(properties)
-}
-
-/// The replacement record one copy-on-write commit applies.
-///
-/// The join key is the write target ordinal and nothing else. Branch `i`
-/// replaces exactly the file its frozen recipe named, and the artifacts the
-/// backends staged for target `i` are that file's replacement — so a
-/// statement that rewrote three files produces three touched files, each with
-/// its own artifacts, rather than one merged claim. No cohort, operation,
-/// execution, or attempt identity takes part.
-///
-/// The matched row ids come off the frozen recipe rather than off anything the
-/// writers reported: their minimum becomes the replacement manifest's
-/// `first_row_id`, which is what stops the v3 manifest-list writer allocating
-/// fresh `_row_id`s for rows that already have them.
-pub(crate) fn cow_update_rewrite_set(
-    handle: &IcebergWriteCommitSession,
-    staged: &[(WriteTargetOrdinal, WrittenFile)],
-) -> Result<Option<CowUpdateRewriteSet>, ConnectorError> {
-    use crate::commit::write_stack::copy_on_write::IcebergCowBranchInput;
-
-    if handle.commit_op_kind() != CommitOpKind::CowUpdate {
-        return Ok(None);
-    }
-    let base_snapshot_id = handle
-        .table()
-        .base_snapshot_id()
-        .ok_or_else(|| invalid("Iceberg copy-on-write commit requires a frozen base snapshot"))?;
-    let staged_for = |ordinal: WriteTargetOrdinal| {
-        staged
-            .iter()
-            .filter(move |(staged_ordinal, _)| *staged_ordinal == ordinal)
-            .map(|(_, file)| file)
-    };
-    let mut touched_data_files = Vec::new();
-    let mut appended_files = Vec::new();
-    let mut updated_row_ids = BTreeSet::new();
-    for (index, branch) in handle.copy_on_write().iter().enumerate() {
-        let ordinal = WriteTargetOrdinal::try_new(
-            u32::try_from(index)
-                .map_err(|_| internal("Iceberg copy-on-write branch ordinal overflowed"))?,
-        )?;
-        match branch {
-            IcebergCowBranchInput::Rewrite {
-                old_file,
-                matched_row_ids,
-            } => {
-                updated_row_ids.extend(matched_row_ids.iter().copied());
-                touched_data_files.push(CowUpdateTouchedFile {
-                    old_file: old_file.clone(),
-                    new_files: staged_for(ordinal).map(|file| file.path.clone()).collect(),
-                    row_ids: matched_row_ids.clone(),
-                });
-            }
-            IcebergCowBranchInput::Append => {
-                appended_files.extend(staged_for(ordinal).cloned());
-            }
-        }
-    }
-    Ok(Some(CowUpdateRewriteSet {
-        base_snapshot_id,
-        target_table_uuid: handle.table().table_uuid().to_string(),
-        updated_row_ids: updated_row_ids.into_iter().collect(),
-        touched_data_files,
-        appended_files,
-    }))
 }
 
 /// The frozen input file set a selected-rewrite commit replaces.
@@ -2085,10 +2012,7 @@ pub(crate) fn session_plan_from_targets(
     mut handle: IcebergWriteCommitSession,
     targets: Vec<crate::commit::write_stack::planning::IcebergWriteTargetPlan>,
     statistics_metadata: Option<&TableMetadata>,
-    copy_on_write: Option<(
-        novarocks_spi::connector::ConnectorRowMutationSelection,
-        novarocks_spi::connector::ConnectorMutationMatchContract,
-    )>,
+    statistics_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
     let statistics_enabled = statistics_metadata.is_some_and(collect_on_write_enabled);
     // Statistics describe the rows a write produced, so a session with no
@@ -2109,21 +2033,14 @@ pub(crate) fn session_plan_from_targets(
     let plans = targets
         .into_iter()
         .map(|target| {
-            let (
-                ordinal,
-                writer,
-                input,
-                route,
-                routing_proof,
-                rewrite_source,
-                rewrite_group_digest,
-                position_materialization,
-            ) = target.into_parts();
+            let (ordinal, writer, input, route, rewrite_group_digest, position_materialization) =
+                target.into_parts();
             let statistics = write_statistics_contract(
                 &writer,
                 &input,
                 statistics_metadata,
                 statistics_enabled && statistics_eligible,
+                statistics_context,
             )?;
             if !statistics.is_empty() {
                 expectations.insert(
@@ -2146,14 +2063,6 @@ pub(crate) fn session_plan_from_targets(
                 Some(group) => plan.with_position_materialization(group),
                 None => plan,
             };
-            let plan = match routing_proof {
-                Some(proof) => plan.with_routing_proof(proof),
-                None => plan,
-            };
-            let plan = match rewrite_source {
-                Some(source) => plan.with_rewrite_source(source),
-                None => plan,
-            };
             let plan = match rewrite_group_digest {
                 Some(digest) => plan.with_rewrite_group_digest(digest),
                 None => plan,
@@ -2163,12 +2072,7 @@ pub(crate) fn session_plan_from_targets(
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     handle = handle.with_statistics_expectations(expectations)?;
     let commit = adapter.wrap_commit_session(handle);
-    match copy_on_write {
-        Some((selection, match_contract)) => {
-            ConnectorWriteSessionPlan::try_copy_on_write(commit, plans, selection, match_contract)
-        }
-        None => ConnectorWriteSessionPlan::try_new(commit, plans),
-    }
+    ConnectorWriteSessionPlan::try_new(commit, plans)
 }
 
 fn position_contribution_group(
@@ -2214,7 +2118,6 @@ fn position_contribution_group(
                     vec![effect],
                     route.input_ordinals().to_vec(),
                     route.requirements().clone(),
-                    Vec::new(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -2259,6 +2162,7 @@ fn write_statistics_contract(
     input: &novarocks_spi::connector::ConnectorWriteInputShape,
     metadata: Option<&TableMetadata>,
     enabled: bool,
+    context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<WriteStatisticsContract, ConnectorError> {
     let Some(data_recipe) = writer.data() else {
         return WriteStatisticsContract::try_new(input, Vec::new());
@@ -2287,25 +2191,45 @@ fn write_statistics_contract(
     }
     let metadata = metadata
         .ok_or_else(|| invalid("Iceberg collect-on-write requires authoritative table metadata"))?;
+    let context = context
+        .ok_or_else(|| invalid("Iceberg statistics lost its original preparation context"))?;
+    let declarations = crate::metadata::with_pure_schema_creation(context, |creation| {
+        crate::commit::write_shared::canonical_data_write_fields(metadata, creation)
+    })?;
     let iceberg_schema = metadata.current_schema();
-    // The engine binds the SQL read carrier at admission, so that is what a
-    // write input's columns are shaped by and what this gate has to compare
-    // against. Converting the Iceberg schema again here restated the carrier
-    // rule shallowly -- it adapted the top-level primitives and cloned every
-    // nested type verbatim -- and the two statements drifted apart the moment
-    // one of them said something about a nested field.
-    let arrow_schema = crate::scalar_integer_domain::metadata_sql_schema(metadata, iceberg_schema)?;
+    // The complete writer input is independent of storage. Field IDs and
+    // storage compatibility continue to come from the same frozen declaration.
     let mut requirements = Vec::new();
     for (ordinal, binding) in input.fields().into_iter().enumerate() {
         let field = binding.field();
-        let Some((field_id, value_type)) = resolve_statistics_field(
+        let authoritative = declarations.iter().find(|declaration| {
+            declaration
+                .field()
+                .name()
+                .eq_ignore_ascii_case(field.name())
+        });
+        if authoritative.is_none()
+            && data_recipe.row_lineage()
+            && matches!(
+                field.name().as_str(),
+                crate::row_lineage_synth::ICEBERG_ROW_ID_COL
+                    | crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL
+            )
+        {
+            continue;
+        }
+        let authoritative = authoritative.ok_or_else(|| {
+            invalid("Iceberg statistics lost its complete authoritative writer declaration")
+        })?;
+        let Some((field_id, value_type)) = resolve_statistics_field_with_declaration(
             iceberg_schema,
-            &arrow_schema,
             field,
             data_recipe.row_lineage(),
             binding.execution_type().ok_or_else(|| {
                 invalid("Iceberg statistics writer input has no complete declaration")
             })?,
+            binding.storage_type(),
+            authoritative,
         )?
         else {
             continue;
@@ -2331,12 +2255,13 @@ fn write_statistics_contract(
     WriteStatisticsContract::try_new(input, requirements)
 }
 
-fn resolve_statistics_field(
+fn resolve_statistics_field_with_declaration(
     iceberg_schema: &crate::iceberg::spec::Schema,
-    arrow_schema: &arrow::datatypes::Schema,
     field: &arrow::datatypes::Field,
     row_lineage: bool,
     value_type: &novarocks_type_contract::FunctionValueType,
+    storage_type: Option<&novarocks_type_contract::FunctionValueType>,
+    authoritative: &novarocks_spi::connector::ConnectorWriteFieldRequest,
 ) -> Result<Option<(i32, novarocks_type_contract::FunctionValueType)>, ConnectorError> {
     let candidates = iceberg_schema
         .as_struct()
@@ -2345,7 +2270,7 @@ fn resolve_statistics_field(
         .enumerate()
         .filter(|(_, candidate)| candidate.name.eq_ignore_ascii_case(field.name()))
         .collect::<Vec<_>>();
-    let (schema_ordinal, iceberg_field) = match candidates.as_slice() {
+    let (_, iceberg_field) = match candidates.as_slice() {
         [] if row_lineage
             && matches!(
                 field.name().as_str(),
@@ -2369,8 +2294,11 @@ fn resolve_statistics_field(
             )));
         }
     };
-    let expected_arrow = arrow_schema.field(schema_ordinal).data_type();
-    if field.data_type() != expected_arrow || field.is_nullable() == iceberg_field.required {
+    let complete_matches = authoritative.execution_type() == Some(value_type)
+        && authoritative.storage_type() == storage_type
+        && authoritative.field().data_type() == field.data_type()
+        && authoritative.field().is_nullable() == field.is_nullable();
+    if !complete_matches {
         return Err(invalid(format!(
             "Iceberg statistics input column `{}` does not match the authoritative table field type/nullability",
             field.name()
@@ -2381,15 +2309,15 @@ fn resolve_statistics_field(
     Ok(Some((iceberg_field.id, value_type.clone())))
 }
 
-/// COW retains the already-loaded immutable generation. No capacity is minted.
+/// Scoped rewrites retain the loaded immutable generation. No capacity is minted.
 enum IcebergAdmissionStatisticsMetadata {
     Shared(Arc<TableMetadata>),
     Owned(Box<TableMetadata>),
 }
 
 impl IcebergAdmissionStatisticsMetadata {
-    fn from_loaded_table(table: &crate::iceberg::table::Table, copy_on_write: bool) -> Self {
-        if copy_on_write {
+    fn from_loaded_table(table: &crate::iceberg::table::Table, shared: bool) -> Self {
+        if shared {
             Self::Shared(table.metadata_ref())
         } else {
             Self::Owned(Box::new(table.metadata().clone()))
@@ -2406,9 +2334,9 @@ impl IcebergAdmissionStatisticsMetadata {
     fn for_statistics(
         &self,
         prospective: Option<&TableMetadata>,
-        copy_on_write: bool,
+        shared: bool,
     ) -> Result<Self, ConnectorError> {
-        if copy_on_write {
+        if shared {
             match (self, prospective) {
                 (Self::Shared(original), None) => Ok(Self::Shared(Arc::clone(original))),
                 _ => Err(invalid(
@@ -2439,12 +2367,12 @@ impl std::ops::Deref for IcebergAdmissionStatisticsMetadata {
     }
 }
 
-#[path = "control/cow_begin.rs"]
-pub(crate) mod cow_begin;
-#[path = "control/cow_begin_own.rs"]
-mod cow_begin_own;
 #[path = "control/rewrite_begin.rs"]
 mod rewrite_begin;
+#[path = "control/rewrite_scope.rs"]
+pub(crate) mod rewrite_scope;
+#[path = "control/rewrite_source.rs"]
+mod rewrite_source;
 
 impl IcebergWriteSessionControl {
     async fn admit_async_with_rewrite_io(
@@ -2491,7 +2419,6 @@ impl IcebergWriteSessionControl {
                 CatalogOperation::PublishDocuments
             }
             ConnectorWriteSessionFlavor::RowMutation => CatalogOperation::RowMutation,
-            ConnectorWriteSessionFlavor::CopyOnWrite { .. } => CatalogOperation::CopyOnWrite,
             ConnectorWriteSessionFlavor::DistributedRewrite { shape, .. } => match shape {
                 ConnectorDistributedRewriteShape::DataFiles { .. } => {
                     CatalogOperation::RewriteDataFiles
@@ -2531,7 +2458,7 @@ impl IcebergWriteSessionControl {
             }
             _ => false,
         };
-        let (table, metadata, cow_read_access) = match &staged {
+        let (table, metadata) = match &staged {
             Some(staged) => {
                 if staged.namespace != namespace || staged.table != table_name {
                     return Err(invalid(
@@ -2541,7 +2468,6 @@ impl IcebergWriteSessionControl {
                 (
                     None,
                     IcebergAdmissionStatisticsMetadata::Owned(Box::new(staged.metadata.clone())),
-                    None,
                 )
             }
             None => {
@@ -2582,26 +2508,15 @@ impl IcebergWriteSessionControl {
                         .await
                 }
                 .map_err(|error| unavailable(error.to_string()))?;
-                let cow_read_access = if matches!(
-                    &request.flavor,
-                    ConnectorWriteSessionFlavor::CopyOnWrite { .. }
-                ) {
-                    Some(Arc::new(
-                        crate::loaded_table::IcebergAttemptTableAccess::freeze(physical.clone()),
-                    ))
-                } else {
-                    None
-                };
                 let table = physical.into_table();
                 let metadata = IcebergAdmissionStatisticsMetadata::from_loaded_table(
                     &table,
                     matches!(
                         &request.flavor,
-                        ConnectorWriteSessionFlavor::CopyOnWrite { .. }
-                            | ConnectorWriteSessionFlavor::DistributedRewrite { .. }
+                        ConnectorWriteSessionFlavor::DistributedRewrite { .. }
                     ),
                 );
-                (Some(table), metadata, cow_read_access)
+                (Some(table), metadata)
             }
         };
         if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
@@ -2801,7 +2716,7 @@ impl IcebergWriteSessionControl {
         }
         let base_sequence_number = source_snapshot_sequence(&metadata, base_snapshot_id)?;
         let facts = if let Some(scope) = rewrite_scope.as_ref() {
-            let loaded = cow_begin_own::loaded_facts(cow_begin_own::LoadedFactsInput {
+            let loaded = rewrite_source::loaded_facts(rewrite_source::LoadedFactsInput {
                 metadata: &metadata,
                 namespace,
                 table: table_name,
@@ -2813,7 +2728,7 @@ impl IcebergWriteSessionControl {
                 format_version: format_version_number(&metadata),
                 scope,
             })
-            .map_err(cow_begin::own_error)
+            .map_err(rewrite_scope::own_error)
             .map_err(formation_error)?;
             loaded.into_facts()
         } else {
@@ -2892,8 +2807,7 @@ impl IcebergWriteSessionControl {
                 .map(|prepared| prepared.prospective_metadata()),
             matches!(
                 &request.flavor,
-                ConnectorWriteSessionFlavor::CopyOnWrite { .. }
-                    | ConnectorWriteSessionFlavor::DistributedRewrite { .. }
+                ConnectorWriteSessionFlavor::DistributedRewrite { .. }
             ),
         )?;
         let authored_input = if matches!(
@@ -2932,8 +2846,8 @@ impl IcebergWriteSessionControl {
             &request.context,
         )?;
         let signed = if let Some(scope) = rewrite_scope.as_ref() {
-            let signed = cow_begin_own::signed_input(&facts, &authored_input, scope)
-                .map_err(cow_begin::own_error)
+            let signed = rewrite_source::signed_input(&facts, &authored_input, scope)
+                .map_err(rewrite_scope::own_error)
                 .map_err(formation_error)?;
             signed.into_shape()
         } else {
@@ -2980,12 +2894,12 @@ impl IcebergWriteSessionControl {
                 .map(|size| size as u64),
             )?,
             data_recipe: if let Some(scope) = rewrite_scope.as_ref() {
-                cow_begin_own::data_recipe(
+                rewrite_source::data_recipe(
                     writer_metadata,
                     matches!(signed, ConnectorWriteInputShape::RowLineage { .. }),
                     scope,
                 )
-                .map_err(cow_begin::own_error)
+                .map_err(rewrite_scope::own_error)
                 .map_err(formation_error)?
             } else {
                 data_branch_recipe(
@@ -3022,7 +2936,7 @@ impl IcebergWriteSessionControl {
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } => {
                 plan_document_publication_branches(
                     &material,
-                    IcebergDocumentPublicationFacts::new(declaration.clone(), *shape),
+                    IcebergDocumentPublicationFacts::new(declaration.as_ref().clone(), *shape),
                 )?
             }
             ConnectorWriteSessionFlavor::RowMutation => plan_row_mutation_branches(&material)?,
@@ -3039,56 +2953,11 @@ impl IcebergWriteSessionControl {
                     .await?;
                 plan_distributed_rewrite_branches(&material, *shape, &groups)?
             }
-            ConnectorWriteSessionFlavor::CopyOnWrite {
-                selection,
-                match_contract,
-            } => {
-                let table = table.as_ref().ok_or_else(|| {
-                    invalid("Iceberg copy-on-write mutation requires a loaded target table")
-                })?;
-                // Without a base snapshot there is nothing to rewrite, and a
-                // copy-on-write mutation that silently became an append would
-                // publish after-images while every before-image stayed live.
-                let snapshot_id = base_snapshot_id.ok_or_else(|| {
-                    invalid("Iceberg copy-on-write mutation requires a frozen base snapshot")
-                })?;
-                let base_version_digest = request
-                    .base
-                    .as_ref()
-                    .map(ConnectorWriteBaseVersion::digest)
-                    .ok_or_else(|| {
-                        invalid("Iceberg copy-on-write mutation requires its signed base version")
-                    })?;
-                let recipes =
-                    crate::commit::write_stack::copy_on_write::freeze_copy_on_write_branches(
-                        selection,
-                        match_contract,
-                        crate::commit::write_stack::copy_on_write::IcebergCowFreezeInput {
-                            owner: &self.key,
-                            catalog: &self.key.instance_id,
-                            namespace,
-                            table_name,
-                            metadata: &metadata,
-                            snapshot_id,
-                            base_files: self.frozen_base_data_files_async(
-                                table, snapshot_id,
-                                cow_read_access.as_ref().ok_or_else(|| invalid(
-                                    "Iceberg copy-on-write source lost its original access recipe"
-                                ))?,
-                            ).await?,
-                            input: &material.input,
-                            base_version_digest,
-                            max_handle_payload_bytes: request.context.max_handle_payload_bytes(),
-                        },
-                    )?;
-                plan_copy_on_write_branches(&material, &recipes, match_contract)?
-            }
         };
         let IcebergSessionFlavorPlan {
             flavor,
             document_publication,
             rewrite_inputs,
-            copy_on_write,
             branches,
         } = plan;
         let session_id = IcebergWriteSessionId::new();
@@ -3109,7 +2978,6 @@ impl IcebergWriteSessionControl {
                 document_publication,
                 staged_metadata: staged.map(|staged| Arc::new(staged.metadata)),
                 rewrite_inputs,
-                copy_on_write,
                 repartition,
                 writer_table: writer_facts,
                 branches,
@@ -3166,41 +3034,6 @@ impl IcebergWriteSessionControl {
         Ok((handle, targets, statistics_metadata))
     }
 
-    /// Every live data file of one frozen base snapshot.
-    ///
-    /// This is the same read a distributed rewrite performs to cut its groups:
-    /// a walk of the frozen snapshot's manifests, and nothing else. It opens no
-    /// delete artifact and mutates nothing.
-    async fn frozen_base_data_files_async(
-        &self,
-        table: &crate::iceberg::table::Table,
-        snapshot_id: i64,
-        access: &Arc<crate::loaded_table::IcebergAttemptTableAccess>,
-    ) -> Result<
-        Vec<crate::commit::write_stack::copy_on_write::IcebergCowFrozenBaseFile>,
-        ConnectorError,
-    > {
-        let owned = table.clone();
-        let metadata = table.metadata_ref();
-        let access = access.clone();
-        (async move {
-            crate::manifest::extract_data_files_with_stats_at_projected(
-                &owned,
-                snapshot_id,
-                None,
-                |stats, manifest, deletes| {
-                    crate::commit::write_stack::copy_on_write::IcebergCowFrozenBaseFile::new(
-                        crate::manifest::FrozenReadFileWithStats::retain(stats, manifest, deletes),
-                        metadata.clone(),
-                        access.clone(),
-                    )
-                },
-            )
-            .await
-        })
-        .await
-    }
-
     async fn rewrite_branches_from_frozen_with_io(
         &self,
         table: &crate::iceberg::table::Table,
@@ -3228,17 +3061,16 @@ impl IcebergWriteSessionControl {
                     let snapshot = io.snapshot(owned, snapshot_id).await?;
                     let scope = io.formation_scope()?;
                     let capture =
-                        crate::read_snapshot::cow_capture::CaptureScope::new(scope.original())
+                        crate::read_snapshot::scoped_capture::CaptureScope::new(scope.original())
                             .map_err(crate::distributed_rewrite::async_plan::capture_failure)?;
-                    let checked =
-                        crate::manifest::finish_checked_cow_data_files_from_original_files(
-                            metadata,
-                            snapshot_id,
-                            snapshot.files,
-                            scope.original(),
-                            &capture,
-                        )
-                        .map_err(crate::distributed_rewrite::async_plan::capture_failure)?;
+                    let checked = crate::manifest::finish_checked_data_files_from_original_files(
+                        metadata,
+                        snapshot_id,
+                        snapshot.files,
+                        scope.original(),
+                        &capture,
+                    )
+                    .map_err(crate::distributed_rewrite::async_plan::capture_failure)?;
                     checked
                         .files
                         .into_iter()
@@ -3382,7 +3214,7 @@ fn sign_input_shape(
             .enumerate()
             .map(|(index, field)| {
                 let mut hasher = Sha256::new();
-                hasher.update(b"novarocks.iceberg.write-stack.field.v1\0");
+                hasher.update(b"novarocks.iceberg.write-stack.field.v2\0");
                 hasher.update(facts.table_uuid().as_bytes());
                 hasher.update([0]);
                 hasher.update(facts.target_ref().as_bytes());
@@ -3394,8 +3226,16 @@ fn sign_input_shape(
                 hasher.update([0]);
                 hasher.update(format!("{:?}", field.field().data_type()).as_bytes());
                 hasher.update([u8::from(field.field().is_nullable())]);
+                novarocks_connector_contract::write_input_projection_identity_observed(
+                    field.execution_type(),
+                    field.storage_type(),
+                    |bytes| {
+                        hasher.update(bytes);
+                        Ok::<(), ConnectorError>(())
+                    },
+                )?;
                 let token = ConnectorWriteFieldToken::from_bytes(hasher.finalize().into());
-                ConnectorWriteFieldBinding::try_new_typed(
+                let binding = ConnectorWriteFieldBinding::try_new_typed(
                     token,
                     field.field().clone(),
                     field
@@ -3404,7 +3244,11 @@ fn sign_input_shape(
                             invalid("Iceberg session field has no frozen complete declaration")
                         })?
                         .clone(),
-                )
+                )?;
+                match field.storage_type() {
+                    Some(storage) => binding.with_storage_type(storage.clone()),
+                    None => Ok(binding),
+                }
             })
             .collect::<Result<Vec<_>, ConnectorError>>()
     };
@@ -3556,26 +3400,22 @@ pub fn write_control_io_geometry()
     let actual_io = crate::commit::operation::OperationLimits::default().io_requests as usize;
     let io = std::num::NonZeroUsize::new(actual_io)
         .ok_or_else(|| internal("write operation I/O inventory is empty"))?;
-    let future =
-        write_control_cow_future_bytes(IcebergWriteSessionControl::begin_cow_original_async)
-            .max(write_control_future_bytes(
-                IcebergWriteSessionControl::begin_write_original,
-            ))
-            .max(write_control_future_bytes(
-                IcebergWriteSessionControl::finish_write_original,
-            ))
-            .max(write_control_future_bytes(
-                IcebergWriteSessionControl::adjudicate_session_request_original,
-            ))
-            .max(write_control_future_bytes(
-                IcebergWriteSessionControl::abort_write_original,
-            ))
-            .max(write_control_future_bytes3(
-                IcebergWriteSessionControl::finish_write_needed_original,
-            ))
-            .max(write_control_future_bytes3(
-                IcebergWriteSessionControl::adjudicate_session_needed_original,
-            ));
+    let future = write_control_future_bytes(IcebergWriteSessionControl::begin_write_original)
+        .max(write_control_future_bytes(
+            IcebergWriteSessionControl::finish_write_original,
+        ))
+        .max(write_control_future_bytes(
+            IcebergWriteSessionControl::adjudicate_session_request_original,
+        ))
+        .max(write_control_future_bytes(
+            IcebergWriteSessionControl::abort_write_original,
+        ))
+        .max(write_control_future_bytes3(
+            IcebergWriteSessionControl::finish_write_needed_original,
+        ))
+        .max(write_control_future_bytes3(
+            IcebergWriteSessionControl::adjudicate_session_needed_original,
+        ));
     let fixed = crate::commit::operation::IcebergCommitOperation::fixed_backing_bytes()
         .map_err(|e| internal(e.to_string()))?
         .checked_add(IcebergWriteCommitSession::fixed_backing_bytes())
@@ -3679,24 +3519,6 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         Box::pin(self.begin_write_original(request))
     }
 
-    fn begin_cow_write_checked_async(
-        &self,
-        request: ConnectorWriteBeginRequest,
-        original: novarocks_spi::connector::ConnectorOriginalResultScope,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        novarocks_spi::connector::ConnectorCowBeginPlan,
-                        novarocks_spi::connector::ConnectorCowBeginFailure,
-                    >,
-                > + Send
-                + '_,
-        >,
-    > {
-        Box::pin(self.begin_cow_original_async(request, original))
-    }
-
     fn finish_write_async<'a>(
         &'a self,
         request: ConnectorWriteFinishRequestRef<'a>,
@@ -3786,17 +3608,6 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
             .map_err(unavailable)?
     }
 
-    fn begin_cow_write_checked(
-        &self,
-        request: ConnectorWriteBeginRequest,
-        original: novarocks_spi::connector::ConnectorOriginalResultScope,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorCowBeginPlan,
-        novarocks_spi::connector::ConnectorCowBeginFailure,
-    > {
-        self.begin_cow_original(request, original)
-    }
-
     fn prepared_logical_row_change(
         &self,
         commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitSession,
@@ -3871,7 +3682,7 @@ mod statistics_contract_tests {
 
     use super::{
         IcebergWriteSessionId, eager_proof_finalization, iceberg_write_phase_marker,
-        resolve_statistics_field, validate_theta_properties,
+        resolve_statistics_field_with_declaration, validate_theta_properties,
     };
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
@@ -3949,6 +3760,101 @@ mod statistics_contract_tests {
             .expect("schema")
     }
 
+    // Existing source-domain oracles also pass through the production resolver.
+    // The frozen declaration is independent of the supplied Field attributes.
+    fn resolve_statistics_field(
+        iceberg: &Schema,
+        arrow: &arrow::datatypes::Schema,
+        field: &Field,
+        lineage: bool,
+        value: &novarocks_type_contract::FunctionValueType,
+    ) -> Result<
+        Option<(i32, novarocks_type_contract::FunctionValueType)>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let original = arrow
+            .fields()
+            .iter()
+            .find(|candidate| candidate.name().eq_ignore_ascii_case(field.name()))
+            .expect("fixture source field");
+        let declaration = novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+            original.as_ref().clone(),
+            value.clone(),
+        )?;
+        resolve_statistics_field_with_declaration(
+            iceberg,
+            field,
+            lineage,
+            value,
+            None,
+            &declaration,
+        )
+    }
+
+    #[test]
+    fn statistics_canonical_bytes_preserve_storage_identity_and_reject_forged_width() {
+        use novarocks_spi::connector::ConnectorWriteFieldRequest;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let iceberg = schema(vec![Arc::new(NestedField::required(
+            31,
+            "payload",
+            Type::Primitive(PrimitiveType::Fixed(4)),
+        ))]);
+        let input = FunctionValueType::new(DataType::Binary, false);
+        let storage = FunctionValueType::new(DataType::FixedSizeBinary(4), false);
+        let field = Field::new("payload", DataType::Binary, false);
+        let declaration = ConnectorWriteFieldRequest::try_new_typed(field.clone(), input.clone())
+            .unwrap()
+            .with_storage_type(storage.clone())
+            .unwrap();
+        let (id, actual) = resolve_statistics_field_with_declaration(
+            &iceberg,
+            &field,
+            false,
+            &input,
+            Some(&storage),
+            &declaration,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(id, 31);
+        assert_eq!(actual, input);
+        assert_eq!(actual.logical_type(), ValueLogicalType::Physical);
+        for forged in [
+            None,
+            Some(FunctionValueType::new(DataType::FixedSizeBinary(8), false)),
+        ] {
+            assert!(
+                resolve_statistics_field_with_declaration(
+                    &iceberg,
+                    &field,
+                    false,
+                    &input,
+                    forged.as_ref(),
+                    &declaration,
+                )
+                .is_err()
+            );
+        }
+        let nominal = FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            false,
+            ValueLogicalType::Hll,
+        )
+        .unwrap();
+        assert!(
+            resolve_statistics_field_with_declaration(
+                &iceberg,
+                &field,
+                false,
+                &nominal,
+                Some(&storage),
+                &declaration,
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn write_phase_marker_identifies_session_attempt_and_phase_without_table_facts() {
         let session_id = IcebergWriteSessionId::from_bytes([1; 16]);
@@ -4007,7 +3913,7 @@ mod statistics_contract_tests {
                     &arrow,
                     &field,
                     false,
-                    &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false)
+                    &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
                 )
                 .is_err()
             );
@@ -4161,7 +4067,7 @@ mod statistics_contract_tests {
                         true,
                         novarocks_type_contract::ValueLogicalType::Uuid
                     )
-                    .unwrap()
+                    .unwrap(),
                 )
                 .is_err()
             );
@@ -4199,7 +4105,7 @@ mod statistics_contract_tests {
                 "object".into(),
             )]));
         assert_eq!(
-            resolve_statistics_field(&iceberg, &arrow, &conflicting, false, &frozen)
+            resolve_statistics_field(&iceberg, &arrow, &conflicting, false, &frozen,)
                 .unwrap()
                 .unwrap()
                 .1,
@@ -5678,9 +5584,6 @@ mod terminal_finalization_tests {
 }
 
 #[cfg(test)]
-mod shared_cow_admission_metadata_tests;
-
-#[cfg(test)]
 mod variant_statistics_tests {
     use super::*;
     #[test]
@@ -5702,13 +5605,6 @@ mod variant_statistics_tests {
         assert!(error.message().contains("Variant statistics"));
         assert!(error.message().contains("Variant writes are unsupported"));
     }
-}
-
-// The measured F is the exact factory above; no request or dummy Future is
-// constructed, polled or dropped to quote backing. Variable graphs remain on
-// their original formation-point receipts rather than guessed fixed minima.
-fn write_control_cow_future_bytes<A, B, C, F>(_: fn(A, B, C) -> F) -> usize {
-    std::mem::size_of::<F>()
 }
 
 fn write_control_future_bytes3<A, B, C, F>(_: fn(A, B, C) -> F) -> usize {
@@ -5736,19 +5632,12 @@ impl IcebergWriteSessionControl {
         let (handle, targets, statistics_metadata) = self
             .admit_async_with_rewrite_io(&request, rewrite_io)
             .await?;
-        let copy_on_write = match &request.flavor {
-            ConnectorWriteSessionFlavor::CopyOnWrite {
-                selection,
-                match_contract,
-            } => Some((selection.clone(), match_contract.clone())),
-            _ => None,
-        };
         session_plan_from_targets(
             &self.adapter,
             handle,
             targets,
             Some(&statistics_metadata),
-            copy_on_write,
+            Some(&request.context),
         )
     }
 

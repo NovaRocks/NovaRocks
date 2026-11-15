@@ -37,7 +37,6 @@
 
 pub(crate) mod codec;
 pub mod control;
-pub(crate) mod copy_on_write;
 pub mod domain;
 pub(crate) mod equality_schema;
 pub mod execution;

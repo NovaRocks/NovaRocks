@@ -194,8 +194,8 @@ fn partition_field_values_checked(
     schema: &crate::iceberg::spec::Schema,
     spec_id: i32,
     partition: &crate::iceberg::spec::Struct,
-    capture: Option<&crate::read_snapshot::cow_capture::CaptureScope<'_>>,
-) -> Result<Vec<IcebergPartitionFieldValue>, crate::read_snapshot::cow_capture::ReadFailure> {
+    capture: Option<&crate::read_snapshot::scoped_capture::CaptureScope<'_>>,
+) -> Result<Vec<IcebergPartitionFieldValue>, crate::read_snapshot::scoped_capture::ReadFailure> {
     let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
         return Err(format!("iceberg table metadata missing partition spec id {spec_id}").into());
     };
@@ -468,8 +468,10 @@ pub async fn extract_data_files_with_stats_at(
 /// This value is provider-private and never crosses a generic/native boundary.
 pub(crate) struct FrozenReadFileWithStats {
     pub stats: DataFileWithStats,
-    manifest: std::sync::Arc<crate::read_model::IcebergDataFileMetadata>,
-    deletes: crate::delete_semantics::LoadView,
+    // Retain the original typed facts through the shared rewrite capture's
+    // lifetime, even when only its statistics projection is read.
+    _manifest: std::sync::Arc<crate::read_model::IcebergDataFileMetadata>,
+    _deletes: crate::delete_semantics::LoadView,
 }
 
 impl FrozenReadFileWithStats {
@@ -480,29 +482,8 @@ impl FrozenReadFileWithStats {
     ) -> Self {
         Self {
             stats,
-            manifest,
-            deletes,
-        }
-    }
-
-    /// Move the exact original fields after legacy statistics, match and
-    /// branch-source validation completed. No file fact is guessed from its
-    /// path, catalog delete DTO, current table, or partition spelling.
-    pub(crate) fn into_read_file(self) -> crate::read_model::IcebergReadFile {
-        let stats = self.stats;
-        crate::read_model::IcebergReadFile {
-            path: stats.path,
-            size: stats.size,
-            record_count: stats.record_count,
-            column_stats: stats.column_stats,
-            partition_spec_id: stats.partition_spec_id,
-            partition_key: stats.partition_key,
-            partition_values: stats.partition_values,
-            manifest_path: stats.manifest_path,
-            first_row_id: stats.first_row_id,
-            data_sequence_number: stats.data_sequence_number,
-            manifest: self.manifest,
-            deletes: self.deletes,
+            _manifest: manifest,
+            _deletes: deletes,
         }
     }
 }
@@ -611,18 +592,18 @@ pub(crate) fn finish_data_files_with_stats_from_original_files<O>(
         .collect()
 }
 
-/// COW extracts the same complete live-file facts without constructing scan-only
+/// scoped extracts the same complete live-file facts without constructing scan-only
 /// DataFile clones or the unused IcebergDataFileMetadata graph.
 #[cfg(test)]
-pub(crate) async fn extract_cow_data_files_with_stats_at(
+pub(crate) async fn extract_scoped_data_files_with_stats_at(
     table: &Table,
     snapshot_id: i64,
 ) -> Result<Vec<DataFileWithStats>, String> {
-    extract_cow_data_files_with_stats_at_with_control(table, snapshot_id, None).await
+    extract_scoped_data_files_with_stats_at_with_control(table, snapshot_id, None).await
 }
 
 #[cfg(test)]
-pub(crate) async fn extract_cow_data_files_with_stats_at_with_control(
+pub(crate) async fn extract_scoped_data_files_with_stats_at_with_control(
     table: &Table,
     snapshot_id: i64,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
@@ -634,7 +615,7 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_control(
         .schema(metadata)
         .map_err(|error| format!("resolve Iceberg snapshot {snapshot_id} schema: {error}"))?;
     let files =
-        crate::read_snapshot::build_cow_read_files_at_with_control(table, snapshot_id, control)
+        crate::read_snapshot::build_scoped_read_files_at_with_control(table, snapshot_id, control)
             .await?;
     files
         .into_iter()
@@ -677,47 +658,22 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_control(
         .collect()
 }
 
-/// Original-window COW capture keeps all outputs under one neutral owner.
-pub(crate) struct CheckedCowDataFiles {
+/// Original-window scoped capture keeps all outputs under one neutral owner.
+pub(crate) struct CheckedDataFiles {
     pub files: Vec<FrozenReadFileWithStats>,
     pub _retention_guard: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
 }
 
-pub(crate) async fn extract_cow_data_files_with_stats_at_with_original_scope(
-    table: &Table,
-    snapshot_id: i64,
-    scope: &novarocks_spi::connector::ConnectorOriginalResultScope,
-) -> Result<CheckedCowDataFiles, novarocks_spi::connector::ConnectorCowBeginCause> {
-    use crate::read_snapshot::cow_capture::{CaptureScope, ReadFailure};
-    let build = async {
-        let capture = CaptureScope::new(scope)?;
-        let captured = crate::read_snapshot::build_cow_read_files_at_with_original_scope(
-            table,
-            snapshot_id,
-            &capture,
-        )
-        .await?;
-        finish_checked_cow_data_files_from_original_files(
-            table.metadata(),
-            snapshot_id,
-            captured,
-            scope,
-            &capture,
-        )
-    };
-    build.await.map_err(ReadFailure::into_cause)
-}
-
 /// Pure checked projection of the same original raw files. The caller retains
 /// its original operation and the exact captured files.
-pub(crate) fn finish_checked_cow_data_files_from_original_files(
+pub(crate) fn finish_checked_data_files_from_original_files(
     metadata: &crate::iceberg::spec::TableMetadata,
     snapshot_id: i64,
     captured: Vec<crate::read_model::IcebergReadFile>,
     scope: &novarocks_spi::connector::ConnectorOriginalResultScope,
-    capture: &crate::read_snapshot::cow_capture::CaptureScope<'_>,
-) -> Result<CheckedCowDataFiles, crate::read_snapshot::cow_capture::ReadFailure> {
-    use crate::read_snapshot::cow_capture::ReadFailure;
+    capture: &crate::read_snapshot::scoped_capture::CaptureScope<'_>,
+) -> Result<CheckedDataFiles, crate::read_snapshot::scoped_capture::ReadFailure> {
+    use crate::read_snapshot::scoped_capture::ReadFailure;
     let snapshot_schema = metadata
         .snapshot_by_id(snapshot_id)
         .ok_or_else(|| format!("Iceberg snapshot {snapshot_id} is absent from table metadata"))?
@@ -763,7 +719,7 @@ pub(crate) fn finish_checked_cow_data_files_from_original_files(
         ));
     }
     capture.active()?;
-    Ok::<_, ReadFailure>(CheckedCowDataFiles {
+    Ok::<_, ReadFailure>(CheckedDataFiles {
         files,
         _retention_guard: scope.retention_guard(),
     })

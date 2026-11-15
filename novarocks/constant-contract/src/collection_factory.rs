@@ -20,7 +20,7 @@
 
 use super::{
     ConstantError, ConstantPolicy, ConstantPool, ConstantValue, ValidationCounts, checked_add,
-    checked_mul, limit, validate_type, validation_envelope_core,
+    checked_mul, limit, validation_envelope_core,
 };
 use arrow_buffer::Buffer;
 use arrow_data::ArrayData;
@@ -71,6 +71,24 @@ fn preflight(
     policy: ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ConstantError> {
+    preflight_observed(
+        field,
+        ty,
+        recipe,
+        policy,
+        &mut super::PoolObserver::plain(),
+        work,
+    )
+    .map(|_| ())
+}
+fn preflight_observed<E: super::PoolFailure>(
+    field: &Field,
+    ty: &FunctionValueType,
+    recipe: CollectionRecipe,
+    policy: ConstantPolicy,
+    observer: &mut super::PoolObserver<'_, E>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<u64, E> {
     let CollectionRecipe {
         nodes,
         depth,
@@ -78,7 +96,7 @@ fn preflight(
         buffers,
         backing,
     } = recipe;
-    let metadata = validate_type(field, ty, policy, work)?;
+    let metadata = super::validate_type_owned(field, ty, policy, observer, work)?;
     limit(1, policy.max_rows, "collection factory row limit exceeded")?;
     limit(
         nodes,
@@ -136,8 +154,8 @@ fn preflight(
         policy.max_library_validation_bytes,
         "collection factory library byte limit exceeded",
     )?;
-    work.step()?;
-    Ok(())
+    observer.step(work)?;
+    Ok(retained)
 }
 fn array(
     builder: arrow_data::ArrayDataBuilder,
@@ -386,3 +404,322 @@ impl ConstantValue {
 #[cfg(test)]
 #[path = "collection_factory_tests.rs"]
 mod tests;
+
+/// The original finite pre-array recipe, including raw Map entries nodes.
+/// No values are manufactured below the one real empty root.
+fn empty_recipe<E: super::PoolFailure>(
+    ty: &DataType,
+    root: bool,
+    depth: u32,
+    policy: ConstantPolicy,
+    recipe: &mut CollectionRecipe,
+    observer: &mut super::PoolObserver<'_, E>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), E> {
+    observer.step(work)?;
+    limit(
+        u64::from(depth),
+        u64::from(policy.max_type_depth),
+        "empty collection depth limit exceeded",
+    )?;
+    limit(
+        u64::from(depth),
+        novarocks_type_contract::MAX_VALUE_TYPE_DEPTH as u64,
+        "empty collection intrinsic depth exceeded",
+    )?;
+    recipe.nodes = checked_add(recipe.nodes, 1)?;
+    limit(
+        recipe.nodes,
+        policy.max_array_nodes,
+        "empty collection array node limit exceeded",
+    )?;
+    recipe.depth = recipe.depth.max(depth);
+    let (buffers, inspected) = empty_buffer_shape(ty, root);
+    recipe.buffers = checked_add(recipe.buffers, buffers as u64)?;
+    recipe.backing = checked_add(recipe.backing, inspected as u64)?;
+    for index in 0..empty_child_count(ty) {
+        empty_recipe(
+            empty_child_type(ty, index),
+            false,
+            depth + 1,
+            policy,
+            recipe,
+            observer,
+            work,
+        )?;
+    }
+    Ok(())
+}
+fn empty_child_count(ty: &DataType) -> usize {
+    match ty {
+        DataType::Struct(fields) => fields.len(),
+        DataType::Union(fields, _) => fields.len(),
+        DataType::RunEndEncoded(_, _) => 2,
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::Map(_, _)
+        | DataType::Dictionary(_, _) => 1,
+        _ => 0,
+    }
+}
+fn empty_child_type(ty: &DataType, index: usize) -> &DataType {
+    match ty {
+        DataType::Struct(fields) => fields[index].data_type(),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .nth(index)
+            .expect("counted union child")
+            .1
+            .data_type(),
+        DataType::RunEndEncoded(run, value) => {
+            if index == 0 {
+                run.data_type()
+            } else {
+                value.data_type()
+            }
+        }
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => field.data_type(),
+        DataType::Dictionary(_, value) => value,
+        _ => unreachable!("only a counted physical child is borrowed"),
+    }
+}
+// Number of actual Buffer handles and bytes a safe Arrow builder can inspect.
+// All handles borrow the same aligned zero backing; no payload is read or cast.
+fn empty_buffer_shape(ty: &DataType, root: bool) -> (usize, usize) {
+    match ty {
+        DataType::Null
+        | DataType::Struct(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::RunEndEncoded(_, _) => (0, 0),
+        DataType::Utf8 | DataType::Binary => (2, 4),
+        DataType::LargeUtf8 | DataType::LargeBinary => (2, 8),
+        DataType::List(_) | DataType::Map(_, _) => (1, if root { 8 } else { 4 }),
+        DataType::LargeList(_) => (1, if root { 16 } else { 8 }),
+        DataType::ListView(_) | DataType::LargeListView(_) => (2, 0),
+        DataType::Union(_, arrow_schema::UnionMode::Dense) => (2, 0),
+        _ => (1, 0),
+    }
+}
+fn empty_reserve<T, E: super::PoolFailure>(
+    count: usize,
+    observer: &mut super::PoolObserver<'_, E>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<T>, E> {
+    let layout = Layout::array::<T>(count)
+        .map_err(|cause| ConstantError::array_backing::<T>(count, cause))?;
+    observer.request(layout, work)?;
+    reserve(count, work).map_err(Into::into)
+}
+fn empty_type_clone<E: super::PoolFailure>(
+    ty: &DataType,
+    observer: &mut super::PoolObserver<'_, E>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DataType, E> {
+    use novarocks_type_contract::{ValueConstructionFailure as F, ValueConstructionRequest as R};
+    let mut visit = |request| match request {
+        R::Exact(layout) => observer.request(layout, work),
+        R::Work(units) => {
+            for _ in 0..units {
+                observer.step(work)?;
+            }
+            Ok(())
+        }
+        R::OpaqueUpper(bytes) => {
+            observer.work(bytes)?;
+            if let Some(creator) = &mut observer.creator {
+                work.flush()?;
+                creator.opaque(bytes, super::PoolStructureClass::Temporary)?;
+            }
+            Ok(())
+        }
+    };
+    novarocks_type_contract::clone_data_type_with_construction(ty, Some(&mut visit)).map_err(
+        |cause| match cause {
+            F::Observer(cause) => cause,
+            F::ValueType(cause) => ConstantError::Type(cause.into()).into(),
+            F::Layout(cause) => ConstantError::from_domain(cause).into(),
+            F::Vec(cause) => ConstantError::from_domain(cause).into(),
+            F::HashMap(cause) => ConstantError::from_domain(cause).into(),
+            F::BTree(cause) => ConstantError::from_domain(cause).into(),
+            F::Rule(_) => {
+                ConstantError::Invalid("validated empty collection type clone rejected a rule")
+                    .into()
+            }
+        },
+    )
+}
+fn empty_array<E: super::PoolFailure>(
+    ty: &DataType,
+    root: bool,
+    zeros: &Buffer,
+    observer: &mut super::PoolObserver<'_, E>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ArrayData, E> {
+    observer.step(work)?;
+    let (count, bytes) = empty_buffer_shape(ty, root);
+    let mut buffers = empty_reserve(count, observer, work)?;
+    for index in 0..count {
+        observer.step(work)?;
+        let len = if index == 0 { bytes } else { 0 };
+        buffers.push(zeros.slice_with_length(0, len));
+    }
+    let mut children = empty_reserve(empty_child_count(ty), observer, work)?;
+    for index in 0..empty_child_count(ty) {
+        children.push(empty_array(
+            empty_child_type(ty, index),
+            false,
+            zeros,
+            observer,
+            work,
+        )?);
+    }
+    let data_type = empty_type_clone(ty, observer, work)?;
+    let builder = ArrayData::builder(data_type)
+        .len(usize::from(root))
+        .buffers(buffers)
+        .child_data(children);
+    let data = array(builder, work)?;
+    observer.step(work)?;
+    Ok(data)
+}
+fn empty_collection_data<E: super::PoolFailure>(
+    field: &Field,
+    ty: &FunctionValueType,
+    policy: ConstantPolicy,
+    observer: &mut super::PoolObserver<'_, E>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ArrayData, E> {
+    // These pre-array refusals precede even creator request observation.
+    limit(1, policy.max_rows, "empty collection row limit exceeded")?;
+    limit(
+        1,
+        policy.max_array_nodes,
+        "empty collection array node limit exceeded",
+    )?;
+    observer.step(work)?;
+    if !matches!(
+        field.data_type(),
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _)
+    ) {
+        return Err(ConstantError::Invalid(
+            "empty collection factory requires List, LargeList or Map root",
+        )
+        .into());
+    }
+    let mut recipe = CollectionRecipe {
+        nodes: 0,
+        depth: 0,
+        elements: 1,
+        buffers: 0,
+        backing: 16,
+    };
+    empty_recipe(
+        field.data_type(),
+        true,
+        1,
+        policy,
+        &mut recipe,
+        observer,
+        work,
+    )?;
+    // Reuse the existing construction/validation numerical owner. Its finite
+    // header/backing envelope also covers the one shared Arrow Buffer handle.
+    let opaque = preflight_observed(field, ty, recipe, policy, observer, work)?;
+    observer.work(usize::try_from(opaque).map_err(|_| CompileControlError::ResourceExhausted)?)?;
+    if let Some(creator) = &mut observer.creator {
+        work.flush()?;
+        creator.opaque(
+            usize::try_from(opaque).map_err(|_| CompileControlError::ResourceExhausted)?,
+            super::PoolStructureClass::Temporary,
+        )?;
+    }
+    // u128 alignment suffices for every accepted zero-length primitive/view
+    // child, including Decimal256. All offsets are literal zero bytes. Reuse
+    // this same backing even for empty buffers, rather than allocating one
+    // private Arrow Bytes owner for every empty child.
+    let mut zero = empty_reserve::<u128, E>(1, observer, work)?;
+    zero.push(0);
+    let zeros = buffer(zero, work)?;
+    empty_array(field.data_type(), true, &zeros, observer, work)
+}
+
+impl ConstantValue {
+    /// Construct exactly one actual non-NULL empty List, LargeList or Map.
+    /// The original Field/FVT and all nested nominal facts remain authored by
+    /// the caller. There are no child values, casts or inferred annotations.
+    pub fn from_empty_collection(
+        field: Arc<Field>,
+        ty: FunctionValueType,
+        policy: ConstantPolicy,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ConstantError> {
+        let mut work = CompileCheckpoints::try_new(control, phase)?;
+        let mut observer: super::PoolObserver<'_, ConstantError> = super::PoolObserver::plain();
+        let result = (|| {
+            let data = empty_collection_data(&field, &ty, policy, &mut observer, &mut work)?;
+            let pool = ConstantPool::try_new_body(
+                field,
+                ty,
+                data,
+                policy,
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                None,
+                &mut observer,
+                &mut work,
+            )?;
+            pool.value(0)
+        })();
+        finish(work, result)
+    }
+    /// The same finite builder under the original creator and cumulative
+    /// constant-owner observation. The caller owns entry and finish callbacks.
+    pub fn from_empty_collection_with_creator_in<H>(
+        field: Arc<Field>,
+        ty: FunctionValueType,
+        policy: ConstantPolicy,
+        source: super::ConstantSourceOwner,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        admit: &mut impl FnMut(
+            &super::ConstantOwnerResourceFacts,
+        ) -> Result<(), super::ConstantCreationFailure<H>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, super::ConstantCreationFailure<H>> {
+        use super::ConstantCreationFailure as Failure;
+        if !Arc::ptr_eq(&field, source.field_ref()) {
+            return Err(ConstantError::Invalid(
+                "empty collection creator requires its original source Field",
+            )
+            .into());
+        }
+        limit(1, policy.max_rows, "empty collection row limit exceeded")?;
+        let storage = creation
+            .storage_lifetime()
+            .retaining_observed(&source.storage_lifetime(), |layout| {
+                creation.request_layout(layout).map_err(Failure::Creator)
+            })?;
+        let mut creator = super::PoolCreator(creation);
+        let mut observer = super::PoolObserver::parent(admit);
+        observer.creator = Some(&mut creator);
+        let data = empty_collection_data(&field, &ty, policy, &mut observer, work)?;
+        let pool = ConstantPool::try_new_body(
+            field,
+            ty,
+            data,
+            policy,
+            storage,
+            Some(source),
+            &mut observer,
+            work,
+        )?;
+        pool.value(0).map_err(Into::into)
+    }
+}

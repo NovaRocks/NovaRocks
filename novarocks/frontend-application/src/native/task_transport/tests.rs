@@ -492,8 +492,183 @@ enum SubscribeAnswer {
     StallOpening,
 }
 
+/// One fixed healthy external peer script for the installed-host test. These
+/// are wire facts authored by this peer, never FE local-work exit reports.
+/// Only the fixed external test peer waits here. A release is persistent;
+/// registration precedes checking it, and canceled RPCs drop their waiter.
+struct SingleRootIoGate {
+    released: std::sync::atomic::AtomicBool,
+    waiters: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+struct SingleRootIoWaiter<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for SingleRootIoWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl SingleRootIoGate {
+    fn new() -> Self {
+        Self {
+            released: std::sync::atomic::AtomicBool::new(false),
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait(&self) {
+        use std::sync::atomic::Ordering;
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+        let _waiter = SingleRootIoWaiter(&self.waiters);
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn waiting(&self) -> bool {
+        self.waiters.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.changed.notify_waiters();
+    }
+}
+
+struct SingleRootIoGates {
+    first_subscription_selected: bool,
+    first_subscription: Arc<SingleRootIoGate>,
+    create: Arc<SingleRootIoGate>,
+}
+
+struct SingleRootLifecycle {
+    io_gates: Option<SingleRootIoGates>,
+    root: TaskIdentity,
+    kind: novarocks_result_contract::RootOutputKind,
+    participation: Option<ParticipationRef>,
+    ticket_issued: bool,
+    revision: u64,
+    running_revision: Option<u64>,
+    status_revision: Option<u64>,
+    task_revision: Option<u64>,
+    quiesce_revision: Option<u64>,
+    participation_revision: Option<u64>,
+    root_end_offered: bool,
+    root_consumed: u64,
+    established: bool,
+    created: bool,
+    quiesce: Option<QuiesceParticipationReceipt>,
+    released: bool,
+    abort_cause: Option<AbortCause>,
+}
+
+impl SingleRootLifecycle {
+    fn bind_participation(&mut self, participation: ParticipationRef) -> Result<(), Status> {
+        if self.root.verify_participation(participation).is_err()
+            || self
+                .participation
+                .is_some_and(|original| original != participation)
+        {
+            return Err(Status::failed_precondition(
+                "single-root peer participation mismatch",
+            ));
+        }
+        self.participation = Some(participation);
+        Ok(())
+    }
+
+    fn next_revision(&mut self) -> u64 {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("five fixed peer facts fit");
+        self.revision
+    }
+
+    fn quiesce_receipt(&self) -> &QuiesceParticipationReceipt {
+        self.quiesce
+            .as_ref()
+            .expect("the first exact fence receipt is retained")
+    }
+
+    fn require_participation(&self, participation: ParticipationRef) -> Result<(), Status> {
+        if self.participation != Some(participation)
+            || self.root.verify_participation(participation).is_err()
+        {
+            return Err(Status::failed_precondition(
+                "single-root peer participation mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn running_status(&self) -> TaskStatus {
+        TaskStatus::try_new(
+            self.root,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::default(),
+        )
+        .expect("the fixed peer started its one installed root")
+    }
+
+    fn finished_status(&self) -> TaskStatus {
+        TaskStatus::try_new(
+            self.root,
+            TaskStatusVersion::new(3).unwrap(),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .expect("the fixed peer finished its one installed root")
+    }
+
+    fn completion_frames(&self) -> [proto::TaskStatusStreamEvent; 3] {
+        [
+            self.frame(
+                CoveredStatusStreamFact::Status(self.running_status()),
+                self.running_revision,
+            ),
+            self.frame(
+                CoveredStatusStreamFact::Status(self.finished_status()),
+                self.status_revision,
+            ),
+            self.frame(
+                CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
+                    self.root,
+                    TaskConvergenceVersion::FIRST,
+                )),
+                self.task_revision,
+            ),
+        ]
+    }
+
+    fn frame(
+        &self,
+        fact: CoveredStatusStreamFact,
+        source_revision: Option<u64>,
+    ) -> proto::TaskStatusStreamEvent {
+        encode_covered_status_event(&CoveredStatusStreamEvent {
+            fact,
+            source_revision,
+        })
+        .expect("fixed single-root peer fact encodes")
+    }
+}
+
 #[derive(Default)]
 struct PeerState {
+    single_root: Option<SingleRootLifecycle>,
     applied: Vec<proto::ApplyTaskOperationsRequest>,
     control_requests: usize,
     heartbeat_descriptor: Option<BackendProcessDescriptor>,
@@ -525,6 +700,32 @@ impl TaskWirePeer {
         request: Request<proto::ApplyTaskOperationsRequest>,
     ) -> Result<Response<proto::ApplyTaskOperationsResponse>, Status> {
         let request = request.into_inner();
+        let (scripted, create_gate) = {
+            let state = self.state.lock().expect("peer state");
+            let script = state.single_root.as_ref();
+            let create = request.operations.iter().any(|operation| {
+                matches!(
+                    operation.operation.as_ref(),
+                    Some(proto::task_operation::Operation::CreateTask(_))
+                )
+            });
+            let gate = create
+                .then(|| {
+                    script
+                        .and_then(|script| script.io_gates.as_ref())
+                        .map(|gates| Arc::clone(&gates.create))
+                })
+                .flatten();
+            (script.is_some(), gate)
+        };
+        if let Some(gate) = create_gate {
+            // The actual Create RPC remains pending. No model mutation or ACK
+            // happens before the fixture releases this original I/O future.
+            gate.wait().await;
+        }
+        if scripted {
+            return self.apply_single_root(request);
+        }
         let answer = {
             let mut state = self.state.lock().expect("peer state");
             state.applied.push(request.clone());
@@ -597,6 +798,439 @@ impl TaskWirePeer {
         Ok(Response::new(proto::ApplyTaskOperationsResponse {
             receipts,
         }))
+    }
+
+    /// Fixed single-root branch only; the existing generic wire tests keep
+    /// their original explicit answer queues. Unknown commands never succeed.
+    fn apply_single_root(
+        &self,
+        request: proto::ApplyTaskOperationsRequest,
+    ) -> Result<Response<proto::ApplyTaskOperationsResponse>, Status> {
+        use novarocks_execution_contract::{
+            LeaseReceipt, ParticipationAdmissionTicketReceipt, ReleaseOutcome,
+        };
+        use novarocks_task_codec::operation::{
+            DecodedOperation as D, DecodedUpdateParticipation as U,
+        };
+        let decoded = request
+            .operations
+            .iter()
+            .map(|operation| {
+                codec::decode_operation(operation, FieldPath::root("single_root_peer"))
+                    .map_err(|_| Status::invalid_argument("single-root operation did not decode"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut state = self.state.lock().expect("peer state");
+        state.applied.push(request.clone());
+        let PeerState {
+            single_root, held, ..
+        } = &mut *state;
+        let script = single_root
+            .as_mut()
+            .expect("enabled fixed single-root script");
+        let mut receipts = Vec::with_capacity(request.operations.len());
+        for (wire, operation) in request.operations.iter().zip(decoded) {
+            let mut finish = false;
+            let mut fence = false;
+            let mut release = false;
+            let mut outcome = OperationOutcome::Accepted;
+            let ack = match operation {
+                D::AcquireParticipationAdmissionTicket(acquire) => {
+                    let participation = acquire.participation();
+                    script.bind_participation(participation)?;
+                    script.ticket_issued = true;
+                    Some(
+                        proto::task_operation_verdict::Ack::ParticipationAdmissionTicket(
+                            codec::encode_participation_admission_ticket_ack(
+                                ParticipationAdmissionTicketReceipt::new(
+                                    AdmissionTicketId::try_from_bytes([0x57; 16]).unwrap(),
+                                    participation,
+                                    acquire.valid_for(),
+                                ),
+                            ),
+                        ),
+                    )
+                }
+                D::UpdateParticipation(U::Establish(establish)) => {
+                    script.require_participation(establish.participation())?;
+                    if !script.ticket_issued
+                        || establish.admission_ticket_id()
+                            != AdmissionTicketId::try_from_bytes([0x57; 16]).unwrap()
+                        || script.released
+                        || script.abort_cause.is_some()
+                    {
+                        return Err(Status::failed_precondition(
+                            "single-root establish is not admitted",
+                        ));
+                    }
+                    script.established = true;
+                    Some(proto::task_operation_verdict::Ack::Participation(
+                        encode_participation_ack(
+                            &ParticipationReceipt::new(
+                                establish.participation(),
+                                ParticipationState::Active,
+                            )
+                            .with_lease(LeaseReceipt::new(
+                                LeaseSequence::INITIAL,
+                                establish.initial_lease_valid_for(),
+                                establish.initial_lease_valid_for().get(),
+                            )),
+                            None,
+                        )
+                        .expect("active participation and its actual initial lease encode"),
+                    ))
+                }
+                D::UpdateParticipation(U::RenewLease {
+                    participation,
+                    sequence,
+                    valid_for,
+                    ..
+                }) => {
+                    script.require_participation(participation)?;
+                    if !script.established || script.released {
+                        return Err(Status::failed_precondition(
+                            "single-root renew has no active owner",
+                        ));
+                    }
+                    let state = if script.abort_cause.is_some() {
+                        ParticipationState::Aborting
+                    } else if script.quiesce.is_some() {
+                        ParticipationState::Quiescing
+                    } else {
+                        ParticipationState::Active
+                    };
+                    Some(proto::task_operation_verdict::Ack::Participation(
+                        encode_participation_ack(
+                            &ParticipationReceipt::new(participation, state).with_lease(
+                                LeaseReceipt::new(sequence, valid_for, valid_for.get()),
+                            ),
+                            script.abort_cause,
+                        )
+                        .expect("original participation state and exact renewed lease encode"),
+                    ))
+                }
+                D::CreateTask(create) => {
+                    script.require_participation(create.request().participation())?;
+                    if create.request().identity() != script.root
+                        || !script.established
+                        || script.quiesce.is_some()
+                        || script.released
+                        || script.abort_cause.is_some()
+                    {
+                        return Err(Status::failed_precondition(
+                            "single-root Create is not admitted",
+                        ));
+                    }
+                    let status = if script.created {
+                        script.finished_status()
+                    } else {
+                        TaskStatus::created(script.root).with_installed()
+                    };
+                    finish = !script.created;
+                    if finish {
+                        // Each actual modeled publication owns its revision.
+                        // Running is published even when a later catch-up
+                        // retains only the latest Finished snapshot.
+                        script.running_revision = Some(script.next_revision());
+                        script.status_revision = Some(script.next_revision());
+                        script.task_revision = Some(script.next_revision());
+                    }
+                    script.created = true;
+                    Some(Self::create_ack(script.root, status))
+                }
+                D::QuiesceParticipation(quiesce) => {
+                    script.require_participation(quiesce.participation())?;
+                    fence = script.quiesce.is_none();
+                    if fence {
+                        // Freeze the actual first decision, including its
+                        // state and accepted membership. Later close state
+                        // cannot rewrite an ACK or catch-up snapshot.
+                        script.quiesce = Some(QuiesceParticipationReceipt::new(
+                            quiesce.participation(),
+                            1, // The production first immutable QuiesceDecision fence is 1.
+                            if script.created {
+                                vec![script.root]
+                            } else {
+                                Vec::new()
+                            },
+                            if script.abort_cause.is_some() {
+                                ParticipationState::Aborting
+                            } else {
+                                ParticipationState::Quiescing
+                            },
+                        ));
+                        script.quiesce_revision = Some(script.next_revision());
+                    } else {
+                        outcome = OperationOutcome::Idempotent;
+                    }
+                    Some(proto::task_operation_verdict::Ack::QuiesceParticipation(
+                        codec::encode_quiesce_ack(script.quiesce_receipt())
+                            .expect("the exact single-root admission fence encodes"),
+                    ))
+                }
+                D::ReleaseParticipation(original) => {
+                    script.require_participation(original.participation())?;
+                    if script.quiesce.is_none() && script.abort_cause.is_none() {
+                        return Err(Status::failed_precondition(
+                            "single-root release precedes its fence",
+                        ));
+                    }
+                    release = !script.released;
+                    script.released = true;
+                    if release {
+                        script.participation_revision = Some(script.next_revision());
+                    }
+                    let mut receipt = codec::encode_release_ack(
+                        original.participation(),
+                        ReleaseOutcome::Released,
+                        ParticipationState::TerminalRetained,
+                        None,
+                    )
+                    .expect("the original single-root release encodes");
+                    receipt.termination_cause =
+                        script.abort_cause.map(codec::encode_abort_cause_field);
+                    Some(proto::task_operation_verdict::Ack::ReleaseParticipation(
+                        receipt,
+                    ))
+                }
+                D::AbortParticipation(abort) => {
+                    script.require_participation(abort.participation())?;
+                    if !script.released {
+                        script.abort_cause = Some(abort.cause());
+                    } else {
+                        outcome = OperationOutcome::Idempotent;
+                    }
+                    Some(proto::task_operation_verdict::Ack::Participation(
+                        encode_participation_ack(
+                            &ParticipationReceipt::new(
+                                abort.participation(),
+                                if script.released {
+                                    ParticipationState::TerminalRetained
+                                } else {
+                                    ParticipationState::Aborting
+                                },
+                            ),
+                            script.abort_cause,
+                        )
+                        .expect("the original abort cause and closed state encode"),
+                    ))
+                }
+                D::CancelTask(cancel) => {
+                    if cancel.identity() != script.root {
+                        return Err(Status::failed_precondition(
+                            "single-root cancel identity mismatch",
+                        ));
+                    }
+                    // This peer's only created task is already terminal; never
+                    // replace Finished with a new cancellation status.
+                    outcome = if script.created {
+                        OperationOutcome::Idempotent
+                    } else {
+                        OperationOutcome::NotReady
+                    };
+                    None
+                }
+                _ => {
+                    return Err(Status::failed_precondition(
+                        "operation is outside the fixed single-root script",
+                    ));
+                }
+            };
+            if finish {
+                for frame in script.completion_frames() {
+                    Self::queue_single_root_frame(held, frame)?;
+                }
+            }
+            if fence {
+                let frame = script.frame(
+                    CoveredStatusStreamFact::Quiesce(script.quiesce_receipt().clone()),
+                    script.quiesce_revision,
+                );
+                Self::queue_single_root_frame(held, frame)?;
+            }
+            if release {
+                let frame = script.frame(
+                    CoveredStatusStreamFact::ParticipationConvergence(convergence_receipt(
+                        script.participation.expect("release has an exact owner"),
+                    )),
+                    script.participation_revision,
+                );
+                Self::queue_single_root_frame(held, frame)?;
+                // Real server EOF after the queued original strong fact. This
+                // is not an FE SubscriptionExited or actual-exit input.
+                held.clear();
+            }
+            receipts.push(proto::TaskOperationReceipt {
+                operation_id: wire
+                    .envelope
+                    .as_ref()
+                    .and_then(|envelope| envelope.operation_id.clone()),
+                result: Some(proto::task_operation_receipt::Result::Verdict(
+                    proto::TaskOperationVerdict {
+                        outcome: encode_operation_outcome(outcome),
+                        safe_detail: String::new(),
+                        safe_field_path: None,
+                        ack,
+                    },
+                )),
+            });
+        }
+        Ok(Response::new(proto::ApplyTaskOperationsResponse {
+            receipts,
+        }))
+    }
+
+    fn queue_single_root_frame(
+        held: &[tokio::sync::mpsc::Sender<Result<proto::TaskStatusStreamEvent, Status>>],
+        frame: proto::TaskStatusStreamEvent,
+    ) -> Result<(), Status> {
+        // A fixed script has at most one open stream and at most seven frames.
+        // Enqueue under the original PeerState gate so Create cannot overtake
+        // its subscription's catch-up snapshot. No extra sender job exists.
+        if let Some(sender) = held.last().filter(|sender| !sender.is_closed()) {
+            sender
+                .try_send(Ok(frame))
+                .map_err(|_| Status::resource_exhausted("single-root stream did not drain"))?;
+        }
+        Ok(())
+    }
+
+    fn subscribe_single_root(
+        &self,
+        request: proto::SubscribeTaskStatusRequest,
+        close_after_initial: bool,
+    ) -> Result<Response<StatusStream>, Status> {
+        let decoded = decode_covered_subscribe_task_status(
+            &request,
+            FieldPath::root("single_root_subscription"),
+        )
+        .map_err(|_| Status::invalid_argument("single-root subscription did not decode"))?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let mut state = self.state.lock().expect("peer state");
+        state.subscribed.push(request);
+        let PeerState {
+            single_root, held, ..
+        } = &mut *state;
+        let script = single_root
+            .as_mut()
+            .expect("enabled fixed single-root script");
+        script.bind_participation(decoded.participation)?;
+        if decoded
+            .required_identities
+            .iter()
+            .any(|task| *task != script.root)
+            || decoded
+                .status_cursors
+                .iter()
+                .any(|cursor| cursor.identity() != script.root)
+            || decoded
+                .task_convergence_cursors
+                .iter()
+                .any(|cursor| cursor.identity() != script.root)
+            || held.iter().any(|sender| !sender.is_closed())
+        {
+            return Err(Status::failed_precondition(
+                "single-root subscription has a foreign task or live predecessor",
+            ));
+        }
+        let status_version = decoded
+            .status_cursors
+            .iter()
+            .find_map(|cursor| cursor.current_version());
+        let task_version = decoded
+            .task_convergence_cursors
+            .iter()
+            .find_map(|cursor| cursor.current_version());
+        let participation_version = decoded
+            .participation_cursor
+            .and_then(|cursor| cursor.current_version());
+        if status_version.is_some_and(|version| !script.created || version.get() > 3)
+            || task_version
+                .is_some_and(|version| !script.created || version > TaskConvergenceVersion::FIRST)
+            || participation_version.is_some_and(|version| {
+                !script.released || version > ParticipationConvergenceVersion::FIRST
+            })
+            || decoded
+                .quiesce_cursor
+                .and_then(|cursor| cursor.fence_version)
+                .is_some_and(|version| script.quiesce.is_none() || version.get() > 1)
+        {
+            return Err(Status::failed_precondition(
+                "single-root subscription cursor is ahead of its retained fact",
+            ));
+        }
+        held.clear();
+        // Initial facts carry no live source revision. The exact original
+        // catch-up cut below separates snapshot replay from later live frames.
+        if script.created {
+            let status = if status_version == Some(TaskStatusVersion::new(3).unwrap()) {
+                CoveredStatusStreamFact::StatusUnchanged(script.root)
+            } else {
+                CoveredStatusStreamFact::Status(script.finished_status())
+            };
+            sender
+                .try_send(Ok(script.frame(status, None)))
+                .expect("fixed snapshot fits");
+            let task = if task_version == Some(TaskConvergenceVersion::FIRST) {
+                CoveredStatusStreamFact::TaskConvergenceUnchanged(script.root)
+            } else {
+                CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
+                    script.root,
+                    TaskConvergenceVersion::FIRST,
+                ))
+            };
+            sender
+                .try_send(Ok(script.frame(task, None)))
+                .expect("fixed snapshot fits");
+        } else if !decoded.required_identities.is_empty() || !decoded.status_cursors.is_empty() {
+            sender
+                .try_send(Ok(
+                    script.frame(CoveredStatusStreamFact::Unknown(script.root), None)
+                ))
+                .expect("fixed absence snapshot fits");
+        }
+        if script.quiesce.is_some() {
+            sender
+                .try_send(Ok(script.frame(
+                    CoveredStatusStreamFact::Quiesce(script.quiesce_receipt().clone()),
+                    None,
+                )))
+                .expect("fixed fence snapshot fits");
+        }
+        if script.released && participation_version != Some(ParticipationConvergenceVersion::FIRST)
+        {
+            sender
+                .try_send(Ok(script.frame(
+                    CoveredStatusStreamFact::ParticipationConvergence(convergence_receipt(
+                        decoded.participation,
+                    )),
+                    None,
+                )))
+                .expect("fixed release snapshot fits");
+        }
+        sender
+            .try_send(Ok(script.frame(
+                CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
+                    generation: decoded.generation.get(),
+                    initial_cut: script.revision,
+                }),
+                None,
+            )))
+            .expect("fixed catch-up cut fits the original channel");
+        if !script.released && !close_after_initial {
+            held.push(sender);
+        }
+        // In the selected first-response mode, dropping this actual sender
+        // yields real server EOF after the queued typed catch-up frames.
+        drop(state);
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
+    fn create_ack(task: TaskIdentity, status: TaskStatus) -> proto::task_operation_verdict::Ack {
+        proto::task_operation_verdict::Ack::CreateTask(
+            codec::encode_create_task_ack(&CreateTaskReceipt::new(task, Vec::new(), status))
+                .expect("the exact Create acknowledgement encodes"),
+        )
     }
 
     fn rejected(rpc: &str) -> Status {
@@ -791,6 +1425,28 @@ impl NovaRocksGrpc for TaskWirePeer {
         if !NativeRpcMethod::SubscribeTaskStatus.is_allowed_at(self.domain) {
             return Err(Self::rejected("wrong endpoint domain"));
         }
+        let (scripted, first_response) = {
+            let mut state = self.state.lock().expect("peer state");
+            let script = state.single_root.as_mut();
+            let configured = script.is_some();
+            let first = script
+                .and_then(|script| script.io_gates.as_mut())
+                .filter(|gates| !gates.first_subscription_selected)
+                .map(|gates| {
+                    gates.first_subscription_selected = true;
+                    Arc::clone(&gates.first_subscription)
+                });
+            (configured, first)
+        };
+        let first_eof = first_response.is_some();
+        if let Some(gate) = first_response {
+            // Actual request arrival is observable, but response headers and
+            // the original catch-up stream are held until explicit release.
+            gate.wait().await;
+        }
+        if scripted {
+            return self.subscribe_single_root(request.into_inner(), first_eof);
+        }
         let answer = {
             let mut state = self.state.lock().expect("peer state");
             state.subscribed.push(request.into_inner());
@@ -842,9 +1498,91 @@ impl NovaRocksGrpc for TaskWirePeer {
 
     async fn fetch_root_result(
         &self,
-        _request: Request<proto::FetchRootResultRequest>,
+        request: Request<proto::FetchRootResultRequest>,
     ) -> Result<Response<proto::FetchRootResultResponse>, Status> {
-        Err(Self::rejected("FetchRootResult"))
+        use novarocks_execution_contract::root_result::{
+            RootReadDeferral, RootReadDeferred, RootReadOutcome, RootReadResponse, RootResultEnd,
+            RootResultReply,
+        };
+        // Unconfigured generic peers retain their original method rejection,
+        // including malformed requests. Only the explicit script parses V1.
+        let scripted = { self.state.lock().expect("peer state").single_root.is_some() };
+        if !scripted {
+            return Err(Self::rejected("FetchRootResult"));
+        }
+        if !NativeRpcMethod::FetchRootResult.is_allowed_at(self.domain) {
+            return Err(Self::rejected("wrong root endpoint domain"));
+        }
+        let wire = request.into_inner();
+        if prost::Message::encoded_len(&wire)
+            > novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES
+        {
+            return Err(Status::resource_exhausted(
+                "fixed root request exceeds its V1 envelope",
+            ));
+        }
+        let read = novarocks_task_codec::root_result::decode_read(
+            &wire,
+            FieldPath::root("single_root_read"),
+        )
+        .map_err(|_| Status::invalid_argument("single-root read did not decode"))?;
+        let response = {
+            let mut state = self.state.lock().expect("peer state");
+            let script = state
+                .single_root
+                .as_mut()
+                .ok_or_else(|| Self::rejected("root is not installed"))?;
+            if read.root_task() != script.root
+                || read.kind() != script.kind
+                || read.profile() != novarocks_result_contract::RootProfileId::V1
+            {
+                return Err(Status::failed_precondition(
+                    "root read differs from its explicit fixture declaration",
+                ));
+            }
+            if !script.created {
+                RootReadResponse::Deferred(RootReadDeferred::for_request(
+                    &read,
+                    RootReadDeferral::Preparing,
+                ))
+            } else {
+                if read.consumed() > u64::from(script.root_end_offered) {
+                    return Err(Status::invalid_argument(
+                        "root ACK exceeds the offered End sequence",
+                    ));
+                }
+                if !script.released {
+                    script.root_consumed = script.root_consumed.max(read.consumed());
+                }
+                let outcome = if script.released {
+                    RootReadOutcome::AwaitTerminalControl
+                } else if read.wanted().is_none() {
+                    RootReadOutcome::AckOnly
+                } else if read.wanted().unwrap().get() <= script.root_consumed {
+                    RootReadOutcome::Retired
+                } else if read.wanted().unwrap().get() == 1 {
+                    script.root_end_offered = true;
+                    RootReadOutcome::End(RootResultEnd {
+                        sequence: std::num::NonZeroU64::MIN,
+                        output_rows: 0,
+                    })
+                } else {
+                    return Err(Status::invalid_argument(
+                        "fixed empty root has no later sequence",
+                    ));
+                };
+                RootReadResponse::Reply(RootResultReply {
+                    root_task: script.root,
+                    profile: read.profile(),
+                    kind: script.kind,
+                    accepted_consumed: script.root_consumed,
+                    outcome,
+                })
+            }
+        };
+        let encoded = novarocks_task_codec::root_result::encode_response(&response)
+            .map_err(|_| Status::internal("the fixed root reply did not encode"))?;
+        Ok(Response::new(encoded))
     }
 
     async fn transmit_runtime_filter_envelope(
@@ -912,6 +1650,39 @@ impl NovaRocksGrpc for TaskWirePeer {
     }
 }
 
+#[tokio::test]
+async fn generic_peer_rejects_root_before_parsing_an_unconfigured_request() {
+    let data = TaskWirePeer::default();
+    let mut control = data.clone();
+    control.domain = NativeEndpointDomain::BackendControl;
+    let data_error = data
+        .fetch_root_result(Request::new(proto::FetchRootResultRequest::default()))
+        .await
+        .unwrap_err();
+    let control_error = control
+        .fetch_root_result(Request::new(proto::FetchRootResultRequest::default()))
+        .await
+        .unwrap_err();
+    let idle = {
+        let state = data.state.lock().expect("peer state");
+        state.single_root.is_none()
+            && state.applied.is_empty()
+            && state.subscribed.is_empty()
+            && state.held.is_empty()
+    };
+    // No server or stream was started; release the original peer objects
+    // before checking the saved protocol refusal facts.
+    drop((data, control));
+    assert!(idle);
+    for error in [data_error, control_error] {
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "task wire test peer rejects FetchRootResult"
+        );
+    }
+}
+
 /// Two independent sockets for one shared process fixture.
 pub(crate) struct Loopback {
     peer: TaskWirePeer,
@@ -975,6 +1746,141 @@ impl Loopback {
         }
     }
 
+    /// Configure once, after the original manifest supplies its exact root.
+    pub(crate) fn enable_single_root_lifecycle(
+        &self,
+        root: TaskIdentity,
+        kind: novarocks_result_contract::RootOutputKind,
+    ) {
+        let mut state = self.peer.state.lock().expect("peer state");
+        assert!(
+            state.single_root.is_none()
+                && state.applied.is_empty()
+                && state.subscribed.is_empty()
+                && state.apply_answers.is_empty()
+                && state.subscribe_answers.is_empty()
+                && state.held.is_empty(),
+            "configure the fixed peer before the original runtime starts"
+        );
+        state.single_root = Some(SingleRootLifecycle {
+            io_gates: None,
+            root,
+            kind,
+            participation: None,
+            ticket_issued: false,
+            revision: 0,
+            running_revision: None,
+            status_revision: None,
+            task_revision: None,
+            quiesce_revision: None,
+            participation_revision: None,
+            root_end_offered: false,
+            root_consumed: 0,
+            established: false,
+            created: false,
+            quiesce: None,
+            released: false,
+            abort_cause: None,
+        });
+    }
+
+    /// Two explicit test I/O gates. Configure before the original runtime.
+    pub(crate) fn enable_single_root_first_subscription_eof_before_create(
+        &self,
+        root: TaskIdentity,
+        kind: novarocks_result_contract::RootOutputKind,
+    ) {
+        self.enable_single_root_lifecycle(root, kind);
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root
+            .as_mut()
+            .expect("the exact single-root script was configured")
+            .io_gates = Some(SingleRootIoGates {
+            first_subscription_selected: false,
+            first_subscription: Arc::new(SingleRootIoGate::new()),
+            create: Arc::new(SingleRootIoGate::new()),
+        });
+    }
+
+    pub(crate) fn single_root_first_subscription_waiting(&self) -> bool {
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root
+            .as_ref()
+            .and_then(|script| script.io_gates.as_ref())
+            .is_some_and(|gates| gates.first_subscription.waiting())
+    }
+
+    pub(crate) fn release_single_root_first_subscription(&self) {
+        let gate = {
+            let state = self.peer.state.lock().expect("peer state");
+            Arc::clone(
+                &state
+                    .single_root
+                    .as_ref()
+                    .and_then(|script| script.io_gates.as_ref())
+                    .expect("release only the configured fixed test gate")
+                    .first_subscription,
+            )
+        };
+        gate.release();
+    }
+
+    pub(crate) fn single_root_create_waiting(&self) -> bool {
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root
+            .as_ref()
+            .and_then(|script| script.io_gates.as_ref())
+            .is_some_and(|gates| gates.create.waiting())
+    }
+
+    pub(crate) fn release_single_root_create(&self) {
+        let gate = {
+            let state = self.peer.state.lock().expect("peer state");
+            Arc::clone(
+                &state
+                    .single_root
+                    .as_ref()
+                    .and_then(|script| script.io_gates.as_ref())
+                    .expect("release only the configured fixed test gate")
+                    .create,
+            )
+        };
+        gate.release();
+    }
+
+    pub(crate) fn single_root_release_observed(&self) -> bool {
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root
+            .as_ref()
+            .is_some_and(|script| script.released)
+    }
+
+    pub(crate) fn bounded_root_descriptor(
+        &self,
+        process: BackendProcessId,
+    ) -> BackendProcessDescriptor {
+        self.descriptor(process)
+            .with_bounded_root_support(
+                novarocks_execution_contract::native_result_support::BoundedRootSupport::new(
+                    self.control_endpoint.clone(),
+                    novarocks_result_contract::RootProfileId::V1,
+                ),
+            )
+            .expect("advertise V1 only at this peer's actual independent control socket")
+    }
+
     pub(crate) fn descriptor(&self, process: BackendProcessId) -> BackendProcessDescriptor {
         test_descriptor(
             process,
@@ -1022,14 +1928,7 @@ impl Loopback {
     pub(in crate::native) fn accept_create(&self, task: TaskIdentity) {
         self.peer.expect_apply(ApplyAnswer::WithAck(vec![(
             OperationOutcome::Accepted,
-            Some(proto::task_operation_verdict::Ack::CreateTask(
-                codec::encode_create_task_ack(&CreateTaskReceipt::new(
-                    task,
-                    Vec::new(),
-                    TaskStatus::created(task),
-                ))
-                .expect("the exact Create acknowledgement encodes"),
-            )),
+            Some(TaskWirePeer::create_ack(task, TaskStatus::created(task))),
         )]));
     }
 

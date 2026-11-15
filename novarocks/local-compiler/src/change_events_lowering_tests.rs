@@ -278,9 +278,18 @@ fn try_fixture(
                 novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
             ][index % 3],
             assignments: if index % 2 == 0 {
-                Box::from([(nested_value, Some(nested_expr)), (value, Some(expr))])
+                Box::from([
+                    novarocks_physical_plan::ChangeAssignment::exact(
+                        nested_value,
+                        Some(nested_expr),
+                    ),
+                    novarocks_physical_plan::ChangeAssignment::exact(value, Some(expr)),
+                ])
             } else {
-                Box::from([(value, None), (nested_value, None)])
+                Box::from([
+                    novarocks_physical_plan::ChangeAssignment::exact(value, None),
+                    novarocks_physical_plan::ChangeAssignment::exact(nested_value, None),
+                ])
             },
         })
         .collect::<Vec<_>>()

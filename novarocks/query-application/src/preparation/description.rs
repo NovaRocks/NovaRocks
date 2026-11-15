@@ -566,7 +566,7 @@ mod tests {
         );
         for output in [
             FrozenRootOutput::CountOnly,
-            FrozenRootOutput::InternalFacts(InternalResultDomain::CowSelectionArrowV1),
+            FrozenRootOutput::InternalFacts(InternalResultDomain::PreparedWriteCommitV1),
         ] {
             let kind = output.kind();
             let plan = plan

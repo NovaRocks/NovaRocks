@@ -735,7 +735,6 @@ impl ProviderReadRuntime for SourceFixture {
 impl ProviderReadMetadata for SourceFixture {
     type PreparedSourceRead = ();
     type PreparedRelation = ();
-    type FrozenSource = ();
     fn prepare_source_read<'a>(
         &'a self,
         _: &'a ConnectorSession,

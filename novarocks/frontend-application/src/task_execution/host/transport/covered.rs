@@ -19,7 +19,8 @@
 
 use super::{
     ActorTransportWork, AttemptCallOwner, AttemptCallSource, BodyOutcome,
-    actor_adapter::covered_open_job_backing_bytes, call_source::AttemptCallReply,
+    actor_adapter::covered_open_job_backing_bytes,
+    call_source::{AttemptCallReply, AttemptCallResultRefusal},
     releases::ReleaseCapture,
 };
 #[cfg(test)]
@@ -338,13 +339,23 @@ struct Active {
     stop_requested: bool,
 }
 
+/// One participant owns exactly one paid open-result lane. Its actual result
+/// waits here until the same generation's complete phase input has retired.
+struct SubscriptionCall {
+    source: AttemptCallSource,
+    exited: Option<ReturnedActorTransportResult>,
+    refused: Option<AttemptCallResultRefusal>,
+}
+
 pub(crate) struct AttemptSubscriptions {
     runtime: ActorRuntime<FrontendActor>,
     registration: ActorRegistration,
     source: ActorId,
     generation_limit: usize,
     endpoints: Option<Arc<SubscriptionEndpoints>>,
-    calls: BTreeMap<ParticipationRef, AttemptCallSource>,
+    calls: BTreeMap<ParticipationRef, SubscriptionCall>,
+    // Index only: the original refusal remains in its participant's paid row.
+    publication_refusal: Option<ParticipationRef>,
     pending: Option<Pending>,
     active: BTreeMap<AttemptActionId, Active>,
     phase_roles: BTreeMap<StandingInputId, AttemptActionId>,
@@ -374,7 +385,7 @@ impl AttemptSubscriptions {
         {
             return Err(ActorTurnError::InputAuthorMismatch);
         }
-        let mut calls = BTreeMap::<_, AttemptCallSource>::new();
+        let mut calls = BTreeMap::<_, SubscriptionCall>::new();
         for &participation in endpoints.keys() {
             let position = match Position::reserve_admitted(
                 &runtime,
@@ -387,7 +398,8 @@ impl AttemptSubscriptions {
                 Err(error) => {
                     for call in calls.values_mut() {
                         assert!(
-                            call.close_idle()
+                            call.source
+                                .close_idle()
                                 .expect("original unused subscription position")
                         );
                     }
@@ -396,14 +408,18 @@ impl AttemptSubscriptions {
             };
             calls.insert(
                 participation,
-                AttemptCallSource::new(
-                    parent,
-                    payer,
-                    registration.initial_epoch(),
-                    observer,
-                    AttemptCallOwner::SubscriptionOpen,
-                    position,
-                ),
+                SubscriptionCall {
+                    source: AttemptCallSource::new(
+                        parent,
+                        payer,
+                        registration.initial_epoch(),
+                        observer,
+                        AttemptCallOwner::SubscriptionOpen,
+                        position,
+                    ),
+                    exited: None,
+                    refused: None,
+                },
             );
         }
         let generation_limit = endpoints
@@ -418,6 +434,7 @@ impl AttemptSubscriptions {
             close_order: endpoints.keys().copied().collect(),
             endpoints: Some(endpoints),
             calls,
+            publication_refusal: None,
             pending: None,
             active: BTreeMap::new(),
             phase_roles: BTreeMap::new(),
@@ -450,7 +467,7 @@ impl AttemptSubscriptions {
             backing::tree::<ParticipationRef, SubscriptionEndpoint>(participants)?,
             backing::tree::<BackendProcessId, usize>(participants)?,
             backing::array::<StagedSubscriptionEndpoint>(participants)?,
-            backing::tree::<ParticipationRef, AttemptCallSource>(participants)?,
+            backing::tree::<ParticipationRef, SubscriptionCall>(participants)?,
             sized(
                 backing::arc::<SubscriptionSource<FrontendActor>>()?.size(),
                 participants,
@@ -507,6 +524,7 @@ impl AttemptSubscriptions {
             .calls
             .get_mut(&key.participation)
             .expect("original subscription call");
+        let call = &mut call.source;
         let result = call
             .prepay(effect)
             .expect("original subscription prepayment")?;
@@ -559,6 +577,7 @@ impl AttemptSubscriptions {
         self.calls
             .get_mut(&key.participation)
             .unwrap()
+            .source
             .return_unclaimed(result);
     }
 
@@ -586,6 +605,7 @@ impl AttemptSubscriptions {
             .calls
             .get_mut(&key.participation)
             .unwrap()
+            .source
             .bind_subscription(ticket, result, || {
                 let original = match endpoint.source.prepare(request.clone(), &phase) {
                     Ok(original) => {
@@ -679,34 +699,59 @@ impl AttemptSubscriptions {
         original: ReturnedActorTransportResult,
     ) -> Result<(), Box<dyn Any + Send>> {
         self.active_scan.request();
-        let row = self
-            .active
-            .get_mut(&effect)
-            .expect("original subscription result");
-        if let Some(BodyOutcome::Call(reply)) = &original.outcome {
-            let AttemptCallReply::Input {
-                input:
-                    AttemptInput::Executor(ExecutorFact::SubscriptionExited {
-                        effect: exited,
-                        participation,
-                        generation,
-                    }),
-                ..
-            } = reply
-            else {
-                panic!("expected the original subscription exit");
-            };
-            assert_eq!(
-                (*exited, *participation, *generation),
-                (effect, row.key.participation, row.key.generation)
-            );
-            row.body_exited = true;
+        let Some(row) = self.active.get_mut(&effect) else {
+            return Err(Box::new(original));
+        };
+        let call = self.calls.get_mut(&row.key.participation).unwrap();
+        if !call.source.matches_original_result(&original)
+            || original.effect.protocol.id != effect
+            || call.exited.is_some()
+            || call.refused.is_some()
+        {
+            return Err(Box::new(original));
         }
-        self.calls
-            .get_mut(&row.key.participation)
-            .unwrap()
-            .accept(original)
-            .map_err(|refused| Box::new(refused) as Box<dyn Any + Send>)
+        let Some(BodyOutcome::Call(reply)) = &original.outcome else {
+            // Preserve the original non-call/panic refusal and its custody.
+            return call
+                .source
+                .accept(original)
+                .map_err(|refused| Box::new(refused) as Box<dyn Any + Send>);
+        };
+        let AttemptCallReply::Input {
+            input:
+                AttemptInput::Executor(ExecutorFact::SubscriptionExited {
+                    effect: exited,
+                    participation,
+                    generation,
+                }),
+            ..
+        } = reply
+        else {
+            return Err(Box::new(original));
+        };
+        if (*exited, *participation, *generation)
+            != (effect, row.key.participation, row.key.generation)
+        {
+            return Err(Box::new(original));
+        }
+        // Actual body exit is known now. Publishing that same original fact
+        // must follow consumption of its complete final phase, or a reconnect
+        // can wait on the older phase while excluding its Source.
+        row.body_exited = true;
+        call.exited = Some(original);
+        Ok(())
+    }
+
+    pub(super) fn take_publication_refusal(&mut self) -> Option<AttemptCallResultRefusal> {
+        let participation = self.publication_refusal.take()?;
+        Some(
+            self.calls
+                .get_mut(&participation)
+                .unwrap()
+                .refused
+                .take()
+                .expect("the indexed original publication refusal"),
+        )
     }
 
     pub(super) fn transport_retired(&mut self, effect: AttemptActionId) {
@@ -715,6 +760,7 @@ impl AttemptSubscriptions {
         self.calls
             .get_mut(&row.key.participation)
             .unwrap()
+            .source
             .transport_retired(effect);
     }
 
@@ -770,7 +816,13 @@ impl AttemptSubscriptions {
         let visits = self
             .active_scan
             .take_visits(self.active_order.len(), budget - units);
+        let mut visited = 0;
         for _ in 0..visits {
+            if self.publication_refusal.is_some() {
+                self.active_scan.request();
+                break;
+            }
+            visited += 1;
             let effect = self
                 .active_order
                 .pop_front()
@@ -781,7 +833,7 @@ impl AttemptSubscriptions {
                 self.active_order.push_back(effect);
             }
         }
-        units += visits;
+        units += visited;
         if self.closing && self.close_order.is_empty() && self.active.is_empty() {
             while units < budget
                 && let Some((participation, mut call)) = self.calls.pop_first()
@@ -794,10 +846,12 @@ impl AttemptSubscriptions {
                     dispose(ReleaseCapture::Subscription(owner));
                 }
                 assert!(
-                    call.close_idle()
+                    call.source
+                        .close_idle()
                         .expect("original subscription result position")
                 );
-                assert!(call.take_drained_owner().is_none() && call.is_drained());
+                assert!(call.exited.is_none() && call.refused.is_none());
+                assert!(call.source.take_drained_owner().is_none() && call.source.is_drained());
                 progressed = true;
                 units += 1;
             }
@@ -881,10 +935,22 @@ impl AttemptSubscriptions {
             }
         }
         if row.phase_closed && !row.call_retired {
-            row.call_retired = self
-                .calls
-                .get_mut(&row.key.participation)
-                .unwrap()
+            let call = self.calls.get_mut(&row.key.participation).unwrap();
+            if let Some(original) = call.exited.take() {
+                match call.source.accept(original) {
+                    Ok(()) => progressed = true,
+                    Err(refused) => {
+                        // The caller transfers this exact original refusal to
+                        // its existing transport-failure custodian after this
+                        // scan; it is never sent to a disposal capture.
+                        call.refused = Some(refused);
+                        self.publication_refusal = Some(row.key.participation);
+                        return (progressed, false);
+                    }
+                }
+            }
+            row.call_retired = call
+                .source
                 .retire_result()
                 .expect("original subscription exit result");
             progressed |= row.call_retired;

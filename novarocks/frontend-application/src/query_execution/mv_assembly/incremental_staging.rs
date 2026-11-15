@@ -232,7 +232,6 @@ mod tests {
                 colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
                 layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
             },
-            Vec::new(),
         )
         .expect("route facts")
     }

@@ -855,6 +855,19 @@ impl LogicalExecutionTestHarness {
             .await
     }
 
+    /// Consumes the same original running authority after its real Native
+    /// completion, using the production completion decision. This helper
+    /// does not manufacture a Native terminal or a participation exit fact.
+    pub async fn complete_original_running_attempt(
+        &mut self,
+    ) -> Result<crate::coordination::LogicalConclusion, LogicalExecutionActorError> {
+        let running = self
+            .running
+            .take()
+            .ok_or(LogicalExecutionActorError::WrongPhase)?;
+        self.actor().complete_attempt(running).await
+    }
+
     /// Completes the real Native pump's NoRecovery decision with its original
     /// running authority. Freezing an attempt error alone is not a conclusion.
     pub async fn fail_original_running_attempt(
@@ -1031,6 +1044,17 @@ impl LogicalExecutionTestHarness {
         &self,
     ) -> Result<LogicalExecutionJoinReadiness, LogicalExecutionRuntimeRegistryError> {
         self.registry.join_readiness(self.registration()).await
+    }
+
+    /// Records the original Native owner's exact never-established fact at
+    /// the existing registry boundary, without synthesizing Worker exit.
+    pub async fn observe_participation_never_established(
+        &self,
+        participation: ParticipationRef,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        self.registry
+            .observe_participation_never_established(self.registration(), participation)
+            .await
     }
 
     pub async fn observe_worker_stopped_and_participation_fenced(

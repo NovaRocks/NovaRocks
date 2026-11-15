@@ -23,7 +23,6 @@ mod cleanup_maintenance;
 mod codec;
 mod context;
 mod control;
-mod cow_begin;
 mod credential;
 mod credential_lease;
 mod data_mutation;
@@ -52,6 +51,7 @@ mod read_session;
 mod resources;
 mod row_mutation;
 mod scalar;
+mod scoped_begin;
 mod semantic_revision;
 mod staged_create;
 mod statistics;
@@ -117,7 +117,6 @@ pub use control::{
     ConnectorControlRegistry, ConnectorControlResolver, ConnectorExecutionDistribution,
     ConnectorScanPlanning,
 };
-pub use cow_begin::{ConnectorCowBeginCause, ConnectorCowBeginFailure, ConnectorCowBeginPlan};
 pub use credential::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
     CatalogNonSecretProperty, CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind,
@@ -304,23 +303,13 @@ pub use resources::{
 };
 pub use row_mutation::{
     CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,
-    ConnectorMutationMatchContract, ConnectorMutationRouteInput,
-    ConnectorMutationSelectionFieldRef, ConnectorMutationSelectionFieldRole,
-    ConnectorMutationSourceField, ConnectorMutationTargetField,
-    ConnectorRowConversionBatchFootprint, ConnectorRowConversionFootprint,
-    ConnectorRowMutationActivationRequest, ConnectorRowMutationCohortRecipe,
-    ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationEffect,
-    ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
-    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorRowMutationRoute, ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
-    ConnectorRowMutationSelectionOrdinal, ConnectorRowMutationSelectionView,
-    ConnectorRowMutationSourceArray, ConnectorRowMutationSourceBatch,
-    ConnectorRowMutationSourceBuffer, ConnectorRowMutationSourceBuilder,
-    ConnectorRowMutationSourceChildren, ConnectorRowMutationStrategy, ConnectorWriteRouteId,
-    MAX_CONNECTOR_ROW_CONVERSION_WORKSPACE_BYTES, MAX_CONNECTOR_ROW_MUTATION_ROUTES,
-    MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES, MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
+    ConnectorMutationMatchContract, ConnectorMutationRouteInput, ConnectorMutationSourceField,
+    ConnectorMutationTargetField, ConnectorRowMutationEffect, ConnectorRowMutationIntent,
+    ConnectorRowMutationPreparation, ConnectorRowMutationPreparationOutcome,
+    ConnectorRowMutationPreparationRequest, ConnectorRowMutationStrategy, ConnectorWriteRouteId,
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
+pub use scoped_begin::ConnectorScopedBeginCause;
 pub use semantic_revision::{
     ConnectorCanonicalReadPoint, ConnectorExactSemanticRevision, ConnectorSemanticFact,
     MAX_CONNECTOR_SEMANTIC_FACT_FORMAT_BYTES, MAX_CONNECTOR_SEMANTIC_FACT_VALUE_BYTES,
@@ -378,19 +367,17 @@ pub use write::{
     ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionSpecReplacementId,
     ConnectorManagedPartitionSpecReplacementTarget, ConnectorManagedPartitionTransform,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
-    ConnectorPreReadyWritePlanningProof, ConnectorPreReadyWritePlanningRequest,
-    ConnectorSealedWriteCohortSet, ConnectorWrite, ConnectorWriteAbortOutcome,
-    ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
+    ConnectorPreReadyWritePlanningProof, ConnectorPreReadyWritePlanningRequest, ConnectorWrite,
+    ConnectorWriteAbortOutcome, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
     ConnectorWriteActivationSource, ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion,
-    ConnectorWriteCohortDescriptor, ConnectorWriteCohortId, ConnectorWriteControl,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
-    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
-    ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
-    ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriteTargetRef,
-    DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES,
-    MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES, MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS,
-    MAX_CONNECTOR_WRITE_RECEIPT_BYTES, WriteCommitEvidenceLedger, WriteCommitEvidenceLimits,
-    WriteCommitEvidenceUsage,
+    ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
+    ConnectorWriteFieldRequest, ConnectorWriteFieldToken, ConnectorWriteInputRequest,
+    ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWriteOperationId,
+    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    ConnectorWriteReceipt, ConnectorWriteTargetRef, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES,
+    DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES, MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES,
+    MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS, MAX_CONNECTOR_WRITE_RECEIPT_BYTES,
+    WriteCommitEvidenceLedger, WriteCommitEvidenceLimits, WriteCommitEvidenceUsage,
 };
 
 pub use process_local::ConnectorProcessLocalPayload;

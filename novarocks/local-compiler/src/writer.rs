@@ -27,10 +27,11 @@
 //! The writer projection is a separate `WriterProjection` arena of synthetic
 //! slot reads, one per target input value, read from the writer's actual
 //! input occurrence. Its layout is the provider recipe's own input fields, so
-//! the provider names and field metadata are kept exactly; only a field's
-//! top-level nullability follows the value that feeds it. A nullable value
-//! feeding a non-null target field is the writer's row obligation, checked by
-//! the executor before any provider I/O.
+//! the provider names and field metadata are kept exactly. Source expression
+//! declarations remain unchanged; the published projection satisfies the
+//! provider's nested requirements, while retaining the source root NULL flag.
+//! Required values are checked before constructing that projection or doing
+//! any provider I/O.
 //!
 //! Writer statistics are compiled by `writer_statistics`: a writer's partial
 //! calls write its multiplex relation's auxiliary channels, and a finish's
@@ -480,6 +481,7 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
     let mut typed_layout =
         crate::typed_layout::TypedLayoutBuilder::new_with_creation(width, work, creation)?;
     let mut ordinals = Vec::new();
+    let mut storage_types = Vec::new();
     let mut channels = Vec::new();
     reserve_vec(&mut nodes, width, work)?;
     match type_scope.as_mut() {
@@ -487,6 +489,7 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
         None => reserve_vec(&mut types, width, work)?,
     }
     reserve_vec(&mut ordinals, width, work)?;
+    reserve_vec(&mut storage_types, width, work)?;
     reserve_vec(
         &mut channels,
         width
@@ -511,6 +514,36 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
                 "missing table writer input type",
             ))?
             .ty;
+        let requirement = binding
+            .execution_type()
+            .ok_or(FragmentCompileError::Invalid(
+                "table writer provider field has no complete value requirement",
+            ))?;
+        work.flush()?;
+        if novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+            ty.typed_binding().borrowed(),
+            requirement.typed_binding().borrowed(),
+            binding
+                .storage_type()
+                .map(|storage| storage.typed_binding().borrowed()),
+            || work.step(),
+        )?
+        .is_none()
+        {
+            return Err(FragmentCompileError::Invalid(
+                "table writer source and provider requirement differ beyond nullability",
+            )
+            .into());
+        }
+        // The source is still evaluated under its original complete binding.
+        // Only the constructed output receives the checked target declaration.
+        let output_ty = requirement.clone_observed(|| work.step())?;
+        storage_types.push(
+            binding
+                .storage_type()
+                .map(|storage| storage.clone_observed(|| work.step()))
+                .transpose()?,
+        );
         work.flush()?;
         nodes.push(StaticExprNode::new_value_typed(
             StaticExprKind::SlotId(input.child_layout.slots()[source]),
@@ -519,10 +552,10 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
         types.push(FunctionArgumentType::Value(
             ty.clone_observed(|| work.step())?,
         ));
-        // Provider attributes stay on the write recipe. This execution
-        // projection is authored by the complete input value binding.
+        // Provider attributes stay on the write recipe. The value obligation
+        // is fulfilled before this target projection is published.
         typed_layout.push_with_creation(
-            ty,
+            &output_ty,
             crate::typed_layout::copy_name_with_creation(binding.field().name(), work, creation)?,
             work,
             creation,
@@ -534,7 +567,7 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
                 ordinal: u32::try_from(ordinal)
                     .map_err(|_| CompileControlError::ResourceExhausted)?,
             },
-            ty.clone(),
+            output_ty,
         ));
         ordinals.push(u32::try_from(source).map_err(|_| CompileControlError::ResourceExhausted)?);
         work.step()?;
@@ -612,6 +645,7 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
             target: target.write_target_ordinal,
             expected_layout: projection_layout.clone(),
             projection: StaticWriterProjection {
+                storage_types,
                 arena,
                 expressions: (0..width).map(ProgramExprId::new).collect(),
                 layout: projection_layout,

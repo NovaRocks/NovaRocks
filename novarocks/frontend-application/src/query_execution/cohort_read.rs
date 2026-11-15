@@ -25,13 +25,7 @@ use novarocks_spi::connector::{
 #[derive(Clone)]
 pub(crate) struct QueryPinnedFileSetRead {
     pub(crate) pinned: ConnectorPinnedFileSet,
-    /// Provider-owned original source; FE only loans it to the admitted reader.
-    /// Ordinary maintenance cohorts have no such receipt.
-    pub(crate) frozen_source:
-        Option<novarocks_spi::connector::read_stack::runtime::ConnectorFrozenReadSource>,
     pub(crate) planning_pin: ConnectorControlPlanningPin,
-    // COW-only neutral holder: declared last so schema/source peers retire first.
-    pub(crate) _original: Option<novarocks_spi::connector::ConnectorOriginalResultScope>,
 }
 
 impl std::fmt::Debug for QueryPinnedFileSetRead {

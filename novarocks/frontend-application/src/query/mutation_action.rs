@@ -17,10 +17,7 @@
 
 //! Governed UPDATE/MERGE stages over the original signed mutation authors.
 
-use super::statement_computation::{
-    StatementComputation, StatementComputationAssembly, StatementComputationOutput,
-    StatementNativeTail,
-};
+use super::statement_computation::{StatementComputation, StatementNativeTail};
 use super::statement_publication::StatementPublication;
 use super::*;
 use crate::dml::{attempt::DmlPublicationAttempt, error::DmlExecutionError};
@@ -29,23 +26,16 @@ use crate::query_execution::{
     completion_facts::FrontendCompletionCustody,
     dml::{
         mutation::{self, MutationStatementInput, OwnedMutationStatement},
-        mutation_flow::{
-            self, PreparedCowMatchAssembly, PreparedCowMutationWrite, PreparedCowSelection,
-            PreparedMorMutationWrite, PreparedMutationFacts,
-        },
+        mutation_flow::{self, PreparedMorMutationWrite, PreparedMutationFacts},
     },
-    internal_consumer::{
-        decoded::{CowComputationOutput, DecodedConsumerRuntime, ReadyCowComputation},
-        domain_cpu::DomainCpuCustody,
-        write::{ReadyWriteComputation, WriteComputationOutput},
-    },
-    logical_execution::{InitialComputationReservation, PreparedLogicalComputation},
+    internal_consumer::write::ReadyWriteComputation,
+    logical_execution::InitialComputationReservation,
     maintenance::io_admission::MetadataIoAdmission,
     write_session::{ConnectorWriteSession, WriteBeginReceiving},
 };
 use novarocks_query_application::{
-    admitted_query_context::{QueryExecutionContext, QueryResultCapacityBinding},
-    api::{ComputationReadyToken, ReservedExecutionIdentity, StatementNativeHealthFailure},
+    admitted_query_context::QueryExecutionContext,
+    api::StatementNativeHealthFailure,
     session_control::{
         GovernedActionContext, GovernedStatementAction, GovernedStatementResidual,
         StatementActionValue,
@@ -53,80 +43,10 @@ use novarocks_query_application::{
 };
 use novarocks_spi::connector::{
     ConnectorControlPlanningPin, ConnectorMetadataCleanupResponsibility, ConnectorRequestContext,
-    ConnectorRowMutationSelection, ConnectorWriteOperationId,
+    ConnectorWriteOperationId,
 };
 use novarocks_workload_control::{WorkError, WorkScope};
-use std::{
-    alloc::Layout,
-    task::{Context, Poll},
-};
-
-// This closed sum delegates actual assembly/consumer construction. No query is
-// reconstructed and no selection is cloned to cross a phase boundary.
-enum MutationAssembly {
-    Selection(Box<MutationSelectionAssembly>),
-    Write(Box<PreparedDmlWriteAssembly>),
-}
-struct MutationSelectionAssembly {
-    assembly: PreparedCowMatchAssembly,
-    options: QueryOptions,
-}
-enum MutationOutput {
-    Selection(CowComputationOutput),
-    Write(WriteComputationOutput),
-}
-enum MutationReady {
-    Selection(Box<ReadyCowComputation>),
-    Write(ReadyWriteComputation),
-}
-impl StatementComputationAssembly for MutationAssembly {
-    type Output = MutationOutput;
-    fn prepare(
-        self,
-        initial: InitialComputationReservation,
-        runtime: DecodedConsumerRuntime,
-    ) -> Result<
-        (
-            PreparedLogicalComputation,
-            ReservedExecutionIdentity,
-            MutationOutput,
-        ),
-        QueryExecutionError,
-    > {
-        match self {
-            Self::Selection(selection) => {
-                let MutationSelectionAssembly { assembly, options } = *selection;
-                assembly
-                    .prepare_computation(initial, runtime, Some(options))
-                    .map(|(c, r, o)| (c, r, MutationOutput::Selection(o)))
-            }
-            Self::Write(assembly) => (*assembly)
-                .prepare_computation(initial, runtime)
-                .map(|(c, r, o)| (c, r, MutationOutput::Write(o))),
-        }
-    }
-}
-impl StatementComputationOutput for MutationOutput {
-    type Ready = MutationReady;
-    fn cpu_custody(&self) -> Arc<DomainCpuCustody> {
-        match self {
-            Self::Selection(o) => o.cpu_custody(),
-            Self::Write(o) => o.cpu_custody(),
-        }
-    }
-    fn take_ready(
-        &mut self,
-        token: ComputationReadyToken,
-    ) -> Result<MutationReady, QueryExecutionError> {
-        match self {
-            Self::Selection(o) => o
-                .take_ready(token)
-                .map(Box::new)
-                .map(MutationReady::Selection),
-            Self::Write(o) => o.take_ready(token).map(MutationReady::Write),
-        }
-    }
-}
+use std::task::{Context, Poll};
 
 struct OriginalInput {
     kernel: crate::query_execution::kernels::DmlExecutionKernel,
@@ -141,99 +61,50 @@ struct OriginalInput {
     receiving: Arc<WriteBeginReceiving>,
 }
 enum PhaseRequest {
-    Facts(QueryExecutionContext, ConnectorRequestContext),
+    Facts(Box<(QueryExecutionContext, ConnectorRequestContext)>),
     Mor(Arc<PreparedMutationFacts>),
-    Selection(Arc<PreparedMutationFacts>),
-    BeginCow(
-        Arc<PreparedMutationFacts>,
-        ConnectorRowMutationSelection,
-        QueryExecutionContext,
-    ),
     CompileMor(
         Arc<PreparedMorMutationWrite>,
-        Arc<FrontendCompletionCustody>,
-    ),
-    CompileSelection(Arc<PreparedCowSelection>, Arc<FrontendCompletionCustody>),
-    CompileTarget(
-        Arc<PreparedCowMutationWrite>,
-        usize,
-        QueryExecutionContext,
-        ConnectorRequestContext,
         Arc<FrontendCompletionCustody>,
     ),
 }
 enum PhaseValue {
     Facts(Arc<PreparedMutationFacts>),
     Mor(Arc<PreparedMorMutationWrite>),
-    Selection(Arc<PreparedCowSelection>),
-    Cow(Arc<PreparedCowMutationWrite>),
-    Assembly(MutationAssembly),
+    Assembly(Box<PreparedDmlWriteAssembly>),
 }
 async fn prepare_phase(
     input: Arc<OriginalInput>,
     request: PhaseRequest,
 ) -> Result<PhaseValue, DmlExecutionError> {
     match request {
-        PhaseRequest::Facts(execution, context) => mutation_flow::prepare_mutation_facts_async(
-            &input.kernel,
-            &input.statement,
-            &input.target,
-            &input.reference,
-            input.request.session().current_catalog(),
-            input.planning_pin.clone(),
-            execution,
-            &context,
-            input.operation,
-        )
-        .await
-        .map(Arc::new)
-        .map(PhaseValue::Facts),
+        PhaseRequest::Facts(request) => {
+            let (execution, context) = *request;
+            mutation_flow::prepare_mutation_facts_async(
+                &input.kernel,
+                &input.statement,
+                &input.target,
+                &input.reference,
+                input.request.session().current_catalog(),
+                input.planning_pin.clone(),
+                execution,
+                &context,
+                input.operation,
+            )
+            .await
+            .map(Arc::new)
+            .map(PhaseValue::Facts)
+        }
         PhaseRequest::Mor(facts) => facts
             .prepare_mor_write_async(&input.kernel, Arc::clone(&input.receiving))
             .await
             .map(Arc::new)
             .map(PhaseValue::Mor),
-        PhaseRequest::Selection(facts) => facts
-            .prepare_cow_selection(&input.kernel)
-            .map(Arc::new)
-            .map(PhaseValue::Selection),
-        PhaseRequest::BeginCow(facts, selection, execution) => facts
-            .prepare_cow_write_async(
-                &input.kernel,
-                selection,
-                execution,
-                Arc::clone(&input.receiving),
-            )
-            .await
-            .map(Arc::new)
-            .map(PhaseValue::Cow),
+
         PhaseRequest::CompileMor(prepared, custody) => prepared
             .compile_async(&custody, Some(input.options.clone()))
             .await
             .map(Box::new)
-            .map(MutationAssembly::Write)
-            .map(PhaseValue::Assembly),
-        PhaseRequest::CompileSelection(prepared, custody) => prepared
-            .compile_async(&custody, Some(input.options.clone()))
-            .await
-            .map(|assembly| {
-                MutationAssembly::Selection(Box::new(MutationSelectionAssembly {
-                    assembly,
-                    options: input.options.clone(),
-                }))
-            })
-            .map(PhaseValue::Assembly),
-        PhaseRequest::CompileTarget(prepared, index, execution, context, custody) => prepared
-            .compile_target_async(
-                index,
-                &execution,
-                &context,
-                &custody,
-                Some(input.options.clone()),
-            )
-            .await
-            .map(Box::new)
-            .map(MutationAssembly::Write)
             .map(PhaseValue::Assembly),
     }
 }
@@ -276,7 +147,7 @@ impl PhasePreparation {
     }
 }
 
-type Computation = StatementComputation<MutationAssembly>;
+type Computation = StatementComputation<PreparedDmlWriteAssembly>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
     Admit,
@@ -285,36 +156,20 @@ enum Phase {
     CloseIo,
     Compute,
     LocalExit,
-    NextWriter,
     Publication,
     Done,
 }
 
-/// The logical count author is chosen by the original mutation path. A COW
-/// rewrite result cannot replace its exact matched-selection count.
+/// The original mutation session owns the complete logical Root count.
 #[derive(Default)]
 enum MutationAffectedRows {
     #[default]
     Pending,
-    CowSelection(u64),
     MorSummary(u64),
 }
 impl MutationAffectedRows {
-    fn receive_selection(
-        &mut self,
-        selection: &ConnectorRowMutationSelection,
-    ) -> Result<(), QueryServiceError> {
-        if !matches!(self, Self::Pending) {
-            return Err(internal_error(
-                "mutation selected-row count was already received",
-            ));
-        }
-        *self = Self::CowSelection(selection.row_count());
-        Ok(())
-    }
     fn receive_write(&mut self, session: &ConnectorWriteSession) -> Result<(), QueryServiceError> {
         match self {
-            Self::CowSelection(_) => Ok(()),
             Self::Pending => {
                 *self = Self::MorSummary(session.freeze_received_row_count().map_err(|error| {
                     QueryServiceError::from_failure_cause(
@@ -329,7 +184,7 @@ impl MutationAffectedRows {
     fn get(&self) -> Option<u64> {
         match self {
             Self::Pending => None,
-            Self::CowSelection(rows) | Self::MorSummary(rows) => Some(*rows),
+            Self::MorSummary(rows) => Some(*rows),
         }
     }
 }
@@ -338,27 +193,15 @@ struct MutationAction {
     original: Arc<OriginalInput>,
     root: WorkScope,
     io: Option<Arc<MetadataIoAdmission>>,
-    launcher: Arc<dyn LogicalExecutionLauncher>,
-    #[cfg(novarocks_dev_controls)]
-    observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
     session_receiving: Arc<Mutex<Option<Arc<ConnectorWriteSession>>>>,
     context: ConnectorRequestContext,
-    next_context: Option<ConnectorRequestContext>,
-    selection_execution: Option<QueryExecutionContext>,
     computation: Option<Computation>,
-    ready: Option<MutationReady>,
+    ready: Option<ReadyWriteComputation>,
     inline_tail: Option<StatementNativeTail>,
-    tails: Vec<StatementNativeTail>,
-    tail_binding: Option<QueryResultCapacityBinding>,
-    tail_capacity: usize,
-    tail_bytes: u64,
-    tails_reserved: bool,
     facts: Option<Arc<PreparedMutationFacts>>,
     mor: Option<Arc<PreparedMorMutationWrite>>,
-    selection: Option<Arc<PreparedCowSelection>>,
-    cow: Option<Arc<PreparedCowMutationWrite>>,
     preparation: PhasePreparation,
-    assembly: Option<MutationAssembly>,
+    assembly: Option<Box<PreparedDmlWriteAssembly>>,
     provider: Option<Arc<FrontendCompletionCustody>>,
     close: Option<CloseFuture>,
     close_result: Option<Result<(), StatementNativeHealthFailure>>,
@@ -367,8 +210,6 @@ struct MutationAction {
     affected_rows: MutationAffectedRows,
     publication: Option<StatementPublication>,
     phase: Phase,
-    index: usize,
-    wrote_any: bool,
     no_op: bool,
     busy: bool,
     health: StatementNativeHealthFailure,
@@ -398,9 +239,6 @@ impl MutationAction {
         if let Some(tail) = self.inline_tail.as_mut() {
             let _ = tail.poll_exit(cx);
         }
-        for tail in &mut self.tails {
-            let _ = tail.poll_exit(cx);
-        }
     }
     fn store_tail(&mut self) -> Result<(), QueryServiceError> {
         self.computation
@@ -408,9 +246,7 @@ impl MutationAction {
             .unwrap()
             .release_result_aliases()
             .map_err(|_| internal_error("mutation computation result aliases did not retire"))?;
-        if (self.tails_reserved && self.tails.len() == self.tails.capacity())
-            || (!self.tails_reserved && self.inline_tail.is_some())
-        {
+        if self.inline_tail.is_some() {
             return Err(internal_error("mutation Native tail storage is occupied"));
         }
         let tail = self
@@ -419,11 +255,7 @@ impl MutationAction {
             .unwrap()
             .take_native_tail()
             .map_err(|_| internal_error("mutation computation Native tail handoff was refused"))?;
-        if self.tails_reserved {
-            self.tails.push(tail);
-        } else if self.inline_tail.is_none() {
-            self.inline_tail = Some(tail);
-        }
+        self.inline_tail = Some(tail);
         drop(self.computation.take());
         Ok(())
     }
@@ -475,10 +307,7 @@ impl MutationAction {
         loop {
             if self.preparation.future.is_none()
                 && self.close.is_none()
-                && matches!(
-                    self.phase,
-                    Phase::Admit | Phase::NextWriter | Phase::CloseIo
-                )
+                && matches!(self.phase, Phase::Admit | Phase::CloseIo)
                 && let Some(reason) = cancellation.reason()
             {
                 self.fail(cancellation_error(reason));
@@ -501,7 +330,10 @@ impl MutationAction {
                         .unwrap()
                         .computation_context(self.original.request.execution())
                         .map_err(|e| internal_error(e.to_string()))?;
-                    self.start(PhaseRequest::Facts(execution, self.context.clone()));
+                    self.start(PhaseRequest::Facts(Box::new((
+                        execution,
+                        self.context.clone(),
+                    ))));
                 }
                 Phase::Preparing => {
                     if self.preparation.poll_returned(cx).is_pending() {
@@ -530,58 +362,14 @@ impl MutationAction {
                                 continue;
                             }
                             let facts = Arc::clone(self.facts.as_ref().unwrap());
-                            if facts.is_copy_on_write() {
-                                self.start(PhaseRequest::Selection(facts));
-                            } else {
-                                self.start(PhaseRequest::Mor(facts));
-                            }
+                            self.start(PhaseRequest::Mor(facts));
                         }
                         PhaseValue::Mor(prepared) => {
                             self.mor = Some(prepared);
                             let p = Arc::clone(self.mor.as_ref().unwrap());
                             self.compile(|c| PhaseRequest::CompileMor(p, c));
                         }
-                        PhaseValue::Selection(prepared) => {
-                            self.selection = Some(prepared);
-                            let p = Arc::clone(self.selection.as_ref().unwrap());
-                            self.compile(|c| PhaseRequest::CompileSelection(p, c));
-                        }
-                        PhaseValue::Cow(prepared) => {
-                            self.cow = Some(prepared);
-                            self.tail_capacity = self
-                                .cow
-                                .as_ref()
-                                .unwrap()
-                                .target_count()
-                                .checked_add(1)
-                                .ok_or_else(|| internal_error("mutation tail count overflow"))?;
-                            if self.tail_capacity
-                                > novarocks_spi::connector::write_stack::MAX_CONNECTOR_WRITE_TARGETS
-                                    + 1
-                            {
-                                return Poll::Ready(Err(internal_error(
-                                    "mutation exceeds the frozen target bound",
-                                )));
-                            }
-                            self.tail_bytes = u64::try_from(
-                                Layout::array::<StatementNativeTail>(self.tail_capacity)
-                                    .map_err(|_| internal_error("mutation tail layout overflow"))?
-                                    .size()
-                                    .checked_add(
-                                        StatementNativeTail::retained_heap_bytes()
-                                            .map_err(|e| internal_error(e.to_string()))?
-                                            .checked_mul(self.tail_capacity)
-                                            .ok_or_else(|| {
-                                                internal_error("mutation tail health overflow")
-                                            })?,
-                                    )
-                                    .ok_or_else(|| {
-                                        internal_error("mutation tail storage overflow")
-                                    })?,
-                            )
-                            .map_err(|_| internal_error("mutation tail layout overflow"))?;
-                            self.phase = Phase::NextWriter;
-                        }
+
                         PhaseValue::Assembly(assembly) => {
                             self.assembly = Some(assembly);
                             self.phase = Phase::CloseProvider;
@@ -622,7 +410,7 @@ impl MutationAction {
                     self.computation
                         .as_mut()
                         .unwrap()
-                        .install_assembly(self.assembly.take().unwrap())?;
+                        .install_assembly(*self.assembly.take().unwrap())?;
                     self.phase = Phase::Compute;
                 }
                 Phase::Compute => {
@@ -654,164 +442,28 @@ impl MutationAction {
                     self.phase = Phase::LocalExit;
                 }
                 Phase::LocalExit => {
-                    if self.selection_execution.is_none()
-                        && let Some(MutationReady::Selection(ready)) = self.ready.as_ref()
-                    {
-                        self.selection_execution = Some(
-                            self.original
-                                .request
-                                .execution()
-                                .for_statement_retention(ready.binding.clone())
-                                .map_err(|e| internal_error(e.to_string()))?,
-                        );
-                    }
                     match self.computation.as_mut().unwrap().poll_ready_local_exit(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Err(_)) => return Poll::Pending,
                         Poll::Ready(Ok(())) => {}
                     }
                     self.store_tail()?;
-                    match self.ready.as_ref().unwrap() {
-                        MutationReady::Selection(ready) => {
-                            // This exact selection includes only admitted actions. COW
-                            // rewrite streams also contain unaffected retained rows.
-                            self.affected_rows.receive_selection(&ready.selection)?;
-                            self.no_op = ready.selection.row_count() == 0;
-                            self.tail_binding = Some(ready.binding.clone());
-                            if self.no_op || cancellation.reason().is_some() {
-                                if let Some(reason) = cancellation.reason() {
-                                    self.fail(cancellation_error(reason));
-                                }
-                                self.phase = Phase::Publication;
-                                continue;
-                            }
-                            let execution = self
-                                .selection_execution
-                                .take()
-                                .expect("original Ready selection execution");
-                            // Moving selection into the original F preserves the
-                            // signed scope and its complete first-party payload.
-                            let MutationReady::Selection(ready) = self.ready.take().unwrap() else {
-                                unreachable!()
-                            };
-                            let ready = *ready;
-                            self.start(PhaseRequest::BeginCow(
-                                Arc::clone(self.facts.as_ref().unwrap()),
-                                ready.selection,
-                                execution,
-                            ));
-                        }
-                        MutationReady::Write(ready) => {
-                            let session = self.session().ok_or_else(|| {
-                                internal_error("mutation Ready has no original session")
-                            })?;
-                            if !Arc::ptr_eq(&ready.session, &session)
-                                || !ready.accepted.belongs_to(&session)
-                            {
-                                return Poll::Ready(Err(internal_error(
-                                    "mutation Ready replaced the original session",
-                                )));
-                            }
-                            self.affected_rows.receive_write(&session)?;
-                            self.wrote_any |= !ready.accepted.is_empty();
-                            self.index = self
-                                .index
-                                .checked_add(1)
-                                .ok_or_else(|| internal_error("mutation target index overflow"))?;
-                            drop(self.ready.take());
-                            if self
-                                .cow
-                                .as_ref()
-                                .is_some_and(|p| self.index < p.target_count())
-                            {
-                                self.phase = Phase::NextWriter;
-                            } else {
-                                self.no_op = !self.wrote_any;
-                                self.phase = Phase::Publication;
-                            }
-                        }
+                    let ready = self.ready.take().unwrap();
+                    let session = self
+                        .session()
+                        .ok_or_else(|| internal_error("mutation Ready has no original session"))?;
+                    if !Arc::ptr_eq(&ready.session, &session)
+                        || !ready.accepted.belongs_to(&session)
+                    {
+                        return Poll::Ready(Err(internal_error(
+                            "mutation Ready replaced the original session",
+                        )));
                     }
+                    self.affected_rows.receive_write(&session)?;
+                    self.no_op = ready.accepted.is_empty();
+                    self.phase = Phase::Publication;
                 }
-                Phase::NextWriter => {
-                    // The actual checked-begin/previous compile IO has exited
-                    // before extending this Root's next dependency union.
-                    let root_owner = owner.execution_owner_slot().as_ref().unwrap();
-                    match self.io.as_ref().unwrap().poll_quiescent(root_owner, cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(r) => r.map_err(|e| internal_error(e.to_string()))?,
-                    }
-                    if self.computation.is_none() {
-                        let initial = InitialComputationReservation::new(
-                            self.launcher
-                                .reserve_identity()
-                                .map_err(governed_query_execution_error)?,
-                        )
-                        .map_err(|e| internal_error(e.to_string()))?;
-                        self.next_context = Some(
-                            initial
-                                .connector_request_context(
-                                    self.context.clone(),
-                                    #[cfg(novarocks_dev_controls)]
-                                    self.original
-                                        .request
-                                        .execution()
-                                        .test_statement_nomination(),
-                                )
-                                .map_err(|e| internal_error(e.to_string()))?,
-                        );
-                        let peak = crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES
-                            .checked_add(if self.tails_reserved {
-                                0
-                            } else {
-                                self.tail_bytes
-                            })
-                            .ok_or_else(|| {
-                                internal_error("mutation retained tail peak overflow")
-                            })?;
-                        self.computation = Some(Computation::new_with_peak(
-                            self.root.clone(),
-                            initial,
-                            Arc::clone(&self.launcher),
-                            peak,
-                            #[cfg(novarocks_dev_controls)]
-                            self.observation.clone(),
-                        ));
-                    }
-                    let root_owner = owner.execution_owner_slot().as_ref().unwrap();
-                    match self.computation.as_mut().unwrap().poll_admit(
-                        self.io.as_ref().unwrap(),
-                        root_owner,
-                        cx,
-                    ) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(r) => r?,
-                    }
-                    if !self.tails_reserved {
-                        // The original positive joint stage has installed the
-                        // retained increment before this actual allocation.
-                        self.tails
-                            .try_reserve_exact(self.tail_capacity)
-                            .map_err(|_| {
-                                QueryServiceError::from_compile_control(
-                                    novarocks_type_contract::CompileControlError::ResourceExhausted,
-                                )
-                            })?;
-                        self.tails_reserved = true;
-                        if let Some(tail) = self.inline_tail.take() {
-                            self.tails.push(tail);
-                        }
-                    }
-                    let execution = self
-                        .computation
-                        .as_ref()
-                        .unwrap()
-                        .computation_context(self.original.request.execution())
-                        .map_err(|e| internal_error(e.to_string()))?;
-                    let context = self.next_context.take().unwrap();
-                    let p = Arc::clone(self.cow.as_ref().unwrap());
-                    let index = self.index;
-                    self.compile(|c| PhaseRequest::CompileTarget(p, index, execution, context, c));
-                }
+
                 Phase::Publication => {
                     // No new effect begins after cancellation. Existing Calls
                     // settle once; an Applied verdict survives late cancellation.
@@ -832,19 +484,7 @@ impl MutationAction {
                         match self.io.as_ref().unwrap().poll_quiescent(root_owner, cx) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Err(error)) => self.fail(internal_error(error.to_string())),
-                            Poll::Ready(Ok(())) => {
-                                let session = self.session();
-                                if deferred_lowering_before_publication(
-                                    self.failure.as_ref(),
-                                    session.as_deref(),
-                                    self.publication.as_ref().unwrap(),
-                                ) {
-                                    // Keep the original admission refusal after its actual
-                                    // CPU and IO exit. No provider operation exists to settle.
-                                    self.phase = Phase::Done;
-                                    continue;
-                                }
-                            }
+                            Poll::Ready(Ok(())) => {}
                         }
                     }
                     let session = self.session();
@@ -888,11 +528,7 @@ impl MutationAction {
                 }
                 Phase::Done => {
                     let result = if let Some(error) = self.failure.as_ref() {
-                        Err(project_failure(
-                            error,
-                            &self.original.sql,
-                            self.publication.as_ref().unwrap().attempt.terminal(),
-                        ))
+                        Err(project_failure(error, &self.original.sql))
                     } else {
                         self.selected.take().unwrap_or_else(|| {
                             Err(internal_error(
@@ -918,37 +554,17 @@ impl MutationAction {
     }
 }
 
-/// A deferred admission refusal cannot author a publication that never began.
-/// Any existing session, Call or terminal keeps the ordinary settlement path.
-fn deferred_lowering_before_publication(
-    failure: Option<&DmlExecutionError>,
-    session: Option<&ConnectorWriteSession>,
-    publication: &StatementPublication,
-) -> bool {
-    matches!(failure, Some(DmlExecutionError::DeferredLowering(_)))
-        && session.is_none()
-        && publication.call.is_none()
-        && publication.attempt.terminal().is_none()
-        && publication.disposition().is_none()
-}
-
 /// Borrow the existing error authors while the exact cause remains in its
 /// original source through abort, client projection and residual handoff.
-fn project_failure(
-    error: &DmlExecutionError,
-    sql: &str,
-    terminal: Option<&novarocks_spi::connector::LakePublicationTerminal>,
-) -> QueryServiceError {
+fn project_failure(error: &DmlExecutionError, sql: &str) -> QueryServiceError {
     match error {
         DmlExecutionError::Application(error) => error.clone(),
         DmlExecutionError::Execution(input) => {
             QueryServiceError::from_execution_failure(input.clone())
         }
-        DmlExecutionError::Engine(error) | DmlExecutionError::DeferredLowering(error) => {
-            routed_execution_service_error(
-                dml_result::<()>(Err(crate::dml::DmlError::executor(error))).unwrap_err(),
-            )
-        }
+        DmlExecutionError::Engine(error) => routed_execution_service_error(
+            dml_result::<()>(Err(crate::dml::DmlError::executor(error))).unwrap_err(),
+        ),
         DmlExecutionError::Compilation(source) => QueryServiceError::from_compile_control(
             novarocks_type_contract::CompileControlError::Source(source.clone()),
         ),
@@ -957,7 +573,6 @@ fn project_failure(
             None => QueryServiceError::from_user_error(error.to_user_error(Some(sql))),
         },
         DmlExecutionError::Control(error) => QueryServiceError::from_compile_control(error.clone()),
-        DmlExecutionError::Cow(error) => internal_error(error.borrowed_presentation(terminal)),
     }
 }
 #[derive(Debug)]
@@ -1022,11 +637,6 @@ impl GovernedStatementAction for MutationAction {
                     .and_then(StatementNativeTail::local_health_failure)
             })
             .or_else(|| {
-                self.tails
-                    .iter()
-                    .find_map(StatementNativeTail::local_health_failure)
-            })
-            .or_else(|| {
                 self.publication
                     .as_ref()
                     .and_then(StatementPublication::local_health_failure)
@@ -1052,9 +662,7 @@ impl GovernedStatementAction for MutationAction {
         // Move original observations and typed causes into a concrete owner.
         // Installation precedes release of any original result/source aliases.
         let mut residual = Box::new(MutationResidual {
-            tails: Vec::new(),
             inline_tail: None,
-            tail_binding: None,
             session: self.session(),
             publication: None,
             io: None,
@@ -1063,21 +671,15 @@ impl GovernedStatementAction for MutationAction {
             health: self.health.clone(),
             busy: false,
         });
-        residual.tails = std::mem::take(&mut self.tails);
         residual.inline_tail = self.inline_tail.take();
-        residual.tail_binding = self.tail_binding.take();
         residual.publication = self.publication.take();
         residual.io = self.io.take();
         residual.failure = self.failure.take();
         *target = Some(residual);
         drop(self.ready.take());
-        drop(self.selection_execution.take());
-        drop(self.next_context.take());
         drop(self.computation.take());
         drop(self.assembly.take());
-        drop(self.cow.take());
         drop(self.mor.take());
-        drop(self.selection.take());
         drop(self.facts.take());
         let session = self
             .session_receiving
@@ -1090,9 +692,7 @@ impl GovernedStatementAction for MutationAction {
     }
 }
 struct MutationResidual {
-    tails: Vec<StatementNativeTail>,
     inline_tail: Option<StatementNativeTail>,
-    tail_binding: Option<QueryResultCapacityBinding>,
     session: Option<Arc<ConnectorWriteSession>>,
     publication: Option<StatementPublication>,
     io: Option<Arc<MetadataIoAdmission>>,
@@ -1136,13 +736,6 @@ impl GovernedStatementResidual for MutationResidual {
                 return Poll::Ready(Err(health));
             }
         }
-        for tail in &mut self.tails {
-            pending |= tail.poll_exit(cx).is_pending();
-            if let Some(health) = tail.local_health_failure() {
-                self.busy = false;
-                return Poll::Ready(Err(health));
-            }
-        }
         if pending {
             self.busy = false;
             return Poll::Pending;
@@ -1171,8 +764,6 @@ impl GovernedStatementResidual for MutationResidual {
         drop(self.publication.take());
         drop(self.session.take());
         drop(self.inline_tail.take());
-        drop(std::mem::take(&mut self.tails));
-        drop(self.tail_binding.take());
         drop(self.failure.take());
         drop(self.io.take());
         self.busy = false;
@@ -1269,25 +860,13 @@ pub(crate) fn prepare(
         original,
         root,
         io: Some(io),
-        launcher: input.launcher,
-        #[cfg(novarocks_dev_controls)]
-        observation: input.observation,
         session_receiving,
         context,
-        next_context: None,
-        selection_execution: None,
         computation: Some(computation),
         ready: None,
         inline_tail: None,
-        tails: Vec::new(),
-        tail_binding: None,
-        tail_capacity: 0,
-        tail_bytes: 0,
-        tails_reserved: false,
         facts: None,
         mor: None,
-        selection: None,
-        cow: None,
         preparation: PhasePreparation::default(),
         assembly: None,
         provider: None,
@@ -1298,8 +877,6 @@ pub(crate) fn prepare(
         affected_rows: MutationAffectedRows::default(),
         publication: Some(StatementPublication::new(attempt)),
         phase: Phase::Admit,
-        index: 0,
-        wrote_any: false,
         no_op: false,
         busy: false,
         health: health(),
@@ -1309,66 +886,25 @@ pub(crate) fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_execution::dml::mutation_flow::CowFailure;
-    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    #[test]
-    fn deferred_cow_source_refusal_preserves_the_original_admission_diagnostic() {
-        use novarocks_spi::connector::{
-            LakePublicationFamily, LakePublicationId, LakePublicationTarget,
-        };
-        let message = "UPDATE assignment span is outside the admitted SQL source";
-        let original = project_failure(&DmlExecutionError::Engine(message.into()), "", None);
-        let deferred = DmlExecutionError::DeferredLowering(message.into());
-        let mut publication = StatementPublication::new(DmlPublicationAttempt::new(
-            LakePublicationId::new_v7(),
-            LakePublicationFamily::DataMutation,
-            LakePublicationTarget::try_new("ice".into(), "db".into(), Some("orders".into()), None)
-                .unwrap(),
-            None,
-        ));
-        assert!(deferred_lowering_before_publication(
-            Some(&deferred),
-            None,
-            &publication,
-        ));
-        let projected = project_failure(&deferred, "", publication.attempt.terminal());
-        assert_eq!(projected.kind(), original.kind());
-        assert_eq!(projected.message(), original.message());
-        assert_eq!(
-            projected.diagnostic_with_external_effect(None).to_string(),
-            original.diagnostic_with_external_effect(None).to_string(),
+    #[derive(Debug)]
+    struct SourceExitProbe(Arc<AtomicBool>);
+    impl novarocks_failure_contract::SourceRetentionCapability for SourceExitProbe {}
+    impl Drop for SourceExitProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    fn retained_compile_failure(
+        message: &str,
+        probe: Arc<AtomicBool>,
+    ) -> novarocks_failure_contract::SharedFailureCause {
+        let source = novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message.into()),
         );
-        assert!(projected.publication_terminal().is_none());
-        assert!(projected.external_effect_disposition().is_none());
-        assert!(publication.disposition().is_none());
-        assert!(!deferred_lowering_before_publication(
-            Some(&DmlExecutionError::Engine(message.into())),
-            None,
-            &publication,
-        ));
-        let fixture = crate::query_execution::write_session::tests::fixture_with_outcome(
-            1,
-            16,
-            crate::query_execution::write_session::tests::known_committed(),
-        );
-        assert!(!deferred_lowering_before_publication(
-            Some(&deferred),
-            Some(&fixture.session),
-            &publication,
-        ));
-        publication
-            .attempt
-            .terminal_pre_dispatch_uncommitted()
-            .unwrap();
-        assert!(!deferred_lowering_before_publication(
-            Some(&deferred),
-            None,
-            &publication,
-        ));
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(publication.poll_retirement(&mut cx).is_ready());
+        source.retain_source_lifetime(Box::new(SourceExitProbe(probe)));
+        source
     }
 
     struct ReadyErrorThenPanicDrop(Option<DmlExecutionError>);
@@ -1387,14 +923,10 @@ mod tests {
     fn actual_preparation_stores_typed_return_before_hostile_future_drop() {
         let exited = Arc::new(AtomicBool::new(false));
         let probe = Arc::clone(&exited);
-        let failure = CowFailure::provider(ConnectorError::new(
-            ConnectorErrorKind::PermissionDenied,
-            "original provider denied",
-        ))
-        .with_exit_probe(move || probe.store(true, Ordering::SeqCst));
+        let failure = retained_compile_failure("original preparation refused", probe);
         let mut preparation = PhasePreparation {
             future: Some(Box::pin(ReadyErrorThenPanicDrop(Some(
-                DmlExecutionError::Cow(failure),
+                DmlExecutionError::Compilation(failure),
             )))),
             result: None,
             busy: false,
@@ -1410,14 +942,11 @@ mod tests {
             preparation.busy,
             "the actual preparation owner is poisoned by child Drop"
         );
-        let Some(Err(DmlExecutionError::Cow(original))) = preparation.result.as_ref() else {
+        let Some(Err(DmlExecutionError::Compilation(original))) = preparation.result.as_ref()
+        else {
             panic!("original typed return must be stable");
         };
-        assert!(
-            original
-                .borrowed_presentation(None)
-                .contains("PermissionDenied: original provider denied")
-        );
+        assert!(original.detail().contains("original preparation refused"));
         assert!(
             !exited.load(Ordering::SeqCst),
             "client projection must not retire the original cause"
@@ -1430,32 +959,43 @@ mod tests {
         assert!(exited.load(Ordering::SeqCst));
     }
     #[test]
-    fn actual_preparation_refusal_is_retained_through_borrowed_projection() {
+    fn actual_preparation_refusal_keeps_original_source_through_client_projection() {
         let exited = Arc::new(AtomicBool::new(false));
         let probe = Arc::clone(&exited);
-        let failure = CowFailure::provider(ConnectorError::new(
-            ConnectorErrorKind::Unavailable,
-            "same provider failure",
-        ))
-        .with_exit_probe(move || probe.store(true, Ordering::SeqCst));
+        let failure = retained_compile_failure("same preparation failure", probe);
         let mut preparation = PhasePreparation {
-            future: Some(Box::pin(
-                async move { Err(DmlExecutionError::Cow(failure)) },
-            )),
+            future: Some(Box::pin(async move {
+                Err(DmlExecutionError::Compilation(failure))
+            })),
             result: None,
             busy: false,
         };
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(preparation.poll_returned(&mut cx).is_ready());
         let original = preparation.result.as_ref().unwrap().as_ref().err().unwrap();
-        let client = project_failure(original, "UPDATE exact_admitted_source SET x = 1", None);
-        assert!(
-            client
-                .message()
-                .contains("Unavailable: same provider failure")
+        let client = project_failure(original, "UPDATE exact_admitted_source SET x = 1");
+        assert_eq!(
+            client.message(),
+            "[UnsupportedCompiledShape] pure compilation failed in its source domain"
         );
+        let Some(novarocks_type_contract::CompileControlError::Source(projected)) =
+            client.compile_control_error()
+        else {
+            panic!("client diagnostic must retain the same original source");
+        };
+        let DmlExecutionError::Compilation(retained) = original else {
+            panic!("preparation must retain its original compilation cause");
+        };
+        assert_eq!(&projected, retained);
+        assert!(projected.detail().contains("same preparation failure"));
+        drop(projected);
         assert!(!exited.load(Ordering::SeqCst));
         drop(preparation);
+        assert!(
+            !exited.load(Ordering::SeqCst),
+            "the client still retains the original compile cause"
+        );
+        drop(client);
         assert!(exited.load(Ordering::SeqCst));
     }
 }
@@ -1467,42 +1007,6 @@ mod affected_count_tests {
         write_result::DecodedPreparedWriteSet,
         write_session::tests::{fixture_with_outcome, known_committed},
     };
-    use arrow::{
-        array::Int64Array,
-        datatypes::{DataType, Field, Schema},
-        record_batch::RecordBatch,
-    };
-
-    fn selected_rows() -> ConnectorRowMutationSelection {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![1_i64, 5, 9]))],
-        )
-        .unwrap();
-        ConnectorRowMutationSelection::try_new(schema, vec![batch], 3, 4096).unwrap()
-    }
-
-    #[test]
-    fn cow_action_count_keeps_selected_rows_across_larger_rewrite_output() {
-        let selection = selected_rows();
-        let fixture = fixture_with_outcome(1, 16, known_committed());
-        fixture
-            .session
-            .receive_for_test(DecodedPreparedWriteSet::for_test(29, Vec::new()))
-            .unwrap();
-        let mut rows = MutationAffectedRows::default();
-        rows.receive_selection(&selection).unwrap();
-        rows.receive_write(&fixture.session).unwrap();
-        let StatementActionValue::Ok(completion) =
-            super::super::write_action::selected_command_completion(Ok(()), rows.get()).unwrap()
-        else {
-            panic!("COW success must preserve selected logical count")
-        };
-        assert_eq!(completion.count(), Some(3));
-        assert_eq!(fixture.session.accumulated_row_count().unwrap(), 29);
-        assert_eq!(fixture.session.finish_invocations(), 0);
-    }
 
     #[test]
     fn mor_action_count_uses_complete_logical_root_and_cannot_be_reauthored() {
@@ -1516,7 +1020,6 @@ mod affected_count_tests {
         rows.receive_write(&fixture.session).unwrap();
         assert_eq!(rows.get(), Some(19));
         assert!(rows.receive_write(&fixture.session).is_err());
-        assert!(rows.receive_selection(&selected_rows()).is_err());
         assert_eq!(rows.get(), Some(19));
         assert_eq!(fixture.session.finish_invocations(), 0);
     }

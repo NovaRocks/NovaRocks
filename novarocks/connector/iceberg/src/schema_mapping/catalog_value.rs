@@ -55,17 +55,6 @@ pub(crate) fn table_with_document(
     table_from_document(document, declaration, pseudo_columns, mutation, creation)
 }
 
-/// The exact frozen COW source retains the same format-owned metadata NULL
-/// facts as an ordinary scan; freezing a file does not assign it row lineage.
-pub(crate) fn frozen_row_mutation_table(
-    metadata: &TableMetadata,
-    declaration: &Schema,
-    pseudo_columns: &[String],
-    creation: &mut ConnectorReadSchemaCreation<'_>,
-) -> Result<ConnectorReadExecutionSchema, Failure> {
-    table(metadata, declaration, pseudo_columns, creation)
-}
-
 fn table_from_document(
     document: &super::nominal_declaration::TableNominalDocument,
     declaration: &Schema,

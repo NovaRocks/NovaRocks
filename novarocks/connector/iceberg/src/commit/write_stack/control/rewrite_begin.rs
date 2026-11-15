@@ -110,8 +110,8 @@ impl Drop for IoLoan<'_> {
 impl RewriteBeginIo {
     pub(super) fn formation_scope(
         &self,
-    ) -> Result<super::cow_begin::CowBeginScope<'_>, ConnectorError> {
-        super::cow_begin::CowBeginScope::new(&self.capture)
+    ) -> Result<super::rewrite_scope::RewriteBeginScope<'_>, ConnectorError> {
+        super::rewrite_scope::RewriteBeginScope::new(&self.capture)
             .map_err(crate::distributed_rewrite::async_plan::formation_failure)
     }
 

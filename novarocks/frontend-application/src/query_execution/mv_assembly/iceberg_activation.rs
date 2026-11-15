@@ -214,7 +214,7 @@ fn prepare_first_refresh_document_write_request(
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
             Some(base),
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-                declaration,
+                declaration: Box::new(declaration),
                 shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
             },
             connector_context,
@@ -311,7 +311,7 @@ fn prepare_metadata_only_document_write_request(
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
             Some(base),
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-                declaration,
+                declaration: Box::new(declaration),
                 shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
             },
             connector_context,
@@ -544,7 +544,7 @@ fn prepare_incremental_document_write_request(
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
             Some(base),
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-                declaration,
+                declaration: Box::new(declaration),
                 shape,
             },
             connector_context,
@@ -721,10 +721,8 @@ mod tests {
         else {
             panic!("a change-stream publication sends row-lineage change events");
         };
-        // `_file`/`_pos` is what makes this a merge-on-read mutation. A
-        // `_row_id`/`_last_updated_sequence_number` identity would be
-        // copy-on-write, which a publication carries no match selection for and
-        // the provider refuses outright.
+        // Merge-on-read deletion names the original physical row by `_file`/`_pos`.
+        // Lineage fields alone do not identify the physical row to delete.
         assert_eq!(field_names(&row_identity_fields), vec!["_file", "_pos"]);
         assert!(
             row_identity_fields

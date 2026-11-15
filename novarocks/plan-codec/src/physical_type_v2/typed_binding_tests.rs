@@ -379,6 +379,7 @@ fn typed_semantic_writer_pairs_its_explicit_binding_while_preserving_source_meta
                 kind: Some(package::connector_write_input_shape::Kind::Data(
                     package::ConnectorWriteDataInput {
                         fields: vec![package::ConnectorWriteFieldBinding {
+                            storage_value_type_id: None,
                             source_field_id: Some(u32::MAX),
                             value_type_id: Some(0),
                             field_token: vec![3; 32],

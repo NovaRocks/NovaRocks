@@ -352,6 +352,34 @@ fn fixture_with_types(
         .unwrap();
     let writer = builder.reserve_node_id().unwrap();
     let fields = relation_fields(&mut builder, writer, false);
+    let projected_target_fields_0: Box<[novarocks_physical_plan::WriterTargetField]> = draft
+        .input()
+        .fields_iter()
+        .zip(&values)
+        .map(|(binding, value)| WriterTargetField {
+            storage_type: None,
+            projected: builder
+                .add_value(
+                    binding
+                        .execution_type()
+                        .expect("provider complete target declaration")
+                        .clone(),
+                    novarocks_physical_plan::ValueOrigin::WriterDerived {
+                        writer_node: writer,
+                        kind: novarocks_physical_plan::WriterDerivedKind::ProjectedInput,
+                    },
+                )
+                .unwrap(),
+            provider_name: binding.field().name().clone().into(),
+            token: binding.token(),
+            input: *value,
+            ty: binding
+                .execution_type()
+                .expect("provider complete target declaration")
+                .clone(),
+            hidden: false,
+        })
+        .collect();
     builder
         .insert_node_unchecked(PhysicalNode {
             id: writer,
@@ -368,21 +396,7 @@ fn fixture_with_types(
                     write_target_ordinal: ordinal,
                     input: values.clone().into_boxed_slice(),
                     required_distribution: Distribution::Singleton,
-                    target_fields: draft
-                        .input()
-                        .fields_iter()
-                        .zip(&values)
-                        .map(|(binding, value)| WriterTargetField {
-                            provider_name: binding.field().name().clone().into(),
-                            token: binding.token(),
-                            input: *value,
-                            ty: binding
-                                .execution_type()
-                                .expect("provider complete target declaration")
-                                .clone(),
-                            hidden: false,
-                        })
-                        .collect(),
+                    target_fields: projected_target_fields_0,
                     output_schema: WriterRelationSchema {
                         revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
                         fields: fields.clone(),
@@ -776,9 +790,9 @@ fn writer_fragment_compiles_a_positional_relation_over_synthetic_slot_reads() {
             graph.nodes()[input.index()].kind(),
             ProgramNodeKind::Values { .. }
         ));
-        // The projection is the provider's own fields, with the value's
-        // nullability: `c1` is fed a non-null value and stays NOT NULL, `c2`
-        // is nullable in the provider but fed a non-null value.
+        // The successful projection declares the provider's complete W:
+        // c1 is required and c2 remains optional even for this non-NULL source.
+        // The synthetic reads below keep their original source declarations.
         let fields = projection.layout.schema().fields();
         assert_eq!(fields.len(), 2);
         assert_eq!(
@@ -800,10 +814,7 @@ fn writer_fragment_compiles_a_positional_relation_over_synthetic_slot_reads() {
                 .map(String::as_str),
             Some("1")
         );
-        assert_eq!(
-            fields[1].as_ref(),
-            &target_fields()[1].clone().with_nullable(false)
-        );
+        assert_eq!(fields[1].as_ref(), &target_fields()[1]);
         assert_eq!(expected_layout.schema(), projection.layout.schema());
         assert_eq!(expected_layout.slots(), projection.layout.slots());
         // Each projected field is a synthetic slot read of its input
@@ -1376,7 +1387,9 @@ fn statistics_fixture() -> StatisticsFixture {
             role: WriterRelationFieldRole::Auxiliary,
         });
     }
-    let inputs = [ty(DataType::Int64, false), ty(DataType::Utf8, false)];
+    // Aggregate arguments describe materialized W, independently of the
+    // non-NULL source literals above. The provider declares c2 optional.
+    let inputs = [ty(DataType::Int64, false), ty(DataType::Utf8, true)];
     let partial = AggregatePhase::Partial {
         sequence: AggregateSequenceId::new(1),
     };
@@ -1385,6 +1398,46 @@ fn statistics_fixture() -> StatisticsFixture {
             input: values[channel],
             binding: theta_binding(&catalog, &inputs[channel], partial),
             output: fields[4 + channel].value,
+        })
+        .collect::<Box<[_]>>();
+    let projected_target_fields_1: Box<[novarocks_physical_plan::WriterTargetField]> = draft
+        .input()
+        .fields_iter()
+        .zip(&values)
+        .map(|(binding, value)| WriterTargetField {
+            storage_type: None,
+            projected: builder
+                .add_value(
+                    binding
+                        .execution_type()
+                        .expect("provider complete target declaration")
+                        .clone(),
+                    novarocks_physical_plan::ValueOrigin::WriterDerived {
+                        writer_node: writer,
+                        kind: novarocks_physical_plan::WriterDerivedKind::ProjectedInput,
+                    },
+                )
+                .unwrap(),
+            provider_name: binding.field().name().clone().into(),
+            token: binding.token(),
+            input: *value,
+            ty: binding
+                .execution_type()
+                .expect("provider complete target declaration")
+                .clone(),
+            hidden: false,
+        })
+        .collect();
+    let partial_aggregates = partial_aggregates
+        .iter()
+        .cloned()
+        .map(|mut call| {
+            call.input = projected_target_fields_1
+                .iter()
+                .find(|field| field.input == call.input)
+                .expect("fixture aggregate reads a projected field")
+                .projected;
+            call
         })
         .collect::<Box<[_]>>();
     builder
@@ -1403,21 +1456,7 @@ fn statistics_fixture() -> StatisticsFixture {
                     write_target_ordinal: ordinal,
                     input: values.clone().into_boxed_slice(),
                     required_distribution: Distribution::Singleton,
-                    target_fields: draft
-                        .input()
-                        .fields_iter()
-                        .zip(&values)
-                        .map(|(binding, value)| WriterTargetField {
-                            provider_name: binding.field().name().clone().into(),
-                            token: binding.token(),
-                            input: *value,
-                            ty: binding
-                                .execution_type()
-                                .expect("provider complete target declaration")
-                                .clone(),
-                            hidden: false,
-                        })
-                        .collect(),
+                    target_fields: projected_target_fields_1,
                     output_schema: WriterRelationSchema {
                         revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
                         fields: fields.clone().into_boxed_slice(),
@@ -2229,7 +2268,7 @@ fn unsupported_writer_statistics_shapes_are_refused_by_name() {
 }
 
 #[test]
-fn actual_writer_compilation_accepts_root_null_obligation_and_refuses_nested_binding_drift() {
+fn actual_writer_compilation_keeps_source_types_and_checks_only_null_differences_at_output() {
     use novarocks_type_contract::{
         ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
         ValueTypeStorageLifetime,
@@ -2275,7 +2314,7 @@ fn actual_writer_compilation_accepts_root_null_obligation_and_refuses_nested_bin
     else {
         panic!("actual writer")
     };
-    assert!(projection.layout.value_binding_at(0).unwrap().nullable());
+    assert!(!projection.layout.value_binding_at(0).unwrap().nullable());
     assert!(
         !program.write_recipes()[&root]
             .draft()
@@ -2287,10 +2326,8 @@ fn actual_writer_compilation_accepts_root_null_obligation_and_refuses_nested_bin
             .unwrap()
             .nullable()
     );
-    for (actual, expected) in [
-        (nested(false, true), nested(true, true)),
-        (nested(true, false), nested(true, true)),
-    ] {
+    {
+        let (actual, expected) = (nested(false, true), nested(true, true));
         let declared = draft_with_types([FunctionValueType::new(DataType::Int64, false), expected]);
         let actual_source = [FunctionValueType::new(DataType::Int64, false), actual];
         match fixture_with_types(actual_source, declared) {
@@ -2300,11 +2337,96 @@ fn actual_writer_compilation_accepts_root_null_obligation_and_refuses_nested_bin
             ),
             Ok(fixture) => assert!(
                 compile(&fixture.writer, 1, None).is_err(),
-                "writer must refuse complete nested domain/NULL drift"
+                "writer must refuse nested domain drift"
             ),
         }
+    }
+    for (source_nullable, required_nullable) in [(true, false), (false, true)] {
+        let source = nested(true, source_nullable);
+        let required = nested(true, required_nullable);
+        let declared = draft_with_types([
+            FunctionValueType::new(DataType::Int64, false),
+            required.clone(),
+        ]);
+        let fixture = fixture_with_types(
+            [
+                FunctionValueType::new(DataType::Int64, false),
+                source.clone(),
+            ],
+            declared,
+        )
+        .unwrap();
+        let program = compile(&fixture.writer, 1, None).unwrap();
+        let root = program.graph().root();
+        let ProgramNodeKind::TableWriter { projection, .. } =
+            program.graph().nodes()[root.index()].kind()
+        else {
+            panic!("actual writer")
+        };
+        assert!(
+            projection
+                .layout
+                .value_binding_at(1)
+                .unwrap()
+                .borrowed()
+                .exactly_equals_observed(required.typed_binding().borrowed(), || Ok::<_, ()>(()))
+                .unwrap(),
+            "the published projection must satisfy the original target requirement",
+        );
+        let Some(novarocks_type_contract::FunctionArgumentType::Value(original)) =
+            program.checked().channels().expressions().definition_type(
+                novarocks_local_program::ProgramExpressionArena::WriterProjection(root),
+                novarocks_local_program::ProgramExprId::new(1),
+            )
+        else {
+            panic!("the original projection expression remains typed")
+        };
+        assert_eq!(
+            original, &source,
+            "the source must not be restated as required"
+        );
     }
 }
 
 #[path = "writer_lowering_tests/change_stream.rs"]
 mod change_stream;
+
+#[test]
+fn writer_statistics_read_projected_values_and_reject_the_original_source_port() {
+    let fixture = statistics_fixture();
+    let writer = &fixture.writer.fragment().nodes()[&fixture.writer_node];
+    let NodeKind::TableWriter { target } = &writer.kind else {
+        unreachable!()
+    };
+    for (ordinal, call) in target.partial_aggregates.iter().enumerate() {
+        assert_eq!(call.input, target.target_fields[ordinal].projected);
+        assert_ne!(call.input, target.target_fields[ordinal].input);
+        assert_eq!(
+            fixture.writer.fragment().values()[&call.input].ty,
+            target.target_fields[ordinal].ty
+        );
+    }
+    let mut control =
+        CompileCheckpoints::try_new(&FixtureControl, CompilePhase::LowerProgram).unwrap();
+    let mut invalid = writer.clone();
+    let NodeKind::TableWriter { target } = &mut invalid.kind else {
+        unreachable!()
+    };
+    target.partial_aggregates[0].input = target.target_fields[0].input;
+    let recipe =
+        validate_fragment_providers(Arc::clone(&fixture.writer), &providers(), &FixtureControl)
+            .unwrap();
+    assert_eq!(
+        unsupported(
+            admit_writer_family(
+                &fixture.writer,
+                &invalid,
+                recipe.writes().get(&fixture.writer_node),
+                NonZeroUsize::new(1).unwrap(),
+                &mut control
+            )
+            .unwrap_err()
+        ),
+        "writer partial aggregate over a value outside its target input"
+    );
+}

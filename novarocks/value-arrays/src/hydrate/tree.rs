@@ -30,8 +30,10 @@ use crate::{
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use novarocks_failure_contract::{RepresentationBoundary, RepresentationFacts};
-use novarocks_type_contract::BorrowedTypedValueBinding;
-use std::{alloc::Layout, sync::Arc};
+use novarocks_type_contract::{
+    BorrowedTypedValueBinding, CheckedWriteInputProjection, WriteInputLeafProjection,
+};
+use std::{alloc::Layout, ops::Range, sync::Arc};
 
 pub(super) struct Node {
     pub source: ArrayRef,
@@ -40,6 +42,7 @@ pub(super) struct Node {
     // Reading and output layout are separate only for an explicit plain-byte
     // projection. Dictionary parse policy continues to use frozen output L.
     pub source_layout: Option<ByteLayout>,
+    pub fixed_binary_source_width: Option<i32>,
     pub convert: bool,
     pub clear_nulls: bool,
     pub rebuild: bool,
@@ -58,6 +61,7 @@ impl Node {
         source: &ArrayRef,
         binding: BorrowedTypedValueBinding<'_>,
         options: HydrateOptions,
+        proof: Option<CheckedWriteInputProjection<'_>>,
         path: &mut [HydratePathStep],
         depth: usize,
         keep_encoded: &mut impl FnMut(&[HydratePathStep], &DataType) -> bool,
@@ -72,6 +76,17 @@ impl Node {
         observe(HydrateEvent::InspectType(source.data_type())).map_err(ValueFailure::Caller)?;
         let layout = ByteLayout::from_data_type(binding.data_type());
         let dictionary = matches!(source.data_type(), DataType::Dictionary(..));
+        let fixed_binary_source_width = match proof.map(|proof| proof.leaf_projection()) {
+            Some(WriteInputLeafProjection::FixedBytesToBinary { source_width }) => {
+                if source.data_type() != &DataType::FixedSizeBinary(source_width)
+                    || layout != Some(ByteLayout::Binary)
+                {
+                    return Err(invalid().into());
+                }
+                Some(source_width)
+            }
+            _ => None,
+        };
         let keep = dictionary && keep_encoded(&path[..depth], source.data_type());
         let source_layout =
             if options.projection == HydrateProjection::ExactByteLayouts && !dictionary {
@@ -79,10 +94,11 @@ impl Node {
             } else {
                 layout
             };
-        let byte_projection = options.projection == HydrateProjection::ExactByteLayouts
-            && !dictionary
-            && layout.is_some()
-            && layout != source_layout;
+        let byte_projection = fixed_binary_source_width.is_some()
+            || options.projection == HydrateProjection::ExactByteLayouts
+                && !dictionary
+                && layout.is_some()
+                && layout != source_layout;
         let required_inactive_nulls = !binding.value_type().nullable() && source.null_count() != 0;
         let convert = dictionary && !keep
             || !dictionary && layout.is_some() && required_inactive_nulls
@@ -98,6 +114,7 @@ impl Node {
             children: Vec::new(),
             layout,
             source_layout,
+            fixed_binary_source_width,
             convert,
             clear_nulls,
             rebuild: convert || clear_nulls,
@@ -120,6 +137,10 @@ impl Node {
                 input,
                 child(binding, index)?,
                 options,
+                match proof {
+                    Some(proof) => Some(proof.child_at(index).ok_or_else(invalid)?),
+                    None => None,
+                },
                 path,
                 depth + 1,
                 keep_encoded,
@@ -186,11 +207,7 @@ impl Node {
     ) -> Result<(), ValueFailure<E>> {
         work(1).map_err(ValueFailure::Caller)?;
         if self.convert {
-            let source = ByteSource::parse(
-                &self.source,
-                self.source_layout.ok_or_else(invalid)?,
-                self.dictionary_layout,
-            )?;
+            let source = self.leaf_source()?;
             if let Some(length) = source.value_len(row)? {
                 self.row_extent = self
                     .row_extent
@@ -450,11 +467,7 @@ impl Node {
     ) -> Result<(), ValueFailure<E>> {
         if self.convert {
             let layout = self.layout.ok_or_else(invalid)?;
-            let source = ByteSource::parse(
-                &self.source,
-                self.source_layout.ok_or_else(invalid)?,
-                self.dictionary_layout,
-            )?;
+            let source = self.leaf_source()?;
             let mut logical = 0u128;
             let mut copied = 0u128;
             for row in self.active.iter() {
@@ -543,6 +556,41 @@ pub(super) fn check_extent(
         Some(limit),
         Some(prefix as u64),
     )))
+}
+
+/// Visit immediate child coordinates reachable from the selected parent rows.
+///
+/// Parent rows use the array's current (possibly sliced) coordinate domain.
+/// NULL parents contribute no children. STRUCT child ordinals name its fields;
+/// LIST and fixed-size LIST use ordinal zero for their values; UNION uses the
+/// selected field's ordinal. MAP exposes its key and value arrays directly at
+/// ordinals zero and one, rather than an intermediate entries STRUCT. Ranges
+/// use those actual child arrays' coordinates, including list slice offsets.
+/// Leaf arrays, including encoded byte dictionaries, contribute no children;
+/// their logical NULL interpretation remains with the byte-access API.
+///
+/// Visits retain parent order and repeated occurrences and may contain empty
+/// ranges. No selection or bitmap is allocated. The caller may stop through
+/// either Work or the visitor, preserving the original caller failure.
+pub fn visit_reachable_child_rows_observed<E>(
+    source: &ArrayRef,
+    rows: impl IntoIterator<Item = usize>,
+    work: &mut Work<'_, E>,
+    visit: &mut impl FnMut(usize, Range<usize>) -> Result<(), E>,
+) -> Result<(), ValueFailure<E>> {
+    for row in rows {
+        work(1).map_err(ValueFailure::Caller)?;
+        if row >= source.len() {
+            return Err(ValueError::Invariant(ValueViolation::Bounds).into());
+        }
+        if source.is_null(row) {
+            continue;
+        }
+        child_rows(source, row, &mut |index, start, end| {
+            visit(index, start..end).map_err(ValueFailure::Caller)
+        })?;
+    }
+    Ok(())
 }
 
 /// Actual source geometry; no metadata or projected child length authors rows.

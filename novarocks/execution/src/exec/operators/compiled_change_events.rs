@@ -27,9 +27,10 @@
 //! channels carry their root's values, unassigned channels are NULL, and the
 //! effect channel carries the event's frozen mutation effect code.
 //!
-//! An assignment value must already have its output channel's exact Arrow
-//! type; there is no cast, unlike the legacy operator. Expressions are
-//! evaluated only through compiled roots.
+//! Assignments retain their source declarations. Only NULL requirements may
+//! differ from the output: those values are checked before the existing value
+//! owner constructs the exact output carrier. There is no value cast here;
+//! expressions are evaluated only through compiled roots.
 
 use crate::exec::fragment::error::{
     FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
@@ -64,13 +65,20 @@ use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 /// One event's frozen facts, resolved to root indices and output ordinals.
 #[derive(Clone)]
+struct AssignedValue {
+    root: usize,
+    expression: novarocks_local_program::ProgramExprId,
+    write_input: Option<novarocks_type_contract::WriteInputDeclaration>,
+}
+
+#[derive(Clone)]
 struct EventPlan {
     /// Index into the root list of the TruthOnly predicate, if any.
     predicate: Option<usize>,
     /// The effect code written to the effect channel.
     effect: i8,
-    /// Per output ordinal: `Some(root index)` for an assigned channel.
-    assigned: Vec<Option<usize>>,
+    /// The root and its original source type remain separate from the target.
+    assigned: Vec<Option<AssignedValue>>,
 }
 
 pub struct CompiledChangeEventProcessorFactory {
@@ -174,13 +182,28 @@ impl CompiledChangeEventProcessorFactory {
                         let target = layout.value_binding_at(ordinal).ok_or_else(|| {
                             invalid("has an output without a complete value binding".into())
                         })?;
-                        if (source.nullable() && !target.nullable())
-                            || !source
-                                .typed_binding()
+                        let requirement = assignment
+                            .write_input
+                            .as_ref()
+                            .map_or(target, |declaration| declaration.input.typed_binding());
+                        let storage = assignment.write_input.as_ref().and_then(|declaration| {
+                            declaration
+                                .storage
+                                .as_ref()
+                                .map(|ty| ty.typed_binding().borrowed())
+                        });
+                        if novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+                            source.typed_binding().borrowed(),
+                            requirement.borrowed(),
+                            storage,
+                            || Ok::<(), ExecutionFailure>(()),
+                        )?
+                        .is_none()
+                            || !target
                                 .borrowed()
                                 .same_physical_binding_ignoring_root_nullability_observed(
-                                    target.borrowed(),
-                                    || Ok::<(), crate::runtime::task::ExecutionFailure>(()),
+                                    requirement.borrowed(),
+                                    || Ok::<(), ExecutionFailure>(()),
                                 )?
                         {
                             return Err(invalid(format!(
@@ -197,7 +220,11 @@ impl CompiledChangeEventProcessorFactory {
                             assignment: assignment_index,
                         },
                     });
-                    assigned[ordinal] = Some(sites.len() - 1);
+                    assigned[ordinal] = Some(AssignedValue {
+                        root: sites.len() - 1,
+                        expression,
+                        write_input: assignment.write_input.clone(),
+                    });
                 }
             }
             plans.push(EventPlan {
@@ -369,16 +396,61 @@ impl CompiledChangeEventProcessor {
             },
         )?;
         let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
         for (ordinal, field) in schema.fields().iter().enumerate() {
             let column = if ordinal == self.effect_ordinal {
                 Arc::new(Int8Array::from_value(event.effect, rows.len())) as ArrayRef
-            } else if let Some(root) = event.assigned[ordinal] {
+            } else if let Some(assignment) = event.assigned[ordinal].as_ref() {
+                let root = assignment.root;
                 let values = evaluate_selected(
                     &mut instances[root],
                     self.sites[root],
                     input,
                     &rows,
                     &self.control,
+                )?;
+                let Some(novarocks_functions::FunctionArgumentType::Value(source_type)) = self
+                    .program
+                    .checked()
+                    .channels()
+                    .expressions()
+                    .definition_type(
+                        novarocks_local_program::ProgramExpressionArena::Main,
+                        assignment.expression,
+                    )
+                else {
+                    return Err(program_binding_failure(
+                        PlanBindingKind::InvalidAssignment,
+                        "compiled change-event assignment lost its original source binding",
+                    ));
+                };
+                let target = output.slots()[ordinal].typed_binding();
+                // Global event slots are nullable for unassigned placeholders.
+                // A selected assignment retains its independent strict W.
+                let requirement = assignment
+                    .write_input
+                    .as_ref()
+                    .map_or(target, |declaration| declaration.input.typed_binding());
+                let storage = assignment.write_input.as_ref().and_then(|declaration| {
+                    declaration
+                        .storage
+                        .as_ref()
+                        .map(|ty| ty.typed_binding().borrowed())
+                });
+                let values = crate::exec::node::table_writer::materialize_target_value(
+                    &values,
+                    source_type.typed_binding().borrowed(),
+                    crate::exec::node::table_writer::TargetValueDeclaration {
+                        column: ordinal,
+                        name: field.name(),
+                        requirement,
+                        storage,
+                        output: target,
+                        input_rows: Some(&rows),
+                    },
+                    &mut conversions,
+                    owner.as_ref(),
+                    &mut |_| self.control.checkpoint_execution(),
                 )?;
                 if values.data_type() != field.data_type() {
                     return Err(ChangeEventFailure::AssignmentType {

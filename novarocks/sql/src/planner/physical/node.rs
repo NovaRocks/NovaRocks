@@ -133,6 +133,7 @@ pub(crate) struct DistributedChangeEventSpec {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedChangeEventOutputExpr {
+    pub(crate) write_input: Option<novarocks_type_contract::WriteInputDeclaration>,
     pub(crate) output_column_id: ColumnId,
     pub(crate) expr: Option<TypedExpr>,
 }

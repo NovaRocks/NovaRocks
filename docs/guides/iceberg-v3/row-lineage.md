@@ -27,7 +27,6 @@ under the License.
 | `_last_updated_sequence_number` 元数据列读 | ✅ | |
 | INSERT / OVERWRITE 实际分配 `first_row_id` 与 snapshot row range | ✅ | 不预测分配量 |
 | DELETE 不分配新 `_row_id`（DV 合并保留语义） | ✅ | |
-| COW UPDATE 保留 `_row_id` | ✅ | 源身份与 replacement/append 输出分别冻结 |
 | MOR UPDATE 复用 `_row_id`，新行版本继承实际提交 | ✅ | `_last_updated_sequence_number` 写 NULL |
 | OPTIMIZE 重写后保留每行 `_row_id`（物理写到 reserved field id `i32::MAX-107` / `-108`） | ✅ | PR #85 |
 | `_row_id` 跨 snapshot 唯一性 invariant 测试（含 OPTIMIZE 后） | ✅ | PR #85（`iceberg_v3_row_lineage_uniqueness.sql`） |
@@ -52,7 +51,7 @@ TBLPROPERTIES (
 v3 表中：
 - INSERT / OVERWRITE 的新逻辑行在实际提交时分配 `_row_id`
 - UPDATE 复用原行的 `_row_id`，仅推进 `_last_updated_sequence_number`
-- DELETE 不分配新 ID，DV / position-delete 上记录被删行
+- DELETE 不分配新 ID；部分覆盖写 DV，完整覆盖逻辑移除数据文件及独占旧位置删除项
 - 写指定 branch / MERGE INTO 等高级 DML 都依赖 row-lineage
 
 ## ✅ 元数据列读
@@ -68,8 +67,8 @@ SELECT id, v, _row_id, _last_updated_sequence_number
 `_last_updated_sequence_number` 表达该行实际逻辑年龄；文件已有 `first_row_id` 时，行内 NULL 继承文件的 data sequence。
 
 v2 升级到 v3、尚未发生 v3 提交的旧文件没有 `first_row_id`，其中两列都返回 SQL NULL。
-首次 v3 提交为保留的历史 manifest 分配范围。对这些旧行的 UPDATE 应显式使用 MOR
-（`novarocks.update.mode=merge-on-read`）；默认 COW 对缺失行血统的旧文件仍有能力限制。
+首次 v3 提交为保留的历史 manifest 分配范围。UPDATE 与所有 MERGE 形状统一使用 MOR，
+无需设置 write-mode 属性；旧行的匹配与删除仍使用 Provider 签发的物理身份。
 MERGE 按 `_file` 判断匹配，并按物理位置判重，不以可能为空的 `_row_id` 判断是否命中。
 MV 基表另须所选快照带 row range；缺失时先执行一次 v3 提交，例如 OPTIMIZE，再重试。
 
@@ -86,23 +85,14 @@ next-row-id 分配。没有物理行 ID 时，读端从继承的 first_row_id �
 
 ## ✅ DELETE 与 DV 合并
 
-DELETE 写 V3 deletion vector blob（不是新 data file），现有 `_row_id` 不变；read 端把 DV 应用到 scan 后，被标记的行不会出现在结果里。
+v3 DELETE 将本次与旧删除位置按文件合并；部分覆盖写最终 DV，完整覆盖逻辑移除数据文件及它独占的旧位置删除项（含旧 DV），不新增 DV。DELETE 不写新 data file，保留行的 `_row_id` 不变；scan 应用当前 snapshot 的文件和删除效果。
 它不产生新的逻辑行 ID；若本次提交同时携带尚未赋值的历史文件，这些历史行仍需完成首次 ID 分配。
-
-## ✅ COW UPDATE
-
-NovaRocks 默认 COW UPDATE：
-
-- 读出整个 data file，应用更新
-- 写新 data file，新文件中**保留原行的 `_row_id`**（不重新分配）
-- 冻结精确源文件事实和 replacement/append 输出；原 ID 不变，新追加行单独分配
-- 移除旧 data file 时显式移除它适用的 DV，其他文件在共享 Puffin 中的 blob 继续保留
 
 ## ✅ MOR UPDATE
 
-MOR UPDATE（`write.update.mode='merge-on-read'`）：
+UPDATE 与 MERGE 的更新分支统一使用 MOR，write-mode 属性不影响策略：
 
-- 旧 data file 写 DV 标删被改的行
+- 旧物理行按同一逐文件规则删除：部分覆盖写 DV；完整覆盖移除 data file 及它独占的旧位置删除项，不新增 DV。这不是 COW 整文件重写
 - 新 data file 中改后的行保留物理 `_row_id`
 - 改后行的 `_last_updated_sequence_number` 写 NULL，由新文件 data sequence 继承实际提交版本
 
@@ -116,7 +106,7 @@ V3 spec 允许 OPTIMIZE / compact 时**保留**原 `_row_id`（也允许重新�
 
 实现细节：
 
-- OPTIMIZE 在 V3 row-lineage 表上自动路由到 `write_row_lineage_batches_as_data_files`（同 COW / MOR UPDATE 用的 writer），把 `_row_id` 与 `_last_updated_sequence_number` 物理写入 parquet 文件，使用 reserved field id `i32::MAX-107` / `i32::MAX-108`
+- OPTIMIZE 在 V3 row-lineage 表上自动路由到 `write_row_lineage_batches_as_data_files`（与 MOR UPDATE 共用的 writer），把 `_row_id` 与 `_last_updated_sequence_number` 物理写入 parquet 文件，使用 reserved field id `i32::MAX-107` / `i32::MAX-108`
 - 冻结前验证 reserved field 的实际 footer 事实，再为保留 ID 的输出声明明确 first_row_id，不能仅凭
   输出 `first_row_id=None` 推断无需分配。该输出不消耗新的逻辑行 ID，但携带的未赋值历史文件仍会首次分配。
 - 快照始终使用本次 manifest-list 的实际 row range；即使本轮没有新 ID，也保留实际零分配结果。

@@ -64,7 +64,8 @@ use crate::metadata_batch_reader::{
 };
 use crate::metadata_context::IcebergMetadataContext;
 use crate::planning_facts::{
-    IcebergTablePlanningFactsInput, snapshot_source_planning_facts, table_planning_facts,
+    IcebergTablePlanningFactsInput, snapshot_source_planning_facts,
+    table_planning_facts_with_write_inputs,
 };
 use crate::scan_model::{
     IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
@@ -329,7 +330,6 @@ impl IcebergMetadata {
             metadata_table_type: None,
             prepared_files: Vec::new(),
             explicit_files: None,
-            row_mutation_frozen_source: false,
             hidden_columns: hidden_internal_columns(metadata.properties()),
         };
         ConnectorTableHandle::try_new(
@@ -1455,7 +1455,6 @@ pub(crate) fn build_table_metadata(
         metadata_table_type,
         prepared_files: Vec::new(),
         explicit_files: None,
-        row_mutation_frozen_source: false,
         hidden_columns,
     };
     let mutation_metadata = if payload.metadata_table_type.is_none() {
@@ -1519,7 +1518,14 @@ pub(crate) fn build_table_metadata(
         if snapshot_source {
             snapshot_source_planning_facts(input)?
         } else {
-            table_planning_facts(input)?
+            let declarations =
+                crate::commit::write_shared::canonical_data_write_fields_from_declaration(
+                    &nominal_document,
+                    metadata.current_schema(),
+                    &execution_schema,
+                    creation,
+                )?;
+            table_planning_facts_with_write_inputs(input, &declarations)?
         }
     };
     let definition_facts = if payload.metadata_table_type.is_some() {
@@ -1849,21 +1855,6 @@ impl IcebergMetadata {
         scan: &IcebergScanPayload,
         request_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Vec<IcebergDataFileInfo>, ConnectorError> {
-        if scan.table.row_mutation_frozen_source {
-            match scan.table.explicit_files.as_deref() {
-                Some([_]) => {}
-                Some(_) => {
-                    return Err(corrupt(
-                        "Iceberg frozen row-mutation source must carry exactly one explicit data file",
-                    ));
-                }
-                None => {
-                    return Err(corrupt(
-                        "Iceberg frozen row-mutation source is missing its explicit data file",
-                    ));
-                }
-            }
-        }
         match (&scan.table.explicit_files, scan.snapshot_id) {
             (Some(files), _) => Ok(files.clone()),
             (None, None) => Ok(Vec::new()),
@@ -1954,121 +1945,6 @@ pub(crate) fn staged_target_metadata(
     })
 }
 
-/// The provider-private table one copy-on-write branch re-reads.
-///
-/// A copy-on-write branch replaces one whole data file, so the read that
-/// produces its replacement rows names exactly that file and pins the base
-/// snapshot the session froze. It is built from the session's own loaded
-/// metadata rather than from an admitted handle, because a session's target is
-/// resolved by name and never arrives as one.
-pub(crate) fn frozen_copy_on_write_source_payload(
-    catalog: &ConnectorInstanceId,
-    namespace: &str,
-    table_name: &str,
-    metadata: &crate::iceberg::spec::TableMetadata,
-    snapshot_id: i64,
-    file: IcebergDataFileInfo,
-) -> Result<IcebergTablePayload, ConnectorError> {
-    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
-        corrupt("Iceberg copy-on-write base snapshot is absent from its metadata")
-    })?;
-    let snapshot_schema = snapshot.schema(metadata).map_err(|error| {
-        corrupt(format!(
-            "resolve Iceberg copy-on-write snapshot schema: {error}"
-        ))
-    })?;
-    Ok(IcebergTablePayload {
-        namespace: namespace.to_string(),
-        table: table_name.to_string(),
-        metadata_location: None,
-        table_info: Some(IcebergTableInfo {
-            catalog: catalog.as_str().to_string(),
-            namespace: namespace.to_string(),
-            table: table_name.to_string(),
-            table_uuid: Some(metadata.uuid().to_string()),
-            current_snapshot_id: Some(snapshot_id),
-            schema_id: snapshot_schema.schema_id(),
-            location: metadata.location().to_string(),
-            schema: iceberg_schema_def(&snapshot_schema),
-            serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
-                corrupt(format!(
-                    "serialize Iceberg copy-on-write source metadata: {error}"
-                ))
-            })?),
-        }),
-        metadata_columns: metadata_column_names(metadata),
-        metadata_table_type: None,
-        prepared_files: Vec::new(),
-        explicit_files: Some(vec![file]),
-        // A frozen source carries a complete explicit file set and must never
-        // fall back to a catalog lookup.
-        row_mutation_frozen_source: true,
-        hidden_columns: hidden_internal_columns(metadata.properties()),
-    })
-}
-
-/// The same frozen payload constructor, using the original checked serializer
-/// for Nova's metadata JSON/default/schema outputs. The returned guard moves
-/// into the source's encoded backing before any handle can escape.
-pub(crate) fn frozen_copy_on_write_source_payload_with_original_scope(
-    catalog: &ConnectorInstanceId,
-    namespace: &str,
-    table_name: &str,
-    metadata: &crate::iceberg::spec::TableMetadata,
-    snapshot_id: i64,
-    file: IcebergDataFileInfo,
-    scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
-) -> Result<
-    (
-        IcebergTablePayload,
-        novarocks_spi::connector::ConnectorPayloadRetentionGuard,
-    ),
-    novarocks_spi::connector::ConnectorCowBeginCause,
-> {
-    use crate::commit::write_stack::control::cow_begin::projection_error;
-    scope.active()?;
-    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
-        corrupt("Iceberg copy-on-write base snapshot is absent from its metadata")
-    })?;
-    let schema = snapshot.schema(metadata).map_err(|e| {
-        corrupt(format!(
-            "resolve Iceberg copy-on-write snapshot schema: {e}"
-        ))
-    })?;
-    let plan = existing_serde_projection::Plan::inspect(metadata, &schema, scope)
-        .map_err(projection_error)?;
-    let mut checked = plan.for_copies(1, scope).map_err(projection_error)?;
-    let output = checked.build_one().map_err(projection_error)?;
-    let (serialized_metadata, schema, guard) = output.into_guarded_parts();
-    let payload = IcebergTablePayload {
-        namespace: namespace.to_string(),
-        table: table_name.to_string(),
-        metadata_location: None,
-        table_info: Some(IcebergTableInfo {
-            catalog: catalog.as_str().to_string(),
-            namespace: namespace.to_string(),
-            table: table_name.to_string(),
-            table_uuid: Some(metadata.uuid().to_string()),
-            current_snapshot_id: Some(snapshot_id),
-            schema_id: snapshot
-                .schema(metadata)
-                .map_err(|_| corrupt("Iceberg copy-on-write snapshot schema changed"))?
-                .schema_id(),
-            location: metadata.location().to_string(),
-            schema,
-            serialized_metadata: Some(serialized_metadata),
-        }),
-        metadata_columns: metadata_column_names(metadata),
-        metadata_table_type: None,
-        prepared_files: Vec::new(),
-        explicit_files: Some(vec![file]),
-        row_mutation_frozen_source: true,
-        hidden_columns: hidden_internal_columns(metadata.properties()),
-    };
-    scope.active()?;
-    Ok((payload, guard))
-}
-
 /// The frozen target one staged write session opens on.
 ///
 /// A registered table is loaded from the catalog on every session; a staged one
@@ -2091,10 +1967,6 @@ pub(crate) struct IcebergTablePayload {
     pub metadata_table_type: Option<MetadataTableType>,
     pub prepared_files: Vec<IcebergDataFileInfo>,
     pub explicit_files: Option<Vec<IcebergDataFileInfo>>,
-    /// Provider-private exact-base COW source. Such a handle carries a complete
-    /// explicit file set and must never fall back to a catalog lookup.
-    #[serde(default)]
-    pub row_mutation_frozen_source: bool,
     #[serde(default)]
     pub hidden_columns: Vec<String>,
 }
@@ -2150,8 +2022,7 @@ pub(crate) fn projected_schema(
     projected_schema_with_metadata(table, projection, &metadata)
 }
 
-/// COW uses its SAME loaded, wire-normalized immutable metadata owner.
-/// The ordinary entry above keeps its original decode and error ordering.
+/// Project the scan schema from the already-decoded immutable metadata.
 pub(crate) fn projected_schema_with_metadata(
     table: &IcebergTablePayload,
     projection: &[usize],
@@ -2161,9 +2032,7 @@ pub(crate) fn projected_schema_with_metadata(
         .table_info
         .as_ref()
         .ok_or_else(|| corrupt("Iceberg table handle has no frozen table descriptor"))?;
-    let storage_schema = if table.row_mutation_frozen_source
-        || table_info.schema_id != metadata.current_schema_id()
-    {
+    let storage_schema = if table_info.schema_id != metadata.current_schema_id() {
         let snapshot_id = table_info.current_snapshot_id.ok_or_else(|| {
             corrupt("Iceberg exact table source has no snapshot for its frozen schema")
         })?;
@@ -2193,9 +2062,7 @@ pub(crate) fn projected_schema_with_metadata(
     let mut fields = storage.fields().to_vec();
     let metadata_fields = metadata_arrow_fields(&table.metadata_columns)?;
     fields.extend(metadata_fields);
-    if !table.row_mutation_frozen_source
-        && let Some(mutation) = mutation_metadata_schema(metadata, &storage_schema)?
-    {
+    if let Some(mutation) = mutation_metadata_schema(metadata, &storage_schema)? {
         fields.extend(mutation.arrow_fields()?);
     }
     let indexes = if projection.is_empty() {
@@ -3588,9 +3455,10 @@ mod plan_splits_pruning_tests {
         }
         assert_eq!(to.planning_facts.partition_source_column_ordinals(), None);
         assert!(
-            to.planning_facts.column_facts().iter().all(|fact| {
-                fact.write_default().is_none() && fact.write_target_type().is_none()
-            })
+            to.planning_facts
+                .column_facts()
+                .iter()
+                .all(|fact| { fact.write_default().is_none() && fact.write_input().is_none() })
         );
         assert_eq!(
             current.planning_facts.partition_source_column_ordinals(),
@@ -3841,7 +3709,6 @@ mod plan_splits_pruning_tests {
             metadata_table_type: None,
             prepared_files: Vec::new(),
             explicit_files: None,
-            row_mutation_frozen_source: false,
             hidden_columns: Vec::new(),
         };
         ConnectorTableHandle::try_new(
@@ -4029,7 +3896,6 @@ mod plan_splits_pruning_tests {
                 metadata_table_type: None,
                 prepared_files: Vec::new(),
                 explicit_files: Some(files),
-                row_mutation_frozen_source: false,
                 hidden_columns: Vec::new(),
             },
             snapshot_id: None,
@@ -4076,39 +3942,6 @@ mod plan_splits_pruning_tests {
         assert_eq!(metrics.candidate_units_considered, 3);
         assert_eq!(metrics.candidate_units_pruned, 2);
         assert_eq!(metrics.scan_units_planned, 1);
-    }
-
-    #[test]
-    fn frozen_row_mutation_source_never_falls_back_to_the_current_catalog() {
-        let (_executor, _warehouse, provider) = provider();
-        let scan = IcebergScanPayload {
-            table: IcebergTablePayload {
-                namespace: "ns".to_string(),
-                table: "t".to_string(),
-                metadata_location: None,
-                table_info: None,
-                metadata_columns: Vec::new(),
-                metadata_table_type: None,
-                prepared_files: Vec::new(),
-                explicit_files: None,
-                row_mutation_frozen_source: true,
-                hidden_columns: Vec::new(),
-            },
-            snapshot_id: Some(7),
-            table_uuid: Some("admitted-table-uuid".to_string()),
-            projection: vec![0],
-            limit: None,
-            purpose: IcebergReadPurposeV1::Query,
-            fact_columns: Vec::new(),
-            physical_predicates: Vec::new(),
-            mode: IcebergScanModeV1::Snapshot,
-        };
-
-        let error = provider
-            .scan_files(&scan, &context())
-            .expect_err("frozen source must not reload the current catalog");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-        assert!(error.to_string().contains("missing its explicit data file"));
     }
 
     /// A zero count must mean "nothing was prunable", never "pruning did not
@@ -5134,10 +4967,6 @@ mod plan_splits_pruning_tests {
         });
     }
 }
-
-#[cfg(test)]
-#[path = "metadata/cow_borrowed_schema_tests.rs"]
-mod cow_borrowed_schema_tests;
 
 pub(crate) fn metadata_creation_error(
     cause: novarocks_connector_contract::PureProviderCompileError<ConnectorError>,

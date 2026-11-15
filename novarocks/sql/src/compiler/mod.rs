@@ -42,6 +42,8 @@ pub use required_constant::{
 
 mod captured_catalog;
 mod dml_catalog;
+mod write_assignment;
+pub use write_assignment::{SqlWriteAssignmentSite, SqlWriteAssignments, SqlWriteLiteralContext};
 mod logical_explain;
 mod scalar_presence_catalog;
 pub use crate::planner::distributed::build::{
@@ -77,7 +79,6 @@ pub use mv_rewrite::{
 
 // The request profile has one owner; application test fixtures may author
 // their explicit ceiling without a second default or translation vocabulary.
-pub use crate::analyzer::root_output_declaration::root_output_type_matches;
 pub use novarocks_functions::ConstantPolicy;
 
 /// SQL's read-only observation of statement cancellation.
@@ -558,7 +559,7 @@ pub use crate::common::expr::{BinOp, LiteralValue, UnOp};
 pub(crate) mod materialized_values;
 pub use materialized_values::{
     SqlConstantExpressionSite, SqlConstantExpressionStep, SqlConstantQueryStep,
-    SqlExpressionConstant, SqlExpressionConstants, SqlMaterializedValuesSite,
+    SqlExpressionConstant, SqlExpressionConstants,
 };
 mod fold_observation;
 pub use fold_observation::{
@@ -820,21 +821,6 @@ impl SqlStatementInput {
         }
     }
 
-    /// A checked materialized relation is a distinct input owner, not a SQL
-    /// cast author or parser literal. The exact structural site belongs to the
-    /// same query; every constant retains its original immutable pool.
-    pub fn materialized_values_query(
-        query: Box<novarocks_parser::ast::Query>,
-        site: SqlMaterializedValuesSite,
-        rows: std::sync::Arc<[Box<[novarocks_functions::ConstantValue]>]>,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<Self, SqlCompileError> {
-        let source = materialized_values::MaterializedValues::try_new(&query, site, rows, control)?;
-        Ok(Self {
-            kind: SqlStatementInputKind::MaterializedValuesQuery { query, source },
-        })
-    }
-
     /// Bind complete constants to exact expressions of the same owned query.
     /// Other syntax uses its original analyzer and evaluation semantics.
     pub fn query_with_expression_constants(
@@ -869,9 +855,6 @@ impl SqlStatementInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlCompileIntent {
     Query,
-    /// A DML-owned result read whose provider facts are completed by its
-    /// statement owner before native encoding.
-    DmlInternalRead,
     Explain {
         level: ExplainLevel,
         analyze: bool,
@@ -1015,6 +998,7 @@ impl novarocks_type_contract::PureCompileControl for SqlCompileControl {
 /// Statistics are deliberately absent because exact binding tokens do not
 /// exist until this phase has completed.
 pub struct SqlAnalyzeRequest<'a> {
+    pub(crate) write_assignments: Option<Arc<SqlWriteAssignments>>,
     pub(crate) statement: SqlStatementInput,
     pub(crate) intent: SqlCompileIntent,
     pub(crate) session: SqlSessionContext,
@@ -1027,10 +1011,31 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
     pub(crate) control: SqlCompileControl,
-    pub(crate) root_output_declaration: Option<Vec<novarocks_type_contract::FunctionValueType>>,
 }
 
 impl<'a> SqlAnalyzeRequest<'a> {
+    pub fn with_write_assignments(
+        mut self,
+        assignments: Arc<SqlWriteAssignments>,
+    ) -> Result<Self, SqlCompileError> {
+        self.control.check()?;
+        if !matches!(
+            &self.intent,
+            SqlCompileIntent::IcebergWrite { .. } | SqlCompileIntent::ChangeStreamWrite
+        ) || !matches!(
+            &self.statement.kind,
+            SqlStatementInputKind::ParsedQuery(_)
+                | SqlStatementInputKind::MaterializedValuesQuery { .. }
+        ) || self.write_assignments.is_some()
+        {
+            return Err(SqlCompileError::InvalidRequest(
+                "write assignments require one original DML query source".into(),
+            ));
+        }
+        self.write_assignments = Some(assignments);
+        Ok(self)
+    }
+
     pub fn new(
         statement: SqlStatementInput,
         intent: SqlCompileIntent,
@@ -1044,6 +1049,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
         control: SqlCompileControl,
     ) -> Self {
         Self {
+            write_assignments: None,
             statement,
             intent,
             session,
@@ -1056,7 +1062,6 @@ impl<'a> SqlAnalyzeRequest<'a> {
             mv_rewrite,
             imv_rewrite: None,
             control,
-            root_output_declaration: None,
         }
     }
 
@@ -1079,6 +1084,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
         control: SqlCompileControl,
     ) -> Self {
         Self {
+            write_assignments: None,
             statement: SqlStatementInput::logical_plan(plan, factory, root_semantics),
             intent,
             session,
@@ -1091,29 +1097,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             mv_rewrite: None,
             imv_rewrite: None,
             control,
-            root_output_declaration: None,
         }
-    }
-
-    /// Exact target domains for the root projection of an internal DML read.
-    /// SQL text cannot supply this input; no type is reconstructed from spelling.
-    pub fn with_root_output_declaration(
-        mut self,
-        declaration: Vec<novarocks_type_contract::FunctionValueType>,
-    ) -> Result<Self, SqlCompileError> {
-        self.check_control()?;
-        if self.intent != SqlCompileIntent::DmlInternalRead
-            || matches!(
-                &self.statement.kind,
-                SqlStatementInputKind::LogicalPlan { .. }
-            )
-        {
-            return Err(SqlCompileError::InvalidRequest(
-                "root output declarations require an analyzed internal DML read".into(),
-            ));
-        }
-        self.root_output_declaration = Some(declaration);
-        Ok(self)
     }
 
     fn freeze_scalar_presence_scope(&mut self) {
@@ -1751,8 +1735,8 @@ impl SqlCompiler {
                         "SQL analysis requires a function catalog".to_string(),
                     )
                 })?;
-                let (mut resolved, ctes, mut factory) =
-                    crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
+                let (resolved, ctes, mut factory) =
+                    crate::analyzer::analyze_with_write_assignments_and_sql_semantics(
                         &query,
                         catalog,
                         &request.session.current_database,
@@ -1766,18 +1750,11 @@ impl SqlCompiler {
                             }
                             _ => None,
                         },
+                        request.write_assignments.as_deref(),
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;
-                crate::analyzer::root_output_declaration::apply_root_output_declaration(
-                    &mut resolved,
-                    &mut factory,
-                    request.root_output_declaration.as_deref(),
-                    functions,
-                    &request.session.sql_semantics,
-                    request.constant_policy,
-                    &request.control,
-                )?;
+
                 let analyzed_fields = resolved.output_columns.clone();
                 let logical_plan =
                     crate::planner::plan_query(resolved, ctes, &mut factory, &request.control)?;

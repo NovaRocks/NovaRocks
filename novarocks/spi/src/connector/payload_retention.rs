@@ -58,6 +58,7 @@ impl ConnectorPayloadRetentionGuard {
         self.lifetime = Some(Arc::new((lifetime, self.lifetime.take())));
         self
     }
+    #[cfg(test)]
     pub(crate) fn is_byte_budget(&self) -> bool {
         matches!(&self.holder, Retention::Budgeted(_))
     }

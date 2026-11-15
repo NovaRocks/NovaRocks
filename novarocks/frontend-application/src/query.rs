@@ -677,7 +677,7 @@ fn routed_distributed_query_failure(
 }
 
 fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExecutionError> {
-    result.map_err(|mut error| {
+    result.map_err(|error| {
         if let Some(original) = error.application_error() {
             let original = match error.publication_terminal() {
                 Some(terminal) => original
@@ -693,21 +693,6 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
                 terminal: error.publication_terminal().cloned(),
                 compile_control: error.compile_control_error(),
                 external_effect_disposition: None,
-            };
-        }
-        if let Some(failure) = error.take_cow_failure() {
-            // Both production COW callers reach this branch inside the
-            // execute_prepared_dml_statement synchronous command closure.
-            // Retire the original cause before publishing the worker receipt;
-            // its original WorkOwner and result_window remain on that worker.
-            let message = failure.retire_on_original_worker(error.publication_terminal());
-            return match error.publication_terminal().cloned() {
-                Some(terminal) => RoutedExecutionError::Publication {
-                    message,
-                    terminal,
-                    compile_control: None,
-                },
-                None => RoutedExecutionError::Engine(message),
             };
         }
         if let Some(control) = error.compile_control_error() {
@@ -3327,184 +3312,6 @@ mod tests {
             ));
             assert_eq!(service.compile_control_error(), Some(cause));
         }
-    }
-
-    #[test]
-    fn cow_dml_route_keeps_publication_terminal_and_original_client_prefix() {
-        use crate::query_execution::dml::mutation_flow::CowFailure;
-        use novarocks_spi::connector::{
-            ConnectorError, ConnectorErrorKind, LakePublicationFamily, LakePublicationId,
-            LakePublicationTarget,
-        };
-        let target = LakePublicationTarget::try_new(
-            "catalog".to_owned(),
-            "namespace".to_owned(),
-            Some("table".to_owned()),
-            None,
-        )
-        .unwrap();
-        let mut attempt = crate::dml::attempt::DmlPublicationAttempt::new(
-            LakePublicationId::new_v7(),
-            LakePublicationFamily::DataMutation,
-            target,
-            None,
-        );
-        attempt.terminal_pre_dispatch_uncommitted().unwrap();
-        let terminal = attempt.terminal().unwrap().clone();
-        let original = ConnectorError::new(ConnectorErrorKind::Unavailable, "first provider cause")
-            .with_retryable_before_progress();
-        let legacy_message = crate::dml::error::DmlError::executor(format!(
-            "begin connector write session: {original}"
-        ))
-        .with_publication_terminal(terminal.clone())
-        .to_string();
-        let error = crate::dml::error::DmlExecutionError::Cow(CowFailure::provider(original))
-            .into_dml_error(None)
-            .with_publication_terminal(terminal.clone());
-        let result = dml_result::<()>(Err(error));
-        match result {
-            Err(RoutedExecutionError::Publication {
-                message,
-                terminal: actual,
-                compile_control: None,
-            }) => {
-                assert_eq!(actual, terminal);
-                assert_eq!(message, legacy_message);
-                let service = QueryServiceError::with_publication_terminal(message, actual);
-                assert_eq!(service.kind(), QueryServiceErrorKind::Internal);
-                assert_eq!(service.publication_terminal(), Some(&terminal));
-            }
-            _ => panic!("COW begin must retain the original publication terminal"),
-        }
-    }
-
-    async fn assert_cow_raw_exit_on_original_worker(abandon_waiter: bool) {
-        use crate::query_execution::dml::mutation_flow::CowFailure;
-        use novarocks_query_application::cpu::{
-            QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
-        };
-        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-        use novarocks_workload_control::{ResultCapacityConfig, WorkloadConfig, WorkloadControl};
-        let workload = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1024 * 1024,
-                control_bytes: 1024,
-                per_scope_bytes: 1024 * 1024 - 1024,
-            },
-        )
-        .unwrap();
-        let capacity = workload
-            .configure_result_capacity(ResultCapacityConfig::V1)
-            .unwrap();
-        workload.mark_ready().unwrap();
-        let root = workload
-            .root_admission()
-            .begin_query_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let (permit, window) = root
-            .owner
-            .scope()
-            .admit_query_with_result(ResultWindowClass::Internal)
-            .unwrap()
-            .await
-            .unwrap();
-        let cancellation =
-            QueryCancellationView::governed(root.owner.scope().cancellation().unwrap(), None);
-        let mut blocking = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
-            std::num::NonZeroUsize::new(1).unwrap(),
-            std::num::NonZeroUsize::new(1).unwrap(),
-        ))
-        .unwrap();
-        let executor = blocking.executor();
-        let alias = window.retain_alias();
-        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let original_gate = gate.clone();
-        let (entered, observed) = tokio::sync::oneshot::channel();
-        let calling_thread = std::thread::current().id();
-        let failure = CowFailure::provider(ConnectorError::new(
-            ConnectorErrorKind::Cancelled,
-            "original typed provider failure",
-        ))
-        .with_exit_probe(move || {
-            // CowFailure's final test-only field runs after its raw cause dropped.
-            // It holds the original worker before the tuple receipt is published.
-            let _ = entered.send(std::thread::current().id());
-            let (open, changed) = &*original_gate;
-            let (open, _) = changed
-                .wait_timeout_while(open.lock().unwrap(), Duration::from_secs(5), |open| !*open)
-                .unwrap();
-            assert!(
-                *open,
-                "original cause-exit probe must be released by cleanup"
-            );
-        });
-        let caller = tokio::spawn(async move {
-            execute_synchronous_stage(executor, cancellation, root.owner, Some(alias), move || {
-                dml_result::<()>(Err(
-                    crate::dml::error::DmlExecutionError::Cow(failure).into_dml_error(None)
-                ))
-            })
-            .await
-        });
-        let exit_thread = tokio::time::timeout(Duration::from_secs(2), observed).await;
-        if abandon_waiter {
-            caller.abort();
-        }
-        drop(permit);
-        drop(window);
-        let held_during_raw_exit = capacity.snapshot().held_positions;
-        // Cleanup runs before any assertion, including an observation failure.
-        let (open, changed) = &*gate;
-        *open.lock().unwrap() = true;
-        changed.notify_all();
-        let returned = caller.await;
-        let mut message = None;
-        let mut caller_was_cancelled = false;
-        match returned {
-            Ok(Ok((result, owner, alias))) => {
-                if let Err(RoutedExecutionError::Engine(presentation)) = result {
-                    message = Some(presentation);
-                }
-                owner.complete();
-                drop(alias);
-            }
-            Err(error) => {
-                caller_was_cancelled = error.is_cancelled();
-            }
-            Ok(Err(_)) => {}
-        }
-        let shutdown = blocking
-            .shutdown_until(Instant::now() + Duration::from_secs(2))
-            .await;
-        assert!(shutdown.is_ok(), "join the original bounded command worker");
-        let exit_thread = exit_thread
-            .expect("raw exit observed")
-            .expect("raw exit sender completes");
-        assert_ne!(exit_thread, calling_thread);
-        assert_eq!(held_during_raw_exit, [0, 0, 1, 0]);
-        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
-        if abandon_waiter {
-            assert!(
-                caller_was_cancelled,
-                "original waiter actually joins as cancelled"
-            );
-        } else {
-            assert_eq!(
-                message.as_deref(),
-                Some(
-                    "Executor: begin connector write session: Cancelled: original typed provider failure"
-                )
-            );
-        }
-    }
-    #[tokio::test]
-    async fn cow_raw_failure_exits_on_original_command_worker_before_receipt() {
-        assert_cow_raw_exit_on_original_worker(false).await;
-    }
-    #[tokio::test]
-    async fn abandoned_cow_waiter_cannot_release_original_window_during_raw_exit() {
-        assert_cow_raw_exit_on_original_worker(true).await;
     }
 
     fn test_governed_cancellation() -> (

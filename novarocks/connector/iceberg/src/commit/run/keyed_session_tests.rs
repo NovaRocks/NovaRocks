@@ -188,7 +188,7 @@ fn keyed_begin(prepared: &PreparedKeyed) -> ConnectorWriteBeginRequest {
         input: data_input(),
         base: Some(prepared.declaration.expected_base().clone()),
         flavor: ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-            declaration: prepared.declaration.clone(),
+            declaration: Box::new(prepared.declaration.clone()),
             shape: ConnectorManagedPublicationShape::Data,
         },
         context: context(),
@@ -664,7 +664,7 @@ fn keyed_begin_shape(
         | ConnectorManagedPublicationShape::InsertOnlyChangeStream => data_input(),
     };
     request.flavor = ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-        declaration: prepared.declaration.clone(),
+        declaration: Box::new(prepared.declaration.clone()),
         shape,
     };
     request

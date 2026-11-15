@@ -24,14 +24,12 @@
 
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::write_stack::session::{
-    ConnectorMutationContributionGroup, ConnectorWriteCohortRoutingBody,
-    ConnectorWriteCohortRoutingProof, ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
+    ConnectorMutationContributionGroup, ConnectorWriteRouteFacts,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorWriteAdmissionPurpose, ConnectorWriteInputShape,
 };
 
-use crate::commit::write_stack::copy_on_write::IcebergCowBranchRecipe;
 use crate::commit::write_stack::domain::{
     IcebergDataBranchRecipe, IcebergDocumentPublicationFacts, IcebergEqualityDeleteRecipe,
     IcebergFrozenRewriteBranchInput, IcebergPositionRewriteTarget, IcebergSealedWriteTarget,
@@ -44,8 +42,6 @@ type IcebergWriteTargetPlanParts = (
     IcebergWriterHandle,
     ConnectorWriteInputShape,
     Option<ConnectorWriteRouteFacts>,
-    Option<ConnectorWriteCohortRoutingProof>,
-    Option<ConnectorWriteRewriteSource>,
     Option<[u8; 32]>,
     Option<ConnectorMutationContributionGroup>,
 );
@@ -58,8 +54,6 @@ pub struct IcebergWriteTargetPlan {
     handle: IcebergWriterHandle,
     input: ConnectorWriteInputShape,
     route: Option<ConnectorWriteRouteFacts>,
-    routing_proof: Option<ConnectorWriteCohortRoutingProof>,
-    rewrite_source: Option<ConnectorWriteRewriteSource>,
     rewrite_group_digest: Option<[u8; 32]>,
     position_materialization: Option<ConnectorMutationContributionGroup>,
 }
@@ -81,14 +75,6 @@ impl IcebergWriteTargetPlan {
     /// session routes rows by change event.
     pub const fn route(&self) -> Option<&ConnectorWriteRouteFacts> {
         self.route.as_ref()
-    }
-    /// The read contract of one copy-on-write branch, present exactly when the
-    /// branch produces its rows by re-reading the files it replaces.
-    pub const fn rewrite_source(&self) -> Option<&ConnectorWriteRewriteSource> {
-        self.rewrite_source.as_ref()
-    }
-    pub const fn routing_proof(&self) -> Option<&ConnectorWriteCohortRoutingProof> {
-        self.routing_proof.as_ref()
     }
     pub(crate) fn with_creation_scope(
         mut self,
@@ -126,8 +112,6 @@ impl IcebergWriteTargetPlan {
             self.handle,
             self.input,
             self.route,
-            self.routing_proof,
-            self.rewrite_source,
             self.rewrite_group_digest,
             self.position_materialization,
         )
@@ -240,7 +224,9 @@ impl IcebergWriteBranchPlan {
             Self::Data { plan, .. } => IcebergWriterHandle::try_new_data(
                 table.clone(),
                 plan.output.clone(),
-                plan.recipe.clone(),
+                plan.recipe.clone().with_write_input_identity(
+                    super::domain::data_write_input_identity(&plan.input)?,
+                ),
             ),
             Self::Delete { plan, .. } => {
                 let handle = IcebergWriterHandle::try_new_delete(
@@ -278,9 +264,6 @@ pub struct IcebergBranchSessionPlanInput {
     /// Present exactly on the distributed-rewrite flavor: the exact input files
     /// each sealed branch replaces, in the same order as `branches`.
     pub rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
-    /// Present exactly on the copy-on-write flavor: what each sealed branch
-    /// replaces and what it re-reads, in the same order as `branches`.
-    pub copy_on_write: Vec<IcebergCowBranchRecipe>,
     /// Present only on a managed publication that replaces the target's default
     /// partitioning in the same external commit.
     pub(crate) repartition:
@@ -361,56 +344,17 @@ pub fn plan_branch_session(
         ));
     }
 
-    // A copy-on-write branch's read contract is per branch, so a session
-    // holding a different number of recipes than it sealed branches could not
-    // say which file any one branch replaces or re-reads.
-    if !input.copy_on_write.is_empty() && input.copy_on_write.len() != input.branches.len() {
-        return Err(invalid(format!(
-            "Iceberg {} write session froze {} copy-on-write recipes for {} sealed branches",
-            input.flavor.as_str(),
-            input.copy_on_write.len(),
-            input.branches.len()
-        )));
-    }
-
     let writer_table = input.writer_table.as_ref().unwrap_or(&input.table);
     let mut plans = Vec::with_capacity(sealed.len());
     for (index, plan) in input.branches.iter().enumerate() {
-        let routing_proof = match input.copy_on_write.get(index) {
-            Some(recipe) => {
-                let route = plan.route().ok_or_else(|| {
-                    invalid("Iceberg copy-on-write branch omits its routing facts")
-                })?;
-                Some(ConnectorWriteCohortRoutingProof::try_new(
-                route.route_id(),
-                recipe.selection_digest(),
-                recipe.selection_ordinals().to_vec(),
-                match recipe.input() {
-                    crate::commit::write_stack::copy_on_write::IcebergCowBranchInput::Rewrite {
-                        ..
-                    } => ConnectorWriteCohortRoutingBody::Rewrite,
-                    crate::commit::write_stack::copy_on_write::IcebergCowBranchInput::Append => {
-                        ConnectorWriteCohortRoutingBody::Append
-                    }
-                },
-                )?)
-            }
-            None => None,
-        };
         plans.push(IcebergWriteTargetPlan {
             ordinal: sealed[index].ordinal(),
             branch: plan.branch(),
             handle: plan.writer_handle(writer_table)?,
             input: plan.input().clone(),
             route: plan.route().cloned(),
-            routing_proof,
             rewrite_group_digest: None,
             position_materialization: None,
-            rewrite_source: input
-                .copy_on_write
-                .get(index)
-                .and_then(IcebergCowBranchRecipe::rewrite_source)
-                .cloned(),
         });
     }
 
@@ -424,11 +368,6 @@ pub fn plan_branch_session(
             document_publication: input.document_publication,
             staged_metadata: input.staged_metadata,
             rewrite_inputs: input.rewrite_inputs,
-            copy_on_write: input
-                .copy_on_write
-                .into_iter()
-                .map(IcebergCowBranchRecipe::into_input)
-                .collect(),
             repartition: input.repartition,
         },
         sealed,
@@ -479,7 +418,6 @@ pub fn plan_write_session(
             document_publication: None,
             staged_metadata: input.staged_metadata,
             rewrite_inputs,
-            copy_on_write: Vec::new(),
             repartition: None,
             writer_table: None,
             branches,

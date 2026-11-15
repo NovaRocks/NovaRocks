@@ -201,6 +201,7 @@ pub fn writer_state_source_for_test(
                     predicate: None,
                     effect: ConnectorRowMutationEffect::Replace,
                     assignments: vec![DistributedChangeEventOutputExpr {
+                        write_input: None,
                         output_column_id: data.column_id,
                         expr: Some(TypedExpr {
                             kind: ExprKind::ColumnRef {

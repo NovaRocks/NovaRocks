@@ -17,7 +17,7 @@
 
 -- @order_sensitive=true
 -- SQLX-2 owner coverage: UPDATE ... FROM resolves the target and one source
--- through one request-local compiler input before the COW write lifecycle.
+-- through one request-local compiler input and one merge-on-read write lifecycle.
 
 -- query 1
 -- @skip_result_check=true
@@ -53,6 +53,23 @@ FROM ${case_db}.sqlx2_update_from_target
 ORDER BY id;
 
 -- query 4
+-- @skip_result_check=true
+INSERT INTO ${case_db}.sqlx2_update_from_source VALUES (2, 'cc');
+
+-- query 5
+-- @expect_error_tier=drift
+-- @expect_error=TrinoError { name=MERGE_TARGET_ROW_MULTIPLE_MATCHES type=USER_ERROR code=119 }: One UPDATE target table row matched more than one source row
+UPDATE ${case_db}.sqlx2_update_from_target AS t
+SET v = s.new_v
+FROM ${case_db}.sqlx2_update_from_source AS s
+WHERE t.id = s.id;
+
+-- query 6
+SELECT id, v
+FROM ${case_db}.sqlx2_update_from_target
+ORDER BY id;
+
+-- query 7
 -- @skip_result_check=true
 DROP TABLE ${case_db}.sqlx2_update_from_target FORCE;
 DROP TABLE ${case_db}.sqlx2_update_from_source FORCE;
