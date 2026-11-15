@@ -87,12 +87,20 @@ impl StatisticsReader for IcebergMetadata {
             .map_err(unavailable)?
     }
 
-    fn prepare_scoped_read(
+    fn prepare_scoped_summary_read(
         &self,
         request: novarocks_spi::connector::ConnectorTableRequest,
         original: novarocks_spi::connector::ConnectorOriginalResultScope,
-    ) -> Result<Arc<dyn novarocks_spi::connector::StatisticsReadOriginal>, ConnectorError> {
+    ) -> Result<Arc<dyn novarocks_spi::connector::StatisticsSummaryReadOriginal>, ConnectorError>
+    {
         self.validate_context(&request.context)?;
+        if crate::metadata::is_metadata_table_alias(&request.table.table) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "SHOW STATS FOR does not support Iceberg metadata tables",
+            ));
+        }
+
         if request
             .context
             .io_admission()
@@ -100,10 +108,10 @@ impl StatisticsReader for IcebergMetadata {
             .is_none()
         {
             return Err(invalid(
-                "scoped statistics read requires its original MIO source",
+                "scoped statistics summary requires its original MIO source",
             ));
         }
-        Ok(scoped_cpu::StatisticsCpuOriginal::read_source(
+        Ok(scoped_cpu::StatisticsCpuOriginal::summary_read_source(
             self.clone(),
             request,
             original,
@@ -180,6 +188,8 @@ trait StatisticsFileFacts {
     fn record_count(&self) -> Option<i64>;
     fn stats(&self) -> Option<&HashMap<String, crate::scan_model::IcebergColumnStats>>;
     fn has_deletes(&self) -> bool;
+    fn partition_spec_id(&self) -> Option<i32>;
+    fn partition_values(&self) -> Option<&crate::iceberg::spec::Struct>;
 }
 impl StatisticsFileFacts for DataFileWithStats {
     fn record_count(&self) -> Option<i64> {
@@ -191,6 +201,12 @@ impl StatisticsFileFacts for DataFileWithStats {
     fn has_deletes(&self) -> bool {
         !self.delete_files.is_empty()
     }
+    fn partition_spec_id(&self) -> Option<i32> {
+        self.partition_spec_id
+    }
+    fn partition_values(&self) -> Option<&crate::iceberg::spec::Struct> {
+        self.partition_values.as_ref()
+    }
 }
 impl StatisticsFileFacts for crate::read_model::IcebergReadFile {
     fn record_count(&self) -> Option<i64> {
@@ -201,6 +217,12 @@ impl StatisticsFileFacts for crate::read_model::IcebergReadFile {
     }
     fn has_deletes(&self) -> bool {
         self.deletes.members().next().is_some()
+    }
+    fn partition_spec_id(&self) -> Option<i32> {
+        self.partition_spec_id
+    }
+    fn partition_values(&self) -> Option<&crate::iceberg::spec::Struct> {
+        self.partition_values.as_ref()
     }
 }
 fn project_statistics_evidence<F: StatisticsFileFacts>(
@@ -1002,10 +1024,8 @@ fn validate_artifacts(
             ));
         }
         if let Some(rendered) = properties.get(crate::stats_loader::NDV_PROPERTY) {
-            let supplied = rendered
-                .parse::<f64>()
-                .map_err(|_| invalid("statistics artifact ndv property is not numeric"))?;
-            if !supplied.is_finite() || supplied < 0.0 || supplied.to_bits() != estimate.to_bits() {
+            let supplied = crate::stats_loader::parse_ndv_property(rendered).map_err(invalid)?;
+            if supplied != crate::stats_loader::integer_ndv_estimate(estimate).map_err(invalid)? {
                 return Err(invalid(
                     "statistics artifact ndv property does not match its Theta body",
                 ));
@@ -1013,7 +1033,9 @@ fn validate_artifacts(
         } else {
             properties.insert(
                 crate::stats_loader::NDV_PROPERTY.to_string(),
-                estimate.to_string(),
+                crate::stats_loader::integer_ndv_estimate(estimate)
+                    .map_err(invalid)?
+                    .to_string(),
             );
         }
         normalized.push(parts.try_into_draft()?);
@@ -1754,6 +1776,46 @@ mod tests {
         )
         .expect_err("provider-private artifact properties must be rejected");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn estimate_mode_artifact_preserves_body_and_writes_an_integer_ndv() {
+        let body = Bytes::from_static(include_bytes!(
+            "../../../../../tests/datasketches-tck/fixtures/theta/java62_quickselect_n100000_ordered_v3.sk"
+        ));
+        let estimate = estimate_compact_theta(&body).unwrap();
+        assert_ne!(
+            estimate.fract(),
+            0.0,
+            "fixture must exercise an estimated fractional count"
+        );
+        let identity =
+            StatisticsArtifactIdentity::try_new(vec![7], APACHE_DATASKETCHES_THETA_V1).unwrap();
+        let draft = StatisticsArtifactDraft::try_new(
+            vec![7],
+            APACHE_DATASKETCHES_THETA_V1,
+            body.clone(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let result = validate_artifacts(std::slice::from_ref(&identity), vec![draft]).unwrap();
+        assert_eq!(result[0].body(), &body);
+        assert_eq!(
+            result[0]
+                .properties()
+                .get(crate::stats_loader::NDV_PROPERTY),
+            Some(&((estimate as i64).to_string()))
+        );
+        for invalid in [format!("{estimate}"), format!(" {}", estimate as i64)] {
+            let draft = StatisticsArtifactDraft::try_new(
+                vec![7],
+                APACHE_DATASKETCHES_THETA_V1,
+                body.clone(),
+                BTreeMap::from([(crate::stats_loader::NDV_PROPERTY.to_string(), invalid)]),
+            )
+            .unwrap();
+            assert!(validate_artifacts(std::slice::from_ref(&identity), vec![draft]).is_err());
+        }
     }
 
     fn manifest_file(

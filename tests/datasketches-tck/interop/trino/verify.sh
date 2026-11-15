@@ -18,7 +18,7 @@ set -euo pipefail
 
 java25_home=${JAVA25_HOME:-}
 if [[ -z "$java25_home" || ! -x "$java25_home/bin/java" ]]; then
-  echo "Trino 483 requires JDK 25; set JAVA25_HOME to a JDK 25 installation" >&2
+  echo "The declared Trino reference requires JDK 25; set JAVA25_HOME to a JDK 25 installation" >&2
   exit 1
 fi
 java_major=$("$java25_home/bin/java" -version 2>&1 | sed -n '1s/.*version "\([0-9]*\).*/\1/p')
@@ -28,6 +28,8 @@ test "$java_major" = 25 || {
 }
 
 repo_root=$(cd "$(dirname "$0")/../../../.." && pwd)
+trino_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["images"]["trino"]["version"])' \
+  "$repo_root/docker/fixture-inputs/versions.json")
 source_root="$repo_root/tests/datasketches-tck/interop/trino"
 fixture_root="$repo_root/tests/datasketches-tck/fixtures"
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/novarocks-trino-theta-interop.XXXXXX")
@@ -40,12 +42,7 @@ cp "$source_root/src/VerifyTrinoThetaInterop.java" \
 
 JAVA_HOME="$java25_home" PATH="$java25_home/bin:$PATH" \
   mvn -q -f "$work_dir/pom.xml" compile dependency:build-classpath \
-  -Dmdep.outputFile="$work_dir/classpath"
-trino_jar=$(tr ':' '\n' < "$work_dir/classpath" | grep '/trino-iceberg-483.jar$')
-test "$(shasum -a 256 "$trino_jar" | cut -d ' ' -f 1)" = \
-  "1f656c9c87b8be2815117fe57c78494e049c430cdac97d95a8916df7b426cced"
-unzip -p "$trino_jar" META-INF/MANIFEST.MF | tr -d '\r' | \
-  grep -q '^Git-Commit-Id: 50b0b50b75abd47f830b7805ee1b51716eb4065e$'
+  -Dtrino.version="$trino_version" -Dmdep.outputFile="$work_dir/classpath"
 
 trino_output="$work_dir/trino_long_disjoint_n1000.sk"
 "$java25_home/bin/java" -cp "$work_dir/target/classes:$(<"$work_dir/classpath")" \

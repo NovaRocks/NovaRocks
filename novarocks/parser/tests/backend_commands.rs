@@ -15,20 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_parser::{
-    ast::{ShowBackends, Statement},
-    parse,
-    printer::print_statement,
-};
+use novarocks_parser::parse;
 
 #[test]
-fn show_backends_is_the_only_backend_sql_surface() {
-    let statements = parse("show backends").expect("SHOW BACKENDS must parse");
-    assert!(matches!(
-        statements.as_slice(),
-        [Statement::ShowBackends(ShowBackends { .. })]
-    ));
-    assert_eq!(print_statement(&statements[0]), "SHOW BACKENDS");
+fn retired_backend_observation_and_admin_hooks_are_syntax_errors() {
+    for source in ["SHOW BACKENDS", "ADMIN RAISE ENGINE ERROR 'CommitUnknown'"] {
+        assert_eq!(
+            parse(source)
+                .unwrap_err()
+                .to_user_error(source)
+                .code()
+                .as_str(),
+            "sql.parse.unexpected_token"
+        );
+    }
 }
 
 #[test]

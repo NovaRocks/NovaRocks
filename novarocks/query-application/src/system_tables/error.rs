@@ -73,7 +73,7 @@ impl fmt::Display for SystemTableRegistryError {
             }
             Self::StandardNameConflict { schema, table } => write!(
                 f,
-                "system table conflicts with a Trino 484 standard name: {schema}.{table}"
+                "system table conflicts with a Trino standard name: {schema}.{table}"
             ),
             Self::DuplicateColumn { name } => write!(f, "duplicate system table column: {name}"),
             Self::InvalidKeyColumn { ordinal } => write!(

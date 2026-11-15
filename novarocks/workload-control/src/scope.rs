@@ -55,19 +55,25 @@ impl WorkId {
 pub enum WorkClass {
     Query,
     MaterializedView,
-    Statistics,
     TableMaintenance,
     Management,
 }
 
 impl WorkClass {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Query,
+        Self::MaterializedView,
+        Self::TableMaintenance,
+        Self::Management,
+    ];
+
     /// Work that can initiate warehouse computation shares the one query
     /// concurrency queue. Management requests retain their own protocol
     /// semantics and never consume this slot.
     pub const fn uses_warehouse_concurrency(self) -> bool {
         matches!(
             self,
-            Self::Query | Self::MaterializedView | Self::Statistics | Self::TableMaintenance
+            Self::Query | Self::MaterializedView | Self::TableMaintenance
         )
     }
 }
@@ -1817,7 +1823,7 @@ mod tests {
             .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let job = control
-            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let next = control
             .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
@@ -1860,10 +1866,10 @@ mod tests {
             .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let foreign = other
-            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let job = control
-            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         assert_eq!(foreign.owner.scope().id(), job.owner.scope().id());
         let scope = sql.owner.scope();

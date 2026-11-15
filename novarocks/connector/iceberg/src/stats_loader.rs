@@ -37,6 +37,27 @@ use novarocks_connector_iceberg_functions::validate_compact_theta;
 /// Standard Puffin property carrying the estimate represented by a Theta body.
 pub const NDV_PROPERTY: &str = "ndv";
 
+/// Puffin's NDV property is a decimal non-negative Java long. Do not accept
+/// floating text, whitespace, or an alternate spelling of the numeric domain.
+pub(crate) fn parse_ndv_property(rendered: &str) -> Result<u64, String> {
+    if rendered.is_empty() || !rendered.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Theta ndv must be a decimal non-negative integer".to_string());
+    }
+    rendered
+        .parse::<i64>()
+        .map(|value| value as u64)
+        .map_err(|error| format!("Theta ndv exceeds its integer representation: {error}"))
+}
+
+/// Match Trino's `(long) sketch.getEstimate()`: truncate a non-negative finite
+/// estimate, saturating at the Java long representation boundary.
+pub(crate) fn integer_ndv_estimate(estimate: f64) -> Result<u64, String> {
+    if !estimate.is_finite() || estimate < 0.0 {
+        return Err("Theta estimate must be finite and non-negative".to_string());
+    }
+    Ok((estimate as i64) as u64)
+}
+
 static THETA_BODY_READS: AtomicU64 = AtomicU64::new(0);
 
 /// Loader for Iceberg Puffin statistics. Produces a `field_id → NDV` map.
@@ -89,14 +110,9 @@ impl StatsLoader {
             let rendered = blob.properties.get(NDV_PROPERTY).ok_or_else(|| {
                 format!("Theta blob metadata for field {field_id} is missing ndv")
             })?;
-            let value = rendered.parse::<f64>().map_err(|error| {
-                format!("Theta ndv for field {field_id} is not numeric: {error}")
-            })?;
-            if !value.is_finite() || value < 0.0 {
-                return Err(format!(
-                    "Theta ndv for field {field_id} must be finite and non-negative"
-                ));
-            }
+            let value = parse_ndv_property(rendered)
+                .map_err(|error| format!("Theta ndv for field {field_id} is invalid: {error}"))?
+                as f64;
             if ndv.insert(*field_id, value).is_some() {
                 return Err(format!(
                     "statistics metadata contains duplicate Theta blobs for field {field_id}"
@@ -181,9 +197,9 @@ mod tests {
     #[test]
     fn optimizer_ndv_reads_only_registered_blob_metadata() {
         StatsLoader::reset_theta_body_reads_for_test();
-        let ndv = StatsLoader::load_ndv_from_metadata(&metadata_with_ndv(11, "42.5"))
+        let ndv = StatsLoader::load_ndv_from_metadata(&metadata_with_ndv(11, "42"))
             .expect("metadata NDV");
-        assert_eq!(ndv, Map::from([(11, 42.5)]));
+        assert_eq!(ndv, Map::from([(11, 42.0)]));
         assert_eq!(StatsLoader::theta_body_reads(), 0);
     }
 
@@ -194,6 +210,11 @@ mod tests {
         assert!(StatsLoader::load_ndv_from_metadata(&missing).is_err());
         assert!(StatsLoader::load_ndv_from_metadata(&metadata_with_ndv(11, "NaN")).is_err());
 
+        for invalid in ["42.5", " 42", "42 ", "+42", "-1", "", "9223372036854775808"] {
+            assert!(StatsLoader::load_ndv_from_metadata(&metadata_with_ndv(11, invalid)).is_err());
+        }
+        assert_eq!(integer_ndv_estimate(42.9).unwrap(), 42);
+        assert_eq!(integer_ndv_estimate(f64::MAX).unwrap(), i64::MAX as u64);
         let mut duplicate = metadata_with_ndv(11, "42");
         duplicate
             .blob_metadata

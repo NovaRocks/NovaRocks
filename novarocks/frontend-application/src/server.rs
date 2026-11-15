@@ -39,9 +39,6 @@ use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_state_store_runtime::{StateStoreHostInput, StateStoreProviderRegistry};
 
-use crate::query_execution::maintenance::{
-    BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
-};
 use crate::{
     application::{
         FrontendApplicationError, FrontendApplicationHost, FrontendCatalogRoleRuntime,
@@ -52,38 +49,6 @@ use crate::{
 
 #[cfg(test)]
 type ShutdownSignal = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
-
-#[derive(Clone)]
-struct FrontendBackgroundMaintenanceAttemptFactory {
-    role: novarocks_types::ClusterRole,
-    topology: novarocks_query_application::api::BackendTopologyService,
-    runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
-    runtime: Handle,
-}
-
-impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
-    fn begin_original_root_maintenance_attempt(
-        &self,
-        owner: &novarocks_workload_control::WorkOwner,
-    ) -> Result<BackgroundMaintenanceAttempt, String> {
-        core_capabilities::original_background_maintenance_attempt(
-            self.role,
-            self.topology.clone(),
-            self.runtime_policy.max_attempt_duration(),
-            &self.runtime,
-            owner,
-        )
-    }
-
-    fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String> {
-        core_capabilities::background_maintenance_attempt(
-            self.role,
-            self.topology.clone(),
-            self.runtime_policy.max_attempt_duration(),
-            &self.runtime,
-        )
-    }
-}
 
 /// Inputs required to open the Frontend application owner.
 ///
@@ -167,9 +132,7 @@ struct FrontendRoleProducts {
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
     system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     dml_service: Arc<crate::dml::DmlService>,
-    statistics_application: Arc<crate::statistics_jobs::service::FrontendStatisticsApplicationPort>,
-    maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService>,
-    maintenance_engine: Arc<dyn crate::query_execution::maintenance::TableMaintenanceEngine>,
+    statistics_application: Arc<crate::statistics::service::FrontendStatisticsApplicationPort>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_candidate_reader: crate::mv::domain::readiness::MvCandidateReader,
     /// The role graph owns the sole MV process product.
@@ -189,13 +152,6 @@ impl FrontendRoleProducts {
     /// immutable role graph exists. SQL/session assembly never starts either
     /// worker as a side effect.
     fn start_background_workers(&self) -> Result<(), FrontendApplicationError> {
-        self.maintenance_service
-            .start(Arc::clone(&self.maintenance_engine))
-            .map_err(|error| {
-                FrontendApplicationError::server(format!(
-                    "start table maintenance service failed: {error}"
-                ))
-            })?;
         self.mv_service
             .start_background_workers(core_capabilities::mv_background_bindings(
                 core_capabilities::MvBackgroundPorts::new(
@@ -228,17 +184,6 @@ impl FrontendRoleProducts {
         let mut first_error = None;
         crate::application::trace_shutdown_stage("role_products_started");
         self.mv_product_service.begin_stopping();
-        crate::application::trace_shutdown_stage("statistics_worker_join_started");
-        if let Err(error) = self
-            .statistics_application
-            .shutdown_worker_until(deadline)
-            .await
-        {
-            first_error = Some(FrontendApplicationError::server(format!(
-                "shutdown statistics analyze worker failed: {error}"
-            )));
-        }
-        crate::application::trace_shutdown_stage("statistics_worker_join_returned");
         crate::application::trace_shutdown_stage("mv_workers_join_started");
         if let Err(error) = self
             .mv_service
@@ -252,15 +197,6 @@ impl FrontendRoleProducts {
             });
         }
         crate::application::trace_shutdown_stage("mv_workers_join_returned");
-        crate::application::trace_shutdown_stage("maintenance_join_started");
-        if let Err(error) = self.maintenance_service.shutdown_until(deadline).await {
-            first_error.get_or_insert_with(|| {
-                FrontendApplicationError::server(format!(
-                    "shutdown frontend table-maintenance service failed: {error}"
-                ))
-            });
-        }
-        crate::application::trace_shutdown_stage("maintenance_join_returned");
         crate::application::trace_shutdown_stage("product_catalog_join_started");
         if let Err(error) = self.catalog_runtime.shutdown_until(deadline).await {
             first_error.get_or_insert_with(|| {
@@ -274,11 +210,8 @@ impl FrontendRoleProducts {
     }
 
     fn request_background_stop_for_process_exit(&self) {
-        self.statistics_application
-            .request_worker_stop_for_process_exit();
         self.mv_product_service.begin_stopping();
         self.mv_service.request_background_stop_for_process_exit();
-        self.maintenance_service.request_shutdown_for_process_exit();
         self.catalog_runtime.request_stop_for_process_exit();
     }
 }
@@ -373,19 +306,16 @@ async fn build_frontend_role_products(
     let view_service: Arc<dyn novarocks_query_application::view::ViewService> =
         Arc::new(novarocks_query_application::view::QueryViewService::new());
     let dml_service = Arc::new(crate::dml::DmlService::new());
-    let maintenance_service = crate::table_maintenance::FrontendTableMaintenanceService::open(
-        host.durable(),
-        Handle::current(),
-        host.workload_root_admission(),
-    )
-    .await
-    .map_err(|error| {
-        FrontendApplicationError::new(
-            crate::application::FrontendApplicationErrorKind::TableMaintenanceServiceOpen,
-            error,
-        )
-    })?
-    .with_lake_publication_runtime_policy(host.lake_publication_runtime_policy());
+    let maintenance_service =
+        crate::table_maintenance::FrontendTableMaintenanceService::open(host.durable())
+            .await
+            .map_err(|error| {
+                FrontendApplicationError::new(
+                    crate::application::FrontendApplicationErrorKind::TableMaintenanceServiceOpen,
+                    error,
+                )
+            })?
+            .with_lake_publication_runtime_policy(host.lake_publication_runtime_policy());
     #[cfg(novarocks_dev_controls)]
     let maintenance_service = maintenance_service.with_test_controls(
         host.test_session
@@ -521,7 +451,6 @@ async fn build_frontend_role_products(
     )
     .with_state_store_original(host.state_store_original_binding())
     .with_rewrite_runtime(crate::query_execution::kernels::MaintenanceRewriteRuntime {
-        client: host.logical_execution_client(),
         launcher: logical_execution_launcher.clone(),
         completion: crate::query_execution::completion_facts::CompletionFactOwners::new(
             catalog_service.clone(),
@@ -541,63 +470,49 @@ async fn build_frontend_role_products(
         ),
     });
 
-    let maintenance_engine = core_capabilities::background_maintenance_engine(
-        maintenance_ports.clone(),
-        Arc::new(FrontendBackgroundMaintenanceAttemptFactory {
-            role,
-            topology: topology.clone(),
-            runtime_policy: host.lake_publication_runtime_policy(),
-            runtime: Handle::current(),
-        }),
-    );
     let statistics_connector_control = Arc::clone(&connector_control)
         as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>;
-    let statistics_application = Arc::new(
-        crate::statistics_jobs::service::FrontendStatisticsApplicationPort::new(
-            novarocks_statistics_application::StatisticsJobService::new(),
-            Arc::new(
-                crate::statistics_jobs::application::ConnectorStatisticsTargetResolver::new(
-                    Arc::clone(&statistics_connector_control),
-                ),
+    let statistics_statement_executor = core_capabilities::statistics_attempt_executor(
+        core_capabilities::StatisticsAttemptExecutorPorts::new(
+            logical_execution_launcher.clone(),
+            crate::query_execution::completion_facts::CompletionFactOwners::new(
+                catalog_service.clone(),
+                Some(catalog_application.clone()),
+                typed_connector_control.clone(),
+                unified_statistics.clone(),
+                mv_candidate_reader.clone(),
+                mv_storage_observation.clone(),
+                host.connector_blocking_io_supervisor(),
+                view_service.clone(),
+                system_relations.clone(),
+                mv_readiness.clone(),
             ),
-            Arc::new(
-                crate::statistics_jobs::service::RootAdmissionStatisticsJobSource::new(
-                    host.workload_root_admission(),
-                ),
+            (
+                host.connector_blocking_io_supervisor(),
+                host.write_data_runtime(),
             ),
-            core_capabilities::statistics_attempt_executor(
-                core_capabilities::StatisticsAttemptExecutorPorts::new(
-                    role,
-                    statistics_connector_control,
-                    Arc::clone(&typed_connector_control),
-                    topology.clone(),
-                    host.logical_execution_client(),
-                    logical_execution_launcher.clone(),
-                    crate::query_execution::completion_facts::CompletionFactOwners::new(
-                        catalog_service.clone(),
-                        Some(catalog_application.clone()),
-                        typed_connector_control.clone(),
-                        unified_statistics.clone(),
-                        mv_candidate_reader.clone(),
-                        mv_storage_observation.clone(),
-                        host.connector_blocking_io_supervisor(),
-                        view_service.clone(),
-                        system_relations.clone(),
-                        mv_readiness.clone(),
-                    ),
-                    (
-                        host.connector_blocking_io_supervisor(),
-                        host.write_data_runtime(),
-                    ),
-                    Arc::clone(&function_catalog),
-                    host.lake_publication_runtime_policy(),
-                    Handle::current(),
-                    host.constant_policy(),
-                    host.static_plan_carrier(),
-                ),
-            ),
+            Arc::clone(&function_catalog),
             Handle::current(),
-            host.connector_blocking_io_supervisor(),
+            host.constant_policy(),
+            host.static_plan_carrier(),
+        ),
+    );
+    let statistics_target_resolver = Arc::new(
+        crate::statistics::application::ConnectorStatisticsTargetResolver::new(
+            statistics_connector_control,
+        ),
+    );
+    let statistics_read = crate::statistics::read::StatisticsReadService::new(
+        statistics_target_resolver.clone(),
+        host.connector_blocking_io_supervisor(),
+        Handle::current(),
+        view_service.clone(),
+    );
+    let statistics_application = Arc::new(
+        crate::statistics::service::FrontendStatisticsApplicationPort::new(
+            statistics_target_resolver,
+            statistics_statement_executor,
+            statistics_read,
         ),
     );
     // No fallible product construction follows these transfers. Keeping them
@@ -645,8 +560,6 @@ async fn build_frontend_role_products(
         system_relations,
         dml_service,
         statistics_application,
-        maintenance_service,
-        maintenance_engine,
         mv_readiness,
         mv_candidate_reader,
         mv_product_service,
@@ -675,7 +588,6 @@ fn build_frontend_query_session_factory_from_role_products(
     let role = products.role;
     let view_service = Arc::clone(&products.view_service);
     let statistics_application = Arc::clone(&products.statistics_application);
-    let maintenance_service = Arc::clone(&products.maintenance_service);
     let mv_readiness = Arc::clone(&products.mv_readiness);
     let mv_candidate_reader = products.mv_candidate_reader.clone();
     let mv_service = Arc::clone(&products.mv_service);
@@ -720,9 +632,6 @@ fn build_frontend_query_session_factory_from_role_products(
         ));
     let statistics_command_executor =
         core_capabilities::statistics_command_executor(statistics_application);
-    let backend_command_executor = core_capabilities::backend_command_executor(
-        core_capabilities::BackendCommandPorts::new(host.backend_topology_command_port()),
-    );
     let view_command_executor =
         core_capabilities::view_command_executor(core_capabilities::ViewCommandPorts::new(
             Arc::clone(&function_catalog),
@@ -767,15 +676,12 @@ fn build_frontend_query_session_factory_from_role_products(
     ));
     let maintenance_command_executor =
         core_capabilities::maintenance_command_executor(maintenance_ports);
-    let maintenance_read_command_executor =
-        core_capabilities::maintenance_read_command_executor(maintenance_service);
     let product_command_router = crate::query::product_command_router(
         catalog_command_executor,
         view_command_executor.clone(),
         iceberg_ref_command_executor.clone(),
         statistics_command_executor,
         maintenance_command_executor,
-        maintenance_read_command_executor,
         host.query_blocking_executor(),
         host.state_store_original_binding(),
         #[cfg(novarocks_dev_controls)]
@@ -812,7 +718,6 @@ fn build_frontend_query_session_factory_from_role_products(
         host.required_constant_interpreter(),
         query_compiler,
         product_command_router,
-        backend_command_executor,
         view_command_executor,
         mv_command_consumer,
         mv_command_executor,
@@ -1068,8 +973,10 @@ where
     // Design: ADR-0226 (docs/adr/ADR-0226-engine-metadata-through-typed-system-relations.md)
     let system_catalog: Arc<novarocks_query_application::system_tables::SystemTableRegistry> =
         Arc::new(
-            novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
-                .expect("sealed system table declarations"),
+            novarocks_query_application::system_tables::SystemTableRegistry::try_new([
+                crate::system_tables::materialized_view_states_registration(),
+            ])
+            .expect("sealed system table declarations"),
         );
     let mut products = match build_frontend_role_products(
         host,
@@ -1531,18 +1438,6 @@ mod tests {
         terminal.complete();
     }
 
-    fn settle_governed_query(statement: QuerySessionStatement) {
-        let (result, terminal) = statement.into_parts();
-        let StatementResult::GovernedQuery(result) = result else {
-            panic!("query result must retain its owner through terminal EOF");
-        };
-        let (result, mut protocol) = result.into_parts();
-        drop(result);
-        let _ = protocol.seal_success_visibility();
-        let _ = protocol.complete();
-        terminal.complete();
-    }
-
     fn test_native_trust() -> Arc<NativeTrust> {
         Arc::new(NativeTrust::new(
             DeploymentId::parse("frontend-server-test").expect("deployment"),
@@ -1939,10 +1834,27 @@ mod tests {
             ))
             .expect("open frontend query session");
         let result = session
-            .execute_statement("SHOW ANALYZE JOBS")
+            .execute_statement("ANALYZE TABLE system.metadata.materialized_views")
             .await
-            .expect("configured Frontend statistics application port handles SHOW ANALYZE JOBS");
-        settle_governed_query(result);
+            .expect("configured statistics application selects the system-relation refusal");
+        let (output, terminal) = result.into_parts();
+        let StatementResult::GovernedError(result) = output else {
+            panic!("ANALYZE refusal retains its governed statement")
+        };
+        let (error, mut protocol) = result.into_parts();
+        assert_eq!(
+            error
+                .execution_failure()
+                .unwrap()
+                .descriptor()
+                .descriptor
+                .code
+                .as_str(),
+            "query.execution.unsupported"
+        );
+        assert!(error.failure_cause().is_some());
+        let _ = protocol.fail();
+        terminal.complete();
 
         session.close();
         drop(session);

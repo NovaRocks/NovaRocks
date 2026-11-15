@@ -18,7 +18,7 @@
 -- @order_sensitive=true
 -- @sequential=true
 -- @tags=variant,timestamp,trino_semantics
--- Oracle: fixed Java Variant fixture ids 17/18/22/23, rendered using Trino 483 UTC and precision rules.
+-- Oracle: fixed Java Variant fixture ids 17/18/22/23, rendered using Trino UTC and precision rules.
 -- query 1
 -- @result_contains=IRU9_UNSHREDDED_OK
 shell: set -eu

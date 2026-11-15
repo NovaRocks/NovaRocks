@@ -173,6 +173,7 @@ fn retry_scenario(scenario: Scenario) {
             let preparations = Arc::new(Mutex::new(Vec::new()));
             let captured_preparations = preparations.clone();
             let publisher = journal.observe_prepared(Arc::new(CatalogPublisher {
+                expected_table_uuid: None,
                 catalog_operation: CatalogOperation::AlterProperties,
                 catalog: owner,
                 ident: table.identifier().clone(),
@@ -340,4 +341,125 @@ fn hadoop_stop_after_known_conflict_prevents_new_preparation_and_dispatch() {
 #[test]
 fn hadoop_retry_cannot_cross_a_replaced_table_uuid() {
     retry_scenario(Scenario::ReplacedTable);
+}
+
+#[test]
+fn rewrite_captured_uuid_rejects_same_name_replacement_before_any_commit_dispatch() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let bridge = crate::resources::IcebergCatalogRuntime::new(runtime.handle().clone());
+    let operation_bridge = bridge.clone();
+    let directory = tempfile::tempdir().unwrap();
+    let catalog = {
+        let _entered = runtime.enter();
+        Arc::new(super::super::tests::test_catalog(
+            directory.path().to_str().unwrap(),
+        ))
+    };
+    bridge
+        .block_on(async move {
+            let table = catalog
+                .create_fixture_table(
+                    &NamespaceIdent::new("db".into()),
+                    super::super::tests::test_creation("t"),
+                )
+                .await
+                .unwrap();
+            let captured = table.metadata().uuid();
+            let metadata_dir = std::path::Path::new(table.metadata().location()).join("metadata");
+            let mut replaced = serde_json::to_value(table.metadata()).unwrap();
+            replaced["table-uuid"] = uuid::Uuid::from_u128(901).to_string().into();
+            let replacement_bytes = serde_json::to_vec(&replaced).unwrap();
+            std::fs::write(metadata_dir.join("v2.metadata.json"), &replacement_bytes).unwrap();
+            let dispatches = Arc::new(AtomicUsize::new(0));
+            let recorded = dispatches.clone();
+            let owner = all_admitted_recording(
+                crate::catalog::factory::NovaRocksCatalogFactory::adopt_hadoop_for_test(
+                    catalog.clone(),
+                ),
+                Arc::new(move |_, _| {
+                    recorded.fetch_add(1, Ordering::SeqCst);
+                }),
+            );
+            owner
+                .bind_publication_generation(ProviderBindingEpoch::from_bytes([0x71; 16]))
+                .unwrap();
+            let token =
+                OperationToken::from_mutation(ConnectorMutationOperationId::from_bytes([0x71; 16]));
+            let stop = ConnectorStopOwner::new();
+            let context = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                2 * 1024 * 1024,
+                4 * 1024 * 1024,
+            )
+            .unwrap();
+            let operation = IcebergCommitOperation::new(
+                token,
+                table.metadata().location(),
+                catalog.binding.clone().unwrap(),
+                context,
+                operation_bridge,
+                OperationLimits::default(),
+            )
+            .unwrap();
+            let intent = OperationIntent::new(OperationIntentParts {
+                target: TableTarget {
+                    ident: table.identifier().clone(),
+                    uuid: Some(captured),
+                },
+                target_ref: "main".into(),
+                start: None,
+                changes: FileChanges::default(),
+                dependencies: vec![],
+                isolation: IsolationLevel::Snapshot,
+                shape: RequestShape::MetadataOnly,
+                summary: Default::default(),
+                token,
+            })
+            .unwrap();
+            let publisher =
+                PublicationJournal::<()>::new(token).observe_prepared(Arc::new(CatalogPublisher {
+                    expected_table_uuid: Some(captured),
+                    catalog_operation: CatalogOperation::RewriteDataFiles,
+                    catalog: owner,
+                    ident: table.identifier().clone(),
+                    target_ref: "main".into(),
+                    operation: token,
+                    recovery_preflight: Arc::new(|_, _| {
+                        panic!("replaced target cannot reach publication preflight")
+                    }),
+                }));
+            let report = attempt::run(
+                &operation,
+                &intent,
+                &PreparedChange {
+                    requirements: vec![],
+                    updates: vec![crate::iceberg::TableUpdate::SetProperties {
+                        updates: HashMap::from([(
+                            "test.rewrite.must_not_publish".into(),
+                            "true".into(),
+                        )]),
+                    }],
+                },
+                &[],
+                &publisher,
+                RetryPolicy::from_properties(&HashMap::new()).unwrap(),
+            )
+            .await;
+            let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
+                panic!("the actual replaced UUID must reject before dispatch")
+            };
+            assert!(failure.message().contains("TARGET_REPLACED"), "{failure:?}");
+            assert!(matches!(
+                report.cleanup,
+                IcebergCleanupReport::Complete { .. }
+            ));
+            assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+            assert!(!metadata_dir.join("v3.metadata.json").exists());
+            assert_eq!(
+                std::fs::read(metadata_dir.join("v2.metadata.json")).unwrap(),
+                replacement_bytes
+            );
+        })
+        .expect("actual catalog owner and operation cleanup must join");
 }

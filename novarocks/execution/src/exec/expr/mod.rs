@@ -52,9 +52,6 @@ mod cast_decimal_float_oracle_tests;
 mod numeric_unary_owned_transaction_tests;
 
 #[cfg(test)]
-mod numeric_unary_public_transport_tests;
-
-#[cfg(test)]
 mod cast_decimal_float32_oracle_tests;
 
 #[cfg(test)]
@@ -121,9 +118,6 @@ mod sql_dependency_binding_host_abort_tests;
 mod sql_dependency_constant_host_abort_tests;
 
 #[cfg(test)]
-mod exact_percentile_actual_sql_rate_source_tests;
-
-#[cfg(test)]
 mod cast_text_time_oracle_tests;
 
 #[cfg(test)]
@@ -149,12 +143,6 @@ mod percentile_hash_corpus_sql_source_tests;
 
 #[cfg(test)]
 mod between_actual_sql_compiler_tests;
-
-#[cfg(test)]
-mod integral_decimal128_actual_sql_tests;
-
-#[cfg(test)]
-mod between_actual_after_tests;
 
 #[cfg(test)]
 mod percentile_hash_native_n1_frame_tests;
@@ -232,9 +220,6 @@ mod e08s1_owned_lifecycle_tests;
 mod late_call_sql_source_tests;
 
 #[cfg(test)]
-mod e08s1_late_source_tests;
-
-#[cfg(test)]
 mod percentile_profile_sql_source_tests;
 
 #[cfg(test)]
@@ -286,9 +271,6 @@ mod time_profile_sql_source_tests;
 mod e08s1_time_static_profile_tests;
 
 #[cfg(test)]
-mod left_right_actual_sql_source_tests;
-
-#[cfg(test)]
 mod split_part_actual_sql_source_tests;
 
 #[cfg(test)]
@@ -302,9 +284,6 @@ pub(crate) mod runtime_scalar_memory_actual_sql_tests;
 
 #[cfg(test)]
 mod runtime_scalar_memory_actual_sql_bitwise_tests;
-
-#[cfg(test)]
-mod signed_cast_nullability_sql_tests;
 
 #[cfg(test)]
 pub(crate) mod test_support;

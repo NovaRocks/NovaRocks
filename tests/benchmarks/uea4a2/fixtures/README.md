@@ -11,4 +11,4 @@
 
 当前入口与环境变量见 [range输入](../README.md)，planning多文件显式prepare/verify见 [planning输入](../../uea4a4/README.md)。相关input/provider/FS合同变更必跑对应canonical owner；本地FS沿Rust CI，native功能组每周手工领域轮次，缺输入不记通过。
 
-共享 fixture 下，`provision_trino.sh` 从 publication 读取准确 network，并用原 run ID 的 `_tr` namespace 和 scratch location 产出数据；镜像仍需事先离线供给。临时 Trino 继承 `NOVA_FIXTURE_RUN_CONTEXT` 的绝对期限，容器 PID 1 在原工作期限到达时自主退出，迟到启动拒绝写入。清理只针对准确返回的容器 ID；清理失败保留非零退出。
+Trino 语料与两份 `trino-manifest.json` 已冻结为来源证据，原生成脚本已退役。清单中的生成器名称、版本与校验值保留历史事实；现有校验器只读取冻结语料，不启动 Trino，也不重新生成数据。

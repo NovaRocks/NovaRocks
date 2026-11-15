@@ -92,8 +92,10 @@ GROUP BY region;
 -- therefore locks the Dependencies column content, not just MV name presence.
 -- @result_contains=mv_orders_${uuid0}
 -- @result_contains=mv_region_${uuid0}
--- @result_contains=mv:ice_ivm_dep_${uuid0}.dep_${uuid0}.mv_orders_${uuid0}
-SHOW MATERIALIZED VIEWS;
+-- @result_rows_where=name=mv_region_${uuid0}
+-- @result_rows_count=1
+-- @result_rows_expect=upstream_identity_matches=true
+SELECT name, upstream_materialized_views[1] = concat(catalog_name, '.', schema_name, '.mv_orders_${uuid0}') AS upstream_identity_matches FROM system.runtime.materialized_view_states WHERE catalog_name = 'ice_ivm_dep_${uuid0}';
 
 -- query 7
 -- @skip_result_check=true

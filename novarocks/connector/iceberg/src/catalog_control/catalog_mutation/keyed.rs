@@ -236,6 +236,7 @@ pub(super) fn execute(
         },
     );
     let owner_publisher: Arc<dyn PublicationPreparer> = Arc::new(CatalogPublisher {
+        expected_table_uuid: None,
         catalog_operation: CatalogOperation::UpdateDocuments,
         catalog: Arc::clone(provider.runtime().novarocks_catalog()),
         ident: intent.target().ident.clone(),
@@ -597,6 +598,7 @@ pub(super) async fn execute_async(
         },
     );
     let owner_publisher: Arc<dyn PublicationPreparer> = Arc::new(CatalogPublisher {
+        expected_table_uuid: None,
         catalog_operation: CatalogOperation::UpdateDocuments,
         catalog: Arc::clone(provider.runtime().novarocks_catalog()),
         ident: intent.target().ident.clone(),

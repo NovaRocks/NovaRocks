@@ -102,12 +102,15 @@ fn alter_table_maintenance_forms_roundtrip() {
 }
 
 #[test]
-fn show_alter_table_optimize_keeps_presentation_structure() {
-    let source = "show alter table optimize in `ice`.`analytics` \
-        where `TableName` = 'orders' order by `CreateTime` desc limit 20;";
+fn show_alter_table_optimize_is_retired_syntax() {
+    let source = "SHOW ALTER TABLE OPTIMIZE FROM ice.analytics WHERE TableName = 'orders'";
     assert_eq!(
-        roundtrip(source),
-        "SHOW ALTER TABLE OPTIMIZE FROM `ice`.`analytics` WHERE `TableName` = 'orders' ORDER BY `CreateTime` DESC LIMIT 20"
+        parse(source)
+            .unwrap_err()
+            .to_user_error(source)
+            .code()
+            .as_str(),
+        "sql.parse.unexpected_token"
     );
 }
 

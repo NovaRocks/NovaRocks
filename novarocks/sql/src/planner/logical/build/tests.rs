@@ -1214,7 +1214,7 @@ fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
 #[test]
 fn p2_repeat_grouping_aggregate_outputs_follow_group_by_order() {
     // Computed GROUPING arguments remain the existing Nova grammar extension.
-    // Trino 483 requires qualifiedName here; that grammar flip belongs to 5e.
+    // Trino requires qualifiedName here; that grammar flip belongs to 5e.
     // The public width still follows the approved INTEGER/BIGINT rule.
     let plan = plan_test_query(
         "SELECT grouping(a + 1) AS g, a + 1 AS k, count(*) AS cnt \

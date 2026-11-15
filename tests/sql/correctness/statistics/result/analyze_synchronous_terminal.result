@@ -1,0 +1,5 @@
+-- query 5
+-- types	varchar	double	double	double	double	varchar	varchar
+column_name	data_size	distinct_values_count	nulls_fraction	row_count	low_value	high_value
+k	NULL	3.0	0.0	NULL	1	3
+NULL	NULL	NULL	NULL	3.0	NULL	NULL

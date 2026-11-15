@@ -87,7 +87,7 @@ def main(argv=None):
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--metrics")
     parser.add_argument("--source", type=Path)
-    parser.add_argument("--jdbc-jar")
+    parser.add_argument("--jdbc-jar", help="declared host JDBC driver mounted read-only at /probe/trino-jdbc.jar")
     args, rest = parser.parse_known_args(argv)
     rest = rest[1:] if rest[:1] == ["--"] else rest
     runtime.install_signal_handlers()
@@ -99,7 +99,7 @@ def main(argv=None):
             result = trino_client_owner.cli(args.env_file, args.image, args.evidence_dir, rest, args.metrics)
         else:
             if args.source is None or not args.jdbc_jar:
-                raise runtime.RuntimeFailure("InvalidConfiguration", "JDBC operation requires image-local driver and saved source")
+                raise runtime.RuntimeFailure("InvalidConfiguration", "JDBC operation requires declared host driver and saved source")
             result = trino_client_owner.jdbc(args.env_file, args.image, args.evidence_dir, args.source, args.jdbc_jar, rest)
         sys.stdout.buffer.write(result.stdout)
         sys.stderr.buffer.write(result.stderr)

@@ -92,11 +92,6 @@ impl super::staging::Preparer for SelectedRewritePreparer {
         }
         let data_rewrite = self.files.kind == SelectedRewriteKind::Data;
         let removed = if data_rewrite {
-            if self.files.data_paths != live_data || self.files.delete_paths != live_deletes {
-                return Err(selected_invalid(
-                    "Selected data rewrite does not own every live data and delete entry",
-                ));
-            }
             self.files
                 .data_paths
                 .union(&self.files.delete_paths)
@@ -352,7 +347,43 @@ mod preparer_tests {
             .with_manifest_list(list.object.path().to_string())
             .with_summary(Summary {
                 operation: Operation::Append,
-                additional_properties: HashMap::new(),
+                additional_properties: HashMap::from([
+                    (
+                        "total-records".into(),
+                        files
+                            .iter()
+                            .filter(|f| f.content_type() == DataContentType::Data)
+                            .map(|f| f.record_count())
+                            .sum::<u64>()
+                            .to_string(),
+                    ),
+                    (
+                        "total-data-files".into(),
+                        files
+                            .iter()
+                            .filter(|f| f.content_type() == DataContentType::Data)
+                            .count()
+                            .to_string(),
+                    ),
+                    (
+                        "total-delete-files".into(),
+                        files
+                            .iter()
+                            .filter(|f| f.content_type() != DataContentType::Data)
+                            .count()
+                            .to_string(),
+                    ),
+                    (
+                        "total-files-size".into(),
+                        files
+                            .iter()
+                            .map(|f| {
+                                super::super::row_delta_dv_metadata::logical_file_size(f).unwrap()
+                            })
+                            .sum::<u64>()
+                            .to_string(),
+                    ),
+                ]),
             })
             .with_schema_id(metadata.current_schema_id());
         let (first, count) = list.row_range.unwrap();
@@ -770,33 +801,83 @@ mod preparer_tests {
     }
 
     #[tokio::test]
-    async fn selected_data_rewrite_rejects_partial_ownership_without_allocating() {
+    async fn selected_data_rewrite_replaces_only_owned_files_and_carries_parent_totals() {
         let writer = Writer::new();
-        let metadata = fixture(&writer, false).await;
+        let metadata = fixture(&writer, true).await;
         let original = live(&writer, &metadata, 10).await;
-        let first = original.keys().next().unwrap().clone();
+        let selected_data = EntryIdentity::DataFile {
+            path: "file:///source-a.parquet".into(),
+        };
+        let selected_deletes = original.keys().filter(|id| matches!(id,
+            EntryIdentity::DeletionVector { referenced_data_file, .. } if referenced_data_file == "file:///source-a.parquet"
+        )).cloned().collect::<BTreeSet<_>>();
+        assert_eq!(selected_deletes.len(), 1);
+        let retained_delete_bytes = original
+            .keys()
+            .find_map(|id| match id {
+                EntryIdentity::DeletionVector {
+                    referenced_data_file,
+                    length,
+                    ..
+                } if referenced_data_file == "file:///source-b.parquet" => {
+                    Some(u64::try_from(*length).unwrap())
+                }
+                _ => None,
+            })
+            .expect("the unselected data file retains its own DV blob");
+        let removed = std::iter::once(selected_data.clone())
+            .chain(selected_deletes.iter().cloned())
+            .map(|id| original[&id].frozen.clone())
+            .collect();
+        let output = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("file:///partial-output.parquet".into())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(2)
+            .file_size_in_bytes(70)
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
         let intent = intent(
             &writer,
             &metadata,
-            vec![],
-            vec![original[&first].frozen.clone()],
+            vec![AddedContent::rewritten_data(output, 0, 1).unwrap()],
+            removed,
             RequestShape::SnapshotProducing,
         );
-        let staging = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
-        let before = writer.ledger.lock().unwrap().records().count();
-        let error = SelectedRewritePreparer {
-            files: SelectedRewriteFiles {
-                kind: SelectedRewriteKind::Data,
-                data_paths: BTreeSet::from([first]),
-                delete_paths: BTreeSet::new(),
-            },
+        let mut staging = StagingEngine::begin(base(metadata.clone()), &intent, &writer).unwrap();
+        staging
+            .stage(&SelectedRewritePreparer {
+                files: SelectedRewriteFiles {
+                    kind: SelectedRewriteKind::Data,
+                    data_paths: BTreeSet::from([selected_data.clone()]),
+                    delete_paths: selected_deletes.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        let snapshot = staging.metadata().snapshot_for_ref("dev").unwrap();
+        // The rewrite targets dev's snapshot 10 even though main points at 20.
+        assert_eq!(snapshot.parent_snapshot_id(), Some(10));
+        let facts = &snapshot.summary().additional_properties;
+        assert_eq!(facts["total-records"], "5");
+        assert_eq!(facts["total-data-files"], "2");
+        assert_eq!(facts["total-delete-files"], "1");
+        // Preserve source-b's 100-byte data file and its exact DV blob;
+        // replace only source-a with the independently specified 70-byte output.
+        assert_eq!(
+            facts["total-files-size"],
+            (100 + 70 + retained_delete_bytes).to_string()
+        );
+        let after = live(&writer, staging.metadata(), snapshot.snapshot_id()).await;
+        assert_eq!(after.len(), 3);
+        assert!(!after.contains_key(&selected_data));
+        assert!(selected_deletes.iter().all(|id| !after.contains_key(id)));
+        for (id, entry) in &original {
+            if id != &selected_data && !selected_deletes.contains(id) {
+                assert_eq!(after[id].frozen.facts(), entry.frozen.facts());
+            }
         }
-        .prepare(&staging.view(), &intent)
-        .await
-        .err()
-        .unwrap();
-        assert!(error.to_string().contains("every live"));
-        assert_eq!(writer.ledger.lock().unwrap().records().count(), before);
     }
 
     #[tokio::test]

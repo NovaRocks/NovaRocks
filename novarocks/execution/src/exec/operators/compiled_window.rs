@@ -1119,7 +1119,12 @@ impl CompiledWindowProcessor {
             let mut input = input_creation.vector::<Chunk>(pieces.len(), temporary.as_ref())?;
             input.extend(pieces.iter().map(|piece| piece.batch.clone()));
             let batch = input_creation.concat(&input, retained.as_ref())?;
-            input_creation.publish(batch, source, retained.as_ref())?
+            let storage = Chunk::source_set_storage_lifetime_observed::<ConstructionFailure>(
+                &input,
+                retained.storage_lifetime(),
+                |layout| retained.request(layout),
+            )?;
+            input_creation.publish_with_storage(batch, source, storage, retained.as_ref())?
         };
         let rows = batch.len();
         let join = |column: &dyn Fn(&Piece) -> &ArrayRef| -> ExecutionResult<ArrayRef> {
@@ -1224,7 +1229,12 @@ impl CompiledWindowProcessor {
                 let creation = SortCreation::new(factory.as_ref(), self.prepared_output()?);
                 let retained = factory.begin_input_construction(&closed[0])?;
                 let batch = creation.concat(&closed, retained.as_ref())?;
-                creation.publish(batch, &closed[0], retained.as_ref())?
+                let storage = Chunk::source_set_storage_lifetime_observed::<ConstructionFailure>(
+                    &closed,
+                    retained.storage_lifetime(),
+                    |layout| retained.request(layout),
+                )?;
+                creation.publish_with_storage(batch, &closed[0], storage, retained.as_ref())?
             }
         };
         Ok(Some(output))

@@ -408,13 +408,6 @@ async fn bounded_target_lookup_returns_the_current_exact_version_after_replaceme
     );
 }
 
-fn dependency_bound() -> crate::repository::MvDependencyReadBound {
-    crate::repository::MvDependencyReadBound {
-        entries: 4,
-        collection_bytes: 16 * 1024,
-    }
-}
-
 fn assert_dependency_scan_closed(store: &RecordingStore, ranges: usize) {
     let trace = store.trace.lock().unwrap();
     assert_eq!(trace.begins, 1);
@@ -424,7 +417,7 @@ fn assert_dependency_scan_closed(store: &RecordingStore, ranges: usize) {
 }
 
 #[tokio::test]
-async fn bounded_dependencies_preserve_the_exact_classification_and_sort_oracle() {
+async fn dependency_validation_preserve_the_exact_classification_and_sort_oracle() {
     use crate::dependency::MvDependencyObjectType;
     let (store, repository) = recorded_repository().await;
     repository
@@ -449,7 +442,7 @@ async fn bounded_dependencies_preserve_the_exact_classification_and_sort_oracle(
         .unwrap();
     store.reset();
     let rows = repository
-        .list_keyed_dependencies_by_downstream_bounded(&downstream, dependency_bound())
+        .list_keyed_dependencies_by_downstream(&downstream)
         .await
         .unwrap();
     assert_eq!(rows, oracle);
@@ -465,7 +458,7 @@ async fn bounded_dependencies_preserve_the_exact_classification_and_sort_oracle(
 }
 
 #[tokio::test]
-async fn bounded_dependencies_require_the_fresh_exact_downstream_version() {
+async fn dependency_validation_require_the_fresh_exact_downstream_version() {
     let (store, repository) = recorded_repository().await;
     let downstream = seed(&repository, "downstream").await;
     let replaced = repository
@@ -482,14 +475,14 @@ async fn bounded_dependencies_require_the_fresh_exact_downstream_version() {
         .unwrap();
     store.reset();
     let error = repository
-        .list_keyed_dependencies_by_downstream_bounded(&downstream, dependency_bound())
+        .list_keyed_dependencies_by_downstream(&downstream)
         .await
         .unwrap_err();
     assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
     assert_dependency_scan_closed(&store, 0);
     assert_eq!(
         repository
-            .list_keyed_dependencies_by_downstream_bounded(&replaced, dependency_bound())
+            .list_keyed_dependencies_by_downstream(&replaced)
             .await
             .unwrap()[0]
             .upstream
@@ -499,7 +492,7 @@ async fn bounded_dependencies_require_the_fresh_exact_downstream_version() {
 }
 
 #[tokio::test]
-async fn bounded_dependency_index_and_classification_share_the_first_read_snapshot() {
+async fn dependency_index_and_classification_share_the_first_read_snapshot() {
     use crate::dependency::MvDependencyObjectType;
     let (store, repository) = recorded_repository().await;
     let upstream = repository
@@ -527,7 +520,7 @@ async fn bounded_dependency_index_and_classification_share_the_first_read_snapsh
     let captured = downstream.clone();
     let running = tokio::spawn(async move {
         reader
-            .list_keyed_dependencies_by_downstream_bounded(&captured, dependency_bound())
+            .list_keyed_dependencies_by_downstream(&captured)
             .await
     });
     observed.await.unwrap();
@@ -549,7 +542,7 @@ async fn bounded_dependency_index_and_classification_share_the_first_read_snapsh
     );
     assert_dependency_scan_closed(&store, 4);
     let rows = repository
-        .list_keyed_dependencies_by_downstream_bounded(&downstream, dependency_bound())
+        .list_keyed_dependencies_by_downstream(&downstream)
         .await
         .unwrap();
     assert!(
@@ -559,7 +552,7 @@ async fn bounded_dependency_index_and_classification_share_the_first_read_snapsh
 }
 
 #[tokio::test]
-async fn bounded_dependencies_reject_a_missing_canonical_occurrence_before_classifying() {
+async fn dependency_validation_reject_a_missing_canonical_occurrence_before_classifying() {
     use novarocks_state_store_api::{CommitOutcome, Precondition};
     let (store, repository) = recorded_repository().await;
     let downstream = seed(&repository, "downstream").await;
@@ -588,7 +581,7 @@ async fn bounded_dependencies_reject_a_missing_canonical_occurrence_before_class
     assert!(matches!(write.commit().await, CommitOutcome::Committed(_)));
     store.reset();
     let error = repository
-        .list_keyed_dependencies_by_downstream_bounded(&downstream, dependency_bound())
+        .list_keyed_dependencies_by_downstream(&downstream)
         .await
         .unwrap_err();
     assert_eq!(error.kind(), MvRepositoryErrorKind::Corruption);
@@ -597,7 +590,7 @@ async fn bounded_dependencies_reject_a_missing_canonical_occurrence_before_class
 }
 
 #[tokio::test]
-async fn bounded_dependency_range_or_close_failures_never_publish_partial_facts() {
+async fn dependency_range_or_close_failures_never_publish_partial_facts() {
     let (store, repository) = recorded_repository().await;
     let downstream = seed(&repository, "downstream").await;
     for (fault, ranges, message) in [
@@ -608,43 +601,10 @@ async fn bounded_dependency_range_or_close_failures_never_publish_partial_facts(
         store.reset();
         *store.fault.lock().unwrap() = Some(fault);
         let error = repository
-            .list_keyed_dependencies_by_downstream_bounded(&downstream, dependency_bound())
+            .list_keyed_dependencies_by_downstream(&downstream)
             .await
             .unwrap_err();
         assert!(error.to_string().contains(message), "{error}");
         assert_dependency_scan_closed(&store, ranges);
-    }
-}
-
-#[tokio::test]
-async fn dependency_display_keeps_its_own_entry_and_collection_limits() {
-    let (store, repository) = recorded_repository().await;
-    let downstream = seed(&repository, "downstream").await;
-    for (bound, message) in [
-        (
-            crate::repository::MvDependencyReadBound {
-                entries: 1,
-                ..dependency_bound()
-            },
-            "entry bound",
-        ),
-        (
-            crate::repository::MvDependencyReadBound {
-                collection_bytes: 1,
-                ..dependency_bound()
-            },
-            "collection byte bound",
-        ),
-    ] {
-        store.reset();
-        let error = repository
-            .list_keyed_dependencies_by_downstream_bounded(&downstream, bound)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains(message), "{error}");
-        let trace = store.trace.lock().unwrap();
-        assert_eq!(trace.begins, 1);
-        assert_eq!(trace.aborts, 1);
-        assert!(trace.ranges.iter().all(|request| request.page_size == 1));
     }
 }

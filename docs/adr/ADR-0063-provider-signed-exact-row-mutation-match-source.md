@@ -4,7 +4,7 @@ title: "Provider-signed exact match source for row mutation"
 domain: [provider-spi, frontend-dml]
 status: superseded
 supersedes: [ADR-0062]
-superseded-by: ADR-0231
+superseded-by: ADR-0233
 date: 2026-08-12
 provenance:
   - "discussion: 2026-08-12 exact pre-selection match source for branch copy-on-write mutation"

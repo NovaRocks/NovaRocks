@@ -6,6 +6,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
+    pub reference: novarocks_cluster_harness::reference_inputs::ResolvedReference,
     pub build: crate::build_information::BuildInformation,
     pub binary: PathBuf,
     pub compatible_binary: Option<PathBuf>,
@@ -46,6 +47,7 @@ impl RunnerConfig {
             .clone()
             .context("--artifact-root is required when running scenarios")?;
         Ok(Self {
+            reference: Default::default(),
             build,
             binary,
             compatible_binary,

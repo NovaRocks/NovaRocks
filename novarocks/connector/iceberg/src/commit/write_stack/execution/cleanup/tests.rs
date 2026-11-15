@@ -277,7 +277,7 @@ async fn cleanup_projection_preserves_original_scope_capabilities_and_restrictio
         .with_io_admission(io.clone())
         .with_execution_source(range, operations.clone())
         .with_necessary_finalization_deadline_cap(cap)
-        .with_initiation(ConnectorRequestInitiation::JobAttempt);
+        .with_initiation(ConnectorRequestInitiation::Statement);
     let marker = original.request_scope_extension_or_insert_with(|| String::from("same scope"));
     let ticket = operations.admit(Arc::new(|| {})).unwrap();
     let mut cleanup = UnsealedWriterCleanup::new(binding(None), original.clone(), "file:///owned");

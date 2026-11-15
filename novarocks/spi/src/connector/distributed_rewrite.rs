@@ -43,7 +43,6 @@ pub use async_plan::{
 
 pub const CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION: u16 = 1;
 pub const MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES: usize = 64 * 1024;
-pub const MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS: usize = 4096;
 
 const REQUEST_DOMAIN: &[u8] = b"novarocks.connector-distributed-rewrite.request.v1\0";
 const PLAN_DOMAIN: &[u8] = b"novarocks.connector-distributed-rewrite.plan.v1\0";
@@ -53,6 +52,10 @@ pub const REWRITE_POSITION_DELETES_KIND: &str = "rewrite-position-deletes";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorDistributedRewriteOperation {
+    OptimizeDataFiles {
+        table: ConnectorTableHandle,
+        file_size_threshold_bytes: u64,
+    },
     RewriteDataFiles {
         table: ConnectorTableHandle,
         rewrite_all: bool,
@@ -97,7 +100,9 @@ pub enum ConnectorDistributedRewriteShape {
 impl ConnectorDistributedRewriteOperation {
     pub const fn kind(&self) -> &'static str {
         match self {
-            Self::RewriteDataFiles { .. } => REWRITE_DATA_FILES_KIND,
+            Self::RewriteDataFiles { .. } | Self::OptimizeDataFiles { .. } => {
+                REWRITE_DATA_FILES_KIND
+            }
             Self::RewritePositionDeletes { .. } => REWRITE_POSITION_DELETES_KIND,
         }
     }
@@ -105,6 +110,9 @@ impl ConnectorDistributedRewriteOperation {
     /// What this operation rewrites, without its target.
     pub const fn shape(&self) -> ConnectorDistributedRewriteShape {
         match self {
+            Self::OptimizeDataFiles { .. } => {
+                ConnectorDistributedRewriteShape::DataFiles { rewrite_all: false }
+            }
             Self::RewriteDataFiles { rewrite_all, .. } => {
                 ConnectorDistributedRewriteShape::DataFiles {
                     rewrite_all: *rewrite_all,
@@ -123,9 +131,9 @@ impl ConnectorDistributedRewriteOperation {
 
     pub const fn table(&self) -> &ConnectorTableHandle {
         match self {
-            Self::RewriteDataFiles { table, .. } | Self::RewritePositionDeletes { table, .. } => {
-                table
-            }
+            Self::RewriteDataFiles { table, .. }
+            | Self::OptimizeDataFiles { table, .. }
+            | Self::RewritePositionDeletes { table, .. } => table,
         }
     }
 
@@ -149,6 +157,13 @@ impl ConnectorDistributedRewriteOperation {
         digest_bytes(hash, self.table().payload());
         match self {
             Self::RewriteDataFiles { rewrite_all, .. } => hash.update([u8::from(*rewrite_all)]),
+            Self::OptimizeDataFiles {
+                file_size_threshold_bytes,
+                ..
+            } => {
+                digest_bytes(hash, b"optimize");
+                hash.update(file_size_threshold_bytes.to_be_bytes());
+            }
             Self::RewritePositionDeletes {
                 rewrite_all,
                 min_input_files,
@@ -533,9 +548,6 @@ impl ConnectorDistributedRewritePlan {
     ) -> Result<Self, ConnectorError> {
         request.validate()?;
         validate_payload(&provider_payload, "plan")?;
-        if cohorts.len() > MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS {
-            return Err(exhausted("distributed rewrite plan exceeds cohort limit"));
-        }
         cohorts.sort_by_key(ConnectorDistributedRewriteCohortPlan::cohort_id);
         if cohorts
             .windows(2)
@@ -625,11 +637,10 @@ impl ConnectorDistributedRewritePlan {
     pub fn validate(&self) -> Result<(), ConnectorError> {
         validate_payload(&self.provider_payload, "plan")?;
         self.operation.validate()?;
-        if self.cohorts.len() > MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS
-            || self
-                .cohorts
-                .windows(2)
-                .any(|pair| pair[0].cohort_id >= pair[1].cohort_id)
+        if self
+            .cohorts
+            .windows(2)
+            .any(|pair| pair[0].cohort_id >= pair[1].cohort_id)
         {
             return Err(invalid("distributed rewrite plan is invalid"));
         }

@@ -35,6 +35,7 @@ pub mod publication;
 pub mod publication_catalog;
 pub mod publication_service;
 pub mod recording_rest_catalog;
+pub mod reference_inputs;
 pub mod resource_registration;
 pub mod s3_write_fault;
 pub mod vended_rest_catalog;

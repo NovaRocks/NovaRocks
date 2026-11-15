@@ -28,13 +28,19 @@ pub fn is_shell_step(sql: &str) -> bool {
 ///
 /// Successful steps retain the historical `"<exit_code>\n<stdout>"` result text so
 /// existing text assertions and golden files continue to see the same value.
+#[cfg(test)]
 pub fn execute_shell_step(sql: &str) -> (bool, Option<QueryExecution>, String) {
     let cmd = sql
         .trim_start()
         .strip_prefix("shell:")
         .expect("shell steps must start with shell:")
         .trim();
-    execute_command(Command::new("sh").arg("-c").arg(cmd))
+    execute_command(
+        Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .env_remove("NOVA_TRINO_REFERENCE_IMAGE"),
+    )
 }
 
 /// The controlled caller supplies its existing absolute scenario clock.
@@ -67,7 +73,37 @@ pub(crate) fn execute_shell_step_observed(
     cleanup: bool,
     writer_exit: Option<&std::sync::atomic::AtomicBool>,
 ) -> (bool, Option<QueryExecution>, String) {
-    execute_shell_step_core(sql, deadline, context, storage, cleanup, writer_exit, None).0
+    execute_shell_step_observed_with_reference(
+        sql,
+        deadline,
+        context,
+        storage,
+        cleanup,
+        writer_exit,
+        None,
+    )
+}
+
+pub(crate) fn execute_shell_step_observed_with_reference(
+    sql: &str,
+    deadline: Option<Instant>,
+    context: Option<&str>,
+    storage: Option<&str>,
+    cleanup: bool,
+    writer_exit: Option<&std::sync::atomic::AtomicBool>,
+    trino_image: Option<&str>,
+) -> (bool, Option<QueryExecution>, String) {
+    execute_shell_step_core(
+        sql,
+        deadline,
+        context,
+        storage,
+        cleanup,
+        writer_exit,
+        None,
+        trino_image,
+    )
+    .0
 }
 
 /// Only a concrete domain owner can combine this local observation with its
@@ -87,6 +123,7 @@ pub(crate) fn execute_shell_step_with_group_observation(
         false,
         None,
         Some(GroupObservation::Lifetime(work_deadline, complete_deadline)),
+        None,
     )
 }
 
@@ -107,6 +144,7 @@ pub(crate) fn execute_hms_shell_step_observed(
         cleanup,
         Some(writer_exit),
         Some(GroupObservation::Until(deadline)),
+        None,
     )
 }
 
@@ -124,13 +162,27 @@ fn execute_shell_step_core(
     cleanup: bool,
     writer_exit: Option<&std::sync::atomic::AtomicBool>,
     observation: Option<GroupObservation>,
+    trino_image: Option<&str>,
 ) -> (ShellExecution, bool) {
     let mut group_exit_observed = false;
     let mut hms_host_control_confirmed = false;
     let require_group = matches!(observation, Some(GroupObservation::Until(_)));
     let result = (|| -> ShellExecution {
         let Some(deadline) = deadline else {
-            return execute_shell_step(sql);
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg(
+                    sql.trim_start()
+                        .strip_prefix("shell:")
+                        .expect("shell step")
+                        .trim(),
+                )
+                .env_remove("NOVA_TRINO_REFERENCE_IMAGE");
+            if let Some(image) = trino_image {
+                command.env("NOVA_TRINO_REFERENCE_IMAGE", image);
+            }
+            return execute_command(&mut command);
         };
         #[cfg(not(unix))]
         {
@@ -167,6 +219,11 @@ fn execute_shell_step_core(
                     .expect("shell step")
                     .trim(),
             );
+            // Reference authority comes only from the selected suite declaration.
+            command.env_remove("NOVA_TRINO_REFERENCE_IMAGE");
+            if let Some(image) = trino_image {
+                command.env("NOVA_TRINO_REFERENCE_IMAGE", image);
+            }
             if let Some(context) = context {
                 command
                     .env(
@@ -352,6 +409,28 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn declared_reference_is_child_local_and_unrelated_steps_do_not_receive_it() {
+        let sql = "shell: printf '%s' \"${NOVA_TRINO_REFERENCE_IMAGE:-absent}\"";
+        let run = |image| {
+            super::execute_shell_step_observed_with_reference(
+                sql,
+                Some(Instant::now() + Duration::from_secs(5)),
+                None,
+                None,
+                false,
+                None,
+                image,
+            )
+        };
+        let supplied = run(Some("sha256:declared-image"));
+        assert!(supplied.0, "{}", supplied.2);
+        assert_eq!(supplied.1.unwrap().text_output, "0\nsha256:declared-image");
+        let unrelated = run(None);
+        assert!(unrelated.0, "{}", unrelated.2);
+        assert_eq!(unrelated.1.unwrap().text_output, "0\nabsent");
+    }
+
+    #[test]
     fn unsuccessful_producer_keeps_outer_cleanup_unconfirmed_even_when_host_cli_exits() {
         let exited = std::sync::atomic::AtomicBool::new(true);
         let result = execute_shell_step_observed(
@@ -423,6 +502,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             None,
         );

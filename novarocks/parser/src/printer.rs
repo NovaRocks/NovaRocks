@@ -72,9 +72,6 @@ impl Printer {
 
     fn write_statement(&mut self, statement: &Statement) {
         match statement {
-            Statement::ShowBackends(statement) => {
-                crate::ast::backend::write_sql(statement, &mut self.output)
-            }
             Statement::ShowProcessList(statement) => {
                 crate::ast::session::write_show_process_list(statement, &mut self.output)
             }
@@ -1574,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn parenthesizes_binary_expressions_and_prints_show_backends() {
+    fn parenthesizes_binary_expressions_and_prints_processlist() {
         let expression = binary(
             identifier("a"),
             BinaryOperator::Multiply,
@@ -1582,11 +1579,14 @@ mod tests {
         );
         assert_eq!(print_expr(&expression), "a * (b + c)");
 
-        let show = Statement::ShowBackends(ShowBackends { span: span() });
-        assert_eq!(print_statement(&show), "SHOW BACKENDS");
+        let show = Statement::ShowProcessList(ShowProcessList {
+            full: false,
+            span: span(),
+        });
+        assert_eq!(print_statement(&show), "SHOW PROCESSLIST");
         assert_eq!(
             print_statements(&[show.clone(), show]),
-            "SHOW BACKENDS; SHOW BACKENDS"
+            "SHOW PROCESSLIST; SHOW PROCESSLIST"
         );
     }
 

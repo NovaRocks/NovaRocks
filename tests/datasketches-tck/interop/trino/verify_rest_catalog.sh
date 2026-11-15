@@ -20,9 +20,6 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 runtime_env="${NOVA_ENV_REST_ENV_FILE:-}"
-readonly trino_release=483
-readonly trino_manifest_digest=sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534
-readonly default_trino_image="trinodb/trino@${trino_manifest_digest}"
 
 usage() {
   cat >&2 <<'EOF'
@@ -30,10 +27,9 @@ Usage:
   verify_rest_catalog.sh create-parent NAMESPACE TABLE
   verify_rest_catalog.sh verify-current NAMESPACE TABLE COLUMN EXPECTED_ROWS EXPECTED_NDV EXPECTED_MIN EXPECTED_MAX
 
-The script starts one transient released Trino 483 container on the existing
-Iceberg REST fixture network. It never pulls: the frozen manifest must already
-be in this host's image store, under any local name. NOVA_TRINO_IMAGE may name
-a specific local reference, but it must retain the frozen manifest digest.
+The script starts one transient Trino reference container on the existing
+Iceberg REST fixture network. NOVA_TRINO_REFERENCE_IMAGE must contain the
+image ID resolved by the run entry from the fixture input declaration.
 EOF
 }
 
@@ -46,42 +42,6 @@ require_identifier() {
   local value=$1
   local label=$2
   [[ "$value" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "$label is not a safe SQL identifier: $value"
-}
-
-trino_image_exposes_pin() {
-  local candidate=$1 id digests
-  id=$(docker image inspect "$candidate" --format '{{.Id}}' 2>/dev/null) || return 1
-  # A containerd image store reports the manifest digest as the image id; a
-  # graphdriver store reports the config digest and carries the manifest
-  # digest in RepoDigests. Either one proves the frozen identity.
-  if [[ "$id" == "$trino_manifest_digest" ]]; then
-    return 0
-  fi
-  digests=$(docker image inspect "$candidate" \
-    --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null || true)
-  grep -Fq "@$trino_manifest_digest" <<<"$digests"
-}
-
-resolve_local_trino_image() {
-  # Design: ADR-0141 (docs/adr/ADR-0141-fixture-images-never-pull.md)
-  # The frozen manifest digest is the authority for which image may run; the
-  # name it carries on this host is not. A mirror pull records
-  # `<mirror>/trinodb/trino@<digest>` rather than `trinodb/trino@<digest>`,
-  # and `docker tag` cannot create a digest reference to paper over that, so
-  # look the pinned manifest up under every name it could have locally. A
-  # candidate that is present but carries a different manifest is fatal, not
-  # skipped.
-  local candidate
-  for candidate in "$@"; do
-    [[ -n "$candidate" ]] || continue
-    docker image inspect "$candidate" >/dev/null 2>&1 || continue
-    if trino_image_exposes_pin "$candidate"; then
-      printf '%s' "$candidate"
-      return 0
-    fi
-    fail "local image $candidate does not expose frozen Trino manifest $trino_manifest_digest"
-  done
-  return 1
 }
 
 if [[ $# -lt 3 ]]; then
@@ -131,10 +91,29 @@ source "$runtime_env"
 NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$script_dir/../../../../docker/iceberg-rest/fixture_run.py" context --env-file "$runtime_env")"
 export NOVA_FIXTURE_RUN_CONTEXT
 trino_owner=(python3 "$script_dir/../../../../docker/iceberg-rest/trino_run.py" --env-file "$runtime_env")
+[[ "${NOVA_ENV_READY:-}" == true ]] || fail "the generated Iceberg REST fixture is not ready"
+[[ -n "${NOVA_ENV_COMPOSE_PROJECT:-}" ]] || fail "generated Iceberg REST environment has no compose project"
+[[ -n "${NOVA_ENV_REST_WAREHOUSE_URI:-}" ]] || fail "generated Iceberg REST environment has no warehouse URI"
+[[ -n "${AWS_S3_ACCESS_KEY_ID:-}" ]] || fail "generated Iceberg REST environment has no S3 access key"
+[[ -n "${AWS_S3_SECRET_ACCESS_KEY:-}" ]] || fail "generated Iceberg REST environment has no S3 secret key"
+network="$(python3 - "$runtime_env" "$script_dir" <<'PYNETWORK'
+import pathlib,sys
+sys.path.insert(0,str(pathlib.Path(sys.argv[2]).resolve().parents[3]/"docker/iceberg-rest"))
+import fixture_run
+values,manifest,_ = fixture_run.admit(sys.argv[1])
+shared = manifest["shared_docker"]
+if not isinstance(shared,bool) or values.get("NOVA_ENV_SHARED_DOCKER") != str(shared).lower():
+    raise SystemExit("generated fixture storage owner differs from its manifest")
+record = manifest["runtime"]["machine" if shared else "catalog"]
+print(record["network"])
+PYNETWORK
+)"
+docker network inspect "$network" >/dev/null 2>&1 || fail "missing Docker network $network; run docker/iceberg-rest/up.sh"
 schema_location=""
 if [[ "$action" == create-parent ]]; then
   python3 "$script_dir/../../../../docker/iceberg-rest/fixture_run.py" sweep-start --env-file "$runtime_env" >&2
-  schema_location="$(python3 - "$NOVA_FIXTURE_RUN_CONTEXT" "$namespace" "$script_dir" <<'PYCTX'
+  if [[ "$NOVA_ENV_SHARED_DOCKER" == true ]]; then
+    schema_location="$(python3 - "$NOVA_FIXTURE_RUN_CONTEXT" "$namespace" "$script_dir" <<'PYCTX'
 import json,pathlib,sys
 sys.path.insert(0,str(pathlib.Path(sys.argv[3]).resolve().parents[3]/"docker/iceberg-rest"))
 from scratch import resource_run
@@ -144,52 +123,18 @@ if value is None or resource_run(sys.argv[2]) != value["identity"]["run_id"]:
 print(value["identity"]["scope_root"]+"/rest/"+sys.argv[2])
 PYCTX
 )"
+  else
+    # The original private publication owns this entire object store. Keep the
+    # explicit table location and the actual-file prefix check without minting a
+    # shared-machine scratch context.
+    schema_location="${NOVA_ENV_REST_WAREHOUSE_URI%/}/$namespace"
+  fi
 fi
 
-[[ "${NOVA_ENV_SHARED_DOCKER:-}" == true ]] || fail "a shared Iceberg REST fixture is not active"
-[[ -n "${NOVA_ENV_COMPOSE_PROJECT:-}" ]] || fail "generated Iceberg REST environment has no compose project"
-[[ -n "${NOVA_ENV_REST_WAREHOUSE_URI:-}" ]] || fail "generated Iceberg REST environment has no warehouse URI"
-[[ -n "${AWS_S3_ACCESS_KEY_ID:-}" ]] || fail "generated Iceberg REST environment has no S3 access key"
-[[ -n "${AWS_S3_SECRET_ACCESS_KEY:-}" ]] || fail "generated Iceberg REST environment has no S3 secret key"
-network="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["runtime"]["machine"]["network"])' "$NOVA_ENV_MANIFEST")"
-docker network inspect "$network" >/dev/null 2>&1 || fail "missing Docker network $network; run docker/iceberg-rest/up.sh"
-
-if [[ -n "${NOVA_TRINO_IMAGE:-}" ]]; then
-  [[ "$NOVA_TRINO_IMAGE" == *@"$trino_manifest_digest" ]] || \
-    fail "NOVA_TRINO_IMAGE must pin released Trino $trino_release manifest $trino_manifest_digest"
-fi
-# Interop runs never pull: the frozen manifest must already be in this host's
-# image store, under any name. Resolving it before the container starts also
-# proves the identity without having run an unverified image.
-trino_candidates=(
-  "${NOVA_TRINO_IMAGE:-}"
-  "$default_trino_image"
-  # A containerd image store keys images by manifest digest, so this finds the
-  # frozen manifest whatever local name it carries -- including a mirror name
-  # that no `docker tag` could rewrite into `trinodb/trino@<digest>`.
-  "$trino_manifest_digest"
-)
-if ! trino_image=$(resolve_local_trino_image "${trino_candidates[@]}"); then
-  cat >&2 <<EOF
-Missing local image (Trino $trino_release manifest $trino_manifest_digest)
-
-This interop check never pulls during a run. Import the frozen manifest once,
-then re-run:
-  docker pull $default_trino_image
-
-If the daemon cannot reach Docker Hub, pull the same digest through a
-reachable mirror; no further setup is needed, because the manifest is then
-found under the mirror's own name:
-  docker pull dockerproxy.net/trinodb/trino@$trino_manifest_digest
-
-Local references tried:
-$(printf '  %s\n' "${trino_candidates[@]}")
-EOF
-  exit 1
-fi
+trino_image="${NOVA_TRINO_REFERENCE_IMAGE:?Trino reference is resolved by the run entry; run the trino-reference suite or docker/fixture-inputs/provision.sh --consumer image:trino --result <file>}"
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/novarocks-trino-rest-interop.XXXXXX")
-container_name="nr-trino483-${$}-$(date +%s)"
+container_name="nr-trino-${$}-$(date +%s)"
 cleanup() {
   local primary=$? cleanup=0
   trap - EXIT INT TERM
@@ -253,9 +198,6 @@ show_stats_ndv() {
   ' "$stats_file"
 }
 
-actual_version=$(trino --output-format TSV --execute 'SELECT version()')
-[[ "$actual_version" == "$trino_release" ]] || fail "expected Trino $trino_release, got $actual_version"
-
 qualified="iceberg.${namespace}.${table}"
 qualified_snapshots="iceberg.${namespace}.\"${table}\$snapshots\""
 if [[ "$action" == create-parent ]]; then
@@ -279,7 +221,7 @@ if [[ "$action" == create-parent ]]; then
     fail "Trino parent SHOW STATS returned unknown/non-numeric id NDV: ${stats_ndv:-<empty>}"
   awk -v actual="$stats_ndv" 'BEGIN { delta = actual - 2; if (delta < 0) delta = -delta; exit(delta <= 0.01 ? 0 : 1) }' || \
     fail "Trino parent SHOW STATS expected id NDV 2, got $stats_ndv"
-  echo "TRINO_PUFFIN_PARENT_READY version=$actual_version rows=2 exact_ndv=2 stats_ndv=$stats_ndv"
+  echo "TRINO_PUFFIN_PARENT_READY rows=2 exact_ndv=2 stats_ndv=$stats_ndv"
   exit 0
 fi
 
@@ -301,4 +243,4 @@ awk -v actual="$stats_ndv" -v expected="$expected_ndv" \
 current_snapshot=$(trino --output-format TSV --execute \
   "SELECT CAST(snapshot_id AS VARCHAR) FROM ${qualified_snapshots} ORDER BY committed_at DESC, snapshot_id DESC LIMIT 1")
 [[ "$current_snapshot" =~ ^[0-9]+$ ]] || fail "Trino did not resolve a numeric current snapshot id"
-echo "TRINO_NOVA_CURRENT_PUFFIN_OK version=$actual_version snapshot=$current_snapshot exact_facts=$source_facts column=$column stats_ndv=$stats_ndv"
+echo "TRINO_NOVA_CURRENT_PUFFIN_OK snapshot=$current_snapshot exact_facts=$source_facts column=$column stats_ndv=$stats_ndv"

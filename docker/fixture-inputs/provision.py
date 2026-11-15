@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from fixture_inputs import (
     FixtureInputError, CONSUMER_INPUT_ROOTS, fixture_store, fixture_store_lock,
     inspect_image, load_inputs, read_recommendations, resolve_inputs,
-    require_relative, run, validate_artifact,
+    require_relative, run, run_owned_check, validate_artifact,
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -188,6 +188,13 @@ class InputBuilder:
                     info = inspect_image(reference)
                 if info is None:
                     raise FixtureInputError(f"Docker did not retain the pulled image: {reference}")
+                if item.get("creation_check") == "trino-cli-version":
+                    checked = run_owned_check(str(info["Id"]), item["platform"],
+                        timeout_seconds=self.timeout, work_dir=self.store / "builds")
+                    if checked.stdout.strip() != f"Trino CLI {item['version']}":
+                        raise FixtureInputError(
+                            f"fixture image creation check mismatch: {' '.join(checked.args)}; "
+                            f"stdout={checked.stdout!r}; stderr={checked.stderr!r}; cleanup=confirmed absent")
                 run(["docker", "tag", str(info["Id"]), alias])
             else:
                 arguments = []
@@ -213,6 +220,8 @@ class InputBuilder:
                     raise FixtureInputError(f"fixture build returned an empty image: {name}")
                 info = {"Id": image_id}
         result = {"alias": alias, "image_id": str(info["Id"]), "platform": item["platform"]}
+        if "version" in item:
+            result["version"] = item["version"]
         self.outputs[kind][name] = result
         return result
 
@@ -293,6 +302,24 @@ def prepare_inputs(store, repo_root, *, consumer="iceberg-rest", platform=None,
                             url_prefixes=prefixes, timeout=pull_timeout_seconds).prepare(consumer)
 
 
+def write_result(path: Path, result: dict) -> None:
+    """Publish a complete result atomically, separately from child diagnostics."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.",
+                                         suffix=".tmp", delete=False) as target:
+            temporary = Path(target.name)
+            json.dump(result, target, sort_keys=True)
+            target.write("\n")
+        temporary.replace(path)
+    except OSError as error:
+        raise FixtureInputError(f"cannot publish fixture result: {path}: {error}") from error
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store")
@@ -306,9 +333,11 @@ def main():
                         default=int(os.environ.get("NOVA_FIXTURE_DOCKER_PULL_TIMEOUT_SECONDS", "180")))
     parser.add_argument("--context-only")
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--result", type=Path)
     args = parser.parse_args()
     try:
         if args.context_only:
+            if args.result is not None: parser.error("--result cannot be used with --context-only")
             if args.out is None: parser.error("--context-only requires --out")
             consumer = f"derived:{args.context_only}"
             inputs = load_inputs(args.versions, platform=args.platform, consumer=consumer)
@@ -327,10 +356,14 @@ def main():
                 build_context(inputs, args.context_only, args.repo_root, store / "artifacts", args.out)
             print(args.out)
         else:
-            print(json.dumps(prepare_inputs(fixture_store(args.store), args.repo_root,
+            result = prepare_inputs(fixture_store(args.store), args.repo_root,
                 consumer=args.consumer, platform=args.platform, versions_path=args.versions,
                 image_source_specs=args.image_source, artifact_url_prefix_specs=args.artifact_url_prefix,
-                pull_timeout_seconds=args.docker_pull_timeout_seconds), sort_keys=True))
+                pull_timeout_seconds=args.docker_pull_timeout_seconds)
+            if args.result is not None:
+                write_result(args.result, result)
+            else:
+                print(json.dumps(result, sort_keys=True))
     except FixtureInputError as error:
         print(f"FIXTURE BUILD FAILED: {error}", file=__import__("sys").stderr)
         return 1

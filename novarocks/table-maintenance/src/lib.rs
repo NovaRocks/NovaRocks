@@ -19,17 +19,15 @@
 //!
 //! This crate owns no SQL session, provider client, executor, or workload
 //! policy. Products supply their exact target binding and execution adapter;
-//! this crate supplies the single target conflict gate and current-process job
-//! observation semantics shared by SQL and MV.
+//! this crate supplies the single target conflict gate and rewrite/cleanup
+//! state machines shared by SQL and MV.
 
 use std::collections::BTreeMap;
 
 pub mod activity;
 pub mod gc_observation;
-pub mod job_service;
 pub mod product;
 pub mod runtime;
-pub mod worker;
 
 /// Stable product identity of one external table-maintenance target.
 ///
@@ -59,34 +57,6 @@ impl MaintenanceEffectId {
         self.0
     }
 }
-
-/// Provider receipt facts retained by one OPTIMIZE job.
-///
-/// Optional counts mean that the provider did not prove the fact; they are not
-/// a known zero.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OptimizeJobOutcome {
-    /// `Some(true)` proves an automatic action committed, `Some(false)` proves
-    /// an automatic no-op without a commit. SQL jobs retain `None` because
-    /// their legacy receipt does not distinguish these success terminals.
-    pub commit_occurred: Option<bool>,
-    pub target_snapshot_id: Option<i64>,
-    pub rewritten_data_files: i64,
-    pub deleted_data_files: i64,
-    pub added_data_files: Option<i64>,
-    pub added_delete_files: Option<i64>,
-    pub output_record_count: Option<i64>,
-}
-
-/// Current-process OPTIMIZE job state owned by the table-maintenance product.
-pub type OptimizeJob = runtime::JobRecord<MaintenanceTarget, OptimizeJobOutcome>;
-
-/// Current-process OPTIMIZE job ledger and target permit owner.
-pub type OptimizeProcessRuntime = runtime::ProcessRuntime<
-    MaintenanceTarget,
-    OptimizeJobOutcome,
-    activity::MaintenanceActivityPermit,
->;
 
 /// One typed maintenance operation after SQL lowering.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,37 +152,6 @@ impl AutomaticMaintenanceOutcome {
     }
 }
 
-/// Projects the only provider outcome accepted by an OPTIMIZE job into its
-/// stable product receipt.
-///
-/// The conversion preserves unknown output facts as `None`; an OPTIMIZE job
-/// must not turn a provider's missing proof into zero.
-pub fn optimize_job_outcome_from_action(
-    outcome: MaintenanceActionOutcome,
-) -> Result<OptimizeJobOutcome, String> {
-    let MaintenanceActionOutcome::RewriteDataFiles {
-        target_snapshot_id,
-        rewritten_data_files_count,
-        added_data_files_count,
-        added_delete_files_count,
-        removed_delete_files_count,
-        output_record_count,
-        ..
-    } = outcome
-    else {
-        return Err("optimize job expected a RewriteDataFiles outcome".to_string());
-    };
-    Ok(OptimizeJobOutcome {
-        commit_occurred: None,
-        target_snapshot_id,
-        rewritten_data_files: i64::from(rewritten_data_files_count),
-        deleted_data_files: i64::from(removed_delete_files_count),
-        added_data_files: added_data_files_count.map(i64::from),
-        added_delete_files: added_delete_files_count.map(i64::from),
-        output_record_count,
-    })
-}
-
 /// Result of rebinding one durable maintenance target to its current table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaintenanceTargetRebind {
@@ -221,101 +160,6 @@ pub enum MaintenanceTargetRebind {
     Missing,
 }
 
-/// Named current-process submission for one exact OPTIMIZE job.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OptimizeCompletionMode {
-    Detached,
-    AwaitTerminal,
-}
-
-/// Submission retains the completion rule captured with the exact target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OptimizeSubmission {
-    Submitted {
-        job_id: i64,
-        completion: OptimizeCompletionMode,
-    },
-    AlreadyActive,
-}
-
-/// Exact terminal of one automatic OPTIMIZE request.
-///
-/// `Finished` names only the caller's own completed job. `AlreadyActive`
-/// never joins another caller's job or reports it as successful work.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AutomaticOptimizeOutcome {
-    Finished {
-        handle: runtime::JobHandle,
-        commit_occurred: bool,
-    },
-    AlreadyActive,
-}
-
-impl OptimizeSubmission {
-    /// `AlreadyActive` has no handle: joining another caller's job would
-    /// silently transfer its business responsibility and conflict gate.
-    pub const fn handle(self) -> Option<runtime::JobHandle> {
-        match self {
-            Self::Submitted { job_id, .. } => Some(runtime::JobHandle::new(job_id)),
-            Self::AlreadyActive => None,
-        }
-    }
-}
-
 #[cfg(test)]
 #[path = "tests_ports.rs"]
 mod port_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::{MaintenanceActionOutcome, OptimizeSubmission, optimize_job_outcome_from_action};
-
-    #[test]
-    fn submitted_handle_names_only_its_exact_job() {
-        assert_eq!(
-            OptimizeSubmission::Submitted {
-                job_id: 41,
-                completion: super::OptimizeCompletionMode::Detached
-            }
-            .handle()
-            .expect("submitted job has a handle")
-            .job_id(),
-            41
-        );
-        assert_eq!(OptimizeSubmission::AlreadyActive.handle(), None);
-    }
-
-    #[test]
-    fn optimize_receipt_preserves_unknown_output_facts() {
-        let receipt =
-            optimize_job_outcome_from_action(MaintenanceActionOutcome::RewriteDataFiles {
-                target_snapshot_id: Some(19),
-                rewritten_data_files_count: 2,
-                added_data_files_count: None,
-                added_delete_files_count: Some(3),
-                rewritten_bytes_count: 0,
-                failed_data_files_count: 0,
-                removed_delete_files_count: 4,
-                output_record_count: None,
-            })
-            .expect("rewrite data files is an optimize outcome");
-        assert_eq!(receipt.target_snapshot_id, Some(19));
-        assert_eq!(receipt.commit_occurred, None);
-        assert_eq!(receipt.rewritten_data_files, 2);
-        assert_eq!(receipt.deleted_data_files, 4);
-        assert_eq!(receipt.added_data_files, None);
-        assert_eq!(receipt.added_delete_files, Some(3));
-        assert_eq!(receipt.output_record_count, None);
-    }
-
-    #[test]
-    fn optimize_rejects_a_non_rewrite_provider_outcome() {
-        assert_eq!(
-            optimize_job_outcome_from_action(MaintenanceActionOutcome::RemoveOrphanFiles {
-                orphan_file_locations: Vec::new(),
-            })
-            .expect_err("cleanup cannot complete an optimize job"),
-            "optimize job expected a RewriteDataFiles outcome"
-        );
-    }
-}

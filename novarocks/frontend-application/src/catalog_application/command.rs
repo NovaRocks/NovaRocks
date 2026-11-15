@@ -1206,10 +1206,13 @@ mod tests {
             "CREATE EXTERNAL CATALOG IF NOT EXISTS Warehouse PROPERTIES ('type'='iceberg')",
         )
         .expect("parse catalog statement");
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(
-            novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(statement),
-        )) = novarocks_query_application::sql::lower_product_sql_command(&statement)
-            .expect("lower catalog statement")
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(boxed_command)) =
+            novarocks_query_application::sql::lower_product_sql_command(&statement)
+                .expect("lower catalog statement")
+        else {
+            panic!("expected semantic CREATE CATALOG");
+        };
+        let novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(statement) = *boxed_command
         else {
             panic!("expected semantic CREATE CATALOG");
         };

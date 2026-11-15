@@ -18,7 +18,7 @@
 -- @sequential=true
 -- This is the authoritative LNP-3C product acceptance: the runner owns one
 -- FE and three independent BEs, publishes a statistics artifact, restarts FE,
--- then proves lake truth survives while the old process-local job is absent.
+-- then proves the published statistics remain after the process exits.
 
 -- query 1
 -- @skip_result_check=true
@@ -41,59 +41,47 @@ INSERT INTO lnp_3c_${suite_uuid0}.ns_${uuid0}.orders VALUES (2, 20);
 INSERT INTO lnp_3c_${suite_uuid0}.ns_${uuid0}.orders VALUES (3, 30);
 
 -- query 5
--- ANALYZE submits a process-local background job. Observe fresh task
--- admission before a separate terminal observation orders the FE restart.
+-- ANALYZE publishes within this statement before the following FE restart.
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
 -- @skip_result_check=true
 ANALYZE TABLE lnp_3c_${suite_uuid0}.ns_${uuid0}.orders;
 
 -- query 6
--- Wait through the public status surface; only read-only observations retry.
--- The restart follows successful publication, never bare job submission.
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_rows_where=catalog=lnp_3c_${suite_uuid0}
--- @result_rows_where=namespace=ns_${uuid0}
--- @result_rows_where=table=orders
--- @result_rows_count=1
--- @result_rows_expect=state=SUCCEEDED
+-- ANALYZE has published and exited before this FE restart.
 -- @restart_fe_after_step=true
 -- @skip_result_check=true
-SHOW ANALYZE JOBS;
+SELECT 1;
 
 -- query 7
--- The previous FE incarnation cannot recover a terminal statistics job.
--- @result_not_contains=SUCCEEDED
--- @skip_result_check=true
-SHOW ANALYZE JOBS;
-
--- query 8
 -- The provider-owned published artifact and table data remain readable after
 -- the FE restart; this observation never consults old job state.
--- @result_contains=row_count
--- @result_contains=3
--- @result_contains=AVAILABLE
 -- @skip_result_check=true
-SHOW TABLE STATS lnp_3c_${suite_uuid0}.ns_${uuid0}.orders;
+-- @result_rows_where=column_name=id
+-- @result_rows_count=1
+-- @result_rows_expect=distinct_values_count=3.0
+-- @result_rows_expect=low_value=1
+-- @result_rows_expect=high_value=3
+SHOW STATS FOR lnp_3c_${suite_uuid0}.ns_${uuid0}.orders;
 
--- query 9
+
+-- query 8
 -- A new intent belongs to the new process and may publish a fresh artifact.
 -- @skip_result_check=true
 ANALYZE TABLE lnp_3c_${suite_uuid0}.ns_${uuid0}.orders;
 
--- query 10
+-- query 9
 -- A completed maintenance command must leave provider-owned lake truth that
 -- survives a process restart.  It must not recover an old FE job record.
 -- @restart_fe_after_step=true
 -- @skip_result_check=true
 ALTER TABLE lnp_3c_${suite_uuid0}.ns_${uuid0}.orders REWRITE MANIFESTS;
 
--- query 11
+-- query 10
 -- @result_contains=3
 -- @skip_result_check=true
 SELECT COUNT(*) AS n FROM lnp_3c_${suite_uuid0}.ns_${uuid0}.orders;
 
--- query 12
+-- query 11
 -- @skip_result_check=true
 DROP TABLE lnp_3c_${suite_uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE lnp_3c_${suite_uuid0}.ns_${uuid0};

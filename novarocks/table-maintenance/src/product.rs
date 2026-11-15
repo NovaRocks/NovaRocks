@@ -23,31 +23,32 @@
 //! transitions, and the interpretation of terminal provider facts.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use novarocks_state_store_api::StateStore;
 use novarocks_state_store_runtime::StateStoreRunPolicy;
-use tokio::runtime::Handle;
 use uuid::Uuid;
 
 use crate::activity::{
     MaintenanceActivityBusy, MaintenanceActivityFamily, MaintenanceActivityPermit,
+    TableMaintenanceActivity,
 };
 use crate::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };
-use crate::job_service::{OptimizeJobRuntime, OptimizeTargetCapturePort};
-use crate::runtime::{JobHandle, MaintenanceJobState, TerminalError};
-use crate::worker::{OptimizeJobAdmissionPort, OptimizeJobExecutionPort};
+use crate::runtime::{MaintenanceJobState, TerminalError};
 use crate::{
     AutomaticMaintenanceOutcome, MaintenanceActionOutcome, MaintenanceActionRequest,
-    MaintenanceEffectId, MaintenanceTarget, OptimizeJob, OptimizeSubmission,
+    MaintenanceEffectId, MaintenanceTarget,
 };
 
 /// A provider-neutral rewrite intent.  SQL lowering remains outside this crate;
 /// this value is the product's execution decision after lowering.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RewriteIntent {
+    Optimize {
+        file_size_threshold_bytes: u64,
+    },
     DataFiles {
         rewrite_all: bool,
     },
@@ -297,7 +298,7 @@ pub trait TableMaintenanceEffectPort: Sync {
 
 /// Single process-local business owner for every table-maintenance operation.
 pub struct TableMaintenanceProduct {
-    jobs: OptimizeJobRuntime,
+    activity: TableMaintenanceActivity,
     observations: Option<Arc<GcOwnedRefObservationAccelerator>>,
     safe_gc_age: Option<Duration>,
 }
@@ -321,7 +322,7 @@ impl TableMaintenanceProduct {
 
     pub fn new(observations: Option<Arc<GcOwnedRefObservationAccelerator>>) -> Self {
         Self {
-            jobs: OptimizeJobRuntime::new(),
+            activity: TableMaintenanceActivity::default(),
             observations,
             safe_gc_age: None,
         }
@@ -332,75 +333,12 @@ impl TableMaintenanceProduct {
         self
     }
 
-    pub fn start(
-        &self,
-        runtime: &Handle,
-        admission: Arc<dyn OptimizeJobAdmissionPort>,
-        execution: Arc<dyn OptimizeJobExecutionPort>,
-    ) -> Result<(), String> {
-        self.jobs.start(runtime, admission, execution)
-    }
-
-    pub async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {
-        self.jobs.shutdown_until(deadline).await
-    }
-
-    pub fn request_shutdown_for_process_exit(&self) {
-        self.jobs.request_shutdown_for_process_exit();
-    }
-
-    pub fn jobs(&self) -> &OptimizeJobRuntime {
-        &self.jobs
-    }
-
     pub fn acquire_activity(
         &self,
         target: &MaintenanceTarget,
         family: MaintenanceActivityFamily,
     ) -> Result<MaintenanceActivityPermit, MaintenanceActivityBusy> {
-        self.jobs.acquire_activity(target, family)
-    }
-
-    pub async fn submit_optimize(
-        &self,
-        target: MaintenanceTarget,
-        capture: &dyn OptimizeTargetCapturePort,
-    ) -> Result<OptimizeSubmission, String> {
-        self.jobs.submit_optimize(target, capture).await
-    }
-
-    pub async fn submit_automatic_optimize(
-        &self,
-        target: MaintenanceTarget,
-        capture: &dyn OptimizeTargetCapturePort,
-        effect_id: MaintenanceEffectId,
-    ) -> Result<OptimizeSubmission, TerminalError> {
-        self.jobs
-            .submit_automatic_optimize(target, capture, effect_id)
-            .await
-    }
-
-    pub async fn list_optimize(&self) -> Result<Vec<OptimizeJob>, String> {
-        self.jobs.list().await
-    }
-
-    pub async fn request_cancel_optimize(&self, handle: JobHandle) -> Result<(), String> {
-        self.jobs.request_cancel(handle).await
-    }
-
-    pub async fn wait_optimize(&self, handle: JobHandle) -> Result<MaintenanceJobState, String> {
-        self.jobs.wait_for_completion(handle).await
-    }
-
-    pub async fn wait_optimize_terminal_record(
-        &self,
-        handle: JobHandle,
-    ) -> Result<OptimizeJob, String> {
-        self.jobs.wait_for_terminal_record(handle).await
-    }
-
-    pub async fn wait_automatic_optimize(&self, handle: JobHandle) -> Result<OptimizeJob, String> {
-        self.wait_optimize_terminal_record(handle).await
+        self.activity.acquire(target, family)
     }
 
     /// Executes a user action after the SQL adapter has resolved its target.
@@ -479,8 +417,11 @@ impl TableMaintenanceProduct {
                 let _permit = self
                     .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| TerminalError::pre_dispatch_failed(error.to_string()))?;
-                self.execute_automatic_rewrite_terminal(effects, &target, effect_id)
-                    .await
+                let intent = RewriteIntent::DataFiles { rewrite_all: true };
+                let session = effects
+                    .begin_rewrite_with_id(&target, intent.clone(), effect_id)
+                    .await?;
+                Self::run_rewrite_session_terminal(session, intent).await
             }
             MaintenanceActionRequest::RewritePositionDeleteFiles {
                 target,
@@ -510,22 +451,6 @@ impl TableMaintenanceProduct {
                 effects.execute_metadata_with_id(request, effect_id).await
             }
         }
-    }
-
-    /// Executes an automatic OPTIMIZE rewrite while its job already owns the
-    /// target activity permit. The job, not this method, releases that permit
-    /// after its exact terminal is recorded.
-    pub async fn execute_automatic_rewrite_terminal<P: TableMaintenanceEffectPort + ?Sized>(
-        &self,
-        effects: &P,
-        target: &MaintenanceTarget,
-        effect_id: MaintenanceEffectId,
-    ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
-        let intent = RewriteIntent::DataFiles { rewrite_all: true };
-        let session = effects
-            .begin_rewrite_with_id(target, intent.clone(), effect_id)
-            .await?;
-        Self::run_rewrite_session_terminal(session, intent).await
     }
 
     pub async fn execute_rewrite_terminal<P: TableMaintenanceEffectPort + ?Sized>(
@@ -816,39 +741,42 @@ fn rewrite_outcome(
 ) -> Result<MaintenanceActionOutcome, String> {
     let receipt = receipt.unwrap_or_default();
     match intent {
-        RewriteIntent::DataFiles { .. } => Ok(MaintenanceActionOutcome::RewriteDataFiles {
-            target_snapshot_id: receipt.target_snapshot_id,
-            rewritten_data_files_count: i32::try_from(receipt.input_data_files)
-                .map_err(|_| "distributed rewrite input data file count exceeds i32")?,
-            added_data_files_count: receipt
-                .output_data_files
-                .map(|count| {
-                    i32::try_from(count).map_err(|_| {
-                        "distributed rewrite output data file count exceeds i32".to_string()
+        RewriteIntent::DataFiles { .. } | RewriteIntent::Optimize { .. } => {
+            Ok(MaintenanceActionOutcome::RewriteDataFiles {
+                target_snapshot_id: receipt.target_snapshot_id,
+                rewritten_data_files_count: i32::try_from(receipt.input_data_files)
+                    .map_err(|_| "distributed rewrite input data file count exceeds i32")?,
+                added_data_files_count: receipt
+                    .output_data_files
+                    .map(|count| {
+                        i32::try_from(count).map_err(|_| {
+                            "distributed rewrite output data file count exceeds i32".to_string()
+                        })
                     })
-                })
-                .transpose()?,
-            added_delete_files_count: receipt
-                .output_delete_files
-                .map(|count| {
-                    i32::try_from(count).map_err(|_| {
-                        "distributed rewrite output delete file count exceeds i32".to_string()
+                    .transpose()?,
+                added_delete_files_count: receipt
+                    .output_delete_files
+                    .map(|count| {
+                        i32::try_from(count).map_err(|_| {
+                            "distributed rewrite output delete file count exceeds i32".to_string()
+                        })
                     })
-                })
-                .transpose()?,
-            rewritten_bytes_count: i64::try_from(plan.input_bytes)
-                .map_err(|_| "distributed rewrite input byte count exceeds i64")?,
-            failed_data_files_count: 0,
-            removed_delete_files_count: i32::try_from(receipt.input_delete_files)
-                .map_err(|_| "distributed rewrite input delete file count exceeds i32")?,
-            output_record_count: receipt
-                .output_rows
-                .map(|count| {
-                    i64::try_from(count)
-                        .map_err(|_| "distributed rewrite output row count exceeds i64".to_string())
-                })
-                .transpose()?,
-        }),
+                    .transpose()?,
+                rewritten_bytes_count: i64::try_from(plan.input_bytes)
+                    .map_err(|_| "distributed rewrite input byte count exceeds i64")?,
+                failed_data_files_count: 0,
+                removed_delete_files_count: i32::try_from(receipt.input_delete_files)
+                    .map_err(|_| "distributed rewrite input delete file count exceeds i32")?,
+                output_record_count: receipt
+                    .output_rows
+                    .map(|count| {
+                        i64::try_from(count).map_err(|_| {
+                            "distributed rewrite output row count exceeds i64".to_string()
+                        })
+                    })
+                    .transpose()?,
+            })
+        }
         RewriteIntent::PositionDeletes { .. } => {
             Ok(MaintenanceActionOutcome::RewritePositionDeleteFiles {
                 rewritten_delete_files_count: i32::try_from(receipt.input_delete_files)

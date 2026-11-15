@@ -28,7 +28,7 @@
     <dependency>
       <groupId>io.trino</groupId>
       <artifactId>trino-iceberg</artifactId>
-      <version>483</version>
+      <version>${trino.version}</version>
     </dependency>
   </dependencies>
 </project>

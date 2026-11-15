@@ -72,20 +72,6 @@ printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_MISSING_PARENT_OK"
 ANALYZE TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0};
 
 -- query 8
--- Wait for this case's own job, not any SUCCEEDED job on the shared
--- frontend. Every ANALYZE of this case-unique table is this case's own, so
--- the count names the one just submitted and requires all of them to succeed.
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
--- @result_rows_where=namespace=${suite_uuid0}
--- @result_rows_where=table=cow_missing_parent_${uuid0}
--- @result_rows_count=1
--- @result_rows_expect=state=SUCCEEDED
--- @skip_result_check=true
-SHOW ANALYZE JOBS;
-
--- query 9
 -- Replace the Nova-produced parent with a Spark-produced standard Puffin file
 -- for the same snapshot. The next Nova INSERT must consume and union this
 -- cross-engine parent rather than treating it as provider-private state.
@@ -140,7 +126,7 @@ spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh"
 printf '%s\n' "$spark_out"
 printf '%s\n' "$spark_out" | grep -F "SPARK_CROSS_ENGINE_PARENT_OK"
 
--- query 10
+-- query 9
 -- With a compatible parent sketch, collect-on-write must publish the union for
 -- the same newly committed snapshot. Duplicate values exercise Theta union
 -- instead of making the expected NDV equal to the number of written rows.
@@ -148,7 +134,7 @@ printf '%s\n' "$spark_out" | grep -F "SPARK_CROSS_ENGINE_PARENT_OK"
 INSERT INTO statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0}
 VALUES (2, 20), (3, 30);
 
--- query 11
+-- query 10
 -- @result_contains=COLLECT_ON_WRITE_INCREMENTAL_OK
 shell: set -eu
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-collect-on-write-incremental-XXXXXX.scala")"
@@ -173,30 +159,18 @@ spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh"
 printf '%s\n' "$spark_out"
 printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_INCREMENTAL_OK"
 
--- query 12
+-- query 11
 -- Repair from the full table and then append again. This alternation exercises
 -- both producers without changing the published Puffin contract.
 -- @skip_result_check=true
 ANALYZE TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0};
 
--- query 13
--- The second ANALYZE of this table: both of its jobs must have succeeded.
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
--- @result_rows_where=namespace=${suite_uuid0}
--- @result_rows_where=table=cow_missing_parent_${uuid0}
--- @result_rows_count=2
--- @result_rows_expect=state=SUCCEEDED
--- @skip_result_check=true
-SHOW ANALYZE JOBS;
-
--- query 14
+-- query 12
 -- @skip_result_check=true
 INSERT INTO statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0}
 VALUES (4, 40);
 
--- query 15
+-- query 13
 -- @result_contains=COLLECT_ON_WRITE_ALTERNATING_OK
 shell: set -eu
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-collect-on-write-alternating-XXXXXX.scala")"
@@ -221,12 +195,12 @@ spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh"
 printf '%s\n' "$spark_out"
 printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_ALTERNATING_OK"
 
--- query 16
+-- query 14
 -- DELETE must not reseat this current StatisticsFile onto its new snapshot.
 -- @skip_result_check=true
 DELETE FROM statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0} WHERE id = 1;
 
--- query 17
+-- query 15
 -- @result_contains=COLLECT_ON_WRITE_DELETE_BASIS_OK
 shell: set -eu
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-collect-on-write-delete-XXXXXX.scala")"
@@ -245,25 +219,13 @@ spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh"
 printf '%s\n' "$spark_out"
 printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_DELETE_BASIS_OK"
 
--- query 18
+-- query 16
 -- A full ANALYZE after an ineligible mutation must restore exact evidence for
 -- the mutation snapshot instead of leaving the optimizer on ancestor data.
 -- @skip_result_check=true
 ANALYZE TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0};
 
--- query 19
--- The third ANALYZE of this table: all three of its jobs must have succeeded.
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
--- @result_rows_where=namespace=${suite_uuid0}
--- @result_rows_where=table=cow_missing_parent_${uuid0}
--- @result_rows_count=3
--- @result_rows_expect=state=SUCCEEDED
--- @skip_result_check=true
-SHOW ANALYZE JOBS;
-
--- query 20
+-- query 17
 -- @result_contains=COLLECT_ON_WRITE_MUTATION_REPAIR_OK
 shell: set -eu
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-collect-on-write-repair-XXXXXX.scala")"
@@ -288,6 +250,6 @@ spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh"
 printf '%s\n' "$spark_out"
 printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_MUTATION_REPAIR_OK"
 
--- query 21
+-- query 18
 -- @skip_result_check=true
 DROP TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0} FORCE;

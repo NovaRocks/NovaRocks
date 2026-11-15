@@ -30,6 +30,8 @@ pub struct SuiteManifest {
     pub explicit_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub case_input: Option<CaseInputRecipe>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reference_inputs: Vec<novarocks_cluster_harness::reference_inputs::ReferenceInput>,
     pub disabled_reason: Option<String>,
     pub prepared_dataset: Option<PreparedDatasetRequirement>,
     pub heavy: Option<HeavyDeclaration>,
@@ -169,6 +171,11 @@ impl SuiteManifest {
     pub fn parse(content: &str) -> Result<Self> {
         let manifest: Self = toml::from_str(content).context("failed to parse suite manifest")?;
         manifest.session.validate()?;
+        anyhow::ensure!(
+            manifest.reference_inputs.is_empty()
+                || (manifest.explicit_only && manifest.heavy.is_some()),
+            "reference input suites require explicit_only = true and a heavy declaration"
+        );
         anyhow::ensure!(
             manifest.case_input.is_none() || manifest.explicit_only,
             "case input recipes require explicit_only = true"
@@ -314,6 +321,28 @@ heavy = { reason = "cost", detail = "Exhaustive native matrix" }
             .explicit_only
         );
         assert!(SuiteManifest::parse("cluster_size = 3\n").is_err());
+    }
+
+    #[test]
+    fn reference_declarations_require_explicit_heavy_suites_and_reject_unknown_inputs() {
+        for manifest in [
+            "reference_inputs = ['trino-image']",
+            "explicit_only = true\nreference_inputs = ['trino-image']",
+            "explicit_only = true\nreference_inputs = ['unknown-reference']\nheavy = { reason='fixture', detail='reference' }",
+        ] {
+            assert!(SuiteManifest::parse(manifest).is_err());
+        }
+        assert!(
+            serde_json::to_value(SuiteManifest::default())
+                .unwrap()
+                .get("reference_inputs")
+                .is_none()
+        );
+        let manifest = SuiteManifest::parse("explicit_only = true\nreference_inputs = ['trino-image']\nheavy = { reason='fixture', detail='reference' }").unwrap();
+        assert_eq!(
+            serde_json::to_value(manifest).unwrap()["reference_inputs"],
+            serde_json::json!(["trino-image"])
+        );
     }
 
     #[test]

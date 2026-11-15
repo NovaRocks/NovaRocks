@@ -320,3 +320,61 @@ async fn original_fe_completion_rejects_a_provider_carrier_type_mismatch_as_inte
     drop(source);
     fixture.finish(false).await;
 }
+
+#[tokio::test]
+async fn original_fe_completion_carries_typed_state_table_declaration_into_compiled_plan() {
+    let listing = ListingFixture::new(FailurePoint::Views, ConnectorErrorKind::Unavailable);
+    let mut fixture = Fixture::new(&listing, ResultWindowClass::Client).await;
+    let old = fixture.source.take().unwrap();
+    let mut owners = old.owners.clone();
+    owners.system_relations = Arc::new(
+        novarocks_query_application::system_tables::SystemTableRegistry::try_new([
+            crate::system_tables::materialized_view_states_registration(),
+        ])
+        .unwrap(),
+    );
+    let scope = old.scope.clone();
+    old.close().await.unwrap();
+    drop(old);
+    let source = FrontendSystemTableFacts::new(owners, scope).unwrap();
+    fixture.source = Some(source.clone());
+    // Plain EXPLAIN compiles the complete typed declaration without opening an
+    // inventory. Runtime production reads are exercised against SQLite.
+    let counted = Arc::new(CountSnapshots {
+        source: source.clone(),
+        calls: AtomicUsize::new(0),
+    });
+    let facts = Arc::new(statement_fact_source(
+        source.owners.clone(),
+        source.scope.clone(),
+        Arc::new(NoExternalScans),
+        counted.clone(),
+    ));
+    let cpu = source
+        .scope
+        .planning
+        .as_ref()
+        .unwrap()
+        .cpu
+        .as_ref()
+        .unwrap()
+        .clone();
+    let control = source.scope.planning.as_ref().unwrap().control.clone();
+    let taken = ReadAccessSink::new();
+    let driver = FinalPlanCompletionDriver::new(facts.clone());
+    let completed=driven(&fixture.control,&mut fixture.driver,driver.complete(
+        request("SELECT refresh_paused, last_refresh_time, base_tables FROM system.runtime.materialized_view_states",
+            SqlCompileIntent::Explain { level:ExplainLevel::Normal,analyze:false },control),
+        source.scope.capacity.scope(),&taken,cpu.as_ref(),
+    )).await.unwrap().unwrap();
+    assert!(!completed.plan().fragments().is_empty());
+    assert_eq!(counted.calls.load(Ordering::Relaxed), 0);
+    assert!(taken.into_taken().is_empty());
+    drop(completed);
+    drop(driver);
+    drop(facts);
+    drop(counted);
+    drop(cpu);
+    drop(source);
+    fixture.finish(false).await;
+}

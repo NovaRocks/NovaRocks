@@ -171,7 +171,7 @@ impl Scenario for MvOwnerHandover {
         select_catalog_and_namespace(context, &mut conn, CATALOG)?;
         context.action("verify the handed-over MV is listed as read-only");
         let listed = conn
-            .execute("SHOW MATERIALIZED VIEWS FROM ns")
+            .execute(format!("SELECT name, manageability, manageability_reason FROM system.runtime.materialized_view_states WHERE catalog_name = '{CATALOG}' AND schema_name = 'ns'"))
             .context("list handed-over MV after old deployment restart")?;
         let named = |name: &str| -> Result<usize> {
             let columns = listed
@@ -183,30 +183,35 @@ impl Scenario for MvOwnerHandover {
                 .collect::<Vec<_>>();
             anyhow::ensure!(
                 listed.is_result_set() && columns.len() == 1,
-                "SHOW MATERIALIZED VIEWS omitted or duplicated {name}"
+                "MV state table omitted or duplicated {name}"
             );
             anyhow::ensure!(
                 listed.columns[columns[0]].type_signature.raw_type == "varchar",
-                "SHOW {name} is not declared text"
+                "MV state {name} is not declared text"
             );
             Ok(columns[0])
         };
-        let name = named("Name")?;
-        let manageability_column = named("Manageability")?;
+        let name = named("name")?;
+        let manageability_column = named("manageability")?;
         let target = listed.rows.iter().filter(|row| matches!(row.get(name), Some(TrinoValue::Text(value)) if value == "orders_mv")).collect::<Vec<_>>();
         anyhow::ensure!(
             target.len() == 1,
-            "handed-over MV is missing or duplicated in SHOW MATERIALIZED VIEWS"
+            "handed-over MV is missing or duplicated in the state table"
         );
         let Some(TrinoValue::Text(manageability)) = target[0].get(manageability_column) else {
-            bail!("handed-over MV omitted its text Manageability")
+            bail!("handed-over MV omitted its text manageability")
         };
-        if !manageability.starts_with("READ_ONLY:") {
+        if manageability != "READ_ONLY" {
             bail!(
                 "handed-over MV was listed as {manageability:?}, expected READ_ONLY; {}",
                 context.diagnostics()
             );
         }
+        let reason_column = named("manageability_reason")?;
+        anyhow::ensure!(
+            matches!(target[0].get(reason_column),Some(TrinoValue::Text(reason)) if !reason.is_empty()),
+            "read-only handed-over MV omitted its management reason"
+        );
         context.action("verify the old deployment cannot publish after handover");
         let error = conn
             .execute("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE")

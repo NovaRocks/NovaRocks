@@ -665,6 +665,18 @@ pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
     let Some(statement) = statements.last() else {
         return false;
     };
+    // OPTIMIZE returns the table procedure's metric rows. Its ALTER spelling
+    // cannot inherit the general DDL waiver or silently disable comparison.
+    if let Ok(statements) = novarocks_parser::parse(statement)
+        && matches!(
+            statements.as_slice(),
+            [novarocks_parser::ast::Statement::Maintenance(
+                novarocks_parser::ast::MaintenanceStatement::Optimize(_)
+            )]
+        )
+    {
+        return false;
+    }
     let normalized = statement
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -676,7 +688,7 @@ pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
         return true;
     }
     // Classify the final statement, so setup such as USE cannot hide a query.
-    // DDL / DML statements do not produce recordable rowsets. Treat them as
+    // Other DDL / DML statements retain their existing non-rowset policy. Treat them as
     // implicit skip_result_check so only real queries (SELECT/SHOW/WITH/etc.)
     // need a recorded result set. This lets legacy tests that issue
     // CREATE/INSERT/DROP before an assertion SELECT work without requiring
@@ -872,6 +884,8 @@ mod implicit_skip_result_tests {
             "USE x; /* setup; */ SELECT 1; /* trailing; */ ;",
             "USE x; WITH t AS (SELECT 1) SELECT * FROM t;",
             "USE x; SHOW TABLES;",
+            "ALTER TABLE t OPTIMIZE;",
+            "USE x; ALTER TABLE `qualified`.`table` OPTIMIZE;",
         ] {
             let step = step(sql);
             assert!(!step_has_implicit_skip_result(&step), "{sql}");

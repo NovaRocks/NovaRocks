@@ -17,8 +17,8 @@
 
 -- @order_sensitive=false
 -- @tags=integer-semantics,self_contained
--- Test Objective: Preserve Trino 483 signed integer types, checked errors, and GROUPING widths through native execution.
--- Oracle: Trino tag 483 (50b0b50b75abd47f830b7805ee1b51716eb4065e), independently observed types, values, and errors.
+-- Test Objective: Preserve Trino signed integer types, checked errors, and GROUPING widths through native execution.
+-- Oracle: the semantic baseline's Trino integer operators, independently observed types, values, and errors.
 -- Maintenance: project suite owner; small constant/VALUES queries share the normal 1FE+3BE lifecycle and cleanup.
 
 -- query 1

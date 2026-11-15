@@ -417,10 +417,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
                 "Hadoop Iceberg catalog requires a single writer: background {} is not supported",
                 request.operation.name()
             ))),
-            CatalogInitiation::StatementJob => Ok(CatalogAdmission::AdmittedAwaitingCompletion),
-            CatalogInitiation::Statement | CatalogInitiation::JobAttempt => {
-                Ok(CatalogAdmission::Admitted)
-            }
+            CatalogInitiation::Statement => Ok(CatalogAdmission::Admitted),
         }
     }
 

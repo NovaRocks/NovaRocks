@@ -608,7 +608,7 @@ fn timezone(
     dt: chrono::DateTime<chrono::Utc>,
     zone: &str,
 ) -> Result<(chrono::DateTime<chrono::FixedOffset>, Option<Atom>), RenderError> {
-    // Trino 483 TimeZoneKey normalizes these zero-offset aliases to UTC.
+    // Trino TimeZoneKey normalizes these zero-offset aliases to UTC.
     let utc = matches!(
         zone,
         "GMT"

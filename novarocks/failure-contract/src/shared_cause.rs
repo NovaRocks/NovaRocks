@@ -125,6 +125,24 @@ impl SharedFailureCause {
             retention: Mutex::new(Vec::new()),
         }))
     }
+    /// Retain the original source with an explicitly authored bounded public
+    /// detail, without invoking its formatter. Existing shared sources keep
+    /// their canonical fact, detail and retention, including earlier aliases.
+    pub fn from_bounded_detail<E: Error + FailureProjection + Send + Sync + 'static>(
+        cause: E,
+        detail: BoundedDetail,
+    ) -> Self {
+        if let Some(shared) = (&cause as &dyn Any).downcast_ref::<Self>() {
+            return shared.clone();
+        }
+        let fact = cause.failure_fact();
+        Self(Arc::new(CauseRecord {
+            cause,
+            fact,
+            detail,
+            retention: Mutex::new(Vec::new()),
+        }))
+    }
     /// The actual private pointee, including fact and BoundedDetail header.
     /// The caller's locked Arc-layout author adds the original Arc counters;
     /// E's already-owned pointees and diagnostic bytes are separate custody.
@@ -450,6 +468,57 @@ mod tests {
             assert!(rewrapped.downcast_ref::<OwnedSource>().is_some());
             assert!(rewrapped.downcast_ref::<SharedFailureCause>().is_none());
             drop(wrapped);
+            drop(rewrapped);
+            assert_eq!(lifetime.source_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(lifetime.guard_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(lifetime.projections.load(Ordering::SeqCst), 1);
+            assert_eq!(lifetime.renderings.load(Ordering::SeqCst), 0);
+            drop(alias);
+            assert_eq!(lifetime.source_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(lifetime.guard_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(*lifetime.order.lock().unwrap(), ["source", "guard"]);
+        }
+    }
+
+    #[test]
+    fn bounded_detail_preserves_original_source_without_formatting_or_rewrapping() {
+        for early_alias in [false, true] {
+            let lifetime = Arc::new(SourceLifetime::default());
+            let source = SharedFailureCause::from_bounded_detail(
+                OwnedSource {
+                    lifetime: lifetime.clone(),
+                    panic_on_drop: false,
+                },
+                BoundedDetail::truncating("explicit public detail"),
+            );
+            assert_eq!(
+                SharedFailureCause::record_layout::<OwnedSource>(),
+                std::alloc::Layout::for_value(source.0.as_ref())
+            );
+            let pointer = source.downcast_ref::<OwnedSource>().unwrap() as *const _;
+            let fact = source.failure_fact();
+            let before = early_alias.then(|| source.clone());
+            source.retain_source_lifetime(Box::new(SourceGuard(lifetime.clone())));
+            let alias = before.unwrap_or_else(|| source.clone());
+            let wrapped = SharedFailureCause::from_bounded_detail(
+                source,
+                BoundedDetail::truncating("outer diagnostic"),
+            );
+            let static_wrapped =
+                SharedFailureCause::from_static_detail(wrapped.clone(), "outer static diagnostic");
+            let rewrapped = SharedFailureCause::new(wrapped.clone());
+            assert_eq!(wrapped, alias);
+            assert_eq!(static_wrapped, alias);
+            assert_eq!(rewrapped, alias);
+            assert_eq!(rewrapped.failure_fact(), fact);
+            assert_eq!(rewrapped.detail(), "explicit public detail");
+            assert_eq!(
+                rewrapped.downcast_ref::<OwnedSource>().unwrap() as *const _,
+                pointer
+            );
+            assert!(rewrapped.downcast_ref::<SharedFailureCause>().is_none());
+            drop(wrapped);
+            drop(static_wrapped);
             drop(rewrapped);
             assert_eq!(lifetime.source_drops.load(Ordering::SeqCst), 0);
             assert_eq!(lifetime.guard_drops.load(Ordering::SeqCst), 0);

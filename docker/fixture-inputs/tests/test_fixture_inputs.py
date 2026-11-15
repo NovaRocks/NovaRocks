@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
+import os
+import signal
+import subprocess
+import time
 import hashlib
 import sys
 import tempfile
@@ -16,6 +21,206 @@ import provision
 
 class FixtureInputsTest(unittest.TestCase):
     """Build only absent targets; environment differences are not admission facts."""
+
+    @contextmanager
+    def fake_docker(self, root, mode="ok", *, alias=False):
+        """Exercise acquisition and custody with observable fake Docker resources."""
+        command = root / 'docker'
+        command.write_text(r'''#!/usr/bin/env python3
+import json,os,sys,time
+from pathlib import Path
+root=Path(os.environ['FAKE_DOCKER_ROOT']); args=sys.argv[1:]
+with (root/'commands').open('a') as f: f.write(json.dumps(args)+'\n')
+mode=os.environ['FAKE_DOCKER_MODE']; cid='a'*64
+if args[:2]==['image','inspect']:
+    if (root/'alias').exists() or (args[2]=='source:42' and (root/'source').exists()):
+        print(json.dumps({'Id':'sha256:actual'}))
+    else:
+        print('Error: No such image: '+args[2],file=sys.stderr);sys.exit(1)
+elif args[0]=='pull':
+    print('pull progress from Docker',flush=True);(root/'source').touch()
+elif args[0]=='tag': (root/'alias').touch()
+elif args[0]=='run':
+    if mode=='no-cid':
+        print('creation transport failed',file=sys.stderr);sys.exit(9)
+    Path(args[args.index('--cidfile')+1]).write_text(cid);(root/'present').touch()
+    if mode in ('timeout','cleanup-fail','signal','daemon-lost'): time.sleep(30)
+    if mode=='command-fail':
+        print('check failed',file=sys.stderr);sys.exit(7)
+    if mode!='remains': (root/'present').unlink()
+    print('wrong version' if mode=='mismatch' else 'Trino CLI 42')
+elif args[:2]==['rm','-f']:
+    if mode=='cleanup-fail':
+        print('cannot remove owned container',file=sys.stderr);sys.exit(3)
+    (root/'present').unlink(missing_ok=True)
+elif args[:2]==['container','inspect']:
+    if mode in ('cleanup-fail','daemon-lost'):
+        print('Cannot connect to Docker daemon',file=sys.stderr);sys.exit(1)
+    if (root/'present').exists(): print(json.dumps({'Id':cid}))
+    else:
+        print('Error: No such container: '+cid,file=sys.stderr);sys.exit(1)
+else: sys.exit(13)
+''')
+        command.chmod(0o755)
+        if alias: (root / 'alias').touch()
+        with mock.patch.dict(os.environ, {'PATH':str(root)+os.pathsep+os.environ['PATH'],
+                'FAKE_DOCKER_ROOT':str(root), 'FAKE_DOCKER_MODE':mode}):
+            yield
+
+    def trino_recipe(self):
+        return {'schema':1, 'images':{'trino':{'source':'source', 'version':'42',
+            'creation_check':'trino-cli-version', 'jdbc_artifact':'driver.jar',
+            'variants':{'linux/arm64':{'platform':'linux/arm64','alias':'fixture:42'}}}},
+            'artifacts':{'driver.jar':{'url':'https://example.invalid/42/driver.jar'}},
+            'derived_images':{}, 'python_environments':{}}
+
+    def commands(self, root):
+        return [json.loads(line) for line in (root / 'commands').read_text().splitlines()]
+
+    def test_missing_reference_alias_is_checked_before_tagging(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            recipe=inputs.resolve_inputs(self.trino_recipe(),'linux/arm64',consumer='image:trino')
+            builder=self.builder(root,recipe)
+            with self.fake_docker(root): result=builder.image('images','trino')
+            self.assertEqual(result, {'alias':'fixture:42','image_id':'sha256:actual','platform':'linux/arm64','version':'42'})
+            commands=self.commands(root)
+            self.assertEqual([c[0] for c in commands],['image','image','pull','image','run','container','tag'])
+            self.assertIn('--pull',commands[4]);self.assertIn('never',commands[4])
+            self.assertFalse((root/'present').exists())
+            self.assertFalse(list((root/'builds').glob('fixture-image-check-*')))
+
+    def test_reference_creation_mismatch_does_not_tag(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            builder=self.builder(root,inputs.resolve_inputs(self.trino_recipe(),'linux/arm64',consumer='image:trino'))
+            with self.fake_docker(root,'mismatch'):
+                with self.assertRaisesRegex(inputs.FixtureInputError,'mismatch.*wrong version.*cleanup=confirmed absent'):
+                    builder.image('images','trino')
+            self.assertNotIn('tag',[c[0] for c in self.commands(root)])
+
+    def test_existing_reference_alias_is_not_checked(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            builder=self.builder(root,inputs.resolve_inputs(self.trino_recipe(),'linux/arm64',consumer='image:trino'))
+            with self.fake_docker(root,alias=True): builder.image('images','trino')
+            self.assertEqual([c[0] for c in self.commands(root)],['image'])
+
+    def test_unknown_creation_check_is_rejected(self):
+        recipe=self.trino_recipe();recipe['images']['trino']['creation_check']='guess'
+        with mock.patch.object(inputs,'read_json',return_value=recipe):
+            with self.assertRaisesRegex(inputs.FixtureInputError,'unknown fixture creation_check'):
+                inputs.read_recommendations(Path('unused'))
+
+    def test_jdbc_artifact_must_exist_and_match_image_version(self):
+        for artifacts in ({}, {'driver.jar':{'url':'https://example.invalid/41/driver.jar'}}):
+            recipe=self.trino_recipe();recipe['artifacts']=artifacts
+            with mock.patch.object(inputs,'read_json',return_value=recipe):
+                with self.assertRaises(inputs.FixtureInputError): inputs.read_recommendations(Path('unused'))
+
+    def test_owned_check_waits_for_explicit_absence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            with self.fake_docker(root):
+                result=inputs.run_owned_check('sha256:actual','linux/arm64',work_dir=root)
+            self.assertEqual(result.stdout,'Trino CLI 42\n')
+            self.assertEqual([c[0] for c in self.commands(root)],['run','container'])
+
+    def test_owned_check_timeout_removes_exact_cid_and_keeps_primary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            with self.fake_docker(root,'timeout'):
+                with self.assertRaisesRegex(inputs.FixtureInputError,'timed out.*cleanup=confirmed absent: '+ 'a'*64):
+                    inputs.run_owned_check('sha256:actual','linux/arm64',timeout_seconds=3,work_dir=root)
+            self.assertEqual(self.commands(root)[1],['rm','-f','a'*64])
+            self.assertFalse((root/'present').exists())
+
+    def test_owned_check_cleanup_failure_keeps_original_and_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            with self.fake_docker(root,'cleanup-fail'):
+                with self.assertRaisesRegex(inputs.FixtureInputError,'timed out.*cleanup=failed:.*Cannot connect'):
+                    inputs.run_owned_check('sha256:actual','linux/arm64',timeout_seconds=3,work_dir=root)
+            self.assertEqual(next(root.glob('fixture-image-check-*/container-id')).read_text(),'a'*64)
+            self.assertTrue((root/'present').exists())
+
+    def test_owned_check_without_cid_does_not_guess_cleanup_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            with self.fake_docker(root,'no-cid'):
+                with self.assertRaisesRegex(inputs.FixtureInputError,'command failed.*creation transport failed.*creation outcome unknown'):
+                    inputs.run_owned_check('sha256:actual','linux/arm64',work_dir=root)
+            self.assertEqual([c[0] for c in self.commands(root)],['run'])
+
+    def test_owned_check_failed_command_is_removed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            with self.fake_docker(root,'command-fail'):
+                with self.assertRaisesRegex(inputs.FixtureInputError,'command failed.*check failed.*cleanup=confirmed absent'):
+                    inputs.run_owned_check('sha256:actual','linux/arm64',work_dir=root)
+            self.assertFalse((root/'present').exists())
+
+    def test_owned_check_unconfirmed_normal_exit_is_reclaimed_and_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            with self.fake_docker(root,'remains'):
+                with self.assertRaisesRegex(inputs.FixtureInputError,'initial removal confirmation failed.*cleanup=confirmed absent'):
+                    inputs.run_owned_check('image','linux/arm64',timeout_seconds=3,work_dir=root)
+            self.assertFalse((root/'present').exists())
+            self.assertIn(['rm','-f','a'*64],self.commands(root))
+
+    def test_owned_check_daemon_loss_never_claims_absence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            with self.fake_docker(root,'daemon-lost'):
+                with self.assertRaisesRegex(inputs.FixtureInputError,'timed out.*cleanup=failed:.*Cannot connect'):
+                    inputs.run_owned_check('image','linux/arm64',timeout_seconds=3,work_dir=root)
+            self.assertTrue(list(root.glob('fixture-image-check-*/container-id')))
+
+    def check_signal_settles_custody(self, cancellation):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            with self.fake_docker(root,'signal'):
+                env={**os.environ,'PYTHONPATH':str(ROOT)}
+                code="from pathlib import Path; from fixture_inputs import run_owned_check; run_owned_check('image','linux/arm64',timeout_seconds=3,work_dir=Path("+repr(str(root))+"))"
+                child=subprocess.Popen([sys.executable,'-c',code],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                try:
+                    until=time.monotonic()+5
+                    while not (root/'present').exists() and child.poll() is None and time.monotonic()<until: time.sleep(.01)
+                    self.assertTrue((root/'present').exists())
+                    child.send_signal(cancellation)
+                    _,err=child.communicate(timeout=5)
+                    self.assertNotEqual(child.returncode,0)
+                    self.assertIn(signal.Signals(cancellation).name,err);self.assertIn('cleanup=confirmed absent',err)
+                    self.assertFalse((root/'present').exists())
+                finally:
+                    if child.poll() is None: child.kill();child.communicate()
+
+    def test_owned_check_sigterm_settles_custody(self):
+        self.check_signal_settles_custody(signal.SIGTERM)
+
+    def test_owned_check_sigint_settles_custody(self):
+        self.check_signal_settles_custody(signal.SIGINT)
+
+    def test_result_file_is_complete_despite_cold_pull_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);recipe=root/'versions.json';recipe.write_text(json.dumps(self.trino_recipe()))
+            result=root/'result.json'
+            command=[sys.executable,str(ROOT/'provision.py'),'--store',str(root/'store'),'--versions',str(recipe),
+                     '--consumer','image:trino','--platform','linux/arm64']
+            with self.fake_docker(root):
+                completed=subprocess.run([*command,'--result',str(result)],text=True,capture_output=True)
+                self.assertEqual(completed.returncode,0,completed.stderr)
+                value=json.loads(result.read_text())
+                self.assertEqual(value['images']['trino']['version'],'42')
+                self.assertEqual(completed.stdout,'pull progress from Docker\n')
+                reused=subprocess.run(command,text=True,capture_output=True)
+                self.assertEqual(json.loads(reused.stdout),value)
+                (root/'alias').unlink()
+                failed=subprocess.run([*command,'--result',str(root/'failed.json')],env={**os.environ,'FAKE_DOCKER_MODE':'mismatch'},text=True,capture_output=True)
+                self.assertNotEqual(failed.returncode,0)
+                self.assertFalse((root/'failed.json').exists())
+            self.assertFalse(list(root.glob('.result.json.*.tmp')))
 
     def test_platform_selection_keeps_recipe_dependencies(self):
         arm = inputs.load_inputs(ROOT / 'versions.json', platform='linux/arm64', consumer='iceberg-rest')

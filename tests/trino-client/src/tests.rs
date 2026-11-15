@@ -1143,6 +1143,54 @@ fn observed_interrupted_response_retains_identity_without_a_retry() {
 }
 
 #[test]
+fn table_execute_keeps_metric_rows_update_type_and_terminal_ack() {
+    let server = FakeServer::new(vec![
+        queued(),
+        Reply::json(
+            r#"{"id":"q","updateType":"ALTER TABLE EXECUTE","columns":[{"name":"metric_name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},{"name":"metric_value","type":"bigint","typeSignature":{"rawType":"bigint","arguments":[]}}],"data":[["rewritten_data_files_count",3],["removed_delete_files_count",0],["added_data_files_count",1]],"nextUri":"$BASE/next/1"}"#,
+        ),
+        Reply::json(r#"{"id":"q","updateType":"ALTER TABLE EXECUTE"}"#),
+    ]);
+    let (result, _) = server
+        .client()
+        .submit(&session(), "ALTER TABLE t OPTIMIZE", deadline())
+        .unwrap()
+        .run(deadline())
+        .unwrap();
+    assert!(result.is_result_set());
+    assert!(!result.is_completion());
+    assert_eq!(result.update_type.as_deref(), Some("ALTER TABLE EXECUTE"));
+    assert_eq!(result.update_count, None);
+    assert_eq!(result.pages, 3);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                TrinoValue::Text("rewritten_data_files_count".into()),
+                TrinoValue::Integer(3)
+            ],
+            vec![
+                TrinoValue::Text("removed_delete_files_count".into()),
+                TrinoValue::Integer(0)
+            ],
+            vec![
+                TrinoValue::Text("added_data_files_count".into()),
+                TrinoValue::Integer(1)
+            ],
+        ]
+    );
+    let requests = server.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        ["POST", "GET", "GET"]
+    );
+    assert_eq!(requests[2].path, "/next/1");
+}
+
+#[test]
 fn counted_completion_rows_and_trace_retain_zero_through_terminal_ack() {
     for n in [0, 3] {
         let data = format!(

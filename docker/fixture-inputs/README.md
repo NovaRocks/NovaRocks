@@ -40,6 +40,18 @@ docker/fixture-inputs/provision.sh --consumer derived:hive-metastore --platform 
 
 镜像使用推荐的可读版本 tag，不做环境 digest 锁定。实际创建输出记录所选目标的 image ID 和配置，供原 owner 操作准确目标；这些事实不是后续消费者的 BOM 准入证明。已有但损坏、不可访问、部分创建或状态不明的输入保留并报错，交人工维护，不自动修复或换版本。
 
+Trino 参照声明在 `images.trino`，同时声明 amd64 与 arm64；`jdbc_artifact` 指向独立下载的 JDBC 驱动。版本只在该条目及其驱动 artifact 中声明，不在消费者中重复固定。需要参照时可手工准备：
+
+```bash
+docker/fixture-inputs/provision.sh --consumer image:trino --result /absolute/path/reference.json
+```
+
+`creation_check` 当前只接受 `trino-cli-version`。仅在缺失本地别名、准备创建别名时，builder 对准确 image ID 运行 `trino --version`，与声明的版本比较；已有别名直接复用，不做版本核对。核对通过后才打别名，结果记录 `alias`、`image_id`、`platform` 与 `version`。
+
+核对容器通过独占目录中的 `--cidfile` 记录准确身份；正常退出后确认 Docker 明确报告容器不存在，超时、SIGINT、SIGTERM 或命令失败时结束客户端、按准确 CID 强制移除并确认不存在。执行、移除及确认沿用 `--docker-pull-timeout-seconds` 的设置。原错误与清理失败同时报告；Docker 失联或创建后没有返回 CID 时保持未知，保留工作目录，不能据此声称已清理。该目录位于 fixture store 的 `builds/` 中。
+
+`--result <path>` 在所选输入全部准备成功后，以同目录临时文件和原子改名写入 JSON；失败不写结果。它与原标准输出 JSON 结构相同，镜像项含声明的 `version`，artifact 通过 `artifact_dir` 返回目录。指定该选项后标准输出与标准错误只承载诊断和子命令日志；省略时仍把结果 JSON 打印到标准输出。
+
 ## 下载完整性与来源
 
 下载 artifact 的 URL、长度和 SHA-1/SHA-256 保留在推荐清单，Gradle 的 `verification-metadata.xml` 继续严格校验构建依赖。这些校验针对实际取得的构建输入，不是对运行环境的检查。缺失文件在独占临时位置下载，验证成功后原子移交；已有文件不符则报错，不覆盖原件。失败材料保留以便调查。

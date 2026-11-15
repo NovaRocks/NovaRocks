@@ -4,7 +4,7 @@ explicit_only = true
 heavy = { reason = "cost", detail = "Native 1FE+3BE acceptance of runtime-state cut across an FE restart; run serially." }
 
 [impact]
-paths = ["novarocks/frontend-application/src/state_family/**"]
+paths = ["novarocks/frontend-application/src/statistics/**", "novarocks/frontend-application/src/query_execution/statistics/**", "novarocks/connector/iceberg/src/catalog_control/statistics/**", "novarocks/frontend-application/src/state_family/**"]
 
 [reuse]
 scope = "suite"

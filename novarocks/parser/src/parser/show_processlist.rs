@@ -95,13 +95,9 @@ mod tests {
 
     #[test]
     fn processlist_does_not_shadow_its_neighbours() {
-        // This parser runs before `show_backends`, so it has to decline
-        // everything that is not its own form rather than claim the SHOW.
         assert!(matches!(
-            parse("SHOW BACKENDS")
-                .expect("SHOW BACKENDS still parses")
-                .as_slice(),
-            [Statement::ShowBackends(_)]
+            parse("SHOW STATS FOR t").unwrap().as_slice(),
+            [Statement::Statistics(_)]
         ));
         // PROCESSLIST is matched as a word, so it remains usable as an alias.
         assert!(matches!(

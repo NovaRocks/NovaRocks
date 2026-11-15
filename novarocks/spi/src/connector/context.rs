@@ -463,13 +463,11 @@ impl fmt::Debug for ResolvedVendedS3Access {
     }
 }
 
-/// The host-owned origin of this connector operation. Statement-submitted job
-/// admission is a separate metadata request, not a request-context origin.
+/// The host-owned origin of this connector operation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ConnectorRequestInitiation {
     #[default]
     Statement,
-    JobAttempt,
     Background,
 }
 
@@ -903,7 +901,7 @@ mod tests {
         .unwrap()
         .with_storage_resolver(Arc::new(RejectingResolver))
         .with_vended_credential_lease_sink(Arc::new(RejectingSink))
-        .with_initiation(ConnectorRequestInitiation::JobAttempt);
+        .with_initiation(ConnectorRequestInitiation::Background);
         let scope =
             original.request_scope_extension_or_insert_with(|| String::from("original scope"));
         let earlier = Instant::now() + Duration::from_secs(3);
@@ -926,7 +924,7 @@ mod tests {
         ));
         assert_eq!(
             shortened.initiation(),
-            ConnectorRequestInitiation::JobAttempt
+            ConnectorRequestInitiation::Background
         );
         assert_eq!(
             shortened.max_handle_payload_bytes(),
@@ -955,7 +953,6 @@ mod tests {
         assert_eq!(request.initiation(), ConnectorRequestInitiation::Statement);
         for initiation in [
             ConnectorRequestInitiation::Statement,
-            ConnectorRequestInitiation::JobAttempt,
             ConnectorRequestInitiation::Background,
         ] {
             let request = request.clone().with_initiation(initiation);

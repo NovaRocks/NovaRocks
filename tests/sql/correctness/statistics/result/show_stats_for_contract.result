@@ -1,0 +1,26 @@
+-- query 2
+-- types	varchar	double	double	double	double	varchar	varchar
+column_name	data_size	distinct_values_count	nulls_fraction	row_count	low_value	high_value
+k	0.0	0.0	1.0	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	0.0	NULL	NULL
+
+-- query 5
+-- types	varchar	double	double	double	double	varchar	varchar
+column_name	data_size	distinct_values_count	nulls_fraction	row_count	low_value	high_value
+k	NULL	NULL	0.3333333333333333	NULL	1	2
+only_null	0.0	NULL	1.0	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	3.0	NULL	NULL
+
+-- query 7
+-- types	varchar	double	double	double	double	varchar	varchar
+column_name	data_size	distinct_values_count	nulls_fraction	row_count	low_value	high_value
+k	NULL	2.0	0.3333333333333333	NULL	1	2
+only_null	0.0	NULL	1.0	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	3.0	NULL	NULL
+
+-- query 9
+-- types	varchar	double	double	double	double	varchar	varchar
+column_name	data_size	distinct_values_count	nulls_fraction	row_count	low_value	high_value
+k	NULL	2.0	0.25	NULL	1	3
+only_null	0.0	NULL	1.0	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	4.0	NULL	NULL

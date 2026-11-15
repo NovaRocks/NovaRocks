@@ -62,7 +62,7 @@ SELECT 1;
 -- @result_contains=a_mv
 -- @result_contains=UNAVAILABLE
 USE lnp3d_disc_${uuid0}.ns_${uuid0};
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'lnp3d_disc_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 4
 -- @skip_result_check=true
@@ -73,7 +73,7 @@ SELECT 1;
 -- @skip_result_check=true
 -- @result_contains=a_mv
 USE lnp3d_disc_${uuid0}.ns_${uuid0};
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'lnp3d_disc_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 6
 -- @retry_count=40

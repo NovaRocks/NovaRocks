@@ -299,6 +299,7 @@ impl RegisteredIcebergDataMutationBackend {
             },
         );
         let direct = Arc::new(CatalogPublisher {
+            expected_table_uuid: None,
             catalog_operation: match planned {
                 PlannedIcebergMutation::Truncate { .. } => {
                     crate::catalog::admission::CatalogOperation::Truncate
@@ -1062,6 +1063,7 @@ mod tests {
         let publisher = journal.observe_prepared(Arc::new(CountedSourcePublisher {
             inner: Arc::new(MutationPublisher {
                 inner: Arc::new(CatalogPublisher {
+                    expected_table_uuid: None,
                     catalog_operation: match planned {
                         PlannedIcebergMutation::Truncate { .. } => {
                             crate::catalog::admission::CatalogOperation::Truncate

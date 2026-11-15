@@ -78,6 +78,7 @@ struct Source {
     stop_after_view: Option<ConnectorStopOwner>,
     mvs: Vec<MaterializedViewFacts>,
     observed: Result<Vec<MvSourceObservation>, ConnectorError>,
+    upstream: Result<Vec<String>, ConnectorError>,
     batch_sizes: Mutex<Vec<usize>>,
     snapshot: Mutex<Option<SnapshotInput>>,
 }
@@ -92,6 +93,7 @@ impl Source {
             stop_after_view: None,
             mvs: vec![],
             observed: Ok(vec![]),
+            upstream: Ok(vec![]),
             batch_sizes: Mutex::new(vec![]),
             snapshot: Mutex::new(None),
         }
@@ -155,6 +157,20 @@ impl StatementSystemTableSource for Source {
         self.call("inventory");
         Ok(Box::new(Inventory(self.mvs.clone().into_iter())))
     }
+    async fn materialized_view_states(
+        &self,
+        context: &ConnectorRequestContext,
+    ) -> Result<Box<dyn MaterializedViewInventory>, SystemTableError> {
+        self.materialized_views(false, false, context).await
+    }
+    async fn upstream_materialized_views(
+        &self,
+        _: &novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection,
+        _: &ConnectorRequestContext,
+    ) -> Result<Vec<String>, SystemTableError> {
+        self.call("dependencies");
+        self.upstream.clone().map_err(Into::into)
+    }
     async fn current_sources(
         &self,
         _occurrences: &[RelationOccurrence],
@@ -176,14 +192,14 @@ impl StatementSystemTableSource for Source {
         });
         Ok(())
     }
-    fn stage_row(&self, values: &[Option<&str>]) -> Result<RowStage, SystemTableError> {
+    fn stage_row(&self, values: &[SystemValueRef<'_>]) -> Result<RowStage, SystemTableError> {
         let mut snapshot = self.snapshot.lock().unwrap();
         let input = snapshot.as_mut().unwrap();
         input.rows.push(
             input
                 .columns
                 .iter()
-                .map(|ordinal| values[*ordinal].map(str::to_owned))
+                .map(|ordinal| super::construction::copy_value(values[*ordinal]).unwrap())
                 .collect(),
         );
         Ok(RowStage::Staged)
@@ -268,7 +284,12 @@ async fn snapshot(
     keys: SystemTableKeyConstraint,
     target: usize,
 ) -> Result<SystemTableSnapshot, SystemTableError> {
-    let registry = Arc::new(SystemTableRegistry::try_new([]).unwrap());
+    let registry = Arc::new(
+        SystemTableRegistry::try_new(
+            (table == "materialized_view_states").then(materialized_view_states_registration),
+        )
+        .unwrap(),
+    );
     let declaration = declaration(&registry, binding, schema, table);
     let context = context();
     let request =
@@ -514,6 +535,7 @@ fn mv(unavailable: bool) -> MaterializedViewFacts {
         unavailable,
         occurrences: vec![occurrence()],
         publication: Some(vec![input()]),
+        state: None,
     }
 }
 #[tokio::test]
@@ -829,4 +851,260 @@ async fn original_view_provider_failure_precedes_a_concurrent_stop() {
         SystemTableError::Provider(original)
     );
     assert!(context.is_cancelled());
+}
+
+// These state-table assertions use immutable projection input and an isolated
+// fake fact source; SQLite and full completion coverage live with the Source.
+async fn state_mv(
+    manageability: novarocks_mv_application::readiness::MvListedManageability,
+    phase: novarocks_mv_application::management::MvManagementPhase,
+    publication: bool,
+) -> MaterializedViewFacts {
+    use crate::mv::domain::test_admission::{KeyedProjectionFixture, keyed_repository};
+    let mut fixture = KeyedProjectionFixture::new(
+        novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "db", "mv"),
+        publication.then_some(1),
+    );
+    fixture.configuration.refresh_policy =
+        novarocks_mv_application::persistence::codec::RefreshPolicy::AsyncInterval;
+    fixture.configuration.refresh_interval_ms = Some(60_000);
+    fixture.configuration.paused = true;
+    if publication {
+        fixture
+            .publication
+            .as_mut()
+            .unwrap()
+            .publication_prepared_at_ms = 1_700_000_001_234;
+        fixture.publication.as_mut().unwrap().logical_result_rows = Some(7);
+    } else {
+        fixture.publication = None;
+    }
+    let loaded = keyed_repository()
+        .await
+        .install_keyed_projection(uuid::Uuid::now_v7(), fixture.build().unwrap(), None)
+        .await
+        .unwrap();
+    let mut facts = mv(false);
+    facts.state = Some(super::source::MaterializedViewStateFacts {
+        loaded,
+        manageability,
+        phase,
+    });
+    facts
+}
+#[test]
+fn state_extension_declares_real_types_and_creates_runtime_schema() {
+    let registration = materialized_view_states_registration();
+    let registry = SystemTableRegistry::try_new([registration.clone()]).unwrap();
+    assert_eq!(
+        registry.schemas(&SystemTableBinding::System),
+        ["metadata", "runtime"]
+    );
+    assert_eq!(registration.columns.len(), 12);
+    assert_eq!(
+        registration.columns[5].value_type.data_type(),
+        &DataType::Boolean
+    );
+    assert_eq!(
+        registration.columns[6].value_type.data_type(),
+        &DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, Some("UTC".into()))
+    );
+    assert!(!registration.columns[10].value_type.nullable());
+    assert!(registration.columns[11].value_type.nullable());
+    let DataType::List(child) = registration.columns[10].value_type.data_type() else {
+        panic!("array(varchar)")
+    };
+    assert_eq!(child.data_type(), &DataType::Utf8);
+    assert!(!child.is_nullable());
+}
+#[tokio::test]
+async fn state_rows_preserve_configuration_publication_arrays_and_projected_dependency_reads() {
+    use arrow::array::{BooleanArray, Int64Array, ListArray, TimestampMillisecondArray};
+    use novarocks_mv_application::{
+        management::MvManagementPhase as P, readiness::MvListedManageability as R,
+    };
+    let mut source = Source::new();
+    source.mvs = vec![state_mv(R::Manageable, P::Manageable, true).await];
+    source.upstream = Ok(vec!["ice.db.upstream".into()]);
+    let source = Arc::new(source);
+    let result = snapshot(
+        source.clone(),
+        SystemTableBinding::System,
+        "runtime",
+        "materialized_view_states",
+        (0..12).collect(),
+        SystemTableKeyConstraint::default(),
+        1,
+    )
+    .await
+    .unwrap();
+    let b = &result.batches[0];
+    assert_eq!(
+        b.column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "INTERVAL"
+    );
+    assert_eq!(
+        b.column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        60_000
+    );
+    assert!(
+        b.column(5)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0)
+    );
+    assert_eq!(
+        b.column(6)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap()
+            .value(0),
+        1_700_000_001_234
+    );
+    assert_eq!(
+        b.column(7)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        7
+    );
+    assert_eq!(
+        b.column(8)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "MANAGEABLE"
+    );
+    assert!(b.column(9).is_null(0));
+    let bases = b
+        .column(10)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    let bases = bases.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(bases.iter().collect::<Vec<_>>(), [Some("ice.sales.orders")]);
+    let upstream = b
+        .column(11)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        upstream
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "ice.db.upstream"
+    );
+    assert_eq!(*source.calls.lock().unwrap(), ["inventory", "dependencies"]);
+}
+#[tokio::test]
+async fn state_manageability_preserves_reasons_and_missing_publication_without_dependency_io() {
+    use novarocks_mv_application::{
+        management::MvManagementPhase as P, readiness::MvListedManageability as R,
+    };
+    for (readiness, phase, expected, reason) in [
+        (R::Manageable, P::NotObserved, "MANAGEABLE", None),
+        (R::Manageable, P::Managing, "MANAGING", None),
+        (
+            R::Manageable,
+            P::AwaitingConvergence,
+            "READ_ONLY",
+            Some("AWAITING_CONVERGENCE"),
+        ),
+        (
+            R::ReadOnly("foreign owner".into()),
+            P::Managing,
+            "READ_ONLY",
+            Some("foreign owner"),
+        ),
+        (
+            R::Unavailable("catalog read failed".into()),
+            P::Manageable,
+            "UNAVAILABLE",
+            Some("catalog read failed"),
+        ),
+    ] {
+        let mut source = Source::new();
+        source.mvs = vec![state_mv(readiness, phase, false).await];
+        source.upstream = Err(ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            "unrequested dependencies",
+        ));
+        let source = Arc::new(source);
+        let result = snapshot(
+            source.clone(),
+            SystemTableBinding::System,
+            "runtime",
+            "materialized_view_states",
+            vec![6, 7, 8, 9],
+            SystemTableKeyConstraint::default(),
+            2,
+        )
+        .await
+        .unwrap();
+        let b = &result.batches[0];
+        assert!(b.column(0).is_null(0));
+        assert!(b.column(1).is_null(0));
+        assert_eq!(
+            b.column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            expected
+        );
+        let reasons = b.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(reasons.iter().next().unwrap(), reason);
+        assert_eq!(*source.calls.lock().unwrap(), ["inventory"]);
+    }
+}
+#[tokio::test]
+async fn state_dependency_failure_remains_typed_and_read_only_dependencies_are_null() {
+    use novarocks_mv_application::{
+        management::MvManagementPhase as P, readiness::MvListedManageability as R,
+    };
+    let original = ConnectorError::new(
+        ConnectorErrorKind::Unavailable,
+        "original dependency read failed",
+    );
+    for readiness in [R::Manageable, R::ReadOnly("not managed".into())] {
+        let mut source = Source::new();
+        source.mvs = vec![state_mv(readiness.clone(), P::Manageable, false).await];
+        source.upstream = Err(original.clone());
+        let source = Arc::new(source);
+        let result = snapshot(
+            source.clone(),
+            SystemTableBinding::System,
+            "runtime",
+            "materialized_view_states",
+            vec![11],
+            SystemTableKeyConstraint::default(),
+            2,
+        )
+        .await;
+        if readiness == R::Manageable {
+            assert_eq!(
+                result.unwrap_err(),
+                SystemTableError::Provider(original.clone())
+            );
+            assert_eq!(*source.calls.lock().unwrap(), ["inventory", "dependencies"]);
+        } else {
+            assert!(result.unwrap().batches[0].column(0).is_null(0));
+            assert_eq!(*source.calls.lock().unwrap(), ["inventory"]);
+        }
+    }
 }

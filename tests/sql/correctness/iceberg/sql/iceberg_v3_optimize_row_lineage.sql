@@ -97,8 +97,6 @@ SELECT count(*) AS main_matches_pre_opt
   WHERE current_ref.name = 'main' AND baseline_ref.name = 'pre_opt';
 
 -- query 7
--- @skip_result_check=true
--- @wait_alter_optimize=olineage
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
 ALTER TABLE olineage OPTIMIZE;
 

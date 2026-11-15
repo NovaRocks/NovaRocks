@@ -91,7 +91,6 @@ runtime-inputs = [
     "tests/fixtures/iceberg-rest-publication/src/**",
 ]
 env-inputs = [
-    { name = "NOVA_TRINO_IMAGE", kind = "value" },
     { name = "PATH", kind = "value" },
     { name = "HOME", kind = "value" },
     { name = "TMPDIR", kind = "value" },

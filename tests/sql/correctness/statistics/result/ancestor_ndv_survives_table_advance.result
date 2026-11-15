@@ -1,0 +1,13 @@
+-- query 5
+-- types	varchar	double	double	double	double	varchar	varchar
+column_name	data_size	distinct_values_count	nulls_fraction	row_count	low_value	high_value
+id	NULL	4.0	0.0	NULL	1	4
+k	NULL	4.0	0.0	NULL	10	40
+NULL	NULL	NULL	NULL	4.0	NULL	NULL
+
+-- query 7
+-- types	varchar	double	double	double	double	varchar	varchar
+column_name	data_size	distinct_values_count	nulls_fraction	row_count	low_value	high_value
+id	NULL	4.0	0.0	NULL	1	6
+k	NULL	4.0	0.0	NULL	10	60
+NULL	NULL	NULL	NULL	6.0	NULL	NULL

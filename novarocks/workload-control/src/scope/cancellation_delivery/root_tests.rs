@@ -55,7 +55,7 @@ async fn batch_decisions_and_counts_precede_cross_root_reentrant_callbacks() {
         .try_begin_root(WorkRequest::new(WorkClass::Management))
         .unwrap();
     let existing = control
-        .try_begin_root(WorkRequest::new(WorkClass::Statistics))
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
     let child = first
         .owner
@@ -111,13 +111,8 @@ async fn batch_decisions_and_counts_precede_cross_root_reentrant_callbacks() {
         .root_lifecycle
         .frontend_drain_deadline_cancelled;
     assert_eq!(
-        (
-            totals.query,
-            totals.table_maintenance,
-            totals.statistics,
-            totals.management
-        ),
-        (1, 1, 0, 0)
+        (totals.query, totals.table_maintenance, totals.management),
+        (1, 1, 0)
     );
     drop(cancelled);
     acknowledge(&control);

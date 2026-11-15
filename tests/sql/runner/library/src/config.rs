@@ -153,6 +153,12 @@ enum FixtureObjectStore {
     NodeLocal,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum FixtureStorageKind {
+    Minio,
+    NodeLocal,
+}
+
 /// One endpoint projection for generated configurations and private fixtures.
 /// Secrets deliberately have no Debug implementation.
 pub(crate) struct FixtureEndpoints {
@@ -164,6 +170,7 @@ pub(crate) struct FixtureEndpoints {
     data_name: String,
     generation: String,
     env_file: PathBuf,
+    isolated_hadoop_roots: Option<[String; 2]>,
 }
 
 impl FixtureEndpoints {
@@ -202,13 +209,7 @@ impl FixtureEndpoints {
             .map(required)
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
-        let kind = fixture_config_value(config, "fixture_object_store_kind")?
-            .unwrap_or_else(|| "minio".into());
-        let node_local = match kind.as_str() {
-            "minio" => false,
-            "aliyun-oss" => true,
-            _ => bail!("unsupported fixture_object_store_kind {kind}"),
-        };
+        let node_local = Self::storage_kind(config)? == FixtureStorageKind::NodeLocal;
         let optional = |key: &str, default: &str| -> Result<String> {
             Ok(fixture_config_value(config, key)?.unwrap_or_else(|| default.into()))
         };
@@ -299,7 +300,20 @@ impl FixtureEndpoints {
         identity: &IsolatedS3Identity,
         env_file: PathBuf,
     ) -> Result<Self> {
-        Self::new(
+        let publication = load_runner_config(Some(&env_file.with_file_name("sql-test.toml")))?;
+        let required = |key| -> Result<String> {
+            fixture_config_value(&publication, key)?
+                .with_context(|| format!("isolated fixture publication omitted {key}"))
+        };
+        anyhow::ensure!(
+            Path::new(&required("fixture_env_file")?).canonicalize()? == env_file.canonicalize()?,
+            "isolated fixture configuration belongs to another publication"
+        );
+        let hadoop_roots = [
+            required("iceberg_catalog_warehouse")?,
+            required("iceberg_test_warehouse")?,
+        ];
+        let mut projection = Self::new(
             [
                 endpoints.rest_uri.clone(),
                 endpoints.rest_warehouse.clone(),
@@ -317,7 +331,9 @@ impl FixtureEndpoints {
             "iceberg-test-data".into(),
             "v1".into(),
             env_file,
-        )
+        )?;
+        projection.isolated_hadoop_roots = Some(hadoop_roots);
+        Ok(projection)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -353,6 +369,7 @@ impl FixtureEndpoints {
             data_name,
             generation,
             env_file,
+            isolated_hadoop_roots: None,
         })
     }
 
@@ -360,13 +377,20 @@ impl FixtureEndpoints {
         matches!(self.object_store, FixtureObjectStore::NodeLocal)
     }
 
-    pub(crate) fn preflight_cloud(config: &RunnerConfig, suites: &[String]) -> Result<()> {
+    pub(crate) fn storage_kind(config: &RunnerConfig) -> Result<FixtureStorageKind> {
         match fixture_config_value(config, "fixture_object_store_kind")?.as_deref() {
-            Some("aliyun-oss") => {
+            None | Some("minio") => Ok(FixtureStorageKind::Minio),
+            Some("aliyun-oss") => Ok(FixtureStorageKind::NodeLocal),
+            Some(kind) => bail!("unsupported fixture_object_store_kind {kind}"),
+        }
+    }
+
+    pub(crate) fn preflight_cloud(config: &RunnerConfig, suites: &[String]) -> Result<()> {
+        match Self::storage_kind(config)? {
+            FixtureStorageKind::NodeLocal => {
                 Self::from_runner_config(config)?.reject_unsupported_suites(suites)
             }
-            None | Some("minio") => Ok(()),
-            Some(kind) => bail!("unsupported fixture_object_store_kind {kind}"),
+            FixtureStorageKind::Minio => Ok(()),
         }
     }
 
@@ -374,9 +398,7 @@ impl FixtureEndpoints {
         config: &RunnerConfig,
         sources: &BTreeMap<String, Vec<PathBuf>>,
     ) -> Result<()> {
-        if fixture_config_value(config, "fixture_object_store_kind")?.as_deref()
-            != Some("aliyun-oss")
-        {
+        if Self::storage_kind(config)? != FixtureStorageKind::NodeLocal {
             return Ok(());
         }
         let vended = Regex::new(
@@ -407,6 +429,12 @@ impl FixtureEndpoints {
 
     /// Replaces every supported spelling, including aliases left by TOML flattening.
     pub(crate) fn project(&self, config: &mut RunnerConfig) -> BTreeMap<String, String> {
+        if let Some([catalog, test]) = &self.isolated_hadoop_roots {
+            // Keep the admitted catalog type while replacing roots with the same
+            // publication that owns the projected object-store endpoint.
+            project_fixture_value(config, "iceberg_catalog_warehouse", catalog);
+            project_fixture_value(config, "iceberg_test_warehouse", test);
+        }
         for (key, value) in FIXTURE_COMMON_KEYS.iter().zip(&self.values) {
             project_fixture_value(config, key, value);
         }
@@ -458,6 +486,10 @@ impl FixtureEndpoints {
         .into_iter()
         .map(|(key, value)| (key.into(), value))
         .collect();
+        if let Some([catalog, test]) = &self.isolated_hadoop_roots {
+            child.insert("CATALOG_WAREHOUSE_URI".into(), catalog.clone());
+            child.insert("NOVAROCKS_ICEBERG_TEST_WAREHOUSE".into(), test.clone());
+        }
         if let FixtureObjectStore::Static {
             access_key,
             secret_key,
@@ -1123,6 +1155,9 @@ trino_port = "23223"
 
 [env]
 fixture_env_file = {env_file:?}
+iceberg_catalog_type = "hadoop"
+iceberg_catalog_warehouse = "s3://novarocks/worktree/catalog"
+iceberg_test_warehouse = "s3://novarocks/worktree/test"
 iceberg_rest_uri = "http://127.0.0.1:38181"
 iceberg_rest_warehouse = "s3://warehouse/worktree/rest"
 iceberg_rest_mv_uri = "http://127.0.0.1:38182"
@@ -1144,7 +1179,10 @@ oss_sk = "fixture-secret"
         // Include a conflicting nested legacy scope: a private fixture replaces all.
         let mut source = fs::read_to_string(&path).unwrap();
         source.push_str("\n[env.oss]\n");
-        for key in FIXTURE_ENDPOINT_KEYS {
+        for key in FIXTURE_ENDPOINT_KEYS
+            .into_iter()
+            .chain(["iceberg_catalog_warehouse", "iceberg_test_warehouse"])
+        {
             source.push_str(&format!("{key} = \"foreign\"\n"));
         }
         fs::write(&path, source).unwrap();
@@ -1166,11 +1204,41 @@ oss_sk = "fixture-secret"
             access_key_id: "private-key".into(),
             secret_access_key: "private-secret".into(),
         };
-        let env_file = path.parent().unwrap().join("private-env.sh");
+        let private_publication = path.parent().unwrap().join("private");
+        fs::create_dir(&private_publication).unwrap();
+        let env_file = private_publication.join("env.sh");
         fs::write(&env_file, "export NOVA_ENV_READY=true\n").unwrap();
+        fs::write(
+            private_publication.join("sql-test.toml"),
+            format!(
+                r#"[env]
+fixture_env_file = {env_file:?}
+iceberg_catalog_warehouse = "s3://novarocks/isolated/catalog"
+iceberg_test_warehouse = "s3://novarocks/isolated/test"
+"#
+            ),
+        )
+        .unwrap();
         let projection =
             FixtureEndpoints::from_isolated(&endpoints, &identity, env_file.clone()).unwrap();
         let child = projection.project(&mut config);
+        assert_eq!(config.values["iceberg_catalog_type"], "hadoop");
+        assert_eq!(config.values["env.iceberg_catalog_type"], "hadoop");
+        for (key, expected) in [
+            (
+                "iceberg_catalog_warehouse",
+                "s3://novarocks/isolated/catalog",
+            ),
+            ("iceberg_test_warehouse", "s3://novarocks/isolated/test"),
+        ] {
+            for alias in [
+                key.to_string(),
+                format!("env.{key}"),
+                format!("env.oss.{key}"),
+            ] {
+                assert_eq!(config.values[&alias], expected, "{alias}");
+            }
+        }
         for (key, expected) in FIXTURE_COMMON_KEYS.iter().zip(&projection.values) {
             for alias in [
                 key.to_string(),
@@ -1195,6 +1263,14 @@ oss_sk = "fixture-secret"
             })
             .collect();
         assert_eq!(captured, child);
+        assert_eq!(
+            captured["CATALOG_WAREHOUSE_URI"],
+            "s3://novarocks/isolated/catalog"
+        );
+        assert_eq!(
+            captured["NOVAROCKS_ICEBERG_TEST_WAREHOUSE"],
+            "s3://novarocks/isolated/test"
+        );
         assert_eq!(captured["AWS_S3_ENDPOINT"], endpoints.minio_endpoint);
         assert_eq!(captured["AWS_S3_ACCESS_KEY_ID"], identity.access_key_id);
         assert_eq!(captured["MINIO_ROOT_USER"], identity.access_key_id);
@@ -1486,9 +1562,34 @@ paimon_object_store_credential_generation = "v1"
     fn cloud_fixture_rejects_minio_and_vended_scenarios_before_launch() {
         let (directory, config) = node_local_config();
         assert!(FixtureEndpoints::preflight_cloud(&config, &["iceberg-rest".into()]).is_ok());
+        let (_local_directory, local_path) = configured_fixture();
+        let local_config = load_runner_config(Some(&local_path)).unwrap();
+        for suite in crate::LOCAL_ISOLATED_REST_CATALOG_SUITES {
+            let selected = vec![(*suite).to_string()];
+            assert!(
+                !crate::isolated_rest_catalog_selection(&config, &selected).unwrap(),
+                "{suite}: node-local storage must retain its original path"
+            );
+            assert!(
+                crate::isolated_rest_catalog_selection(&local_config, &selected).unwrap(),
+                "{suite}: local MinIO must select an original private fixture"
+            );
+        }
         for suite in ["iceberg-ivm", "mv-publication-v11", "paimon"] {
             assert!(FixtureEndpoints::preflight_cloud(&config, &[suite.into()]).is_err());
         }
+        for invalid in ["", "unknown"] {
+            let mut changed = local_config.clone();
+            project_fixture_value(&mut changed, "fixture_object_store_kind", invalid);
+            assert!(
+                crate::isolated_rest_catalog_selection(&changed, &["iceberg-rest".into()]).is_err()
+            );
+        }
+        let mut mixed = config.clone();
+        mixed
+            .values
+            .insert("env.oss.fixture_object_store_kind".into(), "minio".into());
+        assert!(crate::isolated_rest_catalog_selection(&mixed, &["iceberg-rest".into()]).is_err());
         let source = directory.path().join("vended.sql");
         fs::write(&source, r#"CREATE EXTERNAL CATALOG c PROPERTIES ("credential.object-store-data.mode" = "vended");"#).unwrap();
         assert!(

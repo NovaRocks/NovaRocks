@@ -378,7 +378,7 @@ mod tests {
             vec![
                 TokenKind::Keyword(Keyword::Show),
                 TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Keyword(Keyword::Backends),
+                TokenKind::Ident,
                 TokenKind::Trivia(TriviaKind::Whitespace),
                 TokenKind::Keyword(Keyword::As),
                 TokenKind::Trivia(TriviaKind::Whitespace),

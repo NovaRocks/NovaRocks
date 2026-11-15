@@ -112,29 +112,6 @@ impl RefreshCtx {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MvListRow {
-    pub name: String,
-    pub database: String,
-    pub storage_engine: String,
-    pub refresh_mode: String,
-    pub last_refresh_time: Option<String>,
-    pub last_refresh_rows: Option<String>,
-    pub base_tables: String,
-    pub select_text: String,
-    pub dependencies: String,
-    pub refresh_paused: String,
-    pub next_refresh_time: Option<String>,
-    pub last_scheduler_error: Option<String>,
-    pub max_staleness_ms: Option<String>,
-    pub refresh_state: String,
-    pub retry_after_time: Option<String>,
-    /// Whether this process may manage the target, and why not when it may
-    /// not. A target it can only read is still listed: it is being queried,
-    /// and leaving it out would report it as gone.
-    pub manageability: String,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshErrorKind {
     UserError,

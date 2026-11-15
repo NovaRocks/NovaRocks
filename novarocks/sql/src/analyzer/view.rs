@@ -449,7 +449,7 @@ impl crate::catalog::IcebergMetadataTableProvider for SavedViewCatalog<'_> {
     }
 }
 
-/// Trino 483 TypeCoercion compatibility over the public view type. Its value
+/// Trino TypeCoercion compatibility over the public view type. Its value
 /// nodes are nullable; required MAP keys retain their structural role.
 fn store_compatible(
     source: &ValueTypeRef,

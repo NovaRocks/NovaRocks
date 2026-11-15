@@ -18,7 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,system_catalog
--- Correctness owner: materialized-view. Trino 484 A06/D05/D07/D09/D11/D18
+-- Correctness owner: materialized-view. Trino A06/D05/D07/D09/D11/D18
 -- and E08/E12/E14 provide independent schemas, states and lookup rules.
 -- Accepted differences: storage is the MV's own table, last_fresh_time is
 -- always NULL, and definition preserves the exact user SQL after AS.

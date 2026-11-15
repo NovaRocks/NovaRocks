@@ -21,6 +21,10 @@ set -euo pipefail
 base_ref=${1:?usage: check-against-base.sh <base-ref>}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
+# NOVA_CI_ARTIFACT_RECEIPT must name the last canonical preparation receipt.
+# Consume its verified executable without starting another Cargo graph.
+source "$repo_root/tools/ci/lib/build_capabilities.sh"
+error_manifest="$(REPO_ROOT="$repo_root" ci_bound_binary novarocks-error-manifest)"
 merge_base=$(git -C "$repo_root" merge-base "$base_ref" HEAD)
 ledger_path=tools/error-manifest/error-ledger-v1.tsv
 baseline=$(mktemp)
@@ -32,4 +36,4 @@ else
   printf 'schema_version=0\n' > "$baseline"
 fi
 
-cargo run --quiet --manifest-path "$script_dir/Cargo.toml" -- --check-against "$baseline"
+"$error_manifest" --check-against "$baseline"

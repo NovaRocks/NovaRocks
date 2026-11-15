@@ -1,0 +1,31 @@
+[package]
+name = "novarocks-test-compile-to-execute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+arrow.workspace = true
+novarocks-sql.workspace = true
+novarocks-physical-plan.workspace = true
+novarocks-connector-contract.workspace = true
+novarocks-local-compiler.workspace = true
+novarocks-local-program.workspace = true
+novarocks-functions.workspace = true
+novarocks-type-contract.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []
+
+[dev-dependencies]
+novarocks-execution.workspace = true
+novarocks-sql-testkit.workspace = true
+novarocks-plan-codec.workspace = true
+prost.workspace = true

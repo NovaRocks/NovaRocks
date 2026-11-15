@@ -47,7 +47,7 @@ pub(crate) fn control_storage_base(
         .and_then(|n| {
             n.checked_add(crate::control_storage::arc_bytes::<Vec<DependencyRef>>().ok()?)
         })
-        .and_then(|n| n.checked_mul(5))
+        .and_then(|n| n.checked_mul(WorkClass::ALL.len()))
         .ok_or(WorkError::ArithmeticOverflow)?;
     bytes = bytes
         .checked_add(empty_facts)
@@ -115,13 +115,7 @@ impl WorkloadControl {
                 .map_err(|_| WorkError::Capacity("fixed control inventory"))?;
             let mut claims = BTreeMap::new();
             let mut empty_facts = std::array::from_fn(|_| None);
-            let classes = [
-                WorkClass::Query,
-                WorkClass::MaterializedView,
-                WorkClass::Statistics,
-                WorkClass::TableMaintenance,
-                WorkClass::Management,
-            ];
+            let classes = WorkClass::ALL;
             for (class, _) in classes.iter().enumerate() {
                 let facts = Arc::new(ResponsibilityFacts {
                     key: Arc::new(FactKey {

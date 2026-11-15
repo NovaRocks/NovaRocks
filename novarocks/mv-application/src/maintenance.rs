@@ -24,7 +24,7 @@ use std::{
 };
 
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, runtime::JobHandle,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget,
 };
 
 /// Product policy configuration for process-local automatic MV maintenance.
@@ -167,8 +167,8 @@ pub struct MaintenanceActionFailure {
 pub struct MaintenanceExecutionReport {
     pub evaluation: MaintenanceEvaluation,
     pub completed: Vec<MaintenanceActionKind>,
-    /// The exact OPTIMIZE job whose terminal success was observed, if any.
-    pub optimize_finished_handle: Option<JobHandle>,
+    /// The exact automatic effect whose terminal success was observed, if any.
+    pub optimize_finished_effect_id: Option<MaintenanceEffectId>,
     pub already_active: Vec<MaintenanceActionKind>,
     pub failures: Vec<MaintenanceActionFailure>,
 }
@@ -179,11 +179,10 @@ impl MaintenanceExecutionReport {
     }
 }
 
-/// A durable OPTIMIZE result after the host has waited on the exact job.
-/// Submission alone cannot establish this outcome.
+/// A completed automatic OPTIMIZE result preserving its original effect identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OptimizeDurableOutcome {
-    Finished { handle: JobHandle },
+    Finished { effect_id: MaintenanceEffectId },
     AlreadyActive,
 }
 
@@ -536,7 +535,7 @@ impl MaintenanceCoordinator {
         let mut report = MaintenanceExecutionReport {
             evaluation: attempt.evaluation.clone(),
             completed: Vec::new(),
-            optimize_finished_handle: None,
+            optimize_finished_effect_id: None,
             already_active: Vec::new(),
             failures: Vec::new(),
         };
@@ -570,8 +569,8 @@ impl MaintenanceCoordinator {
                 }
                 AutomaticMaintenanceAction::Optimize => {
                     match runner.optimize_durably(attempt.target.clone()).await {
-                        Ok(OptimizeDurableOutcome::Finished { handle }) => {
-                            report.optimize_finished_handle = Some(handle);
+                        Ok(OptimizeDurableOutcome::Finished { effect_id }) => {
+                            report.optimize_finished_effect_id = Some(effect_id);
                             report.completed.push(kind);
                             continue;
                         }
@@ -859,7 +858,7 @@ mod tests {
         OptimizeDurableOutcome, TablePolicy,
     };
     use novarocks_table_maintenance::{
-        MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, runtime::JobHandle,
+        MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget,
     };
 
     fn facts() -> MvMaintenanceFacts {
@@ -995,7 +994,7 @@ mod tests {
                 expire_error: None,
                 compile_control: None,
                 optimize_outcome: OptimizeDurableOutcome::Finished {
-                    handle: JobHandle::new(7),
+                    effect_id: MaintenanceEffectId::from_bytes([7; 16]),
                 },
                 calls: Vec::new(),
             }
@@ -1084,7 +1083,10 @@ mod tests {
                 MaintenanceActionKind::Optimize
             ]
         );
-        assert_eq!(report.optimize_finished_handle, Some(JobHandle::new(7)));
+        assert_eq!(
+            report.optimize_finished_effect_id,
+            Some(MaintenanceEffectId::from_bytes([7; 16]))
+        );
         let next = coordinator
             .try_begin(1, target("mv"), &policy_facts(), NOW + 1)
             .expect("terminal success must release admission");
@@ -1133,7 +1135,7 @@ mod tests {
                 }]
             );
             assert!(report.completed.is_empty());
-            assert!(report.optimize_finished_handle.is_none());
+            assert!(report.optimize_finished_effect_id.is_none());
 
             let next = coordinator
                 .try_begin(1, target("mv"), &policy_facts(), NOW + 1)

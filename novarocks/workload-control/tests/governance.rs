@@ -164,7 +164,6 @@ fn unpolled_warehouse_roots_and_children_share_the_finite_scope_inventory() {
     for class in [
         WorkClass::Query,
         WorkClass::MaterializedView,
-        WorkClass::Statistics,
         WorkClass::TableMaintenance,
     ] {
         let control = WorkloadControl::try_new_counted(WorkloadConfig {
@@ -1374,7 +1373,7 @@ fn stale_obligation_handle_cannot_resolve_a_new_generation() {
 #[test]
 fn owner_drop_or_handoff_does_not_erase_unresolved_responsibility() {
     let control = control();
-    let work = root(&control, WorkClass::Statistics);
+    let work = root(&control, WorkClass::Query);
     let scope = work.owner.scope();
     let unknown = scope
         .register_obligation(key(1), ObligationKind::UnknownCreate)

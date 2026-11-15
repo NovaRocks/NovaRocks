@@ -352,20 +352,10 @@ pub struct QueryMeta {
     /// After this step, assert that the fixture object for `iceberg_orphan_fixture`
     /// is absent. This keeps the object-store assertion outside SQL result text.
     pub iceberg_orphan_fixture_absent: bool,
-    /// After the step SQL executes, poll `SHOW ALTER TABLE COLUMN` until FINISHED.
-    /// Value is the table name.
-    pub wait_alter_column: Option<String>,
-    /// After the step SQL executes, poll `SHOW ALTER TABLE ROLLUP` until FINISHED.
-    /// Value is the table name.
-    pub wait_alter_rollup: Option<String>,
-    /// After the step SQL executes, poll `SHOW ALTER TABLE OPTIMIZE` until FINISHED.
-    /// Value is the table name.
-    pub wait_alter_optimize: Option<String>,
     /// After the step SQL executes (verify mode), assert the named MV's
     /// incremental contents equal a full recompute derived by running the MV's
-    /// SelectText (from `SHOW MATERIALIZED VIEWS`) directly against its base
-    /// tables. Value is the MV name (qualified by the step/case db like
-    /// wait_alter_*).
+    /// persisted definition (from `system.metadata.materialized_views`) directly
+    /// against its base tables. Value is the MV name, qualified by the step/case db.
     pub imv_equivalence_check: Option<String>,
     /// After the step SQL executes (verify mode), assert that the named MV
     /// can be rebuilt statelessly at the requested fidelity level (default

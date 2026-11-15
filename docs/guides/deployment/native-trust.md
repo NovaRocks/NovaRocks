@@ -167,7 +167,7 @@ client certificate；每条新连接验证 server certificate，每个 RPC 仍�
    IP/DNS reference；automatic 必须能生成该 SAN，PEM 的 explicit roots 必须验证它。
 4. 停止所有 Native role，替换配置和受保护的 secret/PEM material，然后启动全部 BE，最后启动 FE。
 5. 检查每个 role 的 `native_trust_ready` startup log（可出现 deployment id、transport mode，绝不能
-   出现 secret 或 token），执行 `SHOW BACKENDS` 和一条真实分布式查询。
+   出现 secret 或 token），通过 FE 管理 HTTP 端口访问 `GET /v1/frontend/backends`，核对 `identity_verified`、`eligible`，再执行一条真实分布式查询。
 
 secret、deployment id、transport mode 或 PEM material 的变更都是 **restart-only**。当前版本没有
 secret/certificate hot reload、old/new secret overlap、rolling upgrade 或 per-node transport revocation。轮换时

@@ -124,6 +124,7 @@ impl StatementAdmission {
         ) {
             StatementOutputShape::Rows
         } else if kind.is_row_kind()
+            || kind == StatementKind::Optimize
             || matches!(
                 statement,
                 Statement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(alter))

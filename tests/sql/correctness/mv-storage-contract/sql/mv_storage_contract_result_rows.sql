@@ -64,10 +64,10 @@ REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
 
 -- query 8
 -- @skip_result_check=true
--- @result_rows_where=Name=rows_mv
+-- @result_rows_where=name=rows_mv
 -- @result_rows_count=1
--- @result_rows_expect=LastRefreshRows=1
-SHOW MATERIALIZED VIEWS;
+-- @result_rows_expect=last_refresh_rows=1
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvrows_${uuid0}';
 
 -- query 9
 SELECT k, v FROM rows_mv ORDER BY k;
@@ -84,10 +84,10 @@ REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
 
 -- query 12
 -- @skip_result_check=true
--- @result_rows_where=Name=rows_mv
+-- @result_rows_where=name=rows_mv
 -- @result_rows_count=1
--- @result_rows_expect=LastRefreshRows=2
-SHOW MATERIALIZED VIEWS;
+-- @result_rows_expect=last_refresh_rows=2
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvrows_${uuid0}';
 
 -- query 13
 SELECT k, v FROM rows_mv ORDER BY k;
@@ -101,10 +101,10 @@ REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
 
 -- query 15
 -- @skip_result_check=true
--- @result_rows_where=Name=rows_mv
+-- @result_rows_where=name=rows_mv
 -- @result_rows_count=1
--- @result_rows_expect=LastRefreshRows=2
-SHOW MATERIALIZED VIEWS;
+-- @result_rows_expect=last_refresh_rows=2
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvrows_${uuid0}';
 
 -- query 16
 SELECT k, v FROM rows_mv ORDER BY k;
@@ -121,10 +121,10 @@ REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
 
 -- query 19
 -- @skip_result_check=true
--- @result_rows_where=Name=rows_mv
+-- @result_rows_where=name=rows_mv
 -- @result_rows_count=1
--- @result_rows_expect=LastRefreshRows=0
-SHOW MATERIALIZED VIEWS;
+-- @result_rows_expect=last_refresh_rows=0
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvrows_${uuid0}';
 
 -- query 20
 SELECT COUNT(*) AS row_count FROM rows_mv;

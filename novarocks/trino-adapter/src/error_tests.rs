@@ -27,9 +27,9 @@ use novarocks_user_error::{
     ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserErrorLocation,
 };
 
-// Independent oracle transcribed from Trino tag 483 StandardErrorCode.java.
+// Independent oracle transcribed from the semantic baseline's Trino StandardErrorCode.
 // Each emitted name must have exactly this number and error type.
-const TRINO_483: &[(&str, i32, &str)] = &[
+const TRINO_STANDARD_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("GENERIC_USER_ERROR", 0, "USER_ERROR"),
     ("SYNTAX_ERROR", 1, "USER_ERROR"),
     ("ABANDONED_QUERY", 2, "USER_ERROR"),
@@ -46,6 +46,7 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("NUMERIC_VALUE_OUT_OF_RANGE", 19, "USER_ERROR"),
     ("QUERY_TEXT_TOO_LARGE", 35, "USER_ERROR"),
     ("ADMINISTRATIVELY_KILLED", 38, "USER_ERROR"),
+    ("INVALID_ANALYZE_PROPERTY", 42, "USER_ERROR"),
     ("CATALOG_NOT_FOUND", 44, "USER_ERROR"),
     ("SCHEMA_NOT_FOUND", 45, "USER_ERROR"),
     ("TABLE_NOT_FOUND", 46, "USER_ERROR"),
@@ -77,10 +78,10 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("EXCEEDED_TIME_LIMIT", 131075, "INSUFFICIENT_RESOURCES"),
 ];
 fn assert_wire(error: &TrinoQueryError, name: &str) {
-    let (_, number, kind) = TRINO_483
+    let (_, number, kind) = TRINO_STANDARD_ERROR_CODES
         .iter()
         .find(|(candidate, _, _)| *candidate == name)
-        .expect("name in Trino 483 oracle");
+        .expect("name in Trino StandardErrorCode oracle");
     assert_eq!(
         (error.error_name, error.error_code, error.error_type),
         (name, *number, *kind)
@@ -95,6 +96,21 @@ fn retired_metadata_commands_are_syntax_errors_at_the_trino_boundary() {
         "SHOW VIEWS IN x",
         "SHOW BASIC STATS META",
         "SHOW HISTOGRAM STATS META",
+        "SHOW ALTER TABLE OPTIMIZE",
+        "SHOW ANALYZE",
+        "SHOW ANALYZE JOBS",
+        "SHOW TABLE STATS t",
+        "SHOW MATERIALIZED VIEWS",
+        "SHOW BACKENDS",
+        "CANCEL ANALYZE 1",
+        "KILL ANALYZE 1",
+        "ADMIN RAISE ENGINE ERROR 'CommitUnknown'",
+        "DROP STATS t",
+        "DROP HISTOGRAM ON t (c)",
+        "DROP MULTIPLE COLUMNS STATS t",
+        "ANALYZE FULL TABLE t",
+        "ANALYZE SAMPLE TABLE t",
+        "ANALYZE TABLE t WITH SYNC MODE",
     ] {
         let parse = novarocks_parser::parse(sql)
             .expect_err("retired metadata command must fail in parsing");
@@ -110,7 +126,7 @@ fn retired_metadata_commands_are_syntax_errors_at_the_trino_boundary() {
 }
 
 #[test]
-fn query_text_too_large_has_the_frozen_trino_483_identity_without_text_classification() {
+fn query_text_too_large_has_the_frozen_trino_identity_without_text_classification() {
     let error = query_error(TrinoErrorSource::QueryTextTooLarge {
         message: "opaque admission fact",
     });
@@ -150,6 +166,7 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
         "sql.analyze.invalid_literal" => "INVALID_LITERAL",
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
+        "sql.analyze.invalid_analyze_property" => "INVALID_ANALYZE_PROPERTY",
         "sql.analyze.too_many_arguments" => "TOO_MANY_ARGUMENTS",
         "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => "GENERIC_USER_ERROR",
         "query.execution.merge_target_row_multiple_matches"
@@ -563,7 +580,7 @@ fn integer_data_reasons_survive_execution_and_service_projection() {
     use novarocks_execution_contract::failure::{FailureReason, domain};
     use std::num::NonZeroU16;
 
-    // Stable function facts, independently paired with the Trino 483 oracle.
+    // Stable function facts, independently paired with the Trino oracle.
     for (reason, expected) in [(41, "NUMERIC_VALUE_OUT_OF_RANGE"), (43, "DIVISION_BY_ZERO")] {
         let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
             FailureFact::new(

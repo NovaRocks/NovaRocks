@@ -392,6 +392,25 @@ pub fn render_session_double(value: f64) -> Result<String, RenderError> {
             required: None,
         })
 }
+/// Render a SQL real using the same Java-compatible author as Trino JSON.
+/// Non-finite values have their Java text spelling, without JSON quotes.
+pub fn java_float_text(value: f32) -> Result<String, RenderError> {
+    let atom = trino_json::float32(value, &mut Budget::new())?;
+    let bytes = &atom.data[..atom.len];
+    let bytes = if value.is_finite() {
+        bytes
+    } else {
+        &bytes[1..bytes.len() - 1]
+    };
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| RenderError {
+            kind: crate::RenderErrorKind::CursorInvariant,
+            output_ordinal: None,
+            required: None,
+        })
+}
+
 impl Budget {
     fn new() -> Self {
         Self {

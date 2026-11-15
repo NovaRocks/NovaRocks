@@ -10,9 +10,15 @@ import json
 import os
 import platform as host_platform
 import re
+import signal
 import subprocess
+import sys
+import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 
 class FixtureInputError(RuntimeError):
@@ -88,6 +94,19 @@ def read_recommendations(path: Path) -> dict[str, Any]:
                     raise FixtureInputError(f"invalid fixture variant: {kind}/{name}/{target}")
                 if variant.get("platform", target) != target:
                     raise FixtureInputError(f"fixture variant platform mismatch: {kind}/{name}/{target}")
+                if kind == "images":
+                    image = {**item, **variant}
+                    if ("creation_check" in image
+                            and image["creation_check"] != "trino-cli-version"):
+                        raise FixtureInputError(f"unknown fixture creation_check: {name}/{target}")
+                    if "jdbc_artifact" in image:
+                        artifact_name = image["jdbc_artifact"]
+                        artifact = lock["artifacts"].get(artifact_name) if isinstance(artifact_name, str) else None
+                        if not isinstance(artifact, dict) or not isinstance(artifact.get("url"), str):
+                            raise FixtureInputError(f"fixture JDBC artifact is missing: {name}/{target}")
+                        parts = urlsplit(artifact["url"]).path.split("/")
+                        if len(parts) < 3 or parts[-2] != image.get("version"):
+                            raise FixtureInputError(f"fixture JDBC artifact version mismatch: {name}/{target}")
     for name, declaration in lock["derived_images"].items():
         for variant in declaration["variants"].values():
             item = {**{key: value for key, value in declaration.items() if key != "variants"}, **variant}
@@ -368,6 +387,124 @@ def run(
         detail = (result.stderr or result.stdout or "").strip() if capture else ""
         raise FixtureInputError(f"command failed ({result.returncode}): {' '.join(command)} {detail}".strip())
     return result.stdout if capture else ""
+
+
+def confirm_container_absent(cid: str, *, timeout_seconds: int) -> None:
+    """Only an explicit Docker absence proves the owned container is removed."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FixtureInputError(f"container still present after {timeout_seconds}s: {cid}")
+        try:
+            result = subprocess.run(["docker", "container", "inspect", cid],
+                text=True, capture_output=True, check=False, timeout=remaining)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise FixtureInputError(f"cannot confirm container removal: {cid}: {error}") from error
+        if result.returncode:
+            if result.stderr.strip().lower().startswith((
+                    "error response from daemon: no such container:", "error: no such container:")):
+                return
+            raise FixtureInputError(f"cannot confirm container removal: {cid}: {result.stderr.strip()}")
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+
+
+def run_owned_check(image_id: str, platform: str, *, timeout_seconds: int = 180, work_dir: Path | None = None
+                    ) -> subprocess.CompletedProcess[str]:
+    # Design: docs/adr/ADR-0231-reference-inputs-declared-once-and-bound-per-run.md
+    """Retain exact container custody through client exit and confirmed removal.
+
+    A missing cidfile after dispatch leaves creation unknown. Retain that work
+    directory for investigation rather than claiming that client exit removed it.
+    """
+    work = Path(tempfile.mkdtemp(prefix="fixture-image-check-", dir=work_dir))
+    cidfile = work / "container-id"
+    command = ["docker", "run", "--rm", "--pull", "never", "--platform", platform,
+               "--cidfile", str(cidfile), "--entrypoint", "trino", image_id, "--version"]
+    proc = None
+    primary = None
+    stdout, stderr = "", ""
+    previous_term = None
+    previous_int = None
+    pending_term = None
+    handle_term = threading.current_thread() is threading.main_thread()
+
+    def terminated(signum, frame):
+        nonlocal pending_term
+        pending_term = signum
+        if proc is not None:
+            raise FixtureInputError(f"command cancelled by {signal.Signals(signum).name}")
+
+    if handle_term:
+        previous_term = signal.signal(signal.SIGTERM, terminated)
+        previous_int = signal.signal(signal.SIGINT, terminated)
+    try:
+        try:
+            print(f"Checking fixture image creation: {' '.join(command)}", file=sys.stderr, flush=True)
+            proc = subprocess.Popen(command, text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, start_new_session=True)
+            if pending_term is not None:
+                terminated(pending_term, None)
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+            if proc.returncode:
+                primary = f"command failed ({proc.returncode})"
+        except (subprocess.TimeoutExpired, KeyboardInterrupt, OSError, FixtureInputError) as error:
+            primary = (f"command timed out after {timeout_seconds}s" if isinstance(error, subprocess.TimeoutExpired)
+                       else f"command interrupted: {error.__class__.__name__}: {error}")
+        finally:
+            # Further cancellation must not interrupt custody settlement.
+            if handle_term:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                stdout, stderr = proc.communicate()
+            try:
+                cid = cidfile.read_text().strip() if cidfile.exists() else ""
+                if cid and not re.fullmatch(r"[0-9a-f]{64}", cid):
+                    raise FixtureInputError(f"invalid owned container identity: {cidfile}")
+                if not cid:
+                    cleanup = ("not started" if proc is None else
+                               f"creation outcome unknown (no container ID); retained {work}")
+                    if primary is None:
+                        primary = "command returned without an owned container ID"
+                else:
+                    removal_error = None
+                    if primary:
+                        try:
+                            run(["docker", "rm", "-f", cid], capture=True, timeout_seconds=timeout_seconds)
+                        except FixtureInputError as error:
+                            removal_error = str(error)
+                    try:
+                        confirm_container_absent(cid, timeout_seconds=timeout_seconds)
+                    except FixtureInputError as error:
+                        if primary is not None:
+                            raise FixtureInputError(f"{removal_error}; {error}" if removal_error else str(error)) from error
+                        primary = f"initial removal confirmation failed: {error}"
+                        run(["docker", "rm", "-f", cid], capture=True, timeout_seconds=timeout_seconds)
+                        confirm_container_absent(cid, timeout_seconds=timeout_seconds)
+                    cleanup = f"confirmed absent: {cid}"
+                    if removal_error:
+                        cleanup += f"; removal command failed: {removal_error}"
+            except (FixtureInputError, OSError) as error:
+                cleanup = f"failed: {error}; retained {work}"
+                if primary is None:
+                    primary = "container removal was not confirmed"
+        detail = (f"{' '.join(command)}; stdout={stdout!r}; stderr={stderr!r}; cleanup={cleanup}")
+        if primary:
+            raise FixtureInputError(f"{primary}: {detail}")
+        cidfile.unlink()
+        work.rmdir()
+        print(f"Fixture image creation check exited: stdout={stdout!r}; stderr={stderr!r}; cleanup={cleanup}",
+              file=sys.stderr, flush=True)
+        return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    finally:
+        if handle_term:
+            signal.signal(signal.SIGTERM, previous_term)
+            signal.signal(signal.SIGINT, previous_int)
 
 
 def inspect_image(reference: str) -> Mapping[str, Any] | None:

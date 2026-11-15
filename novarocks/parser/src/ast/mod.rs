@@ -17,7 +17,6 @@
 
 //! Syntax-only SQL abstract syntax tree nodes.
 
-pub(crate) mod backend;
 pub(crate) mod catalog;
 pub(crate) mod command;
 pub(crate) mod dml;
@@ -36,7 +35,6 @@ pub(crate) mod view;
 mod visit;
 mod window;
 
-pub use backend::ShowBackends;
 pub use catalog::{
     CatalogProperty, CatalogStatement, CreateCatalog, CreateDatabase, DropCatalog, DropDatabase,
     DropTable, ShowCreateTable, TruncateTable,
@@ -65,8 +63,7 @@ pub use iceberg::{
 pub use maintenance::{
     CallStatement, ExpireSnapshots, ExpireSnapshotsOption, MaintenanceStatement, MaintenanceValue,
     OptimizeTable, ProcedureArgument, ProcedureArgumentMode, ProcedureMap, ProcedureMapEntry,
-    RemoveOrphanFiles, RewriteManifests, ShowAlterTableOptimize, ShowOptimizeFilter,
-    ShowOptimizeOrder, SortDirection,
+    RemoveOrphanFiles, RewriteManifests,
 };
 pub use materialized_view::{
     AlterMaterializedView, CreateMaterializedView, DropMaterializedView,
@@ -74,7 +71,6 @@ pub use materialized_view::{
     MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
     MaterializedViewPartitionField, MaterializedViewProperty, MaterializedViewRefreshMode,
     MaterializedViewRefreshPolicy, MaterializedViewStatement, RefreshMaterializedView,
-    ShowMaterializedViews,
 };
 pub use query::{
     Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, Offset, OffsetRows, OrderByExpr, Query,
@@ -90,10 +86,7 @@ pub use session::{
     KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement,
     TransactionControlKind, TransactionControlStatement, UseStatement,
 };
-pub use statistics::{
-    AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats, DropStats,
-    ShowAnalyzeJobs, ShowTableStats, StatisticsStatement,
-};
+pub use statistics::{AnalyzeTable, ShowStats, StatisticsStatement};
 pub use table::{
     ColumnDefinition, CreateTable, LegacyRangePartition, LegacyRangePartitionDefinition,
     PartitionTransform, TableDistribution, TableKey, TableKeyKind, TablePartition,
@@ -103,11 +96,10 @@ pub use validate::{validate_statement, validate_statements};
 pub use view::{CreateView, DropView, ShowCreateView, ViewStatement};
 pub use visit::{
     Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_literal,
-    fold_nested_expr, fold_object_name, fold_query, fold_select, fold_show_backends,
-    fold_statement, fold_table_factor, fold_type_name, fold_unary_expr, fold_view_statement,
-    walk_binary_expr, walk_expr, walk_function_call, walk_ident, walk_literal, walk_nested_expr,
-    walk_object_name, walk_query, walk_show_backends, walk_statement, walk_table_factor,
-    walk_type_name, walk_unary_expr, walk_view_statement,
+    fold_nested_expr, fold_object_name, fold_query, fold_select, fold_statement, fold_table_factor,
+    fold_type_name, fold_unary_expr, fold_view_statement, walk_binary_expr, walk_expr,
+    walk_function_call, walk_ident, walk_literal, walk_nested_expr, walk_object_name, walk_query,
+    walk_statement, walk_table_factor, walk_type_name, walk_unary_expr, walk_view_statement,
 };
 pub use window::{
     NamedWindow, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
@@ -118,7 +110,6 @@ use crate::Span;
 /// A top-level SQL statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
-    ShowBackends(ShowBackends),
     ShowProcessList(ShowProcessList),
     Statistics(StatisticsStatement),
     Catalog(CatalogStatement),
@@ -136,7 +127,6 @@ pub enum Statement {
 impl Statement {
     pub const fn span(&self) -> Span {
         match self {
-            Self::ShowBackends(statement) => statement.span,
             Self::ShowProcessList(statement) => statement.span,
             Self::Statistics(statement) => statement.span(),
             Self::Catalog(statement) => statement.span(),
@@ -244,7 +234,10 @@ mod tests {
             span: span(8, 10),
         };
         let expression = Expr::Literal(literal.clone());
-        let statement = Statement::ShowBackends(ShowBackends { span: span(11, 24) });
+        let statement = Statement::ShowProcessList(ShowProcessList {
+            full: false,
+            span: span(11, 24),
+        });
 
         assert_eq!(name.span, span(0, 7));
         assert_eq!(type_name.span, span(0, 7));

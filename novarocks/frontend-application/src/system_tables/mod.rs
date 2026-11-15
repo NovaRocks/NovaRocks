@@ -25,10 +25,10 @@ mod source;
 use batch::build_system_table_batch;
 pub(crate) use construction::{RowStage, SystemTableCpuStaging, control_error};
 pub(crate) use pinned_catalog::PinnedCatalogListing;
-pub(crate) use provider::FrontendSystemTableProvider;
+pub(crate) use provider::{FrontendSystemTableProvider, materialized_view_states_registration};
 pub(crate) use source::{
     ListableMaterializedViews, MaterializedViewFacts, MaterializedViewInventory,
-    StatementSystemTableSource, repository_error,
+    StatementSystemTableSource, SystemValueRef, repository_error,
 };
 #[cfg(test)]
 mod tests;

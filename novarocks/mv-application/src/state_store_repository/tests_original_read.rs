@@ -234,12 +234,7 @@ async fn explicit_view_uses_original_snapshot_for_inventory_lookup_and_dependenc
         Some(first.clone())
     );
     let dependencies = view
-        .list_keyed_dependencies_by_downstream_bounded(
-            &first,
-            MvDependencyReadBound {
-                ..dependency_bound()
-            },
-        )
+        .list_keyed_dependencies_by_downstream(&first)
         .await
         .unwrap();
     assert!(!dependencies.is_empty());
@@ -252,12 +247,6 @@ async fn explicit_view_uses_original_snapshot_for_inventory_lookup_and_dependenc
     let ranges = trace.ranges.lock().unwrap();
     assert!(ranges.iter().all(|request| request.page_size == 1));
     assert!(ranges.iter().any(|request| request.continuation.is_some()));
-}
-fn dependency_bound() -> MvDependencyReadBound {
-    MvDependencyReadBound {
-        entries: 32,
-        collection_bytes: 1024 * 1024,
-    }
 }
 
 #[tokio::test]
@@ -554,7 +543,7 @@ async fn original_write_view_preserves_guarded_cas_dependency_indexes_and_delete
         Some(replaced.clone())
     );
     let dependencies = view
-        .list_keyed_dependencies_by_downstream_bounded(&replaced, dependency_bound())
+        .list_keyed_dependencies_by_downstream(&replaced)
         .await
         .unwrap();
     assert!(!dependencies.is_empty());

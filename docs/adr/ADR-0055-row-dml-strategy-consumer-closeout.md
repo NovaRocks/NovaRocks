@@ -6,9 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
-  - id: ADR-0231
+  - id: ADR-0233
     scope: "Property-selected COW UPDATE/MERGE and COW source/activation consumers retire; Provider strategy ownership, SQL predicate legality and MOR facts remain active"
-    link: "ADR-0231-iceberg-mor-only-and-provider-owned-write-validation.md"
+    link: "ADR-0233-iceberg-mor-only-and-provider-owned-write-validation.md"
   - id: ADR-0178
     scope: "Decision 5 and compromise 3: divergent Variant write target carriers are replaced by frozen storage schema and early denial; strategy ownership remains active"
     link: "ADR-0178-iceberg-write-type-boundary-and-variant-layering.md"

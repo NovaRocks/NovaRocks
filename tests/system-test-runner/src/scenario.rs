@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use novarocks_cluster_harness::reference_inputs::{ReferenceInput, ResolvedReference};
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessCluster, CrossProcessConfigOverlay,
     CrossProcessNativeFaultProxyConfig, CrossProcessRootReplyFaultConfig, LaunchProfile,
@@ -60,6 +61,11 @@ pub trait Scenario: Send + Sync {
         &[ScenarioBinary::Primary]
     }
 
+    /// Released-reference components resolved once before any selected scenario starts.
+    fn reference_inputs(&self) -> &'static [ReferenceInput] {
+        &[]
+    }
+
     fn child_environment(&self) -> CrossProcessChildEnvironment {
         CrossProcessChildEnvironment::default()
     }
@@ -114,6 +120,8 @@ pub trait Scenario: Send + Sync {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ScenarioDeclaration {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reference_inputs: Vec<ReferenceInput>,
     pub impact: ScenarioImpact,
     pub env_inputs: Vec<ScenarioEnvironmentInput>,
     pub initial_state: Option<&'static str>,
@@ -164,6 +172,7 @@ pub struct ScenarioLaunchConfig {
 }
 
 pub struct ScenarioContext {
+    reference: ResolvedReference,
     build: crate::build_information::BuildInformation,
     name: &'static str,
     handle: CrossProcessCluster,
@@ -251,6 +260,7 @@ pub struct ScenarioPhaseObservation {
 }
 
 pub(crate) struct ScenarioContextParams {
+    pub reference: ResolvedReference,
     pub name: &'static str,
     pub handle: CrossProcessCluster,
     pub scenario_root: PathBuf,
@@ -269,6 +279,7 @@ pub(crate) struct ScenarioContextParams {
 impl ScenarioContext {
     pub(crate) fn new(params: ScenarioContextParams) -> Self {
         let ScenarioContextParams {
+            reference,
             name,
             handle,
             scenario_root,
@@ -284,6 +295,7 @@ impl ScenarioContext {
             build,
         } = params;
         Self {
+            reference,
             build,
             name,
             handle,
@@ -301,6 +313,10 @@ impl ScenarioContext {
             launch_profile,
             started_at: SystemTime::now(),
         }
+    }
+
+    pub fn reference(&self) -> &ResolvedReference {
+        &self.reference
     }
 
     pub fn name(&self) -> &'static str {

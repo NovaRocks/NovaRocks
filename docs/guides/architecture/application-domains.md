@@ -38,17 +38,19 @@ ADR-0198 的统一执行契约已接受；源码索引反映旧同步协调路�
 Provider rewrite session 保管在 `query_execution/distributed_rewrite.rs`，空的
 `QueryExecutionService` 及其注入链已退役。
 原 credentials、RF 与 Profile 的共享事实/作者仍由实际消费者保留。
-Statistics 的现有 Action 入口在 `statistics_jobs/{service,attempt_executor}.rs`：前台 capture 实际关闭
-CPU/Provider 后，把原 query permit 移交给同 job 稳定槽，再通知原 worker；后台沿共享计算 owner
-推进。`query_execution/internal_result_cpu/scoped_statistics.rs` 持封闭 scoped CPU source，
+Statistics 的 Action 与只读入口在 Frontend 的
+`statistics/{application,attempt_executor,service,read,publication}.rs`：ANALYZE 在同一语句的 Internal Root、
+冻结会话设置与 query permit 下 capture、计算并发布；首次 capture 的完整 binding 原样交给 attempt，
+不建立后台 job 或串行 worker，不移交许可。空表无统计产物时成功完成但不发布 Puffin。`query_execution/internal_result_cpu/scoped_statistics.rs` 持封闭 scoped CPU source，
 `query_execution/statistics/preparation.rs` 保留原准备访问，`query_execution/internal_consumer/decoded.rs`
 在 Ready payload 移交前取得原 statement retention。
 
-维护 SQL 的实际 Action 选择位于 `query/maintenance_action.rs`；后台 Rewrite 与 Cleanup 原来源在
-`query_execution/maintenance/{rewrite_job,cleanup_action}.rs`，共享产品算法仍在
+维护 SQL 的实际 Action 选择位于 `query/maintenance_action.rs`；OPTIMIZE 复用
+`query_execution/maintenance/rewrite_job/direct.rs` 的原语句重写作者，Cleanup 原来源在
+`query_execution/maintenance/cleanup_action.rs`，共享产品算法仍在
 `novarocks/table-maintenance/src/product.rs`。`query/mv_action.rs` 保管同 SQL Root 的多步骤 MV
 编排，数据步骤借共享 Native 计算，控制/publication 由相应原 Source 推进；
-`query/mv_read_action.rs` 保只读 SHOW/EXPLAIN 与原本地结果交接。MV 后台由
+`query/mv_read_action.rs` 保只读 EXPLAIN 与原本地结果交接；MV 状态由类型化系统表 Source 提供。MV 后台由
 `mv-application/src/process_runtime.rs` 的异步任务保原事件与 Join，Frontend 的
 `mv/service/background_original.rs` 保稳定调度 Source/同 Root。`MvProductOperations` 与唯一
 runtime wrapper 分开，仍共用同业务闸门和调度状态，不弱化 Unknown 保管来断开强引用循环。
@@ -72,7 +74,7 @@ runtime wrapper 分开，仍共用同业务闸门和调度状态，不弱化 Unk
 | Worker | `novarocks-worker` | BE 本地 Task/Participation 准入、租约、入站围栏、实际停止与收敛 | FE 观察、编译、逻辑恢复政策或产品状态 |
 | Workload Control | `novarocks-workload-control` | 进程内 scope、责任/完整依赖事实及原结果预算授权 | MV/Statistics/Maintenance 的业务锁、外部提交或 durable truth |
 | Catalog Application | `novarocks-catalog-application` | 长期 Catalog generation 与退休 | 查询局部 compiler 映射或 Connector execution instance |
-| 产品应用 | MV、Statistics、Maintenance application crates | 业务状态、外部效果、发布与业务恢复决定 | Query Application 的通用协调 policy |
+| 产品应用 | MV、Maintenance 产品与 Frontend statistics 模块 | 业务状态、外部效果、发布与业务恢复决定 | Query Application 的通用协调 policy |
 | Native/Trino adapter | `novarocks-native-adapter`、`novarocks-trino-adapter` | wire/协议 decode、encode、连接与 transport 事实 | 领域业务 policy 或全局 service locator |
 | Server | `novarocks-server` | 配置验证、唯一 owner 构造、窄 handle 注入与逆序 shutdown | SQL/Task wire 的业务解释或查询执行 policy |
 

@@ -360,7 +360,7 @@ fn map_resolution_failure(error: StatisticsResolutionFailure) -> DmlStatisticsFa
 /// collection fails closed as a whole: `finish_visible_row` rejects the
 /// result when any requested metric produced nothing, so two requesters that
 /// disagree about what is askable do not degrade one column, they discard the
-/// table. Read paths such as `SHOW TABLE STATS` are free to ask about a metric
+/// table. Read paths such as `SHOW STATS FOR` are free to ask about a metric
 /// that cannot exist, since an unavailable answer is a fine answer to a
 /// question about what is known.
 pub(crate) fn visible_row_metric_request<'a>(

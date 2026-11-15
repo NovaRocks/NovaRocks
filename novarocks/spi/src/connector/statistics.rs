@@ -1166,6 +1166,57 @@ impl fmt::Debug for StatisticsReceipt {
     }
 }
 
+/// Provider-authored statistics presentation identity. These facts come from
+/// the source declaration, not from the normalized Arrow carrier (which can
+/// intentionally erase a timestamp's time zone or a fixed binary domain).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatisticsSummaryColumnType {
+    Boolean,
+    Integer,
+    Real,
+    Double,
+    Decimal { scale: u32 },
+    Date,
+    Timestamp { precision: u8, with_time_zone: bool },
+    Varchar,
+    Varbinary,
+    FixedBinary { width: u64 },
+    Time,
+    Uuid,
+    Complex,
+}
+
+/// Raw optional manifest and registered-Puffin facts for one visible top-level
+/// column. Missing optional file metrics remain unknown; counts are physical
+/// and do not subtract delete files. Bounds use the source type's statistics
+/// representation: ordinary timestamps in microseconds, zoned ones in millis.
+#[derive(Clone, Debug)]
+pub struct StatisticsSummaryColumn {
+    pub name: Arc<str>,
+    pub value_type: novarocks_type_contract::FunctionValueType,
+    pub column_type: StatisticsSummaryColumnType,
+    pub null_count: Option<u64>,
+    pub column_size: Option<u64>,
+    pub lower_bound: Option<f64>,
+    pub upper_bound: Option<f64>,
+    pub ndv: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TableStatisticsSummary {
+    pub row_count: u64,
+    pub columns: Vec<StatisticsSummaryColumn>,
+}
+
+/// The summary and physical object binding come from the same metadata
+/// observation. FE policy consumers may inspect application documents through
+/// that binding without resolving the table name a second time.
+#[derive(Clone)]
+pub struct StatisticsSummaryReadResult {
+    pub summary: TableStatisticsSummary,
+    pub binding: super::ConnectorTableObjectBinding,
+}
+
 /// Read-only half of the FE-only statistics capability.
 pub trait StatisticsReader: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
@@ -1175,17 +1226,17 @@ pub trait StatisticsReader: Send + Sync {
         request: StatisticsReadRequest,
     ) -> Result<StatisticsEvidence, ConnectorError>;
 
-    /// Observe the original pinned evidence without a synchronous runtime bridge.
-    /// A scoped SQL read is constructed only by this exact lease's Provider.
-    /// This does not delegate to the legacy synchronous or ungoverned reader.
-    fn prepare_scoped_read(
+    /// Construct the same exact-generation scoped source for SQL statistics
+    /// summaries. Its original request, projection and close stay independent
+    /// of the borrowed asynchronous waiter.
+    fn prepare_scoped_summary_read(
         &self,
         _request: ConnectorTableRequest,
         _original: ConnectorOriginalResultScope,
-    ) -> Result<Arc<dyn StatisticsReadOriginal>, ConnectorError> {
+    ) -> Result<Arc<dyn StatisticsSummaryReadOriginal>, ConnectorError> {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
-            "connector has no scoped statistics read source",
+            "connector has no scoped statistics summary source",
         ))
     }
 
@@ -1326,29 +1377,32 @@ impl ConnectorStatisticsSession {
         }
         Ok(evidence)
     }
-    pub fn prepare_scoped_read(
+    pub fn prepare_scoped_summary_read(
         &self,
         request: ConnectorTableRequest,
         original: ConnectorOriginalResultScope,
-    ) -> Result<Arc<dyn StatisticsReadOriginal>, ConnectorError> {
+    ) -> Result<Arc<dyn StatisticsSummaryReadOriginal>, ConnectorError> {
         if request.table.instance_id != self.descriptor.instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "statistics read table has a foreign lease",
+                "statistics summary table has a foreign lease",
             ));
         }
-        let source = self.statistics.prepare_scoped_read(request, original)?;
+        let source = self
+            .statistics
+            .prepare_scoped_summary_read(request, original)?;
         if source.descriptor() != &self.descriptor
             || source.incarnation() != self.incarnation
             || std::any::Any::type_id(source.as_ref()) != self.scoped_cpu_source_type_id()?
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "statistics read source has a foreign exact generation",
+                "statistics summary source has a foreign exact generation",
             ));
         }
         Ok(source)
     }
+
     pub fn collection_io_profile(
         &self,
     ) -> Result<ConnectorMetadataMaintenanceIoProfile, ConnectorError> {

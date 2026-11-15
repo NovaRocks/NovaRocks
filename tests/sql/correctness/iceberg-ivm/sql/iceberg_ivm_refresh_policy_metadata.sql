@@ -58,22 +58,24 @@ AS SELECT k1, v2 FROM orders;
 
 -- query 2
 -- @result_contains=orders_policy_mv_
--- @result_contains=iceberg
--- @result_contains=ASYNC_INTERVAL
--- @result_contains=RefreshState
--- @result_contains=RetryAfterTime
--- @result_contains=PENDING
-SHOW MATERIALIZED VIEWS;
+-- @result_rows_where=name=orders_policy_mv_${uuid0}
+-- @result_rows_count=1
+-- @result_rows_expect=refresh_policy=INTERVAL
+-- @result_rows_expect=refresh_paused=false
+-- @result_rows_expect=refresh_interval_ms=300000
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'ice_ivm_policy_${uuid0}';
 
 -- query 3
 ALTER MATERIALIZED VIEW orders_policy_mv_${uuid0} PAUSE REFRESH;
 
 -- query 4
 -- @result_contains=orders_policy_mv_
--- @result_contains=ASYNC_INTERVAL
+-- @result_contains=INTERVAL
 -- @result_contains=true
--- @result_contains=PAUSED
-SHOW MATERIALIZED VIEWS;
+-- @result_rows_where=name=orders_policy_mv_${uuid0}
+-- @result_rows_count=1
+-- @result_rows_expect=refresh_paused=true
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'ice_ivm_policy_${uuid0}';
 
 -- query 5
 ALTER MATERIALIZED VIEW orders_policy_mv_${uuid0} SET REFRESH ASYNC ON CHANGE;
@@ -81,10 +83,13 @@ ALTER MATERIALIZED VIEW orders_policy_mv_${uuid0} RESUME REFRESH;
 
 -- query 6
 -- @result_contains=orders_policy_mv_
--- @result_contains=ASYNC_ON_CHANGE
+-- @result_rows_where=name=orders_policy_mv_${uuid0}
+-- @result_rows_count=1
+-- @result_rows_expect=refresh_policy=ON_CHANGE
+-- @result_rows_expect=refresh_paused=false
+-- @result_rows_expect=refresh_interval_ms=NULL
 -- @result_contains=false
--- @result_contains=PENDING
-SHOW MATERIALIZED VIEWS;
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'ice_ivm_policy_${uuid0}';
 
 -- query 7
 -- @cleanup=true

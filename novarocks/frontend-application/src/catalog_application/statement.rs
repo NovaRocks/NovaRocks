@@ -1965,10 +1965,13 @@ mod tests {
         let sql = "CREATE TABLE IF NOT EXISTS ice.db.orders (id BIGINT DEFAULT 3, amount DECIMAL(10,2) DEFAULT '12.30', payload BINARY DEFAULT X'CAFE') DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 8 PARTITION BY (month(id)) PROPERTIES ('format-version' = '2') COMMENT 'orders'";
         let statement = novarocks_query_application::sql::parse_single_statement(sql)
             .expect("parse semantic CREATE TABLE");
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(
-            novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command),
-        )) = novarocks_query_application::sql::lower_product_sql_command(&statement)
-            .expect("lower semantic CREATE TABLE")
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(boxed_command)) =
+            novarocks_query_application::sql::lower_product_sql_command(&statement)
+                .expect("lower semantic CREATE TABLE")
+        else {
+            panic!("expected semantic CREATE TABLE");
+        };
+        let novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command) = *boxed_command
         else {
             panic!("expected semantic CREATE TABLE");
         };
@@ -2021,10 +2024,13 @@ mod tests {
     fn semantic_create_table(sql: &str) -> Vec<(String, String)> {
         let statement = novarocks_query_application::sql::parse_single_statement(sql)
             .expect("parse semantic CREATE TABLE");
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(
-            novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command),
-        )) = novarocks_query_application::sql::lower_product_sql_command(&statement)
-            .expect("lower semantic CREATE TABLE")
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(boxed_command)) =
+            novarocks_query_application::sql::lower_product_sql_command(&statement)
+                .expect("lower semantic CREATE TABLE")
+        else {
+            panic!("expected semantic CREATE TABLE");
+        };
+        let novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command) = *boxed_command
         else {
             panic!("expected semantic CREATE TABLE");
         };
@@ -2172,10 +2178,14 @@ mod tests {
     ) -> novarocks_sql::semantic::command::IcebergTableSqlAction {
         let statement = novarocks_query_application::sql::parse_single_statement(sql)
             .expect("parse semantic Iceberg command");
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(
-            novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(statement),
-        )) = novarocks_query_application::sql::lower_product_sql_command(&statement)
-            .expect("lower semantic Iceberg command")
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(boxed_command)) =
+            novarocks_query_application::sql::lower_product_sql_command(&statement)
+                .expect("lower semantic Iceberg command")
+        else {
+            panic!("expected semantic Iceberg ALTER TABLE statement");
+        };
+        let novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(statement) =
+            *boxed_command
         else {
             panic!("expected semantic Iceberg ALTER TABLE statement");
         };

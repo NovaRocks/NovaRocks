@@ -79,13 +79,14 @@ SELECT 1;
 -- SHOW must reflect source-backed desired facts, never durable runtime.
 -- @skip_result_check=true
 -- @result_contains=orders_mv
--- @result_contains=PENDING
 -- @result_contains=READ_ONLY
--- @result_not_contains=RUNNING
--- @result_not_contains=BLOCKED_RECOVERY
--- @result_not_contains=BACKOFF
+-- @result_rows_where=name=orders_mv
+-- @result_rows_count=1
+-- @result_rows_expect=refresh_policy=INTERVAL
+-- @result_rows_expect=refresh_interval_ms=3600000
+-- @result_rows_expect=refresh_paused=false
 USE lnp3d_runtime_${uuid0}.ns_${uuid0};
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'lnp3d_runtime_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 6
 -- Runtime was forgotten, but management remains closed until the old FE's

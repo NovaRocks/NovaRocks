@@ -162,7 +162,6 @@ struct Body {
     started: bool,
     unstarted_withdrawing: bool,
     unstarted_withdrawn: bool,
-    adopted_initial: bool,
     first_ready: bool,
     failure: Option<WorkError>,
     changed: bool,
@@ -633,46 +632,12 @@ impl MetadataIoAdmission {
                 started: false,
                 unstarted_withdrawing: false,
                 unstarted_withdrawn: false,
-                adopted_initial: false,
                 first_ready: false,
                 failure: None,
                 changed: false,
                 reobserve: false,
             })),
         }))
-    }
-    /// Move the same queued Root payload into its original I/O author. The
-    /// caller paid this source's fixed/variable envelope before job publication.
-    /// No initial grant is recreated; the original LocalHost D grows through
-    /// the same paid Root proposal before the provider can observe Ready.
-    pub(crate) fn adopt_original_payload_in(
-        &self,
-        source: &mut Option<RetainedPayloadGrant>,
-    ) -> Result<(), WorkError> {
-        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
-        let body = original.body.as_mut().ok_or(WorkError::Released)?;
-        let payload = source.as_ref().ok_or(WorkError::NotReady)?;
-        if body.started
-            || body.unstarted_withdrawing
-            || body.unstarted_withdrawn
-            || body.initial.is_some()
-            || body.payload.is_some()
-            || !payload.is_for_scope(&body.root)
-        {
-            return Err(WorkError::Conflict);
-        }
-        // Preserve the exact positive incarnation. Profile/layout numbers
-        // are responsibility facts, never a qualification of actual capacity.
-        drop(payload.root_domain_source(&body.root, JointLane::Foreground)?);
-        body.provider_owned_floor = payload.capacity_bytes().map_err(|_| WorkError::Released)?;
-        Self::publish_payload_retention(&self.payload_retention, payload)?;
-        body.bound.push(SharedDependency::LocalHost);
-        body.full = Some(body.bound.clone().into());
-        body.payload = source.take();
-        body.started = true;
-        body.adopted_initial = true;
-        body.changed = true;
-        Ok(())
     }
     fn publish_payload_retention(
         target: &OnceLock<RetainedPayloadAlias>,
@@ -923,24 +888,6 @@ impl MetadataIoAdmission {
                 .requested = body.bound.first().cloned();
             body.changed = true;
             notice.notify();
-        }
-        if body.adopted_initial
-            && !body.first_ready
-            && body.growth.is_none()
-            && body.growth_ready.is_none()
-            && body.growth_cell.is_none()
-        {
-            let route = body
-                .initial_dependencies
-                .as_slice()
-                .iter()
-                .find(|route| !body.bound.contains(route))
-                .cloned()
-                .unwrap_or(SharedDependency::LocalHost);
-            let mut first = loan(&body.cells[0].original).ok_or(WorkError::Conflict)?;
-            let first = first.body.as_mut().unwrap();
-            first.extension = (!body.bound.contains(&route)).then(|| route.clone());
-            first.requested = Some(route);
         }
         if body.growth.is_none() && body.growth_ready.is_none() && body.growth_cell.is_none() {
             for original in &mut body.cells {
@@ -1278,13 +1225,7 @@ impl MetadataIoAdmission {
             }
         }
         body.cursor = (body.cursor + 1) % body.cells.len();
-        body.first_ready |= cells[0].body.as_ref().unwrap().grant.is_some()
-            && (!body.adopted_initial
-                || body
-                    .initial_dependencies
-                    .as_slice()
-                    .iter()
-                    .all(|route| body.bound.contains(route)));
+        body.first_ready |= cells[0].body.as_ref().unwrap().grant.is_some();
         // These refusals were received into the same cells above. They are
         // business observations, not structural failures of this progress turn.
         // Actual-exit consumers still inspect every admission, stream and alias.
@@ -1550,7 +1491,6 @@ impl MetadataIoAdmission {
             // A positive payload may already be installed before `started`
             // is published. Never treat that intermediate cut as unstarted.
             if body.payload.is_some()
-                || body.adopted_initial
                 || body.first_ready
                 || body.growth.is_some()
                 || body.growth_ready.is_some()
@@ -1870,14 +1810,14 @@ impl std::error::Error for MetadataIoAdmission {}
 pub(super) mod cleanup_tests;
 
 #[cfg(test)]
+pub(crate) mod fixtures;
+
+#[cfg(test)]
 mod original_governor_tests {
+    use super::fixtures::{drive_original, original_governor};
     use super::*;
     use novarocks_spi::connector::ConnectorIoPermit;
-    use novarocks_workload_control::{
-        ControlStorageConfig, ResponsibilityConfig, ResultCapacityConfig, RootWork, WorkClass,
-        WorkRequest, WorkloadConfig, WorkloadControl,
-        joint_admission::{JointProgress, JointProgressDriver},
-    };
+    use novarocks_workload_control::ResultCapacityConfig;
     use std::{
         num::NonZeroUsize,
         sync::atomic::{AtomicUsize, Ordering},
@@ -1893,46 +1833,6 @@ mod original_governor_tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
-    }
-
-    // This creates the real original substrate and actual result configuration;
-    // neither the dependency count nor profile geometry is a quota.
-    fn original_governor() -> (WorkloadControl, JointProgressDriver, RootWork) {
-        let count = 8;
-        let control = WorkloadControl::try_new_counted(WorkloadConfig {
-            root_limit: count,
-            business_limit: count,
-            query_concurrency_limit: count,
-            scope_records_limit: count,
-            ..WorkloadConfig::default()
-        })
-        .unwrap()
-        .owner;
-        control
-            .configure_result_capacity(ResultCapacityConfig::V1)
-            .unwrap();
-        let (_, driver) = control
-            .configure_responsibility(ResponsibilityConfig {
-                work_per_turn: NonZeroUsize::new(7).unwrap(),
-            })
-            .unwrap();
-        control
-            .configure_control_storage(ControlStorageConfig::new(count, &[]))
-            .unwrap();
-        control.mark_ready().unwrap();
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        (control, driver, root)
-    }
-
-    fn drive_original(driver: &mut JointProgressDriver) {
-        for _ in 0..100000 {
-            if matches!(driver.step(), JointProgress::Idle(_)) {
-                return;
-            }
-        }
-        panic!("same finite metadata component driver failed to become idle");
     }
 
     fn assert_original_healthy(source: &MetadataIoAdmission) {
@@ -1955,133 +1855,102 @@ mod original_governor_tests {
     #[test]
     fn provider_retention_and_publication_fact_survive_the_original_progress_loan() {
         use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
-        for adopted in [false, true] {
-            let (control, mut driver, root) = original_governor();
-            let scope = root.owner.scope();
-            let bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
-            let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
-                NonZeroUsize::new(1).unwrap(),
-                NonZeroU64::new(bytes).unwrap(),
-                NonZeroU64::new(128).unwrap(),
-                vec![SharedDependency::LocalHost],
-            )
-            .unwrap();
-            let source = MetadataIoAdmission::new(scope.clone(), profile, bytes).unwrap();
-            let stop = ConnectorStopOwner::new();
-            let context = ConnectorRequestContext::try_new(
-                std::time::Instant::now() + std::time::Duration::from_secs(10),
-                stop.view(),
-                1024,
-                4096,
-            )
-            .unwrap()
-            .with_io_admission(source.clone());
-            assert!(
-                context.retain_owned_metadata().is_err(),
-                "no pin before actual install"
-            );
-            let mut cx = Context::from_waker(Waker::noop());
-            if adopted {
-                let domains = scope.prepare_root_domains().unwrap();
-                let initial = domains
-                    .initial_payload_source(&scope, JointLane::Custody)
-                    .unwrap();
-                let JointTryBegin::Started(mut proposal) = initial
-                    .try_begin(
-                        NonZeroU64::new(bytes).unwrap(),
-                        NonZeroU64::new(128).unwrap(),
-                    )
-                    .unwrap()
-                else {
-                    panic!("original queued proposal");
-                };
-                proposal
-                    .push_dependency(&SharedDependency::LocalHost)
-                    .unwrap();
-                let mut admission = proposal.submit().unwrap();
-                let mut payload = None;
-                drive_original(&mut driver);
-                let Poll::Ready(Ok(notice)) =
-                    admission.poll_install_in(&mut cx, &scope, &mut payload)
-                else {
-                    panic!("actual queued payload install");
-                };
-                notice.notify();
-                drop(admission);
-                source.adopt_original_payload_in(&mut payload).unwrap();
-                assert!(payload.is_none());
+        let (control, mut driver, root) = original_governor();
+        let scope = root.owner.scope();
+        let bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
+        let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(bytes).unwrap(),
+            NonZeroU64::new(128).unwrap(),
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let source = MetadataIoAdmission::new(scope.clone(), profile, bytes).unwrap();
+        let stop = ConnectorStopOwner::new();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            stop.view(),
+            1024,
+            4096,
+        )
+        .unwrap()
+        .with_io_admission(source.clone());
+        assert!(
+            context.retain_owned_metadata().is_err(),
+            "no pin before actual install"
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let mut ready = false;
+        for _ in 0..256 {
+            ready = source.poll_progress(&root.owner, &mut cx).unwrap();
+            if ready {
+                break;
             }
-            let mut ready = false;
-            for _ in 0..256 {
-                ready = source.poll_progress(&root.owner, &mut cx).unwrap();
-                if ready {
-                    break;
-                }
-                drive_original(&mut driver);
-            }
-            assert!(ready);
-            assert!(matches!(
-                source.check_existing_metadata_obligation(&scope),
-                Err(WorkError::NotReady)
-            ));
-            let borrowed = loan(&source.original).unwrap();
-            // The CPU creator is concurrent with the original progress turn;
-            // it does not poll that turn or borrow its admission authority.
-            let retained = std::thread::scope(|threads| {
-                threads
-                    .spawn(|| context.retain_owned_metadata().unwrap().unwrap())
-                    .join()
-                    .unwrap()
-            });
-            context.publication_obligation_started().unwrap();
-            drop(borrowed);
-            assert!(
-                source.check_existing_metadata_obligation(&scope).is_ok(),
-                "the original journal fact was not lost during the loan"
-            );
-            root.owner
-                .cancel(novarocks_workload_control::CancellationReason::ServerShutdown);
-            control.close_admission();
-            assert!(
-                source.root_capacity().is_err(),
-                "retention does not grant new business"
-            );
-            let closed = match source.poll_actual_quiescent_continuing(&mut cx) {
-                Poll::Ready(Ok(closed)) => closed,
-                _ => panic!("the positive retention header cannot wait on its own Source"),
-            };
-            assert!(closed.into_ordinary_failure().is_none());
-            assert!(source.health_failure().is_none());
-            assert!(source.check_existing_metadata_obligation(&scope).is_ok());
-            let cleanup_alias = context.retain_owned_metadata().unwrap().unwrap();
-            drop(cleanup_alias);
-            drop(source);
-            assert!(
-                context.retain_owned_metadata().is_err(),
-                "a guard cannot recreate the Source"
-            );
-            let final_alias = retained.try_clone().unwrap();
-            drop(retained);
-            drop(context);
-            drop(scope);
-            root.business.release();
-            root.owner.complete_after_terminal_cancel_settled();
             drive_original(&mut driver);
-            let failure = control
-                .shutdown()
-                .expect_err("the last actual payload pin remains");
-            let (error, control) = failure.into_parts();
-            assert_eq!(
-                error,
-                novarocks_workload_control::WorkloadShutdownError::NotDrained
-            );
-            drop(final_alias);
-            drive_original(&mut driver);
-            assert!(
-                control.shutdown().is_ok(),
-                "the last original pin actually retired"
-            );
         }
+        assert!(ready);
+        assert!(matches!(
+            source.check_existing_metadata_obligation(&scope),
+            Err(WorkError::NotReady)
+        ));
+        let borrowed = loan(&source.original).unwrap();
+        // The CPU creator is concurrent with the original progress turn;
+        // it does not poll that turn or borrow its admission authority.
+        let retained = std::thread::scope(|threads| {
+            threads
+                .spawn(|| context.retain_owned_metadata().unwrap().unwrap())
+                .join()
+                .unwrap()
+        });
+        context.publication_obligation_started().unwrap();
+        drop(borrowed);
+        assert!(
+            source.check_existing_metadata_obligation(&scope).is_ok(),
+            "the original journal fact was not lost during the loan"
+        );
+        root.owner
+            .cancel(novarocks_workload_control::CancellationReason::ServerShutdown);
+        control.close_admission();
+        assert!(
+            source.root_capacity().is_err(),
+            "retention does not grant new business"
+        );
+        let closed = match source.poll_actual_quiescent_continuing(&mut cx) {
+            Poll::Ready(Ok(closed)) => closed,
+            _ => panic!("the positive retention header cannot wait on its own Source"),
+        };
+        assert!(closed.into_ordinary_failure().is_none());
+        assert!(source.health_failure().is_none());
+        assert!(source.check_existing_metadata_obligation(&scope).is_ok());
+        let cleanup_alias = context.retain_owned_metadata().unwrap().unwrap();
+        drop(cleanup_alias);
+        drop(source);
+        assert!(
+            context.retain_owned_metadata().is_err(),
+            "a guard cannot recreate the Source"
+        );
+        let final_alias = retained.try_clone().unwrap();
+        drop(retained);
+        drop(context);
+        drop(scope);
+        root.business.release();
+        root.owner.complete_after_terminal_cancel_settled();
+        drive_original(&mut driver);
+        let failure = control
+            .shutdown()
+            .expect_err("the last actual payload pin remains");
+        let (error, control) = failure.into_parts();
+        assert_eq!(
+            error,
+            novarocks_workload_control::WorkloadShutdownError::NotDrained
+        );
+        drop(final_alias);
+        drive_original(&mut driver);
+        assert!(
+            control.shutdown().is_ok(),
+            "the last original pin actually retired"
+        );
     }
 
     #[test]
@@ -2627,7 +2496,7 @@ mod original_governor_tests {
     }
 
     #[test]
-    fn queued_root_payload_is_adopted_and_provider_domains_are_proved_before_ready() {
+    fn bootstrap_root_payload_and_provider_domains_are_proved_before_ready() {
         let (control, mut driver, root) = original_governor();
         let scope = root.owner.scope();
         let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
@@ -2644,43 +2513,12 @@ mod original_governor_tests {
             vec![SharedDependency::LocalHost, route.clone()],
         )
         .unwrap();
-        let domains = scope.prepare_root_domains().unwrap();
-        let initial = domains
-            .initial_payload_source(&scope, JointLane::Custody)
-            .unwrap();
-        let JointTryBegin::Started(mut proposal) = initial
-            .try_begin(
-                NonZeroU64::new(source_bytes).unwrap(),
-                NonZeroU64::new(128).unwrap(),
-            )
-            .unwrap()
-        else {
-            panic!("original queued Root Q");
-        };
-        proposal
-            .push_dependency(&SharedDependency::LocalHost)
-            .unwrap();
-        let mut admission = proposal.submit().unwrap();
-        let mut payload = None;
-        let mut cx = Context::from_waker(Waker::noop());
-        drive_original(&mut driver);
-        let Poll::Ready(Ok(notice)) = admission.poll_install_in(&mut cx, &scope, &mut payload)
-        else {
-            panic!("original queued payload proof");
-        };
-        notice.notify();
-        drop(admission);
-        drive_original(&mut driver);
         let source = MetadataIoAdmission::new(scope.clone(), profile, source_bytes).unwrap();
-        source.adopt_original_payload_in(&mut payload).unwrap();
-        assert!(
-            payload.is_none(),
-            "the exact original was moved, not copied"
-        );
-        assert_eq!(source.root_capacity().unwrap().scope().id(), scope.id());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(source.root_capacity(), Err(WorkError::NotReady)));
         assert!(
             !source.poll_progress(&root.owner, &mut cx).unwrap(),
-            "queued LocalHost capacity is not the newly selected Provider route"
+            "Provider work cannot dispatch before the original bootstrap installs full D"
         );
         {
             let original = source.original.lock().unwrap();
@@ -2695,6 +2533,7 @@ mod original_governor_tests {
             }
         }
         assert!(ready);
+        assert_eq!(source.root_capacity().unwrap().scope().id(), scope.id());
         assert_original_healthy(&source);
         {
             let original = source.original.lock().unwrap();
@@ -2702,7 +2541,7 @@ mod original_governor_tests {
             assert!(body.bound.contains(&route));
             assert!(
                 body.initial.is_none(),
-                "adoption never creates a second initial payload"
+                "the original bootstrap admission retired after install"
             );
             assert_eq!(
                 body.payload.as_ref().unwrap().capacity_bytes().unwrap(),

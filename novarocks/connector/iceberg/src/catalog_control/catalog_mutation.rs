@@ -3848,7 +3848,6 @@ mod tests {
         for (operation, expected) in operations {
             for initiation in [
                 ConnectorRequestInitiation::Statement,
-                ConnectorRequestInitiation::JobAttempt,
                 ConnectorRequestInitiation::Background,
             ] {
                 let request = ConnectorCatalogMutationRequest {

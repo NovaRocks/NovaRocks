@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Independent expectations follow Trino 483 JsonEncodingUtils.java:177-515,
-//! TimeZoneKey.java:261-322 and VariantUtil.java:1228-1304.
+//! Independent expectations follow the semantic baseline's Trino JsonEncodingUtils,
+//! TimeZoneKey and VariantUtil.
 use super::*;
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{Field, Schema, i256};
@@ -226,7 +226,7 @@ fn decimal256_support_remains_nested_only() {
 }
 
 #[test]
-fn scalar_type_values_and_nulls_follow_trino_483() {
+fn scalar_type_values_and_nulls_follow_trino() {
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(BooleanArray::from(vec![Some(true), None])),
         Arc::new(Int8Array::from(vec![Some(-8), None])),
@@ -864,4 +864,17 @@ fn nulls_of_every_supported_native_family_are_json_null() {
         payloads(encoder(arrays, fields, TrinoJsonFacts::default()), 11),
         vec![expected]
     );
+}
+
+#[test]
+fn public_java_float_text_preserves_show_statistics_spellings() {
+    for (value, expected) in [
+        (1.5, "1.5"),
+        (1e-5, "1.0E-5"),
+        (12345678.9, "1.23456789E7"),
+        (1234567890123456800.0, "1.2345678901234568E18"),
+    ] {
+        assert_eq!(crate::java_double_text(value).unwrap(), expected);
+    }
+    assert_eq!(crate::java_float_text(3.4e10).unwrap(), "3.4E10");
 }

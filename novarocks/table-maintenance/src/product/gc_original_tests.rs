@@ -28,6 +28,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use std::time::Instant;
+
 struct NoPhysicalPort;
 impl StateStoreExecutionPort for NoPhysicalPort {
     fn bind_original_in(

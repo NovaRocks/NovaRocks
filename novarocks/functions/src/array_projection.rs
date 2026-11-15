@@ -421,14 +421,28 @@ where
     rebuild_field(source, target.as_ref(), name, observe)
 }
 
-#[allow(
-    deprecated,
-    reason = "Actual IPC dictionary IDs remain encoding facts during normalization."
-)]
 pub fn rebuild_field<E, F>(
     source: &Field,
     target: &DataType,
     name: &str,
+    observe: &mut F,
+) -> Result<FieldRef, E>
+where
+    E: From<ArrayProjectionFailure>,
+    F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
+{
+    rebuild_field_with_nullability(source, target, name, source.is_nullable(), observe)
+}
+
+#[allow(
+    deprecated,
+    reason = "Actual IPC dictionary descriptors belong to the source field."
+)]
+fn rebuild_field_with_nullability<E, F>(
+    source: &Field,
+    target: &DataType,
+    name: &str,
+    nullable: bool,
     observe: &mut F,
 ) -> Result<FieldRef, E>
 where
@@ -444,7 +458,7 @@ where
         Field::new_dict(
             name,
             target.clone(),
-            source.is_nullable(),
+            nullable,
             source.dict_id().ok_or_else(|| {
                 E::from(ArrayProjectionFailure::Contract(
                     ArrayProjectionViolation::MissingDictionaryId,
@@ -457,9 +471,167 @@ where
             })?,
         )
     } else {
-        Field::new(name, target.clone(), source.is_nullable())
+        Field::new(name, target.clone(), nullable)
     };
     Ok(Arc::new(field))
+}
+
+/// Merge only physical child NULL declarations of normalized execution
+/// carriers. Complete value bindings remain with the caller. Neither source
+/// data nor semantic requiredness is inferred from these Arrow fields.
+pub fn merge_execution_carriers_observed<'a, E, F>(
+    left: &'a DataType,
+    right: &DataType,
+    observe: &mut F,
+) -> Result<Cow<'a, DataType>, E>
+where
+    E: From<ArrayProjectionFailure>,
+    F: for<'b> FnMut(ArrayNormalizationStep<'b>) -> Result<(), E>,
+{
+    for source in [left, right] {
+        normalization_preflight_observed(source, ArrowTypeDepth::ROOT, &mut 0, &mut |source| {
+            observe(ArrayNormalizationStep::InspectType(source))
+        })?;
+    }
+    merge_carrier_type(left, right, observe)
+}
+
+#[allow(
+    deprecated,
+    reason = "Actual IPC dictionary descriptors remain exact carrier facts."
+)]
+fn merge_carrier_field<E, F>(
+    left: &FieldRef,
+    right: &FieldRef,
+    observe: &mut F,
+) -> Result<FieldRef, E>
+where
+    E: From<ArrayProjectionFailure>,
+    F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
+{
+    observe(ArrayNormalizationStep::InspectField {
+        source: left,
+        name: right.name(),
+    })?;
+    if left.name() != right.name() || !left.metadata().is_empty() || !right.metadata().is_empty() {
+        return Err(E::from(ArrayProjectionFailure::Contract(
+            ArrayProjectionViolation::ScalarChanged,
+        )));
+    }
+    if matches!(left.data_type(), DataType::Dictionary(..))
+        && (left.dict_id() != right.dict_id() || left.dict_is_ordered() != right.dict_is_ordered())
+    {
+        return Err(E::from(ArrayProjectionFailure::Contract(
+            ArrayProjectionViolation::ScalarChanged,
+        )));
+    }
+    let target = merge_carrier_type(left.data_type(), right.data_type(), observe)?;
+    let nullable = left.is_nullable() || right.is_nullable();
+    if matches!(target, Cow::Borrowed(_)) && nullable == left.is_nullable() {
+        return Ok(Arc::clone(left));
+    }
+    rebuild_field_with_nullability(left, target.as_ref(), left.name(), nullable, observe)
+}
+
+enum CarrierMergeError<E> {
+    Caller(E),
+    ValueType(novarocks_type_contract::ValueTypeError),
+}
+impl<E> From<novarocks_type_contract::ValueTypeError> for CarrierMergeError<E> {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::ValueType(error)
+    }
+}
+
+fn merge_carrier_type<'a, E, F>(
+    left: &'a DataType,
+    right: &DataType,
+    observe: &mut F,
+) -> Result<Cow<'a, DataType>, E>
+where
+    E: From<ArrayProjectionFailure>,
+    F: for<'b> FnMut(ArrayNormalizationStep<'b>) -> Result<(), E>,
+{
+    let same = novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<
+        CarrierMergeError<E>,
+    >(left, right, ArrowTypeProfile::Value, || {
+        observe(ArrayNormalizationStep::InspectConstructionWork { units: 1 })
+            .map_err(CarrierMergeError::Caller)
+    })
+    .map_err(|error| match error {
+        CarrierMergeError::Caller(error) => error,
+        CarrierMergeError::ValueType(error) => E::from(ArrayProjectionFailure::ValueType(error)),
+    })?;
+    if same {
+        return Ok(Cow::Borrowed(left));
+    }
+    observe(ArrayNormalizationStep::RebuildType { source: left })?;
+    let invalid = || {
+        E::from(ArrayProjectionFailure::Contract(
+            ArrayProjectionViolation::ScalarChanged,
+        ))
+    };
+    let target = match (left, right) {
+        (DataType::List(a), DataType::List(b)) => {
+            DataType::List(merge_carrier_field(a, b, observe)?)
+        }
+        (DataType::LargeList(a), DataType::LargeList(b)) => {
+            DataType::LargeList(merge_carrier_field(a, b, observe)?)
+        }
+        (DataType::ListView(a), DataType::ListView(b)) => {
+            DataType::ListView(merge_carrier_field(a, b, observe)?)
+        }
+        (DataType::LargeListView(a), DataType::LargeListView(b)) => {
+            DataType::LargeListView(merge_carrier_field(a, b, observe)?)
+        }
+        (DataType::FixedSizeList(a, al), DataType::FixedSizeList(b, bl)) if al == bl => {
+            DataType::FixedSizeList(merge_carrier_field(a, b, observe)?, *al)
+        }
+        (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => DataType::Struct(
+            a.iter()
+                .zip(b)
+                .map(|(a, b)| merge_carrier_field(a, b, observe))
+                .collect::<Result<Fields, E>>()?,
+        ),
+        (DataType::Map(a, ao), DataType::Map(b, bo)) if ao == bo => {
+            for entries in [a, b] {
+                let DataType::Struct(fields) = entries.data_type() else {
+                    return Err(invalid());
+                };
+                if entries.is_nullable() || fields.len() != 2 || fields[0].is_nullable() {
+                    return Err(invalid());
+                }
+            }
+            DataType::Map(merge_carrier_field(a, b, observe)?, *ao)
+        }
+        (DataType::Union(a, am), DataType::Union(b, bm)) if am == bm && a.len() == b.len() => {
+            let fields = a
+                .iter()
+                .zip(b.iter())
+                .map(|((aid, a), (bid, b))| {
+                    if aid != bid {
+                        return Err(invalid());
+                    }
+                    Ok((aid, merge_carrier_field(a, b, observe)?))
+                })
+                .collect::<Result<UnionFields, E>>()?;
+            DataType::Union(fields, *am)
+        }
+        (DataType::Dictionary(ak, av), DataType::Dictionary(bk, bv)) if ak == bk => {
+            DataType::Dictionary(
+                ak.clone(),
+                Box::new(merge_carrier_type(av, bv, observe)?.into_owned()),
+            )
+        }
+        (DataType::RunEndEncoded(ae, av), DataType::RunEndEncoded(be, bv)) => {
+            DataType::RunEndEncoded(
+                merge_carrier_field(ae, be, observe)?,
+                merge_carrier_field(av, bv, observe)?,
+            )
+        }
+        _ => return Err(invalid()),
+    };
+    Ok(Cow::Owned(target))
 }
 
 fn physical<T: 'static, E: From<ArrayProjectionFailure>>(array: &ArrayRef) -> Result<&T, E> {

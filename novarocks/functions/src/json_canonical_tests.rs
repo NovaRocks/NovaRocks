@@ -33,7 +33,7 @@ fn key(s: &str) -> String {
         .to_owned()
 }
 #[test]
-fn trino_483_canonical_examples() {
+fn trino_canonical_examples() {
     for (source, expected) in [
         (r#"{"b":1,"a":2}"#, r#"{"a":2,"b":1}"#),
         (r#"{"a":1,"a":2}"#, r#"{"a":2}"#),
@@ -67,7 +67,7 @@ fn trino_483_canonical_examples() {
     }
 }
 #[test]
-fn trino_483_equality_examples() {
+fn trino_equality_examples() {
     for (left, right, equal) in [
         ("1.0", "1.00", false),
         ("1e2", "100", false),

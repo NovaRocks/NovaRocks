@@ -471,7 +471,6 @@ pub struct MaintenanceExecutionKernel {
 /// neither a new Root nor a runtime, and exposes no caller-selected CPU work.
 #[derive(Clone)]
 pub(crate) struct MaintenanceRewriteRuntime {
-    pub(crate) client: novarocks_query_application::api::QueryExecutionClient,
     pub(crate) launcher:
         Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
     pub(crate) completion: crate::query_execution::completion_facts::CompletionFactOwners,

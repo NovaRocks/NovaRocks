@@ -28,9 +28,6 @@ pub trait Visit {
     fn visit_show_process_list(&mut self, statement: &ShowProcessList) {
         walk_show_process_list(self, statement);
     }
-    fn visit_show_backends(&mut self, statement: &ShowBackends) {
-        walk_show_backends(self, statement);
-    }
 
     fn visit_statistics_statement(&mut self, statement: &StatisticsStatement) {
         walk_statistics_statement(self, statement);
@@ -119,7 +116,6 @@ pub trait Visit {
 
 pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement) {
     match statement {
-        Statement::ShowBackends(statement) => visitor.visit_show_backends(statement),
         Statement::ShowProcessList(statement) => visitor.visit_show_process_list(statement),
         Statement::Statistics(statement) => visitor.visit_statistics_statement(statement),
         Statement::Catalog(statement) => visitor.visit_catalog_statement(statement),
@@ -136,8 +132,6 @@ pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement)
         Statement::ExplainQuery(query) => visitor.visit_explain_query(query),
     }
 }
-
-pub fn walk_show_backends<V: Visit + ?Sized>(_: &mut V, _: &ShowBackends) {}
 
 pub fn walk_show_process_list<V: Visit + ?Sized>(_: &mut V, _: &ShowProcessList) {}
 
@@ -603,9 +597,6 @@ pub trait Fold {
     fn fold_show_process_list(&mut self, statement: ShowProcessList) -> ShowProcessList {
         fold_show_process_list(self, statement)
     }
-    fn fold_show_backends(&mut self, statement: ShowBackends) -> ShowBackends {
-        fold_show_backends(self, statement)
-    }
 
     fn fold_statistics_statement(&mut self, statement: StatisticsStatement) -> StatisticsStatement {
         fold_statistics_statement(self, statement)
@@ -707,9 +698,6 @@ pub fn fold_statement<F: Fold + ?Sized>(folder: &mut F, statement: Statement) ->
         Statement::ShowProcessList(statement) => {
             Statement::ShowProcessList(folder.fold_show_process_list(statement))
         }
-        Statement::ShowBackends(statement) => {
-            Statement::ShowBackends(folder.fold_show_backends(statement))
-        }
         Statement::Statistics(statement) => {
             Statement::Statistics(folder.fold_statistics_statement(statement))
         }
@@ -740,10 +728,6 @@ pub fn fold_show_process_list<F: Fold + ?Sized>(
     _: &mut F,
     statement: ShowProcessList,
 ) -> ShowProcessList {
-    statement
-}
-
-pub fn fold_show_backends<F: Fold + ?Sized>(_: &mut F, statement: ShowBackends) -> ShowBackends {
     statement
 }
 

@@ -39,6 +39,7 @@ pub enum LocalColumnKind {
     Boolean,
     Int32,
     Int64,
+    Float64,
 }
 
 /// Borrowed metadata cannot publish an Arrow/schema/ResultField alias.
@@ -138,7 +139,8 @@ impl OwnedLocalResult {
                 novarocks_type_contract::ValueKind::Scalar(
                     arrow::datatypes::DataType::Boolean
                     | arrow::datatypes::DataType::Int32
-                    | arrow::datatypes::DataType::Int64,
+                    | arrow::datatypes::DataType::Int64
+                    | arrow::datatypes::DataType::Float64,
                 ) => {}
                 _ => return Err("Local result field is outside its closed value contract".into()),
             }
@@ -271,6 +273,7 @@ fn kind(data_type: &DataType, has_logical_type: bool) -> Result<LocalColumnKind,
         DataType::Boolean => Ok(LocalColumnKind::Boolean),
         DataType::Int32 => Ok(LocalColumnKind::Int32),
         DataType::Int64 => Ok(LocalColumnKind::Int64),
+        DataType::Float64 => Ok(LocalColumnKind::Float64),
         _ => Err("Local result has an unsupported declared type".into()),
     }
 }
@@ -280,6 +283,7 @@ fn native(kind: LocalColumnKind) -> NativeRenderType {
         LocalColumnKind::Boolean => NativeRenderType::Boolean,
         LocalColumnKind::Int32 => NativeRenderType::SignedInteger(32),
         LocalColumnKind::Int64 => NativeRenderType::SignedInteger(64),
+        LocalColumnKind::Float64 => NativeRenderType::Float64,
     }
 }
 
@@ -735,7 +739,7 @@ mod tests {
     #[test]
     fn trino_local_primitives_freeze_family_and_render_json_rows() {
         use super::super::{ResultField, build_arrow_query_result};
-        use arrow::array::{BooleanArray, Int32Array, Int64Array, StringArray};
+        use arrow::array::{BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
         use novarocks_result_contract::TrinoJsonFacts;
         let (host, capacity) = fixture();
         let (root, window) = host
@@ -778,6 +782,13 @@ mod tests {
                                 ),
                             ),
                             ResultField::new(
+                                "nulls_fraction",
+                                novarocks_type_contract::FunctionValueType::new(
+                                    DataType::Float64,
+                                    true,
+                                ),
+                            ),
+                            ResultField::new(
                                 "text",
                                 novarocks_type_contract::FunctionValueType::new(
                                     DataType::Utf8,
@@ -789,6 +800,7 @@ mod tests {
                             Arc::new(BooleanArray::from(vec![true, false])),
                             Arc::new(Int32Array::from(vec![-2, i32::MIN])),
                             Arc::new(Int64Array::from(vec![i64::MAX, 7])),
+                            Arc::new(Float64Array::from(vec![Some(1.0 / 3.0), None])),
                             Arc::new(StringArray::from(vec![None, Some("a\"\n")])),
                         ],
                     )
@@ -813,6 +825,7 @@ mod tests {
                 &NativeRenderType::Boolean,
                 &NativeRenderType::SignedInteger(32),
                 &NativeRenderType::SignedInteger(64),
+                &NativeRenderType::Float64,
                 &NativeRenderType::String
             ],
         );
@@ -835,8 +848,8 @@ mod tests {
         }
         let mut expected = Vec::new();
         for payload in [
-            br#"[true,-2,9223372036854775807,null]"#.as_slice(),
-            br#"[false,-2147483648,7,"a\"\n"]"#.as_slice(),
+            br#"[true,-2,9223372036854775807,0.3333333333333333,null]"#.as_slice(),
+            br#"[false,-2147483648,7,null,"a\"\n"]"#.as_slice(),
         ] {
             expected.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             expected.extend_from_slice(payload);

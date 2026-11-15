@@ -95,7 +95,7 @@ SELECT sensor, total FROM readings_total ORDER BY sensor;
 -- @skip_result_check=true
 -- @result_contains=readings_total
 -- @result_contains=MANAGEABLE
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 10
 -- @skip_result_check=true

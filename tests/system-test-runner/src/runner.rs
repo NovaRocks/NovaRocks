@@ -7,14 +7,26 @@ use crate::scenario::{
 use crate::scenario_settlement::ScenarioSettlement;
 use crate::scenarios;
 use anyhow::{Context, Result, bail};
+use novarocks_cluster_harness::fixture_run::RunBudget;
+use novarocks_cluster_harness::reference_inputs::{self, ReferenceInput, ResolvedReference};
 use novarocks_cluster_harness::{CrossProcessCluster, CrossProcessClusterOptions};
+use std::collections::BTreeSet;
 use std::fs;
+use std::path::Path;
 
 pub fn run(cli: Cli, build: crate::build_information::BuildInformation) -> Result<()> {
     run_dispatch(cli, build)
 }
 
 fn run_dispatch(cli: Cli, build: crate::build_information::BuildInformation) -> Result<()> {
+    run_dispatch_with_reference_resolver(cli, build, reference_inputs::resolve_until)
+}
+
+fn run_dispatch_with_reference_resolver(
+    cli: Cli,
+    build: crate::build_information::BuildInformation,
+    resolver: impl FnOnce(&Path, &BTreeSet<ReferenceInput>, &RunBudget) -> Result<ResolvedReference>,
+) -> Result<()> {
     let scenarios = scenarios::all();
     if cli.list_declarations {
         println!(
@@ -73,11 +85,17 @@ fn run_dispatch(cli: Cli, build: crate::build_information::BuildInformation) -> 
         }
         return Ok(());
     }
-    let config = RunnerConfig::from_cli(&cli, build)?;
+    let mut config = RunnerConfig::from_cli(&cli, build)?;
     let selected = select(&scenarios, &cli.only)?;
     if selected.is_empty() {
         bail!("no system scenarios are registered");
     }
+    config.reference = resolve_selected_reference(
+        &selected,
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        &config.fixture_budget,
+        resolver,
+    )?;
     for scenario in &selected {
         scenario.validate_runner_inputs(config.launch_profile)?;
         validate_required_programs(*scenario, &config)?;
@@ -86,6 +104,22 @@ fn run_dispatch(cli: Cli, build: crate::build_information::BuildInformation) -> 
         run_one(scenario, &config)?;
     }
     Ok(())
+}
+
+fn resolve_selected_reference(
+    selected: &[&dyn Scenario],
+    repository: &Path,
+    budget: &RunBudget,
+    resolver: impl FnOnce(&Path, &BTreeSet<ReferenceInput>, &RunBudget) -> Result<ResolvedReference>,
+) -> Result<ResolvedReference> {
+    let needed = selected
+        .iter()
+        .flat_map(|scenario| scenario.reference_inputs().iter().copied())
+        .collect::<BTreeSet<_>>();
+    if needed.is_empty() {
+        return Ok(ResolvedReference::default());
+    }
+    resolver(repository, &needed, budget)
 }
 
 fn list_scenarios(
@@ -118,6 +152,8 @@ fn scenario_declarations(
         })
         .map(|scenario| {
             let paused_reason = scenarios::disabled_reason(scenario.name());
+            let mut declaration = scenario.declaration();
+            declaration.reference_inputs = scenario.reference_inputs().to_vec();
             serde_json::json!({
                 "name": scenario.name(),
                 "default": !scenario.is_explicit_stage() && paused_reason.is_none(),
@@ -125,7 +161,7 @@ fn scenario_declarations(
                 "compatibility": scenario.is_compatibility_stage(),
                 "paused": paused_reason.is_some(),
                 "paused_reason": paused_reason,
-                "declaration": scenario.declaration(),
+                "declaration": declaration,
             })
         })
         .collect::<Vec<_>>();
@@ -191,6 +227,13 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     fs::create_dir_all(&scenario_root)
         .with_context(|| format!("create scenario artifact root {}", scenario_root.display()))?;
     let settlement = ScenarioSettlement::new(scenario.name(), &scenario_root)?;
+    if !scenario.reference_inputs().is_empty() {
+        settlement.record_reference(
+            &config
+                .reference
+                .subset(&scenario.reference_inputs().iter().copied().collect()),
+        )?;
+    }
     let result = run_one_inner(scenario, config, scenario_root, &settlement);
     match settlement.write() {
         Ok(()) => result,
@@ -408,6 +451,9 @@ fn run_one_inner(
     };
     settlement.cluster_launched();
     let mut context = ScenarioContext::new(ScenarioContextParams {
+        reference: config
+            .reference
+            .subset(&scenario.reference_inputs().iter().copied().collect()),
         name: scenario.name(),
         handle,
         scenario_root,
@@ -559,6 +605,12 @@ mod tests {
                 "{}",
                 scenario.name()
             );
+            let reference = serde_json::to_value(scenario.reference_inputs()).unwrap();
+            if scenario.reference_inputs().is_empty() {
+                assert!(entry["declaration"].get("reference_inputs").is_none());
+            } else {
+                assert_eq!(entry["declaration"]["reference_inputs"], reference);
+            }
             if scenario.is_explicit_stage() {
                 assert!(
                     entry["declaration"]["heavy"]["detail"]
@@ -685,6 +737,113 @@ mod tests {
             assert!(selected[0].binary_requirements().contains(&OtherIsland));
         }
         assert!(select(&scenarios, &[String::new()]).is_err());
+    }
+
+    #[test]
+    fn selected_reference_components_are_unioned_and_resolved_once() {
+        use ReferenceInput::{TrinoImage, TrinoJdbcDriver};
+        let scenarios = crate::scenarios::all();
+        let budget = RunBudget::from_environment(3600).unwrap();
+        for (names, expected) in [
+            (
+                vec!["trino-interop/encoding-conformance"],
+                BTreeSet::from([TrinoImage]),
+            ),
+            (
+                vec![
+                    "trino-interop/encoding-conformance",
+                    "trino-interop/official-cli",
+                ],
+                BTreeSet::from([TrinoImage]),
+            ),
+            (
+                vec![
+                    "trino-interop/encoding-conformance",
+                    "trino-interop/jdbc-probe",
+                ],
+                BTreeSet::from([TrinoImage, TrinoJdbcDriver]),
+            ),
+        ] {
+            let names = names.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let selected = select(&scenarios, &names).unwrap();
+            let mut calls = 0;
+            resolve_selected_reference(
+                &selected,
+                Path::new("repository"),
+                &budget,
+                |repository, actual, original| {
+                    calls += 1;
+                    assert_eq!(repository, Path::new("repository"));
+                    assert_eq!(actual, &expected);
+                    assert_eq!(original.deadline(), budget.deadline());
+                    Ok(ResolvedReference::default())
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, 1);
+        }
+        let defaults = select(&scenarios, &[]).unwrap();
+        resolve_selected_reference(&defaults, Path::new("repository"), &budget, |_, _, _| {
+            panic!("default selection must not resolve references")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reference_failure_precedes_every_scenario_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("binary");
+        let config = root.path().join("config");
+        fs::write(&binary, "not an executable").unwrap();
+        fs::write(&config, "not a server config").unwrap();
+        let arguments = vec![
+            "--only".to_owned(),
+            "trino-interop/encoding-conformance".to_owned(),
+            "--binary".to_owned(),
+            binary.display().to_string(),
+            "--config".to_owned(),
+            config.display().to_string(),
+            "--artifact-root".to_owned(),
+            root.path().display().to_string(),
+        ];
+        let cli = Cli::parse(arguments).unwrap();
+        let mut calls = 0;
+        let error = run_dispatch_with_reference_resolver(
+            cli,
+            crate::build_information::BuildInformation::fixture(),
+            |_, _, _| {
+                calls += 1;
+                bail!("original reference resolution failed")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.to_string(), "original reference resolution failed");
+        assert!(
+            !root
+                .path()
+                .join("trino-interop-encoding-conformance")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn listing_options_never_resolve_reference_inputs() {
+        for flag in [
+            "--list",
+            "--list-default",
+            "--list-declarations",
+            "--list-binary-requirements",
+            "--list-compatibility",
+        ] {
+            let cli = Cli::parse([flag.to_owned()]).unwrap();
+            run_dispatch_with_reference_resolver(
+                cli,
+                crate::build_information::BuildInformation::fixture(),
+                |_, _, _| panic!("listing must not resolve reference inputs"),
+            )
+            .unwrap();
+        }
     }
 
     #[test]
@@ -972,6 +1131,7 @@ mod neutral_root_prelaunch_tests {
     }
     fn configuration(root: &std::path::Path) -> RunnerConfig {
         RunnerConfig {
+            reference: Default::default(),
             build: crate::build_information::BuildInformation::fixture(),
             binary: root.join("no-binary"),
             compatible_binary: None,
@@ -1169,6 +1329,7 @@ mod settlement_integration_tests {
     }
     fn config(root: &Path) -> RunnerConfig {
         RunnerConfig {
+            reference: Default::default(),
             build: crate::build_information::BuildInformation::fixture(),
             binary: root.join("deliberately-missing-binary"),
             compatible_binary: None,

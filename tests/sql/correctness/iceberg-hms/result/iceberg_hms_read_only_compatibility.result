@@ -53,23 +53,23 @@ id	p
 2	2
 3	1
 
--- query 56
+-- query 54
 -- types	bigint	integer
 id	p
 2	2
 3	1
 
--- query 57
+-- query 55
 -- types	varchar
 name
 
--- query 58
+-- query 56
 -- types	varchar	varchar
 table_name	table_type
 v1	BASE TABLE
 v2	BASE TABLE
 v3	BASE TABLE
 
--- query 59
+-- query 57
 -- types	varchar
 table_name

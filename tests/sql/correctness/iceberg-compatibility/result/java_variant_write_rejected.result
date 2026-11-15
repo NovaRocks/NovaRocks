@@ -4,7 +4,7 @@
 IRU9_SHREDDED_OK rows=3 bounds=absent
 IRU9_FIXTURE_COMPLETE
 
--- query 17
+-- query 16
 -- types	integer	varchar
 id	note_renamed
 1	NULL

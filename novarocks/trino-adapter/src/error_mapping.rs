@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Typed projection of application failures into the Trino 483 client contract.
+//! Typed projection of application failures into the Trino client contract.
 use crate::diagnostics::{self, BoundedMessage};
 use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
 use novarocks_query_application::{
@@ -79,7 +79,7 @@ pub(crate) struct TrinoErrorLocation {
     pub(crate) column_number: u32,
 }
 
-// Numeric identities and error types are frozen by Trino 483 StandardErrorCode.
+// Numeric identities and error types are frozen by Trino StandardErrorCode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Code {
     GenericUser,
@@ -94,6 +94,7 @@ enum Code {
     AlreadyExists,
     NotSupported,
     InvalidSessionProperty,
+    InvalidAnalyzeProperty,
     InvalidWindowFrame,
     NumericOutOfRange,
     QueryTextTooLarge,
@@ -144,6 +145,7 @@ impl Code {
             NumericOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE", "USER_ERROR"),
             QueryTextTooLarge => (35, "QUERY_TEXT_TOO_LARGE", "USER_ERROR"),
             AdministrativelyKilled => (38, "ADMINISTRATIVELY_KILLED", "USER_ERROR"),
+            InvalidAnalyzeProperty => (42, "INVALID_ANALYZE_PROPERTY", "USER_ERROR"),
             CatalogNotFound => (44, "CATALOG_NOT_FOUND", "USER_ERROR"),
             SchemaNotFound => (45, "SCHEMA_NOT_FOUND", "USER_ERROR"),
             TableNotFound => (46, "TABLE_NOT_FOUND", "USER_ERROR"),
@@ -499,6 +501,7 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.type_mismatch" => TypeMismatch,
         "sql.analyze.invalid_literal" => InvalidLiteral,
         "sql.analyze.invalid_argument" => InvalidArguments,
+        "sql.analyze.invalid_analyze_property" => InvalidAnalyzeProperty,
         "sql.admit.invalid_session_property" => InvalidSessionProperty,
         "sql.admit.session_catalog_not_found" => CatalogNotFound,
         "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => GenericUser,

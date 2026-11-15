@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual Optimize Root and Product borrow the common background Action host.
+//! Statement-owned rewrite execution and product state-machine custody.
 use super::*;
 use super::{
     io_admission::{MetadataIoAdmission, extend_original_dependencies},
@@ -28,9 +28,8 @@ use crate::query_execution::{
     completion_facts::FrontendCompletionCustody, logical_execution::InitialComputationReservation,
 };
 use novarocks_query_application::{
-    admitted_query_context::{QueryExecutionContext, QueryResultCapacityBinding},
     api::StatementNativeHealthFailure,
-    session_control::{GovernedActionContext, GovernedBackgroundAction, GovernedStatementResidual},
+    session_control::GovernedActionContext,
     session_error::{QueryServiceError, QueryServiceErrorKind},
 };
 use novarocks_spi::connector::{
@@ -38,8 +37,6 @@ use novarocks_spi::connector::{
     ConnectorRewriteSelection, ConnectorRewriteSourceRequest, LakePublicationDisposition,
     ProviderMetadataCpuPort, RewriteCpuPort, SharedConnectorDistributedRewrite,
 };
-use novarocks_table_maintenance::worker::OptimizeJobOriginals;
-use novarocks_table_maintenance::{OptimizeJob, OptimizeJobOutcome, OptimizeProcessRuntime};
 use novarocks_table_maintenance::{product::RewriteFailure, runtime::TerminalError};
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::{
@@ -49,12 +46,8 @@ use std::{
     task::{Context, Poll},
 };
 
-enum OriginalProductOutcome {
-    Job(OptimizeJobOutcome),
-    Direct(MaintenanceActionOutcome),
-}
 type ProductFuture =
-    Pin<Box<dyn Future<Output = Result<OriginalProductOutcome, TerminalError>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<MaintenanceActionOutcome, TerminalError>> + Send>>;
 type CloseFuture = Pin<Box<dyn Future<Output = Result<(), StatementNativeHealthFailure>> + Send>>;
 #[derive(Debug, Default)]
 struct RewriteWake(futures::task::AtomicWaker);
@@ -85,6 +78,9 @@ pub(crate) struct RewriteDomain {
     engine: RequestScopedMaintenanceEngine,
     root: WorkScope,
     context: ConnectorRequestContext,
+    expected_object_id: Option<novarocks_spi::connector::ConnectorTableObjectId>,
+    #[cfg(novarocks_dev_controls)]
+    maintenance_observation: Option<crate::table_maintenance::test_controls::AuthorizedStatement>,
     rewrite: SharedConnectorDistributedRewrite,
     cpu: Arc<dyn RewriteCpuPort>,
     binding_cpu: Arc<dyn ProviderMetadataCpuPort>,
@@ -110,10 +106,8 @@ pub(crate) struct RewriteDomain {
     tails: Vec<Option<StatementNativeTail>>,
     publication: Option<StatementPublication>,
     publication_failure: Option<novarocks_failure_contract::SharedFailureCause>,
-    action_failure:
-        Option<Arc<novarocks_query_application::session_control::StatementActionFailure>>,
     receipt: Option<novarocks_spi::connector::ConnectorDistributedRewriteReceipt>,
-    result: Option<Result<OriginalProductOutcome, TerminalError>>,
+    result: Option<Result<MaintenanceActionOutcome, TerminalError>>,
     health: Option<StatementNativeHealthFailure>,
     stopping: bool,
     stop_reason: Option<TerminalError>,
@@ -122,18 +116,12 @@ pub(crate) struct RewriteDomain {
 }
 pub(crate) type RewriteDomainAlias = Arc<tokio::sync::Mutex<RewriteDomain>>;
 pub(crate) type RewriteDomainView = Weak<tokio::sync::Mutex<RewriteDomain>>;
-struct RewriteAction {
-    state: Option<RewriteActionState>,
-}
-struct RewriteResidual {
-    state: RewriteActionState,
-}
 struct RewriteActionState {
     domain: RewriteDomainAlias,
     io: Arc<MetadataIoAdmission>,
     wake: Arc<RewriteWake>,
     product: Option<ProductFuture>,
-    product_result: Option<Result<OriginalProductOutcome, TerminalError>>,
+    product_result: Option<Result<MaintenanceActionOutcome, TerminalError>>,
     refused_close: Option<CloseFuture>,
     refused_result: Option<Result<(), StatementNativeHealthFailure>>,
     close: Option<CloseFuture>,
@@ -145,11 +133,11 @@ struct RewriteActionState {
     health: Option<StatementNativeHealthFailure>,
 }
 fn select_product_terminal(
-    result: Result<OriginalProductOutcome, TerminalError>,
+    result: Result<MaintenanceActionOutcome, TerminalError>,
     selected: &mut Option<TerminalError>,
     stop_reason: &mut Option<TerminalError>,
     effect: Option<novarocks_coordination_contract::ExecutionEffect>,
-) -> Result<OriginalProductOutcome, TerminalError> {
+) -> Result<MaintenanceActionOutcome, TerminalError> {
     use novarocks_execution_contract::failure::FailureEvidence;
     use novarocks_table_maintenance::runtime::MaintenanceJobState;
 
@@ -231,12 +219,15 @@ pub(crate) fn computation_service_error(error: TerminalError) -> QueryServiceErr
 // Only the Provider's explicit public projection may replace the neutral
 // detail. Reading it invokes no foreign formatter or new failure selection.
 fn from_connector_cause(error: novarocks_spi::connector::ConnectorError) -> TerminalError {
-    let public_detail = error.public_failure_detail().map(str::to_owned);
-    let mut terminal = TerminalError::from_original_cause(error);
-    if let Some(detail) = public_detail {
-        terminal.message = detail;
-    }
-    terminal
+    let Some(detail) = error
+        .public_failure_detail()
+        .map(novarocks_failure_contract::BoundedDetail::truncating)
+    else {
+        return TerminalError::from_original_cause(error);
+    };
+    let message = detail.as_str().to_owned();
+    let cause = novarocks_failure_contract::SharedFailureCause::from_bounded_detail(error, detail);
+    TerminalError::pre_dispatch_failed(message).with_failure_cause(Some(cause))
 }
 fn health(
     detail: &'static str,
@@ -244,15 +235,6 @@ fn health(
 ) -> StatementNativeHealthFailure {
     StatementNativeHealthFailure::actual_exit_unproven(detail, Arc::new(cause))
 }
-fn background_start_error(
-    error: novarocks_query_application::api::QueryExecutionError,
-) -> TerminalError {
-    // Application refusals do not carry a domain fact. Preserve the original
-    // execution input when present; never invent a fact from its public kind.
-    TerminalError::pre_dispatch_failed(error.message())
-        .with_execution_failure(error.execution_failure().cloned())
-}
-
 pub(crate) fn guard_terminal_error(error: QueryServiceError) -> TerminalError {
     let mut terminal = computation_error(error);
     terminal.state = novarocks_table_maintenance::runtime::MaintenanceJobState::PreDispatchFailed;
@@ -654,53 +636,7 @@ impl RewriteActionState {
             })
     }
 }
-impl GovernedBackgroundAction for RewriteAction {
-    fn poll_action(
-        &mut self,
-        owner: &mut GovernedActionContext<'_>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), QueryServiceError>> {
-        self.state.as_mut().unwrap().poll_product(owner, cx)
-    }
-    fn external_effect_disposition(
-        &self,
-    ) -> Option<novarocks_query_application::api::StatementExternalEffectDisposition> {
-        self.state
-            .as_ref()
-            .and_then(|s| s.disposition)
-            .map(crate::query::external_effect_from_lake)
-    }
-    fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
-        self.state
-            .as_ref()
-            .and_then(RewriteActionState::local_health)
-    }
-    fn handoff_residual_in(
-        &mut self,
-        target: &mut Option<Box<dyn GovernedStatementResidual>>,
-    ) -> Result<(), StatementNativeHealthFailure> {
-        if target.is_some() {
-            return Err(health(
-                "Rewrite residual receiver is occupied",
-                WorkError::Conflict,
-            ));
-        }
-        if let Some(state) = self.state.take() {
-            *target = Some(Box::new(RewriteResidual { state }));
-        }
-        Ok(())
-    }
-}
-impl GovernedStatementResidual for RewriteResidual {
-    fn poll_retirement(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
-        self.state.poll_close(cx)
-    }
-}
-
-// Same pure forming author for the original Job and SQL Root. No work,
+// Pure forming author for the original SQL Root. No work,
 // permit or physical action is created here; all callers hold positive MIO.
 fn form_original_domain(
     engine: RequestScopedMaintenanceEngine,
@@ -797,6 +733,9 @@ fn form_original_domain(
         engine,
         root: root.clone(),
         context,
+        expected_object_id: None,
+        #[cfg(novarocks_dev_controls)]
+        maintenance_observation: None,
         rewrite,
         cpu,
         binding_cpu,
@@ -817,7 +756,6 @@ fn form_original_domain(
         tails: Vec::new(),
         publication: Some(publication),
         publication_failure: None,
-        action_failure: None,
         receipt: None,
         result: None,
         health: None,
@@ -829,221 +767,12 @@ fn form_original_domain(
     Ok(domain)
 }
 
-/// No external I/O happens before start_background_action_in transfers the
-/// SAME original owner/context/permit to the existing background Source.
-pub(crate) async fn mount_original(
-    mut adapter: Box<crate::table_maintenance::worker::FrontendOptimizeJobExecution>,
-    jobs: Arc<OptimizeProcessRuntime>,
-    mut originals: OptimizeJobOriginals,
-    job: OptimizeJob,
-) -> Result<OptimizeJobOutcome, TerminalError> {
-    let root = originals
-        .owner
-        .as_ref()
-        .ok_or_else(|| TerminalError::pre_dispatch_failed("Optimize original Root is empty"))?
-        .scope();
-    let engine = adapter.engine.clone();
-    let runtime = engine
-        .kernel
-        .rewrite_runtime()
-        .map_err(TerminalError::from_original_cause)?
-        .clone();
-    let identity = RequestScopedMaintenanceEngine::target_identity(&job.target)
-        .map_err(TerminalError::pre_dispatch_failed)?;
-    let rewrite = engine
-        .kernel
-        .connector_control()
-        .acquire_current_distributed_rewrite(&identity.instance_id)
-        .map_err(TerminalError::from_original_cause)?;
-    let mut dependencies = rewrite
-        .planning_initial_dependencies()
-        .map_err(TerminalError::from_original_cause)?;
-    let write = engine
-        .kernel
-        .typed_connector_control()
-        .acquire_exact_write_stack(rewrite.planning_pin().control_runtime_id())
-        .map_err(TerminalError::from_original_cause)?;
-    extend_original_dependencies(
-        &mut dependencies,
-        &write
-            .session()
-            .rewrite_begin_initial_dependencies()
-            .map_err(TerminalError::from_original_cause)?,
-    );
-    let io =
-        MetadataIoAdmission::for_original_source(originals.owner.as_ref().unwrap(), dependencies)
-            .map_err(TerminalError::from_original_cause)?;
-    std::future::poll_fn(
-        |cx| match io.poll_progress(originals.owner.as_ref().unwrap(), cx) {
-            Ok(true) => Poll::Ready(Ok(())),
-            Ok(false) => Poll::Pending,
-            Err(e) => Poll::Ready(Err(TerminalError::from_original_cause(e))),
-        },
-    )
-    .await?;
-    let domain = form_original_domain(
-        engine,
-        root.clone(),
-        rewrite,
-        io.clone(),
-        &job.target,
-        // Background admission has its own job controls, not a SQL observation.
-        #[cfg(novarocks_dev_controls)]
-        None,
-    )?;
-    let (capacity, wake, execution) = {
-        let source = domain.try_lock().map_err(|_| {
-            TerminalError::pre_dispatch_failed("new Rewrite Domain is already borrowed")
-        })?;
-        (
-            source.engine.execution.result_capacity().unwrap().clone(),
-            source.wake.clone(),
-            source.engine.execution.clone(),
-        )
-    };
-    adapter.engine = domain
-        .try_lock()
-        .map_err(|_| TerminalError::pre_dispatch_failed("new Rewrite Domain is already borrowed"))?
-        .engine
-        .clone();
-    adapter.mounted = Some(Arc::downgrade(&domain));
-    let adapter: Arc<crate::table_maintenance::worker::FrontendOptimizeJobExecution> =
-        Arc::from(adapter);
-    let job_id = job.job_id;
-    let product: ProductFuture = Box::pin(run_original_product(
-        adapter,
-        jobs.clone(),
-        root,
-        capacity,
-        job,
-    ));
-    let mut action: Option<Box<dyn GovernedBackgroundAction>> = Some(Box::new(RewriteAction {
-        state: Some(RewriteActionState::new(domain.clone(), io, wake, product)),
-    }));
-    let mut context = Some(execution);
-    // Actual data custody stays in MIO/Domain. The host receives that same
-    // positive Root retention context, with no additional legacy payload.
-    let mut additional_payload = None;
-    let mut input = None;
-    let mut ready = None;
-    let mut exit = None;
-    runtime
-        .client
-        .prepare_background_action_in(
-            &originals.owner,
-            &mut context,
-            &mut originals.query_concurrency,
-            &mut additional_payload,
-            &mut action,
-            &mut input,
-        )
-        .map_err(background_start_error)?;
-    let tail = runtime
-        .client
-        .start_background_action_in(&mut input, &mut originals.owner, &mut ready, &mut exit)
-        .map_err(background_start_error)?;
-    // Same original TM record receives observation before any waiter or the
-    // Starting F can disappear. Physical custody stays in the common Source.
-    jobs.install_original_exit_in(job_id, &mut exit)
-        .map_err(|e| TerminalError::failed(e.to_string()))?;
-    tail.finish()
-        .map_err(|e| TerminalError::failed(e.to_string()))?;
-    let receipt = match ready
-        .as_mut()
-        .ok_or_else(|| TerminalError::failed("Optimize host returned no original Ready source"))?
-        .await
-    {
-        Ok(receipt) => receipt,
-        Err(failure) => {
-            domain.lock().await.action_failure = Some(failure);
-            return Err(TerminalError::failed(
-                "Optimize original Action failed; original health retained",
-            ));
-        }
-    };
-    let result = domain
-        .lock()
-        .await
-        .result
-        .take()
-        .ok_or_else(|| TerminalError::failed("Optimize original Product result is absent"))?;
-    receipt.finish();
-    match result {
-        Ok(OriginalProductOutcome::Job(outcome)) => Ok(outcome),
-        Ok(OriginalProductOutcome::Direct(_)) => Err(TerminalError::failed(
-            "Job Source received a direct SQL product outcome",
-        )),
-        Err(cause) => Err(cause),
-    }
-}
-async fn run_original_product(
-    adapter: Arc<crate::table_maintenance::worker::FrontendOptimizeJobExecution>,
-    jobs: Arc<OptimizeProcessRuntime>,
-    root: WorkScope,
-    capacity: QueryResultCapacityBinding,
-    job: OptimizeJob,
-) -> Result<OriginalProductOutcome, TerminalError> {
-    novarocks_table_maintenance::worker::execute_claimed_job(
-        jobs.as_ref(),
-        adapter.as_ref(),
-        &root,
-        capacity,
-        job,
-    )
-    .await
-    .map(OriginalProductOutcome::Job)
-}
-
 #[path = "rewrite_job/direct.rs"]
 pub(crate) mod direct;
 
 fn upgrade_original(view: &RewriteDomainView) -> Result<RewriteDomainAlias, TerminalError> {
     view.upgrade()
         .ok_or_else(|| TerminalError::pre_dispatch_failed("Rewrite original Source has retired"))
-}
-
-pub(crate) async fn actual_original_effect(
-    view: &RewriteDomainView,
-) -> Option<novarocks_coordination_contract::ExecutionEffect> {
-    let source = view.upgrade()?;
-    let original = source.lock().await;
-    if original.session.as_ref().is_some_and(|s| s.is_noop()) {
-        return Some(novarocks_coordination_contract::ExecutionEffect::None);
-    }
-    original.publication.as_ref().and_then(original_effect)
-}
-
-pub(crate) async fn rebind_original(
-    view: &RewriteDomainView,
-    job: &OptimizeJob,
-) -> Result<MaintenanceTargetRebind, String> {
-    use novarocks_spi::connector::{
-        ConnectorTableObjectId, ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector,
-        ConnectorTableResolution,
-    };
-    let source = upgrade_original(view).map_err(|e| e.to_string())?;
-    let original = source.lock().await;
-    if original.stopping {
-        return Err("Rewrite original Source is closing".into());
-    }
-    let object = ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(&job.object_id))
-        .map_err(|e| e.to_string())?;
-    let identity = RequestScopedMaintenanceEngine::target_identity(&job.target)?;
-    let binding = original
-        .rewrite
-        .metadata()
-        .rebind_table_object_with_cpu(
-            ConnectorTableObjectRebindRequest {
-                table: identity,
-                expected_object_id: object,
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                selector: ConnectorTableObjectSelector::Current,
-                context: original.context.clone(),
-            },
-            original.binding_cpu.clone(),
-        )
-        .await;
-    maintenance_target_rebind_from_connector_result(binding.map(|_| ()))
 }
 
 pub(crate) struct GovernedRewriteEffectPort {
@@ -1077,6 +806,11 @@ async fn begin_original(
     let identity = RequestScopedMaintenanceEngine::target_identity(target)
         .map_err(TerminalError::pre_dispatch_failed)?;
     let selection = match intent {
+        novarocks_table_maintenance::product::RewriteIntent::Optimize {
+            file_size_threshold_bytes,
+        } => ConnectorRewriteSelection::Optimize {
+            file_size_threshold_bytes,
+        },
         novarocks_table_maintenance::product::RewriteIntent::DataFiles { rewrite_all } => {
             ConnectorRewriteSelection::DataFiles { rewrite_all }
         }
@@ -1092,6 +826,7 @@ async fn begin_original(
         operation_id,
         table: identity,
         selection,
+        expected_object_id: original.expected_object_id.clone(),
         context: original.context.clone(),
     });
     let rewrite = original.rewrite.clone();
@@ -1132,6 +867,12 @@ async fn begin_original(
     tails.resize_with(count, || None);
     original.tails = tails;
     if count != 0 {
+        #[cfg(novarocks_dev_controls)]
+        if let Some(observation) = original.maintenance_observation.as_mut() {
+            observation
+                .record_dispatch()
+                .map_err(TerminalError::pre_dispatch_failed)?;
+        }
         let prepared = original.prepared.as_ref().unwrap();
         let request_source =
             super::rewrite_preparation::RewriteCohortCpuOriginal::begin_request_original(
@@ -1698,7 +1439,7 @@ async fn product_port_reject_user_action_on_mv<'a>(
     _target: &'a MaintenanceTarget,
 ) -> Result<(), TerminalError> {
     Err(TerminalError::pre_dispatch_failed(
-        "mounted Optimize uses its already admitted maintenance activity",
+        "statement Rewrite uses its already admitted maintenance activity",
     ))
 }
 async fn product_port_execute_metadata(

@@ -2,7 +2,7 @@
 // contributor license agreements. See the NOTICE file for additional
 // information. Licensed under the Apache License, Version 2.0.
 
-//! Released Trino483 oracle and official clients: explicit, fixture-heavy G1 assets.
+//! Declared Trino reference oracle and official clients: explicit, fixture-heavy G1 assets.
 //! Same-signature values have no divergence allowance. The independent producer
 //! is Spark SQL plus Iceberg Java records inside the same original Spark JVM.
 use crate::scenario::{
@@ -11,6 +11,7 @@ use crate::scenario::{
 };
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::fixture_run::{RunBudget, RunStorageScope};
+use novarocks_cluster_harness::reference_inputs::{ReferenceInput, ResolvedReference};
 use novarocks_cluster_harness::resource_registration::{Registration, register};
 use novarocks_test_support::ManagedCommand;
 use serde_json::{Value, json};
@@ -49,6 +50,7 @@ struct Prepared {
     probe: Option<ProbeOwner>,
 }
 struct ProbeOwner {
+    reference: ResolvedReference,
     registration: Registration,
     root: PathBuf,
     nova: String,
@@ -80,8 +82,15 @@ impl Scenario for TrinoInterop {
     fn is_explicit_stage(&self) -> bool {
         true
     }
+    fn reference_inputs(&self) -> &'static [ReferenceInput] {
+        match self.mode {
+            Mode::Encoding | Mode::Cli => &[ReferenceInput::TrinoImage],
+            Mode::Jdbc => &[ReferenceInput::TrinoImage, ReferenceInput::TrinoJdbcDriver],
+        }
+    }
     fn declaration(&self) -> ScenarioDeclaration {
         ScenarioDeclaration {
+            reference_inputs: self.reference_inputs().to_vec(),
             impact: ScenarioImpact {
                 paths: [
                     "novarocks/trino-adapter/**",
@@ -101,6 +110,7 @@ impl Scenario for TrinoInterop {
                     "tests/system-test-runner/src/scenarios/trino_interop/**",
                     "tests/system-test-runner/src/*.rs",
                     "docker/iceberg-rest/**",
+                    "docker/fixture-inputs/**",
                     "tests/datasketches-tck/interop/trino/rest-catalog/**",
                     "tests/datasketches-tck/interop/trino/verify_rest_catalog.sh",
                 ]
@@ -110,7 +120,6 @@ impl Scenario for TrinoInterop {
             },
             env_inputs: [
                 ("NOVA_ENV_REST_ENV_FILE", "file-content"),
-                ("NOVA_TRINO_IMAGE", "value"),
                 ("DOCKER_HOST", "value"),
                 ("DOCKER_CONTEXT", "value"),
                 ("DOCKER_CONFIG", "value"),
@@ -125,7 +134,7 @@ impl Scenario for TrinoInterop {
             ),
             heavy: Some(ScenarioHeavyReason {
                 reason: "external-programs",
-                detail: "Requires local digest-pinned Trino483 image, image-local curl, Linux host networking, original Spark/Iceberg REST fixture and native 1FE+3BE. JDBC is conditional on image-local Java and driver jar. Missing prerequisites are BLOCKED; images are never pulled.",
+                detail: "Requires the declared Trino reference image, Linux host networking, original Spark/Iceberg REST fixture and native 1FE+3BE. JDBC uses the declared driver mounted read-only. Reference inputs are resolved before cluster startup; unavailable Docker/host networking is BLOCKED.",
             }),
         }
     }
@@ -181,6 +190,7 @@ impl Scenario for TrinoInterop {
             "Released Trino image children and independent Spark REST tables; exact identities are in released-client-probe/resource-intents.json",
         )?;
         prepared.probe = Some(ProbeOwner {
+            reference: context.reference().clone(),
             registration,
             root: root.clone(),
             nova,
@@ -203,7 +213,7 @@ impl Scenario for TrinoInterop {
         {
             Err(novarocks_cluster_harness::fixture_run::rejected(
                 anyhow::anyhow!(
-                    "{} missing pinned image/curl/Linux host-network prerequisite; retained raw result at {}",
+                    "{} missing Docker/Linux host-network prerequisite; retained raw result at {}",
                     self.mode.name(),
                     root.display()
                 ),
@@ -237,7 +247,7 @@ impl Scenario for TrinoInterop {
             super::result_delivery_support::await_idle(context, "trino", "interop-after", epoch);
         primary?;
         convergence?;
-        context.action(format!("{} completed with released Trino483 client/oracle; optional JDBC and Variant applicability are retained in probe reports", self.mode.name()));
+        context.action(format!("{} completed with the declared Trino reference client/oracle; Variant applicability is retained in probe reports", self.mode.name()));
         outcome.release_diagnostics()?;
         Ok(())
     }
@@ -301,6 +311,20 @@ fn read_cleanup(root: &Path) -> Result<()> {
     Ok(())
 }
 #[cfg(unix)]
+fn bind_probe_lifecycle(
+    command: &mut ManagedCommand,
+    mode: &str,
+    work_deadline: Instant,
+    complete_deadline: Instant,
+) -> Instant {
+    if mode != "cleanup" {
+        command.terminate_at(work_deadline, complete_deadline);
+    }
+    command.observe_group_exit_until(complete_deadline);
+    complete_deadline
+}
+
+#[cfg(unix)]
 fn invoke(
     mode: &str,
     prepared: &Prepared,
@@ -317,7 +341,7 @@ fn invoke(
     fs::create_dir(&directory)?;
     let repository = repository()?;
     let program = repository.join("docker/iceberg-rest/trino_client_protocol_probe.py");
-    let arguments = vec![
+    let mut arguments = vec![
         mode.to_owned(),
         "--env-file".into(),
         prepared.publication.display().to_string(),
@@ -328,6 +352,22 @@ fn invoke(
         "--output".into(),
         owner.root.display().to_string(),
     ];
+    if mode != "cleanup" {
+        let image = owner
+            .reference
+            .trino_image
+            .as_ref()
+            .context("run entry omitted the declared Trino image")?;
+        arguments.extend(["--trino-image".into(), image.image_id.clone()]);
+        if mode == "jdbc-probe" {
+            let driver = owner
+                .reference
+                .trino_jdbc_driver
+                .as_ref()
+                .context("run entry omitted the declared Trino JDBC driver")?;
+            arguments.extend(["--trino-jdbc-jar".into(), driver.path.display().to_string()]);
+        }
+    }
     let mut recorded_arguments = vec![program.display().to_string()];
     recorded_arguments.extend(arguments.clone());
     fs::write(
@@ -347,6 +387,16 @@ fn invoke(
     if mode == "cleanup" {
         command.env("NOVA_FIXTURE_CLEANUP_MODE", "true");
     }
+    let complete_deadline = bind_probe_lifecycle(
+        &mut command,
+        mode,
+        deadline.min(prepared.budget.work_deadline()),
+        if mode == "cleanup" {
+            deadline.min(prepared.budget.deadline())
+        } else {
+            prepared.budget.deadline()
+        },
+    );
     let output = novarocks_test_support::capture_command_until(
         command,
         OpenOptions::new()
@@ -361,7 +411,7 @@ fn invoke(
             .create_new(true)
             .mode(0o600)
             .open(directory.join("stderr.log"))?,
-        deadline,
+        complete_deadline,
     )?;
     fs::write(
         directory.join("exit.json"),
@@ -383,3 +433,6 @@ fn invoke(
         anyhow::anyhow!("official client scenarios require Linux host-network execution"),
     ))
 }
+
+#[cfg(all(test, unix))]
+mod tests;

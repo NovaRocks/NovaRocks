@@ -26,8 +26,7 @@ use crate::{
         maintenance::{
             CallStatement, ExpireSnapshots, ExpireSnapshotsOption, MaintenanceValue, OptimizeTable,
             ProcedureArgument, ProcedureArgumentMode, ProcedureMap, ProcedureMapEntry,
-            RemoveOrphanFiles, RewriteManifests, ShowAlterTableOptimize, ShowOptimizeFilter,
-            ShowOptimizeOrder, SortDirection,
+            RemoveOrphanFiles, RewriteManifests,
         },
     },
     token::Symbol,
@@ -38,13 +37,6 @@ use super::StatementParser;
 pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<Statement>, ParseError> {
     if parser.current_is_word("CALL") {
         return parse_call(parser).map(|statement| Some(Statement::Maintenance(statement)));
-    }
-    if parser.current_is_word("SHOW")
-        && parser.peek_word(1, "ALTER")
-        && parser.peek_word(2, "TABLE")
-    {
-        return parse_show_optimize(parser)
-            .map(|statement| Some(Statement::Maintenance(statement)));
     }
     if parser.current_is_word("ALTER") && parser.peek_word(1, "TABLE") {
         return parse_alter_table(parser).map(|statement| Some(Statement::Maintenance(statement)));
@@ -312,74 +304,6 @@ fn parse_expire_snapshots(
     Ok(MaintenanceStatement::ExpireSnapshots(ExpireSnapshots {
         table,
         options,
-        span: Span::new(start, end),
-    }))
-}
-
-fn parse_show_optimize(
-    parser: &mut StatementParser<'_, '_>,
-) -> Result<MaintenanceStatement, ParseError> {
-    let start = parser.consume_word("SHOW")?.start();
-    parser.consume_word("ALTER")?;
-    parser.consume_word("TABLE")?;
-    let optimize_end = parser.consume_word("OPTIMIZE")?.end();
-
-    let from = if parser.consume_if_word("FROM") || parser.consume_if_word("IN") {
-        Some(parser.parse_object_name()?)
-    } else {
-        None
-    };
-    let filter = if parser.consume_if_word("WHERE") {
-        let column = parser.parse_ident()?;
-        parser.consume_symbol(Symbol::Eq)?;
-        let value = parser.parse_literal()?;
-        Some(ShowOptimizeFilter {
-            span: Span::new(column.span.start(), value.span.end()),
-            column,
-            value,
-        })
-    } else {
-        None
-    };
-    let order_by = if parser.current_is_word("ORDER") {
-        let order_start = parser.consume_word("ORDER")?.start();
-        parser.consume_word("BY")?;
-        let column = parser.parse_ident()?;
-        let direction = if parser.consume_if_word("ASC") {
-            Some(SortDirection::Asc)
-        } else if parser.consume_if_word("DESC") {
-            Some(SortDirection::Desc)
-        } else {
-            None
-        };
-        let end = direction
-            .map(|_| parser.current_offset())
-            .unwrap_or(column.span.end());
-        Some(ShowOptimizeOrder {
-            column,
-            direction,
-            span: Span::new(order_start, end),
-        })
-    } else {
-        None
-    };
-    let limit = if parser.consume_if_word("LIMIT") {
-        Some(parser.parse_literal()?)
-    } else {
-        None
-    };
-    let end = limit
-        .as_ref()
-        .map(|value| value.span.end())
-        .or_else(|| order_by.as_ref().map(|value| value.span.end()))
-        .or_else(|| filter.as_ref().map(|value| value.span.end()))
-        .or_else(|| from.as_ref().map(|value| value.span.end()))
-        .unwrap_or(optimize_end);
-    Ok(MaintenanceStatement::ShowOptimize(ShowAlterTableOptimize {
-        from,
-        filter,
-        order_by,
-        limit,
         span: Span::new(start, end),
     }))
 }

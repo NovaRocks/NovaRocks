@@ -98,7 +98,7 @@ GROUP BY out.account;
 -- @result_contains=move_balance
 -- @result_contains=MANAGEABLE
 USE mvsc_${uuid0}.ns_${uuid0};
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 9
 -- @skip_result_check=true

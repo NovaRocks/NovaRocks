@@ -29,8 +29,8 @@ mod maintenance;
 mod materialized_view;
 mod pratt;
 mod query;
+mod retired;
 mod session;
-mod show_backends;
 mod show_processlist;
 mod statistics;
 mod table;
@@ -100,10 +100,8 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
     fn parse_statement(&mut self) -> Result<Statement, ParserError> {
         for parser in [
             view::parse as FamilyParser,
-            // Ahead of `show_backends`, which claims any unrecognized `SHOW`
-            // and then fails asking for BACKENDS.
             show_processlist::parse,
-            show_backends::parse,
+            retired::parse,
             statistics::parse,
             session::parse,
             catalog::parse,
@@ -113,6 +111,7 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             maintenance::parse,
             materialized_view::parse,
             query::parse,
+            retired::show,
         ] {
             if let Some(statement) = parser(self)? {
                 return Ok(statement);
@@ -459,7 +458,7 @@ fn hex_string_literal(source: &str) -> Option<String> {
 mod tests {
     use crate::{
         ParserError, Span,
-        ast::{DmlStatement, ShowBackends, Statement},
+        ast::{DmlStatement, ShowProcessList, Statement},
         lex,
         printer::print_statements,
     };
@@ -467,11 +466,11 @@ mod tests {
     use super::{parse, unquote_string};
 
     #[test]
-    fn show_backends_is_a_complete_round_trip_vertical_slice() {
-        let source = " /*+ SET_VAR(x=1) */ show backends; SHOW BACKENDS ";
-        let ast = parse(source).expect("SHOW BACKENDS should parse");
+    fn show_processlist_is_a_complete_round_trip_vertical_slice() {
+        let source = " /*+ SET_VAR(x=1) */ show processlist; SHOW PROCESSLIST ";
+        let ast = parse(source).expect("SHOW PROCESSLIST should parse");
         assert_eq!(ast.len(), 2);
-        assert_eq!(print_statements(&ast), "SHOW BACKENDS; SHOW BACKENDS");
+        assert_eq!(print_statements(&ast), "SHOW PROCESSLIST; SHOW PROCESSLIST");
         let re_parsed = parse(&print_statements(&ast)).expect("printed statements should parse");
         assert_eq!(statement_shapes(&re_parsed), statement_shapes(&ast));
     }
@@ -512,18 +511,19 @@ mod tests {
             Ok(statements) if matches!(statements.as_slice(), [Statement::Dml(DmlStatement::Insert(_))])
         ));
 
-        let trailing = parse("SHOW BACKENDS unexpected").expect_err("trailing token must fail");
+        let trailing = parse("SHOW PROCESSLIST unexpected").expect_err("trailing token must fail");
         assert_eq!(
             trailing
-                .to_user_error("SHOW BACKENDS unexpected")
+                .to_user_error("SHOW PROCESSLIST unexpected")
                 .code()
                 .as_str(),
             "sql.parse.unexpected_token"
         );
         assert_eq!(
-            parse("SHOW BACKENDS").unwrap(),
-            vec![Statement::ShowBackends(ShowBackends {
-                span: Span::new(0, 13),
+            parse("SHOW PROCESSLIST").unwrap(),
+            vec![Statement::ShowProcessList(ShowProcessList {
+                full: false,
+                span: Span::new(0, 16),
             })]
         );
     }
@@ -568,7 +568,6 @@ mod tests {
         statements
             .iter()
             .map(|statement| match statement {
-                Statement::ShowBackends(_) => "SHOW BACKENDS",
                 Statement::ShowProcessList(_) => "SHOW PROCESSLIST",
                 Statement::Statistics(_) => "STATISTICS",
                 Statement::Catalog(_) => "CATALOG",

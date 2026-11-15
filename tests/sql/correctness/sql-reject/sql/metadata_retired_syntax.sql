@@ -18,7 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=system_catalog,retired_syntax
--- Correctness owner: sql-reject. Trino 484 B05-B08 reject these complete
+-- Correctness owner: sql-reject. Trino B05-B08 reject these complete
 -- statements with SYNTAX_ERROR/USER_ERROR. No external fixture is required.
 
 -- query 1

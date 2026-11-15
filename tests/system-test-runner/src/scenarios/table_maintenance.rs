@@ -1,6 +1,6 @@
 use super::mv_uea7::ManagedMvRestFixture;
 use super::native_sql_controls::SelectedStatement;
-use crate::actors::sql::{SqlSession, StatementResult, TrinoValue};
+use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use novarocks_cluster_harness::{
@@ -55,9 +55,8 @@ impl Scenario for OptimizeTargetReplacement {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        // REST admits detached maintenance, allowing replacement while the
-        // worker is paused. Hadoop requires the submitting statement to await
-        // actual worker exit to preserve its single-writer contract.
+        // A private REST fixture admits the concurrent DROP/CREATE writer
+        // while this statement is held before its original planning load.
         let (rest, launch) = ManagedMvRestFixture::start(scenario_root, CATALOG)
             .context("start private REST fixture for optimize target replacement")?;
         let mut fixture = self
@@ -92,8 +91,6 @@ impl Scenario for OptimizeTargetReplacement {
         let mut plan = ClusterTestSessionPlan::new(original_deadline)?;
         let root = plan.reserve_transport("maintenance-rendezvous")?;
         let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
-        let successor = plan.reserve_launch(RoleSlot::Frontend)?;
-        plan.authorize_ordinary_launch(&successor, binary.to_path_buf())?;
         for index in 0..cluster_size {
             let backend = plan.reserve_launch(RoleSlot::Backend(index))?;
             plan.authorize_ordinary_launch(&backend, binary.to_path_buf())?;
@@ -158,77 +155,68 @@ impl Scenario for OptimizeTargetReplacement {
             .context("maintenance finite intent is missing")?;
         let mut conn = connect(context)?;
         let phase = (|| {
-            let conn = &mut conn;
-            setup_orders_fixture(context, conn, catalog, &create_catalog_sql)?;
-
-            submit_optimize(
+            setup_orders_fixture(context, &mut conn, catalog, &create_catalog_sql)?;
+            let (first, paths) = execute_held_optimize(
                 context,
-                conn,
-                &intent.statements[0],
-                "submit optimize for the original table incarnation",
+                &mut conn,
+                &intent,
+                0,
+                "execute optimize for the original table incarnation",
+                |context, conn, _paths| {
+                    execute(
+                        context,
+                        conn,
+                        "drop original optimize target incarnation",
+                        "DROP TABLE orders FORCE",
+                    )?;
+                    execute(
+                        context,
+                        conn,
+                        "recreate optimize target under the same logical name",
+                        "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+                    )?;
+                    execute(
+                        context,
+                        conn,
+                        "seed replacement optimize target table",
+                        "INSERT INTO orders VALUES (9, 90)",
+                    )
+                },
             )?;
-            let first = wait_for_ready_marker(context, &intent, 0, None)?;
-            context.action("observed process-local optimize claim before its first rebind");
-
-            execute(
+            let error = match first {
+                Err(StatementFailure::Trino(error)) => error,
+                Err(other) => bail!("replaced optimize target returned a non-SQL failure: {other}"),
+                Ok(result) => bail!("replaced optimize target unexpectedly succeeded: {result:?}"),
+            };
+            ensure!(
+                error.message.contains("TARGET_REPLACED"),
+                "replaced optimize target lost its public binding failure: {error:?}"
+            );
+            assert_dispatch_count(context, &paths, 0)?;
+            context.action("verified the original statement failed TARGET_REPLACED with zero provider dispatch");
+            let (second, paths) = execute_held_optimize(
                 context,
-                conn,
-                "drop original optimize target incarnation",
-                "DROP TABLE orders FORCE",
+                &mut conn,
+                &intent,
+                1,
+                "execute optimize again after the original statement actually closed",
+                |_, _, _| Ok(()),
             )?;
-            execute(
-                context,
-                conn,
-                "recreate optimize target under the same logical name",
-                "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
-            )?;
-            execute(
-                context,
-                conn,
-                "seed replacement optimize target table",
-                "INSERT INTO orders VALUES (9, 90)",
-            )?;
-            write_resume(&first)?;
-            context.action("released optimize rebind barrier after same-name replacement");
-
-            wait_for_job_state(context, conn, catalog, first.job_id, "TARGET_REPLACED")?;
-            assert_dispatch_count(context, &first, 0)?;
-            context
-                .action("verified replacement became TARGET_REPLACED with zero provider dispatch");
-
-            submit_optimize(
-                context,
-                conn,
-                &intent.statements[1],
-                "submit a new optimize to prove the terminal job released its active fence",
-            )?;
-            let second = wait_for_ready_marker(context, &intent, 1, Some(first.job_id))?;
-            write_resume(&second)?;
-            context.action("a second process-local optimize claim acquired the same table fence");
-            wait_for_terminal_job(context, conn, catalog, second.job_id)?;
-
-            Ok(first.job_id)
+            let second =
+                second.context("optimize replacement table after releasing the original fence")?;
+            assert_zero_optimize_metrics(&second)?;
+            assert_dispatch_count(context, &paths, 0)?;
+            context.action("a second synchronous optimize acquired the released table fence and returned three zero metrics");
+            Ok(())
         })();
-        let first_job_id = match phase {
-            Ok(job_id) => job_id,
+        match phase {
+            Ok(()) => Ok(()),
             Err(primary) => {
                 let released = release_ready_barriers(&intent);
                 let stopped = context.shutdown();
-                return with_cleanup(with_cleanup(Err(primary), released), stopped);
+                with_cleanup(with_cleanup(Err(primary), released), stopped)
             }
-        };
-        restart_frontend(
-            context,
-            "restart FE after process-local TARGET_REPLACED transition",
-        )?;
-        let mut conn = connect(context)?;
-        (|| {
-            let conn = &mut conn;
-            select_catalog_and_database(context, conn, catalog)?;
-            assert_job_not_listed(context, conn, catalog, first_job_id)?;
-            context.action("verified the restarted FE discards process-local optimize history in native 1FE+3BE");
-            Ok(())
-        })()
+        }
     }
 
     fn teardown(&self) -> Result<()> {
@@ -266,32 +254,104 @@ fn connect(context: &mut ScenarioContext) -> Result<SqlSession> {
     )?)
 }
 
-fn submit_optimize(
+fn execute_held_optimize(
     context: &mut ScenarioContext,
     conn: &mut SqlSession,
-    selected: &SelectedStatement,
+    intent: &MaintenanceIntent,
+    ordinal: usize,
     action: &str,
-) -> Result<()> {
+    held: impl FnOnce(&mut ScenarioContext, &mut SqlSession, &BarrierPaths) -> Result<()>,
+) -> Result<(
+    std::result::Result<StatementResult, StatementFailure>,
+    BarrierPaths,
+)> {
     context.action(action);
+    let selected = &intent.statements[ordinal];
     let pending = conn.submit(OPTIMIZE_SQL)?;
     let (pending, observation) = selected.arm_pending(context, pending, OPTIMIZE_SQL)?;
     let cancel = pending.cancel_handle();
-    let result = conn
-        .run_pending(pending)
-        .map(|_| ())
-        .map_err(anyhow::Error::from);
-    // Even a joined HTTP/transport failure may leave the original query live.
-    let cancelled = if result.is_err() {
-        cancel
-            .delete(selected.deadline)
-            .map_err(anyhow::Error::from)
-    } else {
-        Ok(())
-    };
-    let drained = context
-        .handle()
-        .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
-    with_cleanup(with_cleanup(result, cancelled), drained)
+    let mut reader_session = conn.clone();
+    // This scope joins the real reader on every ordinary/error return. The
+    // main actor keeps a different session for the concurrent target writer.
+    thread::scope(|scope| {
+        let reader = scope.spawn(move || reader_session.run_pending(pending));
+        let phase: Result<BarrierPaths> = (|| {
+            let paths = wait_for_ready_marker(context, intent, ordinal, || reader.is_finished())?;
+            held(context, conn, &paths)?;
+            write_resume(&paths)?;
+            Ok(paths)
+        })();
+        let released = if phase.is_err() {
+            release_ready_barriers(intent)
+        } else {
+            Ok(())
+        };
+        let cancelled = if phase.is_err() {
+            cancel.delete(selected.deadline).map_err(Into::into)
+        } else {
+            Ok(())
+        };
+        let joined = reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("original optimize SQL reader panicked"));
+        let response_needs_cancel = match joined.as_ref() {
+            Err(_) => true,
+            Ok(result) => {
+                matches!(result, Err(error) if !matches!(error, StatementFailure::Trino(_)))
+            }
+        };
+        let cancel_after_read = if phase.is_ok() && response_needs_cancel {
+            cancel.delete(selected.deadline).map_err(Into::into)
+        } else {
+            Ok(())
+        };
+        let drained = context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
+        let cleanup = with_cleanup(
+            with_cleanup(with_cleanup(released, cancelled), cancel_after_read),
+            drained,
+        );
+        let phase = match (&joined, phase) {
+            (Ok(Err(original)), Err(primary)) => {
+                Err(primary.context(format!("original optimize SQL reader: {original}")))
+            }
+            (_, phase) => phase,
+        };
+        let paths = with_cleanup(phase, cleanup)?;
+        Ok((joined?, paths))
+    })
+}
+fn assert_zero_optimize_metrics(result: &StatementResult) -> Result<()> {
+    ensure!(
+        result.is_result_set() && result.columns.len() == 2,
+        "OPTIMIZE omitted its metric result set: {result:?}"
+    );
+    for (column, name, ty) in [
+        (&result.columns[0], "metric_name", "varchar"),
+        (&result.columns[1], "metric_value", "bigint"),
+    ] {
+        ensure!(
+            column.name == name && column.type_signature.raw_type == ty,
+            "OPTIMIZE metric declaration differs: {column:?}"
+        );
+    }
+    let expected = [
+        "rewritten_data_files_count",
+        "removed_delete_files_count",
+        "added_data_files_count",
+    ];
+    ensure!(
+        result.rows.len() == expected.len(),
+        "OPTIMIZE omitted a metric row: {result:?}"
+    );
+    for (row, metric) in result.rows.iter().zip(expected) {
+        ensure!(
+            matches!(row.as_slice(), [TrinoValue::Text(name), TrinoValue::Integer(0)] if name == metric),
+            "singleton OPTIMIZE changed independently expected zero metric {metric}: {row:?}"
+        );
+    }
+    Ok(())
 }
 fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
     match (primary, cleanup) {
@@ -382,21 +442,9 @@ fn execute(
         .with_context(|| format!("{action}: {sql}"))
 }
 
-fn query(
-    context: &mut ScenarioContext,
-    conn: &mut SqlSession,
-    sql: &str,
-    action: &str,
-) -> Result<StatementResult> {
-    context.remaining(action)?;
-    context.action(action);
-    conn.execute(sql)
-        .with_context(|| format!("{action}: {sql}"))
-}
-
 #[derive(Debug)]
 struct BarrierPaths {
-    job_id: i64,
+    work_id: u64,
     resume: PathBuf,
     dispatch_count: PathBuf,
 }
@@ -405,7 +453,6 @@ struct BarrierPaths {
 #[serde(deny_unknown_fields)]
 struct ReadyReceipt {
     schema_version: u32,
-    job_id: i64,
     work_id: u64,
     phase: String,
     catalog: String,
@@ -446,7 +493,7 @@ fn wait_for_ready_marker(
     context: &mut ScenarioContext,
     intent: &MaintenanceIntent,
     ordinal: usize,
-    excluded_job_id: Option<i64>,
+    reader_finished: impl Fn() -> bool,
 ) -> Result<BarrierPaths> {
     context.action("wait for STAT-2F optimize before-rebind barrier");
     let selected = &intent.statements[ordinal];
@@ -466,11 +513,9 @@ fn wait_for_ready_marker(
             receipt.nomination.validate()?;
             let role = RoleProcessReceipt::read_private(&intent.frontend.process_receipt)?;
             ensure!(
-                receipt.schema_version == 1
-                    && receipt.job_id > 0
+                receipt.schema_version == 2
                     && receipt.work_id > 0
-                    && Some(receipt.job_id) != excluded_job_id
-                    && receipt.phase == "after-claim-before-rebind"
+                    && receipt.phase == "after-capture-before-planning"
                     && receipt.catalog == CATALOG
                     && receipt.namespace == "ns"
                     && receipt.table == "orders"
@@ -481,10 +526,10 @@ fn wait_for_ready_marker(
                     && role.launch_id == receipt.launch_id
                     && role.role == novarocks_failpoint::session::SessionRole::Fe
                     && role.process_id == receipt.nomination.frontend_process()?.to_string(),
-                "maintenance ready receipt differs from its exact finite job/role target"
+                "maintenance ready receipt differs from its exact finite statement/role target"
             );
             return Ok(BarrierPaths {
-                job_id: receipt.job_id,
+                work_id: receipt.work_id,
                 resume: intent
                     .root
                     .join(format!("{}.before-rebind.resume", selected.token)),
@@ -493,6 +538,10 @@ fn wait_for_ready_marker(
                     .join(format!("{}.dispatch-count", selected.token)),
             });
         }
+        ensure!(
+            !reader_finished(),
+            "original OPTIMIZE exited before reaching its authorized planning barrier"
+        );
         ensure!(
             Instant::now() < deadline,
             "timed out waiting for exact maintenance before-rebind receipt"
@@ -530,144 +579,10 @@ fn assert_dispatch_count(
     })?;
     if actual != expected {
         bail!(
-            "optimize job {} provider dispatch count was {actual}, expected {expected}; {}",
-            paths.job_id,
+            "optimize statement work {} provider dispatch count was {actual}, expected {expected}; {}",
+            paths.work_id,
             context.diagnostics()
         );
     }
     Ok(())
-}
-
-fn wait_for_job_state(
-    context: &mut ScenarioContext,
-    conn: &mut SqlSession,
-    catalog: &str,
-    job_id: i64,
-    expected_state: &str,
-) -> Result<()> {
-    context.action(format!(
-        "wait for optimize job {job_id} state {expected_state}"
-    ));
-    loop {
-        let jobs = list_optimize_jobs(context, conn, catalog)?;
-        if let Some(state) = jobs
-            .iter()
-            .find(|(observed_job_id, _)| *observed_job_id == job_id)
-            .map(|(_, state)| state.as_str())
-        {
-            if state == expected_state {
-                return Ok(());
-            }
-            if !matches!(state, "PENDING" | "RUNNING") {
-                bail!(
-                    "optimize job {job_id} reached state {state}, expected {expected_state}; {}",
-                    context.diagnostics()
-                );
-            }
-        }
-        context.remaining("wait for durable optimize job state")?;
-        thread::sleep(POLL_INTERVAL);
-    }
-}
-
-fn wait_for_terminal_job(
-    context: &mut ScenarioContext,
-    conn: &mut SqlSession,
-    catalog: &str,
-    job_id: i64,
-) -> Result<()> {
-    context.action(format!(
-        "wait for resubmitted optimize job {job_id} terminal state"
-    ));
-    loop {
-        let jobs = list_optimize_jobs(context, conn, catalog)?;
-        if let Some(state) = jobs
-            .iter()
-            .find(|(observed_job_id, _)| *observed_job_id == job_id)
-            .map(|(_, state)| state.as_str())
-        {
-            if matches!(state, "FINISHED" | "FAILED" | "TARGET_REPLACED") {
-                return Ok(());
-            }
-            if !matches!(state, "PENDING" | "RUNNING") {
-                bail!(
-                    "resubmitted optimize job {job_id} reached unexpected state {state}; {}",
-                    context.diagnostics()
-                );
-            }
-        }
-        context.remaining("wait for resubmitted optimize job terminal state")?;
-        thread::sleep(POLL_INTERVAL);
-    }
-}
-
-fn assert_job_not_listed(
-    context: &mut ScenarioContext,
-    conn: &mut SqlSession,
-    catalog: &str,
-    job_id: i64,
-) -> Result<()> {
-    let jobs = list_optimize_jobs(context, conn, catalog)?;
-    if jobs
-        .iter()
-        .any(|(observed_job_id, _)| *observed_job_id == job_id)
-    {
-        bail!(
-            "optimize job {job_id} survived FE restart even though optimize job state is process-local; {}",
-            context.diagnostics()
-        );
-    }
-    Ok(())
-}
-
-fn list_optimize_jobs(
-    context: &mut ScenarioContext,
-    conn: &mut SqlSession,
-    catalog: &str,
-) -> Result<Vec<(i64, String)>> {
-    let result = query(
-        context,
-        conn,
-        &format!(
-            "SHOW ALTER TABLE OPTIMIZE FROM {catalog}.ns WHERE TableName = 'orders' ORDER BY CreateTime DESC"
-        ),
-        "read current-process optimize job state",
-    )?;
-    ensure!(
-        result.is_result_set() && result.columns.len() >= 3,
-        "SHOW ALTER TABLE OPTIMIZE did not return its job columns: {result:?}"
-    );
-    for (index, name) in [(0, "JobId"), (2, "State")] {
-        let column = &result.columns[index];
-        ensure!(
-            column.name == name && column.type_signature.raw_type == "varchar",
-            "SHOW ALTER TABLE OPTIMIZE {name} is not its declared text column: {column:?}"
-        );
-    }
-    result
-        .rows
-        .into_iter()
-        .map(|row| {
-            let Some(TrinoValue::Text(job_id)) = row.first() else {
-                bail!("SHOW ALTER TABLE OPTIMIZE JobId is not non-null text: {row:?}");
-            };
-            let job_id = job_id
-                .parse::<i64>()
-                .context("parse SHOW ALTER TABLE OPTIMIZE JobId")?;
-            let Some(TrinoValue::Text(state)) = row.get(2) else {
-                bail!("SHOW ALTER TABLE OPTIMIZE State is not non-null text: {row:?}");
-            };
-            Ok((job_id, state.clone()))
-        })
-        .collect()
-}
-
-fn restart_frontend(context: &mut ScenarioContext, action: &str) -> Result<()> {
-    context.action(action);
-    let deadline = context.deadline();
-    let action = action.to_owned();
-    context
-        .handle()
-        .restart_fe_until(deadline)
-        .with_context(|| action)
 }

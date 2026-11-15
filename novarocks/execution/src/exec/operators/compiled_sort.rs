@@ -406,15 +406,9 @@ impl CompiledSortProcessor {
                 |layout| owner.request(layout),
             )?;
         }
-        let (_, data, rows) = batch.into_parts();
-        let batch = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
-            self.prepared_output()?.clone(),
-            data,
-            rows,
-            payload_storage,
-            |step| owner.observe(0, &[], step),
-        )?
-        .into_batch_projection();
+        let batch = creation
+            .publish_with_storage(batch, &source, payload_storage, owner.as_ref())?
+            .into_batch_projection();
         Ok(Some(SortedRun {
             batch,
             keys: CreatedSortColumns::new(kept_keys, type_storage, key_storage),

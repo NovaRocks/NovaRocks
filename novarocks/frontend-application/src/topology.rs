@@ -44,9 +44,6 @@ use novarocks_query_application::api::{
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome,
     LiveBackendTarget,
 };
-use novarocks_query_application::api::{
-    BackendTopologyCommandPort, QueryResult, build_utf8_query_result,
-};
 
 #[derive(Clone, Debug)]
 pub struct ClusterBackendOpenConfig {
@@ -130,28 +127,6 @@ pub struct BackendTopologyRow {
     pub native_compatibility_id: String,
     pub diagnostic_status: String,
     pub status_detail: String,
-}
-
-impl BackendTopologyRow {
-    fn into_show_backends_row(self) -> Vec<String> {
-        vec![
-            self.process_id,
-            self.endpoint,
-            self.lease_valid.to_string(),
-            self.identity_verified.to_string(),
-            self.reported_state,
-            self.compatible.to_string(),
-            self.endpoint_owned.to_string(),
-            self.eligible.to_string(),
-            self.scheduled_fragments.to_string(),
-            self.last_announce_ms.to_string(),
-            self.last_heartbeat_ms.to_string(),
-            self.build_identity,
-            self.native_compatibility_id,
-            self.diagnostic_status,
-            self.status_detail,
-        ]
-    }
 }
 
 /// Read-only topology capability used only by the Frontend management surface.
@@ -1038,35 +1013,6 @@ impl BackendTopologyPort for ClusterBackendService {
     }
 }
 
-impl BackendTopologyCommandPort for ClusterBackendService {
-    fn show_backends(&self) -> Result<QueryResult, String> {
-        let names = [
-            "ProcessId",
-            "Endpoint",
-            "LeaseValid",
-            "IdentityVerified",
-            "ReportedState",
-            "Compatible",
-            "EndpointOwned",
-            "Eligible",
-            "ScheduledFragments",
-            "LastAnnounceAt",
-            "LastHeartbeatAt",
-            "BuildIdentity",
-            "NativeCompatibilityId",
-            "DiagnosticStatus",
-            "StatusDetail",
-        ];
-        let rows = self
-            .backend_rows()?
-            .into_iter()
-            .map(BackendTopologyRow::into_show_backends_row)
-            .collect();
-        build_utf8_query_result(&names, rows)
-            .map_err(|error| format!("build SHOW BACKENDS result failed: {error}"))
-    }
-}
-
 impl BackendProcessObservationPort for ClusterBackendService {
     fn subscribe_process_changes(&self) -> watch::Receiver<u64> {
         self.process_epoch.subscribe()
@@ -1284,7 +1230,6 @@ mod tests {
     use novarocks_execution_contract::{
         BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
     };
-    use novarocks_query_application::api::BackendTopologyCommandPort;
     use novarocks_query_application::api::{
         BackendProcessObservation, BackendProcessObservationPort, BackendTopologyPort,
     };
@@ -1752,13 +1697,8 @@ mod tests {
             BackendReportedState::Draining
         );
     }
-    /// One `SHOW BACKENDS` row as the cross-process topology barrier reads it.
-    ///
-    /// The barrier in `tests/cluster-harness` counts rows that satisfy
-    /// `is_eligible_live()`: `DiagnosticStatus == "Live"`, `Eligible`, both
-    /// identities present, **and an empty `StatusDetail`**. That last clause is
-    /// what makes this projection load-bearing rather than diagnostic, so the
-    /// test below reads exactly these six fields and nothing else.
+    /// The management topology barrier reads these typed live facts. An empty
+    /// status detail is required alongside eligibility and both identities.
     struct BarrierRow {
         process_id: String,
         diagnostic_status: String,
@@ -1779,46 +1719,19 @@ mod tests {
     }
 
     fn barrier_rows(service: &ClusterBackendService) -> Vec<BarrierRow> {
-        let result = service.show_backends().expect("SHOW BACKENDS projection");
-        let names = result
-            .columns
-            .iter()
-            .map(|column| column.name().to_string())
-            .collect::<Vec<_>>();
-        let index = |name: &str| {
-            names
-                .iter()
-                .position(|candidate| candidate == name)
-                .unwrap_or_else(|| panic!("SHOW BACKENDS has no {name} column"))
-        };
-        let mut rows = Vec::new();
-        for batch in &result.batches {
-            let column = |name: &str| {
-                batch
-                    .column(index(name))
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .expect("SHOW BACKENDS projects every column as Utf8")
-                    .clone()
-            };
-            let process_id = column("ProcessId");
-            let diagnostic_status = column("DiagnosticStatus");
-            let eligible = column("Eligible");
-            let build_identity = column("BuildIdentity");
-            let compatibility_id = column("NativeCompatibilityId");
-            let status_detail = column("StatusDetail");
-            for row in 0..batch.num_rows() {
-                rows.push(BarrierRow {
-                    process_id: process_id.value(row).to_string(),
-                    diagnostic_status: diagnostic_status.value(row).to_string(),
-                    eligible: eligible.value(row) == "true",
-                    build_identity: build_identity.value(row).to_string(),
-                    compatibility_id: compatibility_id.value(row).to_string(),
-                    status_detail: status_detail.value(row).to_string(),
-                });
-            }
-        }
-        rows
+        service
+            .backend_rows()
+            .expect("typed topology projection")
+            .into_iter()
+            .map(|row| BarrierRow {
+                process_id: row.process_id,
+                diagnostic_status: row.diagnostic_status,
+                eligible: row.eligible,
+                build_identity: row.build_identity,
+                compatibility_id: row.native_compatibility_id,
+                status_detail: row.status_detail,
+            })
+            .collect()
     }
 
     /// What the frontend's exact refusal of a heartbeat aimed at a retired
@@ -1942,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_rows_preserve_show_backends_names_order_and_text() {
+    fn backend_rows_preserve_typed_topology_facts() {
         let service = ClusterBackendService::new_transient_for_test(1);
         let announced = descriptor("127.0.0.1:9070".parse().unwrap());
         service
@@ -1952,62 +1865,27 @@ mod tests {
         let rows = service.backend_rows().expect("typed topology rows");
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        let result = service.show_backends().expect("SHOW BACKENDS projection");
-        assert_eq!(
-            result
-                .columns
-                .iter()
-                .map(|column| column.name())
-                .collect::<Vec<_>>(),
-            vec![
-                "ProcessId",
-                "Endpoint",
-                "LeaseValid",
-                "IdentityVerified",
-                "ReportedState",
-                "Compatible",
-                "EndpointOwned",
-                "Eligible",
-                "ScheduledFragments",
-                "LastAnnounceAt",
-                "LastHeartbeatAt",
-                "BuildIdentity",
-                "NativeCompatibilityId",
-                "DiagnosticStatus",
-                "StatusDetail",
-            ]
-        );
-        let expected = vec![
-            announced.process_id().to_string(),
-            "127.0.0.1:9070".to_string(),
-            "true".to_string(),
-            "true".to_string(),
-            "Running".to_string(),
-            "true".to_string(),
-            "true".to_string(),
-            "true".to_string(),
-            "0".to_string(),
-            row.last_announce_ms.to_string(),
-            "1".to_string(),
-            "fixture-build".to_string(),
-            "71".repeat(32),
-            "Live".to_string(),
-            String::new(),
-        ];
         assert!(row.last_announce_ms > 0);
-        let projected = result.batches[0]
-            .columns()
-            .iter()
-            .map(|column| {
-                column
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .expect("SHOW BACKENDS Utf8 column")
-                    .value(0)
-                    .to_string()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(projected, expected);
+        assert_eq!(
+            row,
+            &super::BackendTopologyRow {
+                process_id: announced.process_id().to_string(),
+                endpoint: "127.0.0.1:9070".into(),
+                lease_valid: true,
+                identity_verified: true,
+                reported_state: "Running".into(),
+                compatible: true,
+                endpoint_owned: true,
+                eligible: true,
+                scheduled_fragments: 0,
+                last_announce_ms: row.last_announce_ms,
+                last_heartbeat_ms: 1,
+                build_identity: "fixture-build".into(),
+                native_compatibility_id: "71".repeat(32),
+                diagnostic_status: "Live".into(),
+                status_detail: String::new(),
+            }
+        );
         let json = serde_json::to_value(row).expect("serialize typed row");
         assert_eq!(json["lease_valid"], true);
         assert_eq!(json["identity_verified"], true);
@@ -2055,29 +1933,6 @@ mod tests {
                 .expect("installed topology")
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn show_exposes_orthogonal_facts() {
-        let service = ClusterBackendService::new_transient_for_test(1);
-        let descriptor = descriptor("127.0.0.1:9070".parse().unwrap());
-        service
-            .record_announce(descriptor.clone(), BackendReportedState::Running)
-            .unwrap();
-        verify(&service, &descriptor);
-        let columns = service
-            .show_backends()
-            .unwrap()
-            .columns
-            .into_iter()
-            .map(|column| column.name().to_string())
-            .collect::<Vec<_>>();
-        assert!(columns.contains(&"LeaseValid".to_string()));
-        assert!(columns.contains(&"IdentityVerified".to_string()));
-        assert!(columns.contains(&"EndpointOwned".to_string()));
-        assert!(columns.contains(&"Eligible".to_string()));
-        assert!(columns.contains(&"DiagnosticStatus".to_string()));
-        assert!(columns.contains(&"NativeCompatibilityId".to_string()));
     }
 
     #[test]

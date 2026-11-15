@@ -825,15 +825,6 @@ fn parse_meta_with_name_binding(
             "iceberg_orphan_fixture_absent" => {
                 meta.iceberg_orphan_fixture_absent = parse_bool(&raw_value)?;
             }
-            "wait_alter_column" => {
-                meta.wait_alter_column = Some(raw_value);
-            }
-            "wait_alter_rollup" => {
-                meta.wait_alter_rollup = Some(raw_value);
-            }
-            "wait_alter_optimize" => {
-                meta.wait_alter_optimize = Some(raw_value);
-            }
             "imv_equivalence_check" => {
                 meta.imv_equivalence_check = Some(raw_value);
             }
@@ -1242,18 +1233,6 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .or_else(|| base.iceberg_orphan_fixture.clone()),
         iceberg_orphan_fixture_absent: override_meta.iceberg_orphan_fixture_absent
             || base.iceberg_orphan_fixture_absent,
-        wait_alter_column: override_meta
-            .wait_alter_column
-            .clone()
-            .or_else(|| base.wait_alter_column.clone()),
-        wait_alter_rollup: override_meta
-            .wait_alter_rollup
-            .clone()
-            .or_else(|| base.wait_alter_rollup.clone()),
-        wait_alter_optimize: override_meta
-            .wait_alter_optimize
-            .clone()
-            .or_else(|| base.wait_alter_optimize.clone()),
         imv_equivalence_check: override_meta
             .imv_equivalence_check
             .clone()
@@ -3392,7 +3371,7 @@ mod opt5_directive_tests {
         for (name, steps, contract_query) in [
             ("broadcast_risk_fallback_large_build_rejected_dist", 6, 6),
             ("broadcast_risk_zero_stats_dist", 6, 6),
-            ("broadcast_risk_narrow_build_medium_rows_kept_dist", 11, 11),
+            ("broadcast_risk_narrow_build_medium_rows_kept_dist", 10, 10),
             ("broadcast_risk_small_build_kept_dist", 11, 11),
             ("broadcast_risk_wide_build_uncertain_rejected_dist", 11, 11),
         ] {
@@ -3442,7 +3421,7 @@ mod opt5_directive_tests {
              -- @result_rows_where=catalog=cat\n\
              -- @result_rows_count=1\n\
              -- @result_rows_expect=state=SUCCEEDED\n\
-             SHOW ANALYZE JOBS;\n\
+             SELECT table_name, catalog_name, state FROM metadata_fixture;\n\
              -- query 2\n\
              SELECT 1;\n",
         )
@@ -3497,8 +3476,10 @@ mod opt5_directive_tests {
                 "duplicate @result_rows_count",
             ),
         ] {
-            let failure = load_result_rows_test_case(&format!("{directives}SHOW ANALYZE JOBS;\n"))
-                .unwrap_err();
+            let failure = load_result_rows_test_case(&format!(
+                "{directives}SELECT table_name, catalog_name, state FROM metadata_fixture;\n"
+            ))
+            .unwrap_err();
             assert!(format!("{failure:#}").contains(expected), "{failure:#}");
         }
     }

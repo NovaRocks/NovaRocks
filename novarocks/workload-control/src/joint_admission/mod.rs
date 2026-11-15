@@ -138,9 +138,8 @@ fn class_index(class: WorkClass) -> usize {
     match class {
         WorkClass::Query => 0,
         WorkClass::MaterializedView => 1,
-        WorkClass::Statistics => 2,
-        WorkClass::TableMaintenance => 3,
-        WorkClass::Management => 4,
+        WorkClass::TableMaintenance => 2,
+        WorkClass::Management => 3,
     }
 }
 

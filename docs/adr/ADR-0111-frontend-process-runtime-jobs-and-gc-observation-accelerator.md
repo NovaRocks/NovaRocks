@@ -5,13 +5,16 @@ domain: [table-maintenance, provider-spi]
 status: active
 supersedes: [ADR-0065, ADR-0067, ADR-0084]
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0232
+    scope: "Maintenance/statistics job queues, workers, histories and observer-only cancellation in decisions 1 and 3; crash-only publication, activity gates and GC Accelerator remain"
 date: 2026-08-26
 provenance:
   - "discussion: 2026-08-26 frontend runtime-state owner cut"
 code-anchors:
-  - "novarocks/frontend/src/table_maintenance/mod.rs (FrontendTableMaintenanceService)"
-  - "novarocks/frontend/src/statistics_jobs/service.rs (FrontendStatisticsJobService)"
-  - "novarocks/frontend/src/common/admitted_query_context.rs (LakePublicationRuntimePolicy)"
+  - "novarocks/table-maintenance/src/gc_observation.rs (GcOwnedRefObservationAccelerator)"
+  - "novarocks/frontend-application/src/query_execution/maintenance/rewrite_job/direct.rs (DirectRewriteAction)"
+  - "novarocks/frontend-application/src/statistics/attempt_executor/statement.rs (StatementStatisticsAction)"
 ---
 
 ## 问题

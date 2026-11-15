@@ -24,7 +24,9 @@
 
 use novarocks_parser::{
     Span,
-    ast::{BinaryExpr, BinaryOperator, Expr, Ident, Literal, LiteralKind, ShowBackends, Statement},
+    ast::{
+        BinaryExpr, BinaryOperator, Expr, Ident, Literal, LiteralKind, ShowProcessList, Statement,
+    },
     printer::{print_expr, print_statement},
 };
 
@@ -52,8 +54,11 @@ fn binary(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
 
 #[test]
 fn roundtrip_seed_ast_printer_contracts_cover_vertical_slice_and_expressions() {
-    let show_backends = Statement::ShowBackends(ShowBackends { span: span() });
-    assert_eq!(print_statement(&show_backends), "SHOW BACKENDS");
+    let show_processlist = Statement::ShowProcessList(ShowProcessList {
+        full: false,
+        span: span(),
+    });
+    assert_eq!(print_statement(&show_processlist), "SHOW PROCESSLIST");
 
     let expression = binary(
         ident("a"),

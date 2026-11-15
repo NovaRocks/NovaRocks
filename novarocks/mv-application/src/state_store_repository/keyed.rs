@@ -83,15 +83,6 @@ impl StateStoreMvRepository {
             .delete_keyed_projection(operation_id, expected)
             .await
     }
-    pub async fn list_keyed_dependencies_by_downstream_bounded(
-        &self,
-        loaded: &LoadedKeyedMvProjection,
-        bound: MvDependencyReadBound,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        self.read_repository()
-            .list_keyed_dependencies_by_downstream_bounded(loaded, bound)
-            .await
-    }
 }
 pub(super) async fn projection_inventory<T: ReadAccess + ?Sized>(
     tx: &mut T,

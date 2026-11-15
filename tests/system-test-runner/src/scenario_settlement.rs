@@ -51,6 +51,14 @@ impl ScenarioSettlement {
         })
     }
 
+    pub(crate) fn record_reference(
+        &self,
+        reference: &novarocks_cluster_harness::reference_inputs::ResolvedReference,
+    ) -> Result<()> {
+        self.record.borrow_mut()["reference"] = serde_json::to_value(reference)?;
+        Ok(())
+    }
+
     pub(crate) fn launch_config_succeeded(&self) {
         self.record.borrow_mut()["fixture"]["launch_config"] = json!("ok");
     }
@@ -190,6 +198,48 @@ mod tests {
                     assert!(record["cluster"]["partial_cleanup"].is_null());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn normal_and_failed_settlements_keep_only_the_scenarios_reference_components() {
+        use novarocks_cluster_harness::reference_inputs::{
+            ArtifactRef, ReferenceInput, ResolvedReference, TrinoImageRef,
+        };
+        let reference = ResolvedReference {
+            trino_image: Some(TrinoImageRef {
+                alias: "declared-alias".into(),
+                image_id: "exact-image".into(),
+                version: "declared-version".into(),
+            }),
+            trino_jdbc_driver: Some(ArtifactRef {
+                name: "driver.jar".into(),
+                path: "/declared/driver.jar".into(),
+                sha256: "driver-hash".into(),
+            }),
+        };
+        for fixture_fails in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let observation = ScenarioSettlement::new("component/settlement", root.path()).unwrap();
+            observation
+                .record_reference(
+                    &reference.subset(&[ReferenceInput::TrinoImage].into_iter().collect()),
+                )
+                .unwrap();
+            let _ = observation.teardown(&Fixture {
+                fails: fixture_fails,
+            });
+            observation.write().unwrap();
+            let record = read(root.path());
+            assert_eq!(
+                record["reference"]["trino_image"]["image_id"],
+                "exact-image"
+            );
+            assert_eq!(
+                record["reference"]["trino_image"]["version"],
+                "declared-version"
+            );
+            assert!(record["reference"].get("trino_jdbc_driver").is_none());
         }
     }
 

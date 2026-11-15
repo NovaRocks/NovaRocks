@@ -54,6 +54,7 @@ sha2.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-sql-testkit.workspace = true
 novarocks-connector-iceberg-functions.workspace = true
 
 [package.metadata.novarocks.test]

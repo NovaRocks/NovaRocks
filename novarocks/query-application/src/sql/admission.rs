@@ -17,10 +17,8 @@
 
 //! Query-application SQL admission that is independent of a product route.
 
-use crate::engine_error::EngineError;
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_parser::ast::{self, Statement as ParsedStatement};
-use novarocks_types::EngineErrorCode;
 use novarocks_workload_control::WorkClass;
 
 /// Connection management has no authority in a statement-scoped client session.
@@ -106,23 +104,15 @@ pub fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
         ParsedStatement::Catalog(statement) => {
             !matches!(statement, ast::CatalogStatement::ShowCreateTable(_))
         }
-        ParsedStatement::Maintenance(statement) => {
-            !matches!(statement, ast::MaintenanceStatement::ShowOptimize(_))
+        ParsedStatement::Maintenance(_) => true,
+        ParsedStatement::MaterializedView(statement) => {
+            !matches!(statement, ast::MaterializedViewStatement::ExplainRefresh(_))
         }
-        ParsedStatement::MaterializedView(statement) => !matches!(
-            statement,
-            ast::MaterializedViewStatement::Show(_)
-                | ast::MaterializedViewStatement::ExplainRefresh(_)
-        ),
         ParsedStatement::View(statement) => !matches!(statement, ast::ViewStatement::ShowCreate(_)),
-        ParsedStatement::Statistics(statement) => matches!(
-            statement,
-            ast::StatisticsStatement::AnalyzeTable(_)
-                | ast::StatisticsStatement::DropStats(_)
-                | ast::StatisticsStatement::DropHistogram(_)
-                | ast::StatisticsStatement::DropMultipleColumnsStats(_)
-        ),
-        ParsedStatement::ShowBackends(_) | ParsedStatement::ShowProcessList(_) => false,
+        ParsedStatement::Statistics(statement) => {
+            matches!(statement, ast::StatisticsStatement::AnalyzeTable(_))
+        }
+        ParsedStatement::ShowProcessList(_) => false,
         ParsedStatement::Session(_)
         | ParsedStatement::Query(_)
         | ParsedStatement::ExplainQuery(_) => false,
@@ -152,85 +142,6 @@ pub fn typed_statement_work_class(statement: &ParsedStatement) -> WorkClass {
     }
 }
 
-/// Parse the test-only SQL hook that forces a stable engine error.
-pub fn admin_raise_engine_error(sql: &str) -> Result<Option<QueryServiceError>, QueryServiceError> {
-    let parts = sql.split_whitespace().collect::<Vec<_>>();
-    if !matches!(parts.as_slice(), [admin, raise, engine, error, _]
-        if admin.eq_ignore_ascii_case("admin")
-            && raise.eq_ignore_ascii_case("raise")
-            && engine.eq_ignore_ascii_case("engine")
-            && error.eq_ignore_ascii_case("error"))
-    {
-        return Ok(None);
-    }
-    let [_, _, _, _, raw_code] = parts.as_slice() else {
-        return Err(QueryServiceError::new(
-            QueryServiceErrorKind::Parse,
-            "expected ADMIN RAISE ENGINE ERROR '<engine_error_code>'",
-        ));
-    };
-    let raw_code = raw_code
-        .strip_prefix('\'')
-        .and_then(|inner| inner.strip_suffix('\''))
-        .or_else(|| {
-            raw_code
-                .strip_prefix('"')
-                .and_then(|inner| inner.strip_suffix('"'))
-        })
-        .ok_or_else(|| {
-            QueryServiceError::new(
-                QueryServiceErrorKind::Parse,
-                "expected ADMIN RAISE ENGINE ERROR '<engine_error_code>'",
-            )
-        })?;
-    let code = EngineErrorCode::parse(raw_code).ok_or_else(|| {
-        QueryServiceError::new(
-            QueryServiceErrorKind::Parse,
-            format!("unknown engine error code: {raw_code}"),
-        )
-    })?;
-    let error = match code {
-        EngineErrorCode::UnsupportedDistributedDmlShape => {
-            EngineError::unsupported_distributed_dml_shape(
-                "ADMIN RAISE ENGINE ERROR",
-                "forced P8 SQL runner error-code smoke",
-            )
-        }
-        EngineErrorCode::IcebergWriteDescriptorMismatch => {
-            EngineError::iceberg_write_descriptor_mismatch("forced P8 SQL runner error-code smoke")
-        }
-        EngineErrorCode::UnsupportedPositionDeleteDescriptor => {
-            EngineError::unsupported_position_delete_descriptor(
-                "forced position-delete descriptor error-code smoke",
-            )
-        }
-        EngineErrorCode::CommitKnownUncommitted => {
-            EngineError::commit_known_uncommitted("forced P8 SQL runner error-code smoke")
-        }
-        EngineErrorCode::CommitUnknown => {
-            EngineError::commit_unknown("forced P8 SQL runner error-code smoke")
-        }
-        EngineErrorCode::CommitKnownCommittedFinalizeFailed => {
-            EngineError::commit_known_committed_finalize_failed(
-                "forced P8 SQL runner error-code smoke",
-            )
-        }
-        EngineErrorCode::ProtocolDecodeError => {
-            EngineError::protocol_decode("forced P8 SQL runner error-code smoke")
-        }
-        _ => {
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::Parse,
-                format!("unsupported engine error code for ADMIN RAISE ENGINE ERROR: {raw_code}"),
-            ));
-        }
-    };
-    Ok(Some(QueryServiceError::new(
-        QueryServiceErrorKind::Unsupported,
-        error.to_bracketed_user_message(),
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,7 +164,7 @@ mod tests {
             "SELECT 1",
             "USE db",
             "SET SESSION pipeline_dop = 1",
-            "SHOW BACKENDS",
+            "SHOW STATS FOR lake.db.events",
         ] {
             admit_statement_session(&parse_single_statement(sql).unwrap()).unwrap();
         }
@@ -310,15 +221,6 @@ mod tests {
     }
 
     #[test]
-    fn admin_raise_engine_error_keeps_the_engine_code_visible() {
-        let error =
-            admin_raise_engine_error("ADMIN RAISE ENGINE ERROR 'UnsupportedDistributedDmlShape'")
-                .expect("parse")
-                .expect("admin error");
-        assert!(error.message().contains("UnsupportedDistributedDmlShape"));
-    }
-
-    #[test]
     fn typed_statement_work_class_keeps_data_plane_work_distinct_from_management() {
         let explain = parse_single_statement("EXPLAIN SELECT 1").expect("parse explain");
         let dml = parse_single_statement("INSERT INTO target VALUES (1)").expect("parse DML");
@@ -331,20 +233,18 @@ mod tests {
             typed_statement_work_class(&management),
             WorkClass::Management
         );
-        // OPTIMIZE carries this exact SQL permit into its original JobRoot.
+        // OPTIMIZE retains this exact SQL permit until its statement exits.
         let optimize = parse_single_statement("ALTER TABLE lake.db.events OPTIMIZE")
-            .expect("parse job-submitting statement");
+            .expect("parse statement-owned optimize");
         assert_eq!(typed_statement_work_class(&optimize), WorkClass::Query);
     }
 
     #[test]
-    fn analyze_reserves_the_original_query_permit_for_its_job_handoff() {
-        // Capture closes before moving this same grant into the job. It must
-        // not enter the management route with an empty query-permit slot.
+    fn analyze_retains_the_original_query_permit() {
+        // ANALYZE is ordinary query work under its original SQL permit.
         for sql in [
             "ANALYZE TABLE lake.db.events",
-            "ANALYZE FULL TABLE lake.db.events (event_id) WITH SYNC MODE",
-            "ANALYZE SAMPLE TABLE lake.db.events",
+            "ANALYZE TABLE lake.db.events (event_id)",
         ] {
             let statement = parse_single_statement(sql).expect("parse ANALYZE");
             assert!(matches!(
@@ -360,24 +260,13 @@ mod tests {
     }
 
     #[test]
-    fn statistics_observation_cancellation_and_drop_remain_management() {
-        for sql in [
-            "SHOW ANALYZE JOBS",
-            "SHOW TABLE STATS lake.db.events",
-            "CANCEL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419",
-            "KILL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419",
-            "DROP STATS lake.db.events",
-            "DROP HISTOGRAM ON lake.db.events (event_id)",
-            "DROP MULTIPLE COLUMNS STATS lake.db.events",
-        ] {
-            let statement = parse_single_statement(sql).expect("parse statistics management");
-            assert!(matches!(statement, ParsedStatement::Statistics(_)));
-            assert_eq!(
-                typed_statement_work_class(&statement),
-                WorkClass::Management,
-                "{sql}"
-            );
-        }
+    fn statistics_observation_remains_management() {
+        let statement = parse_single_statement("SHOW STATS FOR lake.db.events").unwrap();
+        assert_eq!(
+            typed_statement_work_class(&statement),
+            WorkClass::Management
+        );
+        assert!(!requires_lake_publication_deadline(&statement));
     }
 
     #[test]
@@ -528,7 +417,7 @@ mod tests {
             "CALL ice.system.remove_orphan_files(table => 'db.orders', older_than => TIMESTAMP '2020-01-01 00:00:00')",
             "CALL ice.other.rewrite_data_files(table => 'db.orders')",
             "CALL ice.system.rewrite_manifests(table => 'db.orders')",
-            "SHOW ALTER TABLE OPTIMIZE",
+            "SHOW STATS FOR lake.db.events",
         ] {
             let statement = parse_single_statement(sql).expect("original typed management parser");
             assert_eq!(

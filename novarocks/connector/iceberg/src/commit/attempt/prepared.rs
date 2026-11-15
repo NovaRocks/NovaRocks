@@ -82,6 +82,7 @@ pub(crate) trait PublicationPreparer: Send + Sync + 'static {
 }
 
 pub(crate) struct CatalogPublisher {
+    pub expected_table_uuid: Option<uuid::Uuid>,
     pub catalog_operation: crate::catalog::admission::CatalogOperation,
     pub catalog: Arc<dyn crate::catalog::NovaRocksCatalog>,
     pub ident: crate::iceberg::TableIdent,
@@ -129,6 +130,22 @@ impl PublicationPreparer for CatalogPublisher {
             .await;
         attempt.check_active()?;
         let base = loaded?;
+        if self
+            .expected_table_uuid
+            .is_some_and(|expected| expected != base.metadata.uuid())
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "TARGET_REPLACED: Iceberg rewrite target changed before commit",
+            )
+            .with_source(
+                novarocks_spi::connector::ConnectorError::table_object_binding(
+                    novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced,
+                    "TARGET_REPLACED: Iceberg rewrite target changed before commit",
+                )
+                .with_public_failure_detail(),
+            ));
+        }
         Ok(StagingBase::Existing {
             metadata: base.metadata,
             metadata_location: base.metadata_location,

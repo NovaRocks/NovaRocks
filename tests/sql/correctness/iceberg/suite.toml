@@ -18,7 +18,7 @@
 explicit_only = false
 
 [impact]
-paths = [
+paths = ["novarocks/table-maintenance/**", "novarocks/frontend-application/src/query_execution/maintenance/**", "novarocks/frontend-application/src/table_maintenance/**",
     "tests/sql/fixtures/iceberg-read-policy/**",
     "novarocks/connector/iceberg/**",
     "novarocks/frontend-application/src/query_execution/dml/mutation_flow.rs",

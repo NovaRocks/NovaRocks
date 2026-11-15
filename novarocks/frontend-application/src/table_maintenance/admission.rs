@@ -21,7 +21,7 @@ use crate::query_execution::maintenance::MaintenanceRequestContext;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use novarocks_sql::semantic::command::{
     CommandLiteral, ExpireSnapshotsOptionSql, MaintenanceSqlCommand, MaintenanceValueSql,
-    ProcedureArgumentModeSql, SortDirectionSql,
+    ProcedureArgumentModeSql,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -34,7 +34,6 @@ pub enum ParsedMaintenanceStatement {
     SubmitOptimize {
         name_parts: Vec<String>,
     },
-    ShowOptimize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,15 +58,6 @@ pub enum ParsedMaintenanceAction {
         options: BTreeMap<String, String>,
         where_clause: Option<String>,
     },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ParsedShowOptimize {
-    pub(super) catalog: Option<String>,
-    pub(super) database: Option<String>,
-    pub(super) table_name: Option<String>,
-    pub(super) order_by_create_time_desc: bool,
-    pub(super) limit: Option<usize>,
 }
 
 /// Lowers the Query-Application semantic command into the maintenance
@@ -146,71 +136,7 @@ pub(crate) fn lower_semantic_maintenance_statement(
                 },
             })
         }
-        MaintenanceSqlCommand::ShowOptimize(statement) => {
-            let _ = lower_semantic_show_optimize(statement)?;
-            Ok(ParsedMaintenanceStatement::ShowOptimize)
-        }
     }
-}
-
-pub(crate) fn lower_semantic_show_optimize(
-    statement: &novarocks_sql::semantic::command::ShowOptimizeSqlCommand,
-) -> Result<ParsedShowOptimize, String> {
-    let (catalog, database) = match statement.from.as_ref() {
-        Some(name) => match normalize_semantic_object_name(name)?.as_slice() {
-            [database] => (None, Some(database.clone())),
-            [catalog, database] => (Some(catalog.clone()), Some(database.clone())),
-            _ => {
-                return Err(
-                    "SHOW ALTER TABLE OPTIMIZE FROM only supports db or catalog.db".to_string(),
-                );
-            }
-        },
-        None => (None, None),
-    };
-    let table_name = match statement.filter.as_ref() {
-        Some(filter) => {
-            if !filter.column.eq_ignore_ascii_case("TableName") {
-                return Err(
-                    "SHOW ALTER TABLE OPTIMIZE only supports WHERE TableName = '...'".to_string(),
-                );
-            }
-            let CommandLiteral::String(value) = &filter.value else {
-                return Err(
-                    "SHOW ALTER TABLE OPTIMIZE only supports WHERE TableName = '...'".to_string(),
-                );
-            };
-            Some(normalize_identifier(value)?)
-        }
-        None => None,
-    };
-    let order_by_create_time_desc = match statement.order_by.as_ref() {
-        Some(order_by) => {
-            if !order_by.column.eq_ignore_ascii_case("CreateTime") {
-                return Err(
-                    "SHOW ALTER TABLE OPTIMIZE only supports ORDER BY CreateTime".to_string(),
-                );
-            }
-            matches!(order_by.direction, Some(SortDirectionSql::Desc))
-        }
-        None => false,
-    };
-    let limit = match statement.limit.as_ref() {
-        Some(CommandLiteral::Number(value)) => Some(
-            value
-                .parse::<usize>()
-                .map_err(|error| format!("parse SHOW ALTER TABLE OPTIMIZE LIMIT: {error}"))?,
-        ),
-        Some(_) => return Err("SHOW ALTER TABLE OPTIMIZE LIMIT expects number".to_string()),
-        None => None,
-    };
-    Ok(ParsedShowOptimize {
-        catalog,
-        database,
-        table_name,
-        order_by_create_time_desc,
-        limit,
-    })
 }
 
 fn lower_semantic_call(
@@ -844,36 +770,6 @@ mod semantic_tests {
                 },
             })
         );
-    }
-
-    #[test]
-    fn lowers_semantic_show_optimize_presentation() {
-        let command = semantic_maintenance(
-            "SHOW ALTER TABLE OPTIMIZE FROM `ice`.`analytics` \
-             WHERE `TableName` = 'orders' ORDER BY `CreateTime` DESC LIMIT 20",
-        );
-        let MaintenanceSqlCommand::ShowOptimize(show) = command else {
-            panic!("expected semantic SHOW ALTER TABLE OPTIMIZE command");
-        };
-
-        assert_eq!(
-            lower_semantic_show_optimize(&show),
-            Ok(ParsedShowOptimize {
-                catalog: Some("ice".to_string()),
-                database: Some("analytics".to_string()),
-                table_name: Some("orders".to_string()),
-                order_by_create_time_desc: true,
-                limit: Some(20),
-            })
-        );
-        let error = lower_semantic_show_optimize(
-            match &semantic_maintenance("SHOW ALTER TABLE OPTIMIZE WHERE TableName = 1") {
-                MaintenanceSqlCommand::ShowOptimize(show) => show,
-                _ => panic!("expected semantic SHOW ALTER TABLE OPTIMIZE command"),
-            },
-        )
-        .expect_err("numeric TableName filter is not part of maintenance admission");
-        assert!(error.contains("WHERE TableName"));
     }
 
     #[test]

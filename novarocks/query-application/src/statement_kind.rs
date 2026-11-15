@@ -32,15 +32,9 @@ pub enum StatementKind {
     Empty,
     Query,
     Explain,
-    ShowBackends,
     ShowProcessList,
     Analyze,
-    ShowAnalyzeJobs,
-    CancelAnalyze,
-    ShowTableStats,
-    DropStats,
-    DropHistogram,
-    DropMultipleColumnsStats,
+    ShowStats,
     CreateCatalog,
     DropCatalog,
     CreateDatabase,
@@ -72,7 +66,6 @@ pub enum StatementKind {
     RewriteManifests,
     ExpireSnapshots,
     RemoveOrphanFiles,
-    ShowOptimize,
     CreateMaterializedView,
     DropMaterializedView,
     AlterMaterializedViewRefresh,
@@ -81,7 +74,6 @@ pub enum StatementKind {
     ResumeMaterializedViewRefresh,
     RepartitionMaterializedView,
     RefreshMaterializedView,
-    ShowMaterializedViews,
     ExplainMaterializedViewRefresh,
     CreateView,
     DropView,
@@ -106,18 +98,10 @@ impl StatementKind {
     /// There is deliberately no SQL-string dispatch and no catch-all kind.
     pub fn from_statement(statement: &ast::Statement) -> Self {
         match statement {
-            ast::Statement::ShowBackends(_) => Self::ShowBackends,
             ast::Statement::ShowProcessList(_) => Self::ShowProcessList,
             ast::Statement::Statistics(statement) => match statement {
                 ast::StatisticsStatement::AnalyzeTable(_) => Self::Analyze,
-                ast::StatisticsStatement::ShowAnalyzeJobs(_) => Self::ShowAnalyzeJobs,
-                ast::StatisticsStatement::CancelAnalyze(_) => Self::CancelAnalyze,
-                ast::StatisticsStatement::ShowTableStats(_) => Self::ShowTableStats,
-                ast::StatisticsStatement::DropStats(_) => Self::DropStats,
-                ast::StatisticsStatement::DropHistogram(_) => Self::DropHistogram,
-                ast::StatisticsStatement::DropMultipleColumnsStats(_) => {
-                    Self::DropMultipleColumnsStats
-                }
+                ast::StatisticsStatement::ShowStats(_) => Self::ShowStats,
             },
             ast::Statement::Catalog(statement) => match statement {
                 ast::CatalogStatement::TruncateTable(_) => Self::TruncateTable,
@@ -180,7 +164,6 @@ impl StatementKind {
                 ast::MaintenanceStatement::RewriteManifests(_) => Self::RewriteManifests,
                 ast::MaintenanceStatement::ExpireSnapshots(_) => Self::ExpireSnapshots,
                 ast::MaintenanceStatement::RemoveOrphanFiles(_) => Self::RemoveOrphanFiles,
-                ast::MaintenanceStatement::ShowOptimize(_) => Self::ShowOptimize,
             },
             ast::Statement::MaterializedView(statement) => match statement {
                 ast::MaterializedViewStatement::Create(_) => Self::CreateMaterializedView,
@@ -208,7 +191,6 @@ impl StatementKind {
                     }
                 },
                 ast::MaterializedViewStatement::Refresh(_) => Self::RefreshMaterializedView,
-                ast::MaterializedViewStatement::Show(_) => Self::ShowMaterializedViews,
                 ast::MaterializedViewStatement::ExplainRefresh(_) => {
                     Self::ExplainMaterializedViewRefresh
                 }
@@ -253,27 +235,20 @@ impl StatementKind {
     /// True only for syntax families whose result is statically a row result.
     ///
     /// This is not proof of a completion carrier when false: CALL may produce
-    /// rows. An adapter must inspect the actual carrier and suppress updateType
-    /// for row output even if this method is false. Empty has no updateType.
+    /// rows. An adapter inspects the actual carrier; row output suppresses
+    /// updateType except for Trino table procedures such as OPTIMIZE that
+    /// explicitly report both. Empty has no updateType.
     pub const fn is_row_kind(self) -> bool {
         match self {
             Self::Query
             | Self::Explain
-            | Self::ShowBackends
             | Self::ShowProcessList
-            | Self::ShowAnalyzeJobs
-            | Self::ShowTableStats
+            | Self::ShowStats
             | Self::ShowCreateTable
-            | Self::ShowOptimize
-            | Self::ShowMaterializedViews
             | Self::ExplainMaterializedViewRefresh
             | Self::ShowCreateView => true,
             Self::Empty
             | Self::Analyze
-            | Self::CancelAnalyze
-            | Self::DropStats
-            | Self::DropHistogram
-            | Self::DropMultipleColumnsStats
             | Self::CreateCatalog
             | Self::DropCatalog
             | Self::CreateDatabase

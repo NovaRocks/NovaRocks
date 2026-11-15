@@ -604,25 +604,90 @@ impl<'a> SortCreation<'a> {
         self.verify_chunks(chunks)?;
         let first = &chunks[0];
         let temporary = self.begin(first)?;
-        let schema = self.output.arrow_schema_ref();
-        // These are the original concat_batches outer constructors. The
-        // per-array neutral model owns only that kernel's internal structure.
+        let schema = self.concat_schema(chunks, retained)?;
+        use std::borrow::Cow;
+        let mut needs_projection = false;
+        for chunk in chunks {
+            needs_projection |= !self.batch_matches_schema(chunk.record_batch(), &schema)?;
+        }
+        if !needs_projection {
+            return self.concat_batch_sequence(
+                &schema,
+                chunks.iter().map(Chunk::record_batch),
+                retained,
+                temporary.as_ref(),
+            );
+        }
+        // Only a batch whose actual carrier changes creates new wrappers.
+        // Payload buffers and complete signed bindings are unchanged.
+        let mut batches = self.vector::<Cow<'_, RecordBatch>>(chunks.len(), temporary.as_ref())?;
+        for chunk in chunks {
+            if self.batch_matches_schema(chunk.record_batch(), &schema)? {
+                batches.push(Cow::Borrowed(chunk.record_batch()));
+                continue;
+            }
+            let mut columns =
+                self.vector::<arrow::array::ArrayRef>(schema.fields().len(), temporary.as_ref())?;
+            for (ordinal, (array, field)) in chunk
+                .record_batch()
+                .columns()
+                .iter()
+                .zip(schema.fields())
+                .enumerate()
+            {
+                let array = if array.data_type() == field.data_type() {
+                    array.clone()
+                } else {
+                    novarocks_functions::array_projection::rebuild_array_observed::<
+                        ConstructionFailure,
+                        _,
+                    >(array, field.data_type(), &mut |step| {
+                        retained.observe(ordinal, &[], step)
+                    })?
+                };
+                columns.push(array);
+            }
+            batches.push(Cow::Owned(
+                RecordBatch::try_new_with_options(
+                    schema.clone(),
+                    columns,
+                    &arrow::record_batch::RecordBatchOptions::new()
+                        .with_row_count(Some(chunk.len())),
+                )
+                .map_err(|source| failure::arrow(Operation::Batch, source))?,
+            ));
+        }
+        self.concat_batch_sequence(
+            &schema,
+            batches.iter().map(Cow::as_ref),
+            retained,
+            temporary.as_ref(),
+        )
+    }
+
+    fn concat_batch_sequence<'b, I>(
+        &self,
+        schema: &arrow::datatypes::SchemaRef,
+        batches: I,
+        retained: &dyn InputConstructionOwner,
+        temporary: &dyn InputConstructionOwner,
+    ) -> ExecutionResult<RecordBatch>
+    where
+        I: Clone + ExactSizeIterator<Item = &'b RecordBatch>,
+    {
+        let batch_count = batches.len();
+        // The original concat_batches container and kernel construction author.
         if !schema.fields().is_empty() {
-            temporary.request(std::alloc::Layout::array::<&RecordBatch>(chunks.len())
+            temporary.request(std::alloc::Layout::array::<&RecordBatch>(batch_count)
                 .map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
             retained.request(std::alloc::Layout::array::<arrow::array::ArrayRef>(schema.fields().len())
                 .map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
         }
         for column in 0..schema.fields().len() {
-            temporary.request(std::alloc::Layout::array::<&dyn arrow::array::Array>(chunks.len())
+            temporary.request(std::alloc::Layout::array::<&dyn arrow::array::Array>(batch_count)
                 .map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
-            let mut sources =
-                self.vector::<&arrow::array::ArrayRef>(chunks.len(), temporary.as_ref())?;
-            sources.extend(
-                chunks
-                    .iter()
-                    .map(|chunk| chunk.record_batch().column(column)),
-            );
+            let mut sources = self.vector::<&arrow::array::ArrayRef>(batch_count, temporary)?;
+            sources.extend(batches.clone().map(|batch| batch.column(column)));
             let mut temporary_request = |layout| temporary.request(layout);
             let mut temporary_opaque = |bytes| temporary.observe_opaque_upper_bound(bytes);
             let mut result_request = |layout| retained.request(layout);
@@ -645,10 +710,112 @@ impl<'a> SortCreation<'a> {
             )
             .map_err(concat_failure)?;
         }
-        // Original payload algorithm and SchemeS are unchanged. Complete
-        // declarations are already exact; there is no NULL/name inference.
-        arrow::compute::concat_batches(&schema, chunks.iter().map(Chunk::record_batch))
+        arrow::compute::concat_batches(schema, batches)
             .map_err(|source| failure::arrow(Operation::ConcatBatches, source))
+    }
+
+    fn batch_matches_schema(
+        &self,
+        batch: &RecordBatch,
+        schema: &arrow::datatypes::SchemaRef,
+    ) -> ExecutionResult<bool> {
+        let mut matches = batch.num_columns() == schema.fields().len();
+        for (field, actual) in schema.fields().iter().zip(batch.columns()) {
+            matches &= novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<
+                ComparisonFailure,
+            >(
+                field.data_type(),
+                actual.data_type(),
+                novarocks_type_contract::ArrowTypeProfile::Value,
+                || {
+                    self.factory
+                        .observe_input_work(1)
+                        .map_err(ComparisonFailure::Creator)
+                },
+            )
+            .map_err(ComparisonFailure::into_execution)?;
+        }
+        Ok(matches)
+    }
+
+    fn concat_schema(
+        &self,
+        chunks: &[Chunk],
+        owner: &dyn InputConstructionOwner,
+    ) -> ExecutionResult<arrow::datatypes::SchemaRef> {
+        use crate::exec::chunk::ChunkSlotSchema;
+        use crate::exec::operators::project_processor::{
+            project_field_owned, project_reserve, project_schema_owned,
+        };
+        use std::borrow::Cow;
+        let mut unchanged = true;
+        for chunk in chunks {
+            for (declared, actual) in self
+                .output
+                .slots()
+                .iter()
+                .zip(chunk.record_batch().columns())
+            {
+                unchanged &=
+                    novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<
+                        ComparisonFailure,
+                    >(
+                        declared.data_type(),
+                        actual.data_type(),
+                        novarocks_type_contract::ArrowTypeProfile::Value,
+                        || {
+                            self.factory
+                                .observe_input_work(1)
+                                .map_err(ComparisonFailure::Creator)
+                        },
+                    )
+                    .map_err(ComparisonFailure::into_execution)?;
+            }
+        }
+        if unchanged {
+            return Ok(self.output.arrow_schema_ref());
+        }
+        let first = &chunks[0];
+        let mut slots = project_reserve(self.output.slots().len(), owner)?;
+        for (ordinal, declared) in self.output.slots().iter().enumerate() {
+            let mut carrier = Cow::Borrowed(first.record_batch().column(ordinal).data_type());
+            for chunk in &chunks[1..] {
+                let merged =
+                    match novarocks_functions::array_projection::merge_execution_carriers_observed::<
+                        ConstructionFailure,
+                        _,
+                    >(
+                        carrier.as_ref(),
+                        chunk.record_batch().column(ordinal).data_type(),
+                        &mut |step| owner.observe(ordinal, &[], step),
+                    )? {
+                        Cow::Owned(merged) => Some(merged),
+                        Cow::Borrowed(_) => None,
+                    };
+                if let Some(merged) = merged {
+                    carrier = Cow::Owned(merged);
+                }
+            }
+            let field = project_field_owned(
+                first.chunk_schema().slots()[ordinal].field(),
+                carrier.as_ref(),
+                declared.name(),
+                declared.nullable(),
+                owner,
+            )?;
+            slots.push(ChunkSlotSchema::try_new_typed_observed::<
+                ConstructionFailure,
+                _,
+            >(
+                declared.slot_id(),
+                field,
+                declared.typed_binding().clone(),
+                declared.unique_id(),
+                owner.storage_lifetime(),
+                |step| owner.observe(ordinal, &[], step),
+            )?);
+        }
+        Ok(project_schema_owned(slots, owner.storage_lifetime(), owner)?.arrow_schema_ref())
     }
 
     pub(crate) fn source_type_storage(
@@ -677,28 +844,58 @@ impl<'a> SortCreation<'a> {
     // The original Arrow operation has already authored the payload. This
     // method governs only the actual Chunk columns and RecordBatch wrapper;
     // the operation's own array/header construction is a separate preflight.
+    #[cfg(test)]
     pub(crate) fn publish(
         &self,
         batch: RecordBatch,
         source: &Chunk,
         owner: &dyn InputConstructionOwner,
     ) -> ExecutionResult<Chunk> {
-        let (_, columns, rows) = batch.into_parts();
         let storage = owner
             .storage_lifetime()
             .retaining_observed(&source.array_type_storage_lifetime(), |layout| {
                 owner.request(layout)
             })?;
-        Ok(Chunk::try_new_typed_with_columns_owned_observed::<
-            ConstructionFailure,
-            _,
-        >(
-            self.output.clone(),
+        self.publish_with_storage(batch, source, storage, owner)
+    }
+
+    pub(crate) fn publish_with_storage(
+        &self,
+        batch: RecordBatch,
+        source: &Chunk,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        owner: &dyn InputConstructionOwner,
+    ) -> ExecutionResult<Chunk> {
+        use crate::exec::operators::project_processor::{
+            ProjectEncodingSource, materialize_project_output_owned,
+        };
+        if self.batch_matches_schema(&batch, &self.output.arrow_schema_ref())? {
+            let (_, columns, rows) = batch.into_parts();
+            return Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+                ConstructionFailure,
+                _,
+            >(
+                self.output.clone(),
+                columns,
+                rows,
+                storage,
+                |step| owner.observe(0, &[], step),
+            )?);
+        }
+        let (schema, columns, rows) = batch.into_parts();
+        materialize_project_output_owned(
             columns,
             rows,
+            self.output.clone(),
+            |ordinal| Ok(source.chunk_schema().slots()[ordinal].typed_binding()),
+            |ordinal| {
+                Ok(ProjectEncodingSource::OriginalField(
+                    &schema.fields()[ordinal],
+                ))
+            },
             storage,
-            |step| owner.observe(0, &[], step),
-        )?)
+            owner,
+        )
     }
 }
 
@@ -728,3 +925,6 @@ fn concat_failure(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

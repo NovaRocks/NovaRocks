@@ -24,7 +24,7 @@ use novarocks_query_application::{
 use novarocks_result_contract::{ClientPresentationFamily, TrinoJsonFacts};
 use serde::Serialize;
 
-/// Trino 483 query.max-length, measured in Java UTF-16 code units.
+/// Trino query.max-length, measured in Java UTF-16 code units.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryTextLimit {
     units: u32,
@@ -198,7 +198,7 @@ impl ParsedStatementRequest {
             ));
         }
         let mut properties: Vec<(String, String)> = Vec::new();
-        // Trino 483 parseProperty applies the last value for repeated names.
+        // Trino parseProperty applies the last value for repeated names.
         // Decoding happens after comma and '=' framing, so encoded separators
         // remain part of the property value.
         for value in headers.get_all("x-trino-session") {

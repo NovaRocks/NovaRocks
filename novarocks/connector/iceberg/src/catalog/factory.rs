@@ -510,12 +510,7 @@ mod tests {
                 } else {
                     CatalogTableName::new("db", "t").into()
                 };
-                for initiation in [
-                    CatalogInitiation::Statement,
-                    CatalogInitiation::StatementJob,
-                    CatalogInitiation::JobAttempt,
-                    CatalogInitiation::Background,
-                ] {
+                for initiation in [CatalogInitiation::Statement, CatalogInitiation::Background] {
                     let result = catalog.admit(&CatalogAdmissionRequest::new(
                         operation,
                         target.clone(),
@@ -542,14 +537,7 @@ mod tests {
                             assert!(refused.message().contains(operation.name()));
                         }
                     } else {
-                        assert_eq!(
-                            result.unwrap(),
-                            if kind == "hadoop" && initiation == CatalogInitiation::StatementJob {
-                                CatalogAdmission::AdmittedAwaitingCompletion
-                            } else {
-                                CatalogAdmission::Admitted
-                            }
-                        );
+                        assert_eq!(result.unwrap(), CatalogAdmission::Admitted);
                     }
                 }
             }
