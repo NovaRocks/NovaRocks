@@ -3513,6 +3513,7 @@ dependencies = [
  "novarocks-functions",
  "novarocks-local-compiler",
  "novarocks-local-program",
+ "novarocks-logical-execution-protocol",
  "novarocks-memory",
  "novarocks-mv-application",
  "novarocks-native-adapter",
@@ -3684,6 +3685,17 @@ dependencies = [
  "novarocks-types",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "novarocks-logical-execution-protocol"
+version = "0.1.0"
+dependencies = [
+ "novarocks-coordination-contract",
+ "novarocks-execution-contract",
+ "novarocks-failure-contract",
+ "novarocks-result-contract",
+ "novarocks-types",
 ]
 
 [[package]]
@@ -3919,6 +3931,7 @@ dependencies = [
  "novarocks-failure-contract",
  "novarocks-function-contract",
  "novarocks-functions",
+ "novarocks-logical-execution-protocol",
  "novarocks-parser",
  "novarocks-physical-plan",
  "novarocks-resource-contract",
