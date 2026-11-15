@@ -4147,6 +4147,7 @@ mod tests {
                 namespace: "db".into(),
                 table: "t".into(),
                 fields: vec![DmlWriteTargetField {
+                    storage_type: None,
                     token: ConnectorWriteFieldToken::from_bytes([4; 32]),
                     column: column.clone(),
                     is_hidden: false,
