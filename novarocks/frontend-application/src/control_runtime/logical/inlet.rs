@@ -384,6 +384,24 @@ impl LogicalInletObligation {
     pub(super) fn close(&self) {
         self.shared.close();
     }
+    /// The execution-wide gate already rejects new senders. A normal Source
+    /// drains each admitted sender frame before closing its original inlet,
+    /// so gate closure cannot overturn that frame's actual retirement reply.
+    /// Failure fencing instead uses close() immediately and preserves Closed.
+    pub(super) fn close_after_sender_frames(&self) {
+        assert!(
+            self.shared.admission_closed(),
+            "normal inlet close requires its original admission fence"
+        );
+        {
+            let mut state = self.shared.lock();
+            if state.frames != 0 {
+                state.host_waiting_frames = true;
+                return;
+            }
+        }
+        self.shared.close();
+    }
     pub(super) fn ingress_close_observer(&self) -> LogicalIngressCloseObserver {
         self.shared.publish_ingress_closed();
         LogicalIngressCloseObserver {
@@ -937,6 +955,43 @@ mod tests {
             InletProgress::Closed
         );
         assert_eq!(sender.send(fact(2)).await, Err(LogicalSourceClosed));
+        assert!(f.failures.lock().unwrap().is_empty());
+        f.finish();
+    }
+
+    #[tokio::test]
+    async fn normal_source_fence_drains_the_same_submitted_frame_before_closing_its_inlet() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let mut f = fixture_with_gate(false, Some(Arc::clone(&gate)));
+        let mut sender = f.inlet.take_sender().unwrap();
+        let mut send = sender.send(fact(1));
+        assert!(once(send.as_mut(), Waker::noop()).is_pending());
+        let submitted = f.inlet.shared.lock().submitted.unwrap();
+        gate.store(true, Ordering::Release);
+        f.inlet.close_after_sender_frames();
+        f.producer_exit();
+        assert!(!f.inlet.shared.lock().closing);
+        assert_eq!(f.inlet.shared.lock().submitted, Some(submitted));
+        assert_eq!(f.inlet.progress(true, false).unwrap(), InletProgress::Idle);
+        assert!(once(send.as_mut(), Waker::noop()).is_pending());
+        f.consume();
+        assert_eq!(
+            f.inlet.progress(true, false).unwrap(),
+            InletProgress::Changed
+        );
+        let before = f.host.calls.load(Ordering::SeqCst);
+        assert_eq!(
+            send.await,
+            Ok(()),
+            "the original healthy occurrence really retired"
+        );
+        assert_eq!(f.host.calls.load(Ordering::SeqCst), before + 1);
+        assert_eq!(sender.send(fact(2)).await, Err(LogicalSourceClosed));
+        f.inlet.close_after_sender_frames();
+        assert_eq!(
+            f.inlet.progress(true, false).unwrap(),
+            InletProgress::Closed
+        );
         assert!(f.failures.lock().unwrap().is_empty());
         f.finish();
     }

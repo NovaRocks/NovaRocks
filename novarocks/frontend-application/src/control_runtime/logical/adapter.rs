@@ -230,6 +230,7 @@ pub(super) fn input_class(input: &LogicalInput) -> InputClass {
         | LogicalInput::Snapshot { .. } => InputClass::Ordinary,
         LogicalInput::AttemptPort(message) => match message.body {
             AttemptToLogicalBody::AuthorizationRequest { .. }
+            | AttemptToLogicalBody::EstablishSettlement { .. }
             | AttemptToLogicalBody::PreReadyReplacementQuery { .. } => InputClass::Ordinary,
             _ => InputClass::Lifecycle,
         },

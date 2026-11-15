@@ -119,7 +119,11 @@ impl InputSlot {
         let mut changed = false;
         let closed = if let Some(inlet) = &mut self.inlet {
             if closing {
-                inlet.close();
+                if failed {
+                    inlet.close();
+                } else {
+                    inlet.close_after_sender_frames();
+                }
             }
             changed = inlet.progress(producer_exited, failed)? == InletProgress::Changed;
             if !inlet.is_closed() {
@@ -635,13 +639,6 @@ impl LogicalInputs {
     /// A late original activation may bind after admission closes. Only the
     /// move-only loan from the already-issued Business link permits this path;
     /// numeric activation or row identities cannot recreate that authority.
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "P12 binds the original Native activation to its already-issued AP author"
-        )
-    )]
     pub(crate) fn ap_author_from_link(
         &mut self,
         link: &super::links::AttemptActivationLinkLoan,

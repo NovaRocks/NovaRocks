@@ -20,7 +20,7 @@ use super::{
     adapter::{LogicalEffectEnvelope, LogicalHostEffect},
     auxiliary_work::{AuxiliaryHeaderOwner, AuxiliaryWorkObligation, AuxiliaryWorkStart},
     failure::{
-        LogicalFailureCut, LogicalFailureDriver, LogicalFailureProgressObligation,
+        LogicalFailureCut, LogicalFailureProgressObligation, LogicalFailureSupervisor,
         LogicalInfrastructureFailure,
     },
     funding::{LogicalFundingObligation, SourceFundingObligation, reported_step},
@@ -605,7 +605,7 @@ impl EffectSource for LogicalEffectSource {
                 originals.as_ref().map(|originals| originals.governance()),
                 self.wake.clone(),
             );
-            let driver = LogicalFailureDriver {
+            let supervisor = LogicalFailureSupervisor {
                 runtime: runtime.clone(),
                 registration: self.registration.clone(),
                 ticket: ticket.clone(),
@@ -620,15 +620,15 @@ impl EffectSource for LogicalEffectSource {
             if let Some(observer) = &self.owner_failure_observer {
                 observer.report(self.failure.error());
             }
-            let mut driver = Some(driver);
+            let mut supervisor = Some(supervisor);
             let job = AuxiliaryWorkObligation::start(AuxiliaryWorkStart {
                 handle: self.runtime.clone(),
                 original,
                 make: Box::new(move || {
                     Box::pin(
-                        driver
+                        supervisor
                             .take()
-                            .expect("same original logical failure driver")
+                            .expect("same original logical failure supervisor")
                             .run(),
                     )
                 }),
@@ -670,12 +670,31 @@ impl EffectSource for LogicalEffectSource {
             self.startup_cursor = 2;
         }
         if self.state.retirable.load(Ordering::Acquire) && !self.closed {
-            self.close_external();
-            self.funding
-                .scope()
-                .close_external()
-                .expect("close original logical external admission");
-            progressed = true;
+            // Core retirement closes new external submission immediately. Its
+            // Registry reply and other already-committed neutral effects may
+            // still be awaiting their original purpose. Keep those original
+            // result/exit positions and dispatch admission until the actual
+            // batches and jobs have drained; Retirable is not their receipt.
+            self.inputs.close_admission_gate();
+            if let Some(mut inputs) = self.inputs.try_loan() {
+                inputs.close();
+            }
+            let inventory = runtime
+                .snapshot(self.registration.actor())
+                .expect("same original logical retirement inventory");
+            if self.live_jobs == 0
+                && self.inputs_retired
+                && self.pending.is_none()
+                && inventory.inputs == 0
+                && inventory.batches == 0
+            {
+                self.close_external();
+                self.funding
+                    .scope()
+                    .close_external()
+                    .expect("close original logical external admission");
+                progressed = true;
+            }
         }
         let mut cx = Context::from_waker(&self.wake);
         // One finite pass per real change. Pending Join/header/input readiness
@@ -920,7 +939,7 @@ impl EffectSource for LogicalEffectSource {
         let mut inputs_waiting = false;
         if !self.input_pass_done && family_budget[1] != 0 && units < budget {
             if let Some(mut inputs) = self.inputs.try_loan() {
-                if self.closed {
+                if self.closed || self.state.retirable.load(Ordering::Acquire) {
                     inputs.close();
                 }
                 let input_progress = inputs
@@ -1207,3 +1226,6 @@ impl EffectSource for LogicalEffectSource {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(super) use tests::fixture::assemble_logical;

@@ -75,3 +75,11 @@ pub(crate) use install::{
 };
 mod auxiliary_work;
 mod tails;
+
+#[cfg(test)]
+#[path = "../../fixtures/logical.rs"]
+pub(crate) mod test_fixtures;
+
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod integration_tests;

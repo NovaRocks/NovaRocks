@@ -18,7 +18,7 @@
 //! Real logical Core, original Source, paid roles, HostRegistry and Tokio Join.
 //! Fake application facts do not prove Native/Worker or P11 failure projection.
 
-mod fixture;
+pub(super) mod fixture;
 use super::*;
 use fixture::*;
 use novarocks_control_runtime::actor_turn::{FailureSourceState, InputPhase};

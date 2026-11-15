@@ -834,9 +834,23 @@ async fn completed_install_role_cannot_retire_running_runtime_before_exact_core_
         .unwrap();
     original.role_ended_silent(false);
     assert!(
-        original.pending_actor(),
-        "the old role-owned cleanup predicate is insufficient for an install-only role"
+        !original.pending_actor(),
+        "an install-only runtime role never enters legacy role-owned actor cleanup"
     );
+    let observer =
+        crate::coordination::original_exit::LogicalExecutionExitObserver::new(original.clone());
+    {
+        let view = observer.view().unwrap();
+        assert!(view.role_ended());
+        assert_eq!(
+            view.actor_phase(),
+            crate::coordination::original_exit::LogicalActorExitPhase::Installed
+        );
+        assert!(
+            view.runtime_actor_result().is_none(),
+            "the original install-role exit is not an actual runtime actor exit"
+        );
+    }
     assert!(
         !handle.original_exit_pending(),
         "the install role cannot block supervisor shutdown on logical business completion"
@@ -885,6 +899,17 @@ async fn completed_install_role_cannot_retire_running_runtime_before_exact_core_
     }
     assert_eq!(handle.entry_count(), 0);
     assert!(!original.pending_actor());
+    {
+        let view = observer.view().unwrap();
+        assert_eq!(
+            view.actor_phase(),
+            crate::coordination::original_exit::LogicalActorExitPhase::Joined
+        );
+        assert!(matches!(
+            view.runtime_actor_result(),
+            Some(LogicalExit::Completed)
+        ));
+    }
     assert!(!original.has_failure());
     registry
         .shutdown_until(Instant::now() + Duration::from_secs(1))

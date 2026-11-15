@@ -16,13 +16,12 @@
 // under the License.
 
 //! The exact infrastructure cause and the original prepaid failure marker.
-mod driver;
 mod originals;
+mod supervisor;
 pub(super) use originals::LogicalFailureOriginals;
 mod progress;
 use super::work::{FailureReporter, RawFailure};
 use crate::control_runtime::actor::{FrontendActor, FrontendInput};
-pub(super) use driver::LogicalFailureDriver;
 use novarocks_control_runtime::actor_turn::{
     ActorFailureProof, ActorTurnError, StandingInputObligation,
 };
@@ -45,6 +44,7 @@ use std::{
     task::Waker,
     time::Duration,
 };
+pub(super) use supervisor::LogicalFailureSupervisor;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct LogicalFailureCut {

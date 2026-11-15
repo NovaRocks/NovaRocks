@@ -79,6 +79,20 @@ pub(crate) struct PreparedEffectJob {
     /// handing off the launch credential and original result to the executor.
     pub(crate) transport: Option<Box<TransportRetirement>>,
 }
+/// The actual binding destination of the original paid job. A retained
+/// request/metadata job has already moved into its Source's checked custody;
+/// it is never copied, replaced or reported as physically exited here.
+pub(crate) enum PreparedEffectBinding {
+    Job(PreparedEffectJob),
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "P12 composes the original retained request Source"
+        )
+    )]
+    Retained,
+}
 pub(crate) trait EffectExecutor: Send + Sync + 'static {
     /// A temporary refusal must arrange the original host's real availability
     /// wake before returning the full job. Retrying uses no timer or new Work.
@@ -118,6 +132,20 @@ pub(crate) trait EffectSource: Send + 'static {
         result: CausalInputObligation<FrontendActor>,
     ) -> Result<PreparedEffectJob, EffectBindRefusal> {
         Ok(self.bind_job(runtime, turn, ticket, result))
+    }
+    /// Bind the same original once. Retained is valid only after the complete
+    /// original job is in Source custody and its current-ticket publication
+    /// has committed. Dispatcher/transport-owned tails still use Job. This
+    /// bounded metadata step grants no Work start, result or exit certificate.
+    fn try_bind_effect(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        turn: &ActorHostTurn<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: CausalInputObligation<FrontendActor>,
+    ) -> Result<PreparedEffectBinding, EffectBindRefusal> {
+        self.try_bind_job(runtime, turn, ticket, result)
+            .map(PreparedEffectBinding::Job)
     }
     fn owner_failed_binding(
         &mut self,
@@ -1501,10 +1529,10 @@ impl HostRegistry {
                         return Err(error.into());
                     }
                 };
-                let mut job =
+                let binding =
                     match machine
                         .source
-                        .try_bind_job(&self.runtime, turn, &ticket, prepaid)
+                        .try_bind_effect(&self.runtime, turn, &ticket, prepaid)
                     {
                         Ok(job) => job,
                         Err(refused)
@@ -1521,6 +1549,38 @@ impl HostRegistry {
                         }
                         Err(refused) => std::panic::resume_unwind(Box::new((ticket, refused))),
                     };
+                let mut job = match binding {
+                    PreparedEffectBinding::Job(job) => job,
+                    PreparedEffectBinding::Retained => {
+                        // Exactly as for an accepted dispatcher handoff below,
+                        // complete only this original ticket/dispatch position.
+                        // The Source still owns the real job and its exit.
+                        if matches!(&ticket.effect, FrontendEffect::Attempt(effect) if must_handoff_before_local_close(effect))
+                        {
+                            machine.local_source_handoffs_pending -= 1;
+                        }
+                        let lane = machine.policy.classify(&ticket.effect);
+                        let receipt = self
+                            .runtime
+                            .effect_completed_with_receipt(ticket)
+                            .map_err(|refusal| HostError::Runtime(refusal.error))?;
+                        if let Some(transport) = &machine.transport {
+                            transport.original_input_progress();
+                        }
+                        if let Some((key, EffectRelease::Completed)) = lane {
+                            original_dispatch!(
+                                machine
+                                    .dispatch
+                                    .completion_observed_with_receipt(key, &receipt)
+                            );
+                        }
+                        if machine.scan_remaining.is_some() {
+                            machine.rescan_requested = true;
+                        }
+                        handoffs += 1;
+                        continue;
+                    }
+                };
                 if let Some(retirement) = job.transport.take() {
                     let FrontendEffect::Attempt(effect) = &ticket.effect else {
                         std::panic::resume_unwind(Box::new((job, retirement)));

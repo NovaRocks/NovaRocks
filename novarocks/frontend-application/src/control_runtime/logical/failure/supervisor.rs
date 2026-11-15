@@ -47,7 +47,7 @@ use novarocks_query_application::{
 use novarocks_types::QueryExecutionId;
 use std::sync::Arc;
 
-pub(in crate::control_runtime::logical) struct LogicalFailureDriver {
+pub(in crate::control_runtime::logical) struct LogicalFailureSupervisor {
     pub(in crate::control_runtime::logical) runtime: ActorRuntime<FrontendActor>,
     pub(in crate::control_runtime::logical) registration: ActorRegistration,
     pub(in crate::control_runtime::logical) ticket: Arc<EffectTicket<FrontendEffect>>,
@@ -69,7 +69,7 @@ struct Remote {
     activation: AttemptActivationIdentity,
     positive: bool,
 }
-impl LogicalFailureDriver {
+impl LogicalFailureSupervisor {
     pub(in crate::control_runtime::logical) async fn run(mut self) {
         if let Err(error) = self.run_original().await {
             self.failure.retain_typed(error);

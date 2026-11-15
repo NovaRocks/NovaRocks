@@ -16,6 +16,8 @@
 // under the License.
 
 use super::super::*;
+use crate::control_runtime::logical::{links::LogicalAttemptLinks, test_fixtures::LogicalParts};
+
 use crate::control_runtime::{
     actor::{FrontendActorKind, FrontendEffect},
     host::{FrontendLanePolicy, HostBinding, HostRegistry},
@@ -307,6 +309,138 @@ impl Wake for HostWake {
         let _ = self.runtime.notify_host_actor(&self.registration);
     }
 }
+pub(in crate::control_runtime::logical) fn assemble_logical(
+    runtime: &ActorRuntime<FrontendActor>,
+    ledger: &RuntimeLedger,
+    host: &HostRegistry,
+    start: &LogicalStart,
+    wrap: impl FnOnce(LogicalActor) -> FrontendActor,
+    build: impl FnOnce(&LogicalParts) -> Arc<dyn LogicalJobExecutor>,
+) -> LogicalParts {
+    start.validate().unwrap();
+    let funding = LogicalFundingObligation::reserve(ledger).unwrap();
+    let geometry = LogicalGeometry::derive(funding.scope().id(), start).unwrap();
+    let scope = funding.scope().clone();
+    let failure_work = funding.reserve_reported(WorkKind::Cleanup, 0).unwrap();
+    let disposal_work = funding.reserve_reported(WorkKind::Cleanup, 0).unwrap();
+    let actor = wrap(LogicalActor::new(
+        LogicalExecutionCore::new(start.clone()),
+        funding.step_reservations(),
+    ));
+    let registration = runtime
+        .register_supervised_bound_with_source_cut(
+            geometry.actor,
+            scope.clone(),
+            actor,
+            geometry.config,
+            failure_work.work(),
+            geometry.source(0).unwrap(),
+        )
+        .unwrap_or_else(|(e, _)| panic!("original logical registration: {e:?}"));
+    let progress_requested = Arc::new(AtomicBool::new(true));
+    let wake = Waker::from(Arc::new(HostWake {
+        runtime: runtime.clone(),
+        registration: registration.clone(),
+        progress: progress_requested.clone(),
+    }));
+    let marker_author = SourceFundingObligation::start(
+        funding
+            .reserve_step(
+                WorkKind::Settlement,
+                OwnedSlotNeed {
+                    inputs: 1,
+                    work_headers: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+    );
+    let marker = runtime
+        .reserve_admitted_input_for(
+            &registration,
+            geometry
+                .source(geometry.purposes + geometry.attempts + 6)
+                .unwrap(),
+            InputClass::Lifecycle,
+            marker_author.work(),
+        )
+        .unwrap()
+        .into_standing_input()
+        .unwrap_or_else(|_| panic!("original failure marker"));
+    let failure = LogicalInfrastructureFailure::new(marker, wake.clone());
+    let state = LogicalInstalledState::new(wake.clone(), failure.clone());
+    let inputs = LogicalInputs::reserve(
+        runtime,
+        registration.clone(),
+        &funding,
+        &geometry,
+        start,
+        state.clone(),
+        failure.clone(),
+        wake.clone(),
+    );
+    let bootstrap = inputs.bootstrap();
+    let inputs = LogicalInputBank::new(inputs, wake.clone());
+    let links = LogicalAttemptLinks::new(geometry.attempts, wake.clone(), failure.reporter());
+    let parts = LogicalParts {
+        registration: registration.clone(),
+        geometry: geometry.clone(),
+        state: state.clone(),
+        failure: failure.clone(),
+        inputs: inputs.clone(),
+        links: links.clone(),
+        bootstrap,
+        wake: wake.clone(),
+        scope: scope.clone(),
+    };
+    let application = build(&parts);
+    let executor = Arc::new(LogicalEffectExecutor {
+        runtime: Handle::current(),
+        original: Arc::downgrade(&application),
+    });
+    let source = LogicalEffectSource::reserve(LogicalSourceAssembly {
+        runtime,
+        registration: registration.clone(),
+        funding,
+        geometry: &geometry,
+        start,
+        failure,
+        executor: application,
+        wake,
+        data_runtime: Handle::current(),
+        inputs,
+        state: state.clone(),
+        links: links.clone(),
+        failure_work,
+        disposal_work,
+        marker_author,
+        progress_requested,
+    });
+    let exit = host
+        .register_logical(
+            HostBinding {
+                scope,
+                registration: registration.clone(),
+                kind: FrontendActorKind::Logical,
+                config: geometry.config,
+                policy: FrontendLanePolicy::logical(OUTPUT_UNITS),
+                source: Box::new(source),
+                executor,
+                transport: None,
+                ordered_observations: None,
+                startup: None,
+                capacity: None,
+                membership: None,
+                owner_controls: None,
+            },
+            start.actor_instance,
+            links,
+        )
+        .unwrap_or_else(|e| panic!("original logical Host registration: {}", e.reason));
+    state.bind_exit(exit);
+    runtime.notify_host_actor(&registration).unwrap();
+    parts
+}
 
 pub(super) struct Fixture {
     pub(super) ledger: RuntimeLedger,
@@ -332,96 +466,13 @@ pub(super) struct Fixture {
 impl Fixture {
     pub(super) fn new(panic_run: bool) -> Self {
         let ledger = RuntimeLedger::new(ResourceVector::default());
-        let funding = LogicalFundingObligation::reserve(&ledger).unwrap();
         let start = start();
-        start.validate().unwrap();
-        let geometry = LogicalGeometry::derive(funding.scope().id(), &start).unwrap();
-        let failure_work = funding.reserve_reported(WorkKind::Cleanup, 0).unwrap();
-        let disposal_work = funding.reserve_reported(WorkKind::Cleanup, 0).unwrap();
-        let core = LogicalExecutionCore::new(start.clone());
-        let actor = LogicalActor::new(core, funding.step_reservations());
         let runtime = ActorRuntime::new();
-        let registration = runtime
-            .register_supervised_bound_with_source_cut(
-                geometry.actor,
-                funding.scope().clone(),
-                FrontendActor::Logical(Box::new(actor)),
-                geometry.config,
-                failure_work.work(),
-                geometry.source(0).unwrap(),
-            )
-            .unwrap_or_else(|(error, _)| {
-                panic!("same original logical actor registration: {error:?}")
-            });
-        let progress_requested = Arc::new(AtomicBool::new(true));
-        let wake = Waker::from(Arc::new(HostWake {
-            runtime: runtime.clone(),
-            registration: registration.clone(),
-            progress: Arc::clone(&progress_requested),
-        }));
-        let marker_author = SourceFundingObligation::start(
-            funding
-                .reserve_step(
-                    WorkKind::Settlement,
-                    OwnedSlotNeed {
-                        inputs: 1,
-                        work_headers: 1,
-                        ..Default::default()
-                    },
-                )
-                .unwrap(),
+        let host = HostRegistry::new(
+            runtime.clone(),
+            ledger.clone(),
+            Arc::new(FrontendHostObservations::new(Arc::new(FixedClock))),
         );
-        let marker = runtime
-            .reserve_admitted_input_for(
-                &registration,
-                geometry
-                    .source(geometry.purposes + geometry.attempts + 6)
-                    .unwrap(),
-                InputClass::Lifecycle,
-                marker_author.work(),
-            )
-            .unwrap()
-            .into_standing_input()
-            .unwrap_or_else(|_| panic!("same original paid failure marker"));
-        let failure = LogicalInfrastructureFailure::new(marker, wake.clone());
-        let state = LogicalInstalledState::new(wake.clone(), Arc::clone(&failure));
-        let inputs = LogicalInputs::reserve(
-            &runtime,
-            registration.clone(),
-            &funding,
-            &geometry,
-            &start,
-            Arc::clone(&state),
-            Arc::clone(&failure),
-            wake.clone(),
-        );
-        let bootstrap = inputs.bootstrap();
-        let inputs = LogicalInputBank::new(inputs, wake.clone());
-        let mut ap = Vec::new();
-        {
-            let mut bank = inputs.try_loan().unwrap();
-            let author = bank.ap_author(0).expect("same prepaid AP source Work");
-            // This paid script is the fake AP fact producer; 91 is its fixed
-            // metadata source key, never an authority reconstructed from ID.
-            for class in [
-                InputClass::Lifecycle,
-                InputClass::Ordinary,
-                InputClass::Ordinary,
-            ] {
-                ap.push(
-                    runtime
-                        .reserve_admitted_input_for(
-                            &registration,
-                            ActorId::new(91).unwrap(),
-                            class,
-                            author,
-                        )
-                        .unwrap()
-                        .into_standing_input()
-                        .unwrap_or_else(|_| panic!("same AP author and original role")),
-                );
-            }
-        }
         let seen = Arc::new(Mutex::new(Vec::new()));
         let run = Arc::new(Gate::default());
         let snapshot = Arc::new(Gate::default());
@@ -429,75 +480,55 @@ impl Fixture {
         let omit_run_result = Arc::new(AtomicBool::new(false));
         let executor_drops = Arc::new(AtomicUsize::new(0));
         let join_ready = Arc::new(AtomicBool::new(false));
-        let application: Arc<dyn LogicalJobExecutor> = Arc::new(ScriptExecutor {
-            bootstrap,
-            state: Arc::clone(&state),
-            seen: Arc::clone(&seen),
-            run: Arc::clone(&run),
-            snapshot: Arc::clone(&snapshot),
-            panic: panic_run.then(|| Arc::clone(&panic)),
-            omit_run_result: omit_run_result.clone(),
-            drops: Arc::clone(&executor_drops),
-            join_ready: Arc::clone(&join_ready),
-        });
-        let executor = Arc::new(LogicalEffectExecutor {
-            runtime: Handle::current(),
-            original: Arc::downgrade(&application),
-        });
-        let scope = funding.scope().clone();
-        let links = super::super::super::links::LogicalAttemptLinks::new(
-            geometry.attempts,
-            wake.clone(),
-            failure.reporter(),
+        let mut ap = Vec::new();
+        let parts = assemble_logical(
+            &runtime,
+            &ledger,
+            &host,
+            &start,
+            |actor| FrontendActor::Logical(Box::new(actor)),
+            |parts| {
+                let mut bank = parts.inputs.try_loan().unwrap();
+                let author = bank.ap_author(0).expect("same prepaid AP source Work");
+                for class in [
+                    InputClass::Lifecycle,
+                    InputClass::Ordinary,
+                    InputClass::Ordinary,
+                ] {
+                    ap.push(
+                        runtime
+                            .reserve_admitted_input_for(
+                                &parts.registration,
+                                ActorId::new(91).unwrap(),
+                                class,
+                                author,
+                            )
+                            .unwrap()
+                            .into_standing_input()
+                            .unwrap_or_else(|_| panic!("same AP author and original role")),
+                    );
+                }
+                Arc::new(ScriptExecutor {
+                    bootstrap: parts.bootstrap.clone(),
+                    state: parts.state.clone(),
+                    seen: seen.clone(),
+                    run: run.clone(),
+                    snapshot: snapshot.clone(),
+                    panic: panic_run.then(|| panic.clone()),
+                    omit_run_result: omit_run_result.clone(),
+                    drops: executor_drops.clone(),
+                    join_ready: join_ready.clone(),
+                })
+            },
         );
-        let source = LogicalEffectSource::reserve(LogicalSourceAssembly {
-            runtime: &runtime,
-            registration: registration.clone(),
-            funding,
-            geometry: &geometry,
-            start: &start,
-            failure: Arc::clone(&failure),
-            executor: application,
-            wake: wake.clone(),
-            data_runtime: Handle::current(),
-            inputs: Arc::clone(&inputs),
-            state: Arc::clone(&state),
-            links: links.clone(),
-            failure_work,
-            disposal_work,
-            marker_author,
-            progress_requested,
-        });
-        let host = HostRegistry::new(
-            runtime.clone(),
-            ledger.clone(),
-            Arc::new(FrontendHostObservations::new(Arc::new(FixedClock))),
-        );
-        let exit = host
-            .register_logical(
-                HostBinding {
-                    scope,
-                    registration: registration.clone(),
-                    kind: FrontendActorKind::Logical,
-                    config: geometry.config,
-                    policy: FrontendLanePolicy::logical(OUTPUT_UNITS),
-                    source: Box::new(source),
-                    executor,
-                    transport: None,
-                    ordered_observations: None,
-                    startup: None,
-                    capacity: None,
-                    membership: None,
-                    owner_controls: None,
-                },
-                start.actor_instance,
-                links,
-            )
-            .unwrap_or_else(|original| {
-                panic!("original logical host registration: {}", original.reason)
-            });
-        state.bind_exit(exit);
-        runtime.notify_host_actor(&registration).unwrap();
+        let LogicalParts {
+            registration,
+            geometry,
+            state,
+            failure,
+            inputs,
+            ..
+        } = parts;
         Self {
             ledger,
             runtime,

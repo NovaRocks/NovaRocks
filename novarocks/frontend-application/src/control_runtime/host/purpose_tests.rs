@@ -25,6 +25,7 @@ use novarocks_control_runtime::{
     completion::ReportSlot,
     exit_custody::ExitCustody,
     obligation::{ReservationObligation, WorkObligation},
+    publication::PublishedSnapshot,
     reported_work::ReportedWork,
 };
 use novarocks_control_runtime_core::{
@@ -158,6 +159,9 @@ struct Bank {
     failed: Option<PendingHandoff>,
     failure_hook: Option<FailureHook>,
     inspect_pending_retirement: bool,
+    retain_binding: bool,
+    retained_jobs: Vec<PreparedEffectJob>,
+    publication: Arc<PublishedSnapshot<u64>>,
 }
 fn take_failure_hook(bank: &mut Bank, point: FailurePoint) -> Option<FailureHook> {
     if bank
@@ -219,6 +223,29 @@ impl EffectSource for PurposeSource {
             result,
             captures: original.capture.take().unwrap(),
         }
+    }
+    fn try_bind_effect(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        turn: &ActorHostTurn<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: CausalInputObligation<FrontendActor>,
+    ) -> Result<PreparedEffectBinding, EffectBindRefusal> {
+        let job = self.bind_job(runtime, turn, ticket, result);
+        let publication = {
+            let mut bank = self.0.lock().unwrap();
+            if !bank.retain_binding {
+                return Ok(PreparedEffectBinding::Job(job));
+            }
+            // Store the exact complete original before its current-ticket
+            // publication; metadata acceptance never consumes its Exit.
+            bank.retained_jobs.push(job);
+            bank.publication.clone()
+        };
+        runtime
+            .commit_snapshot(ticket, &publication, Arc::new(value(&ticket.effect)))
+            .unwrap_or_else(|(error, _)| panic!("original retained publication: {error:?}"));
+        Ok(PreparedEffectBinding::Retained)
     }
     fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>) {
         let mut bank = self.0.lock().unwrap();
@@ -401,6 +428,9 @@ impl Fixture {
             failed: None,
             failure_hook: None,
             inspect_pending_retirement: false,
+            retain_binding: false,
+            retained_jobs: Vec::new(),
+            publication: Arc::new(PublishedSnapshot::new_for_actor(&registration, Arc::new(0))),
         };
         for (value, work, mut capacity) in reserved {
             let role = CausalInputObligation::reserve_admitted(
@@ -583,6 +613,7 @@ impl Fixture {
             .unwrap();
         let mut machine = entry.machine.lock().unwrap().take().unwrap();
         let mut jobs = std::mem::take(&mut *self.executor.jobs.lock().unwrap());
+        jobs.append(&mut self.bank.lock().unwrap().retained_jobs);
         if let Some(pending) = machine.pending.take() {
             self.runtime
                 .effect_completed(pending.ticket)
@@ -1875,4 +1906,65 @@ fn assert_withdrawal_reaches_the_original_send(executor_refuses: bool) {
     assert_eq!(handed_off_after_credit, [1]);
     assert!(same_cell);
     assert_eq!(dropped, 2);
+}
+
+#[test]
+fn original_source_retained_binding_publishes_and_completes_only_metadata_without_dispatching_or_exiting_work()
+ {
+    let f = Fixture::new(vec![vec![(1, 7, vec![]), (3, 7, vec![1])]], &[]);
+    f.bank.lock().unwrap().retain_binding = true;
+    f.executor.refusing.store(true, Ordering::Release);
+    f.send(0);
+    let (_, idle) = f.to_idle();
+    let (observed, dispatched) = f.captured();
+    let (not_exited, published, captures_before_cleanup, retained) = {
+        let bank = f.bank.lock().unwrap();
+        (
+            bank.originals
+                .values()
+                .all(|original| !original.custody.actual_exit_ready().unwrap()),
+            *bank.publication.read(),
+            f.captures.load(Ordering::SeqCst),
+            bank.retained_jobs.len(),
+        )
+    };
+    let states: Vec<_> = f
+        .runtime
+        .committed_batches(f.registration.actor(), None, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, input)| {
+            f.runtime
+                .effect_inventory(f.registration.actor(), input, None, f.max_effects)
+                .unwrap()
+        })
+        .map(|(_, state)| state)
+        .collect();
+    let actual_cleanup = f.finish(false);
+    assert!(idle && dispatched.is_empty());
+    assert!(
+        not_exited,
+        "metadata completion is not original physical exit"
+    );
+    assert_eq!(
+        published, 3,
+        "the real second dependent publication committed"
+    );
+    assert_eq!(
+        captures_before_cleanup, 0,
+        "publication is not capture destruction"
+    );
+    assert_eq!(
+        observed.bound,
+        vec![1, 3],
+        "same-lane dependent ticket becomes eligible after actual metadata completion"
+    );
+    assert!(observed.origins.iter().all(|same| *same));
+    assert_eq!(retained, 2);
+    assert!(states.iter().all(|state| *state == EffectState::Completed));
+    assert_eq!(
+        actual_cleanup,
+        (2, true),
+        "only explicit original capture/unused-exit/role/header cleanup retires the owners"
+    );
 }
