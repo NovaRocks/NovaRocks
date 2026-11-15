@@ -471,6 +471,48 @@ fn format_statement_failure(
     )
 }
 
+/// Splits a script using the Trino lexer while retaining source comments.
+///
+/// This explicit entry is not used by the production session until cutover.
+/// Lexical errors are returned to the caller, not represented as FE outcomes.
+/// A FUNCTION token requires grammar-owned statement boundaries: SQL routines
+/// can contain semicolons, and this lexical slice cannot classify their extent.
+/// This includes conservative rejection of an ordinary FUNCTION identifier;
+/// it does not mean that such SQL is grammatically invalid.
+pub fn split_trino_sql_statements(sql: &str) -> Result<Vec<String>> {
+    use novarocks_parser::trino_token::{Keyword, Symbol, TokenKind};
+
+    let tokens = novarocks_parser::trino_lexer::lex(sql)
+        .context("tokenizing Trino SQL batch for statement splitting")?;
+    if tokens
+        .iter()
+        .any(|token| token.kind == TokenKind::Keyword(Keyword::Function))
+    {
+        bail!("grammar-owned statement boundaries required for SQL containing FUNCTION");
+    }
+
+    let mut statements = Vec::new();
+    let mut start = 0;
+    let mut has_sql = false;
+    for token in tokens {
+        match token.kind {
+            TokenKind::Symbol(Symbol::Semicolon) => {
+                if has_sql {
+                    statements.push(sql[start..token.span.start()].trim().to_owned());
+                }
+                start = token.span.end();
+                has_sql = false;
+            }
+            TokenKind::Trivia(_) | TokenKind::End => {}
+            _ => has_sql = true,
+        }
+    }
+    if has_sql {
+        statements.push(sql[start..].trim().to_owned());
+    }
+    Ok(statements)
+}
+
 pub(crate) fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
@@ -756,8 +798,162 @@ pub(crate) fn drop_case_database_until(
 
 #[cfg(test)]
 mod splitter_tests {
-    use super::{format_statement_failure, split_sql_statements, statement_sha256};
+    use super::{
+        format_statement_failure, split_sql_statements, split_trino_sql_statements,
+        statement_sha256,
+    };
     use std::time::Duration;
+
+    // The runner owns source framing. Expected fragments are hand-written
+    // source slices; lexical rules come from the production parser dependency.
+    #[test]
+    fn trino_split_preserves_semicolons_and_doubled_quotes_inside_literals() {
+        let sql = r#"SELECT 'a'';b', "a"";b"; SELECT 2;"#;
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [r#"SELECT 'a'';b', "a"";b""#, "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn trino_split_backslash_does_not_escape_a_closing_quote() {
+        let sql = r"SELECT 'a\'; SELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [r"SELECT 'a\'", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn trino_split_keeps_unicode_binary_and_dollar_literal_boundaries() {
+        let sql = "SELECT U&'a;b', X'AA;BB', $$BEGIN; RETURN 1; END$$; SELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [
+                "SELECT U&'a;b', X'AA;BB', $$BEGIN; RETURN 1; END$$",
+                "SELECT 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn trino_split_preserves_comments_with_unconditional_double_dash() {
+        let sql = "SELECT 1--not whitespace; stays comment\r\n; /* note; */ SELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [
+                "SELECT 1--not whitespace; stays comment",
+                "/* note; */ SELECT 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn trino_split_block_comment_ends_at_first_close() {
+        let sql = "/* outer /* inner */ SELECT 1; SELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            ["/* outer /* inner */ SELECT 1", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn trino_split_plus_comment_has_no_hint_semantics() {
+        let sql = "/*+ FUNCTION ; */ SELECT 1; SELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            ["/*+ FUNCTION ; */ SELECT 1", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn trino_split_preserves_query_markers_and_directives() {
+        let sql = "-- query 1\n-- @skip_result_check=true\nSELECT 1;\n-- query 2\n-- @expect_error=expected\nSELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [
+                "-- query 1\n-- @skip_result_check=true\nSELECT 1",
+                "-- query 2\n-- @expect_error=expected\nSELECT 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn trino_split_keeps_rewritten_statements_within_the_original_step() {
+        let sql = "-- query 1\nSET SESSION explain_detail = 'VERBOSE'; SELECT 1; RESET SESSION explain_detail;\n-- query 2\nSELECT 2;";
+        let marker = regex::Regex::new(r"^--\s*query\s+(\d+)(?:\s+.*)?$").expect("regex");
+        let framed = crate::parser::frame_case_source(sql, &marker).expect("case frames");
+        assert_eq!(framed.sections.len(), 2);
+        let (first_number, first_range) = &framed.sections[0];
+        let (second_number, second_range) = &framed.sections[1];
+        assert_eq!((*first_number, *second_number), (1, 2));
+        assert_eq!(
+            split_trino_sql_statements(&sql[first_range.clone()]).expect("first step"),
+            [
+                "-- query 1\nSET SESSION explain_detail = 'VERBOSE'",
+                "SELECT 1",
+                "RESET SESSION explain_detail",
+            ]
+        );
+        assert_eq!(
+            split_trino_sql_statements(&sql[second_range.clone()]).expect("second step"),
+            ["-- query 2\nSELECT 2"]
+        );
+    }
+
+    #[test]
+    fn trino_split_preserves_utf8_and_internal_crlf() {
+        let sql = "-- 中文;\r\nSELECT '值;值', \"列;名\"\r\nFROM t; SELECT '尾';";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [
+                "-- 中文;\r\nSELECT '值;值', \"列;名\"\r\nFROM t",
+                "SELECT '尾'"
+            ]
+        );
+    }
+
+    #[test]
+    fn trino_split_ignores_empty_and_trivia_only_fragments() {
+        assert!(
+            split_trino_sql_statements("; -- comment;\n; /* block; */ ;")
+                .expect("split")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn trino_split_propagates_lexical_failures_without_legacy_recovery() {
+        for sql in [
+            "SELECT # not a comment",
+            "SELECT `a;b`",
+            "SELECT 'open",
+            "SELECT \"open",
+            "SELECT 1 /* open",
+        ] {
+            assert!(split_trino_sql_statements(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn trino_split_requires_grammar_boundaries_for_function_tokens() {
+        for sql in [
+            "CREATE FUNCTION f() RETURNS BIGINT BEGIN RETURN 1; END; SELECT 2;",
+            "SELECT function FROM t;",
+        ] {
+            let error = split_trino_sql_statements(sql).expect_err("grammar boundaries missing");
+            assert!(
+                error
+                    .to_string()
+                    .contains("grammar-owned statement boundaries required")
+            );
+        }
+        assert_eq!(
+            split_trino_sql_statements("SELECT 'FUNCTION', \"function\";")
+                .expect("literal and identifier"),
+            ["SELECT 'FUNCTION', \"function\""]
+        );
+    }
 
     #[test]
     fn case_cleanup_enumerates_only_base_tables_in_the_exact_catalog_namespace() {

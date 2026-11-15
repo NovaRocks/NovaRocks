@@ -51,6 +51,8 @@ mod statement_controls;
 mod suite_manifest;
 mod types;
 
+pub use session::split_trino_sql_statements;
+
 #[path = "../../../../../novarocks/types/src/engine_error_codes.rs"]
 mod engine_error_codes;
 

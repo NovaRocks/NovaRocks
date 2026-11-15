@@ -1399,6 +1399,83 @@ mod tests {
     }
 
     #[test]
+    fn show_create_location_uses_exact_fixture_placeholders() {
+        use crate::golden::{Block, render_text};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("show_create.result");
+        let ddl = "CREATE TABLE catalog.${case_db}.t (id BIGINT)\nWITH (location = '${iceberg_rest_warehouse}/${case_db}/t')";
+        let source = format!(
+            "-- query 1\n-- types\tvarchar\nCreate Table\n{}\n",
+            render_text(ddl)
+        );
+        std::fs::write(&path, &source).unwrap();
+
+        for (warehouse, namespace) in [
+            ("s3://warehouse/run-a/rest", "run_a_d0000"),
+            ("file:///tmp/run-b/warehouse", "run_b_d0000"),
+        ] {
+            let variables = HashMap::from([
+                ("iceberg_rest_warehouse".into(), warehouse.into()),
+                ("case_db".into(), namespace.into()),
+            ]);
+            let mut expected =
+                crate::results::load_expected_results_with_variables(&path, &variables)
+                    .unwrap()
+                    .remove(&1)
+                    .unwrap();
+            let statement = format!("SHOW CREATE TABLE catalog.{namespace}.t");
+            render_expected_for_execution(
+                &statement,
+                &mut expected,
+                &variables,
+                &BTreeMap::new(),
+                std::slice::from_ref(&statement),
+            )
+            .unwrap();
+
+            let actual_ddl = format!(
+                "CREATE TABLE catalog.{namespace}.t (id BIGINT)\nWITH (location = '{warehouse}/{namespace}/t')"
+            );
+            let actual = Block::Typed {
+                types: vec!["varchar".into()],
+                names: vec!["Create Table".into()],
+                rows: vec![vec![render_text(&actual_ddl)]],
+            };
+            let golden = expected.golden.unwrap();
+            assert!(
+                crate::golden::execution::compare_blocks(
+                    &golden.expanded.blocks,
+                    std::slice::from_ref(&actual),
+                    true,
+                    None,
+                )
+                .0
+            );
+            let Block::Typed { rows, .. } = &golden.source.blocks[0] else {
+                unreachable!()
+            };
+            assert!(rows[0][0].contains("${case_db}"));
+            assert!(rows[0][0].contains("${iceberg_rest_warehouse}"));
+            let mut wrong_location = actual;
+            let Block::Typed { rows, .. } = &mut wrong_location else {
+                unreachable!()
+            };
+            rows[0][0] = render_text(&actual_ddl.replace("/t')", "/other_table')"));
+            assert!(
+                !crate::golden::execution::compare_blocks(
+                    &golden.expanded.blocks,
+                    &[wrong_location],
+                    true,
+                    None,
+                )
+                .0
+            );
+        }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+
+    #[test]
     fn typed_metadata_retains_sql_null_and_rewrites_only_the_string_null() {
         let mut result =
             typed_expected("-- query 1\n-- types\tvarchar\nDatabase\nNULL\n\"NULL\"\n");
