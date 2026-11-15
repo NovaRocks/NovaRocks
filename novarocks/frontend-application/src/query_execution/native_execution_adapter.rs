@@ -4548,6 +4548,7 @@ mod tests {
 #[cfg(test)]
 mod production_failure_projection_tests {
     use super::*;
+    use novarocks_query_application::api::ExecutionFailurePresentation;
 
     #[test]
     fn original_production_capacity_refusal_preserves_resource_fact_and_safe_client_detail() {

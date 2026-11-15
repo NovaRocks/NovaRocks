@@ -3044,6 +3044,7 @@ mod tests {
 #[cfg(test)]
 mod actual_close_tests {
     use super::*;
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
     };

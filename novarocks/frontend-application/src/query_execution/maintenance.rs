@@ -1170,6 +1170,7 @@ mod maintenance_attempt_context_tests {
 mod rewrite_selected_failure_tests {
     use super::*;
     use novarocks_failure_contract::FailureProjection;
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use novarocks_query_application::{
         cancellation::QueryCancellationReason,
         session_error::{QueryServiceError, QueryServiceErrorKind},

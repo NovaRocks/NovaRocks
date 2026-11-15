@@ -38,3 +38,57 @@ pub mod stand_down;
 pub mod start;
 pub mod state;
 pub mod visibility;
+
+use std::num::NonZeroU64;
+
+macro_rules! correlation_id {
+    ($name:ident) => {
+        /// Process-local correlation data, never a resource or execution grant.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+        pub struct $name(NonZeroU64);
+        impl $name {
+            pub const fn new(value: NonZeroU64) -> Self {
+                Self(value)
+            }
+            pub const fn get(self) -> u64 {
+                self.0.get()
+            }
+        }
+    };
+}
+correlation_id!(LogicalActionId);
+correlation_id!(LogicalSourceId);
+correlation_id!(LogicalRequestToken);
+
+/// The host charges the current turn, without clocks, waiting or callbacks.
+pub trait StepBudget {
+    fn charge(&mut self, units: usize) -> bool;
+}
+
+/// Ordered effects are captured during the same pure step and handed off atomically.
+pub trait EffectSink {
+    fn emit(&mut self, effect: effect::LogicalEffect);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreFault {
+    ForeignExecution,
+    ForeignActivation,
+    UnknownAction,
+    UnexpectedInput,
+}
+
+/// The constructor retains already validated immutable start facts.
+/// Decision handling is assembled from the component state machines.
+pub struct LogicalExecutionCore {
+    _start: start::LogicalStart,
+}
+
+impl LogicalExecutionCore {
+    pub fn new(start: start::LogicalStart) -> Self {
+        start
+            .validate()
+            .expect("logical start facts must satisfy the frozen contract");
+        Self { _start: start }
+    }
+}

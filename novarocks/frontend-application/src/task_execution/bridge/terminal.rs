@@ -19,16 +19,16 @@
 
 use super::control::AttemptOwnerControls;
 use crate::control_runtime::membership::MembershipErrors;
-use crate::task_execution::{
-    error::TaskExecutionError,
-    host::{
-        failure_bridge::FailureBridge, publication::OriginalHostFailure, startup::AttemptStartup,
-    },
+#[cfg(test)]
+use crate::task_execution::error::TaskExecutionError;
+use crate::task_execution::host::{
+    failure_bridge::FailureBridge, publication::OriginalHostFailure, startup::AttemptStartup,
 };
+#[cfg(test)]
+use novarocks_attempt_protocol::failure::AttemptFailureSite;
 use novarocks_attempt_protocol::{
-    error::{ParticipantObservationFailure, TaskExecutionError as ProtocolError},
-    failure::{AttemptFailure, AttemptFailureSite, HostFailureRef, ProtocolFailure},
-    operation::OperationDispatchResult,
+    error::TaskExecutionError as ProtocolError,
+    failure::{AttemptFailure, HostFailureRef},
 };
 use novarocks_control_runtime::actor_turn::ActorTurnError;
 use novarocks_coordination_contract::{
@@ -36,12 +36,13 @@ use novarocks_coordination_contract::{
     AttemptParticipationConvergence, AttemptTerminal, AttemptToLogical, AttemptToLogicalBody,
     MonotonicClock, RuntimeFilterDiagnostic,
 };
-use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+#[cfg(test)]
+use novarocks_execution_contract::SafeDetail;
 use novarocks_query_application::{
     api::{
         NativeActiveConvergenceClosure, NativeActiveConvergenceRequest, NativeAttemptConvergence,
         NativeAttemptPreparationFailure, NativeAttemptTerminal, NativeParticipationConvergence,
-        PreReadyProcessReplacementWitness, StatementNativeHealthFailure,
+        StatementNativeHealthFailure,
     },
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
@@ -618,12 +619,7 @@ fn project_convergence(original: &AttemptConvergenceClosure) -> NativeActiveConv
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TerminalProjectionError {
-    MissingOriginalHostFailure(HostFailureRef),
-    MissingSelectedTaskCause,
-    InvalidReplacement,
-}
+pub(crate) use novarocks_attempt_protocol::port_projection::FailureProjectionError as TerminalProjectionError;
 
 fn project_terminal(
     terminal: &AttemptTerminal<AttemptFailure>,
@@ -639,303 +635,11 @@ fn project_terminal(
     )?))
 }
 
-pub(super) fn project_failure(
-    failure: &AttemptFailure,
-    resolve_host: &mut impl FnMut(HostFailureRef) -> Option<ExecutionFailureInput>,
-) -> Result<NativeAttemptPreparationFailure, TerminalProjectionError> {
-    let input = match failure {
-        AttemptFailure::OwnerFailed => owner_failure(),
-        AttemptFailure::Protocol(original) => protocol_failure(original),
-        AttemptFailure::TaskProtocol(original) => project_task_failure(original, resolve_host)?,
-        AttemptFailure::Host(original) => resolve_host(original.original).ok_or(
-            TerminalProjectionError::MissingOriginalHostFailure(original.original),
-        )?,
-        AttemptFailure::SelectedTask(original) => {
-            ExecutionFailureInput::from_selected_task(original)
-                .ok_or(TerminalProjectionError::MissingSelectedTaskCause)?
-        }
-        AttemptFailure::EstablishReplayExhausted { participation, .. } => {
-            TaskExecutionError::PreReadyEstablishTransportUnknown {
-                backend: participation.backend_process_id(),
-            }
-            .preparation_input()
-        }
-        AttemptFailure::BackendReplaced {
-            original,
-            replacement,
-        } => {
-            if original == replacement {
-                return Err(TerminalProjectionError::InvalidReplacement);
-            }
-            failure_input(
-                QueryFailureReason::BackendLost,
-                "the frozen pre-ready backend process was replaced",
-                ExecutionFailureSite::Backend { process: *original },
-            )
-        }
-        AttemptFailure::PreReadyReplacement {
-            refusal,
-            participation,
-            operation_id,
-            kind,
-            replacement,
-        } => {
-            let input =
-                replacement_refusal(refusal).ok_or(TerminalProjectionError::InvalidReplacement)?;
-            let mut projected = NativeAttemptPreparationFailure::from_input(input);
-            if projected.input().site()
-                == (ExecutionFailureSite::Operation {
-                    participation: *participation,
-                    operation_id: *operation_id,
-                    kind: *kind,
-                })
-                && let Ok(witness) = PreReadyProcessReplacementWitness::try_new(
-                    projected.input(),
-                    *participation,
-                    *operation_id,
-                    *replacement,
-                )
-            {
-                projected
-                    .attach_pre_ready_replacement(witness)
-                    .expect("same original refusal");
-            }
-            return Ok(projected);
-        }
-    };
-    Ok(NativeAttemptPreparationFailure::from_input(input))
-}
-
-fn project_task_failure(
-    original: &ProtocolError,
-    resolve_host: &mut impl FnMut(HostFailureRef) -> Option<ExecutionFailureInput>,
-) -> Result<ExecutionFailureInput, TerminalProjectionError> {
-    use ProtocolError as E;
-    let input = match original {
-        E::Workload(host)
-        | E::HostExecution(host)
-        | E::SplitAssignment(host)
-        | E::Actor(host)
-        | E::NativeTransport(host)
-        | E::Establish(host) => resolve_host(host.original).ok_or(
-            TerminalProjectionError::MissingOriginalHostFailure(host.original),
-        )?,
-        E::Execution(original) => protocol_failure(original),
-        E::PreReadyEstablishRejected {
-            participation,
-            operation_id,
-            rejection,
-        } => TaskExecutionError::PreReadyEstablishRejected {
-            participation: *participation,
-            operation_id: *operation_id,
-            rejection: rejection.clone(),
-        }
-        .preparation_input(),
-        E::OperationFailed {
-            participation,
-            operation_id,
-            kind,
-            rejection,
-            ..
-        } => TaskExecutionError::OperationFailed {
-            participation: *participation,
-            operation_id: *operation_id,
-            kind: *kind,
-            rejection: rejection.clone(),
-        }
-        .preparation_input(),
-        E::Descriptor(original) => {
-            TaskExecutionError::Descriptor(original.clone()).preparation_input()
-        }
-        E::Request(original) => TaskExecutionError::Request(original.clone()).preparation_input(),
-        E::DomainRegression {
-            domain,
-            token,
-            conflict,
-        } => TaskExecutionError::DomainRegression {
-            domain,
-            token: token.clone(),
-            conflict: *conflict,
-        }
-        .preparation_input(),
-        E::Capacity(bound) => ExecutionFailureInput::new(
-            bound.failure_fact(),
-            SafeDetail::truncating("frontend task protocol capacity bound was exceeded"),
-            ExecutionFailureSite::Coordinator,
-        ),
-        E::PreReadyEstablishTransportUnknown { backend } => {
-            TaskExecutionError::PreReadyEstablishTransportUnknown { backend: *backend }
-                .preparation_input()
-        }
-        E::ParticipantUnobservable {
-            backend,
-            state: ParticipantObservationFailure::ConnectionLost,
-        } => failure_input(
-            QueryFailureReason::BackendLost,
-            "frontend task protocol could not continue",
-            ExecutionFailureSite::Backend { process: *backend },
-        ),
-        E::ParticipantUnobservable {
-            backend,
-            state: ParticipantObservationFailure::Transport(_),
-        } => failure_input(
-            QueryFailureReason::ObservationLost,
-            "frontend task protocol could not continue",
-            ExecutionFailureSite::Backend { process: *backend },
-        ),
-        E::QueueResidenceExpired { .. } => failure_input(
-            QueryFailureReason::TransportDeadline,
-            "frontend task protocol could not continue",
-            ExecutionFailureSite::Coordinator,
-        ),
-        E::DispatchRejected {
-            result: OperationDispatchResult::TransportUnknown,
-            ..
-        } => failure_input(
-            QueryFailureReason::ObservationLost,
-            "frontend task protocol could not continue",
-            ExecutionFailureSite::Coordinator,
-        ),
-        E::DispatchRejected {
-            result: OperationDispatchResult::IngressRejected(_),
-            ..
-        } => failure_input(
-            QueryFailureReason::TransportCapacity,
-            "frontend task protocol could not continue",
-            ExecutionFailureSite::Coordinator,
-        ),
-        E::DispatchRejected {
-            kind,
-            result: OperationDispatchResult::WorkerReceipt(receipt),
-        } => ExecutionFailureInput::new(
-            crate::task_execution::error::local_protocol_refusal(*kind, receipt.outcome()).fact(),
-            SafeDetail::truncating("frontend task protocol could not continue"),
-            ExecutionFailureSite::Coordinator,
-        ),
-        E::Schedule(_)
-        | E::UnknownOperation
-        | E::MissingReceipt(_)
-        | E::DomainReceipt(_)
-        | E::Identity(_)
-        | E::EdgeAlreadyOpened(_)
-        | E::Observation(_)
-        | E::IllegalTaskTransition { .. }
-        | E::FinalInfo(_)
-        | E::ParticipantUnobservable {
-            state: ParticipantObservationFailure::IdentityViolation(_),
-            ..
-        }
-        | E::DispatchRejected {
-            result: OperationDispatchResult::NonWorkerRejected,
-            ..
-        } => failure_input(
-            QueryFailureReason::PreparationProtocol,
-            "frontend task protocol could not continue",
-            ExecutionFailureSite::Coordinator,
-        ),
-    };
-    Ok(input)
-}
-
-fn protocol_failure(original: &ProtocolFailure) -> ExecutionFailureInput {
-    use AttemptFailureSite as S;
-    let site = match original.site {
-        S::Attempt => ExecutionFailureSite::Coordinator,
-        S::Participation(participation) => ExecutionFailureSite::Backend {
-            process: participation.backend_process_id(),
-        },
-        S::Task { identity, phase } => ExecutionFailureSite::Task { identity, phase },
-        S::TaskControl { identity } => ExecutionFailureSite::TaskControl { identity },
-        S::RootRead { root } => ExecutionFailureSite::RootRead { root },
-        S::Backend { process } => ExecutionFailureSite::Backend { process },
-        S::Operation {
-            participation,
-            operation_id,
-            kind,
-        } => ExecutionFailureSite::Operation {
-            participation,
-            operation_id,
-            kind,
-        },
-    };
-    ExecutionFailureInput::new(original.fact, original.detail.clone(), site)
-}
-
-fn failure_input(
-    reason: QueryFailureReason,
-    detail: &str,
-    site: ExecutionFailureSite,
-) -> ExecutionFailureInput {
-    ExecutionFailureInput::new(reason.failure_fact(), SafeDetail::truncating(detail), site)
-}
-
-pub(crate) fn owner_failure() -> ExecutionFailureInput {
-    failure_input(
-        QueryFailureReason::NativeFuturePanicked,
-        "Native attempt Core failed",
-        ExecutionFailureSite::Coordinator,
-    )
-}
-
-pub(super) fn replacement_refusal(
-    refusal: &AttemptFailure,
-) -> Option<novarocks_query_application::execution_error::ExecutionFailureInput> {
-    use novarocks_attempt_protocol::error::TaskExecutionError as ProtocolError;
-    use novarocks_execution_contract::{
-        OperationKind, OperationOutcome, operation::OperationResult,
-    };
-
-    let AttemptFailure::TaskProtocol(original) = refusal else {
-        return None;
-    };
-    let (participation, operation_id, kind, rejection) = match original.as_ref() {
-        ProtocolError::PreReadyEstablishRejected {
-            participation,
-            operation_id,
-            rejection,
-        } => (
-            *participation,
-            *operation_id,
-            OperationKind::UpdateParticipation,
-            rejection,
-        ),
-        ProtocolError::OperationFailed {
-            task: Some(task),
-            participation,
-            operation_id,
-            kind: OperationKind::CreateTask,
-            rejection,
-        } if task.backend_process_id() == participation.backend_process_id()
-            && task.query_execution_id() == participation.query_execution_id() =>
-        {
-            (
-                *participation,
-                *operation_id,
-                OperationKind::CreateTask,
-                rejection,
-            )
-        }
-        _ => return None,
-    };
-    if !matches!(
-        rejection,
-        OperationResult::Verdict {
-            outcome: OperationOutcome::IdentityMismatch,
-            ..
-        }
-    ) {
-        return None;
-    }
-    Some(
-        TaskExecutionError::OperationFailed {
-            participation,
-            operation_id,
-            kind,
-            rejection: rejection.clone(),
-        }
-        .preparation_input(),
-    )
-}
+use novarocks_attempt_protocol::port_projection::failure_input;
+pub(crate) use novarocks_attempt_protocol::port_projection::owner_failure;
+pub(super) use novarocks_attempt_protocol::port_projection::{
+    project_failure, replacement_refusal,
+};
 
 #[cfg(test)]
 mod tests {
@@ -946,6 +650,7 @@ mod tests {
         operation::OperationResult,
     };
     use novarocks_query_application::api::NativeAttemptTopologyRequirement;
+    use novarocks_query_application::api::NativeFailureTopology;
     use novarocks_types::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };

@@ -592,6 +592,8 @@ mod tests {
         attempt_convergence::NativeAttemptConvergenceTarget, intent::TaskOperationSink,
     };
     use novarocks_coordination_contract::AttemptFailureClass;
+    use novarocks_query_application::api::ExecutionFailurePresentation;
+    use novarocks_query_application::api::NativeFailureTopology;
     use novarocks_query_application::api::{BackendProcessObservation, QueryExecutionErrorKind};
 
     fn protocol_participation(

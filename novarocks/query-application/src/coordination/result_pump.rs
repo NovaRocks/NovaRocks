@@ -21,6 +21,8 @@
 //! ordered relay, acknowledgement, status progression and terminal handoff.
 //! It has no Arrow decoder or execution-kernel dependency.
 
+use crate::execution_error::ExecutionFailurePresentation;
+
 use std::{future::Future, num::NonZeroU64, pin::Pin, sync::Arc};
 
 use novarocks_execution_contract::root_result::RootResultRead;

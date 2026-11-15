@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use novarocks_workload_control::{CancellationReason, WorkCancellationRequester, WorkOwner};
 
@@ -204,68 +204,7 @@ pub enum QueryExecutionKind {
     Maintenance,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueryExecutionErrorKind {
-    InvalidRequest,
-    Rejected,
-    Cancelled,
-    DeadlineExceeded,
-    Failed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum QueryExecutionErrorBody {
-    Application {
-        kind: QueryExecutionErrorKind,
-        message: Arc<str>,
-    },
-    Execution(Box<crate::execution_error::ExecutionFailureInput>),
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryExecutionError {
-    body: QueryExecutionErrorBody,
-}
-impl QueryExecutionError {
-    /// Application/control errors with no domain execution conclusion.
-    pub fn new(kind: QueryExecutionErrorKind, message: impl Into<Arc<str>>) -> Self {
-        Self {
-            body: QueryExecutionErrorBody::Application {
-                kind,
-                message: message.into(),
-            },
-        }
-    }
-    pub fn from_execution(input: crate::execution_error::ExecutionFailureInput) -> Self {
-        Self {
-            body: QueryExecutionErrorBody::Execution(Box::new(input)),
-        }
-    }
-    pub fn execution_failure(&self) -> Option<&crate::execution_error::ExecutionFailureInput> {
-        match &self.body {
-            QueryExecutionErrorBody::Execution(input) => Some(input.as_ref()),
-            QueryExecutionErrorBody::Application { .. } => None,
-        }
-    }
-    pub fn kind(&self) -> QueryExecutionErrorKind {
-        match &self.body {
-            QueryExecutionErrorBody::Application { kind, .. } => *kind,
-            QueryExecutionErrorBody::Execution(input) => input.error_kind(),
-        }
-    }
-    pub fn message(&self) -> &str {
-        match &self.body {
-            QueryExecutionErrorBody::Application { message, .. } => message,
-            QueryExecutionErrorBody::Execution(input) => input.detail().as_str(),
-        }
-    }
-}
-impl fmt::Display for QueryExecutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message())
-    }
-}
-
-impl Error for QueryExecutionError {}
+pub use novarocks_coordination_contract::{QueryExecutionError, QueryExecutionErrorKind};
 
 pub use crate::coordination::{
     LocalExecutionDisposition, LogicalActorExitPhase, LogicalExecutionExitObserver,

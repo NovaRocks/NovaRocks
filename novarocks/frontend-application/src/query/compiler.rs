@@ -296,6 +296,7 @@ pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
 #[cfg(test)]
 mod compile_control_tests {
     use super::*;
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use novarocks_type_contract::CompileControlError;
 
     fn service(

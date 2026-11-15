@@ -14,3 +14,25 @@
 // KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+//! Failure values authored by logical execution decisions, without host custody.
+
+use novarocks_coordination_contract::{
+    ExecutionFailureInput, ExecutionFailureSite, QueryExecutionError, QueryFailureReason,
+};
+use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+
+pub fn query_failure(reason: QueryFailureReason, detail: &str) -> QueryExecutionError {
+    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        reason.failure_fact(),
+        SafeDetail::truncating(detail),
+        ExecutionFailureSite::Coordinator,
+    ))
+}
+
+pub fn invariant_failure(detail: &str) -> QueryExecutionError {
+    query_failure(QueryFailureReason::ActorProtocol, detail)
+}
+
+#[cfg(test)]
+mod tests;

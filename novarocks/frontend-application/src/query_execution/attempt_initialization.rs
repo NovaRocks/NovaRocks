@@ -1095,6 +1095,7 @@ impl AttemptReady {
 
 #[cfg(test)]
 mod tests {
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     mod prepared_opening_tests;
     use std::future::Future;
     use std::sync::mpsc;

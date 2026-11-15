@@ -992,6 +992,7 @@ mod tests {
     use novarocks_control_runtime_core::scope::WorkAdmission;
     use novarocks_execution_contract::failure::FailureProjection;
     use novarocks_proto_codec::lifecycle::QueryExecutionId;
+    use novarocks_query_application::api::NativeFailureTopology;
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
     use novarocks_types::{AttemptId, QueryId};
     use std::{

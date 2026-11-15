@@ -37,3 +37,11 @@ pub use status::*;
 mod attempt_port;
 
 pub use attempt_port::*;
+
+mod failure;
+pub use failure::*;
+
+mod ids;
+pub use ids::*;
+
+pub mod logical_port;

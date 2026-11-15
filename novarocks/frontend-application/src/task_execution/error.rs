@@ -21,6 +21,8 @@
 //! a hint to try something weaker: there is no fallback path, no guessed
 //! default, and no message-text classification anywhere in this module.
 
+#[cfg(test)]
+use novarocks_execution_contract::OperationOutcome;
 use std::fmt;
 #[cfg(test)]
 use std::time::Duration;
@@ -32,8 +34,7 @@ use crate::task_execution::{
 #[cfg(test)]
 use novarocks_coordination_contract::StatusObservation;
 use novarocks_execution::task_execution::{
-    DescriptorError, DomainConflict, OperationKind, OperationOutcome, ParticipationRef,
-    RequestError, TaskOperationId,
+    DescriptorError, DomainConflict, OperationKind, ParticipationRef, RequestError, TaskOperationId,
 };
 #[cfg(test)]
 use novarocks_execution::task_execution::{ExchangeEdgeId, IdentityMismatch, TaskState};
@@ -94,6 +95,13 @@ pub enum TaskExecutionError {
     /// replay authorization while every Worker outcome remained unknown. The
     /// whole-attempt recovery owner must observe whether this exact process
     /// was replaced before deciding a successor schedule.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the legacy test driver is removed in the cutover commit"
+        )
+    )]
     PreReadyEstablishTransportUnknown {
         backend: BackendProcessId,
     },
@@ -101,6 +109,13 @@ pub enum TaskExecutionError {
     /// attempt is unusable, but only the whole-attempt recovery owner may
     /// decide whether independently observed process replacement permits a
     /// successor schedule.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the legacy test driver is removed in the cutover commit"
+        )
+    )]
     PreReadyEstablishRejected {
         participation: ParticipationRef,
         operation_id: TaskOperationId,
@@ -128,6 +143,13 @@ pub enum TaskExecutionError {
     /// The three task domains are advanced by unrelated producers, so a
     /// conflict that reports only its kind costs a cluster run just to learn
     /// which producer to look at.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the legacy test driver is removed in the cutover commit"
+        )
+    )]
     DomainRegression {
         domain: &'static str,
         token: String,
@@ -148,6 +170,13 @@ pub enum TaskExecutionError {
         to: TaskState,
     },
     /// A backend answered an operation with an outcome that fails the attempt.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the legacy test driver is removed in the cutover commit"
+        )
+    )]
     OperationFailed {
         participation: ParticipationRef,
         operation_id: TaskOperationId,
@@ -508,98 +537,7 @@ impl From<CapacityBound> for TaskExecutionError {
 /// DomainFailure bypasses this projection and keeps its exact producer fact.
 /// QUERY reasons 1..=13 and 27 belong to QueryFailureReason. This closed FE
 /// protocol projection owns 14..=26 and 28; 29..=32 remain unassigned.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TaskProtocolFailureReason {
-    OwnerFailed,
-    OperationTimedOut,
-    IdentityMismatch,
-    CompatibilityMismatch,
-    ParticipationNotEstablished,
-    ParticipationConflict,
-    DomainConflict,
-    LeaseExpired,
-    ParticipationTerminalReceipt,
-    InvalidStateOrRequest,
-    TerminalRejected,
-    Gone,
-    ResourceExhausted,
-    NonterminalVerdictAtFailure,
-}
-impl TaskProtocolFailureReason {
-    fn terminal_verdict(outcome: OperationOutcome) -> Self {
-        match outcome {
-            OperationOutcome::OwnerFailed => Self::OwnerFailed,
-            OperationOutcome::OperationTimedOut => Self::OperationTimedOut,
-            OperationOutcome::IdentityMismatch => Self::IdentityMismatch,
-            OperationOutcome::CompatibilityMismatch => Self::CompatibilityMismatch,
-            OperationOutcome::ParticipationNotEstablished => Self::ParticipationNotEstablished,
-            OperationOutcome::ParticipationConflict => Self::ParticipationConflict,
-            OperationOutcome::DomainConflict => Self::DomainConflict,
-            OperationOutcome::LeaseExpired => Self::LeaseExpired,
-            OperationOutcome::ParticipationTerminalReceipt => Self::ParticipationTerminalReceipt,
-            OperationOutcome::InvalidStateOrRequest => Self::InvalidStateOrRequest,
-            OperationOutcome::TerminalRejected => Self::TerminalRejected,
-            OperationOutcome::Gone => Self::Gone,
-            OperationOutcome::ResourceExhausted => Self::ResourceExhausted,
-            // These are success/wait facts, not failure authors. Reaching a
-            // terminal-only error branch is a local protocol invariant;
-            // it cannot manufacture Resource, Task acceptance or BackendLost.
-            OperationOutcome::Accepted
-            | OperationOutcome::Idempotent
-            | OperationOutcome::ReleaseNotReady
-            | OperationOutcome::NotReady
-            | OperationOutcome::PreparationBusy
-            | OperationOutcome::AdmissionTicketStillActive => Self::NonterminalVerdictAtFailure,
-        }
-    }
-}
-impl novarocks_execution_contract::failure::FailureProjection for TaskProtocolFailureReason {
-    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::{
-            FailureClass, FailureFact, FailureReason, domain,
-        };
-        let (class, code) = match self {
-            Self::OwnerFailed => (FailureClass::Invariant, 28),
-            Self::OperationTimedOut => (FailureClass::Dependency, 14),
-            Self::IdentityMismatch => return FailureFact::new(
-                FailureClass::Invariant,
-                novarocks_query_application::execution_error::TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
-            ),
-            Self::CompatibilityMismatch => (FailureClass::Invariant, 16),
-            Self::ParticipationNotEstablished => (FailureClass::Invariant, 17),
-            Self::ParticipationConflict => (FailureClass::Invariant, 18),
-            Self::DomainConflict => (FailureClass::Invariant, 19),
-            Self::LeaseExpired => (FailureClass::Control, 20),
-            Self::ParticipationTerminalReceipt => (FailureClass::Control, 21),
-            Self::InvalidStateOrRequest => (FailureClass::Invariant, 22),
-            Self::TerminalRejected => (FailureClass::Control, 23),
-            Self::Gone => (FailureClass::Control, 24),
-            Self::ResourceExhausted => (FailureClass::Resource, 25),
-            Self::NonterminalVerdictAtFailure => (FailureClass::Invariant, 26),
-        };
-        FailureFact::new(
-            class,
-            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap()),
-        )
-    }
-}
-
-/// The same protocol reason author preserves a locally refused operation's
-/// fact without claiming that a Worker sent a receipt.
-pub(crate) fn local_protocol_refusal(
-    kind: OperationKind,
-    outcome: OperationOutcome,
-) -> novarocks_query_application::execution_error::ExecutionFailureInput {
-    use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
-    use novarocks_query_application::execution_error::{
-        ExecutionFailureInput, ExecutionFailureSite,
-    };
-    ExecutionFailureInput::new(
-        TaskProtocolFailureReason::terminal_verdict(outcome).failure_fact(),
-        SafeDetail::truncating(&format!("{kind} returned {outcome:?}")),
-        ExecutionFailureSite::Coordinator,
-    )
-}
+pub(crate) use novarocks_attempt_protocol::port_projection::local_protocol_refusal;
 
 /// Project only a settled local dispatch refusal; identity, Worker and
 /// cleanup failures keep their original owners and typed branches.
@@ -705,7 +643,7 @@ impl TaskExecutionError {
                 OperationResult::Verdict {
                     outcome, detail, ..
                 } => ExecutionFailureInput::new(
-                    TaskProtocolFailureReason::terminal_verdict(*outcome).failure_fact(),
+                    novarocks_attempt_protocol::port_projection::operation_failure_fact(*outcome),
                     detail.clone().unwrap_or_else(|| {
                         SafeDetail::truncating(&format!("{kind} returned {outcome:?}"))
                     }),
@@ -778,7 +716,9 @@ impl TaskExecutionError {
                 ..
             } => {
                 return ExecutionFailureInput::new(
-                    TaskProtocolFailureReason::terminal_verdict(receipt.outcome()).failure_fact(),
+                    novarocks_attempt_protocol::port_projection::operation_failure_fact(
+                        receipt.outcome(),
+                    ),
                     SafeDetail::truncating("frontend task protocol could not continue"),
                     ExecutionFailureSite::Coordinator,
                 );
@@ -815,6 +755,8 @@ mod canonical_input_tests {
         },
         operation::{DomainFailureOutcome, OperationDomainFailure, OperationResult},
     };
+    use novarocks_query_application::api::ExecutionFailurePresentation;
+    use novarocks_query_application::api::NativeFailureTopology;
     use novarocks_query_application::execution_error::{ExecutionFailureSite, QueryFailureReason};
     fn participation() -> ParticipationRef {
         use novarocks_types::{AttemptId, FrontendProcessId, QueryExecutionId, QueryId};

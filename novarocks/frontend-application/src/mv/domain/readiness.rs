@@ -803,6 +803,7 @@ mod controlled_wipe_tests {
 mod guard_original_projection_tests {
     use super::*;
     use novarocks_failure_contract::FailureProjection;
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, KeyedDocumentReadError};
 
     #[test]

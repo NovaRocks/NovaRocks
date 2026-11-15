@@ -83,6 +83,7 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
 mod tests {
     use super::*;
     use novarocks_failure_contract::FailureProjection;
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use novarocks_query_application::{
         admitted_query_context::QueryExecutionContext, api::BackendTopologySnapshot,
         cancellation::QueryCancellationSource, session_control::GovernedStatementAction,

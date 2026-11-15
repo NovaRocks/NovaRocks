@@ -695,6 +695,7 @@ pub(crate) fn receipt_channel() -> (
 
 #[cfg(test)]
 mod failure_projection_tests {
+    use crate::execution_error::ExecutionFailurePresentation;
     #[test]
     fn qualification_outcome_cannot_claim_backend_loss_or_accepted_cancellation() {
         use super::ReplacementQualificationFailure;

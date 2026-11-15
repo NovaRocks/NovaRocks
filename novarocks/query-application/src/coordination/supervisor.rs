@@ -25,6 +25,9 @@
 //!
 //! Design: ADR-0198 (docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md).
 
+#[cfg(test)]
+use crate::execution_error::ExecutionFailurePresentation;
+
 use super::LogicalExecutionExitObserver;
 use super::original_exit::OriginalLogicalExit;
 use std::collections::BTreeSet;

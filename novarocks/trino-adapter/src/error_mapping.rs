@@ -16,6 +16,8 @@
 // under the License.
 
 //! Typed projection of application failures into the Trino client contract.
+use novarocks_query_application::api::ExecutionFailurePresentation;
+
 use crate::diagnostics::{self, BoundedMessage};
 use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
 use novarocks_query_application::{
