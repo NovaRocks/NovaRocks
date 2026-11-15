@@ -129,7 +129,7 @@ impl super::staging::Preparer for OverwritePartitionsPreparer {
             })
             .collect::<Vec<_>>();
         removed.extend(dependent);
-        let snapshot_id = super::staging::new_snapshot_id(metadata);
+        let snapshot_id = view.stage_snapshot_id()?;
         let added = super::overwrite::write_added_intent_data(view, intent, snapshot_id).await?;
         let manifests = super::manifest_transform::ordinary_manifests(
             view,

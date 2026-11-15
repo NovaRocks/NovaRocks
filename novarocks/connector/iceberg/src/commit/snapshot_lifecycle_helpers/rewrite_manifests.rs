@@ -340,19 +340,26 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
             .lock()
             .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))?
             .clone();
-        let reusable = match cached.filter(|cache| {
+        let cached = cached.filter(|cache| {
             cache.encoding_basis == encoding_basis
                 && rewrite_sources_are_current(&cache.sources, latest)
-        }) {
+        });
+        let groups = if cached.is_none() {
+            let groups = group_manifests_by_spec_and_content(latest);
+            if groups.values().all(|group| group.len() <= 1) {
+                return Ok(no_op());
+            }
+            Some(groups)
+        } else {
+            None
+        };
+        let snapshot_id = view.stage_snapshot_id()?;
+        let reusable = match cached {
             Some(cache) => cache,
             None => {
                 // This is a policy operation: invalidated selections are
                 // replanned, rather than treated as an explicit-input promise.
-                let groups = group_manifests_by_spec_and_content(latest);
-                if groups.values().all(|group| group.len() <= 1) {
-                    return Ok(no_op());
-                }
-                let snapshot_id = crate::commit::staging::new_snapshot_id(metadata);
+                let groups = groups.expect("invalidated rewrite selected nontrivial groups");
                 let mut sources = Vec::new();
                 let mut outputs = Vec::new();
                 for group in groups.values().filter(|group| group.len() > 1) {
@@ -381,7 +388,6 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
                 cache
             }
         };
-        let snapshot_id = crate::commit::staging::new_snapshot_id(metadata);
         let mut manifests = latest
             .iter()
             .filter(|manifest| {
@@ -392,13 +398,7 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
             })
             .cloned()
             .collect::<Vec<_>>();
-        for mut manifest in reusable.outputs.clone() {
-            // List-level introduction/sequence is attempt-local; immutable
-            // merged entries retain their exact original file/snapshot facts.
-            manifest.added_snapshot_id = snapshot_id;
-            manifest.sequence_number = -1;
-            manifests.push(manifest);
-        }
+        manifests.extend(reusable.outputs.iter().cloned());
         let properties = finalize_snapshot_summary(
             HashMap::from([
                 (
@@ -481,6 +481,7 @@ mod keyed_record_tests {
         token: crate::commit::model::OperationToken,
         attempt: Mutex<crate::commit::model::AttemptToken>,
         ledger: Mutex<crate::commit::model::ArtifactLedger>,
+        stage_ids: Mutex<BTreeMap<usize, i64>>,
     }
     impl RewriteArtifacts {
         fn new() -> Self {
@@ -492,12 +493,17 @@ mod keyed_record_tests {
                 token,
                 attempt: Mutex::new(crate::commit::model::AttemptToken::new(token, 0)),
                 ledger: Mutex::new(crate::commit::model::ArtifactLedger::new(token)),
+                stage_ids: Mutex::new(BTreeMap::new()),
             }
         }
     }
     impl crate::commit::model::ArtifactWriter for RewriteArtifacts {
         fn file_io(&self) -> &FileIO {
             &self.io
+        }
+        fn stage_snapshot_id(&self, stage: usize, metadata: &crate::iceberg::spec::TableMetadata) -> crate::iceberg::Result<i64> {
+            let mut ids = self.stage_ids.lock().unwrap();
+            Ok(*ids.entry(stage).or_insert_with(|| crate::commit::staging::new_snapshot_id(metadata)))
         }
         fn allocate(
             &self,

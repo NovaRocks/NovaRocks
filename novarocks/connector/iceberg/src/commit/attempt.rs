@@ -340,6 +340,13 @@ async fn run_in_phase(
     policy: RetryPolicy,
     cleanup_phase: CommittedCleanupPhase,
 ) -> Report {
+    if let Err(error) = operation.enter_commit_loop() {
+        // Re-entry is an implementation error, not another cleanup opportunity.
+        return Report {
+            publication: PublicationOutcome::KnownUncommitted(before_dispatch_failure(&error)),
+            cleanup: IcebergCleanupReport::NotAttempted,
+        };
+    }
     if operation.token() != intent.token() {
         return rejected(
             operation,
@@ -572,6 +579,13 @@ async fn prepare(
     preparers: &[&dyn Preparer],
     captured_merge_policy: &mut Option<super::preparation::CapturedMergePolicy>,
 ) -> std::result::Result<(FrozenRequest, Vec<ObjectIdentity>), ConnectorMutationFailure> {
+    let metadata = match &base {
+        StagingBase::Existing { metadata, .. } => metadata,
+        StagingBase::Create { staged, .. } => staged.initial_metadata(),
+    };
+    attempt
+        .check_stage_snapshot_ids(metadata)
+        .map_err(|error| before_dispatch_failure(&error))?;
     if let StagingBase::Existing { metadata, .. } = &base {
         if intent.target().uuid != Some(metadata.uuid()) {
             return Err(ConnectorMutationFailure::new(
@@ -1226,6 +1240,7 @@ mod tests {
             snapshots[1]["sequence-number"],
             raced.next_sequence_number()
         );
+        assert_eq!(snapshots[0]["snapshot-id"], snapshots[1]["snapshot-id"]);
         assert_eq!(snapshots[1]["first-row-id"], raced.next_row_id());
         assert_eq!(snapshots[1]["added-rows"], 3);
         assert_ne!(snapshots[0]["manifest-list"], snapshots[1]["manifest-list"]);
@@ -1249,6 +1264,131 @@ mod tests {
             )
             .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn a_second_commit_loop_is_an_internal_error_without_another_dispatch() {
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V2);
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
+        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
+        let first = invoke(&fixture, &intent, &publisher).await;
+        assert!(matches!(
+            first.publication,
+            PublicationOutcome::Committed(_)
+        ));
+        let before = fixture.operation.artifacts().unwrap();
+        let second = invoke(&fixture, &intent, &publisher).await;
+        let PublicationOutcome::KnownUncommitted(failure) = second.publication else {
+            panic!("a second commit loop must be refused");
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Internal);
+        assert_eq!(publisher.requests.lock().unwrap().len(), 1);
+        assert_eq!(fixture.operation.artifacts().unwrap(), before);
+        let read = fixture.operation.begin_attempt().unwrap();
+        for artifact in before {
+            assert!(read.file_io().exists(artifact.object.path()).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn each_stage_keeps_its_distinct_snapshot_id_across_conflict_retries() {
+        let baseline = Fixture::new();
+        let metadata = append_state(&baseline, baseline.metadata(FormatVersion::V3), 2).await;
+        let competitor = Fixture::new();
+        let raced = append_state(&competitor, metadata.clone(), 4).await;
+        let fixture = Fixture::new();
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
+        let publisher =
+            ControlledPublisher::new(&fixture, metadata, Dispatch::ConflictThen(Box::new(raced)));
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&FastAppendPreparer, &RemoveAfterAppend],
+            &publisher,
+            policy(),
+        )
+        .await;
+        assert!(
+            matches!(report.publication, PublicationOutcome::Committed(_)),
+            "{report:?}"
+        );
+        let requests = publisher.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let ids: Vec<Vec<_>> = requests
+            .iter()
+            .map(|request| {
+                request["updates"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|update| update["action"] == "add-snapshot")
+                    .map(|update| update["snapshot"]["snapshot-id"].as_i64().unwrap())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(ids[0].len(), 2);
+        assert_ne!(ids[0][0], ids[0][1]);
+        assert_eq!(ids[0], ids[1]);
+    }
+
+    #[tokio::test]
+    async fn stage_id_in_refreshed_base_refuses_dispatch_and_withholds_cleanup() {
+        use crate::commit::model::ArtifactWriter;
+        use crate::iceberg::spec::{Operation, Snapshot, Summary};
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V2);
+        let writer = fixture.operation.begin_attempt().unwrap();
+        let id = writer.stage_snapshot_id(0, &metadata).unwrap();
+        let object = super::super::staging::write_manifest_list(
+            &writer,
+            &metadata,
+            id,
+            None,
+            std::iter::empty(),
+        )
+        .await
+        .unwrap()
+        .object;
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(id)
+            .with_sequence_number(metadata.next_sequence_number())
+            .with_timestamp_ms(metadata.last_updated_ms())
+            .with_manifest_list(object.path().to_owned())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(metadata.current_schema_id())
+            .build();
+        let metadata = TableUpdate::AddSnapshot { snapshot }
+            .apply(metadata.into_builder(None))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
+        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
+        let before = fixture.operation.artifacts().unwrap();
+        let report = invoke(&fixture, &intent, &publisher).await;
+        let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
+            panic!("an existing stage ID must refuse publication");
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Internal);
+        assert!(failure.message().contains(&id.to_string()));
+        assert!(publisher.requests.lock().unwrap().is_empty());
+        assert!(
+            matches!(report.cleanup, IcebergCleanupReport::Withheld { ref reason } if reason.contains(&id.to_string()))
+        );
+        assert_eq!(fixture.operation.artifacts().unwrap(), before);
+        assert!(writer.file_io().exists(object.path()).await.unwrap());
+        let later = fixture
+            .operation
+            .cleanup(CleanupScope::EntireOperation)
+            .await;
+        assert_eq!(later, report.cleanup);
+        assert!(writer.file_io().exists(object.path()).await.unwrap());
     }
 
     #[tokio::test]
@@ -2157,7 +2297,20 @@ mod tests {
         // the parent's existing manifests and must not clean them on rejection.
         let source = Fixture::new();
         let metadata = source.metadata_with_data_and_delete_manifests().await;
-        let source_objects = source.operation.artifacts().unwrap();
+        let read = source.operation.begin_attempt().unwrap();
+        let source_snapshot = metadata.current_snapshot().unwrap();
+        let source_list =
+            crate::manifest::load_manifest_list(source_snapshot, read.file_io(), &metadata)
+                .await
+                .unwrap();
+        let source_objects: Vec<_> = std::iter::once(source_snapshot.manifest_list().to_owned())
+            .chain(
+                source_list
+                    .entries()
+                    .iter()
+                    .map(|manifest| manifest.manifest_path.clone()),
+            )
+            .collect();
         assert_eq!(source_objects.len(), 3); // data manifest + delete manifest + list
         let fixture = Fixture::new();
         let intent = OperationIntent::new(OperationIntentParts {
@@ -2246,10 +2399,7 @@ mod tests {
         assert!(!std::path::Path::new(list.strip_prefix("file://").unwrap()).exists());
         assert!(fixture.operation.artifacts().unwrap().is_empty());
         for original in source_objects {
-            assert!(
-                std::path::Path::new(original.object.path().strip_prefix("file://").unwrap())
-                    .exists()
-            );
+            assert!(std::path::Path::new(original.strip_prefix("file://").unwrap()).exists());
         }
     }
 }

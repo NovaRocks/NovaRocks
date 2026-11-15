@@ -44,6 +44,10 @@ pub enum IcebergCleanupReport {
     },
     /// A possibly dispatched publication keeps every object until adjudication.
     NotAttempted,
+    /// An ambiguous stage ID observation permanently withholds deletion authority.
+    Withheld {
+        reason: String,
+    },
 }
 
 impl IcebergCleanupReport {
@@ -62,6 +66,12 @@ impl IcebergCleanupReport {
                     format!(
                         "Iceberg owned artifact cleanup incomplete: deleted={deleted}, remaining={remaining:?}"
                     ),
+                ))
+            }
+            Self::Withheld { reason } => {
+                ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Internal,
+                    format!("Iceberg owned artifact cleanup withheld: {reason}"),
                 ))
             }
             Self::NotAttempted => {

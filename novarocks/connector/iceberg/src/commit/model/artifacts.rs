@@ -63,6 +63,22 @@ pub trait ArtifactWriter: Send + Sync {
     fn allocate(&self, class: ArtifactClass, kind: ArtifactKind) -> Result<ObjectIdentity>;
     fn attempt_token(&self) -> AttemptToken;
     fn check_active(&self) -> Result<()>;
+    /// Production writers allocate stable IDs from their original operation.
+    #[cfg(not(test))]
+    fn stage_snapshot_id(
+        &self,
+        stage: usize,
+        metadata: &crate::iceberg::spec::TableMetadata,
+    ) -> Result<i64>;
+    /// Simple staging doubles have no operation lifetime and only generate a fresh ID.
+    #[cfg(test)]
+    fn stage_snapshot_id(
+        &self,
+        _stage: usize,
+        metadata: &crate::iceberg::spec::TableMetadata,
+    ) -> Result<i64> {
+        Ok(crate::commit::staging::new_snapshot_id(metadata))
+    }
     fn snapshot_artifacts(&self, owned_references: &[ObjectIdentity]) -> Result<AttemptArtifacts>;
 }
 

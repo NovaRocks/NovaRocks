@@ -270,7 +270,7 @@ pub(crate) async fn prepare_physical_rewrite(
             .or_default()
             .push(added.clone());
     }
-    let snapshot_id = super::staging::new_snapshot_id(metadata);
+    let snapshot_id = view.stage_snapshot_id()?;
     let mut additions = Vec::new();
     for ((spec_id, assigned), added) in added_groups {
         let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {

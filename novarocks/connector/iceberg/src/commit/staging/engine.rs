@@ -251,6 +251,7 @@ pub struct StagingEngine<'a> {
     state: StagingState,
     intent: &'a OperationIntent,
     artifacts: &'a dyn ArtifactWriter,
+    stage: usize,
     context: PreparationContext,
     completed_list: Option<(String, ManifestList)>,
 }
@@ -297,6 +298,7 @@ impl<'a> StagingEngine<'a> {
                 io_window_width,
             },
             completed_list: None,
+            stage: 0,
         })
     }
     pub fn metadata(&self) -> &TableMetadata {
@@ -321,6 +323,7 @@ impl<'a> StagingEngine<'a> {
     pub fn view(&self) -> StagedView<'_> {
         StagedView::new(
             &self.state.metadata,
+            self.stage,
             self.intent,
             self.artifacts,
             self.context,
@@ -344,6 +347,10 @@ impl<'a> StagingEngine<'a> {
             }
         }
         self.stage_change(prepared)?;
+        self.stage = self
+            .stage
+            .checked_add(1)
+            .ok_or_else(|| invalid("Iceberg stage ordinal exhausted"))?;
         if completed_list.is_some() {
             self.completed_list = completed_list;
         }

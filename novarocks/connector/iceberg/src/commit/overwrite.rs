@@ -52,7 +52,7 @@ impl super::staging::Preparer for OverwritePreparer {
         if removed.is_empty() && intent.changes().added.is_empty() && intent.summary().is_empty() {
             return Ok(super::staging::PreparedChange::default());
         }
-        let snapshot_id = super::staging::new_snapshot_id(view.metadata());
+        let snapshot_id = view.stage_snapshot_id()?;
         let added = write_added_intent_data(view, intent, snapshot_id).await?;
         let manifests = super::manifest_transform::ordinary_manifests(
             view,
@@ -923,6 +923,9 @@ pub(crate) mod preparer_tests {
         pub directory: tempfile::TempDir,
         pub operation: IcebergCommitOperation,
         _stop: ConnectorStopOwner,
+        binding: crate::access_binding::IcebergReadBinding,
+        catalog_runtime: crate::resources::IcebergCatalogRuntime,
+        limits: OperationLimits,
     }
     impl Fixture {
         pub(crate) fn new() -> Self {
@@ -962,7 +965,7 @@ pub(crate) mod preparer_tests {
             let operation = IcebergCommitOperation::new(
                 OperationToken::from_write(ConnectorWriteOperationId::from_bytes([7; 16])),
                 location,
-                binding,
+                binding.clone(),
                 ConnectorRequestContext::try_new(
                     Instant::now() + Duration::from_secs(60),
                     stop.view(),
@@ -970,7 +973,7 @@ pub(crate) mod preparer_tests {
                     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
                 )
                 .unwrap(),
-                catalog_runtime,
+                catalog_runtime.clone(),
                 limits,
             )
             .unwrap();
@@ -978,6 +981,9 @@ pub(crate) mod preparer_tests {
                 directory,
                 operation,
                 _stop: stop,
+                binding,
+                catalog_runtime,
+                limits,
             }
         }
         pub(crate) fn cancel(&self) {
@@ -1042,7 +1048,31 @@ pub(crate) mod preparer_tests {
             intent: &OperationIntent,
             preparer: &dyn Preparer,
         ) -> (TableMetadata, FrozenRequest) {
-            let attempt = self.operation.begin_attempt().unwrap();
+            // Each seed is a separate logical publication, rather than a retry
+            // of this fixture's operation. Its fresh token also keeps output paths unique.
+            let operation = IcebergCommitOperation::new(
+                OperationToken::from_write(ConnectorWriteOperationId::new()),
+                format!("file://{}", self.directory.path().display()),
+                self.binding.clone(),
+                self.operation.request_context().clone(),
+                self.catalog_runtime.clone(),
+                self.limits,
+            )
+            .unwrap();
+            let intent = OperationIntent::new(OperationIntentParts {
+                target: intent.target().clone(),
+                target_ref: intent.target_ref().to_owned(),
+                start: intent.start(),
+                changes: intent.changes().clone(),
+                dependencies: intent.dependencies().to_vec(),
+                isolation: intent.isolation(),
+                shape: intent.shape(),
+                summary: intent.summary().clone(),
+                token: operation.token(),
+            })
+            .unwrap()
+            .with_snapshot_loading(intent.snapshot_loading());
+            let attempt = operation.begin_attempt().unwrap();
             let mut engine = StagingEngine::begin(
                 StagingBase::Existing {
                     metadata,
@@ -1051,7 +1081,7 @@ pub(crate) mod preparer_tests {
                         self.directory.path().display()
                     ),
                 },
-                intent,
+                &intent,
                 &attempt,
             )
             .unwrap();
@@ -1122,7 +1152,7 @@ pub(crate) mod preparer_tests {
             view: &super::super::staging::StagedView<'_>,
             intent: &OperationIntent,
         ) -> crate::iceberg::Result<PreparedChange> {
-            let id = super::super::staging::new_snapshot_id(view.metadata());
+            let id = view.stage_snapshot_id()?;
             let mut manifests = Vec::new();
             for content in [ManifestContentType::Data, ManifestContentType::Deletes] {
                 let entries: Vec<_> = self

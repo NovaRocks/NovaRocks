@@ -160,7 +160,7 @@ impl Preparer for SlotChangePreparer {
         } else {
             vec![]
         };
-        let snapshot_id = super::staging::new_snapshot_id(metadata);
+        let snapshot_id = view.stage_snapshot_id()?;
         let carry = carry_records_and_closure(metadata)?;
         let mut rewrites = carry.properties;
         for (name, value) in &self.change.slots {
