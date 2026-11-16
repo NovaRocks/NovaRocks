@@ -50,6 +50,7 @@ const REST_AUTHENTICATION_SOURCE: &str = "REST catalog authentication is only po
 the catalog's CatalogControl or DataCredentialVending credential binding";
 
 pub(crate) const MAX_PARTITIONS_PER_WRITER: &str = "iceberg.max-partitions-per-writer";
+pub const MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY: &str = "max_partitions_per_writer";
 const TARGET_MAX_FILE_SIZE: &str = "iceberg.target-max-file-size";
 pub(crate) const DEFAULT_MAX_PARTITIONS_PER_WRITER: u32 = 100;
 pub(crate) const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 1 << 30;

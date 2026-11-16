@@ -181,6 +181,7 @@ async fn prepare_keyed(fixture: &Fixture, payload: &'static [u8]) -> PreparedKey
 
 fn keyed_begin(prepared: &PreparedKeyed) -> ConnectorWriteBeginRequest {
     ConnectorWriteBeginRequest {
+        catalog_session: Default::default(),
         table: Arc::from("db.t"),
         target_ref: ConnectorWriteTargetRef::main(),
         intent: ConnectorWriteIntent::Overwrite,

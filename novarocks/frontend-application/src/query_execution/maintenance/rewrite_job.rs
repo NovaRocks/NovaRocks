@@ -715,8 +715,10 @@ fn form_original_domain(
             TerminalError::from_original_cause(error)
         })?;
     let original_write = Arc::new(std::sync::Mutex::new(None));
-    let begin =
-        crate::query_execution::write_session::WriteBeginReceiving::new(original_write.clone());
+    let begin = crate::query_execution::write_session::WriteBeginReceiving::for_statement(
+        original_write.clone(),
+        Arc::clone(execution.session_property_inputs()),
+    );
     let publication = StatementPublication::new(crate::dml::attempt::DmlPublicationAttempt::new(
         novarocks_spi::connector::LakePublicationId::new_v7(),
         novarocks_spi::connector::LakePublicationFamily::MetadataMaintenance,

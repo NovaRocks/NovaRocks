@@ -51,6 +51,7 @@ pub struct CatalogRuntimeObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogConfigurationObservation {
     pub runtime: CatalogRuntimeObservation,
+    pub control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     pub configuration: Arc<crate::CatalogLogicalConfig>,
 }
 

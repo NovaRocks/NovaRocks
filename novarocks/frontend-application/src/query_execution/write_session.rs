@@ -249,6 +249,7 @@ impl ConnectorWriteSession {
         receiving: &WriteBeginReceiving,
     ) -> Result<Arc<Self>, ConnectorError> {
         request.context = context_for_write_begin(request.context, &catalog_properties)?;
+        receiving.bind_catalog_session(&mut request, &write_stack_pin, &catalog_properties);
         receiving.install_publication_input(
             write_stack_pin,
             catalog_properties,
@@ -282,7 +283,7 @@ impl ConnectorWriteSession {
     pub(crate) async fn begin_rewrite_scoped_in(
         write_stack_pin: ConnectorWriteStackPin,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
-        request: ConnectorWriteBeginRequest,
+        mut request: ConnectorWriteBeginRequest,
         receiving: &WriteBeginReceiving,
         original_source: &mut Option<
             Arc<dyn novarocks_spi::connector::ConnectorRewriteWriteBeginSource>,
@@ -303,6 +304,7 @@ impl ConnectorWriteSession {
             ));
         }
         receiving.claim()?;
+        receiving.bind_catalog_session(&mut request, &write_stack_pin, &catalog_properties);
         receiving.install_input(write_stack_pin, catalog_properties);
         let mut request = Some(request);
         receiving.control().prepare_rewrite_begin_source_in(
@@ -1109,6 +1111,7 @@ pub(crate) mod tests {
         begin_declaration: Option<ConnectorDocumentPublicationDeclaration>,
         capture_begin_context: bool,
         begin_context: Option<ConnectorRequestContext>,
+        begin_catalog_session: novarocks_spi::connector::read_stack::ConnectorCatalogSession,
         pub(crate) finish_future_drops: usize,
         pub(crate) finalization_context:
             Option<Result<Option<ConnectorRequestContext>, ConnectorError>>,
@@ -1576,6 +1579,7 @@ pub(crate) mod tests {
                 }
                 if recorded.capture_begin_context {
                     recorded.begin_context = Some(request.context);
+                    recorded.begin_catalog_session = request.catalog_session;
                 }
             }
             let commit = self.adapter.wrap_commit_session(FakeCommit);
@@ -2027,6 +2031,7 @@ pub(crate) mod tests {
 
     fn begin_request() -> ConnectorWriteBeginRequest {
         ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from("db.t"),
             target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
@@ -2190,6 +2195,7 @@ pub(crate) mod tests {
         declaration: ConnectorDocumentPublicationDeclaration,
     ) -> ConnectorWriteBeginRequest {
         ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from("db.t"),
             target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             intent: novarocks_spi::connector::ConnectorWriteIntent::Overwrite,

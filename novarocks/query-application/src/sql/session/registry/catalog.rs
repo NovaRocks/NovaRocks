@@ -25,6 +25,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogPropertyIdentity {
     pub attachment_id: Uuid,
+    pub control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     pub instance_id: ConnectorInstanceId,
     pub provider_id: ConnectorProviderId,
     pub generation: u64,

@@ -301,8 +301,8 @@ impl ServerProviderManifest {
             .collect()
     }
 
-    /// Every sealed provider explicitly declares the current empty property
-    /// capability. Instance defaults are bound later from admitted config facts.
+    /// Compose each provider's property factory. Instance defaults are bound
+    /// from its exact admitted configuration.
     pub fn compose_session_property_registry(
         &self,
     ) -> anyhow::Result<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>
@@ -315,9 +315,15 @@ impl ServerProviderManifest {
             .builders
             .iter()
             .map(|builder| {
-                Arc::new(EmptyCatalogPropertyDeclarationFactory::new(
-                    builder.provider_id.clone(),
-                )) as Arc<dyn CatalogPropertyDeclarationFactory>
+                let factory: Arc<dyn CatalogPropertyDeclarationFactory> =
+                    if builder.provider_id.as_str() == "iceberg" {
+                        Arc::new(IcebergSessionProperties(builder.provider_id.clone()))
+                    } else {
+                        Arc::new(EmptyCatalogPropertyDeclarationFactory::new(
+                            builder.provider_id.clone(),
+                        ))
+                    };
+                factory
             })
             .collect();
         SessionPropertyRegistry::with_catalog_factories(factories)
@@ -943,5 +949,95 @@ mod tests {
             error.contains("installed pure facets differ from the manifest"),
             "{error}"
         );
+    }
+}
+
+// The declaration port belongs to Query Application. The sealed provider
+// supplies the property name and parses its catalog default.
+struct IcebergSessionProperties(novarocks_spi::connector::ConnectorProviderId);
+
+impl novarocks_query_application::sql::session::registry::CatalogPropertyDeclarationFactory
+    for IcebergSessionProperties
+{
+    fn provider_id(&self) -> &novarocks_spi::connector::ConnectorProviderId {
+        &self.0
+    }
+
+    fn declarations(
+        &self,
+        _identity: &novarocks_query_application::sql::session::registry::CatalogPropertyIdentity,
+        configuration: &[(String, String)],
+    ) -> Result<
+        Vec<novarocks_query_application::sql::session::registry::PropertyDeclaration>,
+        novarocks_query_application::sql::session::registry::SessionPropertyError,
+    > {
+        use novarocks_connector_iceberg::catalog_config::{
+            IcebergCatalogWriteConfig, MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
+        };
+        use novarocks_query_application::sql::session::registry::{
+            PropertyDeclaration, SessionPropertyError, SessionPropertyType, SessionPropertyValue,
+        };
+        let limit = IcebergCatalogWriteConfig::max_partitions_from_properties(configuration)
+            .map_err(|_| SessionPropertyError::InvalidDeclaration {
+                detail: "Admitted Iceberg catalog has an invalid open partition limit",
+            })?;
+        Ok(vec![PropertyDeclaration::catalog(
+            MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
+            SessionPropertyType::Integer,
+            Some(SessionPropertyValue::Integer(limit)),
+            "Maximum open Iceberg partition writers per driver",
+            false,
+            move |value| match value {
+                SessionPropertyValue::Integer(value) if (1..=limit).contains(value) => Ok(()),
+                _ => Err(format!("Value must be between 1 and {limit}")),
+            },
+        )?])
+    }
+}
+
+#[cfg(test)]
+mod iceberg_session_properties_tests {
+    use super::*;
+    use novarocks_query_application::sql::session::registry::{
+        CatalogPropertyIdentity, SessionPropertyRegistry, SessionPropertyValue,
+    };
+    use novarocks_spi::connector::{
+        ConnectorControlRuntimeId, ConnectorInstanceId, ConnectorProviderId,
+    };
+
+    #[test]
+    fn open_partition_override_can_only_lower_the_catalog_limit() {
+        let provider = ConnectorProviderId::parse("iceberg").unwrap();
+        let registry = SessionPropertyRegistry::with_catalog_factories(vec![Arc::new(
+            IcebergSessionProperties(provider.clone()),
+        )])
+        .unwrap();
+        let metadata = registry
+            .bind_catalog(
+                "lake",
+                CatalogPropertyIdentity {
+                    attachment_id: uuid::Uuid::nil(),
+                    control_runtime_id: ConnectorControlRuntimeId::new(),
+                    instance_id: ConnectorInstanceId::parse("lake").unwrap(),
+                    provider_id: provider,
+                    generation: 1,
+                },
+                &[("iceberg.max-partitions-per-writer".into(), "30".into())],
+            )
+            .unwrap();
+        let property = "max_partitions_per_writer";
+        assert_eq!(
+            metadata.lookup(property).unwrap().default_value(),
+            Some(&SessionPropertyValue::Integer(30))
+        );
+        assert_eq!(
+            metadata
+                .prepare_header("lake", property, "6")
+                .unwrap()
+                .value(),
+            &SessionPropertyValue::Integer(6)
+        );
+        assert!(metadata.prepare_header("lake", property, "31").is_err());
+        assert!(metadata.prepare_header("lake", property, "0").is_err());
     }
 }

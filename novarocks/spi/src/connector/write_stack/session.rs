@@ -410,6 +410,7 @@ impl WriteStatisticsArtifact {
 /// admissible.
 #[derive(Clone)]
 pub struct ConnectorWriteBeginRequest {
+    pub catalog_session: crate::connector::read_stack::ConnectorCatalogSession,
     pub table: Arc<str>,
     pub target_ref: ConnectorWriteTargetRef,
     pub intent: ConnectorWriteIntent,

@@ -305,7 +305,10 @@ pub(crate) fn prepare(
     let provider = FrontendCompletionCustody::new();
     let controls = GovernedCtasControlReceiving::new();
     let sessions = Arc::new(Mutex::new(None));
-    let begin = WriteBeginReceiving::new(sessions.clone());
+    let begin = WriteBeginReceiving::for_statement(
+        sessions.clone(),
+        Arc::clone(input.context.execution().session_property_inputs()),
+    );
     let publication_id = LakePublicationId::new_v7();
     let attempt = DmlPublicationAttempt::new(
         publication_id,

@@ -337,6 +337,9 @@ fn declaration_defaults_use_original_consumers_and_projection_keeps_other_settin
 fn identity(catalog: &str, generation: u64) -> CatalogPropertyIdentity {
     CatalogPropertyIdentity {
         attachment_id: uuid::Uuid::from_u128(u128::from(generation)),
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId::from_bytes(
+            u128::from(generation).to_be_bytes(),
+        ),
         instance_id: ConnectorInstanceId::parse(catalog).unwrap(),
         provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
         generation,
@@ -441,6 +444,15 @@ fn same_provider_catalog_defaults_and_overrides_are_instance_bound() {
         )
         .unwrap();
     assert_eq!(inputs.read_catalog_override(&recreated, "limit"), None);
+    assert_eq!(
+        inputs.connector_catalog_overrides("first", first.identity().unwrap().control_runtime_id)["limit"],
+        novarocks_spi::connector::read_stack::SessionPropertyValue::Integer(7),
+    );
+    assert!(
+        inputs
+            .connector_catalog_overrides("first", recreated.identity().unwrap().control_runtime_id)
+            .is_empty()
+    );
     assert_eq!(inputs.raw_catalog_value("first", "limit"), Some("7"));
     let metadata = registry
         .visible_metadata(&inputs, &[Arc::new(recreated)])

@@ -1564,6 +1564,7 @@ impl FrontendQuerySession {
             topology
         };
         let presentation = state.presentation().copied();
+        let session_property_inputs = Arc::new(state.property_inputs().clone());
         let (
             current_catalog,
             current_database,
@@ -1592,7 +1593,8 @@ impl FrontendQuerySession {
             optimizer_settings,
             sql_semantics.clone(),
             presentation,
-        ));
+        ))
+        .with_session_property_inputs(session_property_inputs);
         let command_executor = Arc::clone(&self.service.command_executor);
         let product_command_router = self.service.product_command_router.clone();
         let dml = Arc::clone(&self.service.dml);

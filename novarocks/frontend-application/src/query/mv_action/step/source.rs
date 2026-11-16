@@ -252,6 +252,7 @@ impl StepSource {
             repartition_fields: repartition,
             request,
         });
+        let session_properties = Arc::clone(execution.session_property_inputs());
         Ok(Arc::new(Self {
             body: Mutex::new(Some(Box::new(Body {
                 input,
@@ -304,7 +305,10 @@ impl StepSource {
                 Arc::new(PhaseExitUnproven),
             ),
             io: gate,
-            begin: WriteBeginReceiving::new(Arc::new(Mutex::new(None))),
+            begin: WriteBeginReceiving::for_statement(
+                Arc::new(Mutex::new(None)),
+                session_properties,
+            ),
             precommit_registration: CurrentProjectionRegistration::new(),
             project_registration: CurrentProjectionRegistration::new(),
             closed: AtomicBool::new(false),

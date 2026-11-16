@@ -681,6 +681,7 @@ impl novarocks_query_application::sql::session::registry::SessionCatalogProperty
                 let runtime = facts.runtime;
                 let identity = CatalogPropertyIdentity {
                     attachment_id: runtime.attachment_id,
+                    control_runtime_id: facts.control_runtime_id,
                     instance_id: runtime.instance_id,
                     provider_id: runtime.provider_id,
                     generation: runtime.generation,

@@ -2482,6 +2482,7 @@ mod tests {
             lease,
             row_mutation_catalog_properties(),
             novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
+                catalog_session: Default::default(),
                 table: Arc::from("db1.t"),
                 target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
                 intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,

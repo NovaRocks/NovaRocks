@@ -34,6 +34,8 @@ pub const MAX_SESSION_PROPERTIES: usize = 1024;
 
 /// One typed session property value.
 pub type SessionPropertyValue = ConnectorValue;
+/// Exact catalog's admitted overrides for one connector request.
+pub type ConnectorCatalogSession = BTreeMap<Arc<str>, SessionPropertyValue>;
 
 /// An immutable, role-local view of the session driving connector work.
 #[derive(Clone, Debug)]

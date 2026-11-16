@@ -2202,6 +2202,7 @@ fn staged_begin_request(
     target: novarocks_spi::connector::ConnectorTableHandle,
 ) -> novarocks_spi::connector::write_stack::session::ConnectorWriteBeginRequest {
     novarocks_spi::connector::write_stack::session::ConnectorWriteBeginRequest {
+        catalog_session: Default::default(),
         table: Arc::from("db.staged"),
         target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
         intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
@@ -3260,6 +3261,7 @@ impl FrozenRewriteLake {
     ) -> ConnectorWriteBeginRequest {
         let prep = plan.cohorts()[0].preparation();
         ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from("db.t"),
             target_ref: prep.target_ref().clone(),
             intent: prep.intent(),
@@ -3338,6 +3340,7 @@ impl FrozenRewriteLake {
             ConnectorWriteControl, ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
         };
         let request = ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from("db.t"),
             target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             intent,
@@ -3482,6 +3485,7 @@ impl FrozenRewriteLake {
         let session = self
             .control
             .begin_write(ConnectorWriteBeginRequest {
+                catalog_session: Default::default(),
                 table: Arc::from("db.t"),
                 target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
                 intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
@@ -4483,6 +4487,7 @@ fn async_write_control_commits_real_files_without_a_catalog_join_bridge() {
     };
     let before = bridges();
     let request = ConnectorWriteBeginRequest {
+        catalog_session: Default::default(),
         table: Arc::from("db.t"),
         target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
         intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
@@ -4557,6 +4562,7 @@ fn async_write_control_commits_real_files_without_a_catalog_join_bridge() {
 
 fn ordinary_async_test_begin(context: ConnectorRequestContext) -> ConnectorWriteBeginRequest {
     ConnectorWriteBeginRequest {
+        catalog_session: Default::default(),
         table: Arc::from("db.t"),
         target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
         intent: novarocks_spi::connector::ConnectorWriteIntent::Append,

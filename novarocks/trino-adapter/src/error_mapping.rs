@@ -115,6 +115,7 @@ enum Code {
     ViewIsRecursive,
     DuplicateWindowName,
     MergeTargetRowMultipleMatches,
+    IcebergTooManyOpenPartitions,
     GenericInternal,
     PageTransportError,
     PageTransportTimeout,
@@ -164,6 +165,11 @@ impl Code {
             MergeTargetRowMultipleMatches => {
                 (119, "MERGE_TARGET_ROW_MULTIPLE_MATCHES", "USER_ERROR")
             }
+            IcebergTooManyOpenPartitions => (
+                0x0504_0002,
+                "ICEBERG_TOO_MANY_OPEN_PARTITIONS",
+                "USER_ERROR",
+            ),
             GenericInternal => (65536, "GENERIC_INTERNAL_ERROR", "INTERNAL_ERROR"),
             PageTransportError => (65539, "PAGE_TRANSPORT_ERROR", "INTERNAL_ERROR"),
             PageTransportTimeout => (65540, "PAGE_TRANSPORT_TIMEOUT", "INTERNAL_ERROR"),
@@ -208,12 +214,17 @@ enum PublicMessage<'a> {
     Borrowed(&'a str),
     Session(&'a StatementSessionError),
     Execution(&'a ExecutionFailureInput),
+    OpenPartitionLimit { limit: u64, opening: u64 },
 }
 impl fmt::Display for PublicMessage<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Borrowed(message) => formatter.write_str(message),
             Self::Session(error) => fmt::Display::fmt(error, formatter),
+            Self::OpenPartitionLimit { limit, opening } => write!(
+                formatter,
+                "Exceeded limit of {limit} open writers for partitions: {opening}"
+            ),
             // ExecutionFailureInput::user_error has no location and renders
             // exactly this descriptor prefix plus the original safe detail.
             // Borrow both facts instead of cloning the detail into a UserError.
@@ -243,7 +254,7 @@ fn project_source(
         }
         TrinoErrorSource::Execution { error, sql: _sql } => {
             let (code, message) = match error.execution_failure() {
-                Some(input) => (execution_code(input), PublicMessage::Execution(input)),
+                Some(input) => (execution_code(input), execution_message(input)),
                 None => (
                     match error.kind() {
                         QueryExecutionErrorKind::InvalidRequest => Code::GenericUser,
@@ -375,6 +386,11 @@ fn service_error(
             .expect("declared row match SQL identity has a standard message");
         return project(code, diagnostics::bound_display(message), None);
     }
+    if code == Code::IcebergTooManyOpenPartitions
+        && let Some(input) = error.execution_failure()
+    {
+        return project_message(query_id, code, execution_message(input), None, effect);
+    }
     let public = error.diagnostic_with_external_effect(effect);
     let bounded = diagnostics::bound_display(&public);
     if bounded.truncated
@@ -421,7 +437,30 @@ fn row_match_message_for_code(code: &str) -> Option<&'static str> {
     }
 }
 
+fn open_partition_limit(input: &ExecutionFailureInput) -> Option<(u64, u64)> {
+    use novarocks_failure_contract::{
+        ResourceDimension, connector_reason::ICEBERG_TOO_MANY_OPEN_PARTITIONS,
+    };
+    let fact = input.fact();
+    if fact.class() != FailureClass::Resource || fact.reason() != ICEBERG_TOO_MANY_OPEN_PARTITIONS {
+        return None;
+    }
+    let resource = fact.resource()?;
+    let (limit, opening) = (resource.limit?, resource.requested?);
+    (resource.dimension == ResourceDimension::Items && opening > limit).then_some((limit, opening))
+}
+
+fn execution_message(input: &ExecutionFailureInput) -> PublicMessage<'_> {
+    match open_partition_limit(input) {
+        Some((limit, opening)) => PublicMessage::OpenPartitionLimit { limit, opening },
+        None => PublicMessage::Execution(input),
+    }
+}
+
 fn execution_code(input: &ExecutionFailureInput) -> Code {
+    if open_partition_limit(input).is_some() {
+        return Code::IcebergTooManyOpenPartitions;
+    }
     if input.row_match_violation_message().is_some() {
         return Code::MergeTargetRowMultipleMatches;
     }

@@ -2899,13 +2899,29 @@ impl IcebergWriteSessionControl {
         } else {
             None
         };
+        let mut write_config = self.runtime.control_state().configuration().write;
+        if let Some(value) = request
+            .catalog_session
+            .get(crate::catalog_config::MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY)
+        {
+            match value {
+                novarocks_spi::connector::read_stack::SessionPropertyValue::Integer(limit)
+                    if *limit > 0
+                        && (*limit as u32) <= write_config.max_partitions_per_writer() =>
+                {
+                    write_config.max_partitions_per_writer = *limit as u32;
+                }
+                _ => {
+                    return Err(invalid(
+                        "Admitted max_partitions_per_writer is outside the Iceberg catalog limit",
+                    ));
+                }
+            }
+        }
         let material = IcebergSessionMaterial {
             write_binding: self.adapter.binding().clone(),
             write_partition_spec_id: writer_metadata.default_partition_spec_id(),
-            data_output: freeze_writer_output(
-                writer_metadata.properties(),
-                self.runtime.control_state().configuration().write,
-            )?,
+            data_output: freeze_writer_output(writer_metadata.properties(), write_config)?,
             data_recipe: if let Some(scope) = rewrite_scope.as_ref() {
                 rewrite_source::data_recipe(
                     writer_metadata,

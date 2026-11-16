@@ -701,6 +701,7 @@ impl QueryResultCapacityBinding {
 /// receive it as a parameter. Those consumers leave with CLS-R3 and CLS-R5.
 #[derive(Clone)]
 pub struct QueryExecutionContext {
+    session_properties: Arc<crate::sql::session::registry::SessionPropertyInputs>,
     #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
@@ -756,6 +757,7 @@ impl QueryExecutionContext {
             #[cfg(novarocks_dev_controls)]
             test_statement_nomination: None,
             result_capacity: None,
+            session_properties: Arc::default(),
             role,
             topology,
             deadline,
@@ -858,6 +860,12 @@ impl QueryExecutionContext {
         &self.cancellation
     }
 
+    pub fn session_property_inputs(
+        &self,
+    ) -> &Arc<crate::sql::session::registry::SessionPropertyInputs> {
+        &self.session_properties
+    }
+
     /// Settings frozen with the request so DML and coordinator-adjacent plan
     /// construction never consult process- or thread-local session state.
     pub fn sql_semantics(&self) -> &novarocks_sql::sql_mode::SqlSemanticSettings {
@@ -882,6 +890,15 @@ pub struct RequestContext {
     reason = "Retained for target-specific frontend integration and regression coverage."
 )]
 impl RequestContext {
+    /// Preserve admitted session overrides on the immutable statement context.
+    pub fn with_session_property_inputs(
+        mut self,
+        inputs: Arc<crate::sql::session::registry::SessionPropertyInputs>,
+    ) -> Self {
+        self.execution.session_properties = inputs;
+        self
+    }
+
     #[cfg(novarocks_dev_controls)]
     pub fn with_test_statement_nomination(
         mut self,

@@ -823,7 +823,10 @@ pub(crate) fn prepare(
         .map_err(|e| e.to_string())?
         .with_io_admission(io.clone());
     let session_receiving = Arc::new(Mutex::new(None));
-    let receiving = WriteBeginReceiving::new(Arc::clone(&session_receiving));
+    let receiving = WriteBeginReceiving::for_statement(
+        Arc::clone(&session_receiving),
+        Arc::clone(input.context.execution().session_property_inputs()),
+    );
     let publication_id = novarocks_spi::connector::LakePublicationId::new_v7();
     let attempt = DmlPublicationAttempt::new(
         publication_id,
