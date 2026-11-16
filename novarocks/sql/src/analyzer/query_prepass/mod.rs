@@ -54,6 +54,7 @@ pub(crate) fn preanalyze_with_semantics(
     mut query: Query,
     semantics: &crate::sql_mode::SqlSemanticSettings,
 ) -> Result<Query, AnalyzeError> {
+    reject_inline_functions(&query)?;
     let max_depth = recursive_cte_max_depth(&query)
         .or_else(|| {
             semantics
@@ -66,6 +67,36 @@ pub(crate) fn preanalyze_with_semantics(
 
     remove_bare_top_level_dual(&mut query);
     Ok(query)
+}
+
+/// Inline definitions must fail before catalog discovery or global function
+/// lookup; ignoring a declaration could bind its call to an unrelated routine.
+fn reject_inline_functions(query: &Query) -> Result<(), AnalyzeError> {
+    #[derive(Default)]
+    struct UnsupportedFunction(Option<Span>);
+
+    impl Visit for UnsupportedFunction {
+        fn visit_query(&mut self, query: &Query) {
+            if self.0.is_some() {
+                return;
+            }
+            if let Some(function) = query.functions.first() {
+                self.0 = Some(function.span);
+            } else {
+                novarocks_parser::ast::walk_query(self, query);
+            }
+        }
+    }
+
+    let mut visitor = UnsupportedFunction::default();
+    visitor.visit_query(query);
+    match visitor.0 {
+        Some(span) => Err(AnalyzeError::unsupported_expression(
+            "Inline functions are not supported",
+            span,
+        )),
+        None => Ok(()),
+    }
 }
 
 fn recursive_cte_max_depth(query: &Query) -> Option<usize> {
@@ -324,6 +355,7 @@ fn pin_projection_aliases(expr: &mut SetExpr, aliases: &[Ident]) {
 fn query_with_body(template: &Query, body: SetExpr) -> Query {
     Query {
         session_properties: Vec::new(),
+        functions: Vec::new(),
         with: None,
         body: Box::new(body),
         order_by: Vec::new(),
@@ -627,6 +659,7 @@ fn substitute_table_with_derived(
 
     let template = Query {
         session_properties: Vec::new(),
+        functions: Vec::new(),
         with: None,
         body: Box::new(expr.clone()),
         order_by: Vec::new(),
@@ -753,6 +786,61 @@ mod tests {
             Statement::Query(query) => query,
             other => panic!("expected query, got {other:?}"),
         }
+    }
+
+    fn inline_function() -> novarocks_parser::ast::FunctionSpecification {
+        use novarocks_parser::{SYNTHETIC, ast, build};
+        ast::FunctionSpecification {
+            name: build::object_name(vec![build::ident("f", None)]).unwrap(),
+            parameters: vec![],
+            returns: build::simple_type("bigint"),
+            characteristics: vec![],
+            body: ast::RoutineBody::Sql(ast::ControlStatement::Return(ast::ReturnStatement {
+                value: build::integer(1),
+                span: SYNTHETIC,
+            })),
+            span: Span::new(4, 18),
+        }
+    }
+
+    #[test]
+    fn inline_functions_are_rejected_in_every_query_scope_before_catalog_discovery() {
+        struct AddFunction;
+        impl Fold for AddFunction {
+            fn fold_query(&mut self, mut query: Query) -> Query {
+                query.functions.push(inline_function());
+                query
+            }
+        }
+
+        // The outer Fold only enters child queries; the root is tested
+        // separately. Unknown calls and relations must never win this error.
+        for sql in [
+            "WITH x AS (SELECT missing_function() FROM missing_table) SELECT * FROM x",
+            "SELECT * FROM (SELECT missing_function() FROM missing_table) AS x",
+            "SELECT (SELECT missing_function() FROM missing_table)",
+            "(SELECT missing_function() FROM missing_table) UNION ALL SELECT 2",
+        ] {
+            let query = novarocks_parser::ast::fold_query(&mut AddFunction, parse_query(sql));
+            assert!(query.functions.is_empty());
+            let error = preanalyze(query).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+            );
+            assert!(
+                error.to_string().contains("Inline functions"),
+                "{sql}: {error}"
+            );
+        }
+        let mut query = parse_query("SELECT missing_function() FROM missing_table");
+        query.functions.push(inline_function());
+        let error = preanalyze(query).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert!(error.to_string().contains("Inline functions"));
     }
 
     #[test]

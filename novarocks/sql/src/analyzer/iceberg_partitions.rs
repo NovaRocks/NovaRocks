@@ -93,6 +93,7 @@ pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast
     }
     ast::Query {
         session_properties: Vec::new(),
+        functions: Vec::new(),
         with: None,
         body: Box::new(ast::SetExpr::Select(Box::new(ast::Select {
             quantifier: ast::SelectQuantifier::None,

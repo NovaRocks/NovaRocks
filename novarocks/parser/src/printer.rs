@@ -170,7 +170,8 @@ impl Printer {
         while let SetExpr::Query(inner) = body {
             body = &inner.body;
         }
-        let legacy_select = matches!(body, SetExpr::Select(_))
+        let legacy_select = query.functions.is_empty()
+            && matches!(body, SetExpr::Select(_))
             && properties
                 .iter()
                 .all(|property| property.name.parts.len() == 1);
@@ -184,6 +185,10 @@ impl Printer {
         } else {
             properties
         };
+        if !query.functions.is_empty() {
+            self.write_inline_functions(&query.functions);
+            self.output.push(' ');
+        }
         if let Some(with) = &query.with {
             self.write_with(with);
             self.output.push(' ');
@@ -1412,6 +1417,291 @@ impl BinaryOperator {
     }
 }
 
+impl Printer {
+    /// Writes the root-query function prefix, without a trailing separator.
+    fn write_inline_functions(&mut self, functions: &[FunctionSpecification]) {
+        if functions.is_empty() {
+            return;
+        }
+        self.output.push_str("WITH ");
+        for (index, function) in functions.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_function_specification(function, 0);
+        }
+    }
+
+    fn write_function_specification(&mut self, function: &FunctionSpecification, indent: usize) {
+        self.write_routine_indent(indent);
+        self.output.push_str("FUNCTION ");
+        self.write_object_name(&function.name);
+        self.output.push('(');
+        for (index, parameter) in function.parameters.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_function_parameter(parameter);
+        }
+        self.output.push_str(")\n");
+        self.write_routine_indent(indent);
+        self.output.push_str("RETURNS ");
+        self.write_type_name(&function.returns);
+        self.output.push('\n');
+        for characteristic in &function.characteristics {
+            self.write_routine_characteristic(characteristic, indent);
+            self.output.push('\n');
+        }
+        match &function.body {
+            RoutineBody::Sql(statement) => {
+                // AstBuilder.java:4283-4288 enforces this root-body invariant.
+                assert!(
+                    matches!(
+                        statement,
+                        ControlStatement::Return(_) | ControlStatement::Compound(_)
+                    ),
+                    "SQL function body must start with RETURN or BEGIN"
+                );
+                self.write_control_statement(statement, indent);
+            }
+            RoutineBody::External { definition, .. } => {
+                // A parsed DOLLAR_STRING cannot contain its own closing token.
+                // There is no escape spelling for it and no raw SQL fallback.
+                assert!(
+                    !definition.contains("$$"),
+                    "external function definition cannot contain its dollar-string delimiter"
+                );
+                self.write_routine_indent(indent);
+                self.output.push_str("AS $$\n");
+                // AstBuilder removes exactly one initial LF, CR or CRLF. The
+                // inserted LF supplies that framing; decoded content is exact.
+                self.output.push_str(definition);
+                self.output.push_str("$$");
+            }
+        }
+    }
+
+    fn write_function_parameter(&mut self, parameter: &FunctionParameter) {
+        if let Some(name) = &parameter.name {
+            self.write_ident(name);
+            self.output.push(' ');
+        }
+        self.write_type_name(&parameter.data_type);
+    }
+
+    fn write_routine_characteristic(
+        &mut self,
+        characteristic: &RoutineCharacteristic,
+        indent: usize,
+    ) {
+        self.write_routine_indent(indent);
+        match characteristic {
+            RoutineCharacteristic::Language { language, .. } => {
+                self.output.push_str("LANGUAGE ");
+                self.write_ident(language);
+            }
+            RoutineCharacteristic::Deterministic { deterministic, .. } => {
+                self.output.push_str(if *deterministic {
+                    "DETERMINISTIC"
+                } else {
+                    "NOT DETERMINISTIC"
+                });
+            }
+            RoutineCharacteristic::NullInput { called_on_null, .. } => {
+                self.output.push_str(if *called_on_null {
+                    "CALLED ON NULL INPUT"
+                } else {
+                    "RETURNS NULL ON NULL INPUT"
+                });
+            }
+            RoutineCharacteristic::Security { security, .. } => {
+                self.output.push_str("SECURITY ");
+                self.output.push_str(match security {
+                    RoutineSecurity::Invoker => "INVOKER",
+                    RoutineSecurity::Definer => "DEFINER",
+                });
+            }
+            RoutineCharacteristic::Comment { comment, .. } => {
+                self.output.push_str("COMMENT ");
+                self.write_quoted_string(comment);
+            }
+            RoutineCharacteristic::Properties { properties, .. } => {
+                self.output.push_str("WITH (\n");
+                for (index, property) in properties.iter().enumerate() {
+                    self.write_routine_indent(indent + 1);
+                    self.write_routine_property(property);
+                    if index + 1 < properties.len() {
+                        self.output.push(',');
+                    }
+                    self.output.push('\n');
+                }
+                self.write_routine_indent(indent);
+                self.output.push(')');
+            }
+        }
+    }
+
+    fn write_routine_property(&mut self, property: &RoutineProperty) {
+        self.write_ident(&property.name);
+        self.output.push_str(" = ");
+        match &property.value {
+            Some(value) => self.write_expr(value),
+            None => self.output.push_str("DEFAULT"),
+        }
+    }
+
+    fn write_control_statement(&mut self, statement: &ControlStatement, indent: usize) {
+        match statement {
+            ControlStatement::Return(statement) => {
+                self.write_routine_indent(indent);
+                self.output.push_str("RETURN ");
+                self.write_expr(&statement.value);
+            }
+            ControlStatement::Assignment(statement) => {
+                self.write_routine_indent(indent);
+                self.output.push_str("SET ");
+                self.write_ident(&statement.target);
+                self.output.push_str(" = ");
+                self.write_expr(&statement.value);
+            }
+            ControlStatement::Case(statement) => self.write_routine_case(statement, indent),
+            ControlStatement::If(statement) => self.write_routine_if(statement, indent),
+            ControlStatement::Iterate(statement) => {
+                self.write_routine_indent(indent);
+                self.output.push_str("ITERATE ");
+                self.write_ident(&statement.label);
+            }
+            ControlStatement::Leave(statement) => {
+                self.write_routine_indent(indent);
+                self.output.push_str("LEAVE ");
+                self.write_ident(&statement.label);
+            }
+            ControlStatement::VariableDeclaration(statement) => {
+                self.write_variable_declaration(statement, indent);
+            }
+            ControlStatement::Compound(statement) => {
+                self.write_routine_indent(indent);
+                self.output.push_str("BEGIN\n");
+                for declaration in &statement.variable_declarations {
+                    self.write_variable_declaration(declaration, indent + 1);
+                    self.output.push_str(";\n");
+                }
+                self.write_routine_statement_list(&statement.statements, indent + 1);
+                self.write_routine_indent(indent);
+                self.output.push_str("END");
+            }
+            ControlStatement::Loop(statement) => {
+                self.write_routine_begin_label(&statement.label, indent);
+                self.output.push_str("LOOP\n");
+                self.write_routine_statement_list(&statement.statements, indent + 1);
+                self.write_routine_indent(indent);
+                self.output.push_str("END LOOP");
+            }
+            ControlStatement::While(statement) => {
+                self.write_routine_begin_label(&statement.label, indent);
+                self.output.push_str("WHILE ");
+                self.write_expr(&statement.expression);
+                self.output.push_str(" DO\n");
+                self.write_routine_statement_list(&statement.statements, indent + 1);
+                self.write_routine_indent(indent);
+                self.output.push_str("END WHILE");
+            }
+            ControlStatement::Repeat(statement) => {
+                self.write_routine_begin_label(&statement.label, indent);
+                self.output.push_str("REPEAT\n");
+                self.write_routine_statement_list(&statement.statements, indent + 1);
+                self.write_routine_indent(indent);
+                self.output.push_str("UNTIL ");
+                self.write_expr(&statement.condition);
+                self.output.push('\n');
+                self.write_routine_indent(indent);
+                self.output.push_str("END REPEAT");
+            }
+        }
+    }
+
+    fn write_variable_declaration(&mut self, declaration: &VariableDeclaration, indent: usize) {
+        self.write_routine_indent(indent);
+        self.output.push_str("DECLARE ");
+        self.write_ident_list(&declaration.names);
+        self.output.push(' ');
+        self.write_type_name(&declaration.data_type);
+        if let Some(default) = &declaration.default_value {
+            self.output.push_str(" DEFAULT ");
+            self.write_expr(default);
+        }
+    }
+
+    fn write_routine_case(&mut self, statement: &CaseStatement, indent: usize) {
+        self.write_routine_indent(indent);
+        self.output.push_str("CASE");
+        if let Some(expression) = &statement.expression {
+            self.output.push(' ');
+            self.write_expr(expression);
+        }
+        self.output.push('\n');
+        for clause in &statement.when_clauses {
+            self.write_routine_indent(indent + 1);
+            self.output.push_str("WHEN ");
+            self.write_expr(&clause.expression);
+            self.output.push_str(" THEN\n");
+            self.write_routine_statement_list(&clause.statements, indent + 2);
+        }
+        if let Some(clause) = &statement.else_clause {
+            self.write_routine_else(clause, indent + 1);
+        }
+        self.write_routine_indent(indent);
+        self.output.push_str("END CASE");
+    }
+
+    fn write_routine_if(&mut self, statement: &IfStatement, indent: usize) {
+        self.write_routine_indent(indent);
+        self.output.push_str("IF ");
+        self.write_expr(&statement.expression);
+        self.output.push_str(" THEN\n");
+        self.write_routine_statement_list(&statement.statements, indent + 1);
+        for clause in &statement.else_if_clauses {
+            self.write_routine_indent(indent);
+            self.output.push_str("ELSEIF ");
+            self.write_expr(&clause.expression);
+            self.output.push_str(" THEN\n");
+            self.write_routine_statement_list(&clause.statements, indent + 1);
+        }
+        if let Some(clause) = &statement.else_clause {
+            self.write_routine_else(clause, indent);
+        }
+        self.write_routine_indent(indent);
+        self.output.push_str("END IF");
+    }
+
+    fn write_routine_else(&mut self, clause: &ElseClause, indent: usize) {
+        self.write_routine_indent(indent);
+        self.output.push_str("ELSE\n");
+        self.write_routine_statement_list(&clause.statements, indent + 1);
+    }
+
+    fn write_routine_statement_list(&mut self, statements: &[ControlStatement], indent: usize) {
+        for statement in statements {
+            self.write_control_statement(statement, indent);
+            self.output.push_str(";\n");
+        }
+    }
+
+    fn write_routine_begin_label(&mut self, label: &Option<Ident>, indent: usize) {
+        self.write_routine_indent(indent);
+        if let Some(label) = label {
+            self.write_ident(label);
+            self.output.push_str(": ");
+        }
+    }
+
+    fn write_routine_indent(&mut self, indent: usize) {
+        for _ in 0..indent {
+            self.output.push_str("  ");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,6 +1817,7 @@ mod tests {
     fn renders_query_relations_and_modifiers() {
         let query = Query {
             session_properties: Vec::new(),
+            functions: Vec::new(),
             with: Some(With {
                 recursive: false,
                 ctes: vec![Cte {
@@ -1534,6 +1825,7 @@ mod tests {
                     columns: Vec::new(),
                     query: Box::new(Query {
                         session_properties: Vec::new(),
+                        functions: Vec::new(),
                         with: None,
                         body: Box::new(SetExpr::Values(Values {
                             rows: vec![vec![number("1")]],
@@ -1648,6 +1940,44 @@ mod tests {
             let tokens = crate::lex(&canonical).unwrap();
             let reparsed = crate::parser::parse_expression(&canonical, &tokens).unwrap();
             assert_eq!(reparsed, expression);
+        }
+    }
+
+    #[test]
+    fn inline_function_prefixes_and_external_content_preserve_query_facts() {
+        let Statement::Query(mut query) = crate::parse("WITH c AS (SELECT 2) SELECT 1")
+            .unwrap()
+            .remove(0)
+        else {
+            panic!("query");
+        };
+        query.session_properties.push(SessionProperty {
+            name: crate::build::object_name(vec![crate::build::ident("setting", None)]).unwrap(),
+            value: crate::build::integer(10),
+            span: span(),
+        });
+        query.functions.push(FunctionSpecification {
+            name: crate::build::object_name(vec![crate::build::ident("f", None)]).unwrap(),
+            parameters: vec![],
+            returns: crate::build::simple_type("BIGINT"),
+            characteristics: vec![],
+            body: RoutineBody::Sql(ControlStatement::Return(ReturnStatement {
+                value: crate::build::integer(3),
+                span: span(),
+            })),
+            span: span(),
+        });
+        assert_eq!(
+            print_query(&query),
+            "WITH SESSION setting = 10 WITH FUNCTION f()\nRETURNS BIGINT\nRETURN 3 WITH c AS (SELECT 2) SELECT 1"
+        );
+        for definition in ["", "\n", "\r\n'\\雪\n", "return 7"] {
+            query.functions[0].body = RoutineBody::External {
+                definition: definition.to_owned(),
+                span: span(),
+            };
+            let printed = print_query(&query);
+            assert!(printed.contains(&format!("AS $$\n{definition}$$ WITH c AS")));
         }
     }
 }

@@ -70,6 +70,19 @@ fn validate_create_table(table: &super::CreateTable) -> Result<(), ValidateError
 }
 
 fn validate_query(query: &Query) -> Result<(), ValidateError> {
+    for function in &query.functions {
+        struct FunctionExpressions(Result<(), ValidateError>);
+        impl super::Visit for FunctionExpressions {
+            fn visit_expr(&mut self, expression: &Expr) {
+                if self.0.is_ok() {
+                    self.0 = validate_expr(expression);
+                }
+            }
+        }
+        let mut expressions = FunctionExpressions(Ok(()));
+        super::Visit::visit_function_specification(&mut expressions, function);
+        expressions.0?;
+    }
     for property in &query.session_properties {
         validate_expr(&property.value)?;
     }

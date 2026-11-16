@@ -99,6 +99,7 @@ impl SyntaxEq for ExplainQuery {
 impl SyntaxEq for Query {
     fn syntax_eq(&self, other: &Self) -> bool {
         syntax_eq_slice(&self.session_properties, &other.session_properties)
+            && syntax_eq_slice(&self.functions, &other.functions)
             && syntax_eq_option(&self.with, &other.with)
             && self.body.syntax_eq(&other.body)
             && syntax_eq_slice(&self.order_by, &other.order_by)
@@ -847,6 +848,7 @@ mod tests {
     fn sample_query(start: usize) -> Query {
         Query {
             session_properties: Vec::new(),
+            functions: Vec::new(),
             with: Some(With {
                 recursive: true,
                 ctes: vec![Cte {
@@ -854,6 +856,7 @@ mod tests {
                     columns: vec![ident("value", start + 1)],
                     query: Box::new(Query {
                         session_properties: Vec::new(),
+                        functions: Vec::new(),
                         with: None,
                         body: Box::new(SetExpr::Values(Values {
                             rows: vec![vec![number("1", start + 2)]],

@@ -21,6 +21,86 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_function_specification(&mut self, node: &FunctionSpecification) {
+        super::routine::walk_function_specification(self, node);
+    }
+
+    fn visit_function_parameter(&mut self, node: &FunctionParameter) {
+        super::routine::walk_function_parameter(self, node);
+    }
+
+    fn visit_routine_property(&mut self, node: &RoutineProperty) {
+        super::routine::walk_routine_property(self, node);
+    }
+
+    fn visit_return_statement(&mut self, node: &ReturnStatement) {
+        super::routine::walk_return_statement(self, node);
+    }
+
+    fn visit_assignment_statement(&mut self, node: &AssignmentStatement) {
+        super::routine::walk_assignment_statement(self, node);
+    }
+
+    fn visit_case_statement(&mut self, node: &CaseStatement) {
+        super::routine::walk_case_statement(self, node);
+    }
+
+    fn visit_case_statement_when_clause(&mut self, node: &CaseStatementWhenClause) {
+        super::routine::walk_case_statement_when_clause(self, node);
+    }
+
+    fn visit_if_statement(&mut self, node: &IfStatement) {
+        super::routine::walk_if_statement(self, node);
+    }
+
+    fn visit_else_if_clause(&mut self, node: &ElseIfClause) {
+        super::routine::walk_else_if_clause(self, node);
+    }
+
+    fn visit_else_clause(&mut self, node: &ElseClause) {
+        super::routine::walk_else_clause(self, node);
+    }
+
+    fn visit_iterate_statement(&mut self, node: &IterateStatement) {
+        super::routine::walk_iterate_statement(self, node);
+    }
+
+    fn visit_leave_statement(&mut self, node: &LeaveStatement) {
+        super::routine::walk_leave_statement(self, node);
+    }
+
+    fn visit_variable_declaration(&mut self, node: &VariableDeclaration) {
+        super::routine::walk_variable_declaration(self, node);
+    }
+
+    fn visit_compound_statement(&mut self, node: &CompoundStatement) {
+        super::routine::walk_compound_statement(self, node);
+    }
+
+    fn visit_loop_statement(&mut self, node: &LoopStatement) {
+        super::routine::walk_loop_statement(self, node);
+    }
+
+    fn visit_while_statement(&mut self, node: &WhileStatement) {
+        super::routine::walk_while_statement(self, node);
+    }
+
+    fn visit_repeat_statement(&mut self, node: &RepeatStatement) {
+        super::routine::walk_repeat_statement(self, node);
+    }
+
+    fn visit_routine_body(&mut self, node: &RoutineBody) {
+        super::routine::walk_routine_body(self, node);
+    }
+
+    fn visit_routine_characteristic(&mut self, node: &RoutineCharacteristic) {
+        super::routine::walk_routine_characteristic(self, node);
+    }
+
+    fn visit_control_statement(&mut self, node: &ControlStatement) {
+        super::routine::walk_control_statement(self, node);
+    }
+
     fn visit_statement(&mut self, statement: &Statement) {
         walk_statement(self, statement);
     }
@@ -214,6 +294,9 @@ pub fn walk_explain_query<V: Visit + ?Sized>(visitor: &mut V, query: &ExplainQue
 }
 
 pub fn walk_query<V: Visit + ?Sized>(visitor: &mut V, query: &Query) {
+    for function in &query.functions {
+        visitor.visit_function_specification(function);
+    }
     for property in &query.session_properties {
         visitor.visit_session_property(property);
     }
@@ -596,6 +679,95 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_function_specification(
+        &mut self,
+        node: FunctionSpecification,
+    ) -> FunctionSpecification {
+        super::routine::fold_function_specification(self, node)
+    }
+
+    fn fold_function_parameter(&mut self, node: FunctionParameter) -> FunctionParameter {
+        super::routine::fold_function_parameter(self, node)
+    }
+
+    fn fold_routine_property(&mut self, node: RoutineProperty) -> RoutineProperty {
+        super::routine::fold_routine_property(self, node)
+    }
+
+    fn fold_return_statement(&mut self, node: ReturnStatement) -> ReturnStatement {
+        super::routine::fold_return_statement(self, node)
+    }
+
+    fn fold_assignment_statement(&mut self, node: AssignmentStatement) -> AssignmentStatement {
+        super::routine::fold_assignment_statement(self, node)
+    }
+
+    fn fold_case_statement(&mut self, node: CaseStatement) -> CaseStatement {
+        super::routine::fold_case_statement(self, node)
+    }
+
+    fn fold_case_statement_when_clause(
+        &mut self,
+        node: CaseStatementWhenClause,
+    ) -> CaseStatementWhenClause {
+        super::routine::fold_case_statement_when_clause(self, node)
+    }
+
+    fn fold_if_statement(&mut self, node: IfStatement) -> IfStatement {
+        super::routine::fold_if_statement(self, node)
+    }
+
+    fn fold_else_if_clause(&mut self, node: ElseIfClause) -> ElseIfClause {
+        super::routine::fold_else_if_clause(self, node)
+    }
+
+    fn fold_else_clause(&mut self, node: ElseClause) -> ElseClause {
+        super::routine::fold_else_clause(self, node)
+    }
+
+    fn fold_iterate_statement(&mut self, node: IterateStatement) -> IterateStatement {
+        super::routine::fold_iterate_statement(self, node)
+    }
+
+    fn fold_leave_statement(&mut self, node: LeaveStatement) -> LeaveStatement {
+        super::routine::fold_leave_statement(self, node)
+    }
+
+    fn fold_variable_declaration(&mut self, node: VariableDeclaration) -> VariableDeclaration {
+        super::routine::fold_variable_declaration(self, node)
+    }
+
+    fn fold_compound_statement(&mut self, node: CompoundStatement) -> CompoundStatement {
+        super::routine::fold_compound_statement(self, node)
+    }
+
+    fn fold_loop_statement(&mut self, node: LoopStatement) -> LoopStatement {
+        super::routine::fold_loop_statement(self, node)
+    }
+
+    fn fold_while_statement(&mut self, node: WhileStatement) -> WhileStatement {
+        super::routine::fold_while_statement(self, node)
+    }
+
+    fn fold_repeat_statement(&mut self, node: RepeatStatement) -> RepeatStatement {
+        super::routine::fold_repeat_statement(self, node)
+    }
+
+    fn fold_routine_body(&mut self, node: RoutineBody) -> RoutineBody {
+        super::routine::fold_routine_body(self, node)
+    }
+
+    fn fold_routine_characteristic(
+        &mut self,
+        node: RoutineCharacteristic,
+    ) -> RoutineCharacteristic {
+        super::routine::fold_routine_characteristic(self, node)
+    }
+
+    fn fold_control_statement(&mut self, node: ControlStatement) -> ControlStatement {
+        super::routine::fold_control_statement(self, node)
+    }
+
     fn fold_statement(&mut self, statement: Statement) -> Statement {
         fold_statement(self, statement)
     }
@@ -887,6 +1059,11 @@ pub fn fold_explain_query<F: Fold + ?Sized>(
 }
 
 pub fn fold_query<F: Fold + ?Sized>(folder: &mut F, mut query: Query) -> Query {
+    query.functions = query
+        .functions
+        .into_iter()
+        .map(|function| folder.fold_function_specification(function))
+        .collect();
     query.session_properties = query
         .session_properties
         .into_iter()

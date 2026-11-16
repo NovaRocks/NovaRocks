@@ -1552,6 +1552,41 @@ mod tests {
     }
 
     #[test]
+    fn inline_function_rejection_precedes_catalog_needs() {
+        use novarocks_parser::{SYNTHETIC, build};
+        let mut query = parse_query("SELECT f() FROM missing_table");
+        query.functions.push(ast::FunctionSpecification {
+            name: build::object_name(vec![build::ident("f", None)]).unwrap(),
+            parameters: vec![],
+            returns: build::simple_type("bigint"),
+            characteristics: vec![],
+            body: ast::RoutineBody::Sql(ast::ControlStatement::Return(ast::ReturnStatement {
+                value: build::integer(1),
+                span: SYNTHETIC,
+            })),
+            span: SYNTHETIC,
+        });
+        let error = match CatalogCompletionState::try_new(
+            query,
+            Some("catalog"),
+            "schema",
+            TableLookupMode::SchemaOnly,
+            0,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported definitions must not emit catalog needs"),
+        };
+        let SqlCompileError::Analyze(error) = error else {
+            panic!("expected typed capability rejection: {error}");
+        };
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert!(error.to_string().contains("Inline functions"));
+    }
+
+    #[test]
     fn catalog_prepass_keeps_the_session_depth_before_analysis() {
         fn branch_count(body: &ast::SetExpr) -> usize {
             match body {

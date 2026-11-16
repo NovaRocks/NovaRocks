@@ -16,6 +16,7 @@ use crate::{
 pub struct Query {
     /// Overrides belonging to the root query, before its CTEs and body.
     pub session_properties: Vec<SessionProperty>,
+    pub functions: Vec<super::FunctionSpecification>,
     pub with: Option<With>,
     pub body: Box<SetExpr>,
     pub order_by: Vec<OrderByExpr>,

@@ -206,6 +206,7 @@ pub(super) fn parse_query(
         .end();
     Ok(Query {
         session_properties,
+        functions: Vec::new(),
         with,
         body: Box::new(body),
         order_by,

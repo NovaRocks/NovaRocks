@@ -27,6 +27,15 @@ pub(crate) mod maintenance;
 pub(crate) mod materialized_view;
 mod query;
 mod relation;
+mod routine;
+
+pub use routine::{
+    AssignmentStatement, CaseStatement, CaseStatementWhenClause, CompoundStatement,
+    ControlStatement, ElseClause, ElseIfClause, FunctionParameter, FunctionSpecification,
+    IfStatement, IterateStatement, LeaveStatement, LoopStatement, RepeatStatement, ReturnStatement,
+    RoutineBody, RoutineCharacteristic, RoutineProperty, RoutineSecurity, VariableDeclaration,
+    WhileStatement,
+};
 pub(crate) mod session;
 pub(crate) mod statistics;
 pub(crate) mod table;
@@ -338,3 +347,18 @@ mod tests {
         );
     }
 }
+
+pub use routine::{
+    fold_assignment_statement, fold_case_statement, fold_case_statement_when_clause,
+    fold_compound_statement, fold_control_statement, fold_else_clause, fold_else_if_clause,
+    fold_function_parameter, fold_function_specification, fold_if_statement,
+    fold_iterate_statement, fold_leave_statement, fold_loop_statement, fold_repeat_statement,
+    fold_return_statement, fold_routine_body, fold_routine_characteristic, fold_routine_property,
+    fold_variable_declaration, fold_while_statement, walk_assignment_statement,
+    walk_case_statement, walk_case_statement_when_clause, walk_compound_statement,
+    walk_control_statement, walk_else_clause, walk_else_if_clause, walk_function_parameter,
+    walk_function_specification, walk_if_statement, walk_iterate_statement, walk_leave_statement,
+    walk_loop_statement, walk_repeat_statement, walk_return_statement, walk_routine_body,
+    walk_routine_characteristic, walk_routine_property, walk_variable_declaration,
+    walk_while_statement,
+};

@@ -2760,6 +2760,9 @@ impl CompletionRetainedBytes {
     }
 
     fn add_query_containers(&mut self, query: &Query) {
+        self.add_vec_capacity::<novarocks_parser::ast::FunctionSpecification>(
+            query.functions.capacity(),
+        );
         self.add_vec_capacity::<novarocks_parser::ast::SessionProperty>(
             query.session_properties.capacity(),
         );
@@ -2883,6 +2886,109 @@ impl CompletionRetainedBytes {
 }
 
 impl Visit for CompletionRetainedBytes {
+    fn visit_function_specification(
+        &mut self,
+        function: &novarocks_parser::ast::FunctionSpecification,
+    ) {
+        self.add_vec_capacity::<novarocks_parser::ast::FunctionParameter>(
+            function.parameters.capacity(),
+        );
+        self.add_vec_capacity::<novarocks_parser::ast::RoutineCharacteristic>(
+            function.characteristics.capacity(),
+        );
+        novarocks_parser::ast::walk_function_specification(self, function);
+    }
+
+    fn visit_routine_characteristic(
+        &mut self,
+        characteristic: &novarocks_parser::ast::RoutineCharacteristic,
+    ) {
+        use novarocks_parser::ast::RoutineCharacteristic;
+        match characteristic {
+            RoutineCharacteristic::Comment { comment, .. } => self.add(comment.capacity()),
+            RoutineCharacteristic::Properties { properties, .. } => {
+                self.add_vec_capacity::<novarocks_parser::ast::RoutineProperty>(
+                    properties.capacity(),
+                );
+            }
+            _ => {}
+        }
+        novarocks_parser::ast::walk_routine_characteristic(self, characteristic);
+    }
+
+    fn visit_routine_body(&mut self, body: &novarocks_parser::ast::RoutineBody) {
+        if let novarocks_parser::ast::RoutineBody::External { definition, .. } = body {
+            self.add(definition.capacity());
+        }
+        novarocks_parser::ast::walk_routine_body(self, body);
+    }
+
+    fn visit_variable_declaration(
+        &mut self,
+        declaration: &novarocks_parser::ast::VariableDeclaration,
+    ) {
+        self.add_vec_capacity::<Ident>(declaration.names.capacity());
+        novarocks_parser::ast::walk_variable_declaration(self, declaration);
+    }
+
+    fn visit_else_clause(&mut self, clause: &novarocks_parser::ast::ElseClause) {
+        self.add_vec_capacity::<novarocks_parser::ast::ControlStatement>(
+            clause.statements.capacity(),
+        );
+        novarocks_parser::ast::walk_else_clause(self, clause);
+    }
+
+    fn visit_else_if_clause(&mut self, clause: &novarocks_parser::ast::ElseIfClause) {
+        self.add_vec_capacity::<novarocks_parser::ast::ControlStatement>(
+            clause.statements.capacity(),
+        );
+        novarocks_parser::ast::walk_else_if_clause(self, clause);
+    }
+
+    fn visit_case_statement_when_clause(
+        &mut self,
+        clause: &novarocks_parser::ast::CaseStatementWhenClause,
+    ) {
+        self.add_vec_capacity::<novarocks_parser::ast::ControlStatement>(
+            clause.statements.capacity(),
+        );
+        novarocks_parser::ast::walk_case_statement_when_clause(self, clause);
+    }
+
+    fn visit_control_statement(&mut self, statement: &novarocks_parser::ast::ControlStatement) {
+        use novarocks_parser::ast::{ControlStatement, VariableDeclaration};
+        let statements = match statement {
+            ControlStatement::Case(node) => {
+                self.add_vec_capacity::<novarocks_parser::ast::CaseStatementWhenClause>(
+                    node.when_clauses.capacity(),
+                );
+                None
+            }
+            ControlStatement::If(node) => {
+                self.add_vec_capacity::<novarocks_parser::ast::ElseIfClause>(
+                    node.else_if_clauses.capacity(),
+                );
+                Some(&node.statements)
+            }
+            ControlStatement::Compound(node) => {
+                self.add_vec_capacity::<VariableDeclaration>(node.variable_declarations.capacity());
+                Some(&node.statements)
+            }
+            ControlStatement::Loop(node) => Some(&node.statements),
+            ControlStatement::While(node) => Some(&node.statements),
+            ControlStatement::Repeat(node) => Some(&node.statements),
+            ControlStatement::Return(_)
+            | ControlStatement::Assignment(_)
+            | ControlStatement::Iterate(_)
+            | ControlStatement::Leave(_)
+            | ControlStatement::VariableDeclaration(_) => None,
+        };
+        if let Some(statements) = statements {
+            self.add_vec_capacity::<ControlStatement>(statements.capacity());
+        }
+        novarocks_parser::ast::walk_control_statement(self, statement);
+    }
+
     fn visit_query(&mut self, query: &Query) {
         self.add(std::mem::size_of::<Query>());
         self.add_query_containers(query);
