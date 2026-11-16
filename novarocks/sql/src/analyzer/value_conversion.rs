@@ -91,6 +91,7 @@ pub(super) fn cast_to_value_type(
         .map_err(AnalyzeError::control)?;
     if carrier_cast
         || novarocks_type_contract::is_default_json_structure_cast(&source.value_type, &target)
+        || novarocks_type_contract::is_null_list_to_json_cast(&source.value_type, &target)
     {
         // This exact existing intrinsic consumes the complete target,
         // including JSON children; it is not a same-shape domain bridge.

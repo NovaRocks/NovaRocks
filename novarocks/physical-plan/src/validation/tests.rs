@@ -732,3 +732,90 @@ mod validation_error_tests {
         }));
     }
 }
+
+#[test]
+fn null_list_json_cast_keeps_its_declared_domain_through_fragment_validation() {
+    use novarocks_type_contract::{
+        DecimalOverflowPolicy, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
+        ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let storage = ValueTypeStorageLifetime::pure();
+    let json =
+        ValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap();
+    let carrier = DataType::List(Arc::new(arrow_schema::Field::new(
+        "item",
+        DataType::Utf8,
+        true,
+    )));
+    let target = ValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::List(json.value_type().clone()),
+            true,
+            storage.clone(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(&carrier, storage).unwrap(),
+    )
+    .unwrap();
+    for (source_item, admitted) in [(DataType::Null, true), (DataType::Utf8, false)] {
+        let source = ValueType::new(
+            DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                source_item,
+                true,
+            ))),
+            true,
+        );
+        let mut builder = crate::FragmentBuilder::new(FragmentId::new(905));
+        let node = builder.reserve_node_id().unwrap();
+        let input = builder
+            .add_expression(node, source, ExprKind::Literal(crate::LiteralValue::Null))
+            .unwrap();
+        let cast = builder
+            .add_expression(
+                node,
+                target.clone(),
+                ExprKind::Cast {
+                    expr: input,
+                    target: target.data_type().clone(),
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    allow_throw_exception: SemanticParameterRef {
+                        id: SemanticParameterId::new(0),
+                        expected_key: SemanticParameterKey::AllowThrowException,
+                    },
+                },
+            )
+            .unwrap();
+        let output = builder
+            .add_value(
+                target.clone(),
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .add_values(node, Box::from([Box::from([cast])]), Box::from([output]))
+            .unwrap();
+        let fragment = builder.finish_definition(
+            node,
+            FragmentSink::Noop,
+            crate::PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            crate::StagePlacementPolicy::Singleton,
+        );
+        if admitted {
+            validate_fragment(&fragment.unwrap(), &FragmentCuts::default()).unwrap();
+        } else {
+            assert!(fragment.unwrap_err().errors().iter().any(|error| {
+                error
+                    .message()
+                    .contains("cannot establish or erase a logical identity")
+            }));
+        }
+    }
+}

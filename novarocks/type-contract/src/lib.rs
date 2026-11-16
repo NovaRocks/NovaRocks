@@ -183,7 +183,7 @@ pub use owned_resources::metadata_request::{CompleteMetadataRequestFacts, Metada
 mod value_domain_cast;
 pub use value_domain_cast::{
     default_json_structure_carrier_cast_supported, is_default_json_structure_cast,
-    preserves_value_domains_observed,
+    is_null_list_to_json_cast, preserves_value_domains_observed,
 };
 mod client_input;
 pub use client_input::{ClientInputTypeBindings, ValidatedClientInputTypes};

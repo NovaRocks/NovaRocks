@@ -14,6 +14,6 @@ json_values	string_values
 ["{\"key\": \"value2\"}","{\"key\": \"value1\"}"]	["{\"key\": \"value2\"}","{\"key\": \"value1\"}"]
 
 -- query 4
--- legacy
+-- types	array(json)	array(varchar)
 json_values	string_values
 []	[]

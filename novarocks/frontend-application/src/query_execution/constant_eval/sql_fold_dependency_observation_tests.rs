@@ -738,3 +738,189 @@ fn native_decimal_array_and_temporal_literal_compile_sources_remain_valid() {
         .unwrap_or_else(|error| panic!("real literal package semantics for {sql}: {error:#?}"));
     }
 }
+
+fn assert_real_null_list_cast(
+    sql: &str,
+    columns: &[(&str, novarocks_type_contract::ValueLogicalType, usize)],
+) {
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_type_contract::{
+        ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let expected = columns
+        .iter()
+        .map(|(name, domain, len)| {
+            let item =
+                FunctionValueType::try_with_logical_type(DataType::Utf8, true, *domain).unwrap();
+            let value_type = FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(
+                    ValueKind::List(item.value_type().clone()),
+                    true,
+                    ValueTypeStorageLifetime::pure(),
+                )
+                .unwrap(),
+                ValueLayout::try_from_normalized_arrow(
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    ValueTypeStorageLifetime::pure(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            (*name, *len, value_type)
+        })
+        .collect::<Vec<_>>();
+    // Deliberately decline optional folding to inspect the declared conversion
+    // and its independent ARRAY source. The package-receiver regression uses
+    // the production calculator and the native SQL oracle checks actual values.
+    let owner = compile_typed(sql, &DECLINE, None).unwrap_or_else(|error| {
+        let source_detail = match &error {
+            novarocks_sql::compiler::SqlCompileProgressError::Compile(
+                novarocks_sql::compiler::SqlCompileError::CompilationSource(source),
+            ) => format!(
+                "original fact={:#?}; source={source:#?}",
+                source.failure_fact()
+            ),
+            _ => "original error is not a CompilationSource wrapper".into(),
+        };
+        panic!("unfolded null-list CAST refused {sql}: {error:#?}; {source_detail}");
+    });
+    let computed = owner.plan().result_port().expect("computed query result");
+    let result = owner
+        .checked_original_result_declaration_observed(&SqlCompileControl::unbounded())
+        .expect("same-owner declaration association")
+        .expect("original public declaration");
+    assert_eq!(computed.fields.len(), expected.len(), "{sql}");
+    assert_eq!(result.fields().len(), expected.len(), "{sql}");
+    for (computed, published) in computed.fields.iter().zip(result.fields()) {
+        assert_eq!(
+            computed.ty, published.ty,
+            "computed and published full type"
+        );
+    }
+    let source_type = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Null, true))),
+        false,
+    );
+    for (field, (name, expected_items, expected_type)) in result.fields().iter().zip(&expected) {
+        // This compiler fixture exposes the original expression declaration.
+        // Final client aliases are checked by the native SQL result oracle.
+        assert_eq!(&field.ty, expected_type, "{sql}: {name}");
+        assert_eq!(
+            field.ty.try_to_field(*name).unwrap(),
+            expected_type.try_to_field(*name).unwrap(),
+        );
+        let mut actual_casts = 0;
+        for fragment in owner.plan().fragments().values() {
+            for (_, expression) in fragment.expressions().iter() {
+                let ExprKind::Cast { expr, target, .. } = &expression.kind else {
+                    continue;
+                };
+                if expression.ty != *expected_type {
+                    continue;
+                }
+                actual_casts += 1;
+                assert_eq!(target, expected_type.data_type());
+                let input = fragment
+                    .expressions()
+                    .get(*expr)
+                    .expect("actual CAST child");
+                assert_eq!(
+                    input.ty, source_type,
+                    "independent common NULL element type"
+                );
+                let ExprKind::FunctionCall { function, args } = &input.kind else {
+                    panic!("the actual unfurled ARRAY source must remain: {input:#?}");
+                };
+                assert_eq!(function.result_type, source_type);
+                assert_eq!(args.len(), *expected_items);
+                for argument in args.iter() {
+                    assert_eq!(
+                        fragment.expressions().get(*argument).unwrap().ty,
+                        FunctionValueType::new(DataType::Null, true),
+                        "original NULL element declaration",
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            actual_casts, 1,
+            "one exact runtime conversion for {name}: {sql}"
+        );
+    }
+    novarocks_sql::compiler::author_fragment_package_semantics(
+        &owner,
+        policy(),
+        &SqlCompileControl::unbounded(),
+    )
+    .unwrap_or_else(|error| {
+        panic!("complete real null-list package semantics for {sql}: {error:#?}")
+    });
+}
+
+#[test]
+fn real_fe_empty_array_cast_preserves_complete_json_list_output() {
+    assert_real_null_list_cast(
+        "SELECT CAST([] AS ARRAY<JSON>) AS json_values",
+        &[(
+            "json_values",
+            novarocks_type_contract::ValueLogicalType::Json,
+            0,
+        )],
+    );
+}
+
+#[test]
+fn real_fe_null_child_array_cast_preserves_complete_json_list_output() {
+    assert_real_null_list_cast(
+        "SELECT CAST([NULL,NULL] AS ARRAY<JSON>) AS json_values",
+        &[(
+            "json_values",
+            novarocks_type_contract::ValueLogicalType::Json,
+            2,
+        )],
+    );
+}
+
+#[test]
+fn real_fe_empty_array_cast_preserves_complete_varchar_list_output() {
+    assert_real_null_list_cast(
+        "SELECT CAST([] AS ARRAY<VARCHAR>) AS string_values",
+        &[(
+            "string_values",
+            novarocks_type_contract::ValueLogicalType::Physical,
+            0,
+        )],
+    );
+}
+
+#[test]
+fn real_fe_null_child_array_cast_preserves_complete_varchar_list_output() {
+    assert_real_null_list_cast(
+        "SELECT CAST([NULL,NULL] AS ARRAY<VARCHAR>) AS string_values",
+        &[(
+            "string_values",
+            novarocks_type_contract::ValueLogicalType::Physical,
+            2,
+        )],
+    );
+}
+
+#[test]
+fn real_fe_joint_empty_json_and_varchar_casts_keep_distinct_complete_outputs() {
+    assert_real_null_list_cast(
+        "SELECT CAST([] AS ARRAY<JSON>) AS json_values, CAST([] AS ARRAY<VARCHAR>) AS string_values",
+        &[
+            (
+                "json_values",
+                novarocks_type_contract::ValueLogicalType::Json,
+                0,
+            ),
+            (
+                "string_values",
+                novarocks_type_contract::ValueLogicalType::Physical,
+                0,
+            ),
+        ],
+    );
+}

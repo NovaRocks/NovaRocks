@@ -171,7 +171,9 @@ pub(crate) fn plan_conversion(
         return Ok(PlannedConversion::Identity);
     }
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
-    let intermediate = if novarocks_type_contract::is_default_json_structure_cast(source, target) {
+    let intermediate = if novarocks_type_contract::is_default_json_structure_cast(source, target)
+        || novarocks_type_contract::is_null_list_to_json_cast(source, target)
+    {
         None
     } else {
         novarocks_functions::builtin::value_conversion::conversion_intermediate_type(source, target)

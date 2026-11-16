@@ -286,3 +286,261 @@ fn carrier_cast_cannot_erase_nested_nominal_domain_even_in_an_unused_definition(
         );
     }
 }
+
+fn null_json_list(
+    item: novarocks_type_contract::ValueKind,
+    carrier: DataType,
+    item_nullable: bool,
+    nullable: bool,
+) -> FunctionValueType {
+    use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
+    let storage = ValueTypeStorageLifetime::pure();
+    let child = ValueTypeRef::try_new(item, item_nullable, storage.clone()).unwrap();
+    let layout = ValueLayout::try_new(
+        &DataType::List(Arc::new(Field::new("item", carrier, item_nullable))),
+        storage.clone(),
+    )
+    .unwrap();
+    FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(ValueKind::List(child), nullable, storage).unwrap(),
+        layout,
+    )
+    .unwrap()
+}
+
+fn null_json_fixture(
+    source: FunctionValueType,
+    result: FunctionValueType,
+    operation: CastOperation,
+    dead: bool,
+    policy: DecimalOverflowPolicy,
+    allow: bool,
+    constant: Option<novarocks_functions::ConstantValue>,
+) -> (
+    ProgramResolvedCalls,
+    BTreeMap<ProgramExpressionArena, Vec<FunctionArgumentType>>,
+) {
+    let root_type = if dead { boolean(false) } else { result.clone() };
+    assembled(
+        vec![
+            StaticExprNode::new_value_typed(
+                constant.map_or_else(
+                    || StaticExprKind::SlotId(SlotId::new(1)),
+                    StaticExprKind::Constant,
+                ),
+                source.clone(),
+            ),
+            StaticExprNode::new_value_typed(
+                StaticExprKind::PreparedCast {
+                    operation,
+                    child: ProgramExprId::new(0),
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception: allow,
+                },
+                result.clone(),
+            ),
+            slot(2, &boolean(false)),
+        ],
+        vec![
+            FunctionArgumentType::Value(source),
+            FunctionArgumentType::Value(result),
+            FunctionArgumentType::Value(boolean(false)),
+        ],
+        ProgramExprId::new(if dead { 2 } else { 1 }),
+        root_type,
+        EvaluationDemand::Value,
+    )
+}
+
+#[test]
+fn null_list_json_carrier_cast_checks_live_and_dead_definitions_with_full_types() {
+    use novarocks_type_contract::ValueKind;
+    for (source_nullable, target_nullable) in [(false, false), (false, true), (true, true)] {
+        let source = null_json_list(
+            ValueKind::Scalar(DataType::Null),
+            DataType::Null,
+            true,
+            source_nullable,
+        );
+        let target = null_json_list(
+            ValueKind::Nominal(ValueLogicalType::Json),
+            DataType::Utf8,
+            true,
+            target_nullable,
+        );
+        for dead in [false, true] {
+            for policy in [
+                DecimalOverflowPolicy::OutputNull,
+                DecimalOverflowPolicy::ReportError,
+            ] {
+                for allow in [false, true] {
+                    let (calls, types) = null_json_fixture(
+                        source.clone(),
+                        target.clone(),
+                        CastOperation::Carrier,
+                        dead,
+                        policy,
+                        allow,
+                        None,
+                    );
+                    let typed = ProgramTypedExpressions::try_new(calls, types, &Control).unwrap();
+                    let arena = ProgramExpressionArena::Main;
+                    assert_eq!(
+                        typed.definition_type(arena, ProgramExprId::new(0)),
+                        Some(&FunctionArgumentType::Value(source.clone()))
+                    );
+                    assert_eq!(
+                        typed.definition_type(arena, ProgramExprId::new(1)),
+                        Some(&FunctionArgumentType::Value(target.clone()))
+                    );
+                    let snapshot = typed.resolved_calls().snapshot();
+                    let cast = snapshot.roots().arenas()[&arena]
+                        .node(ProgramExprId::new(1))
+                        .unwrap();
+                    assert_eq!(cast.value_type(), Some(&target));
+                    assert!(
+                        matches!(cast.kind(), StaticExprKind::PreparedCast { operation: CastOperation::Carrier, child, decimal_overflow_policy, allow_throw_exception } if *child == ProgramExprId::new(0) && *decimal_overflow_policy == policy && *allow_throw_exception == allow)
+                    );
+                    assert_eq!(
+                        snapshot.flows()[&arena].uses().len(),
+                        if dead { 1 } else { 2 }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn null_list_json_exception_refuses_required_targets_root_nulls_and_foreign_operations() {
+    use novarocks_type_contract::ValueKind;
+    let source = null_json_list(
+        ValueKind::Scalar(DataType::Null),
+        DataType::Null,
+        true,
+        false,
+    );
+    let target = null_json_list(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        DataType::Utf8,
+        true,
+        true,
+    );
+    let required_item = null_json_list(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        DataType::Utf8,
+        false,
+        true,
+    );
+    let required_root = null_json_list(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        DataType::Utf8,
+        true,
+        false,
+    );
+    for dead in [false, true] {
+        for (source, result, operation) in [
+            (
+                source.clone(),
+                required_item.clone(),
+                CastOperation::Carrier,
+            ),
+            (
+                source.clone().with_nullable(true).unwrap(),
+                required_root.clone(),
+                CastOperation::Carrier,
+            ),
+            (
+                FunctionValueType::new(DataType::Null, true),
+                target.clone(),
+                CastOperation::Carrier,
+            ),
+            (source.clone(), target.clone(), CastOperation::Time),
+            (
+                source.clone(),
+                target.clone(),
+                CastOperation::TimeFromDatetime,
+            ),
+        ] {
+            let (calls, types) = null_json_fixture(
+                source,
+                result,
+                operation,
+                dead,
+                DecimalOverflowPolicy::OutputNull,
+                false,
+                None,
+            );
+            assert_eq!(
+                ProgramTypedExpressions::try_new(calls, types, &Control).unwrap_err(),
+                ProgramExpressionTypeError::TypeMismatch
+            );
+        }
+    }
+}
+
+#[test]
+fn nonempty_utf8_list_does_not_acquire_json_domain_in_live_or_dead_cast() {
+    use arrow_array::{
+        Array,
+        builder::{ListBuilder, StringBuilder},
+    };
+    use novarocks_type_contract::ValueKind;
+    let text = "original nonempty UTF8";
+    let mut builder = ListBuilder::with_capacity(StringBuilder::with_capacity(1, text.len()), 1);
+    builder.values().append_value(text);
+    builder.append(true);
+    let array = builder.finish();
+    let source = FunctionValueType::new(array.data_type().clone(), false);
+    let field = Arc::new(Field::new(
+        "original_utf8_list",
+        array.data_type().clone(),
+        false,
+    ));
+    let policy = novarocks_functions::ConstantPolicy {
+        max_rows: 4,
+        max_array_nodes: 16,
+        max_logical_elements: 16,
+        max_retained_buffer_bytes: 4096,
+        max_type_depth: 8,
+        max_type_nodes: 16,
+        max_dictionary_depth: 8,
+        max_metadata_bytes: 4096,
+        max_library_validation_work: 4096,
+        // The original nested Arrow validation envelope includes diagnostic
+        // workspace (nodes * 256 * depth * 16), beyond retained input bytes.
+        max_library_validation_bytes: 65536,
+    };
+    let pool = novarocks_functions::ConstantPool::try_new(
+        field,
+        source.clone(),
+        array.to_data(),
+        policy,
+        CompilePhase::LowerProgram,
+        &Control,
+    )
+    .unwrap();
+    let original = pool.value(0).unwrap();
+    let target = null_json_list(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        DataType::Utf8,
+        true,
+        true,
+    );
+    assert_eq!(source.data_type(), target.data_type());
+    for dead in [false, true] {
+        let (calls, types) = null_json_fixture(
+            source.clone(),
+            target.clone(),
+            CastOperation::Carrier,
+            dead,
+            DecimalOverflowPolicy::OutputNull,
+            false,
+            Some(original.clone()),
+        );
+        assert_eq!(
+            ProgramTypedExpressions::try_new(calls, types, &Control).unwrap_err(),
+            ProgramExpressionTypeError::TypeMismatch
+        );
+    }
+}

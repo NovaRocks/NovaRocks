@@ -92,6 +92,10 @@ impl StaticPlanInterpreter {
 /// plan contract revision, so those exact inputs separate their compatibility
 /// islands without an additional execution-only epoch change.
 ///
+/// Plan revision 26 admits explicit physical NULL-list lifting to declared
+/// nullable JSON and UTF8 list elements. Earlier peers lack these prepared
+/// casts; the exact plan revision separates them without changing epoch 15.
+///
 /// RWM-7 retires COW vocabulary and freezes explicit writer W/T declarations,
 /// projected writer values and selected-assignment construction in the package
 /// descriptor and plan revision 25. Iceberg revision 10 also freezes the private

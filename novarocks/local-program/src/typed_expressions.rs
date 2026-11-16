@@ -269,10 +269,11 @@ impl ProgramTypedExpressions {
                                 return Err(ProgramExpressionTypeError::WrongKind.into());
                             };
                             if ((source.nullable() || *source.data_type() == arrow_schema::DataType::Null) && !value.nullable())
-                                || !novarocks_type_contract::preserves_value_domains_observed(
+                                || (!novarocks_type_contract::preserves_value_domains_observed(
                                     source.value_type(), value.value_type(),
                                     |_| work.step().map_err(ProgramExpressionTypeError::Control),
-                                )?
+                                )? && !(*operation == novarocks_functions::CastOperation::Carrier
+                                    && novarocks_type_contract::is_null_list_to_json_cast(source, value)))
                                 || !novarocks_type_contract::decimal_error_policy_cast_supported_observed(
                                     source.data_type(), value.data_type(), *decimal_overflow_policy,
                                     || work.step().map_err(ProgramExpressionTypeError::Control),

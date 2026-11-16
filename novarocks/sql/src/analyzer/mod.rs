@@ -50,6 +50,8 @@ pub(crate) use json_syntax::{
     is_plain_json_query, is_supported_json_array_profile, is_supported_json_object_profile,
 };
 #[cfg(test)]
+mod collection_expression_tests;
+#[cfg(test)]
 mod control_expression_tests;
 pub(crate) mod declaration_widening;
 mod literal_coercion;

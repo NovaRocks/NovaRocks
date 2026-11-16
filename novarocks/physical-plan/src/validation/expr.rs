@@ -439,6 +439,7 @@ pub(crate) fn validate_expression(
                     &input.ty,
                     &expression.ty,
                 )
+                && !novarocks_type_contract::is_null_list_to_json_cast(&input.ty, &expression.ty)
                 && !novarocks_type_contract::preserves_value_domains_observed(
                     input.ty.value_type(),
                     expression.ty.value_type(),

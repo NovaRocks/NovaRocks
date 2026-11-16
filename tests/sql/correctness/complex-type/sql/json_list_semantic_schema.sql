@@ -25,4 +25,4 @@ WITH q AS (SELECT [json_object('key','value1'), json_object('key','value2')] AS 
 SELECT array_sortby(j,[2,1]) AS json_values,
        array_sortby(CAST(j AS ARRAY<VARCHAR>),[2,1]) AS string_values FROM q;
 
-SELECT ARRAY<JSON>[] AS json_values, CAST([] AS ARRAY<VARCHAR>) AS string_values;
+SELECT CAST([] AS ARRAY<JSON>) AS json_values, CAST([] AS ARRAY<VARCHAR>) AS string_values;
