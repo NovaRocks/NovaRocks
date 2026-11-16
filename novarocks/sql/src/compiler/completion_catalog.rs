@@ -522,21 +522,30 @@ impl<'a> CatalogNeedCollector<'a> {
         }
 
         self.collect_set_expr(&query.body, &body_scope)?;
-        for order in &query.order_by {
-            self.collect_expr(&order.expr, &body_scope)?;
+        self.collect_modifiers(&query.modifiers, &body_scope)?;
+        Ok(())
+    }
+
+    fn collect_modifiers(
+        &mut self,
+        modifiers: &ast::QueryModifiers,
+        scope: &CteScope,
+    ) -> Result<(), SqlCompileError> {
+        for order in &modifiers.order_by {
+            self.collect_expr(&order.expr, scope)?;
         }
-        if let Some(limit) = &query.limit {
-            self.collect_expr(limit, &body_scope)?;
+        if let Some(limit) = &modifiers.limit {
+            self.collect_expr(limit, scope)?;
         }
-        if let Some(offset) = &query.offset {
-            self.collect_expr(&offset.value, &body_scope)?;
+        if let Some(offset) = &modifiers.offset {
+            self.collect_expr(&offset.value, scope)?;
         }
-        if let Some(quantity) = query
+        if let Some(quantity) = modifiers
             .fetch
             .as_ref()
             .and_then(|fetch| fetch.quantity.as_ref())
         {
-            self.collect_expr(quantity, &body_scope)?;
+            self.collect_expr(quantity, scope)?;
         }
         Ok(())
     }
@@ -610,6 +619,7 @@ impl<'a> CatalogNeedCollector<'a> {
         for window in &select.windows {
             self.collect_window_spec(&window.specification, scope)?;
         }
+        self.collect_modifiers(&select.modifiers, scope)?;
         Ok(())
     }
 

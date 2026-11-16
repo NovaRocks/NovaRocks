@@ -358,11 +358,7 @@ fn query_with_body(template: &Query, body: SetExpr) -> Query {
         functions: Vec::new(),
         with: None,
         body: Box::new(body),
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        limit_comma_offset: false,
-        fetch: None,
+        modifiers: Default::default(),
         span: template.span,
     }
 }
@@ -415,6 +411,7 @@ fn inline_iteration(
         having: None,
         qualify: None,
         windows: Vec::new(),
+        modifiers: Default::default(),
         span,
     }))
 }
@@ -481,20 +478,7 @@ fn scan_query_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, query
         return;
     }
     scan_set_expr_for_table_reference(visitor, query.body.as_ref());
-    for order in &query.order_by {
-        visitor.visit_expr(&order.expr);
-    }
-    if let Some(limit) = &query.limit {
-        visitor.visit_expr(limit);
-    }
-    if let Some(offset) = &query.offset {
-        visitor.visit_expr(&offset.value);
-    }
-    if let Some(fetch) = &query.fetch
-        && let Some(quantity) = &fetch.quantity
-    {
-        visitor.visit_expr(quantity);
-    }
+    novarocks_parser::ast::walk_query_modifiers(visitor, &query.modifiers);
 }
 
 fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, expr: &SetExpr) {
@@ -566,6 +550,7 @@ fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, ex
                     }
                 }
             }
+            novarocks_parser::ast::walk_query_modifiers(visitor, &select.modifiers);
         }
         SetExpr::Values(values) => {
             for row in &values.rows {
@@ -662,11 +647,7 @@ fn substitute_table_with_derived(
         functions: Vec::new(),
         with: None,
         body: Box::new(expr.clone()),
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        limit_comma_offset: false,
-        fetch: None,
+        modifiers: Default::default(),
         span: expr.span(),
     };
     let mut substituter = RecursiveTableSubstituter {
@@ -745,10 +726,11 @@ fn remove_bare_top_level_dual(query: &mut Query) {
         || select.having.is_some()
         || select.qualify.is_some()
         || !select.windows.is_empty()
-        || !query.order_by.is_empty()
-        || query.limit.is_some()
-        || query.offset.is_some()
-        || query.fetch.is_some()
+        || !select.modifiers.is_empty()
+        || !query.modifiers.order_by.is_empty()
+        || query.modifiers.limit.is_some()
+        || query.modifiers.offset.is_some()
+        || query.modifiers.fetch.is_some()
     {
         return;
     }

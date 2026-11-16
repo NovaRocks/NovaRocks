@@ -2769,7 +2769,9 @@ impl CompletionRetainedBytes {
         for property in &query.session_properties {
             self.add_vec_capacity::<Ident>(property.name.parts.capacity());
         }
-        self.add_vec_capacity::<novarocks_parser::ast::OrderByExpr>(query.order_by.capacity());
+        self.add_vec_capacity::<novarocks_parser::ast::OrderByExpr>(
+            query.modifiers.order_by.capacity(),
+        );
         if let Some(with) = &query.with {
             self.add_vec_capacity::<novarocks_parser::ast::Cte>(with.ctes.capacity());
             for cte in &with.ctes {
@@ -2805,6 +2807,9 @@ impl CompletionRetainedBytes {
     }
 
     fn add_select_containers(&mut self, select: &Select) {
+        self.add_vec_capacity::<novarocks_parser::ast::OrderByExpr>(
+            select.modifiers.order_by.capacity(),
+        );
         self.add(std::mem::size_of::<Select>());
         if let SelectQuantifier::Distinct { on, .. } = &select.quantifier {
             self.add_vec_capacity::<Expr>(on.capacity());
@@ -3752,7 +3757,10 @@ mod tests {
         let mut query = test_query("select 1");
         let item_size = std::mem::size_of::<novarocks_parser::ast::OrderByExpr>();
         let capacity = COMPLETION_LIMIT / item_size + 1;
-        query.order_by = Vec::with_capacity(capacity);
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT")
+        };
+        select.modifiers.order_by = Vec::with_capacity(capacity);
         let definition = SqlMvRewriteDefinitionFacts::try_new(
             1,
             [11; 32],

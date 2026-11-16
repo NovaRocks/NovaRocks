@@ -83,8 +83,9 @@ pub use materialized_view::{
 };
 pub use query::{
     Corresponding, Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, Offset, OffsetRows,
-    OrderByExpr, Query, ReplaceSelectItem, Select, SelectItem, SelectQuantifier, SessionProperty,
-    SetExpr, SetOperation, SetOperator, SetQuantifier, Values, WildcardOptions, With,
+    OrderByExpr, Query, QueryModifiers, ReplaceSelectItem, Select, SelectItem, SelectQuantifier,
+    SessionProperty, SetExpr, SetOperation, SetOperator, SetQuantifier, Values, WildcardOptions,
+    With,
 };
 pub use relation::{
     Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableVersion,
@@ -362,3 +363,5 @@ pub use routine::{
     walk_routine_characteristic, walk_routine_property, walk_variable_declaration,
     walk_while_statement,
 };
+
+pub use visit::{fold_query_modifiers, walk_query_modifiers};

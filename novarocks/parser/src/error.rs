@@ -122,6 +122,7 @@ pub enum StructuralViolation {
     EmptyValuesRow,
     EmptySelectProjection,
     InvalidSetOperationOperandCount,
+    InvalidQueryModifierOwner,
     EmptyUnnestExpressionList,
     MismatchedCaseArms,
     DuplicateTableColumnName,

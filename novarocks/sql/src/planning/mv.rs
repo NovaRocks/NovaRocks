@@ -2638,7 +2638,10 @@ fn flatten_union_all<'a>(body: &'a SetExpr, out: &mut Vec<&'a SetExpr>) -> Resul
             }
             Ok(())
         }
-        SetExpr::Select(_) => {
+        SetExpr::Select(select) => {
+            if !select.modifiers.is_empty() {
+                return Err(union_all_error());
+            }
             out.push(body);
             Ok(())
         }
@@ -3012,11 +3015,13 @@ fn join_projection_filter_error() -> String {
 
 fn reject_unsupported_query_clauses(query: &Query) -> Result<(), String> {
     if !query.session_properties.is_empty()
+        || !query.functions.is_empty()
         || query.with.is_some()
-        || !query.order_by.is_empty()
-        || query.limit.is_some()
-        || query.offset.is_some()
-        || query.fetch.is_some()
+        || !query.modifiers.order_by.is_empty()
+        || query.modifiers.limit.is_some()
+        || query.modifiers.offset.is_some()
+        || query.modifiers.fetch.is_some()
+        || matches!(query.body.as_ref(), SetExpr::Select(select) if !select.modifiers.is_empty())
     {
         return Err(projection_filter_error());
     }
@@ -3031,6 +3036,7 @@ fn reject_unsupported_select_clauses(select: &Select) -> Result<(), String> {
         || select.having.is_some()
         || !select.windows.is_empty()
         || select.qualify.is_some()
+        || !select.modifiers.is_empty()
     {
         return Err(projection_filter_error());
     }
@@ -3044,6 +3050,7 @@ fn reject_unsupported_aggregate_select_clauses(select: &Select) -> Result<(), St
     ) || select.having.is_some()
         || !select.windows.is_empty()
         || select.qualify.is_some()
+        || !select.modifiers.is_empty()
     {
         return Err(aggregate_error());
     }
@@ -4001,17 +4008,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_union_all_branch_with_parenthesized_limit() {
-        let err = classify_sql(
-            "(select k1, sum(v2) as s from ice.ns.t1 group by k1 limit 1) \
-             union all \
-             select k1, sum(v2) as s from ice.ns.t2 group by k1",
-        )
-        .expect_err("branch-local LIMIT must be rejected");
-        assert!(
-            err.contains("UNION ALL") || err.contains("incremental"),
-            "unexpected: {err}"
-        );
+    fn rejects_union_all_branch_with_parenthesized_modifiers() {
+        for suffix in [
+            "limit 1",
+            "order by k1",
+            "offset 1",
+            "fetch first 1 row only",
+        ] {
+            let sql = format!(
+                "(select k1, sum(v2) as s from ice.ns.t1 group by k1 {suffix}) \
+                 union all select k1, sum(v2) as s from ice.ns.t2 group by k1"
+            );
+            let err = classify_sql(&sql).expect_err("branch-local modifiers must be rejected");
+            assert!(
+                err.contains("UNION ALL") || err.contains("incremental"),
+                "{suffix}: {err}"
+            );
+        }
     }
 
     #[test]

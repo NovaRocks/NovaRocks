@@ -881,6 +881,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         query: &ast::Query,
     ) -> Result<ResolvedQuery, AnalyzeError> {
+        let modifiers = helpers::query_modifiers(query)?;
         let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
             let (child_ctx, local_cte_ids) = self.build_with_clause_context(with_clause)?;
             (Some(child_ctx), local_cte_ids)
@@ -888,24 +889,39 @@ impl<'a> AnalyzerContext<'a> {
             (None, Vec::new())
         };
         let ctx = maybe_child_ctx.as_ref().unwrap_or(self);
-        let select = match query.body.as_ref() {
+        let result = ctx.analyze_query_body(&query.body, modifiers, query.span, local_cte_ids);
+        if let Some(child_ctx) = maybe_child_ctx {
+            self.absorb_semantic_scope(&child_ctx);
+        }
+        result
+    }
+
+    fn analyze_query_body(
+        &self,
+        set_expr: &ast::SetExpr,
+        modifiers: &ast::QueryModifiers,
+        span: novarocks_parser::Span,
+        local_cte_ids: Vec<crate::analysis::cte::CteId>,
+    ) -> Result<ResolvedQuery, AnalyzeError> {
+        let select = match set_expr {
             ast::SetExpr::Select(select) => Some(select.as_ref()),
             _ => None,
         };
-        let result = ctx.with_grouping_scope(select, |ctx| {
+        self.with_grouping_scope(select, |ctx| {
             // Analyze body (SELECT / SetOperation / VALUES)
-            let (mut body, body_output) = ctx.analyze_set_expr(query.body.as_ref())?;
+            let (mut body, body_output) = ctx.analyze_set_expr(set_expr)?;
 
             // Analyze ORDER BY
-            let order_by = ctx.analyze_order_by(query, &body_output, &body)?;
+            let order_by =
+                ctx.analyze_order_by(&modifiers.order_by, select, span, &body_output, &body)?;
             if let QueryBody::Select(select) = &mut body {
                 ctx.validate_grouping_calls(&select.group_by)?;
                 ctx.append_grouping_calls(select);
             }
 
             // Extract LIMIT / OFFSET
-            let limit = extract_limit(query)?;
-            let offset = extract_offset(query)?;
+            let limit = extract_limit(modifiers)?;
+            let offset = extract_offset(modifiers)?;
 
             // Build output columns from the body
             let output_columns = body_output;
@@ -918,11 +934,7 @@ impl<'a> AnalyzerContext<'a> {
                 output_columns,
                 local_cte_ids,
             })
-        });
-        if let Some(child_ctx) = maybe_child_ctx {
-            self.absorb_semantic_scope(&child_ctx);
-        }
-        result
+        })
     }
 
     /// Analyze a SetExpr and return (QueryBody, output_columns).
@@ -955,7 +967,52 @@ impl<'a> AnalyzerContext<'a> {
             ast::SetExpr::Query(q) => {
                 let resolved = self.analyze_query(q)?;
                 let cols = resolved.output_columns.clone();
-                Ok((resolved.body, cols))
+                if resolved.order_by.is_empty()
+                    && resolved.limit.is_none()
+                    && resolved.offset.is_none()
+                    && resolved.local_cte_ids.is_empty()
+                {
+                    return Ok((resolved.body, cols));
+                }
+                // A parenthesized query has its own suffix and CTE scope.
+                // Retain that query under an ordinary subquery relation;
+                // passthrough projection reuses its fields and ColumnIds.
+                let mut projection = Vec::with_capacity(cols.len());
+                for column in &cols {
+                    self.check_control()?;
+                    projection.push(crate::analysis::AnalyzedProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: column.column_id,
+                                qualifier: None,
+                                column: column.name.clone(),
+                            },
+                            value_type: column.value_type.clone(),
+                        },
+                        output_name: column.name.clone(),
+                        field_name: column.field_name.clone(),
+                        output_column_id: column.column_id,
+                    });
+                }
+                Ok((
+                    QueryBody::Select(ResolvedSelect {
+                        from: Some(Relation::Subquery {
+                            query: Box::new(resolved),
+                            alias: String::new(),
+                            output_columns: cols.clone(),
+                        }),
+                        filter: None,
+                        group_by: vec![],
+                        having: None,
+                        projection,
+                        has_aggregation: false,
+                        distinct: false,
+                        repeat: None,
+                        apply_specs: vec![],
+                        predicate_apply_specs: vec![],
+                    }),
+                    cols,
+                ))
             }
         }
     }
@@ -1062,20 +1119,16 @@ impl<'a> AnalyzerContext<'a> {
         match set_expr {
             ast::SetExpr::Query(q) => self.analyze_query(q),
             _ => {
-                let (body, output_columns) = self.analyze_set_expr(set_expr)?;
-                Ok(ResolvedQuery {
-                    body,
-                    order_by: vec![],
-                    limit: None,
-                    offset: None,
-                    output_columns,
-                    local_cte_ids: vec![],
-                })
+                let empty = ast::QueryModifiers::default();
+                let modifiers = match set_expr {
+                    ast::SetExpr::Select(select) => &select.modifiers,
+                    _ => &empty,
+                };
+                self.analyze_query_body(set_expr, modifiers, set_expr.span(), vec![])
             }
         }
     }
 
-    /// Analyze syntax VALUES, retaining checked expression constants at their exact sites.
     fn analyze_values(
         &self,
         values: &ast::Values,
@@ -2460,11 +2513,12 @@ impl<'a> AnalyzerContext<'a> {
     /// Analyze ORDER BY clause.
     fn analyze_order_by(
         &self,
-        query: &ast::Query,
+        order_by_exprs: &[ast::OrderByExpr],
+        ast_select: Option<&ast::Select>,
+        span: novarocks_parser::Span,
         body_output: &[OutputColumn],
         body: &QueryBody,
     ) -> Result<Vec<SortItem>, AnalyzeError> {
-        let order_by_exprs = &query.order_by;
         if order_by_exprs.is_empty() {
             return Ok(vec![]);
         }
@@ -2559,7 +2613,7 @@ impl<'a> AnalyzerContext<'a> {
                     // expressions (not aliases). This handles ORDER BY
                     // count(distinct x) matching SELECT count(distinct x) as y.
                     if let QueryBody::Select(sel) = body
-                        && let ast::SetExpr::Select(ast_sel) = query.body.as_ref()
+                        && let Some(ast_sel) = ast_select
                     {
                         // Bare-identifier ORDER BY (`ORDER BY k1`) must prefer
                         // the projection's output alias over the SELECT item's
@@ -2767,7 +2821,7 @@ impl<'a> AnalyzerContext<'a> {
                     format!(
                         "BITMAP/HLL columns cannot appear in ORDER BY (column has type {logical:?})"
                     ),
-                    query.span,
+                    span,
                 ));
             }
         }
@@ -3178,6 +3232,60 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     struct TestCatalog;
+
+    #[test]
+    fn parenthesized_query_retains_each_suffix_and_original_output_identity() {
+        let query = parse_native_query(
+            "(SELECT k1 FROM t1 ORDER BY v1 LIMIT 5 OFFSET 3) ORDER BY k1 LIMIT 2 OFFSET 1",
+        )
+        .unwrap();
+        let (resolved, ctes, mut factory) = analyze(&query, &TestCatalog, "default").unwrap();
+        assert_eq!(resolved.limit, Some(2));
+        assert_eq!(resolved.offset, Some(1));
+        assert_eq!(resolved.order_by.len(), 1);
+        let QueryBody::Select(passthrough) = &resolved.body else {
+            panic!("query boundary")
+        };
+        let Some(Relation::Subquery {
+            query: inner,
+            output_columns,
+            ..
+        }) = &passthrough.from
+        else {
+            panic!("inner query must remain under the original subquery relation")
+        };
+        assert_eq!(inner.limit, Some(5));
+        assert_eq!(inner.offset, Some(3));
+        assert_eq!(inner.order_by.len(), 1);
+        let field = &inner.output_columns[0];
+        assert_eq!(resolved.output_columns[0].column_id, field.column_id);
+        assert_eq!(output_columns[0].column_id, field.column_id);
+        assert_eq!(passthrough.projection[0].output_column_id, field.column_id);
+        assert_eq!(resolved.output_columns[0].field_name, field.field_name);
+        assert_eq!(resolved.output_columns[0].value_type, field.value_type);
+        assert!(matches!(&resolved.order_by[0].expr.kind,
+            ExprKind::ColumnRef { column_id, .. } if *column_id == field.column_id));
+        crate::planner::plan_query(
+            resolved,
+            ctes,
+            &mut factory,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+
+        for sql in [
+            "(SELECT k1 FROM t1 LIMIT 5) ORDER BY v1",
+            "(SELECT k1 FROM t1 LIMIT 5) ORDER BY t1.k1",
+        ] {
+            let query = parse_native_query(sql).unwrap();
+            let error = analyze(&query, &TestCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnknownColumn,
+                "{sql}"
+            );
+        }
+    }
 
     #[test]
     fn corresponding_set_operations_are_rejected_before_operand_analysis() {

@@ -204,16 +204,25 @@ pub(super) fn parse_query(
             |fetch| fetch.span,
         )
         .end();
-    Ok(Query {
-        session_properties,
-        functions: Vec::new(),
-        with,
-        body: Box::new(body),
+    let modifiers = crate::ast::QueryModifiers {
         order_by,
         limit,
         offset,
         limit_comma_offset,
         fetch,
+    };
+    let modifiers = if let SetExpr::Select(select) = &mut body {
+        select.modifiers = modifiers;
+        Default::default()
+    } else {
+        modifiers
+    };
+    Ok(Query {
+        session_properties,
+        functions: Vec::new(),
+        with,
+        body: Box::new(body),
+        modifiers,
         span: Span::new(start, end),
     })
 }
@@ -441,6 +450,7 @@ fn parse_select(
             having,
             qualify,
             windows,
+            modifiers: Default::default(),
             span: Span::new(start, end),
         },
         hints,

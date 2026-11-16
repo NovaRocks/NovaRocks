@@ -70,6 +70,65 @@ fn select_body(value: i64) -> SetExpr {
 }
 
 #[test]
+fn query_suffixes_keep_specification_and_parenthesized_owners_distinct() {
+    use ast::{Literal, LiteralKind, Visit};
+    for source in [
+        "SELECT 11 ORDER BY 1 LIMIT 5 OFFSET 2",
+        "WITH c AS (SELECT 11) SELECT 13 ORDER BY 1 LIMIT 5 OFFSET 2",
+    ] {
+        let parsed = query(source);
+        assert!(parsed.modifiers.is_empty());
+        let SetExpr::Select(select) = parsed.body.as_ref() else {
+            panic!("SELECT")
+        };
+        assert_eq!(select.modifiers.order_by.len(), 1);
+        assert!(select.modifiers.limit.is_some());
+        assert!(select.modifiers.offset.is_some());
+        ast::validate_statement(&ast::Statement::Query(parsed.clone())).unwrap();
+        assert!(parsed.syntax_eq(&query(&novarocks_parser::printer::print_query(&parsed))));
+    }
+    for source in [
+        "VALUES (11) ORDER BY 1 LIMIT 5 OFFSET 2",
+        "SELECT 11 UNION ALL SELECT 13 ORDER BY 1 LIMIT 5 OFFSET 2",
+        "(SELECT 11 ORDER BY 1 LIMIT 7 OFFSET 3) ORDER BY 1 LIMIT 5 OFFSET 2",
+    ] {
+        let parsed = query(source);
+        assert_eq!(parsed.modifiers.order_by.len(), 1);
+        assert!(parsed.modifiers.limit.is_some());
+        assert!(parsed.modifiers.offset.is_some());
+        assert!(parsed.syntax_eq(&query(&novarocks_parser::printer::print_query(&parsed))));
+    }
+    #[derive(Default)]
+    struct Numbers(Vec<String>);
+    impl Visit for Numbers {
+        fn visit_literal(&mut self, literal: &Literal) {
+            if let LiteralKind::Number(value) = &literal.kind {
+                self.0.push(value.clone());
+            }
+        }
+    }
+    let mut parsed = query("(SELECT 11 ORDER BY 1 LIMIT 7 OFFSET 3) ORDER BY 1 LIMIT 5 OFFSET 2");
+    let mut numbers = Numbers::default();
+    numbers.visit_query(&parsed);
+    assert_eq!(numbers.0, ["11", "1", "7", "3", "1", "5", "2"]);
+    let SetExpr::Query(inner) = parsed.body.as_mut() else {
+        panic!("parenthesized query")
+    };
+    let SetExpr::Select(select) = inner.body.as_mut() else {
+        panic!("SELECT")
+    };
+    inner.modifiers = std::mem::take(&mut select.modifiers);
+    let error = ast::validate_statement(&ast::Statement::Query(parsed)).unwrap_err();
+    assert!(matches!(
+        error,
+        novarocks_parser::ValidateError::InvalidStructure {
+            violation: novarocks_parser::StructuralViolation::InvalidQueryModifierOwner,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn query_session_assignments_preserve_names_values_and_traversal() {
     use ast::{Fold, Literal, LiteralKind, Visit};
 

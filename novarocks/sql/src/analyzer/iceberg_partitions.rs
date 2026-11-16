@@ -133,13 +133,10 @@ pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast
             }),
             qualify: None,
             windows: Vec::new(),
+            modifiers: Default::default(),
             span,
         }))),
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        limit_comma_offset: false,
-        fetch: None,
+        modifiers: Default::default(),
         span,
     }
 }

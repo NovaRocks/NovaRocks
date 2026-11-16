@@ -129,11 +129,12 @@ pub(crate) fn plain_function(function: &ast::FunctionCall) -> bool {
 }
 
 pub(crate) fn literal_query(query: &ast::Query) -> bool {
-    query.with.is_none()
-        && query.order_by.is_empty()
-        && query.limit.is_none()
-        && query.offset.is_none()
-        && query.fetch.is_none()
+    query.functions.is_empty()
+        && query.with.is_none()
+        && query.modifiers.order_by.is_empty()
+        && query.modifiers.limit.is_none()
+        && query.modifiers.offset.is_none()
+        && query.modifiers.fetch.is_none()
         && literal_body(&query.body)
 }
 
@@ -141,7 +142,8 @@ fn literal_body(body: &ast::SetExpr) -> bool {
     match body {
         ast::SetExpr::Values(values) => values.rows.iter().flatten().all(is_literal_expr),
         ast::SetExpr::Select(select) => {
-            select.from.is_empty()
+            select.modifiers.is_empty()
+                && select.from.is_empty()
                 && select.projection.iter().all(|item| match item {
                     ast::SelectItem::UnnamedExpr(expr)
                     | ast::SelectItem::ExprWithAlias { expr, .. } => is_literal_expr(expr),
@@ -254,18 +256,20 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
 }
 
 fn legacy_literal_query(query: &ast::Query) -> bool {
-    if query.with.is_some()
-        || !query.order_by.is_empty()
-        || query.limit.is_some()
-        || query.offset.is_some()
-        || query.fetch.is_some()
+    if !query.functions.is_empty()
+        || query.with.is_some()
+        || !query.modifiers.order_by.is_empty()
+        || query.modifiers.limit.is_some()
+        || query.modifiers.offset.is_some()
+        || query.modifiers.fetch.is_some()
     {
         return false;
     }
     fn body_is_literal(body: &ast::SetExpr) -> bool {
         match body {
             ast::SetExpr::Select(select) => {
-                select.from.is_empty()
+                select.modifiers.is_empty()
+                    && select.from.is_empty()
                     && select.projection.iter().all(|item| match item {
                         ast::SelectItem::UnnamedExpr(expr)
                         | ast::SelectItem::ExprWithAlias { expr, .. } => {

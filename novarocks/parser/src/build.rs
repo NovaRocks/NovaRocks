@@ -472,6 +472,7 @@ pub fn select(
         having: None,
         qualify: None,
         windows: Vec::new(),
+        modifiers: Default::default(),
         span: SYNTHETIC,
     })
 }
@@ -482,11 +483,7 @@ pub fn query(body: SetExpr) -> Query {
         functions: Vec::new(),
         with: None,
         body: Box::new(body),
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        limit_comma_offset: false,
-        fetch: None,
+        modifiers: Default::default(),
         span: SYNTHETIC,
     }
 }

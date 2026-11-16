@@ -102,7 +102,13 @@ impl SyntaxEq for Query {
             && syntax_eq_slice(&self.functions, &other.functions)
             && syntax_eq_option(&self.with, &other.with)
             && self.body.syntax_eq(&other.body)
-            && syntax_eq_slice(&self.order_by, &other.order_by)
+            && self.modifiers.syntax_eq(&other.modifiers)
+    }
+}
+
+impl SyntaxEq for QueryModifiers {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        syntax_eq_slice(&self.order_by, &other.order_by)
             && syntax_eq_option(&self.limit, &other.limit)
             && syntax_eq_option(&self.offset, &other.offset)
             && self.limit_comma_offset == other.limit_comma_offset
@@ -173,6 +179,7 @@ impl SyntaxEq for Select {
             && syntax_eq_option(&self.having, &other.having)
             && syntax_eq_option(&self.qualify, &other.qualify)
             && syntax_eq_slice(&self.windows, &other.windows)
+            && self.modifiers.syntax_eq(&other.modifiers)
     }
 }
 
@@ -863,11 +870,7 @@ mod tests {
                             explicit_row: true,
                             span: span(start + 3),
                         })),
-                        order_by: Vec::new(),
-                        limit: None,
-                        offset: None,
-                        limit_comma_offset: false,
-                        fetch: None,
+                        modifiers: Default::default(),
                         span: span(start + 4),
                     }),
                     span: span(start + 5),
@@ -894,27 +897,30 @@ mod tests {
                 having: None,
                 qualify: None,
                 windows: Vec::new(),
+                modifiers: QueryModifiers {
+                    order_by: vec![OrderByExpr {
+                        expr: Expr::Identifier(ident("result", start + 15)),
+                        asc: Some(false),
+                        nulls_first: Some(true),
+                        span: span(start + 16),
+                    }],
+                    limit: Some(number("10", start + 17)),
+                    offset: Some(Offset {
+                        value: number("3", start + 18),
+                        rows: OffsetRows::Rows,
+                        span: span(start + 19),
+                    }),
+                    limit_comma_offset: false,
+                    fetch: Some(Fetch {
+                        quantity: Some(number("4", start + 20)),
+                        percent: true,
+                        with_ties: true,
+                        span: span(start + 21),
+                    }),
+                },
                 span: span(start + 14),
             }))),
-            order_by: vec![OrderByExpr {
-                expr: Expr::Identifier(ident("result", start + 15)),
-                asc: Some(false),
-                nulls_first: Some(true),
-                span: span(start + 16),
-            }],
-            limit: Some(number("10", start + 17)),
-            offset: Some(Offset {
-                value: number("3", start + 18),
-                rows: OffsetRows::Rows,
-                span: span(start + 19),
-            }),
-            limit_comma_offset: false,
-            fetch: Some(Fetch {
-                quantity: Some(number("4", start + 20)),
-                percent: true,
-                with_ties: true,
-                span: span(start + 21),
-            }),
+            modifiers: Default::default(),
             span: span(start + 22),
         }
     }
@@ -933,7 +939,15 @@ mod tests {
     fn recursive_comparison_preserves_nested_syntax_facts() {
         let left = sample_query(0);
         let mut right = sample_query(1_000);
-        right.fetch.as_mut().expect("fixture has fetch").with_ties = false;
+        let SetExpr::Select(select) = right.body.as_mut() else {
+            panic!("SELECT")
+        };
+        select
+            .modifiers
+            .fetch
+            .as_mut()
+            .expect("fixture has fetch")
+            .with_ties = false;
 
         assert!(!syntax_eq_query(&left, &right));
     }

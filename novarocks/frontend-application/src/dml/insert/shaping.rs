@@ -129,11 +129,12 @@ fn shape_insert_source_in(
     String,
 > {
     let uncontrolled_values = matches!(source.body.as_ref(), ast::SetExpr::Values(_))
+        && source.functions.is_empty()
         && source.with.is_none()
-        && source.order_by.is_empty()
-        && source.limit.is_none()
-        && source.offset.is_none()
-        && source.fetch.is_none();
+        && source.modifiers.order_by.is_empty()
+        && source.modifiers.limit.is_none()
+        && source.modifiers.offset.is_none()
+        && source.modifiers.fetch.is_none();
     if (typed_write && !uncontrolled_values) || (!uncontrolled_values && !literal_query(source)) {
         return Ok(None);
     }
@@ -1119,11 +1120,12 @@ pub(crate) fn attach_write_literal_contexts(
 /// Keep early assignment within the original literal INSERT sources. Source
 /// controls retain their independent inference above this boundary.
 fn source_assignment_before_common_type(query: &ast::Query) -> bool {
-    if query.with.is_some()
-        || !query.order_by.is_empty()
-        || query.limit.is_some()
-        || query.offset.is_some()
-        || query.fetch.is_some()
+    if !query.functions.is_empty()
+        || query.with.is_some()
+        || !query.modifiers.order_by.is_empty()
+        || query.modifiers.limit.is_some()
+        || query.modifiers.offset.is_some()
+        || query.modifiers.fetch.is_some()
     {
         return false;
     }
@@ -1131,7 +1133,8 @@ fn source_assignment_before_common_type(query: &ast::Query) -> bool {
         match body {
             ast::SetExpr::Values(_) => true,
             ast::SetExpr::Select(select) => {
-                select.from.is_empty()
+                select.modifiers.is_empty()
+                    && select.from.is_empty()
                     && !matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. })
                     && select.selection.is_none()
                     && matches!(select.group_by, ast::GroupBy::None)
@@ -1431,10 +1434,15 @@ mod typed_write_source_tests {
         use ast::SyntaxEq;
         let columns = vec![column("p", DataType::Int64)];
         for sql in [
+            "SELECT '1' AS p LIMIT 0",
+            "SELECT '1' AS p OFFSET 1",
+            "SELECT '1' AS p ORDER BY p",
+            "SELECT '1' AS p FETCH FIRST 1 ROW ONLY",
             "SELECT DISTINCT '1' AS p ORDER BY p LIMIT 1",
             "SELECT '1' AS p UNION SELECT '01' AS p",
         ] {
             let source = query(sql);
+            assert!(!source_assignment_before_common_type(&source), "{sql}");
             assert!(
                 shape_typed_write_source(&source, &[], &columns, &columns, None)
                     .unwrap()

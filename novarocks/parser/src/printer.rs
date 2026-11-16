@@ -194,16 +194,20 @@ impl Printer {
             self.output.push(' ');
         }
         self.write_set_expr_with_properties(&query.body, properties);
-        if !query.order_by.is_empty() {
+        self.write_query_modifiers(&query.modifiers);
+    }
+
+    fn write_query_modifiers(&mut self, modifiers: &QueryModifiers) {
+        if !modifiers.order_by.is_empty() {
             self.output.push_str(" ORDER BY ");
-            self.write_order_by_list(&query.order_by);
+            self.write_order_by_list(&modifiers.order_by);
         }
-        if query.limit_comma_offset {
-            let offset = query
+        if modifiers.limit_comma_offset {
+            let offset = modifiers
                 .offset
                 .as_ref()
                 .expect("comma LIMIT syntax requires an offset");
-            let limit = query
+            let limit = modifiers
                 .limit
                 .as_ref()
                 .expect("comma LIMIT syntax requires a limit");
@@ -211,12 +215,12 @@ impl Printer {
             self.write_expr(&offset.value);
             self.output.push_str(", ");
             self.write_expr(limit);
-        } else if let Some(limit) = &query.limit {
+        } else if let Some(limit) = &modifiers.limit {
             self.output.push_str(" LIMIT ");
             self.write_expr(limit);
         }
-        if !query.limit_comma_offset
-            && let Some(offset) = &query.offset
+        if !modifiers.limit_comma_offset
+            && let Some(offset) = &modifiers.offset
         {
             self.output.push_str(" OFFSET ");
             self.write_expr(&offset.value);
@@ -226,7 +230,7 @@ impl Printer {
                 OffsetRows::Rows => self.output.push_str(" ROWS"),
             }
         }
-        if let Some(fetch) = &query.fetch {
+        if let Some(fetch) = &modifiers.fetch {
             self.write_fetch(fetch);
         }
     }
@@ -397,6 +401,7 @@ impl Printer {
                 self.write_window_specification(&named.specification);
             }
         }
+        self.write_query_modifiers(&select.modifiers);
     }
 
     fn write_session_properties(&mut self, properties: &[SessionProperty]) {
@@ -1832,11 +1837,7 @@ mod tests {
                             explicit_row: false,
                             span: span(),
                         })),
-                        order_by: Vec::new(),
-                        limit: None,
-                        offset: None,
-                        limit_comma_offset: false,
-                        fetch: None,
+                        modifiers: Default::default(),
                         span: span(),
                     }),
                     span: span(),
@@ -1875,27 +1876,30 @@ mod tests {
                 having: None,
                 qualify: None,
                 windows: Vec::new(),
+                modifiers: QueryModifiers {
+                    order_by: vec![OrderByExpr {
+                        expr: identifier("value"),
+                        asc: Some(false),
+                        nulls_first: Some(false),
+                        span: span(),
+                    }],
+                    limit: Some(number("10")),
+                    offset: Some(Offset {
+                        value: number("2"),
+                        rows: OffsetRows::Rows,
+                        span: span(),
+                    }),
+                    limit_comma_offset: false,
+                    fetch: Some(Fetch {
+                        quantity: Some(number("3")),
+                        percent: false,
+                        with_ties: false,
+                        span: span(),
+                    }),
+                },
                 span: span(),
             }))),
-            order_by: vec![OrderByExpr {
-                expr: identifier("value"),
-                asc: Some(false),
-                nulls_first: Some(false),
-                span: span(),
-            }],
-            limit: Some(number("10")),
-            offset: Some(Offset {
-                value: number("2"),
-                rows: OffsetRows::Rows,
-                span: span(),
-            }),
-            limit_comma_offset: false,
-            fetch: Some(Fetch {
-                quantity: Some(number("3")),
-                percent: false,
-                with_ties: false,
-                span: span(),
-            }),
+            modifiers: Default::default(),
             span: span(),
         };
 

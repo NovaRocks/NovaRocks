@@ -150,19 +150,29 @@ where
 }
 
 fn validate_mv_select_raw_query_clauses(query: &Query) -> Result<(), String> {
+    if !query.functions.is_empty() {
+        return Err(unsupported_mv_query_clause("inline functions"));
+    }
     if query.with.is_some() {
         return Err(unsupported_mv_query_clause("WITH"));
     }
-    if !query.order_by.is_empty() {
+    validate_mv_query_modifiers(&query.modifiers)?;
+    validate_mv_select_raw_clauses_in_set_expr(query.body.as_ref())
+}
+
+fn validate_mv_query_modifiers(
+    modifiers: &novarocks_parser::ast::QueryModifiers,
+) -> Result<(), String> {
+    if !modifiers.order_by.is_empty() {
         return Err(unsupported_mv_query_clause("ORDER BY"));
     }
-    if query.limit.is_some() || query.offset.is_some() {
+    if modifiers.limit.is_some() || modifiers.offset.is_some() {
         return Err(unsupported_mv_query_clause("LIMIT or OFFSET"));
     }
-    if query.fetch.is_some() {
+    if modifiers.fetch.is_some() {
         return Err(unsupported_mv_query_clause("FETCH"));
     }
-    validate_mv_select_raw_clauses_in_set_expr(query.body.as_ref())
+    Ok(())
 }
 
 fn validate_mv_select_raw_clauses_in_set_expr(expr: &SetExpr) -> Result<(), String> {
@@ -188,6 +198,7 @@ fn validate_mv_select_raw_clauses_in_set_expr(expr: &SetExpr) -> Result<(), Stri
 fn validate_mv_select_raw_select_clauses(
     select: &novarocks_parser::ast::Select,
 ) -> Result<(), String> {
+    validate_mv_query_modifiers(&select.modifiers)?;
     if !select.windows.is_empty() {
         return Err(unsupported_mv_select_clause("named WINDOW clauses"));
     }

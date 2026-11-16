@@ -3070,6 +3070,7 @@ impl<'a> AnalyzerContext<'a> {
         query: &ast::Query,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
+        let modifiers = super::helpers::query_modifiers(query)?;
         let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
             let (child_ctx, local_cte_ids) = self.build_with_clause_context(with_clause)?;
             (Some(child_ctx), local_cte_ids)
@@ -3089,12 +3090,13 @@ impl<'a> AnalyzerContext<'a> {
                     ctx.analyze_select_with_outer_scope(s, outer_scope)?;
                 let body = QueryBody::Select(sel);
 
-                let order_by = ctx.analyze_order_by(query, &cols, &body)?;
+                let order_by =
+                    ctx.analyze_order_by(&modifiers.order_by, select, query.span, &cols, &body)?;
                 if let QueryBody::Select(select) = &body {
                     ctx.validate_grouping_calls(&select.group_by)?;
                 }
-                let limit = super::helpers::extract_limit(query)?;
-                let offset = super::helpers::extract_offset(query)?;
+                let limit = super::helpers::extract_limit(modifiers)?;
+                let offset = super::helpers::extract_offset(modifiers)?;
 
                 Ok((
                     ResolvedQuery {
@@ -3110,9 +3112,10 @@ impl<'a> AnalyzerContext<'a> {
             }
             _ => {
                 let (body, cols) = ctx.analyze_set_expr(body)?;
-                let order_by = ctx.analyze_order_by(query, &cols, &body)?;
-                let limit = super::helpers::extract_limit(query)?;
-                let offset = super::helpers::extract_offset(query)?;
+                let order_by =
+                    ctx.analyze_order_by(&modifiers.order_by, select, query.span, &cols, &body)?;
+                let limit = super::helpers::extract_limit(modifiers)?;
+                let offset = super::helpers::extract_offset(modifiers)?;
 
                 Ok((
                     ResolvedQuery {

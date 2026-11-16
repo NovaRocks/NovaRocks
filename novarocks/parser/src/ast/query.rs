@@ -19,13 +19,29 @@ pub struct Query {
     pub functions: Vec<super::FunctionSpecification>,
     pub with: Option<With>,
     pub body: Box<SetExpr>,
+    pub modifiers: QueryModifiers,
+    pub span: Span,
+}
+
+/// Suffix clauses owned by either a query or its direct specification.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryModifiers {
     pub order_by: Vec<OrderByExpr>,
     pub limit: Option<Expr>,
     pub offset: Option<Offset>,
     /// Whether this query used MySQL `LIMIT offset, count` spelling.
     pub limit_comma_offset: bool,
     pub fetch: Option<Fetch>,
-    pub span: Span,
+}
+
+impl QueryModifiers {
+    pub fn is_empty(&self) -> bool {
+        self.order_by.is_empty()
+            && self.limit.is_none()
+            && self.offset.is_none()
+            && self.fetch.is_none()
+            && !self.limit_comma_offset
+    }
 }
 
 /// A query-local session assignment. Evaluation belongs to statement admission.
@@ -142,6 +158,7 @@ pub struct Select {
     pub having: Option<Expr>,
     pub qualify: Option<Expr>,
     pub windows: Vec<NamedWindow>,
+    pub modifiers: QueryModifiers,
     pub span: Span,
 }
 

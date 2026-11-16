@@ -310,16 +310,20 @@ pub fn walk_query<V: Visit + ?Sized>(visitor: &mut V, query: &Query) {
         }
     }
     walk_set_expr(visitor, &query.body);
-    for order in &query.order_by {
+    walk_query_modifiers(visitor, &query.modifiers);
+}
+
+pub fn walk_query_modifiers<V: Visit + ?Sized>(visitor: &mut V, modifiers: &QueryModifiers) {
+    for order in &modifiers.order_by {
         visitor.visit_expr(&order.expr);
     }
-    if let Some(limit) = &query.limit {
+    if let Some(limit) = &modifiers.limit {
         visitor.visit_expr(limit);
     }
-    if let Some(offset) = &query.offset {
+    if let Some(offset) = &modifiers.offset {
         visitor.visit_expr(&offset.value);
     }
-    if let Some(fetch) = &query.fetch
+    if let Some(fetch) = &modifiers.fetch
         && let Some(quantity) = &fetch.quantity
     {
         visitor.visit_expr(quantity);
@@ -396,6 +400,7 @@ pub fn walk_select<V: Visit + ?Sized>(visitor: &mut V, select: &Select) {
     for window in &select.windows {
         walk_named_window(visitor, window);
     }
+    walk_query_modifiers(visitor, &select.modifiers);
 }
 
 pub fn walk_group_by<V: Visit + ?Sized>(visitor: &mut V, group_by: &GroupBy) {
@@ -1087,7 +1092,15 @@ pub fn fold_query<F: Fold + ?Sized>(folder: &mut F, mut query: Query) -> Query {
         with
     });
     query.body = Box::new(fold_set_expr(folder, *query.body));
-    query.order_by = query
+    query.modifiers = fold_query_modifiers(folder, query.modifiers);
+    query
+}
+
+pub fn fold_query_modifiers<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut modifiers: QueryModifiers,
+) -> QueryModifiers {
+    modifiers.order_by = modifiers
         .order_by
         .into_iter()
         .map(|mut order| {
@@ -1095,16 +1108,16 @@ pub fn fold_query<F: Fold + ?Sized>(folder: &mut F, mut query: Query) -> Query {
             order
         })
         .collect();
-    query.limit = query.limit.map(|limit| folder.fold_expr(limit));
-    query.offset = query.offset.map(|mut offset| {
+    modifiers.limit = modifiers.limit.map(|limit| folder.fold_expr(limit));
+    modifiers.offset = modifiers.offset.map(|mut offset| {
         offset.value = folder.fold_expr(offset.value);
         offset
     });
-    query.fetch = query.fetch.map(|mut fetch| {
+    modifiers.fetch = modifiers.fetch.map(|mut fetch| {
         fetch.quantity = fetch.quantity.map(|quantity| folder.fold_expr(quantity));
         fetch
     });
-    query
+    modifiers
 }
 
 pub fn fold_set_expr<F: Fold + ?Sized>(folder: &mut F, set_expr: SetExpr) -> SetExpr {
@@ -1195,6 +1208,7 @@ pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Sele
         .into_iter()
         .map(|window| fold_named_window(folder, window))
         .collect();
+    select.modifiers = fold_query_modifiers(folder, select.modifiers);
     select
 }
 

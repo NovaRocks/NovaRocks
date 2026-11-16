@@ -99,11 +99,7 @@ fn construction_only_empty_lists_retain_the_generic_structure_code() {
             explicit_row: false,
             span: SPAN,
         })),
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        limit_comma_offset: false,
-        fetch: None,
+        modifiers: Default::default(),
         span: SPAN,
     });
     let error = validate_statement(&statement).expect_err("empty VALUES rows are invalid AST");
@@ -178,13 +174,10 @@ fn select_statement(windows: Vec<NamedWindow>) -> Statement {
             having: None,
             qualify: None,
             windows,
+            modifiers: Default::default(),
             span: SPAN,
         }))),
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        limit_comma_offset: false,
-        fetch: None,
+        modifiers: Default::default(),
         span: SPAN,
     })
 }

@@ -70,6 +70,12 @@ fn validate_create_table(table: &super::CreateTable) -> Result<(), ValidateError
 }
 
 fn validate_query(query: &Query) -> Result<(), ValidateError> {
+    if matches!(query.body.as_ref(), SetExpr::Select(_)) && !query.modifiers.is_empty() {
+        return Err(ValidateError::invalid_structure(
+            StructuralViolation::InvalidQueryModifierOwner,
+            query.span,
+        ));
+    }
     for function in &query.functions {
         struct FunctionExpressions(Result<(), ValidateError>);
         impl super::Visit for FunctionExpressions {
@@ -99,16 +105,21 @@ fn validate_query(query: &Query) -> Result<(), ValidateError> {
         }
     }
     validate_set_expr(&query.body)?;
-    for order_by in &query.order_by {
+    validate_query_modifiers(&query.modifiers)?;
+    Ok(())
+}
+
+fn validate_query_modifiers(modifiers: &super::QueryModifiers) -> Result<(), ValidateError> {
+    for order_by in &modifiers.order_by {
         validate_expr(&order_by.expr)?;
     }
-    if let Some(limit) = &query.limit {
+    if let Some(limit) = &modifiers.limit {
         validate_expr(limit)?;
     }
-    if let Some(offset) = &query.offset {
+    if let Some(offset) = &modifiers.offset {
         validate_expr(&offset.value)?;
     }
-    if let Some(fetch) = &query.fetch
+    if let Some(fetch) = &modifiers.fetch
         && let Some(quantity) = &fetch.quantity
     {
         validate_expr(quantity)?;
@@ -213,6 +224,7 @@ fn validate_select(select: &Select) -> Result<(), ValidateError> {
         validate_expr(qualify)?;
     }
     validate_group_by(&select.group_by)?;
+    validate_query_modifiers(&select.modifiers)?;
     Ok(())
 }
 

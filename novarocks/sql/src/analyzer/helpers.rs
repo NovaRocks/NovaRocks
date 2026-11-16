@@ -1711,15 +1711,30 @@ fn lowercase_leading_keyword(display: &str) -> String {
 // LIMIT / OFFSET extraction
 // ---------------------------------------------------------------------------
 
-pub(super) fn extract_limit(query: &ast::Query) -> Result<Option<i64>, AnalyzeError> {
-    match &query.limit {
+pub(super) fn query_modifiers(query: &ast::Query) -> Result<&ast::QueryModifiers, AnalyzeError> {
+    match query.body.as_ref() {
+        ast::SetExpr::Select(select) => {
+            if !query.modifiers.is_empty() {
+                return Err(AnalyzeError::invalid_query_shape(
+                    "direct SELECT modifiers must belong to the query specification",
+                    query.span,
+                ));
+            }
+            Ok(&select.modifiers)
+        }
+        _ => Ok(&query.modifiers),
+    }
+}
+
+pub(super) fn extract_limit(modifiers: &ast::QueryModifiers) -> Result<Option<i64>, AnalyzeError> {
+    match &modifiers.limit {
         Some(limit) => eval_limit_or_offset(limit, "LIMIT").map(Some),
         None => Ok(None),
     }
 }
 
-pub(super) fn extract_offset(query: &ast::Query) -> Result<Option<i64>, AnalyzeError> {
-    match &query.offset {
+pub(super) fn extract_offset(modifiers: &ast::QueryModifiers) -> Result<Option<i64>, AnalyzeError> {
+    match &modifiers.offset {
         Some(offset) => eval_limit_or_offset(&offset.value, "OFFSET").map(Some),
         None => Ok(None),
     }
