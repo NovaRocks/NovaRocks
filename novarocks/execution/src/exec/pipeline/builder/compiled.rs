@@ -390,10 +390,9 @@ fn validate_compiled_runtime_filter_bindings(
     Ok(())
 }
 
-/// The blocking membership consumers of one compiled scan, keyed by the
-/// scan's `RuntimeFilter { binding }` roots over its own output. This
-/// milestone executes BlockingSnapshot membership (SetUnion) consumers
-/// only; an ordered-domain or NonBlockingLive consumer is refused by name.
+/// The membership consumers of one compiled scan, keyed by its own output
+/// roots. Complete-once SetUnion accepts blocking snapshots or Batch live
+/// delivery of the final snapshot; ordered domains have their own owner.
 fn compiled_runtime_filter_consumers(
     owner: &'static str,
     display_owner: &'static str,
@@ -416,7 +415,7 @@ fn compiled_runtime_filter_consumers(
 }
 
 /// The ordered Scan keeps full-list root ordinals while sharing the original
-/// blocking membership gate and contract author.
+/// membership contract author and blocking or Batch live activation.
 fn compiled_runtime_filter_consumers_selected(
     owner: &'static str,
     display_owner: &'static str,
@@ -446,7 +445,9 @@ fn compiled_runtime_filter_consumers_selected(
                 ),
             ));
         }
-        if let FilterConsumerActivation::NonBlockingLive { late_apply } = consumer.activation() {
+        if let FilterConsumerActivation::NonBlockingLive { late_apply } = consumer.activation()
+            && late_apply != novarocks_local_program::FilterLateApplyGranularity::Batch
+        {
             return Err(program_failure(
                 FragmentBindingErrorKind::InvalidAssignment,
                 format!(
