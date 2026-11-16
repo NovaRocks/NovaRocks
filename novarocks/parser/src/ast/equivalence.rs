@@ -98,13 +98,20 @@ impl SyntaxEq for ExplainQuery {
 
 impl SyntaxEq for Query {
     fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_option(&self.with, &other.with)
+        syntax_eq_slice(&self.session_properties, &other.session_properties)
+            && syntax_eq_option(&self.with, &other.with)
             && self.body.syntax_eq(&other.body)
             && syntax_eq_slice(&self.order_by, &other.order_by)
             && syntax_eq_option(&self.limit, &other.limit)
             && syntax_eq_option(&self.offset, &other.offset)
             && self.limit_comma_offset == other.limit_comma_offset
             && syntax_eq_option(&self.fetch, &other.fetch)
+    }
+}
+
+impl SyntaxEq for SessionProperty {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.name.syntax_eq(&other.name) && self.value.syntax_eq(&other.value)
     }
 }
 
@@ -151,8 +158,7 @@ impl SyntaxEq for Values {
 
 impl SyntaxEq for Select {
     fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_slice(&self.hints, &other.hints)
-            && self.quantifier.syntax_eq(&other.quantifier)
+        self.quantifier.syntax_eq(&other.quantifier)
             && syntax_eq_slice(&self.projection, &other.projection)
             && syntax_eq_slice(&self.from, &other.from)
             && syntax_eq_option(&self.selection, &other.selection)
@@ -160,27 +166,6 @@ impl SyntaxEq for Select {
             && syntax_eq_option(&self.having, &other.having)
             && syntax_eq_option(&self.qualify, &other.qualify)
             && syntax_eq_slice(&self.windows, &other.windows)
-    }
-}
-
-impl SyntaxEq for SelectHint {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.name.syntax_eq(&other.name) && self.value.syntax_eq(&other.value)
-    }
-}
-
-impl SyntaxEq for SelectHintValue {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Bare, Self::Bare) => true,
-            (Self::Call { arguments: left }, Self::Call { arguments: right }) => {
-                syntax_eq_slice(left, right)
-            }
-            (Self::Assignment { value: left }, Self::Assignment { value: right }) => {
-                left.syntax_eq(right)
-            }
-            _ => false,
-        }
     }
 }
 
@@ -855,12 +840,14 @@ mod tests {
 
     fn sample_query(start: usize) -> Query {
         Query {
+            session_properties: Vec::new(),
             with: Some(With {
                 recursive: true,
                 ctes: vec![Cte {
                     name: ident("seed", start),
                     columns: vec![ident("value", start + 1)],
                     query: Box::new(Query {
+                        session_properties: Vec::new(),
                         with: None,
                         body: Box::new(SetExpr::Values(Values {
                             rows: vec![vec![number("1", start + 2)]],
@@ -879,7 +866,6 @@ mod tests {
                 span: span(start + 6),
             }),
             body: Box::new(SetExpr::Select(Box::new(Select {
-                hints: Vec::new(),
                 quantifier: SelectQuantifier::Distinct {
                     on: vec![sample_expr(start + 7)],
                     span: span(start + 8),

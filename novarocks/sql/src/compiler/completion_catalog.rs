@@ -500,6 +500,9 @@ impl<'a> CatalogNeedCollector<'a> {
         outer_scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
         self.step()?;
+        for property in &query.session_properties {
+            self.collect_expr(&property.value, outer_scope)?;
+        }
         let mut body_scope = outer_scope.clone();
         if let Some(with) = &query.with {
             let local_names = with
@@ -568,17 +571,6 @@ impl<'a> CatalogNeedCollector<'a> {
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
         self.step()?;
-        for hint in &select.hints {
-            match &hint.value {
-                ast::SelectHintValue::Bare => {}
-                ast::SelectHintValue::Call { arguments } => {
-                    for argument in arguments {
-                        self.collect_expr(argument, scope)?;
-                    }
-                }
-                ast::SelectHintValue::Assignment { value } => self.collect_expr(value, scope)?,
-            }
-        }
         if let ast::SelectQuantifier::Distinct { on, .. } = &select.quantifier {
             for expression in on {
                 self.collect_expr(expression, scope)?;

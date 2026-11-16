@@ -3062,10 +3062,7 @@ impl<'a> AnalyzerContext<'a> {
         query: &ast::Query,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
-        let settings = crate::sql_mode::query_sql_semantics(&self.sql_semantics, query)?;
-        self.with_sql_semantics_scope(settings, |ctx| {
-            ctx.analyze_query_with_outer_scope_in_semantic_scope(query, outer_scope)
-        })
+        self.analyze_query_with_outer_scope_in_semantic_scope(query, outer_scope)
     }
 
     fn analyze_query_with_outer_scope_in_semantic_scope(
@@ -3145,10 +3142,7 @@ impl<'a> AnalyzerContext<'a> {
         select: &ast::Select,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>, AnalyzerScope), AnalyzeError> {
-        let settings = crate::sql_mode::select_sql_semantics(&self.sql_semantics, select)?;
-        self.with_sql_semantics_scope(settings, |ctx| {
-            ctx.analyze_select_with_outer_scope_in_semantic_scope(select, outer_scope)
-        })
+        self.analyze_select_with_outer_scope_in_semantic_scope(select, outer_scope)
     }
 
     fn analyze_select_with_outer_scope_in_semantic_scope(

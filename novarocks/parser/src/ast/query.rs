@@ -14,6 +14,8 @@ use crate::{
 /// One top-level query expression and its query-level modifiers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Query {
+    /// Overrides belonging to the root query, before its CTEs and body.
+    pub session_properties: Vec<SessionProperty>,
     pub with: Option<With>,
     pub body: Box<SetExpr>,
     pub order_by: Vec<OrderByExpr>,
@@ -22,6 +24,14 @@ pub struct Query {
     /// Whether this query used MySQL `LIMIT offset, count` spelling.
     pub limit_comma_offset: bool,
     pub fetch: Option<Fetch>,
+    pub span: Span,
+}
+
+/// A query-local session assignment. Evaluation belongs to statement admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionProperty {
+    pub name: super::ObjectName,
+    pub value: Expr,
     pub span: Span,
 }
 
@@ -118,11 +128,6 @@ pub struct Values {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Select {
-    /// Optimizer directives attached to this `SELECT` by `/*+ ... */` syntax.
-    ///
-    /// These remain syntax facts only: they do not grant the parser, planner,
-    /// or execution owner any capability.
-    pub hints: Vec<SelectHint>,
     pub quantifier: SelectQuantifier,
     pub projection: Vec<SelectItem>,
     pub from: Vec<TableWithJoins>,
@@ -132,26 +137,6 @@ pub struct Select {
     pub qualify: Option<Expr>,
     pub windows: Vec<NamedWindow>,
     pub span: Span,
-}
-
-/// One structured optimizer directive in a `SELECT /*+ ... */` comment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SelectHint {
-    pub name: Ident,
-    pub value: SelectHintValue,
-    pub span: Span,
-}
-
-/// The typed payload shape of a [`SelectHint`].
-///
-/// Keep assignment-style directives distinct from function-style directives:
-/// `new_planner_agg_stage = 3` is not a function call and must not be
-/// reconstructed from opaque comment text.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SelectHintValue {
-    Bare,
-    Call { arguments: Vec<Expr> },
-    Assignment { value: Expr },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

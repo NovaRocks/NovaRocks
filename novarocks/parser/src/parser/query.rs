@@ -20,14 +20,34 @@
 use crate::{
     Span, Token, TokenKind,
     ast::{
-        Cte, ExplainFormat, ExplainQuery, Expr, Fetch, GroupBy, Join, JoinConstraint, JoinOperator,
-        NamedWindow, Offset, OffsetRows, OrderByExpr, Query, Select, SelectHint, SelectHintValue,
-        SelectItem, SelectQuantifier, SetExpr, SetOperation, SetOperator, SetQuantifier, Statement,
+        Cte, ExplainFormat, ExplainQuery, Expr, Fetch, GroupBy, Ident, Join, JoinConstraint,
+        JoinOperator, NamedWindow, Offset, OffsetRows, OrderByExpr, Query, Select, SelectItem,
+        SelectQuantifier, SetExpr, SetOperation, SetOperator, SetQuantifier, Statement,
         TableFactor, TableVersion, TableVersionKind, TableWithJoins, Values, WildcardOptions, With,
     },
     lex,
     token::{Keyword, Symbol},
 };
+
+/// One structured optimizer directive in a `SELECT /*+ ... */` comment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SelectHint {
+    name: Ident,
+    value: SelectHintValue,
+    span: Span,
+}
+
+/// The typed payload shape of a [`SelectHint`].
+///
+/// Keep assignment-style directives distinct from function-style directives:
+/// `new_planner_agg_stage = 3` is not a function call and must not be
+/// reconstructed from opaque comment text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SelectHintValue {
+    Bare,
+    Call { arguments: Vec<Expr> },
+    Assignment { value: Expr },
+}
 
 use super::{
     StatementParser,
@@ -134,7 +154,7 @@ pub(super) fn parse_query(
     } else {
         None
     };
-    let mut body = parse_set_expr(parser)?;
+    let (mut body, mut session_properties) = parse_set_expr(parser)?;
     while let Some(operator) = parse_set_operator(parser) {
         let operator_start = body.span().start();
         let quantifier = if parser.consume_if_word("ALL") {
@@ -144,7 +164,8 @@ pub(super) fn parse_query(
         } else {
             SetQuantifier::None
         };
-        let right = parse_set_expr(parser)?;
+        let (right, _) = parse_set_expr(parser)?;
+        session_properties.clear();
         if operator != SetOperator::Union || quantifier != SetQuantifier::All {
             body = balance_union_all(body);
         }
@@ -240,6 +261,7 @@ pub(super) fn parse_query(
         )
         .end();
     Ok(Query {
+        session_properties,
         with,
         body: Box::new(body),
         order_by,
@@ -249,6 +271,64 @@ pub(super) fn parse_query(
         fetch,
         span: Span::new(start, end),
     })
+}
+
+// The old entry remains active until cutover. Only a root SELECT hint maps
+// into the query assignment vocabulary; set-operation branches are local.
+fn legacy_session_properties(hints: &[SelectHint]) -> Vec<crate::ast::SessionProperty> {
+    let mut properties = Vec::new();
+    for hint in hints {
+        match &hint.value {
+            SelectHintValue::Call { arguments }
+                if hint.name.value.eq_ignore_ascii_case("set_var") =>
+            {
+                for argument in arguments {
+                    let (name, value) = match argument {
+                        Expr::Binary(binary) => (
+                            &*binary.left,
+                            if binary.operator == crate::ast::BinaryOperator::Equal {
+                                &*binary.right
+                            } else {
+                                argument
+                            },
+                        ),
+                        other => (other, other),
+                    };
+                    let name = match name {
+                        Expr::Identifier(name) => name.clone(),
+                        Expr::Literal(crate::ast::Literal {
+                            kind: crate::ast::LiteralKind::String(value),
+                            span,
+                        }) => crate::ast::Ident {
+                            value: value.clone(),
+                            quoted: false,
+                            quote_style: None,
+                            span: *span,
+                        },
+                        _ => continue,
+                    };
+                    properties.push(crate::ast::SessionProperty {
+                        span: name.span.cover(value.span()),
+                        name: crate::ast::ObjectName {
+                            span: name.span,
+                            parts: vec![name],
+                        },
+                        value: value.clone(),
+                    });
+                }
+            }
+            SelectHintValue::Assignment { value } => properties.push(crate::ast::SessionProperty {
+                name: crate::ast::ObjectName {
+                    parts: vec![hint.name.clone()],
+                    span: hint.name.span,
+                },
+                value: value.clone(),
+                span: hint.span,
+            }),
+            _ => {}
+        }
+    }
+    properties
 }
 
 fn parse_with(
@@ -272,7 +352,8 @@ fn parse_with(
         }
         parser.consume_word("AS")?;
         parser.consume_symbol(Symbol::LParen)?;
-        let query = parse_query(parser)?;
+        let mut query = parse_query(parser)?;
+        query.session_properties.clear();
         let end = parser.consume_symbol(Symbol::RParen)?.end();
         ctes.push(Cte {
             name,
@@ -292,18 +373,25 @@ fn parse_with(
     })
 }
 
-fn parse_set_expr(parser: &mut StatementParser<'_, '_>) -> Result<SetExpr, crate::ParseError> {
+fn parse_set_expr(
+    parser: &mut StatementParser<'_, '_>,
+) -> Result<(SetExpr, Vec<crate::ast::SessionProperty>), crate::ParseError> {
     if parser.current_is_keyword(Keyword::Select) {
-        return Ok(SetExpr::Select(Box::new(parse_select(parser)?)));
+        let (select, hints) = parse_select(parser)?;
+        return Ok((
+            SetExpr::Select(Box::new(select)),
+            legacy_session_properties(&hints),
+        ));
     }
     if parser.current_is_keyword(Keyword::Values) {
-        return Ok(SetExpr::Values(parse_values(parser)?));
+        return Ok((SetExpr::Values(parse_values(parser)?), Vec::new()));
     }
     if parser.current_is_symbol(Symbol::LParen) {
         parser.consume_symbol(Symbol::LParen)?;
-        let query = parse_query(parser)?;
+        let mut query = parse_query(parser)?;
+        let properties = std::mem::take(&mut query.session_properties);
         parser.consume_symbol(Symbol::RParen)?;
-        return Ok(SetExpr::Query(Box::new(query)));
+        return Ok((SetExpr::Query(Box::new(query)), properties));
     }
     Err(parser.unexpected("SELECT, VALUES, or parenthesized query"))
 }
@@ -320,7 +408,9 @@ fn parse_set_operator(parser: &mut StatementParser<'_, '_>) -> Option<SetOperato
     }
 }
 
-fn parse_select(parser: &mut StatementParser<'_, '_>) -> Result<Select, crate::ParseError> {
+fn parse_select(
+    parser: &mut StatementParser<'_, '_>,
+) -> Result<(Select, Vec<SelectHint>), crate::ParseError> {
     let select = parser.consume_word("SELECT")?;
     let start = select.start();
     let hints = parse_select_hints(parser, select)?;
@@ -396,18 +486,20 @@ fn parse_select(parser: &mut StatementParser<'_, '_>) -> Result<Select, crate::P
             },
             |expr| expr.span().end(),
         );
-    Ok(Select {
+    Ok((
+        Select {
+            quantifier,
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            qualify,
+            windows,
+            span: Span::new(start, end),
+        },
         hints,
-        quantifier,
-        projection,
-        from,
-        selection,
-        group_by,
-        having,
-        qualify,
-        windows,
-        span: Span::new(start, end),
-    })
+    ))
 }
 
 /// Parses typed optimizer directives embedded in trivia immediately following
@@ -806,7 +898,8 @@ fn parse_table_factor(
         {
             return Err(parser.unexpected("query after '(' in FROM"));
         }
-        let subquery = parse_query(parser)?;
+        let mut subquery = parse_query(parser)?;
+        subquery.session_properties.clear();
         let end = parser.consume_symbol(Symbol::RParen)?.end();
         let alias = parse_optional_table_alias(parser)?;
         let span_end = alias.as_ref().map_or(end, |alias| alias.span.end());

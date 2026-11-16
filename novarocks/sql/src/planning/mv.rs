@@ -3019,7 +3019,8 @@ fn join_projection_filter_error() -> String {
 }
 
 fn reject_unsupported_query_clauses(query: &Query) -> Result<(), String> {
-    if query.with.is_some()
+    if !query.session_properties.is_empty()
+        || query.with.is_some()
         || !query.order_by.is_empty()
         || query.limit.is_some()
         || query.offset.is_some()
@@ -3031,12 +3032,10 @@ fn reject_unsupported_query_clauses(query: &Query) -> Result<(), String> {
 }
 
 fn reject_unsupported_select_clauses(select: &Select) -> Result<(), String> {
-    if !select.hints.is_empty()
-        || !matches!(
-            select.quantifier,
-            ast::SelectQuantifier::None | ast::SelectQuantifier::All(_)
-        )
-        || !matches!(select.group_by, ast::GroupBy::None)
+    if !matches!(
+        select.quantifier,
+        ast::SelectQuantifier::None | ast::SelectQuantifier::All(_)
+    ) || !matches!(select.group_by, ast::GroupBy::None)
         || select.having.is_some()
         || !select.windows.is_empty()
         || select.qualify.is_some()
@@ -3047,12 +3046,10 @@ fn reject_unsupported_select_clauses(select: &Select) -> Result<(), String> {
 }
 
 fn reject_unsupported_aggregate_select_clauses(select: &Select) -> Result<(), String> {
-    if !select.hints.is_empty()
-        || !matches!(
-            select.quantifier,
-            ast::SelectQuantifier::None | ast::SelectQuantifier::All(_)
-        )
-        || select.having.is_some()
+    if !matches!(
+        select.quantifier,
+        ast::SelectQuantifier::None | ast::SelectQuantifier::All(_)
+    ) || select.having.is_some()
         || !select.windows.is_empty()
         || select.qualify.is_some()
     {

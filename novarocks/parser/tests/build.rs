@@ -70,6 +70,69 @@ fn select_body(value: i64) -> SetExpr {
 }
 
 #[test]
+fn query_session_assignments_preserve_names_values_and_traversal() {
+    use ast::{Fold, Literal, LiteralKind, Visit};
+
+    let mut built = build::query(select_body(1));
+    built.session_properties.push(ast::SessionProperty {
+        name: build::object_name(vec![
+            build::ident("iceberg", None),
+            build::ident("property", None),
+        ])
+        .unwrap(),
+        value: build::integer(5),
+        span: SYNTHETIC,
+    });
+    #[derive(Default)]
+    struct Facts {
+        names: Vec<String>,
+        numbers: Vec<String>,
+    }
+    impl Visit for Facts {
+        fn visit_ident(&mut self, ident: &ast::Ident) {
+            self.names.push(ident.value.clone());
+        }
+        fn visit_literal(&mut self, literal: &Literal) {
+            if let LiteralKind::Number(value) = &literal.kind {
+                self.numbers.push(value.clone());
+            }
+        }
+    }
+    let mut facts = Facts::default();
+    facts.visit_query(&built);
+    assert_eq!(facts.names, ["iceberg", "property"]);
+    assert_eq!(facts.numbers, ["5", "1"]);
+    assert_eq!(
+        novarocks_parser::printer::print_query(&built),
+        "WITH SESSION iceberg.property = 5 SELECT 1"
+    );
+    let mut union = build::query(build::union_all(vec![select_body(1), select_body(2)]).unwrap());
+    union.session_properties = built.session_properties.clone();
+    assert_eq!(
+        novarocks_parser::printer::print_query(&union),
+        "WITH SESSION iceberg.property = 5 SELECT 1 UNION ALL SELECT 2"
+    );
+
+    struct Increment;
+    impl Fold for Increment {
+        fn fold_literal(&mut self, mut literal: Literal) -> Literal {
+            if let LiteralKind::Number(value) = &mut literal.kind {
+                *value = (value.parse::<i64>().unwrap() + 1).to_string();
+            }
+            literal
+        }
+    }
+    let folded = Increment.fold_query(built.clone());
+    assert_eq!(folded.session_properties[0].value, build::integer(6));
+    assert_eq!(built.session_properties[0].value, build::integer(5));
+    assert!(!built.syntax_eq(&folded));
+    let mut relocated = built.clone();
+    relocated.session_properties[0].span = Span::new(10, 20);
+    relocated.session_properties[0].name.parts[0].span = Span::new(10, 12);
+    assert!(built.syntax_eq(&relocated));
+}
+
+#[test]
 fn identifiers_literals_and_unary_nodes_match_parser_shapes() {
     assert_expression(id("field"), "field");
     assert_expression(build::identifier(build::ident("a b", Some('`'))), "`a b`");

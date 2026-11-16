@@ -18,7 +18,7 @@
 //! syntax can round-trip without making it a frontend execution route.
 
 use novarocks_parser::{
-    ast::{BinaryOperator, Expr, SelectHintValue, SetExpr, Statement, SyntaxEq, TableFactor},
+    ast::{BinaryOperator, Expr, SetExpr, Statement, SyntaxEq, TableFactor},
     parse,
     printer::Printer,
 };
@@ -133,16 +133,21 @@ fn select_optimizer_assignment_hint_is_typed_and_roundtrips() {
     let Statement::Query(query) = statements.first().expect("one query statement") else {
         panic!("assignment-style optimizer hint must remain a typed query");
     };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        panic!("assignment-style optimizer hint must remain attached to SELECT");
-    };
+    assert_eq!(query.session_properties.len(), 1);
+    assert_eq!(
+        query.session_properties[0].name.parts[0].value,
+        "new_planner_agg_stage"
+    );
     assert!(matches!(
-        select.hints.as_slice(),
-        [hint] if matches!(hint.value, SelectHintValue::Assignment { .. })
+        &query.session_properties[0].value,
+        Expr::Literal(_)
     ));
 
     let canonical = Printer::new().statements(&statements);
-    assert_eq!(canonical, "SELECT /*+ new_planner_agg_stage = 3 */ 1");
+    assert_eq!(
+        canonical,
+        "SELECT /*+ SET_VAR(new_planner_agg_stage = 3) */ 1"
+    );
 
     let reparsed = parse(&canonical).expect("canonical assignment-style hint should parse");
     assert_eq!(Printer::new().statements(&reparsed), canonical);

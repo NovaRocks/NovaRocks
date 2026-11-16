@@ -26,9 +26,9 @@ use std::sync::Arc;
 
 use novarocks_parser::ast::{
     Expr, FunctionCall, GroupBy, Ident, JoinConstraint, Literal, LiteralKind, ObjectName, Query,
-    Select, SelectHintValue, SelectItem, SelectQuantifier, SetExpr, TableAlias, TableFactor,
-    TableWithJoins, TypeName, Visit, WildcardOptions, WindowSpec, walk_expr, walk_function_call,
-    walk_object_name, walk_query, walk_table_factor, walk_type_name,
+    Select, SelectItem, SelectQuantifier, SetExpr, TableAlias, TableFactor, TableWithJoins,
+    TypeName, Visit, WildcardOptions, WindowSpec, walk_expr, walk_function_call, walk_object_name,
+    walk_query, walk_table_factor, walk_type_name,
 };
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 
@@ -2760,6 +2760,12 @@ impl CompletionRetainedBytes {
     }
 
     fn add_query_containers(&mut self, query: &Query) {
+        self.add_vec_capacity::<novarocks_parser::ast::SessionProperty>(
+            query.session_properties.capacity(),
+        );
+        for property in &query.session_properties {
+            self.add_vec_capacity::<Ident>(property.name.parts.capacity());
+        }
         self.add_vec_capacity::<novarocks_parser::ast::OrderByExpr>(query.order_by.capacity());
         if let Some(with) = &query.with {
             self.add_vec_capacity::<novarocks_parser::ast::Cte>(with.ctes.capacity());
@@ -2792,12 +2798,6 @@ impl CompletionRetainedBytes {
 
     fn add_select_containers(&mut self, select: &Select) {
         self.add(std::mem::size_of::<Select>());
-        self.add_vec_capacity::<novarocks_parser::ast::SelectHint>(select.hints.capacity());
-        for hint in &select.hints {
-            if let SelectHintValue::Call { arguments } = &hint.value {
-                self.add_vec_capacity::<Expr>(arguments.capacity());
-            }
-        }
         if let SelectQuantifier::Distinct { on, .. } = &select.quantifier {
             self.add_vec_capacity::<Expr>(on.capacity());
         }

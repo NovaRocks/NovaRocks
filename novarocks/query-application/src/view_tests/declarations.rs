@@ -425,7 +425,7 @@ fn saved_with_and_derived_cte_scopes_are_analyzed_without_physical_cte_lookups()
 }
 
 #[test]
-fn actual_saved_view_analysis_respects_caller_legacy_semantics_and_select_local_overrides() {
+fn actual_saved_view_analysis_inherits_query_settings_and_ignores_local_hints() {
     use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
     let service = QueryViewService::new();
     let engine = engine();
@@ -456,13 +456,27 @@ fn actual_saved_view_analysis_respects_caller_legacy_semantics_and_select_local_
             assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
             analyze_snapshot_query(&snapshot, sql, "db", &SqlSemanticSettings::default()).unwrap();
         }
+        let root = novarocks_parser::parse(&format!("SELECT /*+ SET_VAR({hint}) */ 1")).unwrap();
+        let effective =
+            novarocks_sql::sql_mode::statement_sql_semantics(&caller, &root[0]).unwrap();
+        analyze_snapshot_query(
+            &snapshot,
+            &format!("SELECT /*+ SET_VAR({hint}) */ * FROM v"),
+            "db",
+            &caller,
+        )
+        .unwrap();
         for sql in [
-            format!("SELECT /*+ SET_VAR({hint}) */ * FROM v"),
             format!("WITH c AS (SELECT /*+ SET_VAR({hint}) */ * FROM v) SELECT * FROM c"),
             format!("SELECT * FROM (SELECT /*+ SET_VAR({hint}) */ * FROM v) d"),
             format!("SELECT 1 AS a UNION ALL SELECT /*+ SET_VAR({hint}) */ * FROM v"),
         ] {
-            analyze_snapshot_query(&snapshot, &sql, "db", &caller).unwrap();
+            let error = analyze_snapshot_query(&snapshot, &sql, "db", &caller).unwrap_err();
+            let SqlCompileError::Analyze(error) = error else {
+                panic!("inherited policy refusal")
+            };
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+            analyze_snapshot_query(&snapshot, &sql, "db", &effective).unwrap();
         }
         assert_eq!(caller, original_caller);
     }

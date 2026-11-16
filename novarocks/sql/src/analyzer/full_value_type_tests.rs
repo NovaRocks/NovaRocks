@@ -1106,13 +1106,13 @@ fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
 }
 
 #[test]
-fn exact_value_conversion_call_preserves_nested_sql_mode_policy() {
+fn exact_value_conversion_call_inherits_query_sql_mode_policy() {
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
     let strict = "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */";
     let relaxed = "/*+ SET_VAR(sql_mode=32) */";
-    for (outer, inner, outer_policy, inner_policy) in [
-        (strict, relaxed, ReportError, OutputNull),
-        (relaxed, strict, OutputNull, ReportError),
+    for (outer, inner, policy) in [
+        (strict, relaxed, ReportError),
+        (relaxed, strict, OutputNull),
     ] {
         let sql = format!(
             "SELECT {outer} CAST(q.j AS VARCHAR) AS x FROM (SELECT {inner} j,CAST(j AS VARCHAR) AS y FROM source) q"
@@ -1139,8 +1139,8 @@ fn exact_value_conversion_call_preserves_nested_sql_mode_policy() {
         );
         assert_eq!(outer.function_id, inner.function_id);
         assert_eq!(outer.selected, inner.selected);
-        assert_eq!(outer.decimal_overflow_policy(), outer_policy, "{sql}");
-        assert_eq!(inner.decimal_overflow_policy(), inner_policy, "{sql}");
+        assert_eq!(outer.decimal_overflow_policy(), policy, "{sql}");
+        assert_eq!(inner.decimal_overflow_policy(), policy, "{sql}");
     }
 }
 

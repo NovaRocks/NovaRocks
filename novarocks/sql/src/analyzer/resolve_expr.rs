@@ -10369,13 +10369,15 @@ mod tests {
     }
 
     #[test]
-    fn decimal_and_mode_scopes_cover_cte_derived_correlated_and_union_siblings() {
+    fn decimal_query_policy_covers_cte_derived_correlated_and_union_siblings() {
         fn resolved(
             sql: &str,
+            settings: &crate::sql_mode::SqlSemanticSettings,
         ) -> (
             crate::analysis::ResolvedQuery,
             crate::analysis::cte::CTERegistry,
         ) {
+            let original_settings = settings.clone();
             let statements = novarocks_parser::parse(sql).unwrap();
             let [ast::Statement::Query(query)] = statements.as_slice() else {
                 panic!("query");
@@ -10386,144 +10388,155 @@ mod tests {
                     &EmptyCatalog,
                     "default",
                     crate::functions::builtin_sql_function_catalog(),
-                    &crate::sql_mode::SqlSemanticSettings::default(),
+                    settings,
                     crate::constant::test_constant_policy(),
                     &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
+            assert_eq!(settings, &original_settings);
             (query, registry)
         }
         let product = "CAST(0 AS DECIMAL(30,10))*CAST(0 AS DECIMAL(18,9))";
-        let on = "/*+ SET_VAR(decimal_overflow_to_double=true) */";
-        let off = "/*+ SET_VAR(decimal_overflow_to_double=false) */";
-        // The first CTE's local override reaches its producer and is retained
-        // in the registry, while the second CTE and outer SELECT stay Decimal.
-        let (query, registry) = resolved(&format!(
-            "WITH a AS (SELECT {on} {product} x), b AS (SELECT {product} y)              SELECT a.x,b.y,{product} z FROM a CROSS JOIN b"
-        ));
-        assert_eq!(
-            query
-                .output_columns
-                .iter()
-                .map(|c| c.value_type.data_type().clone())
-                .collect::<Vec<_>>(),
-            vec![
-                DataType::Float64,
-                DataType::Decimal128(38, 19),
-                DataType::Decimal128(38, 19)
-            ]
-        );
-        assert_eq!(query.local_cte_ids.len(), 2);
-        for id in &query.local_cte_ids {
-            assert!(registry.get(*id).is_some());
-        }
-        let (query, _) = resolved(&format!(
-            "SELECT {on} t.x,{product} y FROM (SELECT {off} {product} x) t"
-        ));
-        assert_eq!(
-            query.output_columns[0].value_type.data_type().clone(),
-            DataType::Decimal128(38, 19)
-        );
-        assert_eq!(
-            query.output_columns[1].value_type.data_type().clone(),
-            DataType::Float64
-        );
-        let (query, _) = resolved(&format!(
-            "SELECT (SELECT {on} {product}) x,(SELECT {product}) y,{product} z"
-        ));
-        assert_eq!(
-            query
-                .output_columns
-                .iter()
-                .map(|c| c.value_type.data_type().clone())
-                .collect::<Vec<_>>(),
-            vec![
-                DataType::Float64,
-                DataType::Decimal128(38, 19),
-                DataType::Decimal128(38, 19)
-            ]
-        );
-        let QueryBody::Select(select) = &query.body else {
-            panic!("select");
-        };
-        assert_eq!(select.apply_specs.len(), 2);
-        assert_ne!(
-            select.apply_specs[0].subquery_id,
-            select.apply_specs[1].subquery_id
-        );
-        assert_ne!(
-            select.apply_specs[0].output_column.column_id,
-            select.apply_specs[1].output_column.column_id
-        );
-        let (query, _) = resolved(&format!(
-            "SELECT (SELECT {on} CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) x, \
-             (SELECT CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) y FROM (SELECT 1 n) o"
-        ));
-        assert_eq!(
-            query.output_columns[0].value_type.data_type().clone(),
-            DataType::Float64
-        );
-        assert_eq!(
-            query.output_columns[1].value_type.data_type().clone(),
-            DataType::Decimal128(38, 19)
-        );
-        let QueryBody::Select(select) = &query.body else {
-            panic!("select");
-        };
-        assert_eq!(select.apply_specs.len(), 2);
-        let Some(crate::analysis::Relation::Subquery { output_columns, .. }) = &select.from else {
-            panic!("outer derived relation");
-        };
-        assert_eq!(output_columns.len(), 1);
-        for spec in &select.apply_specs {
+        for (promote, expected_type) in [
+            (false, DataType::Decimal128(38, 19)),
+            (true, DataType::Float64),
+        ] {
+            let settings = crate::sql_mode::SqlSemanticSettings::default()
+                .with_decimal_overflow_to_double(promote);
+            // All producers inherit the same query policy; identities stay independent.
+            let (query, registry) = resolved(
+                &format!(
+                    "WITH a AS (SELECT {product} x), b AS (SELECT {product} y) SELECT a.x,b.y,{product} z FROM a CROSS JOIN b"
+                ),
+                &settings,
+            );
             assert_eq!(
-                spec.correlation_column_ids,
-                vec![output_columns[0].column_id]
+                query
+                    .output_columns
+                    .iter()
+                    .map(|c| c.value_type.data_type().clone())
+                    .collect::<Vec<_>>(),
+                vec![expected_type.clone(); 3]
+            );
+            assert_eq!(query.local_cte_ids.len(), 2);
+            assert_ne!(query.local_cte_ids[0], query.local_cte_ids[1]);
+            for id in &query.local_cte_ids {
+                assert!(registry.get(*id).is_some());
+            }
+            let (query, _) = resolved(
+                &format!("SELECT t.x,{product} y FROM (SELECT {product} x) t"),
+                &settings,
+            );
+            assert_eq!(
+                query.output_columns[0].value_type.data_type(),
+                &expected_type
+            );
+            assert_eq!(
+                query.output_columns[1].value_type.data_type(),
+                &expected_type
+            );
+            let (query, _) = resolved(
+                &format!("SELECT (SELECT {product}) x,(SELECT {product}) y,{product} z"),
+                &settings,
+            );
+            assert_eq!(
+                query
+                    .output_columns
+                    .iter()
+                    .map(|c| c.value_type.data_type().clone())
+                    .collect::<Vec<_>>(),
+                vec![expected_type.clone(); 3]
+            );
+            let QueryBody::Select(select) = &query.body else {
+                panic!("select");
+            };
+            assert_eq!(select.apply_specs.len(), 2);
+            assert_ne!(
+                select.apply_specs[0].subquery_id,
+                select.apply_specs[1].subquery_id
+            );
+            assert_ne!(
+                select.apply_specs[0].output_column.column_id,
+                select.apply_specs[1].output_column.column_id
+            );
+            let (query, _) = resolved(
+                &format!(
+                    "SELECT (SELECT CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) x, (SELECT CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) y FROM (SELECT 1 n) o"
+                ),
+                &settings,
+            );
+            assert_eq!(
+                query.output_columns[0].value_type.data_type(),
+                &expected_type
+            );
+            assert_eq!(
+                query.output_columns[1].value_type.data_type(),
+                &expected_type
+            );
+            let QueryBody::Select(select) = &query.body else {
+                panic!("select");
+            };
+            assert_eq!(select.apply_specs.len(), 2);
+            let Some(crate::analysis::Relation::Subquery { output_columns, .. }) = &select.from
+            else {
+                panic!("outer derived relation");
+            };
+            assert_eq!(output_columns.len(), 1);
+            for spec in &select.apply_specs {
+                assert_eq!(
+                    spec.correlation_column_ids,
+                    vec![output_columns[0].column_id]
+                );
+            }
+            assert_ne!(
+                select.apply_specs[0].subquery_id,
+                select.apply_specs[1].subquery_id
+            );
+            // UNION policy is an explicit analysis input, never a first-branch hint.
+            let (query, _) = resolved(
+                &format!("SELECT {product} x UNION ALL SELECT {product} x"),
+                &settings,
+            );
+            let QueryBody::SetOperation(set) = query.body else {
+                panic!("set operation");
+            };
+            let QueryBody::Select(left) = set.left.body else {
+                panic!("left select");
+            };
+            let QueryBody::Select(right) = set.right.body else {
+                panic!("right select");
+            };
+            assert_eq!(
+                left.projection[0].expr.value_type.data_type(),
+                &expected_type
+            );
+            assert_eq!(
+                right.projection[0].expr.value_type.data_type(),
+                &expected_type
             );
         }
-        assert_ne!(
-            select.apply_specs[0].subquery_id,
-            select.apply_specs[1].subquery_id
+        let legacy = crate::sql_mode::SqlSemanticSettings::default().with_sql_mode(
+            crate::sql_mode::SqlMode::from_assignment("GROUP_CONCAT_LEGACY"),
         );
-        let (query, _) = resolved(&format!(
-            "SELECT {on} {product} x UNION ALL SELECT {product} x"
-        ));
-        let QueryBody::SetOperation(set) = query.body else {
-            panic!("set operation");
-        };
-        let QueryBody::Select(left) = set.left.body else {
-            panic!("left select");
-        };
-        let QueryBody::Select(right) = set.right.body else {
-            panic!("right select");
-        };
-        assert_eq!(
-            left.projection[0].expr.value_type.data_type().clone(),
-            DataType::Float64
-        );
-        assert_eq!(
-            right.projection[0].expr.value_type.data_type().clone(),
-            DataType::Decimal128(38, 19)
-        );
-        // GROUP_CONCAT must bind using the same lexical mode that normalized
-        // positional separator syntax, including CTE and derived-table scopes.
         for sql in [
-            "WITH t AS (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat('a','-') x) SELECT x FROM t",
-            "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat('a','-') x) t",
-            "SELECT group_concat('a','-') UNION ALL SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat('b','-')",
+            "WITH t AS (SELECT group_concat('a','-') x) SELECT x FROM t",
+            "SELECT x FROM (SELECT group_concat('a','-') x) t",
+            "SELECT group_concat('a','-') UNION ALL SELECT group_concat('b','-')",
         ] {
-            resolved(sql);
+            resolved(sql, &legacy);
         }
     }
     #[test]
-    fn overflow_policy_is_frozen_at_each_lexical_arithmetic_and_cast_scope() {
+    fn overflow_query_policy_is_frozen_for_every_arithmetic_and_cast() {
         use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
         fn resolve(
             sql: &str,
+            settings: &crate::sql_mode::SqlSemanticSettings,
         ) -> (
             crate::analysis::ResolvedQuery,
             crate::analysis::cte::CTERegistry,
         ) {
+            let original_settings = settings.clone();
             let statements = novarocks_parser::parse(sql).unwrap();
             let [ast::Statement::Query(query)] = statements.as_slice() else {
                 panic!("query")
@@ -10534,11 +10547,12 @@ mod tests {
                     &EmptyCatalog,
                     "default",
                     crate::functions::builtin_sql_function_catalog(),
-                    &crate::sql_mode::SqlSemanticSettings::default(),
+                    settings,
                     crate::constant::test_constant_policy(),
                     &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
+            assert_eq!(settings, &original_settings);
             (query, registry)
         }
         fn product_policy(
@@ -10566,57 +10580,73 @@ mod tests {
             *decimal_overflow_policy
         }
         let expression = "CAST(1 AS DECIMAL(38,0))+1";
-        let strict = "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */";
-        let (query, _) = resolve(&format!("SELECT {strict} {expression} x"));
-        assert_eq!(product_policy(&query), ReportError);
-        let (query, _) = resolve(&format!("SELECT {expression} x"));
-        assert_eq!(product_policy(&query), OutputNull);
-        let (query, _) = resolve(&format!(
-            "SELECT {strict} {expression} x UNION ALL SELECT {expression} x"
-        ));
-        let QueryBody::SetOperation(set) = &query.body else {
-            panic!("union")
-        };
-        assert_eq!(product_policy(&set.left), ReportError);
-        assert_eq!(product_policy(&set.right), OutputNull);
-        let (query, registry) = resolve(&format!(
-            "WITH a AS (SELECT {strict} {expression} x), b AS (SELECT {expression} y) SELECT a.x,b.y FROM a CROSS JOIN b"
-        ));
-        assert_eq!(query.local_cte_ids.len(), 2);
-        let a = registry
-            .entries
-            .iter()
-            .find(|entry| entry.name == "a")
-            .unwrap();
-        let b = registry
-            .entries
-            .iter()
-            .find(|entry| entry.name == "b")
-            .unwrap();
-        assert_eq!(product_policy(&a.resolved_query), ReportError);
-        assert_eq!(product_policy(&b.resolved_query), OutputNull);
-        let (query, _) = resolve(&format!(
-            "SELECT {strict} ({expression}) x FROM (SELECT /*+ SET_VAR(sql_mode=32) */ {expression} y) t"
-        ));
-        let QueryBody::Select(select) = &query.body else {
-            panic!("select")
-        };
-        let Some(crate::analysis::Relation::Subquery { query: inner, .. }) = &select.from else {
-            panic!("derived")
-        };
-        assert_eq!(product_policy(inner), OutputNull);
-        // The derived override exits before the outer operation is analyzed.
-        let ExprKind::Nested(outer) = &select.projection[0].expr.kind else {
-            panic!("nested")
-        };
-        let ExprKind::BinaryOp {
-            decimal_overflow_policy,
-            ..
-        } = &outer.kind
-        else {
-            panic!("outer arithmetic")
-        };
-        assert_eq!(*decimal_overflow_policy, ReportError);
+        for (mode, expected) in [("32", OutputNull), ("ERROR_IF_OVERFLOW", ReportError)] {
+            let settings = crate::sql_mode::SqlSemanticSettings::default()
+                .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(mode));
+            let (query, _) = resolve(&format!("SELECT {expression} x"), &settings);
+            assert_eq!(product_policy(&query), expected);
+            let (query, _) = resolve(
+                &format!("SELECT {expression} x UNION ALL SELECT {expression} x"),
+                &settings,
+            );
+            let QueryBody::SetOperation(set) = &query.body else {
+                panic!("union")
+            };
+            assert_eq!(product_policy(&set.left), expected);
+            assert_eq!(product_policy(&set.right), expected);
+            let (query, registry) = resolve(
+                &format!(
+                    "WITH a AS (SELECT {expression} x), b AS (SELECT {expression} y) SELECT a.x,b.y FROM a CROSS JOIN b"
+                ),
+                &settings,
+            );
+            assert_eq!(query.local_cte_ids.len(), 2);
+            assert_ne!(query.local_cte_ids[0], query.local_cte_ids[1]);
+            let a = registry
+                .entries
+                .iter()
+                .find(|entry| entry.name == "a")
+                .unwrap();
+            let b = registry
+                .entries
+                .iter()
+                .find(|entry| entry.name == "b")
+                .unwrap();
+            assert_eq!(product_policy(&a.resolved_query), expected);
+            assert_eq!(product_policy(&b.resolved_query), expected);
+            let (query, _) = resolve(
+                &format!("SELECT ({expression}) x FROM (SELECT {expression} y) t"),
+                &settings,
+            );
+            let QueryBody::Select(select) = &query.body else {
+                panic!("select")
+            };
+            let Some(crate::analysis::Relation::Subquery { query: inner, .. }) = &select.from
+            else {
+                panic!("derived")
+            };
+            assert_eq!(product_policy(inner), expected);
+            let ExprKind::Nested(outer) = &select.projection[0].expr.kind else {
+                panic!("nested")
+            };
+            let ExprKind::BinaryOp {
+                left,
+                decimal_overflow_policy,
+                ..
+            } = &outer.kind
+            else {
+                panic!("outer arithmetic")
+            };
+            let ExprKind::Cast {
+                decimal_overflow_policy: cast_policy,
+                ..
+            } = &left.kind
+            else {
+                panic!("outer cast")
+            };
+            assert_eq!(*decimal_overflow_policy, expected);
+            assert_eq!(*cast_policy, expected);
+        }
     }
     #[test]
     fn nested_report_decimal_numeric_cast_is_rejected_with_the_original_sql_span() {
@@ -10824,19 +10854,18 @@ mod tests {
         // Existing grouping-marker tests prove GROUPING is replaced by exact ColumnId.
     }
     #[test]
-    fn field_implicit_decimal_casts_use_the_call_scope_policy() {
+    fn field_implicit_decimal_casts_inherit_the_query_policy() {
         use crate::analysis::ExprKind;
         use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
         let strict = "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */";
         let relaxed = "/*+ SET_VAR(sql_mode=32) */";
-        for (outer, inner, expected) in [
-            ("", "", OutputNull),
-            (strict, "", ReportError),
-            (strict, relaxed, ReportError),
-            (relaxed, strict, OutputNull),
+        for (root, expected) in [
+            ("", OutputNull),
+            (strict, ReportError),
+            (relaxed, OutputNull),
         ] {
             let sql = format!(
-                "SELECT {outer} FIELD(d.k,d.c) AS f FROM (SELECT {inner} CAST(1 AS DECIMAL(3,0)) k,CAST(1 AS BIGINT) c) d"
+                "SELECT {root} FIELD(d.k,d.c) AS f FROM (SELECT CAST(1 AS DECIMAL(3,0)) k,CAST(1 AS BIGINT) c) d"
             );
             let typed = analyze_projection_expr(&sql).unwrap();
             let ExprKind::FunctionCall { args, binding, .. } = typed.kind else {
@@ -10871,19 +10900,18 @@ mod tests {
     }
 
     #[test]
-    fn full_outer_using_implicit_decimal_cast_uses_the_join_scope_policy() {
+    fn full_outer_using_implicit_decimal_cast_inherits_the_query_policy() {
         use crate::analysis::ExprKind;
         use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
         let strict = "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */";
         let relaxed = "/*+ SET_VAR(sql_mode=32) */";
-        for (outer, inner, expected) in [
-            ("", "", OutputNull),
-            (strict, "", ReportError),
-            (strict, relaxed, ReportError),
-            (relaxed, strict, OutputNull),
+        for (root, expected) in [
+            ("", OutputNull),
+            (strict, ReportError),
+            (relaxed, OutputNull),
         ] {
             let sql = format!(
-                "SELECT {outer} k AS merged FROM (SELECT {inner} CAST(1 AS DECIMAL(3,0)) k) l FULL OUTER JOIN (SELECT {inner} CAST(1000 AS BIGINT) k) r USING(k)"
+                "SELECT {root} k AS merged FROM (SELECT CAST(1 AS DECIMAL(3,0)) k) l FULL OUTER JOIN (SELECT CAST(1000 AS BIGINT) k) r USING(k)"
             );
             let typed = analyze_projection_expr(&sql).unwrap();
             assert_eq!(
@@ -10978,7 +11006,7 @@ mod tests {
     }
 
     #[test]
-    fn function_call_policy_is_frozen_at_nested_scalar_aggregate_window_and_empty_array_scopes() {
+    fn query_policy_is_frozen_for_nested_scalar_aggregate_window_and_empty_array_calls() {
         use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
         let strict = "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */";
         let relaxed = "/*+ SET_VAR(sql_mode=32) */";
@@ -10989,13 +11017,9 @@ mod tests {
             "sum(1) OVER ()",
             "CAST([] AS ARRAY<INT>)",
         ] {
-            for (outer, inner, outer_policy, inner_policy) in [
-                (strict, relaxed, ReportError, OutputNull),
-                (relaxed, strict, OutputNull, ReportError),
-            ] {
-                let sql = format!(
-                    "SELECT {outer} {expression} AS x FROM (SELECT {inner} {expression} AS y) q"
-                );
+            for (root, expected) in [(strict, ReportError), (relaxed, OutputNull)] {
+                let sql =
+                    format!("SELECT {root} {expression} AS x FROM (SELECT {expression} AS y) q");
                 let query = resolve_call_policy_query(&sql);
                 let QueryBody::Select(select) = &query.body else {
                     panic!("select");
@@ -11009,27 +11033,24 @@ mod tests {
                 };
                 let outer = expression_call_binding(&select.projection[0].expr);
                 let inner = expression_call_binding(&inner.projection[0].expr);
-                assert_eq!(outer.decimal_overflow_policy(), outer_policy, "{sql}");
-                assert_eq!(inner.decimal_overflow_policy(), inner_policy, "{sql}");
+                assert_eq!(outer.decimal_overflow_policy(), expected, "{sql}");
+                assert_eq!(inner.decimal_overflow_policy(), expected, "{sql}");
                 assert_eq!(outer.function_id, inner.function_id, "{sql}");
                 assert_eq!(outer.selected, inner.selected, "{sql}");
-                // Equal selections are distinct calls with their own lexical policy.
-                assert_ne!(outer, inner, "{sql}");
+                // The same query policy preserves equal binding facts at both call sites.
+                assert_eq!(outer, inner, "{sql}");
             }
         }
     }
 
     #[test]
-    fn unnest_call_policy_uses_join_scope_after_nested_array_scope_exits() {
+    fn unnest_and_nested_array_calls_inherit_query_policy() {
         use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
         let strict = "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */";
         let relaxed = "/*+ SET_VAR(sql_mode=32) */";
-        for (outer, inner, outer_policy, inner_policy) in [
-            (strict, relaxed, ReportError, OutputNull),
-            (relaxed, strict, OutputNull, ReportError),
-        ] {
+        for (root, expected) in [(strict, ReportError), (relaxed, OutputNull)] {
             let sql = format!(
-                "SELECT {outer} abs(u.x) AS x FROM (SELECT {inner} [1] AS a) q CROSS JOIN LATERAL UNNEST(q.a) AS u(x)"
+                "SELECT {root} abs(u.x) AS x FROM (SELECT [1] AS a) q CROSS JOIN LATERAL UNNEST(q.a) AS u(x)"
             );
             let query = resolve_call_policy_query(&sql);
             let QueryBody::Select(select) = &query.body else {
@@ -11041,14 +11062,10 @@ mod tests {
             let crate::analysis::Relation::Unnest(unnest) = &join.right else {
                 panic!("unnest");
             };
-            assert_eq!(
-                unnest.binding.decimal_overflow_policy(),
-                outer_policy,
-                "{sql}"
-            );
+            assert_eq!(unnest.binding.decimal_overflow_policy(), expected, "{sql}");
             assert_eq!(
                 expression_call_binding(&select.projection[0].expr).decimal_overflow_policy(),
-                outer_policy,
+                expected,
                 "{sql}"
             );
             let crate::analysis::Relation::Subquery { query: inner, .. } = &join.left else {
@@ -11059,7 +11076,7 @@ mod tests {
             };
             assert_eq!(
                 expression_call_binding(&inner.projection[0].expr).decimal_overflow_policy(),
-                inner_policy,
+                expected,
                 "{sql}"
             );
         }

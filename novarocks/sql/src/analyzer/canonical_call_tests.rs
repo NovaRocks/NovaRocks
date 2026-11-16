@@ -237,20 +237,21 @@ fn canonical_day_arithmetic_and_ordinary_calls_keep_four_units_zones_and_source_
 }
 
 #[test]
-fn canonical_day_arithmetic_keeps_lexical_policy_and_required_nullable_sources() {
+fn canonical_day_arithmetic_inherits_root_policy_and_required_nullable_sources() {
     use DecimalOverflowPolicy::{OutputNull, ReportError};
     let source = SourceCatalog {
         carrier: DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         logical: None,
         nullable: true,
     };
-    for (outer, inner, outer_policy, inner_policy) in [
-        ("ERROR_IF_OVERFLOW", "32", ReportError, OutputNull),
-        ("32", "ERROR_IF_OVERFLOW", OutputNull, ReportError),
+    for (outer, inner, outer_policy) in [
+        ("ERROR_IF_OVERFLOW", "32", ReportError),
+        ("32", "ERROR_IF_OVERFLOW", OutputNull),
     ] {
         let sql = format!(
             "SELECT /*+ SET_VAR(sql_mode='{outer}') */ q.x+CAST(1 AS INT), days_add(q.x,CAST(1 AS INT)) FROM (SELECT /*+ SET_VAR(sql_mode='{inner}') */ x,x-CAST(1 AS INT) AS shifted FROM temporal_source) q"
         );
+        // A nested legacy hint cannot shadow the frozen whole-query policy.
         let query = analyze(&sql, &source, crate::constant::test_constant_policy()).unwrap();
         for ordinal in [0, 1] {
             let (_, binding, args) = call(project(&query, ordinal));
@@ -279,7 +280,7 @@ fn canonical_day_arithmetic_keeps_lexical_policy_and_required_nullable_sources()
             panic!("subquery");
         };
         let (_, binding, args) = call(project(inner_query, 1));
-        assert_eq!(binding.decimal_overflow_policy(), inner_policy);
+        assert_eq!(binding.decimal_overflow_policy(), outer_policy);
         let ExprKind::Cast {
             decimal_overflow_policy,
             ..
@@ -287,7 +288,7 @@ fn canonical_day_arithmetic_keeps_lexical_policy_and_required_nullable_sources()
         else {
             panic!("source cast");
         };
-        assert_eq!(*decimal_overflow_policy, inner_policy);
+        assert_eq!(*decimal_overflow_policy, outer_policy);
     }
     // Typed temporal NULL is a legitimate source; it does not authorize a
     // bare untyped NULL arithmetic domain or an extra raw carrier profile.

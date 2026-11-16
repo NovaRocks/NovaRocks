@@ -70,6 +70,9 @@ fn validate_create_table(table: &super::CreateTable) -> Result<(), ValidateError
 }
 
 fn validate_query(query: &Query) -> Result<(), ValidateError> {
+    for property in &query.session_properties {
+        validate_expr(&property.value)?;
+    }
     if let Some(with) = &query.with {
         if with.ctes.is_empty() {
             return Err(ValidateError::invalid_structure(
@@ -147,17 +150,6 @@ fn validate_values(values: &Values) -> Result<(), ValidateError> {
 }
 
 fn validate_select(select: &Select) -> Result<(), ValidateError> {
-    for hint in &select.hints {
-        match &hint.value {
-            super::SelectHintValue::Bare => {}
-            super::SelectHintValue::Call { arguments } => {
-                for argument in arguments {
-                    validate_expr(argument)?;
-                }
-            }
-            super::SelectHintValue::Assignment { value } => validate_expr(value)?,
-        }
-    }
     if select.projection.is_empty() {
         return Err(ValidateError::invalid_structure(
             StructuralViolation::EmptySelectProjection,

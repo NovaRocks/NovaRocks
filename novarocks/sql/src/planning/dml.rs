@@ -5234,6 +5234,16 @@ mod tests {
                 "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode=32) */ 1 AS x) s",
                 true,
             ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT 1 AS x UNION ALL SELECT /*+ SET_VAR(sql_mode=32) */ 2",
+                true,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "WITH s AS (SELECT /*+ SET_VAR(sql_mode=32) */ 1 AS x) SELECT x FROM s",
+                true,
+            ),
         ] {
             let request = |intent| {
                 let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(

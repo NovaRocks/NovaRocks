@@ -377,6 +377,8 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         0,
     )
     .map_err(AnalyzeError::control)?;
+    let effective_semantics = crate::sql_mode::query_sql_semantics(sql_semantics, query)?;
+    let sql_semantics = &effective_semantics;
     let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics)?;
     let query = query_prepass::preanalyze_with_semantics(query, sql_semantics)?;
     let mut materialized_source = materialized
@@ -767,37 +769,6 @@ impl<'a> AnalyzerContext<'a> {
         expr_display_name(&ast::Fold::fold_expr(&mut display, expression.clone()))
     }
 
-    fn with_sql_semantics_scope<T>(
-        &self,
-        settings: crate::sql_mode::SqlSemanticSettings,
-        analyze: impl FnOnce(&Self) -> Result<T, AnalyzeError>,
-    ) -> Result<T, AnalyzeError> {
-        if settings == self.sql_semantics {
-            return analyze(self);
-        }
-        let child = AnalyzerContext {
-            grouping_scope: std::cell::RefCell::new(self.grouping_scope.borrow().clone()),
-            control: self.control,
-            constant_policy: self.constant_policy,
-            materialized_values: self.materialized_values,
-            catalog: self.catalog,
-            current_database: self.current_database,
-            function_catalog: self.function_catalog,
-            sql_semantics: settings,
-            factory: self.factory.clone(),
-            view_stack: self.view_stack.clone(),
-            ctes: self.ctes.clone(),
-            pending_ctes: self.pending_ctes.clone(),
-            next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
-            next_lambda_slot_id: std::cell::Cell::new(self.next_lambda_slot_id.get()),
-            collected_subqueries: std::cell::RefCell::new(Vec::new()),
-            cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
-        };
-        let result = analyze(&child);
-        self.absorb_semantic_scope(&child);
-        result
-    }
-
     fn absorb_semantic_scope(&self, child: &Self) {
         self.next_subquery_id.set(child.next_subquery_id.get());
         self.next_lambda_slot_id
@@ -903,8 +874,7 @@ impl<'a> AnalyzerContext<'a> {
     /// Top-level query analysis.
     fn analyze_query(&self, query: &ast::Query) -> Result<ResolvedQuery, AnalyzeError> {
         self.check_control()?;
-        let settings = crate::sql_mode::query_sql_semantics(&self.sql_semantics, query)?;
-        self.with_sql_semantics_scope(settings, |ctx| ctx.analyze_query_in_semantic_scope(query))
+        self.analyze_query_in_semantic_scope(query)
     }
 
     fn analyze_query_in_semantic_scope(
@@ -1179,8 +1149,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         select: &ast::Select,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
-        let settings = crate::sql_mode::select_sql_semantics(&self.sql_semantics, select)?;
-        self.with_sql_semantics_scope(settings, |ctx| ctx.analyze_select_in_semantic_scope(select))
+        self.analyze_select_in_semantic_scope(select)
     }
 
     fn analyze_select_in_semantic_scope(

@@ -152,15 +152,6 @@ impl SqlSemanticSettings {
     }
 }
 
-fn semantic_key(expression: &ast::Expr, key: &str) -> bool {
-    match expression {
-        ast::Expr::Identifier(name) => name.value.eq_ignore_ascii_case(key),
-        ast::Expr::Literal(literal) => matches!(&literal.kind,
-            ast::LiteralKind::String(value) if value.eq_ignore_ascii_case(key)),
-        _ => false,
-    }
-}
-
 fn decimal_flag(value: &ast::Expr) -> Result<bool, crate::analyze_error::AnalyzeError> {
     let text = match value {
         ast::Expr::Literal(literal) => match &literal.kind {
@@ -182,65 +173,27 @@ fn decimal_flag(value: &ast::Expr) -> Result<bool, crate::analyze_error::Analyze
     }
 }
 
-pub fn select_sql_semantics(
-    session: &SqlSemanticSettings,
-    select: &ast::Select,
-) -> Result<SqlSemanticSettings, crate::analyze_error::AnalyzeError> {
-    let mut settings = session.clone();
-    for hint in &select.hints {
-        if !hint.name.value.eq_ignore_ascii_case("set_var") {
-            continue;
-        }
-        let ast::SelectHintValue::Call { arguments } = &hint.value else {
-            continue;
-        };
-        for argument in arguments {
-            match argument {
-                ast::Expr::Binary(binary)
-                    if semantic_key(&binary.left, "decimal_overflow_to_double") =>
-                {
-                    if binary.operator != ast::BinaryOperator::Equal {
-                        return Err(crate::analyze_error::AnalyzeError::invalid_argument(
-                            "decimal_overflow_to_double hint requires a boolean assignment",
-                            argument.span(),
-                        ));
-                    }
-                    settings =
-                        settings.with_decimal_overflow_to_double(decimal_flag(&binary.right)?);
-                }
-                ast::Expr::Binary(binary)
-                    if binary.operator == ast::BinaryOperator::Equal
-                        && semantic_key(&binary.left, "sql_mode") =>
-                {
-                    settings = settings.with_sql_mode(SqlMode::from_expression(&binary.right));
-                }
-                value if semantic_key(value, "decimal_overflow_to_double") => {
-                    return Err(crate::analyze_error::AnalyzeError::invalid_argument(
-                        "decimal_overflow_to_double hint requires a boolean assignment",
-                        value.span(),
-                    ));
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(settings)
-}
-
-/// Resolve hints belonging to this query's root SELECT only. Nested SELECTs,
-/// CTEs, and set-operation siblings cannot mutate the enclosing statement.
+/// Resolve the root query's assignment facts once for the whole query.
+/// SELECT, CTE and subquery analysis inherit this frozen setting.
 pub fn query_sql_semantics(
     session: &SqlSemanticSettings,
     query: &ast::Query,
 ) -> Result<SqlSemanticSettings, crate::analyze_error::AnalyzeError> {
-    let mut body = query.body.as_ref();
-    while let ast::SetExpr::Query(query) = body {
-        body = query.body.as_ref();
+    let mut settings = session.clone();
+    for property in &query.session_properties {
+        let [name] = property.name.parts.as_slice() else {
+            continue;
+        };
+        if name.value.eq_ignore_ascii_case("sql_mode") {
+            settings = settings.with_sql_mode(SqlMode::from_expression(&property.value));
+        } else if name
+            .value
+            .eq_ignore_ascii_case("decimal_overflow_to_double")
+        {
+            settings = settings.with_decimal_overflow_to_double(decimal_flag(&property.value)?);
+        }
     }
-    match body {
-        ast::SetExpr::Select(select) => select_sql_semantics(session, select),
-        _ => Ok(session.clone()),
-    }
+    Ok(settings)
 }
 
 /// Freeze statement-local overrides at admission for every SQL query producer.
@@ -258,12 +211,7 @@ pub fn statement_sql_semantics(
     };
     query.map_or_else(
         || Ok(session.clone()),
-        |query| {
-            // Validate every lexical override before frontend View expansion,
-            // whose existing port returns String rather than typed errors.
-            query_uses_decimal_overflow_to_double(session, query)?;
-            query_sql_semantics(session, query)
-        },
+        |query| query_sql_semantics(session, query),
     )
 }
 
@@ -277,43 +225,8 @@ pub(crate) fn normalize_concat_query(
 ) -> Result<ast::Query, crate::analyze_error::AnalyzeError> {
     struct Normalizer {
         sql_semantics: SqlSemanticSettings,
-        error: Option<crate::analyze_error::AnalyzeError>,
     }
     impl Fold for Normalizer {
-        fn fold_query(&mut self, query: ast::Query) -> ast::Query {
-            let enclosing = self.sql_semantics.clone();
-            if self.error.is_some() {
-                return query;
-            }
-            self.sql_semantics = match query_sql_semantics(&enclosing, &query) {
-                Ok(settings) => settings,
-                Err(error) => {
-                    self.error = Some(error);
-                    return query;
-                }
-            };
-            let query = ast::fold_query(self, query);
-            self.sql_semantics = enclosing;
-            query
-        }
-
-        fn fold_select(&mut self, select: ast::Select) -> ast::Select {
-            let enclosing = self.sql_semantics.clone();
-            if self.error.is_some() {
-                return select;
-            }
-            self.sql_semantics = match select_sql_semantics(&enclosing, &select) {
-                Ok(settings) => settings,
-                Err(error) => {
-                    self.error = Some(error);
-                    return select;
-                }
-            };
-            let select = ast::fold_select(self, select);
-            self.sql_semantics = enclosing;
-            select
-        }
-
         fn fold_function_call(&mut self, call: ast::FunctionCall) -> ast::FunctionCall {
             let mut call = ast::fold_function_call(self, call);
             let name = call
@@ -353,186 +266,54 @@ pub(crate) fn normalize_concat_query(
         }
     }
     let mut normalizer = Normalizer {
-        sql_semantics: session.clone(),
-        error: None,
+        sql_semantics: query_sql_semantics(session, &query)?,
     };
-    let query = normalizer.fold_query(query);
-    match normalizer.error {
-        Some(error) => Err(error),
-        None => Ok(query),
-    }
+    Ok(normalizer.fold_query(query))
 }
 
-/// Detect the effective numeric semantic setting in every definition scope.
-/// Persistent definitions do not yet capture this setting for reanalysis.
+/// Persisted definitions can contain a SELECT under VALUES or a CTE.
+fn query_has_select(query: &ast::Query) -> bool {
+    use ast::Visit;
+    struct Detector {
+        has_select: bool,
+    }
+    impl Visit for Detector {
+        fn visit_session_property(&mut self, _: &ast::SessionProperty) {}
+        fn visit_select(&mut self, select: &ast::Select) {
+            self.has_select = true;
+            ast::walk_select(self, select);
+        }
+    }
+    let mut detector = Detector { has_select: false };
+    detector.visit_query(query);
+    detector.has_select
+}
+
+/// Detect a numeric policy used by this query's SELECTs under one setting.
 pub fn query_uses_decimal_overflow_to_double(
     session: &SqlSemanticSettings,
     query: &ast::Query,
 ) -> Result<bool, crate::analyze_error::AnalyzeError> {
-    struct Detector {
-        settings: SqlSemanticSettings,
-        uses: bool,
-        error: Option<crate::analyze_error::AnalyzeError>,
-    }
-    impl Fold for Detector {
-        fn fold_query(&mut self, query: ast::Query) -> ast::Query {
-            if self.error.is_some() {
-                return query;
-            }
-            let enclosing = self.settings.clone();
-            match query_sql_semantics(&enclosing, &query) {
-                Ok(settings) => self.settings = settings,
-                Err(error) => {
-                    self.error = Some(error);
-                    return query;
-                }
-            }
-            let query = ast::fold_query(self, query);
-            self.settings = enclosing;
-            query
-        }
-        fn fold_select(&mut self, select: ast::Select) -> ast::Select {
-            if self.error.is_some() {
-                return select;
-            }
-            let enclosing = self.settings.clone();
-            match select_sql_semantics(&enclosing, &select) {
-                Ok(settings) => self.settings = settings,
-                Err(error) => {
-                    self.error = Some(error);
-                    return select;
-                }
-            }
-            self.uses |= self.settings.decimal_overflow_to_double();
-            let select = ast::fold_select(self, select);
-            self.settings = enclosing;
-            select
-        }
-    }
-    let mut detector = Detector {
-        settings: session.clone(),
-        uses: false,
-        error: None,
-    };
-    detector.fold_query(query.clone());
-    match detector.error {
-        Some(error) => Err(error),
-        None => Ok(detector.uses),
-    }
+    let settings = query_sql_semantics(session, query)?;
+    Ok(settings.decimal_overflow_to_double() && query_has_select(query))
 }
 
-/// Detect uncaptured legacy mode at each actual SELECT in lexical scope.
+/// Detect uncaptured legacy mode under the root query setting.
 pub fn query_uses_group_concat_legacy(
     session: &SqlSemanticSettings,
     query: &ast::Query,
 ) -> Result<bool, crate::analyze_error::AnalyzeError> {
-    struct Detector {
-        settings: SqlSemanticSettings,
-        uses: bool,
-        error: Option<crate::analyze_error::AnalyzeError>,
-    }
-    impl Fold for Detector {
-        fn fold_query(&mut self, query: ast::Query) -> ast::Query {
-            if self.error.is_some() {
-                return query;
-            }
-            let enclosing = self.settings.clone();
-            match query_sql_semantics(&enclosing, &query) {
-                Ok(settings) => self.settings = settings,
-                Err(error) => {
-                    self.error = Some(error);
-                    return query;
-                }
-            }
-            let query = ast::fold_query(self, query);
-            self.settings = enclosing;
-            query
-        }
-        fn fold_select(&mut self, select: ast::Select) -> ast::Select {
-            if self.error.is_some() {
-                return select;
-            }
-            let enclosing = self.settings.clone();
-            match select_sql_semantics(&enclosing, &select) {
-                Ok(settings) => self.settings = settings,
-                Err(error) => {
-                    self.error = Some(error);
-                    return select;
-                }
-            }
-            self.uses |= self.settings.sql_mode().group_concat_legacy();
-            let select = ast::fold_select(self, select);
-            self.settings = enclosing;
-            select
-        }
-    }
-    let mut detector = Detector {
-        settings: session.clone(),
-        uses: false,
-        error: None,
-    };
-    detector.fold_query(query.clone());
-    match detector.error {
-        Some(error) => Err(error),
-        None => Ok(detector.uses),
-    }
+    let settings = query_sql_semantics(session, query)?;
+    Ok(settings.sql_mode().group_concat_legacy() && query_has_select(query))
 }
 
-/// Detect uncaptured ERROR_IF_OVERFLOW at each actual SELECT in lexical scope.
+/// Detect uncaptured strict overflow policy under the root query setting.
 pub fn query_uses_error_if_overflow(
     session: &SqlSemanticSettings,
     query: &ast::Query,
 ) -> Result<bool, crate::analyze_error::AnalyzeError> {
-    struct Detector {
-        settings: SqlSemanticSettings,
-        uses: bool,
-        error: Option<crate::analyze_error::AnalyzeError>,
-    }
-    impl Fold for Detector {
-        fn fold_query(&mut self, query: ast::Query) -> ast::Query {
-            if self.error.is_some() {
-                return query;
-            }
-            let enclosing = self.settings.clone();
-            match query_sql_semantics(&enclosing, &query) {
-                Ok(settings) => self.settings = settings,
-                Err(error) => {
-                    self.error = Some(error);
-                    return query;
-                }
-            }
-            let query = ast::fold_query(self, query);
-            self.settings = enclosing;
-            query
-        }
-        fn fold_select(&mut self, select: ast::Select) -> ast::Select {
-            if self.error.is_some() {
-                return select;
-            }
-            let enclosing = self.settings.clone();
-            match select_sql_semantics(&enclosing, &select) {
-                Ok(settings) => self.settings = settings,
-                Err(error) => {
-                    self.error = Some(error);
-                    return select;
-                }
-            }
-            self.uses |= self.settings.sql_mode().error_if_overflow();
-            let select = ast::fold_select(self, select);
-            self.settings = enclosing;
-            select
-        }
-    }
-    let mut detector = Detector {
-        settings: session.clone(),
-        uses: false,
-        error: None,
-    };
-    detector.fold_query(query.clone());
-    match detector.error {
-        Some(error) => Err(error),
-        None => Ok(detector.uses),
-    }
+    let settings = query_sql_semantics(session, query)?;
+    Ok(settings.sql_mode().error_if_overflow() && query_has_select(query))
 }
 
 /// A v1 definition owns namespaces but does not capture SQL semantics.
@@ -610,6 +391,15 @@ mod tests {
         query
     }
 
+    // Author query-level facts explicitly; UNION branches never grant them.
+    fn query_with_assignments(sql: &str, assignments: &str) -> ast::Query {
+        let mut value = query(sql);
+        let assignment_source = query(&format!("SELECT /*+ SET_VAR({assignments}) */ 1"));
+        assert!(!assignment_source.session_properties.is_empty());
+        value.session_properties = assignment_source.session_properties;
+        value
+    }
+
     fn calls(query: &ast::Query) -> Vec<ast::FunctionCall> {
         struct Collector(Vec<ast::FunctionCall>);
         impl ast::Visit for Collector {
@@ -639,32 +429,27 @@ mod tests {
     }
 
     #[test]
-    fn persisted_definition_detector_respects_actual_select_scopes() {
+    fn persisted_definition_detector_uses_one_query_setting() {
         let legacy = semantics("GROUP_CONCAT_LEGACY");
         let modern = semantics("32");
+        let original_legacy = legacy.clone();
+        let original_modern = modern.clone();
         for sql in [
             "SELECT 1",
             "WITH c AS (SELECT 1) SELECT * FROM c",
             "SELECT * FROM (SELECT 1) d",
             "SELECT 1 UNION ALL SELECT 2",
+            "SELECT (SELECT 1)",
         ] {
             assert!(query_uses_group_concat_legacy(&legacy, &query(sql)).unwrap());
             assert!(!query_uses_group_concat_legacy(&modern, &query(sql)).unwrap());
+            let reset = query_with_assignments(sql, "sql_mode=32");
+            assert!(!query_uses_group_concat_legacy(&legacy, &reset).unwrap());
+            let enabled = query_with_assignments(sql, "sql_mode='GROUP_CONCAT_LEGACY'");
+            assert!(query_uses_group_concat_legacy(&modern, &enabled).unwrap());
         }
-        for sql in [
-            "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
-            "SELECT /*+ SET_VAR(sql_mode=32) */ 1 UNION ALL SELECT /*+ SET_VAR(sql_mode=32) */ 2",
-        ] {
-            assert!(!query_uses_group_concat_legacy(&legacy, &query(sql)).unwrap());
-        }
-        for sql in [
-            "WITH c AS (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1) SELECT * FROM c",
-            "SELECT * FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1) d",
-            "SELECT 1 UNION ALL SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 2",
-            "SELECT (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1)",
-        ] {
-            assert!(query_uses_group_concat_legacy(&modern, &query(sql)).unwrap());
-        }
+        assert_eq!(legacy, original_legacy);
+        assert_eq!(modern, original_modern);
     }
 
     #[test]
@@ -816,147 +601,147 @@ mod tests {
     }
 
     #[test]
-    fn nested_and_cte_hints_shadow_without_leaking_to_siblings_or_parent() {
-        let normalized = normalize_concat_query(
-            query(
-                "WITH c AS (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat(v) x FROM t) \
-             SELECT group_concat(v,'-'), \
-                (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat(v) FROM t), \
-                (SELECT group_concat(v,'-') FROM t) FROM t",
-            ),
-            &SqlSemanticSettings::default(),
-        ).unwrap();
-        let collected = calls(&normalized);
-        assert_eq!(collected.len(), 4);
-        assert_eq!(
-            collected
+    fn concat_calls_in_ctes_subqueries_and_union_inherit_query_policy() {
+        fn assert_calls(sql: &str, mode: &str, counts: &[usize], separators: &[&str]) {
+            let caller = SqlSemanticSettings::default();
+            let original_caller = caller.clone();
+            let query = query_with_assignments(sql, &format!("sql_mode='{mode}'"));
+            let normalized = normalize_concat_query(query, &caller).unwrap();
+            let collected = calls(&normalized);
+            assert_eq!(collected.len(), counts.len());
+            assert_eq!(
+                collected
+                    .iter()
+                    .map(|call| call.arguments.len())
+                    .collect::<Vec<_>>(),
+                counts
+            );
+            let actual = collected
                 .iter()
-                .map(|call| call.arguments.len())
-                .collect::<Vec<_>>(),
-            vec![1, 2, 1, 2]
+                .map(|call| {
+                    novarocks_parser::printer::print_expr(
+                        call.separator.as_deref().expect("explicit separator"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, separators);
+            let effective = query_sql_semantics(&caller, &normalized).unwrap();
+            assert_eq!(effective.sql_mode().assignment(), mode);
+            assert_eq!(caller, original_caller);
+        }
+        let nested = "WITH c AS (SELECT group_concat(v) x FROM t) SELECT group_concat(v,'-'), (SELECT group_concat(v) FROM t), (SELECT group_concat(v,'-') FROM t) FROM t";
+        assert_calls(nested, "32", &[1, 2, 1, 2], &["','", "','", "','", "','"]);
+        assert_calls(
+            nested,
+            "GROUP_CONCAT_LEGACY",
+            &[1, 1, 1, 1],
+            &["', '", "'-'", "', '", "'-'"],
         );
-        let separators = collected
-            .iter()
-            .map(|call| {
-                novarocks_parser::printer::print_expr(
-                    call.separator.as_deref().expect("explicit separator"),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(separators, vec!["', '", "','", "', '", "','"]);
-        let parent = query_sql_semantics(&SqlSemanticSettings::default(), &normalized).unwrap();
-        assert!(!parent.sql_mode().group_concat_legacy());
-        let inherited = normalize_concat_query(
-            query(
-                "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat(v), \
-                (SELECT /*+ SET_VAR(sql_mode=32) */ group_concat(v,'-') FROM t), \
-                (SELECT group_concat(v) FROM t) FROM t",
-            ),
-            &SqlSemanticSettings::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            calls(&inherited)
-                .iter()
-                .map(|call| call.arguments.len())
-                .collect::<Vec<_>>(),
-            vec![1, 2, 1]
+        let scalar = "SELECT group_concat(v), (SELECT group_concat(v,'-') FROM t), (SELECT group_concat(v) FROM t) FROM t";
+        assert_calls(scalar, "32", &[1, 2, 1], &["','", "','", "','"]);
+        assert_calls(
+            scalar,
+            "GROUP_CONCAT_LEGACY",
+            &[1, 1, 1],
+            &["', '", "'-'", "', '"],
         );
-        let branches = normalize_concat_query(
-            query(
-                "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat(v) FROM t \
-             UNION ALL SELECT group_concat(v,'-') FROM t",
-            ),
-            &SqlSemanticSettings::default(),
-        )
-        .unwrap();
-        let calls = calls(&branches);
-        assert_eq!(
-            calls
-                .iter()
-                .map(|call| call.arguments.len())
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert!(
-            !query_sql_semantics(&SqlSemanticSettings::default(), &branches)
-                .unwrap()
-                .sql_mode()
-                .group_concat_legacy()
-        );
+        let branches = "SELECT group_concat(v) FROM t UNION ALL SELECT group_concat(v,'-') FROM t";
+        assert_calls(branches, "32", &[1, 2], &["','", "','"]);
+        assert_calls(branches, "GROUP_CONCAT_LEGACY", &[1, 1], &["', '", "'-'"]);
     }
+
     #[test]
-    fn decimal_flag_assignments_preserve_mode_and_apply_only_in_their_scope() {
+    fn decimal_query_assignments_preserve_mode_and_validate_at_the_root() {
         let session = semantics("GROUP_CONCAT_LEGACY").with_decimal_overflow_to_double(true);
+        let original_session = session.clone();
         for value in ["0", "OFF", "false", "'false'"] {
             let resolved = query_sql_semantics(
                 &session,
-                &query(&format!(
-                    "SELECT /*+ SET_VAR(decimal_overflow_to_double={value}) */ 1"
-                )),
+                &query_with_assignments("SELECT 1", &format!("decimal_overflow_to_double={value}")),
             )
             .unwrap();
             assert!(!resolved.decimal_overflow_to_double());
             assert!(resolved.sql_mode().group_concat_legacy());
         }
         let value = query_sql_semantics(&session, &query(
-            "SELECT /*+ SET_VAR(sql_mode=32,decimal_overflow_to_double=0) */              /*+ SET_VAR(decimal_overflow_to_double=1) */ 1"
+            "SELECT /*+ SET_VAR(sql_mode=32,decimal_overflow_to_double=0) */ /*+ SET_VAR(decimal_overflow_to_double=1) */ 1"
         )).unwrap();
         assert!(value.decimal_overflow_to_double());
         assert!(!value.sql_mode().group_concat_legacy());
-        assert!(session.sql_mode().group_concat_legacy());
-        assert!(session.decimal_overflow_to_double());
-        for sql in [
-            "SELECT /*+ SET_VAR(decimal_overflow_to_double=2) */ 1",
-            "SELECT 1 FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double='bad') */ 1) t",
-            "WITH t AS (SELECT /*+ SET_VAR(decimal_overflow_to_double=1+1) */ 1) SELECT 1 FROM t",
-            "SELECT 1 UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=NULL) */ 1",
+        for (sql, value) in [
+            ("SELECT 1", "2"),
+            ("SELECT 1 FROM (SELECT 1) t", "'bad'"),
+            ("WITH t AS (SELECT 1) SELECT 1 FROM t", "1+1"),
+            ("SELECT 1 UNION ALL SELECT 1", "NULL"),
         ] {
-            let error = normalize_concat_query(query(sql), &session).unwrap_err();
+            let query = query_with_assignments(sql, &format!("decimal_overflow_to_double={value}"));
+            let error = normalize_concat_query(query.clone(), &session).unwrap_err();
             assert_eq!(error.code().as_str(), "sql.analyze.invalid_argument");
             assert!(error.span().is_some());
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let error = statement_sql_semantics(&session, &statements[0]).unwrap_err();
+            let error =
+                statement_sql_semantics(&session, &ast::Statement::Query(query)).unwrap_err();
             assert_eq!(error.code().as_str(), "sql.analyze.invalid_argument");
             assert!(error.span().is_some());
         }
+        assert_eq!(session, original_session);
     }
+
     #[test]
-    fn decimal_replay_rejects_consumer_and_stored_local_semantics() {
+    fn decimal_replay_rejects_uncaptured_caller_or_query_policy() {
         let ordinary = SqlSemanticSettings::default();
         let promoted = ordinary.clone().with_decimal_overflow_to_double(true);
-        assert!(validate_persisted_query_semantics(&query("SELECT 1"), &ordinary).is_ok());
-        assert!(
-            validate_persisted_query_semantics(&query("SELECT 1"), &promoted)
-                .unwrap_err()
-                .contains("decimal_overflow_to_double=true is not captured")
-        );
+        let original_ordinary = ordinary.clone();
+        let original_promoted = promoted.clone();
         for sql in [
-            "SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1",
-            "SELECT 1 FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1) t",
-            "WITH t AS (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1) SELECT 1 FROM t",
+            "SELECT 1",
+            "SELECT 1 FROM (SELECT 1) t",
+            "WITH t AS (SELECT 1) SELECT 1 FROM t",
+            "SELECT 1 UNION ALL SELECT 1",
         ] {
-            assert!(validate_persisted_query_semantics(&query(sql), &ordinary).is_err());
+            assert!(validate_persisted_query_semantics(&query(sql), &ordinary).is_ok());
+            assert!(
+                validate_persisted_query_semantics(&query(sql), &promoted)
+                    .unwrap_err()
+                    .contains("decimal_overflow_to_double=true is not captured")
+            );
+            let enabled = query_with_assignments(sql, "decimal_overflow_to_double=true");
+            assert!(
+                validate_persisted_query_semantics(&enabled, &ordinary)
+                    .unwrap_err()
+                    .contains("decimal_overflow_to_double=true is not captured")
+            );
+            let disabled = query_with_assignments(sql, "decimal_overflow_to_double=false");
+            assert!(validate_persisted_query_semantics(&disabled, &ordinary).is_ok());
+            // A query override cannot make an uncaptured caller a replay context.
+            assert!(validate_persisted_query_semantics(&disabled, &promoted).is_err());
         }
+        assert_eq!(ordinary, original_ordinary);
+        assert_eq!(promoted, original_promoted);
     }
+
     #[test]
-    fn decimal_usage_only_observes_effective_select_scopes() {
+    fn decimal_usage_observes_one_effective_query_setting() {
         let on = SqlSemanticSettings::default().with_decimal_overflow_to_double(true);
         let off = SqlSemanticSettings::default();
+        let original_on = on.clone();
+        let original_off = off.clone();
         for sql in [
-            "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ 1",
-            "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ 1 UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ 2",
+            "SELECT 1",
+            "SELECT 1 UNION ALL SELECT 2",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "SELECT (SELECT 1)",
         ] {
-            assert!(!query_uses_decimal_overflow_to_double(&on, &query(sql)).unwrap());
+            assert!(query_uses_decimal_overflow_to_double(&on, &query(sql)).unwrap());
+            assert!(!query_uses_decimal_overflow_to_double(&off, &query(sql)).unwrap());
+            let disabled = query_with_assignments(sql, "decimal_overflow_to_double=false");
+            assert!(!query_uses_decimal_overflow_to_double(&on, &disabled).unwrap());
+            let enabled = query_with_assignments(sql, "decimal_overflow_to_double=true");
+            assert!(query_uses_decimal_overflow_to_double(&off, &enabled).unwrap());
         }
-        for sql in [
-            "SELECT 1 UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 2",
-            "WITH c AS (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1) SELECT * FROM c",
-            "SELECT (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1)",
-        ] {
-            assert!(query_uses_decimal_overflow_to_double(&off, &query(sql)).unwrap());
-        }
+        assert_eq!(on, original_on);
+        assert_eq!(off, original_off);
     }
+
     #[test]
     fn overflow_error_policy_is_independent_from_allow_throw_and_promotion() {
         use novarocks_type_contract::DecimalOverflowPolicy;
@@ -993,31 +778,34 @@ mod tests {
     }
 
     #[test]
-    fn overflow_definition_usage_observes_lexical_selects_and_replay_boundary() {
+    fn overflow_definition_usage_observes_query_policy_and_replay_boundary() {
         let ordinary = SqlSemanticSettings::default();
         let strict = ordinary
             .clone()
             .with_sql_mode(SqlMode::from_assignment("ERROR_IF_OVERFLOW"));
+        let original_ordinary = ordinary.clone();
+        let original_strict = strict.clone();
         for sql in [
-            "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
-            "SELECT /*+ SET_VAR(sql_mode=32) */ 1 UNION ALL SELECT /*+ SET_VAR(sql_mode=32) */ 2",
+            "SELECT 1",
+            "SELECT 1 UNION ALL SELECT 2",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "SELECT (SELECT 1)",
         ] {
-            assert!(!query_uses_error_if_overflow(&strict, &query(sql)).unwrap());
-        }
-        for sql in [
-            "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1",
-            "SELECT 1 UNION ALL SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 2",
-            "WITH c AS (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1) SELECT * FROM c",
-            "SELECT (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1)",
-        ] {
-            assert!(query_uses_error_if_overflow(&ordinary, &query(sql)).unwrap());
+            assert!(!query_uses_error_if_overflow(&ordinary, &query(sql)).unwrap());
+            assert!(query_uses_error_if_overflow(&strict, &query(sql)).unwrap());
+            let reset = query_with_assignments(sql, "sql_mode=32");
+            assert!(!query_uses_error_if_overflow(&strict, &reset).unwrap());
+            let enabled = query_with_assignments(sql, "sql_mode='ERROR_IF_OVERFLOW'");
+            assert!(query_uses_error_if_overflow(&ordinary, &enabled).unwrap());
             assert!(
-                validate_persisted_query_semantics(&query(sql), &ordinary)
+                validate_persisted_query_semantics(&enabled, &ordinary)
                     .unwrap_err()
                     .contains("ERROR_IF_OVERFLOW is not captured")
             );
+            assert!(validate_persisted_query_semantics(&query(sql), &strict).is_err());
+            assert!(validate_persisted_query_semantics(&query(sql), &ordinary).is_ok());
         }
-        assert!(validate_persisted_query_semantics(&query("SELECT 1"), &strict).is_err());
-        assert!(validate_persisted_query_semantics(&query("SELECT 1"), &ordinary).is_ok());
+        assert_eq!(ordinary, original_ordinary);
+        assert_eq!(strict, original_strict);
     }
 }

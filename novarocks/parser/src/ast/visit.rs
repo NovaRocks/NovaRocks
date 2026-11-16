@@ -69,6 +69,15 @@ pub trait Visit {
         walk_query(self, query);
     }
 
+    fn visit_select(&mut self, select: &Select) {
+        walk_select(self, select);
+    }
+
+    fn visit_session_property(&mut self, property: &SessionProperty) {
+        self.visit_object_name(&property.name);
+        self.visit_expr(&property.value);
+    }
+
     fn visit_explain_query(&mut self, query: &ExplainQuery) {
         walk_explain_query(self, query);
     }
@@ -205,6 +214,9 @@ pub fn walk_explain_query<V: Visit + ?Sized>(visitor: &mut V, query: &ExplainQue
 }
 
 pub fn walk_query<V: Visit + ?Sized>(visitor: &mut V, query: &Query) {
+    for property in &query.session_properties {
+        visitor.visit_session_property(property);
+    }
     if let Some(with) = &query.with {
         for cte in &with.ctes {
             visitor.visit_ident(&cte.name);
@@ -233,7 +245,7 @@ pub fn walk_query<V: Visit + ?Sized>(visitor: &mut V, query: &Query) {
 
 pub fn walk_set_expr<V: Visit + ?Sized>(visitor: &mut V, set_expr: &SetExpr) {
     match set_expr {
-        SetExpr::Select(select) => walk_select(visitor, select),
+        SetExpr::Select(select) => visitor.visit_select(select),
         SetExpr::Values(values) => {
             for row in &values.rows {
                 for expr in row {
@@ -250,18 +262,6 @@ pub fn walk_set_expr<V: Visit + ?Sized>(visitor: &mut V, set_expr: &SetExpr) {
 }
 
 pub fn walk_select<V: Visit + ?Sized>(visitor: &mut V, select: &Select) {
-    for hint in &select.hints {
-        visitor.visit_ident(&hint.name);
-        match &hint.value {
-            SelectHintValue::Bare => {}
-            SelectHintValue::Call { arguments } => {
-                for argument in arguments {
-                    visitor.visit_expr(argument);
-                }
-            }
-            SelectHintValue::Assignment { value } => visitor.visit_expr(value),
-        }
-    }
     if let SelectQuantifier::Distinct { on, .. } = &select.quantifier {
         for expr in on {
             visitor.visit_expr(expr);
@@ -644,6 +644,12 @@ pub trait Fold {
         fold_query(self, query)
     }
 
+    fn fold_session_property(&mut self, mut property: SessionProperty) -> SessionProperty {
+        property.name = self.fold_object_name(property.name);
+        property.value = self.fold_expr(property.value);
+        property
+    }
+
     fn fold_select(&mut self, select: Select) -> Select {
         fold_select(self, select)
     }
@@ -875,6 +881,11 @@ pub fn fold_explain_query<F: Fold + ?Sized>(
 }
 
 pub fn fold_query<F: Fold + ?Sized>(folder: &mut F, mut query: Query) -> Query {
+    query.session_properties = query
+        .session_properties
+        .into_iter()
+        .map(|property| folder.fold_session_property(property))
+        .collect();
     query.with = query.with.map(|mut with| {
         with.ctes = with
             .ctes
@@ -934,26 +945,6 @@ pub fn fold_set_expr<F: Fold + ?Sized>(folder: &mut F, set_expr: SetExpr) -> Set
 }
 
 pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Select {
-    select.hints = select
-        .hints
-        .into_iter()
-        .map(|mut hint| {
-            hint.name = folder.fold_ident(hint.name);
-            hint.value = match hint.value {
-                SelectHintValue::Bare => SelectHintValue::Bare,
-                SelectHintValue::Call { arguments } => SelectHintValue::Call {
-                    arguments: arguments
-                        .into_iter()
-                        .map(|argument| folder.fold_expr(argument))
-                        .collect(),
-                },
-                SelectHintValue::Assignment { value } => SelectHintValue::Assignment {
-                    value: folder.fold_expr(value),
-                },
-            };
-            hint
-        })
-        .collect();
     select.quantifier = match select.quantifier {
         SelectQuantifier::Distinct { on, span } => SelectQuantifier::Distinct {
             on: on.into_iter().map(|expr| folder.fold_expr(expr)).collect(),

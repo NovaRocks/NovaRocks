@@ -198,7 +198,7 @@ mod tests {
                 "{prefix} SELECT * FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1) d"
             );
             let statement = parse_single_statement(&sql).unwrap();
-            assert!(admit_persisted_definition_semantics(&sql, &statement, &modern).is_err());
+            assert!(admit_persisted_definition_semantics(&sql, &statement, &modern).is_ok());
         }
         for sql in [
             "REFRESH MATERIALIZED VIEW mv",
@@ -278,7 +278,7 @@ mod tests {
         assert!(requires_lake_publication_deadline(&dml));
     }
     #[test]
-    fn persisted_definition_guard_uses_effective_root_and_nested_settings() {
+    fn persisted_definition_guard_uses_query_settings_and_ignores_local_hints() {
         let disabled = novarocks_sql::sql_mode::SqlSemanticSettings::default();
         let enabled = disabled.clone().with_decimal_overflow_to_double(true);
         for prefix in [
@@ -302,7 +302,7 @@ mod tests {
                 (
                     &disabled,
                     "SELECT 1 FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double=1) */ 1 x) t",
-                    true,
+                    false,
                 ),
                 (
                     &enabled,
@@ -312,12 +312,12 @@ mod tests {
                 (
                     &disabled,
                     "WITH t AS (SELECT /*+ SET_VAR(decimal_overflow_to_double=1) */ 1) SELECT 1 FROM t",
-                    true,
+                    false,
                 ),
                 (
                     &disabled,
                     "SELECT 1 UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=1) */ 1",
-                    true,
+                    false,
                 ),
             ] {
                 let sql = format!("{prefix}{query}");
@@ -336,6 +336,9 @@ mod tests {
         }
         let sql = "CREATE VIEW v AS SELECT 1 FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double='bad') */ 1) t";
         let statement = parse_single_statement(sql).unwrap();
+        assert!(admit_persisted_definition_semantics(sql, &statement, &disabled).is_ok());
+        let sql = "CREATE VIEW v AS SELECT /*+ SET_VAR(decimal_overflow_to_double='bad') */ 1";
+        let statement = parse_single_statement(sql).unwrap();
         let error = admit_persisted_definition_semantics(sql, &statement, &disabled).unwrap_err();
         assert_eq!(
             error.user_error().unwrap().code().as_str(),
@@ -352,7 +355,7 @@ mod tests {
         );
     }
     #[test]
-    fn error_overflow_definition_admission_rejects_inherited_and_nested_policy_before_effects() {
+    fn error_overflow_definition_admission_rejects_query_policy_before_effects() {
         use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
         let default = SqlSemanticSettings::default();
         let error = default
@@ -375,7 +378,7 @@ mod tests {
                 (
                     &default,
                     "SELECT 1 x FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1 x) t",
-                    true,
+                    false,
                 ),
                 (
                     &error,

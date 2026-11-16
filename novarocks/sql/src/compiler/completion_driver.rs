@@ -2321,12 +2321,9 @@ mod tests {
     }
 
     #[test]
-    fn completed_nested_decimal_scope_keeps_root_allow_refs_and_local_policy_separate() {
+    fn completed_nested_legacy_hint_inherits_root_allow_refs_and_decimal_policy() {
         use novarocks_physical_plan::{BinaryOperator, ExprKind};
-        use novarocks_type_contract::{
-            DecimalOverflowPolicy::{OutputNull, ReportError},
-            SemanticParameterValue,
-        };
+        use novarocks_type_contract::{DecimalOverflowPolicy::OutputNull, SemanticParameterValue};
         let completed = complete_root_intrinsic_fixture(
             "SELECT x + 1 AS a FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(order_key AS DECIMAL(18,6)) AS x FROM orders) s",
             "ALLOW_THROW_EXCEPTION",
@@ -2351,7 +2348,7 @@ mod tests {
                         ..
                     } => saw_root_arithmetic = true,
                     ExprKind::Cast {
-                        decimal_overflow_policy: ReportError,
+                        decimal_overflow_policy: OutputNull,
                         ..
                     } => saw_nested_cast = true,
                     _ => {}
@@ -2543,12 +2540,12 @@ mod tests {
                 "32",
             ),
             (
-                "SELECT order_key FROM orders UNION ALL SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders",
-                "32",
+                "SELECT order_key FROM orders UNION ALL SELECT /*+ SET_VAR(sql_mode=32) */ order_key FROM orders",
+                "GROUP_CONCAT_LEGACY",
             ),
             (
-                "SELECT order_key FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders) d",
-                "32",
+                "SELECT order_key FROM (SELECT /*+ SET_VAR(sql_mode=32) */ order_key FROM orders) d",
+                "GROUP_CONCAT_LEGACY",
             ),
         ] {
             let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
@@ -2576,26 +2573,41 @@ mod tests {
     }
 
     #[test]
-    fn modern_root_override_keeps_existing_mv_discovery_policy() {
+    fn modern_root_and_ignored_local_hints_keep_existing_mv_discovery_policy() {
         use crate::sql_mode::SqlMode;
-        let mut request = request_with_mv(
-            "SELECT /*+ SET_VAR(sql_mode=32) */ order_key FROM orders",
-            SqlCompileIntent::Query,
-            true,
-        );
-        request.session.sql_semantics = request
-            .session
-            .sql_semantics
-            .clone()
-            .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
-        let seed = request.try_into_completion().unwrap();
-        let compilation = incomplete(
-            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
-        );
-        assert!(matches!(
-            compilation.needs(),
-            SqlNeedBatch::MaterializedViews(_)
-        ));
+        for (sql, connection_mode) in [
+            (
+                "SELECT /*+ SET_VAR(sql_mode=32) */ order_key FROM orders",
+                "GROUP_CONCAT_LEGACY",
+            ),
+            (
+                "SELECT order_key FROM orders UNION ALL SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders",
+                "32",
+            ),
+            (
+                "SELECT order_key FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders) d",
+                "32",
+            ),
+            (
+                "WITH d AS (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders) SELECT order_key FROM d",
+                "32",
+            ),
+        ] {
+            let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
+            request.session.sql_semantics = request
+                .session
+                .sql_semantics
+                .clone()
+                .with_sql_mode(SqlMode::from_assignment(connection_mode));
+            let seed = request.try_into_completion().unwrap();
+            let compilation = incomplete(
+                SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+            );
+            assert!(matches!(
+                compilation.needs(),
+                SqlNeedBatch::MaterializedViews(_)
+            ));
+        }
     }
 
     #[test]
@@ -2687,12 +2699,12 @@ mod tests {
                 false,
             ),
             (
-                "SELECT order_key FROM orders UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders",
-                false,
+                "SELECT order_key FROM orders UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders",
+                true,
             ),
             (
-                "SELECT order_key FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders) d",
-                false,
+                "SELECT order_key FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders) d",
+                true,
             ),
         ] {
             let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
@@ -2723,9 +2735,17 @@ mod tests {
     fn decimal_false_overrides_keep_existing_mv_discovery_policy() {
         for sql in [
             "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders",
-            "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders",
+            "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
         ] {
             let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
+            let mut query = crate::compiler::test_query(sql);
+            // UNION branches never own session properties. Bind the override
+            // explicitly to the root query, independent of legacy hint syntax.
+            query.session_properties = crate::compiler::test_query(
+                "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ 1",
+            )
+            .session_properties;
+            request.statement = SqlStatementInput::parsed_query(query);
             request.session.sql_semantics = request
                 .session
                 .sql_semantics

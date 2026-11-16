@@ -947,7 +947,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         start: usize,
     ) -> Result<(Box<crate::ast::Query>, Span), ParseError> {
         let mut parser = StatementParser::new(self.source, &self.tokens[self.position..]);
-        let query = query::parse_query(&mut parser)?;
+        let mut query = query::parse_query(&mut parser)?;
+        query.session_properties.clear();
         self.position += parser.position;
         self.skip_trivia();
         if !self.current_is_symbol(Symbol::RParen) {

@@ -28,45 +28,23 @@ pub fn query_allows_throw_exception_hint(
     .allow_throw_exception())
 }
 
-/// Returns the positive per-statement execution-memory limit carried by a
-/// typed `SET_VAR(query_mem_limit = N)` hint.
+/// Returns a positive literal memory override from the root query's facts.
 pub fn query_mem_limit_hint(query: &novarocks_parser::ast::Query) -> Option<i64> {
-    use novarocks_parser::ast::{BinaryOperator, Expr, LiteralKind, SelectHintValue, SetExpr};
-
-    let mut body = query.body.as_ref();
-    while let SetExpr::Query(nested) = body {
-        body = nested.body.as_ref();
-    }
-    let SetExpr::Select(select) = body else {
-        return None;
-    };
-    select.hints.iter().find_map(|hint| {
-        if !hint.name.value.eq_ignore_ascii_case("set_var") {
-            return None;
-        }
-        let SelectHintValue::Call { arguments } = &hint.value else {
+    use novarocks_parser::ast::{Expr, LiteralKind};
+    query.session_properties.iter().find_map(|property| {
+        let [name] = property.name.parts.as_slice() else {
             return None;
         };
-        arguments.iter().find_map(|argument| {
-            let Expr::Binary(binary) = argument else {
-                return None;
-            };
-            let Expr::Identifier(name) = binary.left.as_ref() else {
-                return None;
-            };
-            if binary.operator != BinaryOperator::Equal
-                || !name.value.eq_ignore_ascii_case("query_mem_limit")
-            {
-                return None;
-            }
-            let Expr::Literal(literal) = binary.right.as_ref() else {
-                return None;
-            };
-            let LiteralKind::Number(value) = &literal.kind else {
-                return None;
-            };
-            value.parse::<i64>().ok().filter(|value| *value > 0)
-        })
+        if !name.value.eq_ignore_ascii_case("query_mem_limit") {
+            return None;
+        }
+        let Expr::Literal(literal) = &property.value else {
+            return None;
+        };
+        let LiteralKind::Number(value) = &literal.kind else {
+            return None;
+        };
+        value.parse::<i64>().ok().filter(|value| *value > 0)
     })
 }
 

@@ -162,11 +162,33 @@ impl Printer {
     }
 
     fn write_query(&mut self, query: &Query) {
+        self.write_query_with_properties(query, &query.session_properties);
+    }
+
+    fn write_query_with_properties(&mut self, query: &Query, properties: &[SessionProperty]) {
+        let mut body = query.body.as_ref();
+        while let SetExpr::Query(inner) = body {
+            body = &inner.body;
+        }
+        let legacy_select = matches!(body, SetExpr::Select(_))
+            && properties
+                .iter()
+                .all(|property| property.name.parts.len() == 1);
+        // Query facts with no legacy SELECT spelling still retain their full
+        // query prefix. The new grammar owns parsing those shapes at cutover.
+        let properties = if !properties.is_empty() && !legacy_select {
+            self.output.push_str("WITH SESSION ");
+            self.write_session_properties(properties);
+            self.output.push(' ');
+            &[][..]
+        } else {
+            properties
+        };
         if let Some(with) = &query.with {
             self.write_with(with);
             self.output.push(' ');
         }
-        self.write_set_expr(&query.body);
+        self.write_set_expr_with_properties(&query.body, properties);
         if !query.order_by.is_empty() {
             self.output.push_str(" ORDER BY ");
             self.write_order_by_list(&query.order_by);
@@ -223,6 +245,22 @@ impl Printer {
             self.output.push_str(" AS (");
             self.write_query(&cte.query);
             self.output.push(')');
+        }
+    }
+
+    fn write_set_expr_with_properties(
+        &mut self,
+        expression: &SetExpr,
+        properties: &[SessionProperty],
+    ) {
+        match expression {
+            SetExpr::Select(select) => self.write_select_with_properties(select, properties),
+            SetExpr::Query(query) => {
+                self.output.push('(');
+                self.write_query_with_properties(query, properties);
+                self.output.push(')');
+            }
+            _ => self.write_set_expr(expression),
         }
     }
 
@@ -284,23 +322,15 @@ impl Printer {
     }
 
     fn write_select(&mut self, select: &Select) {
+        self.write_select_with_properties(select, &[]);
+    }
+
+    fn write_select_with_properties(&mut self, select: &Select, properties: &[SessionProperty]) {
         self.output.push_str("SELECT");
-        for hint in &select.hints {
-            self.output.push_str(" /*+ ");
-            self.write_ident(&hint.name);
-            match &hint.value {
-                SelectHintValue::Bare => {}
-                SelectHintValue::Call { arguments } => {
-                    self.output.push('(');
-                    self.write_expr_list(arguments);
-                    self.output.push(')');
-                }
-                SelectHintValue::Assignment { value } => {
-                    self.output.push_str(" = ");
-                    self.write_expr(value);
-                }
-            }
-            self.output.push_str(" */");
+        if !properties.is_empty() {
+            self.output.push_str(" /*+ SET_VAR(");
+            self.write_session_properties(properties);
+            self.output.push_str(") */");
         }
         match &select.quantifier {
             SelectQuantifier::None => {}
@@ -355,6 +385,17 @@ impl Printer {
                 self.output.push_str(" AS ");
                 self.write_window_specification(&named.specification);
             }
+        }
+    }
+
+    fn write_session_properties(&mut self, properties: &[SessionProperty]) {
+        for (index, property) in properties.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_object_name(&property.name);
+            self.output.push_str(" = ");
+            self.write_expr(&property.value);
         }
     }
 
@@ -1479,12 +1520,14 @@ mod tests {
     #[test]
     fn renders_query_relations_and_modifiers() {
         let query = Query {
+            session_properties: Vec::new(),
             with: Some(With {
                 recursive: false,
                 ctes: vec![Cte {
                     name: ident("source"),
                     columns: Vec::new(),
                     query: Box::new(Query {
+                        session_properties: Vec::new(),
                         with: None,
                         body: Box::new(SetExpr::Values(Values {
                             rows: vec![vec![number("1")]],
@@ -1503,7 +1546,6 @@ mod tests {
                 span: span(),
             }),
             body: Box::new(SetExpr::Select(Box::new(Select {
-                hints: Vec::new(),
                 quantifier: SelectQuantifier::Distinct {
                     on: vec![identifier("s")],
                     span: span(),

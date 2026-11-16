@@ -3757,10 +3757,10 @@ mod tests {
     }
 
     #[test]
-    fn nested_decimal_policy_does_not_replace_the_admitted_root_allow_mode() {
+    fn nested_legacy_hint_inherits_the_admitted_root_allow_and_decimal_policy() {
         use crate::analysis::ExprKind;
         use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
-        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        use novarocks_type_contract::DecimalOverflowPolicy::OutputNull;
         fn cast_policies(
             node: &LogicalPlanNode,
             out: &mut Vec<novarocks_type_contract::DecimalOverflowPolicy>,
@@ -3794,7 +3794,7 @@ mod tests {
         assert_eq!(analyzed.decimal_overflow_policy(), OutputNull);
         let mut policies = Vec::new();
         cast_policies(&analyzed.logical_plan, &mut policies);
-        assert_eq!(policies, [ReportError]);
+        assert_eq!(policies, [OutputNull]);
         let optimized = SqlCompiler::optimize(SqlOptimizeRequest::new(
             analyzed,
             &STATISTICS,

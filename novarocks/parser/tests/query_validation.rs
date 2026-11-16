@@ -91,6 +91,7 @@ fn quoted_window_names_keep_their_syntax_identity() {
 #[test]
 fn construction_only_empty_lists_retain_the_generic_structure_code() {
     let statement = Statement::Query(Query {
+        session_properties: Vec::new(),
         with: None,
         body: Box::new(SetExpr::Values(Values {
             rows: Vec::new(),
@@ -164,9 +165,9 @@ fn impossible_unbounded_window_frame_endpoints_are_rejected() {
 
 fn select_statement(windows: Vec<NamedWindow>) -> Statement {
     Statement::Query(Query {
+        session_properties: Vec::new(),
         with: None,
         body: Box::new(SetExpr::Select(Box::new(Select {
-            hints: Vec::new(),
             quantifier: SelectQuantifier::None,
             projection: vec![SelectItem::UnnamedExpr(number("1"))],
             from: Vec::new(),

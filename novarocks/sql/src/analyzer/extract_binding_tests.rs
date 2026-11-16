@@ -286,20 +286,21 @@ fn extract_binding_rejects_carrier_only_largeint_and_unsupported_field_at_origin
 }
 
 #[test]
-fn extract_binding_keeps_lexical_policy_null_sources_and_explicit_constant_admission() {
+fn extract_binding_inherits_root_policy_null_sources_and_explicit_constant_admission() {
     use DecimalOverflowPolicy::{OutputNull, ReportError};
     let catalog = TemporalCatalog {
         carrier: DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
         logical: None,
         nullable: false,
     };
-    for (outer, inner, outer_policy, inner_policy) in [
-        ("ERROR_IF_OVERFLOW", "32", ReportError, OutputNull),
-        ("32", "ERROR_IF_OVERFLOW", OutputNull, ReportError),
+    for (outer, inner, outer_policy) in [
+        ("ERROR_IF_OVERFLOW", "32", ReportError),
+        ("32", "ERROR_IF_OVERFLOW", OutputNull),
     ] {
         let sql = format!(
             "SELECT /*+ SET_VAR(sql_mode='{outer}') */ EXTRACT(YEAR FROM q.x), year(q.x) FROM (SELECT /*+ SET_VAR(sql_mode='{inner}') */ x, EXTRACT(MONTH FROM x) AS m, month(x) AS n FROM temporal_source) q"
         );
+        // A nested legacy hint cannot shadow the frozen whole-query policy.
         let query = analyze(&sql, &catalog, crate::constant::test_constant_policy()).unwrap();
         for ordinal in [0, 1] {
             assert_eq!(
@@ -321,12 +322,12 @@ fn extract_binding_keeps_lexical_policy_null_sources_and_explicit_constant_admis
                 call(project(inner_query, ordinal))
                     .1
                     .decimal_overflow_policy(),
-                inner_policy
+                outer_policy
             );
         }
         for (query, ordinals, policy) in [
             (&query, [0, 1], outer_policy),
-            (inner_query.as_ref(), [1, 2], inner_policy),
+            (inner_query.as_ref(), [1, 2], outer_policy),
         ] {
             for ordinal in ordinals {
                 let ExprKind::Cast {

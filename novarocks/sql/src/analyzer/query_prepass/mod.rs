@@ -24,9 +24,9 @@
 use novarocks_parser::{
     Span,
     ast::{
-        BinaryOperator, Expr, Fold, GroupBy, Ident, JoinConstraint, JoinOperator, LiteralKind,
-        Query, Select, SelectHintValue, SelectItem, SetExpr, SetOperation, SetOperator,
-        SetQuantifier, TableAlias, TableFactor, TableWithJoins, Visit,
+        Expr, Fold, GroupBy, Ident, JoinConstraint, JoinOperator, LiteralKind, Query, Select,
+        SelectItem, SetExpr, SetOperation, SetOperator, SetQuantifier, TableAlias, TableFactor,
+        TableWithJoins, Visit,
     },
 };
 
@@ -69,36 +69,14 @@ pub(crate) fn preanalyze_with_semantics(
 }
 
 fn recursive_cte_max_depth(query: &Query) -> Option<usize> {
-    let select = root_select(query.body.as_ref())?;
-    select.hints.iter().find_map(|hint| {
-        let value = if hint
-            .name
-            .value
-            .eq_ignore_ascii_case("recursive_cte_max_depth")
-        {
-            let SelectHintValue::Assignment { value } = &hint.value else {
-                return None;
-            };
-            value
-        } else if hint.name.value.eq_ignore_ascii_case("set_var") {
-            let SelectHintValue::Call { arguments } = &hint.value else {
-                return None;
-            };
-            arguments.iter().find_map(|argument| {
-                let Expr::Binary(binary) = argument else {
-                    return None;
-                };
-                let Expr::Identifier(name) = binary.left.as_ref() else {
-                    return None;
-                };
-                (binary.operator == BinaryOperator::Equal
-                    && name.value.eq_ignore_ascii_case("recursive_cte_max_depth"))
-                .then_some(binary.right.as_ref())
-            })?
-        } else {
+    query.session_properties.iter().find_map(|property| {
+        let [name] = property.name.parts.as_slice() else {
             return None;
         };
-        let Expr::Literal(value) = value else {
+        if !name.value.eq_ignore_ascii_case("recursive_cte_max_depth") {
+            return None;
+        }
+        let Expr::Literal(value) = &property.value else {
             return None;
         };
         let LiteralKind::Number(value) = &value.kind else {
@@ -343,6 +321,7 @@ fn pin_projection_aliases(expr: &mut SetExpr, aliases: &[Ident]) {
 
 fn query_with_body(template: &Query, body: SetExpr) -> Query {
     Query {
+        session_properties: Vec::new(),
         with: None,
         body: Box::new(body),
         order_by: Vec::new(),
@@ -389,7 +368,6 @@ fn inline_iteration(
         span,
     };
     SetExpr::Select(Box::new(Select {
-        hints: Vec::new(),
         quantifier: novarocks_parser::ast::SelectQuantifier::None,
         projection: vec![SelectItem::Wildcard {
             options: Default::default(),
@@ -449,6 +427,9 @@ fn set_expr_references_table(expr: &SetExpr, target: &str) -> bool {
 }
 
 fn scan_query_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, query: &Query) {
+    for property in &query.session_properties {
+        visitor.visit_expr(&property.value);
+    }
     let mut outer_target_visible = true;
     if let Some(with) = &query.with {
         for cte in &with.ctes {
@@ -487,17 +468,6 @@ fn scan_query_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, query
 fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, expr: &SetExpr) {
     match expr {
         SetExpr::Select(select) => {
-            for hint in &select.hints {
-                match &hint.value {
-                    SelectHintValue::Bare => {}
-                    SelectHintValue::Call { arguments } => {
-                        for argument in arguments {
-                            visitor.visit_expr(argument);
-                        }
-                    }
-                    SelectHintValue::Assignment { value } => visitor.visit_expr(value),
-                }
-            }
             if let novarocks_parser::ast::SelectQuantifier::Distinct { on, .. } = &select.quantifier
             {
                 for expression in on {
@@ -655,6 +625,7 @@ fn substitute_table_with_derived(
     }
 
     let template = Query {
+        session_properties: Vec::new(),
         with: None,
         body: Box::new(expr.clone()),
         order_by: Vec::new(),

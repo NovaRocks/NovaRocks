@@ -464,7 +464,6 @@ pub fn select(
         return Err(BuildError::EmptyProjection);
     }
     Ok(Select {
-        hints: Vec::new(),
         quantifier: SelectQuantifier::None,
         projection,
         from,
@@ -479,6 +478,7 @@ pub fn select(
 
 pub fn query(body: SetExpr) -> Query {
     Query {
+        session_properties: Vec::new(),
         with: None,
         body: Box::new(body),
         order_by: Vec::new(),

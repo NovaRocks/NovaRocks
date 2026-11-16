@@ -74,7 +74,7 @@ pub use materialized_view::{
 };
 pub use query::{
     Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, Offset, OffsetRows, OrderByExpr, Query,
-    ReplaceSelectItem, Select, SelectHint, SelectHintValue, SelectItem, SelectQuantifier, SetExpr,
+    ReplaceSelectItem, Select, SelectItem, SelectQuantifier, SessionProperty, SetExpr,
     SetOperation, SetOperator, SetQuantifier, Values, WildcardOptions, With,
 };
 pub use relation::{
@@ -99,7 +99,8 @@ pub use visit::{
     fold_nested_expr, fold_object_name, fold_query, fold_select, fold_statement, fold_table_factor,
     fold_type_name, fold_unary_expr, fold_view_statement, walk_binary_expr, walk_expr,
     walk_function_call, walk_ident, walk_literal, walk_nested_expr, walk_object_name, walk_query,
-    walk_statement, walk_table_factor, walk_type_name, walk_unary_expr, walk_view_statement,
+    walk_select, walk_statement, walk_table_factor, walk_type_name, walk_unary_expr,
+    walk_view_statement,
 };
 pub use window::{
     NamedWindow, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
