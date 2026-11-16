@@ -1431,33 +1431,35 @@ fn format_function_display_name(function: &ast::FunctionCall) -> String {
         );
     }
 
-    let distinct = matches!(function.quantifier, ast::FunctionQuantifier::Distinct)
-        || original_name == "array_agg_distinct";
+    let distinct = function.distinct || original_name == "array_agg_distinct";
     let argument_values = function
         .arguments
         .iter()
         .map(|argument| &argument.value)
         .collect::<Vec<_>>();
-    let (arguments, order_arguments, implicit_separator) = if canonical_name == "group_concat" {
-        // Prepared syntax owns values and separator in distinct fields.
-        let values = argument_values.as_slice();
-        let separator = function.separator.as_deref();
-        (
-            values
-                .iter()
-                .map(|value| expr_display_name_preserve_path(value))
-                .collect::<Vec<_>>()
-                .join(","),
-            values,
-            separator,
-        )
-    } else {
-        (
-            format_function_arguments(function, &canonical_name),
-            argument_values.as_slice(),
-            None,
-        )
-    };
+    // STRING_AGG's declared final argument is its separator. Raw ordinary
+    // GROUP_CONCAT syntax has not yet acquired that canonical contract.
+    let (arguments, order_arguments, concat_separator) =
+        if original_name == "string_agg" && argument_values.len() >= 2 {
+            let (separator, values) = argument_values
+                .split_last()
+                .expect("two canonical arguments");
+            (
+                values
+                    .iter()
+                    .map(|value| expr_display_name_preserve_path(value))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                values,
+                Some(*separator),
+            )
+        } else {
+            (
+                format_function_arguments(function, &canonical_name),
+                argument_values.as_slice(),
+                None,
+            )
+        };
     let mut out = format!("{canonical_name}(");
     if distinct {
         out.push_str("DISTINCT ");
@@ -1478,20 +1480,12 @@ fn format_function_display_name(function: &ast::FunctionCall) -> String {
             out.push_str(&visible.join(", "));
         }
     }
-    if canonical_name == "group_concat" {
+    if let Some(separator) = concat_separator {
         if !arguments.is_empty() {
             out.push(' ');
         }
         out.push_str("SEPARATOR ");
-        out.push_str(
-            function
-                .separator
-                .as_deref()
-                .map(expr_display_name)
-                .or_else(|| implicit_separator.map(expr_display_name))
-                .as_deref()
-                .unwrap_or("','"),
-        );
+        out.push_str(&expr_display_name(separator));
     }
     out.push(')');
 

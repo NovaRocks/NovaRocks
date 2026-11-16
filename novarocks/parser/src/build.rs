@@ -424,9 +424,8 @@ pub fn function(name: ObjectName, arguments: Vec<Expr>) -> Expr {
             .into_iter()
             .map(|value| call_argument(value, None))
             .collect(),
-        quantifier: FunctionQuantifier::None,
+        distinct: false,
         order_by: None,
-        separator: None,
         filter: None,
         null_treatment: None,
         window: None,

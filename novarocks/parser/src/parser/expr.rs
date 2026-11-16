@@ -33,7 +33,7 @@ pub fn parse_expression(source: &str, tokens: &[Token]) -> Result<Expr, ParseErr
 mod tests {
     use crate::{
         ParseError, ParserError, Span,
-        ast::{BinaryOperator, Expr, FunctionQuantifier, Literal, LiteralKind, UnaryOperator},
+        ast::{BinaryOperator, Expr, Literal, LiteralKind, UnaryOperator},
         lex,
     };
 
@@ -475,7 +475,8 @@ mod tests {
         ) else {
             panic!("expected function modifiers");
         };
-        assert_eq!(call.quantifier, FunctionQuantifier::Distinct);
+        assert!(call.distinct);
+        assert_eq!(call.name.parts[0].value, "string_agg");
         assert_eq!(
             call.order_by
                 .as_ref()
@@ -484,7 +485,10 @@ mod tests {
                 .len(),
             1
         );
-        assert!(call.separator.is_some());
+        assert_eq!(call.arguments.len(), 2);
+        assert!(
+            matches!(&call.arguments[1].value, Expr::Literal(Literal { kind: LiteralKind::String(value), .. }) if value == ",")
+        );
         assert!(call.filter.is_some());
         let Expr::FunctionCall(call) = parse("lead(v IGNORE NULLS, 1) OVER (ORDER BY x)") else {
             panic!("expected null-treatment function");

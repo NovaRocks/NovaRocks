@@ -118,9 +118,8 @@ pub(crate) fn is_literal_expr(expr: &ast::Expr) -> bool {
 }
 
 pub(crate) fn plain_function(function: &ast::FunctionCall) -> bool {
-    matches!(function.quantifier, ast::FunctionQuantifier::None)
+    !function.distinct
         && function.order_by.is_none()
-        && function.separator.is_none()
         && function.filter.is_none()
         && function.null_treatment.is_none()
         && function.window.is_none()

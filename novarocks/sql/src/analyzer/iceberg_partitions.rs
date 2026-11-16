@@ -40,10 +40,9 @@ fn call(name: &str, argument: &str, span: Span) -> ast::Expr {
             None,
         )]
         .into(),
-        quantifier: ast::FunctionQuantifier::None,
+        distinct: false,
         processing_mode: None,
         order_by: None,
-        separator: None,
         filter: None,
         null_treatment: None,
         window: None,

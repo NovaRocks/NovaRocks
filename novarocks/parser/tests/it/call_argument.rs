@@ -742,9 +742,9 @@ fn map_literal_produces_plain_variadic_call_with_real_ordered_children_and_spans
     assert_eq!(call.name.parts[0].value, "map");
     assert!(!call.name.parts[0].quoted);
     assert_eq!(call.name.parts[0].span, novarocks_parser::SYNTHETIC);
-    assert_eq!(call.quantifier, FunctionQuantifier::None);
+    assert!(!call.distinct);
     assert!(call.processing_mode.is_none());
-    assert!(call.order_by.is_none() && call.separator.is_none() && call.filter.is_none());
+    assert!(call.order_by.is_none() && call.filter.is_none());
     assert!(call.null_treatment.is_none() && call.window.is_none());
     assert_eq!(call.arguments.len(), 4);
     for (argument, expected) in call
@@ -859,4 +859,157 @@ fn row_and_map_builders_retain_original_owning_nodes_without_changing_tuple_cont
     assert!(fields.fields[0].name.as_ref().unwrap().quoted);
     assert!(fields.fields[1].name.is_none());
     assert_eq!(printer::print_expr(&named), "STRUCT(`x` := 1, 2)");
+}
+
+#[test]
+fn function_distinct_keeps_the_pinned_none_all_merge_and_real_ordinary_names() {
+    for name in [
+        "f",
+        "group_concat",
+        "string_agg",
+        "catalog.f",
+        "`group_concat`",
+    ] {
+        let absent = expression(&format!("{name}(a, b)"));
+        let all = expression(&format!("{name}(ALL a, b)"));
+        let distinct = expression(&format!("{name}(DISTINCT a, b)"));
+        let Expr::FunctionCall(call) = &all else {
+            panic!("ordinary function");
+        };
+        assert!(!call.distinct);
+        assert_eq!(call.arguments.len(), 2);
+        assert!(all.syntax_eq(&absent));
+        assert!(!all.syntax_eq(&distinct));
+        let Expr::FunctionCall(call) = &distinct else {
+            unreachable!()
+        };
+        assert!(call.distinct);
+        assert!(distinct.syntax_eq(&expression(&printer::print_expr(&distinct))));
+        assert!(!printer::print_expr(&all).contains("ALL "));
+    }
+    let built = build::function(
+        build::object_name(vec![build::ident("f", false)]).unwrap(),
+        vec![build::integer(1)],
+    );
+    let Expr::FunctionCall(call) = &built else {
+        unreachable!()
+    };
+    assert!(!call.distinct);
+    for source in ["group_concat()", "string_agg()"] {
+        let Expr::FunctionCall(call) = expression(source) else {
+            unreachable!()
+        };
+        assert!(call.arguments.is_empty());
+        assert_eq!(call.name.parts[0].value, source.trim_end_matches("()"));
+    }
+}
+
+#[test]
+fn explicit_separator_moves_real_last_argument_and_keeps_all_other_metadata() {
+    let source = "group_concat(DISTINCT a, items[2] ORDER BY sortcol DESC SEPARATOR delimiter[3]) FILTER (WHERE flag) OVER (PARTITION BY partition_key)";
+    let expr = expression(source);
+    let Expr::FunctionCall(call) = &expr else {
+        panic!("canonical string_agg");
+    };
+    assert_eq!(call.name.parts.len(), 1);
+    assert_eq!(call.name.parts[0].value, "string_agg");
+    assert!(!call.name.parts[0].quoted);
+    assert_eq!(call.name.span, novarocks_parser::SYNTHETIC);
+    assert_eq!(call.name.parts[0].span, novarocks_parser::SYNTHETIC);
+    assert_eq!(call.span, Span::new(0, source.len()));
+    assert!(call.distinct);
+    assert!(call.processing_mode.is_none());
+    assert!(call.null_treatment.is_none());
+    assert_eq!(call.arguments.len(), 3);
+    for (argument, expected) in call.arguments.iter().zip(["a", "items[2]", "delimiter[3]"]) {
+        assert!(argument.name.is_none());
+        assert_eq!(argument.span, argument.value.span());
+        assert_eq!(
+            &source[argument.span.start()..argument.span.end()],
+            expected
+        );
+    }
+    let order = call.order_by.as_ref().unwrap();
+    assert_eq!(
+        &source[order.span.start()..order.span.end()],
+        "ORDER BY sortcol DESC"
+    );
+    assert_eq!(order.items[0].ordering, SortOrdering::Descending);
+    assert_eq!(order.items[0].null_ordering, NullOrdering::Undefined);
+    let filter = call.filter.as_ref().unwrap();
+    assert_eq!(&source[filter.span().start()..filter.span().end()], "flag");
+    let window = call.window.as_ref().unwrap();
+    assert_eq!(
+        &source[window.span().start()..window.span().end()],
+        "(PARTITION BY partition_key)"
+    );
+    assert!(expr.syntax_eq(&expression("string_agg(DISTINCT a, items[2], delimiter[3] ORDER BY sortcol DESC) FILTER (WHERE flag) OVER (PARTITION BY partition_key)")));
+    assert!(expr.syntax_eq(&expression(&printer::print_expr(&expr))));
+    struct Args(Vec<*const Expr>);
+    impl Visit for Args {
+        fn visit_call_argument(&mut self, node: &CallArgument) {
+            self.0.push(&node.value as *const Expr);
+            novarocks_parser::ast::walk_call_argument(self, node);
+        }
+    }
+    let mut visited = Args(Vec::new());
+    visited.visit_expr(&expr);
+    assert_eq!(
+        visited.0,
+        call.arguments
+            .iter()
+            .map(|node| &node.value as *const Expr)
+            .collect::<Vec<_>>()
+    );
+    let source = "STRING_AGG(value SEPARATOR NULL)";
+    let explicit_alias = expression(source);
+    let Expr::FunctionCall(call) = &explicit_alias else {
+        unreachable!()
+    };
+    assert_eq!(call.name.parts[0].value, "STRING_AGG");
+    assert_eq!(call.name.span, Span::new(0, "STRING_AGG".len()));
+    assert_eq!(call.span, Span::new(0, source.len()));
+    assert_eq!(call.arguments.len(), 2);
+    assert!(matches!(
+        &call.arguments[1].value,
+        Expr::Literal(Literal {
+            kind: LiteralKind::Null,
+            ..
+        })
+    ));
+    assert!(explicit_alias.syntax_eq(&expression("STRING_AGG(value, NULL)")));
+    novarocks_parser::ast::validate_statement(&statement(explicit_alias)).unwrap();
+}
+
+#[test]
+fn separator_refuses_illegal_source_shapes_before_the_fact_can_be_erased() {
+    for source in [
+        "group_concat(SEPARATOR NULL)",
+        "group_concat(ORDER BY a SEPARATOR ',')",
+        "string_agg(SEPARATOR ',')",
+        "array_agg(SEPARATOR NULL)",
+        "array_agg(a SEPARATOR ',')",
+        "f(a SEPARATOR ',')",
+        "catalog.group_concat(a SEPARATOR ',')",
+        "`group_concat`(a SEPARATOR ',')",
+        "`string_agg`(a SEPARATOR ',')",
+    ] {
+        let tokens = novarocks_parser::lex(source).unwrap();
+        let error = novarocks_parser::parser::parse_expression(source, &tokens).expect_err(source);
+        let novarocks_parser::ParseError::UnexpectedToken { span, .. } = error else {
+            panic!("typed Parse refusal: {source}");
+        };
+        assert_eq!(
+            span,
+            Span::new(0, source.len()),
+            "real complete call span: {source}"
+        );
+    }
+    for source in ["group_concat(a, b)", "string_agg(a, b)"] {
+        let Expr::FunctionCall(call) = expression(source) else {
+            unreachable!()
+        };
+        assert_eq!(call.name.parts[0].value, source.split('(').next().unwrap());
+        assert_eq!(call.arguments.len(), 2);
+    }
 }

@@ -182,9 +182,8 @@ fn register_literal_assignments<'a>(
                 }
             }
             ast::Expr::FunctionCall(function)
-                if matches!(function.quantifier, ast::FunctionQuantifier::None)
+                if !function.distinct
                     && function.order_by.is_none()
-                    && function.separator.is_none()
                     && function.filter.is_none()
                     && function.null_treatment.is_none()
                     && function.window.is_none()
@@ -394,9 +393,8 @@ fn plain_map_arguments(
     use novarocks_parser::{ast, printer};
     (call.name.parts.len() == 1
         && printer::print_object_name(&call.name).eq_ignore_ascii_case("map")
-        && matches!(call.quantifier, ast::FunctionQuantifier::None)
+        && !call.distinct
         && call.order_by.is_none()
-        && call.separator.is_none()
         && call.filter.is_none()
         && call.null_treatment.is_none()
         && call.window.is_none()

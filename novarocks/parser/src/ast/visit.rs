@@ -900,9 +900,6 @@ pub fn walk_function_call<V: Visit + ?Sized>(visitor: &mut V, call: &FunctionCal
     if let Some(order) = &call.order_by {
         visitor.visit_order_by(order);
     }
-    if let Some(separator) = &call.separator {
-        visitor.visit_expr(separator);
-    }
     if let Some(filter) = &call.filter {
         visitor.visit_expr(filter);
     }
@@ -2090,9 +2087,6 @@ pub fn fold_function_call<F: Fold + ?Sized>(
         .map(|argument| folder.fold_call_argument(argument))
         .collect();
     call.order_by = call.order_by.map(|order| folder.fold_order_by(order));
-    call.separator = call
-        .separator
-        .map(|separator| Box::new(folder.fold_expr(*separator)));
     call.filter = call.filter.map(|filter| folder.fold_expr(filter));
     call.window = call.window.map(|window| folder.fold_window(window));
     call

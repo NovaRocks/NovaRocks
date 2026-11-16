@@ -65,7 +65,8 @@ SELECT value FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 11
 -- @expect_error=GROUP_CONCAT_LEGACY is not captured
-SELECT * FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ * FROM default_catalog.${case_db}.v_persisted_mode) d;
+-- The root policy reaches VIEW replay; SELECT-local overrides are retired.
+SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ * FROM (SELECT * FROM default_catalog.${case_db}.v_persisted_mode) d;
 
 -- query 12
 -- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported

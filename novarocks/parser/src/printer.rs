@@ -1270,10 +1270,8 @@ impl Printer {
 
         self.write_object_name(&call.name);
         self.output.push('(');
-        match call.quantifier {
-            FunctionQuantifier::None => {}
-            FunctionQuantifier::Distinct => self.output.push_str("DISTINCT "),
-            FunctionQuantifier::All => self.output.push_str("ALL "),
+        if call.distinct {
+            self.output.push_str("DISTINCT ");
         }
         for (index, argument) in call.arguments.iter().enumerate() {
             if index != 0 {
@@ -1296,10 +1294,6 @@ impl Printer {
             }
             self.output.push_str("ORDER BY ");
             self.write_order_by_list(&order_by.items);
-        }
-        if let Some(separator) = &call.separator {
-            self.output.push_str(" SEPARATOR ");
-            self.write_expr(separator);
         }
         self.output.push(')');
         if let Some(filter) = &call.filter {
@@ -2550,9 +2544,8 @@ mod tests {
                 .map(|value| crate::build::call_argument(value, None))
                 .collect(),
             processing_mode: None,
-            quantifier: FunctionQuantifier::Distinct,
+            distinct: true,
             order_by: None,
-            separator: None,
             filter: Some(crate::build::is_null(identifier("b"), true)),
             null_treatment: Some(NullTreatment::IgnoreNulls),
             window: Some(Window::Specification(AstBox::new(WindowSpecification {

@@ -546,9 +546,8 @@ impl SyntaxEq for FunctionCall {
         self.name.syntax_eq(&other.name)
             && syntax_eq_slice(&self.arguments, &other.arguments)
             && syntax_eq_option(&self.processing_mode, &other.processing_mode)
-            && self.quantifier == other.quantifier
+            && self.distinct == other.distinct
             && syntax_eq_option(&self.order_by, &other.order_by)
-            && syntax_eq_option(&self.separator, &other.separator)
             && syntax_eq_option(&self.filter, &other.filter)
             && self.null_treatment == other.null_treatment
             && syntax_eq_option(&self.window, &other.window)
@@ -727,26 +726,32 @@ mod tests {
                 parts: vec![ident("catalog", start), ident("f", start + 1)],
                 span: span(start + 2),
             },
-            arguments: vec![Expr::Access(AccessExpr {
-                expr: Box::new(Expr::Dereference(AstBox::new(DereferenceExpr {
-                    base: Expr::Identifier(ident("t", start + 3)),
-                    field: Some(ident("payload", start + 4)),
-                    span: span(start + 5),
-                }))),
-                kind: AccessKind::Json {
-                    operator: JsonOperator::ArrowText,
-                    path: Box::new(Expr::Literal(Literal {
-                        kind: LiteralKind::String("name".to_owned()),
-                        span: span(start + 6),
-                    })),
-                },
-                span: span(start + 7),
-            })]
+            arguments: vec![
+                Expr::Access(AccessExpr {
+                    expr: Box::new(Expr::Dereference(AstBox::new(DereferenceExpr {
+                        base: Expr::Identifier(ident("t", start + 3)),
+                        field: Some(ident("payload", start + 4)),
+                        span: span(start + 5),
+                    }))),
+                    kind: AccessKind::Json {
+                        operator: JsonOperator::ArrowText,
+                        path: Box::new(Expr::Literal(Literal {
+                            kind: LiteralKind::String("name".to_owned()),
+                            span: span(start + 6),
+                        })),
+                    },
+                    span: span(start + 7),
+                }),
+                Expr::Literal(Literal {
+                    kind: LiteralKind::String(",".to_owned()),
+                    span: span(start + 10),
+                }),
+            ]
             .into_iter()
             .map(|value| crate::build::call_argument(value, None))
             .collect(),
             processing_mode: None,
-            quantifier: FunctionQuantifier::Distinct,
+            distinct: true,
             order_by: Some(OrderBy {
                 items: vec![SortItem {
                     sort_key: number("1", start + 8),
@@ -757,10 +762,6 @@ mod tests {
                 .into(),
                 span: span(start + 9),
             }),
-            separator: Some(Box::new(Expr::Literal(Literal {
-                kind: LiteralKind::String(",".to_owned()),
-                span: span(start + 10),
-            }))),
             filter: Some(Expr::Predicated(AstBox::new(PredicatedExpr {
                 value: Expr::Identifier(ident("present", start + 11)),
                 predicate: Predicate::IsNull(IsNullPredicate {

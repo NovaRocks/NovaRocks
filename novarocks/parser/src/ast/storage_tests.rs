@@ -1742,6 +1742,7 @@ fn assert_actual_call_argument_or_filter_cycle(filter_child: bool) {
             unreachable!()
         };
         call.span = Span::new(10, 100);
+        call.distinct = marker % 2 == 0;
         call.arguments[0].span = Span::new(20, 40);
         if !filter_child {
             call.arguments[0].name = Some(build::ident(format!("named{marker}"), true));
@@ -1768,6 +1769,7 @@ fn assert_actual_call_argument_or_filter_cycle(filter_child: bool) {
             panic!("actual whole-call AstBox recursive edge")
         };
         assert_eq!(call.name.parts[0].value, "deep_call");
+        assert_eq!(call.distinct, marker % 2 == 0);
         assert_eq!(call.span, Span::new(10, 100));
         assert_eq!(call.arguments[0].span, Span::new(20, 40));
         assert!(matches!(&call.arguments[0].value, Expr::Literal(Literal {
@@ -1806,6 +1808,7 @@ fn assert_actual_call_argument_or_filter_cycle(filter_child: bool) {
 
     #[derive(Debug, Eq, PartialEq)]
     enum Event {
+        Distinct(bool),
         Mode(ProcessingModeKind),
         Argument(Option<(String, bool)>),
         Integer(i64),
@@ -1813,6 +1816,10 @@ fn assert_actual_call_argument_or_filter_cycle(filter_child: bool) {
     #[derive(Default)]
     struct Events(Vec<Event>);
     impl Visit for Events {
+        fn visit_function_call(&mut self, node: &FunctionCall) {
+            self.0.push(Event::Distinct(node.distinct));
+            crate::ast::walk_function_call(self, node);
+        }
         fn visit_processing_mode(&mut self, node: &ProcessingMode) {
             self.0.push(Event::Mode(node.mode));
         }
@@ -1833,6 +1840,7 @@ fn assert_actual_call_argument_or_filter_cycle(filter_child: bool) {
     }
     let mut expected = Vec::new();
     for marker in (1..=DEPTH).rev() {
+        expected.push(Event::Distinct(marker % 2 == 0));
         expected.push(Event::Mode(if marker % 2 == 0 {
             ProcessingModeKind::Running
         } else {
@@ -1911,6 +1919,7 @@ fn assert_actual_call_argument_or_filter_cycle(filter_child: bool) {
     drop(changed);
     let printed = crate::printer::print_expr(&tree);
     assert_eq!(printed.matches("deep_call(").count(), DEPTH as usize);
+    assert_eq!(printed.matches("DISTINCT ").count(), (DEPTH / 2) as usize);
     assert_eq!(printed.matches("RUNNING ").count(), (DEPTH / 2) as usize);
     assert_eq!(printed.matches("FINAL ").count(), (DEPTH / 2) as usize);
     assert_eq!(

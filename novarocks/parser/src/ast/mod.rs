@@ -67,10 +67,9 @@ pub use dml::{
 pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
     AccessExpr, AccessKind, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr, BinaryOperator,
-    CallArgument, DereferenceExpr, Expr, FunctionCall, FunctionQuantifier, IntervalExpr,
-    IntervalField, JsonOperator, LogicalExpr, LogicalOperator, NestedExpr, NullTreatment,
-    ProcessingMode, ProcessingModeKind, RowExpr, RowField, SubqueryExpr, SubscriptExpr, UnaryExpr,
-    UnaryOperator,
+    CallArgument, DereferenceExpr, Expr, FunctionCall, IntervalExpr, IntervalField, JsonOperator,
+    LogicalExpr, LogicalOperator, NestedExpr, NullTreatment, ProcessingMode, ProcessingModeKind,
+    RowExpr, RowField, SubqueryExpr, SubscriptExpr, UnaryExpr, UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -269,9 +268,8 @@ mod tests {
                 .map(|value| crate::build::call_argument(value, None))
                 .collect(),
                 processing_mode: None,
-                quantifier: FunctionQuantifier::None,
+                distinct: false,
                 order_by: None,
-                separator: None,
                 filter: None,
                 null_treatment: None,
                 window: None,

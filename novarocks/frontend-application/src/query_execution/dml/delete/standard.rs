@@ -617,9 +617,8 @@ fn expr_as_supported_scalar_fn_on_col(expr: &Expr) -> Option<(String, String)> {
 }
 
 fn function_expr_args(func: &FunctionCall) -> Option<Vec<&Expr>> {
-    (func.quantifier == novarocks_parser::ast::FunctionQuantifier::None
+    (!func.distinct
         && func.order_by.is_none()
-        && func.separator.is_none()
         && func.filter.is_none()
         && func.window.is_none()
         && func.processing_mode.is_none()

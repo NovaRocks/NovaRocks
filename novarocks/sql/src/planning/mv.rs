@@ -148,10 +148,7 @@ fn validate_imv_aggregate_star_expr(expr: &Expr) -> Result<(), AnalyzeError> {
     let [Expr::Identifier(argument)] = argument_values.as_slice() else {
         return Ok(());
     };
-    if argument.value != "*"
-        || !matches!(function.quantifier, ast::FunctionQuantifier::None)
-        || function.name.parts.len() != 1
-    {
+    if argument.value != "*" || function.distinct || function.name.parts.len() != 1 {
         return Ok(());
     }
     let name = function.name.parts[0].value.to_ascii_lowercase();
@@ -3180,11 +3177,10 @@ fn classify_aggregate_call(expr: &Expr, output_name: String) -> Result<Aggregate
         .collect::<Vec<_>>();
     let args = argument_values.as_slice();
     let function_name = function.name.parts[0].value.to_ascii_lowercase();
-    if function_name == "count" && matches!(function.quantifier, ast::FunctionQuantifier::Distinct)
-    {
+    if function_name == "count" && function.distinct {
         return classify_count_distinct_from_distinct_syntax(args, output_name);
     }
-    if !matches!(function.quantifier, ast::FunctionQuantifier::None) {
+    if function.distinct {
         return Err(format!(
             "incremental aggregate MV DISTINCT modifier is not supported on `{function_name}`; only count(DISTINCT col) is supported"
         ));
@@ -3678,9 +3674,8 @@ fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), Strin
             .iter()
             .any(|argument| argument.name.is_some())
         || function.order_by.is_some()
-        || function.separator.is_some()
         || function.filter.is_some()
-        || !matches!(function.quantifier, ast::FunctionQuantifier::None)
+        || function.distinct
     {
         return Err(projection_filter_error());
     }

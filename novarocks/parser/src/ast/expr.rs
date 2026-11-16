@@ -115,21 +115,13 @@ impl Expr {
 pub struct FunctionCall {
     pub name: ObjectName,
     pub arguments: AstVec<CallArgument>,
-    pub quantifier: FunctionQuantifier,
+    pub distinct: bool,
     pub order_by: Option<OrderBy>,
-    pub separator: Option<Box<Expr>>,
     pub filter: Option<Expr>,
     pub null_treatment: Option<NullTreatment>,
     pub window: Option<super::Window>,
     pub processing_mode: Option<ProcessingMode>,
     pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FunctionQuantifier {
-    None,
-    Distinct,
-    All,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

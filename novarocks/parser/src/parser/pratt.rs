@@ -27,10 +27,10 @@ use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
         AccessExpr, AccessKind, ArrayExpr, AstVec, BinaryExpr, BinaryOperator, CastExpr,
-        DataTypeParameter, DereferenceExpr, ExistsExpr, Expr, FunctionCall, FunctionQuantifier,
-        Ident, InListExpr, IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration,
-        LambdaExpr, Literal, LiteralKind, NestedExpr, NullOrdering, NullTreatment, ObjectName,
-        OrderBy, RowDataTypeField, RowExpr, RowField, SearchedCaseExpr, SimpleCaseExpr, SortItem,
+        DataTypeParameter, DereferenceExpr, ExistsExpr, Expr, FunctionCall, Ident, InListExpr,
+        IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration, LambdaExpr, Literal,
+        LiteralKind, NestedExpr, NullOrdering, NullTreatment, ObjectName, OrderBy,
+        RowDataTypeField, RowExpr, RowField, SearchedCaseExpr, SimpleCaseExpr, SortItem,
         SortOrdering, SubqueryExpr, TypeName, UnaryExpr, UnaryOperator, WhenClause, WhenMatch,
         Window, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits,
         WindowReference, WindowSpecification,
@@ -1280,9 +1280,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 .map(|value| crate::build::call_argument(value, None))
                 .collect(),
             processing_mode: None,
-            quantifier: FunctionQuantifier::None,
+            distinct: false,
             order_by: None,
-            separator: None,
             filter: None,
             null_treatment: None,
             window: None,
@@ -1457,16 +1456,16 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.advance();
         let mut arguments = Vec::new();
         self.skip_trivia();
-        let quantifier = if self.current_is_keyword(Keyword::Distinct) {
+        let distinct = if self.current_is_keyword(Keyword::Distinct) {
             self.advance();
             self.skip_trivia();
-            FunctionQuantifier::Distinct
-        } else if self.current_is_word("ALL") {
-            self.advance();
-            self.skip_trivia();
-            FunctionQuantifier::All
+            true
         } else {
-            FunctionQuantifier::None
+            if self.current_is_word("ALL") {
+                self.advance();
+                self.skip_trivia();
+            }
+            false
         };
         let allow_named_arguments =
             self.allow_table_function_named_arguments && self.function_call_depth == 0;
@@ -1584,7 +1583,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let separator = if self.current_is_word("SEPARATOR") {
             self.advance();
             self.skip_trivia();
-            Some(Box::new(self.parse_binding_power(0)?))
+            Some(self.parse_binding_power(0)?)
         } else {
             None
         };
@@ -1646,10 +1645,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         };
         let span_end = window.as_ref().map_or_else(
             || {
-                filter.as_ref().map_or_else(
-                    || separator.as_ref().map_or(end, |value| value.span().end()),
-                    |value| value.span().end(),
-                )
+                filter
+                    .as_ref()
+                    .map_or_else(|| end, |value| value.span().end())
             },
             |window| window.span().end(),
         );
@@ -1683,7 +1681,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 });
             }
             let metadata_error = if window.is_some() { Some(("a control expression without OVER","OVER")) }
-                else if quantifier == FunctionQuantifier::Distinct { Some(("a control expression without DISTINCT","DISTINCT")) }
+                else if distinct { Some(("a control expression without DISTINCT","DISTINCT")) }
                 else if null_treatment.is_some() { Some(("a control expression without null treatment","NULL treatment")) }
                 // The current grammar has no RUNNING/FINAL producer. P05
                 // checks that mode at this same stage before constructing a node.
@@ -1733,6 +1731,43 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 _ => unreachable!("recognized control expression"),
             });
         }
+        // Erase the legacy clause only after its complete source shape is
+        // admitted. Ordinary calls remain raw for SQL policy preparation.
+        let name = if let Some(separator) = separator {
+            if arguments.is_empty() {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "at least one value before SEPARATOR",
+                    found: "zero value arguments".to_owned(),
+                    span: call_span,
+                });
+            }
+            let group_concat = match name.parts.as_slice() {
+                [part] if !part.quoted && part.value.eq_ignore_ascii_case("group_concat") => true,
+                [part] if !part.quoted && part.value.eq_ignore_ascii_case("string_agg") => false,
+                _ => {
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "an unquoted GROUP_CONCAT or STRING_AGG call with SEPARATOR",
+                        found: "SEPARATOR on another function".to_owned(),
+                        span: call_span,
+                    });
+                }
+            };
+            arguments.push(separator);
+            if group_concat {
+                ObjectName {
+                    parts: vec![Ident {
+                        value: "string_agg".to_owned(),
+                        quoted: false,
+                        span: crate::SYNTHETIC,
+                    }],
+                    span: crate::SYNTHETIC,
+                }
+            } else {
+                name
+            }
+        } else {
+            name
+        };
         Ok(Expr::FunctionCall(AstBox::new(FunctionCall {
             name,
             arguments: arguments
@@ -1740,9 +1775,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 .map(|value| crate::build::call_argument(value, None))
                 .collect(),
             processing_mode: None,
-            quantifier,
+            distinct,
             order_by,
-            separator,
             filter,
             null_treatment,
             window,
@@ -2153,9 +2187,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             },
             arguments,
             processing_mode: None,
-            quantifier: FunctionQuantifier::None,
+            distinct: false,
             order_by: None,
-            separator: None,
             filter: None,
             null_treatment: None,
             window: None,

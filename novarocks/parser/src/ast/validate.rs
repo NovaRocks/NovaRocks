@@ -486,9 +486,6 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             if let Some(order_by) = &function.order_by {
                 validate_order_by(order_by)?;
             }
-            if let Some(separator) = &function.separator {
-                validate_expr(separator)?;
-            }
             if let Some(filter) = &function.filter {
                 validate_expr(filter)?;
             }

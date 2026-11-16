@@ -253,61 +253,43 @@ fn classify_aggregate_call(
         .collect::<Vec<_>>();
     let args = argument_values.as_slice();
     let (function, input) = match name.as_str() {
-        "count" if matches!(function.quantifier, ast::FunctionQuantifier::Distinct) => (
+        "count" if function.distinct => (
             AggregateFunctionKind::CountDistinct,
             single_expression_input(args, "COUNT(DISTINCT)")?,
         ),
-        "count" if matches!(function.quantifier, ast::FunctionQuantifier::None) => {
-            count_input(args)?
-        }
-        "count_distinct" | "multi_distinct_count"
-            if matches!(function.quantifier, ast::FunctionQuantifier::None) =>
-        {
-            (
-                AggregateFunctionKind::CountDistinct,
-                single_expression_input(args, "COUNT(DISTINCT)")?,
-            )
-        }
-        "approx_count_distinct" | "ndv" | "hll_ndv"
-            if matches!(function.quantifier, ast::FunctionQuantifier::None) =>
-        {
-            (
-                AggregateFunctionKind::ApproxCountDistinct,
-                single_expression_input(args, "APPROX_COUNT_DISTINCT")?,
-            )
-        }
-        "sum" if matches!(function.quantifier, ast::FunctionQuantifier::None) => (
+        "count" if !function.distinct => count_input(args)?,
+        "count_distinct" | "multi_distinct_count" if !function.distinct => (
+            AggregateFunctionKind::CountDistinct,
+            single_expression_input(args, "COUNT(DISTINCT)")?,
+        ),
+        "approx_count_distinct" | "ndv" | "hll_ndv" if !function.distinct => (
+            AggregateFunctionKind::ApproxCountDistinct,
+            single_expression_input(args, "APPROX_COUNT_DISTINCT")?,
+        ),
+        "sum" if !function.distinct => (
             AggregateFunctionKind::Sum,
             single_expression_input(args, "SUM")?,
         ),
-        "avg" if matches!(function.quantifier, ast::FunctionQuantifier::None) => (
+        "avg" if !function.distinct => (
             AggregateFunctionKind::Avg,
             single_expression_input(args, "AVG")?,
         ),
-        "min" if matches!(function.quantifier, ast::FunctionQuantifier::None) => (
+        "min" if !function.distinct => (
             AggregateFunctionKind::Min,
             single_expression_input(args, "MIN/MAX")?,
         ),
-        "max" if matches!(function.quantifier, ast::FunctionQuantifier::None) => (
+        "max" if !function.distinct => (
             AggregateFunctionKind::Max,
             single_expression_input(args, "MIN/MAX")?,
         ),
-        "bool_or" | "boolor_agg"
-            if matches!(function.quantifier, ast::FunctionQuantifier::None) =>
-        {
-            (
-                AggregateFunctionKind::BoolOr,
-                single_expression_input(args, "BOOL_OR/BOOL_AND")?,
-            )
-        }
-        "bool_and" | "booland_agg"
-            if matches!(function.quantifier, ast::FunctionQuantifier::None) =>
-        {
-            (
-                AggregateFunctionKind::BoolAnd,
-                single_expression_input(args, "BOOL_OR/BOOL_AND")?,
-            )
-        }
+        "bool_or" | "boolor_agg" if !function.distinct => (
+            AggregateFunctionKind::BoolOr,
+            single_expression_input(args, "BOOL_OR/BOOL_AND")?,
+        ),
+        "bool_and" | "booland_agg" if !function.distinct => (
+            AggregateFunctionKind::BoolAnd,
+            single_expression_input(args, "BOOL_OR/BOOL_AND")?,
+        ),
         _ => return Err(aggregate_error()),
     };
     Ok(SqlAggregateCall {

@@ -2291,15 +2291,11 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         }
 
-        // The native grammar retains ORDER BY and SEPARATOR modifiers on a
-        // function call so the analyzer can make the semantic decision.  They
-        // are nevertheless syntactically invalid when the function has no
-        // value argument, and SEPARATOR belongs exclusively to GROUP_CONCAT.
-        // Reject these shapes before aggregate ORDER BY validation so the
-        // StarRocks-compatible parse error remains stable.
+        // Preserve the original zero-input ORDER BY refusal before aggregate
+        // ordering validation. Legacy SEPARATOR is normalized by its parser owner.
         if original_arguments.is_empty() && func.order_by.is_some() {
             return Err(AnalyzeError::invalid_query_shape(
-                if matches!(func.quantifier, ast::FunctionQuantifier::Distinct) {
+                if func.distinct {
                     "Unexpected input 'order', the most similar input is {a legal identifier}."
                         .to_string()
                 } else {
@@ -2308,21 +2304,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 func.span,
             ));
         }
-        if original_arguments.is_empty() && func.separator.is_some() {
-            return Err(AnalyzeError::invalid_query_shape(
-                format!("No viable statement for input '{}(separator NULL'.", name),
-                func.span,
-            ));
-        }
-        if func.separator.is_some() && !matches!(name.as_str(), "group_concat" | "string_agg") {
-            return Err(AnalyzeError::invalid_query_shape(
-                "Unexpected input 'separator', the most similar input is {',', ')'}.",
-                func.span,
-            ));
-        }
-
         // Check for DISTINCT
-        let is_distinct = matches!(func.quantifier, ast::FunctionQuantifier::Distinct);
+        let is_distinct = func.distinct;
 
         // `*` is parser-native syntax inside a function call, not a column.
         // Keep it out of ordinary argument resolution: the empty aggregate
@@ -2330,22 +2313,8 @@ impl<'a> super::AnalyzerContext<'a> {
         let is_count_star = name == "count"
             && matches!(original_arguments, [ast::Expr::Identifier(ident)] if ident.value == "*");
 
-        // SQL preparation makes separator ownership explicit. Analysis and
-        // output naming consume the same idempotently normalized syntax.
-        let group_concat_args = if matches!(name.as_str(), "group_concat" | "string_agg") {
-            original_arguments
-                .iter()
-                .map(|argument| ast::Expr::clone(argument))
-                .chain(func.separator.as_deref().cloned())
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let arg_exprs: Vec<&ast::Expr> = if matches!(name.as_str(), "group_concat" | "string_agg") {
-            group_concat_args.iter().collect()
-        } else {
-            original_arguments.to_vec()
-        };
+        // Canonical calls borrow the actual original argument occurrences.
+        let arg_exprs = original_arguments.to_vec();
 
         // typeof(CAST(x AS T)) preserves the SQL-level type spelling (CHAR vs
         // VARCHAR, DECIMAL128(p, s), etc.) which is lost once the cast lowers
@@ -10210,6 +10179,17 @@ mod tests {
                         ..
                     }
             )));
+        }
+    }
+
+    #[test]
+    fn canonical_concat_zero_arguments_keep_the_original_analysis_refusal() {
+        for sql in ["SELECT group_concat()", "SELECT string_agg()"] {
+            let error = analyze_projection_expr(sql).expect_err("zero value arguments are invalid");
+            assert!(
+                error.contains("group_concat should have at least one input."),
+                "{sql}: {error}"
+            );
         }
     }
 

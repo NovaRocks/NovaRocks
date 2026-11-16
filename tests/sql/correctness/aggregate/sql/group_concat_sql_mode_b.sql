@@ -86,7 +86,8 @@ SELECT group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 SET sql_mode='32';
 
 -- query 20
-WITH c AS (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat(v ORDER BY id) AS x FROM ${case_db}.t_concat_mode) SELECT x AS value FROM c;
+-- One root policy reaches the CTE; the next step checks connection isolation.
+WITH c AS (SELECT group_concat(v ORDER BY id) AS x FROM ${case_db}.t_concat_mode) SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ x AS value FROM c;
 
 -- query 21
 SELECT group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;

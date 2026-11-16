@@ -223,10 +223,8 @@ pub fn statement_sql_semantics(
     )
 }
 
-/// Make separator ownership explicit once, before name/type resolution.
-/// Explicit SEPARATOR makes this pass idempotent across compiler continuations
-/// and analyzer preparation. STRING_AGG owns its positional separator contract
-/// independently of GROUP_CONCAT's modern/legacy choice.
+/// Canonicalize the existing concat aliases to their declared ordinary args.
+/// STRING_AGG owns its final separator, making repeated preparation idempotent.
 pub(crate) fn normalize_concat_query(
     query: ast::Query,
     session: &SqlSemanticSettings,
@@ -237,13 +235,7 @@ pub(crate) fn normalize_concat_query(
     impl Fold for Normalizer {
         fn fold_function_call(&mut self, call: ast::FunctionCall) -> ast::FunctionCall {
             let mut call = ast::fold_function_call(self, call);
-            let name = call
-                .name
-                .parts
-                .last()
-                .map(|name| name.value.to_ascii_lowercase());
-            if call.separator.is_some()
-                || call.arguments.is_empty()
+            if call.arguments.is_empty()
                 || call.processing_mode.is_some()
                 || call
                     .arguments
@@ -252,32 +244,35 @@ pub(crate) fn normalize_concat_query(
             {
                 return call;
             }
-            let positional_separator = match name.as_deref() {
-                Some("group_concat") => self.sql_semantics.sql_mode().group_concat_legacy(),
-                Some("string_agg") => true,
-                _ => return call,
+            let [name] = call.name.parts.as_mut_slice() else {
+                return call;
             };
-            let separator = if positional_separator && call.arguments.len() > 1 {
-                call.arguments
-                    .pop()
-                    .expect("at least two positional arguments")
-                    .value
+            if name.quoted {
+                return call;
+            }
+            let separator = if name.value.eq_ignore_ascii_case("group_concat") {
+                let legacy = self.sql_semantics.sql_mode().group_concat_legacy();
+                name.value = "string_agg".to_owned();
+                name.span = novarocks_parser::SYNTHETIC;
+                call.name.span = novarocks_parser::SYNTHETIC;
+                if legacy && call.arguments.len() > 1 {
+                    None
+                } else {
+                    Some(if legacy { ", " } else { "," })
+                }
+            } else if name.value.eq_ignore_ascii_case("string_agg") && call.arguments.len() == 1 {
+                Some(",")
             } else {
-                ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::String(
-                        if name.as_deref() == Some("group_concat")
-                            && self.sql_semantics.sql_mode().group_concat_legacy()
-                        {
-                            ", "
-                        } else {
-                            ","
-                        }
-                        .to_string(),
-                    ),
-                    span: call.span,
-                })
+                None
             };
-            call.separator = Some(Box::new(separator));
+            if let Some(separator) = separator {
+                let value = ast::Expr::Literal(ast::Literal {
+                    kind: ast::LiteralKind::String(separator.to_string()),
+                    span: call.span,
+                });
+                call.arguments
+                    .push(novarocks_parser::build::call_argument(value, None));
+            }
             call
         }
     }
@@ -601,6 +596,61 @@ mod tests {
     }
 
     #[test]
+    fn canonical_concat_alias_preserves_source_spans_and_skips_quoted_qualified_and_zero_calls() {
+        for mode in ["32", "GROUP_CONCAT_LEGACY"] {
+            let settings = semantics(mode);
+            let raw = query("SELECT group_concat(v,u)");
+            let original = calls(&raw).remove(0);
+            let prepared = normalize_concat_query(raw, &settings).unwrap();
+            let call = calls(&prepared).remove(0);
+            assert_eq!(call.name.parts[0].value, "string_agg");
+            assert_eq!(call.name.span, novarocks_parser::SYNTHETIC);
+            assert_eq!(call.name.parts[0].span, novarocks_parser::SYNTHETIC);
+            assert_eq!(call.span, original.span);
+            assert_eq!(
+                &call.arguments[..original.arguments.len()],
+                original.arguments.as_slice()
+            );
+            assert_eq!(
+                normalize_concat_query(prepared.clone(), &settings).unwrap(),
+                prepared
+            );
+            assert_eq!(
+                display("SELECT string_agg(v)", mode),
+                "group_concat(v SEPARATOR ',')"
+            );
+            for source in [
+                "SELECT group_concat()",
+                "SELECT string_agg()",
+                "SELECT schema.group_concat(v,u)",
+                "SELECT schema.string_agg(v,u)",
+            ] {
+                let original = query(source);
+                assert_eq!(
+                    normalize_concat_query(original.clone(), &settings).unwrap(),
+                    original
+                );
+            }
+            for source in ["SELECT group_concat(v,u)", "SELECT string_agg(v,u)"] {
+                let mut quoted = query(source);
+                let ast::SetExpr::Select(select) = quoted.body.as_mut() else {
+                    panic!("select");
+                };
+                let ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(call)) =
+                    &mut select.projection[0]
+                else {
+                    panic!("call");
+                };
+                call.name.parts[0].quoted = true;
+                assert_eq!(
+                    normalize_concat_query(quoted.clone(), &settings).unwrap(),
+                    quoted
+                );
+            }
+        }
+    }
+
+    #[test]
     fn statement_admission_freezes_select_explain_insert_and_ctas_overrides() {
         let session = semantics("GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION");
         for sql in [
@@ -626,6 +676,10 @@ mod tests {
             let query = query_with_assignments(sql, &format!("sql_mode='{mode}'"));
             let normalized = normalize_concat_query(query, &caller).unwrap();
             let collected = calls(&normalized);
+            assert!(collected.iter().all(|call| call.name.parts.len() == 1
+                && !call.name.parts[0].quoted
+                && call.name.parts[0].value.eq_ignore_ascii_case("string_agg")
+                && call.arguments.len() >= 2));
             assert_eq!(collected.len(), counts.len());
             assert_eq!(
                 collected
@@ -638,7 +692,7 @@ mod tests {
                 .iter()
                 .map(|call| {
                     novarocks_parser::printer::print_expr(
-                        call.separator.as_deref().expect("explicit separator"),
+                        &call.arguments.last().expect("canonical separator").value,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -648,24 +702,24 @@ mod tests {
             assert_eq!(caller, original_caller);
         }
         let nested = "WITH c AS (SELECT group_concat(v) x FROM t) SELECT group_concat(v,'-'), (SELECT group_concat(v) FROM t), (SELECT group_concat(v,'-') FROM t) FROM t";
-        assert_calls(nested, "32", &[1, 2, 1, 2], &["','", "','", "','", "','"]);
+        assert_calls(nested, "32", &[2, 3, 2, 3], &["','", "','", "','", "','"]);
         assert_calls(
             nested,
             "GROUP_CONCAT_LEGACY",
-            &[1, 1, 1, 1],
+            &[2, 2, 2, 2],
             &["', '", "'-'", "', '", "'-'"],
         );
         let scalar = "SELECT group_concat(v), (SELECT group_concat(v,'-') FROM t), (SELECT group_concat(v) FROM t) FROM t";
-        assert_calls(scalar, "32", &[1, 2, 1], &["','", "','", "','"]);
+        assert_calls(scalar, "32", &[2, 3, 2], &["','", "','", "','"]);
         assert_calls(
             scalar,
             "GROUP_CONCAT_LEGACY",
-            &[1, 1, 1],
+            &[2, 2, 2],
             &["', '", "'-'", "', '"],
         );
         let branches = "SELECT group_concat(v) FROM t UNION ALL SELECT group_concat(v,'-') FROM t";
-        assert_calls(branches, "32", &[1, 2], &["','", "','"]);
-        assert_calls(branches, "GROUP_CONCAT_LEGACY", &[1, 1], &["', '", "'-'"]);
+        assert_calls(branches, "32", &[2, 3], &["','", "','"]);
+        assert_calls(branches, "GROUP_CONCAT_LEGACY", &[2, 2], &["', '", "'-'"]);
     }
 
     #[test]
