@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Design: ADR-0235 (docs/adr/ADR-0235-iceberg-write-layout-and-data-plane-capacity.md)
+
 //! One driver's real partition writers, retained across input pages and close waits.
 use super::{
     IcebergDataFileWriterBuilder, StagedDataFile, StagedPathJournal, StagedWriteContext,

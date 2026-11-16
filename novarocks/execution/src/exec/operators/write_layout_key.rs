@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Design: ADR-0235 (docs/adr/ADR-0235-iceberg-write-layout-and-data-plane-capacity.md)
+
 //! Materialize a provider-authored routing key and consume it at the writer's local exchange.
 
 use std::num::NonZeroU32;

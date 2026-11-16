@@ -1016,7 +1016,7 @@ mod iceberg_session_properties_tests {
             .bind_catalog(
                 "lake",
                 CatalogPropertyIdentity {
-                    attachment_id: uuid::Uuid::nil(),
+                    attachment_id: Default::default(),
                     control_runtime_id: ConnectorControlRuntimeId::new(),
                     instance_id: ConnectorInstanceId::parse("lake").unwrap(),
                     provider_id: provider,
