@@ -522,13 +522,7 @@ impl MaintenanceEngine {
                         retired: None,
                         artifact_cleanup: Some((
                             operation.clone(),
-                            request
-                                .artifacts()
-                                .attempt_owned()
-                                .iter()
-                                .chain(request.artifacts().operation_references())
-                                .cloned()
-                                .collect(),
+                            request.artifacts().references().to_vec(),
                         )),
                         reclamation: Arc::new(Mutex::new(None)),
                     },
@@ -2684,7 +2678,7 @@ mod tests {
                 .stage(&crate::commit::overwrite::OverwritePreparer)
                 .await
                 .unwrap();
-            let frozen = engine.freeze(&[]).unwrap();
+            let frozen = engine.freeze().unwrap();
             assert!(frozen.updates().iter().any(|update| matches!(update,
                 crate::iceberg::TableUpdate::AddSnapshot { snapshot }
                 if snapshot.summary().operation == crate::iceberg::spec::Operation::Overwrite
@@ -3057,21 +3051,29 @@ mod tests {
                     .contains(&operation)
             })
             .collect::<Vec<_>>();
+        let mut expected = list
+            .entries()
+            .iter()
+            .filter(|manifest| manifest.manifest_path.contains(&operation))
+            .map(|manifest| {
+                let location = novarocks_fs::FsLocation::parse(&manifest.manifest_path).unwrap();
+                std::path::PathBuf::from(location.path())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let list_location = novarocks_fs::FsLocation::parse(
+            loaded
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .manifest_list(),
+        )
+        .unwrap();
+        expected.insert(std::path::PathBuf::from(list_location.path()));
+        assert_eq!(expected.len(), 2);
         assert_eq!(
-            owned
-                .iter()
-                .filter(|p| !p
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .contains("-attempt-"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            owned.len(),
-            2,
-            "one reused Operation manifest and one successful Attempt list remain"
+            owned.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            expected,
+            "only the reused manifest and committed manifest list remain"
         );
     }
     #[test]

@@ -39,7 +39,6 @@ mod logical_rows;
 mod publication;
 #[cfg(test)]
 pub(crate) use publication::observed_materialized_staging_fixture;
-mod recovery_codec;
 
 // Design: ADR-0177 (docs/adr/ADR-0177-attempt-local-maintenance-inputs-and-single-rewrite-plan.md)
 use std::collections::{BTreeMap, BTreeSet};
@@ -95,7 +94,7 @@ use crate::write_descriptor::decode_partition_descriptor;
 pub const ICEBERG_WRITE_SESSION_MARKER_PROPERTY: &str = "novarocks.write.session.v1";
 
 /// The evidence schema version this control produces and accepts.
-pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 4;
+pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 5;
 
 /// The operation-kind tag on the evidence envelope.
 pub const ICEBERG_WRITE_SESSION_OPERATION_KIND: &str = "iceberg.connector_write_session.v1";
@@ -207,14 +206,15 @@ fn committed_write_receipt(
     }
 }
 
-use publication::RecoveryPayload as IcebergWriteSessionEvidenceV3;
+use publication::RecoveryPayload as IcebergWriteSessionEvidenceV5;
 
 #[cfg(test)]
 pub(crate) fn decode_write_recovery_facts_for_test(
     evidence: &ExternalMutationEvidence,
 ) -> Result<serde_json::Value, ConnectorError> {
-    let payload: IcebergWriteSessionEvidenceV3 =
-        recovery_codec::decode(evidence.provider_payload().as_ref())?;
+    let payload: IcebergWriteSessionEvidenceV5 =
+        serde_json::from_slice(evidence.provider_payload().as_ref())
+            .map_err(|error| corrupt(error.to_string()))?;
     serde_json::to_value(payload).map_err(|error| corrupt(error.to_string()))
 }
 
@@ -1220,7 +1220,7 @@ impl IcebergWriteSessionControl {
     ///
     /// What differs is everything after it. Nothing here touches the catalog,
     /// writes a manifest, or creates a snapshot; the validated artifacts are
-    /// folded into the receipt payload and the session settles as sealed. The
+    /// retained by the receipt's process-local attachment and the session settles as sealed. The
     /// single `NotExist` assert-create that makes them visible stays with the
     /// staged-create capability that owns the target.
     ///
@@ -1245,11 +1245,7 @@ impl IcebergWriteSessionControl {
         handle.begin_commit()?;
         let sealed = validated
             .iter()
-            .map(|entry| {
-                let file = written_file_from_fragment(entry.fragment, metadata)?;
-                crate::commit::report::writer_report_from_written_file(&file, metadata)
-                    .map_err(corrupt)
-            })
+            .map(|entry| written_file_from_fragment(entry.fragment, metadata))
             .collect::<Result<Vec<_>, ConnectorError>>();
         let sealed = match sealed {
             Ok(sealed) => sealed,
@@ -1260,16 +1256,12 @@ impl IcebergWriteSessionControl {
                 return Err(error);
             }
         };
-        let payload = match crate::write_codec::encode_writer_reports(&sealed, metadata) {
-            Ok(payload) => payload,
-            Err(error) => {
-                handle.settle(IcebergWriteSessionState::KnownUncommitted {
-                    message: error.clone(),
-                })?;
-                return Err(internal(format!("seal staged Iceberg write set: {error}")));
-            }
-        };
-        let receipt = match ConnectorWriteReceipt::try_new(payload) {
+        let receipt = match crate::write_codec::seal_staged_files(
+            sealed,
+            metadata,
+            handle.session_id().to_bytes(),
+            self.binding_key(),
+        ) {
             Ok(receipt) => receipt,
             Err(error) => {
                 handle.settle(IcebergWriteSessionState::KnownUncommitted {
@@ -1356,7 +1348,7 @@ impl IcebergWriteSessionControl {
         &self,
         handle: &IcebergWriteCommitSession,
         evidence: &ExternalMutationEvidence,
-    ) -> Result<IcebergWriteSessionEvidenceV3, ConnectorError> {
+    ) -> Result<IcebergWriteSessionEvidenceV5, ConnectorError> {
         if evidence.schema_version() != ICEBERG_WRITE_SESSION_EVIDENCE_VERSION
             || evidence.descriptor() != &self.descriptor
             || evidence.incarnation() != self.key.incarnation
@@ -1371,8 +1363,9 @@ impl IcebergWriteSessionControl {
                 "Iceberg write session evidence names a different write session",
             ));
         }
-        let payload: IcebergWriteSessionEvidenceV3 =
-            recovery_codec::decode(evidence.provider_payload().as_ref())?;
+        let payload: IcebergWriteSessionEvidenceV5 =
+            serde_json::from_slice(evidence.provider_payload().as_ref())
+                .map_err(|error| corrupt(error.to_string()))?;
         payload.validate(&self.descriptor, self.key.incarnation, handle)?;
         if handle.recovery_evidence()? != *evidence {
             return Err(corrupt(
@@ -3437,7 +3430,12 @@ pub fn write_control_io_geometry()
         u64::try_from(fixed).map_err(|_| internal("write source geometry overflow"))?,
     )
     .ok_or_else(|| internal("write source geometry is empty"))?;
-    let initial = recovery_codec::initial_owned_backing_bytes()?;
+    // The payload identity strings and their one JSON output buffer can coexist.
+    // The existing SPI carrier limit bounds this encoding estimate; it adds no quota.
+    let initial = novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<IcebergWriteSessionEvidenceV5>()))
+        .ok_or_else(|| internal("write initial evidence geometry overflow"))?;
     let initial = std::num::NonZeroU64::new(
         u64::try_from(initial).map_err(|_| internal("write initial payload geometry overflow"))?,
     )
@@ -4735,8 +4733,13 @@ mod eager_attempt_io_tests {
             for object in objects {
                 assert!(self.io.exists(object.path()).await.unwrap());
                 let mut ledger = self.ledger.lock().unwrap();
-                ledger.mark_writing(&object).unwrap();
-                ledger.mark_written(&object).unwrap();
+                let written = ledger.records().any(|record| {
+                    record.object == object
+                        && record.write_state == crate::commit::model::ArtifactWriteState::Written
+                });
+                if !written {
+                    ledger.confirm_written_for_test(&object).unwrap();
+                }
             }
         }
     }
@@ -4746,25 +4749,21 @@ mod eager_attempt_io_tests {
         }
         fn allocate(
             &self,
-            class: crate::commit::model::ArtifactClass,
             kind: crate::commit::model::ArtifactKind,
         ) -> crate::iceberg::Result<crate::commit::model::ObjectIdentity> {
-            assert_eq!(class, crate::commit::model::ArtifactClass::Attempt);
             let object = crate::commit::model::ObjectIdentity::new(format!(
                 "memory://warehouse/db/t/metadata/{}-{}.{}",
                 self.attempt.path_component(),
                 self.ordinal.fetch_add(1, Ordering::SeqCst),
                 kind.extension()
             ))?;
-            self.ledger
-                .lock()
-                .unwrap()
-                .register(crate::commit::model::ArtifactRecord {
-                    object: object.clone(),
-                    class,
-                    attempt: Some(self.attempt),
-                    write_state: crate::commit::model::ArtifactWriteState::Allocated,
-                })?;
+            self.ledger.lock().unwrap().register(
+                crate::commit::model::ArtifactRecord::produced(
+                    object.clone(),
+                    self.attempt_token(),
+                    kind,
+                ),
+            )?;
             Ok(object)
         }
         fn file_io(&self) -> &FileIO {
@@ -4775,12 +4774,49 @@ mod eager_attempt_io_tests {
         }
         fn snapshot_artifacts(
             &self,
-            references: &[crate::commit::model::ObjectIdentity],
+            lists: &[crate::commit::model::ObjectIdentity],
+            statistics: &[crate::commit::model::ObjectIdentity],
         ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
-            self.ledger
-                .lock()
-                .unwrap()
-                .snapshot_for_attempt(self.attempt, references.iter().cloned())
+            self.ledger.lock().unwrap().snapshot_for_request(
+                self.attempt_token(),
+                lists,
+                statistics,
+            )
+        }
+
+        fn record_manifest(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            live_paths: &[String],
+            replaces: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest(object, live_paths, replaces)
+        }
+
+        fn record_manifest_list(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            paths: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest_list(object, paths)
         }
     }
 
@@ -4879,7 +4915,7 @@ mod eager_attempt_io_tests {
             .await
             .unwrap();
         writer.confirm_completed_outputs().await;
-        let commit = engine.freeze(&[]).unwrap();
+        let commit = engine.freeze().unwrap();
         let manifest_paths = writer
             .ledger
             .lock()

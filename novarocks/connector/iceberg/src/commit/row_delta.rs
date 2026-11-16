@@ -123,7 +123,7 @@ impl crate::commit::staging::Preparer for RowDeltaPreparer {
             intent.changes().added.len().to_string(),
         );
         summary.insert("added-files-size".into(), size.to_string());
-        let snapshot_id = crate::commit::staging::new_snapshot_id(view.metadata());
+        let snapshot_id = view.stage_snapshot_id()?;
         let added =
             write_added_entry_groups(view, snapshot_id, intent.changes().added.clone()).await?;
         let manifests = super::manifest_transform::ordinary_manifests(

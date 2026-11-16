@@ -2276,7 +2276,22 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
     // the target has none until it is published.
     assert_eq!(effect, ExternalMutationEffect::NoOp);
     assert!(receipt.committed_version().is_none());
-    assert!(!receipt.payload().is_empty());
+    assert!(receipt.payload().len() < 512);
+    let owner = novarocks_spi::connector::ConnectorProviderBindingKey {
+        instance_id: descriptor("unit").instance_id,
+        incarnation,
+    };
+    assert!(receipt.process_local_payload(&owner).unwrap().is_some());
+    let handle = adapter.commit_session(plan.commit_session()).unwrap();
+    let files =
+        crate::write_codec::open_staged_files(&receipt, handle.staged_metadata().unwrap(), &owner)
+            .unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].record_count, 2);
+    assert!(matches!(
+        handle.state().unwrap(),
+        IcebergWriteSessionState::Sealed
+    ));
 
     // The single terminal is claimed, so a second finish cannot mint a second
     // receipt for the same sealed artifacts.
@@ -2290,6 +2305,136 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
             context: request_context(),
         })
         .expect_err("a sealed session is finished");
+}
+
+/// File facts grow independently of the bounded seal. The domain session
+/// supplies complete accepted artifacts; this test does not claim a writer run.
+#[test]
+fn a_staged_finish_seals_a_thousand_files_with_bounded_receipt_facts() {
+    use novarocks_spi::connector::write_stack::ConnectorWriteFinishRequest;
+    let incarnation = ProviderBindingEpoch::new();
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        incarnation,
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        runtime,
+    );
+    let adapter = adapter("unit", 1);
+    let metadata = super::test_support::staged_table_metadata();
+    let session_id = IcebergWriteSessionId::new();
+    let facts = IcebergWriteTableFacts::try_new(
+        metadata.uuid().to_string(),
+        "db".into(),
+        "staged".into(),
+        metadata.location().into(),
+        format!("{}/data", metadata.location()),
+        "main".into(),
+        None,
+        0,
+        metadata.current_schema_id(),
+        metadata.default_partition_spec_id(),
+        2,
+    )
+    .unwrap();
+    let (session, _) = plan_write_session(
+        session_id,
+        IcebergWriteSessionPlanInput {
+            flavor: IcebergWriteFlavor::StagedCreate,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            table: facts,
+            base_version_digest: None,
+            staged_metadata: Some(metadata.clone()),
+            data: data_branch_plan(),
+            deletes: vec![],
+        },
+    )
+    .unwrap();
+    let expected = session.expected_targets();
+    let commit = adapter.wrap_commit_session(session);
+    let paths: Vec<_> = (0..1000)
+        .map(|index| format!("{}/data/sealed-{index:04}.parquet", metadata.location()))
+        .collect();
+    let fragments = paths
+        .iter()
+        .map(|path| {
+            (
+                ordinal(0),
+                adapter.wrap_commit_fragment(data_fragment(path)),
+            )
+        })
+        .collect();
+    let prepared = ConnectorPreparedWriteSet::try_new(5000, fragments, &expected).unwrap();
+    let result = control
+        .finish_write(ConnectorWriteFinishRequest {
+            commit: &commit,
+            prepared,
+            statistics: vec![],
+            publication:
+                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
+            context: request_context(),
+        })
+        .unwrap();
+    let ExternalMutationOutcome::KnownCommitted {
+        effect: ExternalMutationEffect::NoOp,
+        receipt,
+        finalization: ExternalMutationFinalization::Complete,
+        ..
+    } = result
+    else {
+        panic!("the complete staged set must seal without Catalog publication");
+    };
+    assert!(receipt.payload().len() < 512);
+    assert!(receipt.committed_version().is_none());
+    let owner = novarocks_spi::connector::ConnectorProviderBindingKey {
+        instance_id: descriptor("unit").instance_id,
+        incarnation,
+    };
+    let files = crate::write_codec::open_staged_files(&receipt, &metadata, &owner).unwrap();
+    assert_eq!(files.len(), 1000);
+    assert_eq!(
+        files.iter().map(|file| file.record_count).sum::<u64>(),
+        5000
+    );
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>(),
+        paths
+    );
+    let reports = files
+        .iter()
+        .map(|file| {
+            crate::commit::report::writer_report_from_written_file(file, &metadata).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        crate::write_codec::encode_writer_reports(&reports, &metadata)
+            .unwrap()
+            .len()
+            > 64 * 1024
+    );
+    assert!(matches!(
+        adapter.commit_session(&commit).unwrap().state().unwrap(),
+        IcebergWriteSessionState::Sealed
+    ));
+    assert_eq!(
+        control.cleanup_responsibility(&commit).unwrap(),
+        novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
+    );
+    // Equal session identity/count with different file facts must remain a
+    // different content receipt, even though the attachment is excluded from Eq.
+    let mut changed = files.to_vec();
+    changed[0].record_count += 1;
+    let changed =
+        crate::write_codec::seal_staged_files(changed, &metadata, session_id.to_bytes(), &owner)
+            .unwrap();
+    assert_ne!(receipt, changed);
+    assert_ne!(receipt.digest(), changed.digest());
 }
 
 /// A staged write that produced no artifact still reaches the provider.

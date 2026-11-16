@@ -156,6 +156,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
+- [ADR-0234](ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md) — Iceberg 产物为何由同一 operation 保管到终态、按依据复用，以构造时覆盖断言决定发布引用，并让证据和回执只承载有界事实（active；部分替代 ADR-0171 的产物类别、每轮清理、完整账本证据与对象数预算；ADR-0179 的 journal 结论与 ADR-0198 的原责任/退出不变；代码接线已完成，定向验证与最终验收范围另核）
 - [ADR-0232](ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md) — 维护与统计为何归原语句执行，取消为何保留原 Source 至真实退出，状态为何分别由统计、MV 系统关系与管理 API 提供（active；部分替代 ADR-0169/0111/0226，GC Accelerator、Catalog 准入与三态 publication 保留）
 - [ADR-0233](ADR-0233-iceberg-mor-only-and-provider-owned-write-validation.md) — Iceberg UPDATE/MERGE 为何统一 MOR、表属性为何不选算法、完整 V/W/T、可达字节与赋值 NULL 为何由原写入作者验证（active；替代 ADR-0063，部分替代 ADR-0049/0055/0191/0221 的 COW 接缝，其余 Provider、折叠与共享 codec 规则保留）
 - [ADR-0228](ADR-0228-iceberg-position-delete-materialization.md) — Iceberg v3 位置贡献如何按文件归并、由 BE 物化唯一效果，以及受管对象如何条件创建并核验归属（active）
@@ -210,7 +211,7 @@ code-anchors:
 - ADR-0154 — MV 领域文档与准确发布附着为何是湖上权威（active；存放与附着条款由 ADR-0180 部分替代，湖上权威、领域分工与 Accelerator 边界保留）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0161）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active；SDK transaction/action 准备复用许可由 ADR-0171 部分取代，catalog owner 与 operation admission 仍有效；统一 Transaction 与 late TableCommit carrier 由 ADR-0179 替代）
-- [ADR-0171](ADR-0171-commit-operation-model.md) — Iceberg 提交为何由不可变意图、依赖验证、attempt staging 与产物 owner 共同完成（active；部分取代 ADR-0118、ADR-0055，细化 lake publication ADR-0110；文档请求形状由 ADR-0180 部分替代，不可变操作、依赖验证与产物所有权保留；late SDK carrier、transaction outcome 与可复用 rewrite manifest 生命周期由 ADR-0179 部分替代；同步等待及 finalize/cleanup 完成边界、无条件年龄窗延续由 ADR-0198 部分替代，原有 Unknown 保护保留）
+- [ADR-0171](ADR-0171-commit-operation-model.md) — Iceberg 提交为何由不可变意图、依赖验证、attempt staging 与产物 owner 共同完成（active；部分取代 ADR-0118、ADR-0055，细化 lake publication ADR-0110；文档请求形状由 ADR-0180 部分替代，不可变操作、依赖验证与产物所有权保留；late SDK carrier、transaction outcome 与可复用 rewrite manifest 生命周期由 ADR-0179 部分替代；同步等待及 finalize/cleanup 完成边界、无条件年龄窗延续由 ADR-0198 部分替代，原有 Unknown 保护保留；产物类别、每轮清理、不复用 manifest、完整账本证据与对象数预算由 ADR-0234 部分替代，原意图、依赖、字段、一次派发、路径唯一与实际退出仍有效）
 - [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；请求属性保留量与确定拒绝集由 ADR-0224 部分替代，认证、路由、其余状态码与脱敏规则仍有效）
 - [ADR-0176](ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md) — Iceberg REST 请求词汇为何归连接器、`add-schema` 为何不带 `last-column-id`（支持下限为 Iceberg Java 1.9 语义），view 替换为何总是新增带操作身份的版本并以 `-1` 选择、语义校验为何在派发之前（active；部分替代 ADR-0174 的 core U2/P8/View API 保留项与 ADR-0175 的 core REST 补丁妥协）
 - [ADR-0169](ADR-0169-read-only-hms-and-single-writer-admission.md) — catalog owner 为何在零副作用点统一准入、HMS 永久只读，并保留 publication 分离（active；作业来源、按 catalog 分离完成与 job 取消条款由 ADR-0232 部分替代）

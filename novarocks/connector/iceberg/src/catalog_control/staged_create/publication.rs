@@ -173,7 +173,7 @@ impl PublicationPreparer for CreatePublisher {
         )?;
         let ident = request.identifier();
         let expected_snapshot_id = request.ref_snapshot_after("main");
-        let payload = serde_json::to_vec(&PublishEvidenceV1 {
+        let payload = serde_json::to_vec(&PublishEvidenceV2 {
             version: EVIDENCE_VERSION,
             operation_marker: publication_marker(self.prepared.publication_id),
             table_uuid: self.prepared.staged.table.metadata().uuid().to_string(),
@@ -449,8 +449,7 @@ mod tests {
     use crate::resources::IcebergMetadataResources;
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorMutationOperationId, ConnectorProviderId, ConnectorStopOwner,
-        ConnectorWriteReceipt, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
     use std::time::Duration;
 
@@ -575,15 +574,12 @@ mod tests {
             } else {
                 vec![]
             };
-            let reports = files
-                .iter()
-                .map(|file| {
-                    crate::commit::report::writer_report_from_written_file(file, &metadata).unwrap()
-                })
-                .collect::<Vec<_>>();
             let proof = ConnectorStagedWriteProof::try_new(
-                ConnectorWriteReceipt::try_new(
-                    crate::write_codec::encode_writer_reports(&reports, &metadata).unwrap(),
+                crate::write_codec::seal_staged_files(
+                    files.clone(),
+                    &metadata,
+                    publication_id.to_bytes(),
+                    &adapter.owner(),
                 )
                 .unwrap(),
                 if with_data { 3 } else { 0 },
@@ -1010,7 +1006,7 @@ mod tests {
                     .unwrap();
             }
             let metadata = engine.metadata().clone();
-            let request = engine.freeze(&[]).unwrap();
+            let request = engine.freeze().unwrap();
             publisher.preflight_recovery(&request, &operation).unwrap();
             let entry = journal.current_entry().unwrap();
             journal
@@ -1140,18 +1136,7 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                let mut refs = operation.publication_references().unwrap();
-                refs.extend(
-                    fixture
-                        .prepared
-                        .write
-                        .as_ref()
-                        .unwrap()
-                        .files
-                        .iter()
-                        .map(|file| ObjectIdentity::new(file.path.clone()).unwrap()),
-                );
-                let request = engine.freeze(&refs).unwrap();
+                let request = engine.freeze().unwrap();
                 assert_eq!(
                     request.requirements(),
                     &[crate::iceberg::TableRequirement::NotExist]
@@ -1175,7 +1160,7 @@ mod tests {
                 let encoded = serde_json::to_vec(&facts).unwrap();
                 let decoded: FrozenPublicationFacts = serde_json::from_slice(&encoded).unwrap();
                 assert_eq!(facts, decoded);
-                let envelope = PublishEvidenceV1 {
+                let envelope = PublishEvidenceV2 {
                     version: EVIDENCE_VERSION,
                     operation_marker: publication_marker(fixture.prepared.publication_id),
                     table_uuid: original.uuid().to_string(),
@@ -1200,7 +1185,7 @@ mod tests {
                             )
                         }
                     }
-                    let tampered: PublishEvidenceV1 = serde_json::from_value(tampered).unwrap();
+                    let tampered: PublishEvidenceV2 = serde_json::from_value(tampered).unwrap();
                     assert!(
                         validate_publish_evidence(&tampered, &fixture.prepared, operation_id)
                             .is_err(),
@@ -1213,9 +1198,9 @@ mod tests {
                     ))
                     .unwrap();
                 let text = String::from_utf8(encoded).unwrap();
-                assert!(text.contains(CTAS_UNANCHORED_PROVENANCE_FILE));
+                assert!(!text.contains(CTAS_UNANCHORED_PROVENANCE_FILE));
                 if with_data {
-                    assert!(text.contains("data.parquet"));
+                    assert!(!text.contains("data.parquet"));
                     assert_eq!(
                         intent.changes().added[0].file().column_sizes().get(&1),
                         Some(&24)
@@ -1230,12 +1215,10 @@ mod tests {
                 assert!(
                     request
                         .artifacts()
-                        .operation_references()
+                        .references()
                         .contains(&provenance_object)
                 );
-                let mut retained = request.artifacts().attempt_owned().to_vec();
-                retained.extend_from_slice(request.artifacts().operation_references());
-                retained.extend_from_slice(request.artifacts().session_references());
+                let retained = request.artifacts().references().to_vec();
                 assert!(matches!(
                     operation.cleanup_after_commit(&retained).await,
                     crate::commit::model::IcebergCleanupReport::Complete { .. }
@@ -1269,7 +1252,41 @@ mod tests {
     }
 
     #[test]
-    fn create_preflight_bounds_the_complete_ledger_before_dispatch() {
+    fn create_large_owned_ledger_passes_preflight_and_dispatches_once() {
+        struct ControlledCreatePublisher {
+            inner: CreatePublisher,
+            dispatches: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl crate::commit::attempt::Publisher for ControlledCreatePublisher {
+            async fn load_target(
+                &self,
+                attempt: &IcebergCommitAttempt,
+            ) -> crate::iceberg::Result<StagingBase> {
+                self.inner.load_target(attempt).await
+            }
+            fn preflight_recovery(
+                &self,
+                request: &FrozenRequest,
+                operation: &IcebergCommitOperation,
+            ) -> crate::iceberg::Result<()> {
+                self.inner.preflight_recovery(request, operation)
+            }
+            async fn dispatch_once(
+                &self,
+                request: FrozenRequest,
+            ) -> crate::catalog::error::CatalogOutcome<crate::catalog::transaction::CommitProof>
+            {
+                self.dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::catalog::error::CatalogOutcome::committed(
+                    crate::catalog::transaction::CommitProof::applied(
+                        request.ref_snapshot_after("main"),
+                    ),
+                    ExternalMutationEffect::Applied,
+                )
+            }
+        }
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let mut fixture = Fixture::new(false);
             let operation_id = fixture.prepared.operation_id();
@@ -1280,48 +1297,206 @@ mod tests {
                 &fixture.context,
             )
             .unwrap();
-            // Unreferenced owned records still belong to recovery; projection
-            // must not hide them to squeeze an unknown result into the carrier.
-            for ordinal in 0..350 {
-                operation
-                    .adopt_session_data(
-                        ObjectIdentity::new(format!(
-                            "file://{}/{}.{}",
-                            fixture.directory.path().display(),
-                            ordinal,
-                            "x".repeat(240)
-                        ))
-                        .unwrap(),
-                    )
+            let abandoned = operation.begin_attempt().unwrap();
+            for _ in 0..1200 {
+                abandoned
+                    .allocate(crate::commit::model::ArtifactKind::Manifest)
                     .unwrap();
             }
             let intent = create_intent(&fixture.prepared, operation.token()).unwrap();
             let journal = PublicationJournal::new(operation.token());
-            let publisher = CreatePublisher {
-                adapter: fixture.adapter.clone(),
-                prepared: Arc::new(fixture.prepared.clone()),
-                operation_id,
-                journal: journal.clone(),
-            };
-            let attempt = operation.begin_attempt().unwrap();
-            let mut engine = StagingEngine::begin(
-                publisher.load_target(&attempt).await.unwrap(),
+            let publisher = Arc::new(ControlledCreatePublisher {
+                inner: CreatePublisher {
+                    adapter: fixture.adapter.clone(),
+                    prepared: Arc::new(fixture.prepared.clone()),
+                    operation_id,
+                    journal: journal.clone(),
+                },
+                dispatches: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let observed = journal.observe(publisher.clone());
+            let report = attempt::run(
+                &operation,
                 &intent,
-                &attempt,
+                &create_prefix(&fixture.prepared),
+                &[],
+                &observed,
+                RetryPolicy::from_properties(fixture.prepared.staged.table.metadata().properties())
+                    .unwrap(),
+            )
+            .await;
+            assert!(
+                matches!(
+                    report.publication,
+                    crate::commit::model::PublicationOutcome::Committed(_)
+                ),
+                "{report:?}"
+            );
+            assert_eq!(
+                publisher
+                    .dispatches
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert!(matches!(
+                report.cleanup,
+                crate::commit::model::IcebergCleanupReport::Complete { .. }
+            ));
+            assert!(operation.artifacts().unwrap().is_empty());
+            assert!(fixture.provenance_path().exists());
+        });
+    }
+    #[test]
+    fn create_publishes_a_thousand_files_from_the_original_bounded_seal() {
+        use crate::iceberg::TableRequirement;
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        let initial = Arc::new(Mutex::new(None::<crate::iceberg::spec::TableMetadata>));
+        let committed = Arc::new(Mutex::new(None::<crate::iceberg::spec::TableMetadata>));
+        let input = initial.clone();
+        let output = committed.clone();
+        let server = TestServer::start(Script::new()
+            .on("GET", "/v1/config", Reply::config(&[], &[], None))
+            .on_fn("POST", "/v1/namespaces/db/tables/t", move |request, index| {
+                if index != 0 || output.lock().unwrap().is_some() {
+                    return Reply::status(409);
+                }
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let requirements: Vec<TableRequirement> = serde_json::from_value(body["requirements"].clone()).unwrap();
+                assert_eq!(requirements, [TableRequirement::NotExist]);
+                let updates: Vec<TableUpdate> = serde_json::from_value(body["updates"].clone()).unwrap();
+                let mut builder = input.lock().unwrap().as_ref().unwrap().clone().into_builder(None);
+                for update in updates {
+                    builder = update.apply(builder).unwrap();
+                }
+                let metadata = builder.build().unwrap().metadata;
+                let reply = Reply::json(200, &serde_json::json!({
+                    "metadata-location": format!("{}/metadata/00001-published.metadata.json", metadata.location()),
+                    "metadata": metadata,
+                }));
+                *output.lock().unwrap() = Some(metadata);
+                reply
+            }));
+        let (executor, adapter) = super::super::tests::stage_http_adapter(&server);
+        executor.block_on(async {
+            let mut fixture = Fixture::new(true);
+            fixture.adapter = adapter;
+            let metadata = fixture.prepared.staged.table.metadata().clone();
+            *initial.lock().unwrap() = Some(metadata.clone());
+            let template = fixture.prepared.write.as_ref().unwrap().files[0].clone();
+            let directory = fixture.data_path().parent().unwrap().to_path_buf();
+            let mut files = Vec::new();
+            for ordinal in 0..1000 {
+                let mut file = template.clone();
+                let path = if ordinal == 0 {
+                    fixture.data_path()
+                } else {
+                    directory.join(format!("data-{ordinal:04}.parquet"))
+                };
+                std::fs::write(&path, b"owned output").unwrap();
+                file.path = format!("file://{}", path.display());
+                files.push(file);
+            }
+            let paths: std::collections::BTreeSet<_> =
+                files.iter().map(|file| file.path.clone()).collect();
+            assert_eq!(paths.len(), 1000);
+            let reports = files
+                .iter()
+                .map(|file| {
+                    crate::commit::report::writer_report_from_written_file(file, &metadata).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                crate::write_codec::encode_writer_reports(&reports, &metadata)
+                    .unwrap()
+                    .len()
+                    > 64 * 1024
+            );
+            let receipt = crate::write_codec::seal_staged_files(
+                files,
+                &metadata,
+                fixture.prepared.publication_id.to_bytes(),
+                &fixture.adapter.owner(),
             )
             .unwrap();
-            engine
-                .stage_change(create_prefix(&fixture.prepared))
+            assert!(receipt.payload().len() < 512);
+            let files = crate::write_codec::open_staged_files(
+                &receipt,
+                &metadata,
+                &fixture.adapter.owner(),
+            )
+            .unwrap();
+            fixture.prepared.write = Some(StagedWrite {
+                write: ConnectorStagedWriteProof::try_new(receipt, 3000).unwrap(),
+                files,
+            });
+            let operation_id = fixture.prepared.operation_id();
+            let outcome = publish_async(
+                &fixture.adapter,
+                &mut fixture.prepared,
+                operation_id,
+                &fixture.context,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        finalization: ExternalMutationFinalization::Complete,
+                        cleanup: ExternalMutationFinalization::Complete,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert_eq!(server.count("POST", "/v1/namespaces/db/tables/t"), 1);
+            let published = committed.lock().unwrap().as_ref().unwrap().clone();
+            let snapshot = published.current_snapshot().unwrap();
+            let io = fixture.prepared.staged.table.file_io();
+            let list_bytes = io
+                .new_input(snapshot.manifest_list())
+                .unwrap()
+                .read()
+                .await
                 .unwrap();
-            let request = engine
-                .freeze(&operation.publication_references().unwrap())
-                .unwrap();
-            assert!(publisher.preflight_recovery(&request, &operation).is_err());
-            assert!(matches!(
-                journal.bridge_failure(&operation, "preflight refused".into()),
-                ExternalMutationOutcome::KnownUncommitted { .. }
-            ));
-            assert_eq!(operation.artifacts().unwrap().len(), 351);
+            let list = crate::iceberg::spec::ManifestList::parse_with_version(
+                &list_bytes,
+                FormatVersion::V3,
+            )
+            .unwrap();
+            let mut observed = std::collections::BTreeSet::new();
+            let mut rows = 0;
+            for manifest in list.entries() {
+                let bytes = io
+                    .new_input(&manifest.manifest_path)
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap();
+                let decoded = crate::iceberg::spec::Manifest::parse_avro(&bytes).unwrap();
+                for entry in decoded.entries() {
+                    assert!(observed.insert(entry.data_file().file_path().to_owned()));
+                    rows += entry.data_file().record_count();
+                }
+            }
+            assert_eq!(observed, paths);
+            assert_eq!(rows, 3000);
+            for path in &paths {
+                assert!(std::path::Path::new(path.strip_prefix("file://").unwrap()).exists());
+            }
+            assert!(fixture.provenance_path().exists());
+            assert!(
+                fixture
+                    .prepared
+                    .publication
+                    .as_ref()
+                    .unwrap()
+                    .artifacts()
+                    .unwrap()
+                    .is_empty()
+            );
         });
+        drop(server); // its owner joins every actual connection actor
     }
 }

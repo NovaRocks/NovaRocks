@@ -20,7 +20,7 @@ use crate::commit::manifest_encoding::{
     EncodedManifestEntry, ManifestWriteEncoding, SourcedManifestEntry,
 };
 use crate::commit::model::{
-    AddedContent, ArtifactClass, ArtifactKind, ArtifactWriter, FrozenEntry, ObjectIdentity,
+    AddedContent, ArtifactKind, ArtifactWriter, FrozenEntry, ObjectIdentity,
 };
 use crate::iceberg::Result;
 use crate::iceberg::spec::{
@@ -59,12 +59,12 @@ pub async fn write_manifest(
         .map(|entry| encoding.encode(entry, None));
     write_encoded_manifest(
         artifacts,
-        ArtifactClass::Attempt,
         version,
         snapshot_id,
         &encoding,
         content,
         entries,
+        &[],
     )
     .await
 }
@@ -76,27 +76,7 @@ pub(crate) async fn write_sourced_manifest(
     spec: &PartitionSpec,
     content: ManifestContentType,
     entries: Vec<SourcedManifestEntry>,
-) -> Result<ManifestFile> {
-    write_sourced_manifest_with_class(
-        artifacts,
-        ArtifactClass::Attempt,
-        metadata,
-        snapshot_id,
-        spec,
-        content,
-        entries,
-    )
-    .await
-}
-
-pub(crate) async fn write_sourced_manifest_with_class(
-    artifacts: &dyn ArtifactWriter,
-    class: ArtifactClass,
-    metadata: &TableMetadata,
-    snapshot_id: i64,
-    spec: &PartitionSpec,
-    content: ManifestContentType,
-    entries: Vec<SourcedManifestEntry>,
+    replaces: &[String],
 ) -> Result<ManifestFile> {
     let encoding =
         ManifestWriteEncoding::choose(metadata, spec, &entries, || artifacts.check_active())?;
@@ -105,27 +85,27 @@ pub(crate) async fn write_sourced_manifest_with_class(
         .map(|entry| encoding.encode(entry.entry, Some(&entry.source)));
     write_encoded_manifest(
         artifacts,
-        class,
         metadata.format_version(),
         snapshot_id,
         &encoding,
         content,
         entries,
+        replaces,
     )
     .await
 }
 
 async fn write_encoded_manifest(
     artifacts: &dyn ArtifactWriter,
-    class: ArtifactClass,
     version: FormatVersion,
     snapshot_id: i64,
     encoding: &ManifestWriteEncoding,
     content: ManifestContentType,
     entries: impl IntoIterator<Item = Result<EncodedManifestEntry>>,
+    replaces: &[String],
 ) -> Result<ManifestFile> {
     artifacts.check_active()?;
-    let object = artifacts.allocate(class, ArtifactKind::Manifest)?;
+    let object = artifacts.allocate(ArtifactKind::Manifest)?;
     let output = artifacts.file_io().new_output(object.path())?;
     let builder = ManifestWriterBuilder::new(
         output,
@@ -143,6 +123,7 @@ async fn write_encoded_manifest(
         (FormatVersion::V3, ManifestContentType::Data) => builder.build_v3_data(),
         (FormatVersion::V3, ManifestContentType::Deletes) => builder.build_v3_deletes(),
     };
+    let mut live_paths = Vec::new();
     for entry in entries {
         artifacts.check_active()?;
         match entry? {
@@ -150,9 +131,11 @@ async fn write_encoded_manifest(
                 file,
                 data_sequence,
             } => {
+                live_paths.push(file.file_path().to_owned());
                 writer.add_file(file, data_sequence.manifest_writer_value())?;
             }
             EncodedManifestEntry::Existing { file, facts } => {
+                live_paths.push(file.file_path().to_owned());
                 writer.add_existing_file(
                     file,
                     facts
@@ -175,7 +158,9 @@ async fn write_encoded_manifest(
             }
         }
     }
-    writer.write_manifest_file().await
+    let descriptor = writer.write_manifest_file().await?;
+    artifacts.record_manifest(&object, &live_paths, replaces)?;
+    Ok(descriptor)
 }
 
 pub struct ManifestListOutput {
@@ -192,8 +177,13 @@ pub async fn write_manifest_list(
     manifests: impl IntoIterator<Item = ManifestFile>,
 ) -> Result<ManifestListOutput> {
     artifacts.check_active()?;
-    let object = artifacts.allocate(ArtifactClass::Attempt, ArtifactKind::ManifestList)?;
+    let object = artifacts.allocate(ArtifactKind::ManifestList)?;
     let output = artifacts.file_io().new_output(object.path())?;
+    let manifests: Vec<_> = manifests.into_iter().collect();
+    let paths: Vec<_> = manifests
+        .iter()
+        .map(|manifest| manifest.manifest_path.clone())
+        .collect();
     let first = metadata.next_row_id();
     let mut writer = match metadata.format_version() {
         FormatVersion::V1 => ManifestListWriter::v1(output.writer().await?, snapshot_id, parent),
@@ -221,6 +211,7 @@ pub async fn write_manifest_list(
         })
         .transpose()?;
     writer.close().await?;
+    artifacts.record_manifest_list(&object, &paths)?;
     artifacts.check_active()?;
     Ok(ManifestListOutput { object, row_range })
 }

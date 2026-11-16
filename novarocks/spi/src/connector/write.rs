@@ -34,8 +34,8 @@ use uuid::Uuid;
 use super::{
     CatalogProperties, ConnectorCommittedVersion, ConnectorControlRuntimeId, ConnectorError,
     ConnectorErrorKind, ConnectorExecutionDistribution, ConnectorMutationFailure,
-    ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
+    ConnectorProcessLocalPayload, ConnectorProviderBinding, ConnectorProviderBindingKey,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
     ExternalMutationFinalization, LakePublicationFamily, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, MvExactPartitionField, MvExactPartitionTransform,
 };
@@ -1406,14 +1406,26 @@ impl ConnectorPreReadyWritePlanningProof {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ConnectorWriteReceipt {
     payload: Bytes,
     digest: [u8; 32],
     committed_version: Option<ConnectorCommittedVersion>,
     resulting_row_count: Option<u64>,
     committed_partitioning: Option<ConnectorCommittedPartitioning>,
+    process_local_payload: Option<Arc<ConnectorProcessLocalPayload>>,
 }
+
+impl PartialEq for ConnectorWriteReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        self.payload == other.payload
+            && self.digest == other.digest
+            && self.committed_version == other.committed_version
+            && self.resulting_row_count == other.resulting_row_count
+            && self.committed_partitioning == other.committed_partitioning
+    }
+}
+impl Eq for ConnectorWriteReceipt {}
 
 impl ConnectorWriteReceipt {
     pub fn try_new(payload: Bytes) -> Result<Self, ConnectorError> {
@@ -1424,6 +1436,7 @@ impl ConnectorWriteReceipt {
             committed_version: None,
             resulting_row_count: None,
             committed_partitioning: None,
+            process_local_payload: None,
         })
     }
 
@@ -1499,8 +1512,39 @@ impl ConnectorWriteReceipt {
         self.committed_partitioning.as_ref()
     }
 
+    /// Attach immutable provider content after checking its complete generation.
+    /// The attachment changes neither receipt identity nor its wire representation.
+    pub fn with_process_local_payload(
+        mut self,
+        expected_owner: &ConnectorProviderBindingKey,
+        payload: ConnectorProcessLocalPayload,
+    ) -> Result<Self, ConnectorError> {
+        payload.validate_owner(expected_owner)?;
+        if self.process_local_payload.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write receipt already retains a process-local payload",
+            ));
+        }
+        self.process_local_payload = Some(Arc::new(payload));
+        Ok(self)
+    }
+
+    /// Validate the generation before a provider opens its private content.
+    pub fn process_local_payload(
+        &self,
+        expected_owner: &ConnectorProviderBindingKey,
+    ) -> Result<Option<&ConnectorProcessLocalPayload>, ConnectorError> {
+        if let Some(payload) = &self.process_local_payload {
+            payload.validate_owner(expected_owner)?;
+        }
+        Ok(self.process_local_payload.as_deref())
+    }
+
     /// Stable durable form for application journals. The provider payload is
-    /// carried opaquely and never decoded outside the provider.
+    /// carried opaquely and never decoded outside the provider. Process-local
+    /// attachments are omitted; consumers that require them reject a receipt
+    /// restored from this wire form.
     pub fn try_to_wire_v1(&self) -> Result<Bytes, ConnectorError> {
         self.validate()?;
         const MAGIC: &[u8; 4] = b"CWR1";
@@ -2612,6 +2656,59 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn receipt_attachment_preserves_identity_and_checks_generation() {
+        let owner = ConnectorProviderBinding::iceberg("catalog", [1; 16], "binding")
+            .unwrap()
+            .binding_key()
+            .clone();
+        let foreign = ConnectorProviderBinding::iceberg("catalog", [2; 16], "binding")
+            .unwrap()
+            .binding_key()
+            .clone();
+        let plain = ConnectorWriteReceipt::try_new(Bytes::from_static(b"bounded facts")).unwrap();
+        let content = Arc::new(vec![7u64]);
+        let attached = plain
+            .clone()
+            .with_process_local_payload(
+                &owner,
+                ConnectorProcessLocalPayload::new(owner.clone(), content.clone()),
+            )
+            .unwrap();
+        assert_eq!(plain, attached);
+        assert_eq!(plain.digest(), attached.digest());
+        assert!(Arc::ptr_eq(
+            attached
+                .process_local_payload(&owner)
+                .unwrap()
+                .unwrap()
+                .value::<Vec<u64>>(owner.instance_id())
+                .unwrap(),
+            &content,
+        ));
+        let decoded =
+            ConnectorWriteReceipt::try_from_wire_v1(&attached.try_to_wire_v1().unwrap()).unwrap();
+        assert_eq!(decoded, attached);
+        assert!(decoded.process_local_payload(&owner).unwrap().is_none());
+        assert!(attached.process_local_payload(&foreign).is_err());
+        assert!(
+            plain
+                .with_process_local_payload(
+                    &owner,
+                    ConnectorProcessLocalPayload::new(foreign, content),
+                )
+                .is_err()
+        );
+        assert!(
+            attached
+                .with_process_local_payload(
+                    &owner,
+                    ConnectorProcessLocalPayload::new(owner.clone(), Arc::new(())),
+                )
+                .is_err()
         );
     }
 

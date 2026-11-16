@@ -535,12 +535,12 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   CREATE / ALTER ADD 在所有格式版本递归拒绝新 Variant 列；已有表的 DELETE、合法普通键 equality delete、
   TRUNCATE 与普通 metadata 修改保留原边界。schema ALTER 先在同一代 generation pin 做 Provider 纯准入，再执行原 MV / DROP 保护。
 
-  Iceberg 提交契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)。修改前先读：
-  - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑条目与物理对象身份、继承字段、冻结请求及发布/清理结果。
+  Iceberg 意图、依赖与字段契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)，产物责任、复用与有界发布事实见 [ADR-0234](docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)。修改前先读：
+  - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑/物理身份与继承字段；对象来源、写入与退休状态、覆盖记录及准确发布引用分别保留。
   - `novarocks/connector/iceberg/src/commit/dependency/**`：按类别惰性读取 metadata、目标 ref 存活集和连续历史窗口，验证操作依赖。
   - `novarocks/connector/iceberg/src/commit/staging/**`：updates 前缀事实、ID 规范化、requirements 折算及 manifest-list 的实际 row-ID 分配。
-  - `novarocks/connector/iceberg/src/commit/attempt.rs`：加载、验证、准备、冻结、单次派发和确定冲突的重试。
-  - `novarocks/connector/iceberg/src/commit/operation.rs`：操作内 I/O 并发、先登记后写入、实际退出监督和有界 owned-object 清理。
+  - `novarocks/connector/iceberg/src/commit/attempt.rs`：同一 operation 的单次提交循环；加载、依赖验证、稳定 stage ID 核对、准备与覆盖断言、单次派发及确定冲突重试，循环内不删除产物。
+  - `novarocks/connector/iceberg/src/commit/operation.rs`：同一账本保管接管/自建对象、stage ID、按依据复用与不可逆退休；先登记后写入并等真实退出，终态按准确引用结清和并发删除，Unknown 与 ID 命中保留全部对象。
   - `novarocks/connector/iceberg/src/commit/write_stack/execution/cleanup.rs`：原 unsealed writer actor 持有准确 staged journal，首次清理启用现有 Provider 独立时间预算，保留原 scope、凭据与 I/O 能力；只在实际 DELETE 成功后移除原路径。Work 停止不取消已存在的清理义务，sealed 产物与 Unknown 仍保留原所有权及真实退出要求。
 
 - `novarocks/connector/paimon/**`

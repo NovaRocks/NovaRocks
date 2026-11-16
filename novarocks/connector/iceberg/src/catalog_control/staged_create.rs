@@ -57,7 +57,7 @@ use crate::loaded_table::IcebergRestVendedS3LeaseRefresher;
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
 
-const EVIDENCE_VERSION: u16 = 1;
+const EVIDENCE_VERSION: u16 = 2;
 const CTAS_OPERATION_MARKER: &str = "novarocks.ctas.operation-id";
 const CTAS_PROVENANCE_VERSION: &str = "novarocks.ctas.provenance-version";
 const CTAS_PROVENANCE_TARGET: &str = "novarocks.ctas.target";
@@ -653,23 +653,14 @@ impl PreparedOperation {
     }
 }
 
-/// Read the artifacts a write session sealed into its receipt.
-///
-/// The payload is provider-private in both directions: this catalog generation
-/// minted it in `finish_write` and is the only thing that reads it back. A
-/// receipt from anywhere else fails to decode rather than being interpreted
-/// loosely.
+/// Open the original immutable files after validating the bounded receipt facts
+/// and the complete provider generation. Wire-only receipts lack this attachment.
 fn sealed_artifacts(
     write: &ConnectorStagedWriteProof,
     metadata: &crate::iceberg::spec::TableMetadata,
-) -> Result<Vec<crate::commit::report::IcebergWriterReport>, ConnectorError> {
-    crate::write_codec::decode_writer_reports(write.receipt().payload(), metadata).map_err(
-        |error| {
-            corrupt(format!(
-                "decode the artifacts sealed into a staged-create write receipt: {error}"
-            ))
-        },
-    )
+    owner: &ConnectorProviderBindingKey,
+) -> Result<Arc<[WrittenFile]>, ConnectorError> {
+    crate::write_codec::open_staged_files(write.receipt(), metadata, owner)
 }
 
 #[derive(Clone)]
@@ -679,7 +670,7 @@ struct PublicationUnknownOperation {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct PublishEvidenceV1 {
+struct PublishEvidenceV2 {
     version: u16,
     operation_marker: String,
     table_uuid: String,
@@ -972,16 +963,51 @@ impl IcebergStagedCreateAdapter {
         write: &ConnectorStagedWriteProof,
     ) -> Result<Arc<[WrittenFile]>, ConnectorError> {
         let metadata = prepared.staged.table.metadata().clone();
-        let files = sealed_artifacts(write, &metadata)?.into_iter().map(|report| {
-            let file = crate::commit::report::written_file_from_report(report, metadata.current_schema().as_ref()).map_err(corrupt)?;
-            if file.content != crate::iceberg::spec::DataContentType::Data
-                || metadata.partition_spec_by_id(file.partition_spec_id).is_none()
+        let files = sealed_artifacts(write, &metadata, &self.owner())?;
+        let mut rebound: Option<Vec<WrittenFile>> = None;
+        for (index, file) in files.iter().enumerate() {
+            // Keep the original target-schema author, including typed bound decoding
+            // and normalization of retired field statistics, without a JSON round trip.
+            let mut report =
+                crate::commit::report::writer_report_from_written_file(file, &metadata)
+                    .map_err(corrupt)?;
+            let partition = crate::write_descriptor::encode_partition_descriptor(
+                &report.file.partition.partition_values,
+                report.file.partition.partition_spec_id,
+                &metadata,
+            )
+            .map_err(|error| corrupt(error.to_string()))?;
+            report.file.partition.partition_values =
+                crate::write_descriptor::decode_partition_descriptor(
+                    Some(partition),
+                    report.file.partition.partition_spec_id,
+                    &metadata,
+                )
+                .map_err(|error| corrupt(error.to_string()))?;
+            let normalized = crate::commit::report::written_file_from_report(
+                report,
+                metadata.current_schema().as_ref(),
+            )
+            .map_err(corrupt)?;
+            if normalized.content != crate::iceberg::spec::DataContentType::Data
+                || metadata
+                    .partition_spec_by_id(normalized.partition_spec_id)
+                    .is_none()
             {
-                return Err(corrupt("Staged create output requires Data content and an authoritative partition spec"));
+                return Err(corrupt(
+                    "Staged create output requires Data content and an authoritative partition spec",
+                ));
             }
-            Ok(file)
-        }).collect::<Result<Vec<_>, ConnectorError>>()?;
-        Ok(files.into())
+            if let Some(rebound) = &mut rebound {
+                rebound.push(normalized);
+            } else if normalized != *file {
+                let mut prefix = Vec::with_capacity(files.len());
+                prefix.extend(files[..index].iter().cloned());
+                prefix.push(normalized);
+                rebound = Some(prefix);
+            }
+        }
+        Ok(rebound.map_or(files, Arc::from))
     }
 
     fn abort_prepared(
@@ -1924,7 +1950,7 @@ impl IcebergStagedCreateAdapter {
             ));
         }
         let prepared = unknown.prepared;
-        let evidence: PublishEvidenceV1 =
+        let evidence: PublishEvidenceV2 =
             serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
                 invalid(format!(
                     "Iceberg staged-create publish evidence is invalid: {error}"
@@ -2611,7 +2637,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 "Iceberg staged-create write binding is stale, unplanned, or already bound",
             ));
         }
-        // Decoding the receipt here is the binding check: a receipt this
+        // Opening the receipt here is the binding check: a receipt this
         // generation did not mint, or one whose artifacts do not fit this
         // target's schema, is refused before the target records a write at all.
         let files = match self.staged_write_files(&prepared, &write) {
@@ -2816,7 +2842,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             ));
         }
         let prepared = unknown.prepared;
-        let evidence: PublishEvidenceV1 =
+        let evidence: PublishEvidenceV2 =
             serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
                 invalid(format!(
                     "Iceberg staged-create publish evidence is invalid: {error}"
@@ -2976,7 +3002,7 @@ fn take_abortable(
 }
 
 fn validate_publish_evidence(
-    evidence: &PublishEvidenceV1,
+    evidence: &PublishEvidenceV2,
     prepared: &PreparedOperation,
     dispatch_operation_id: ConnectorStagedCreateOperationId,
 ) -> Result<(), ConnectorError> {
@@ -3359,7 +3385,13 @@ mod tests {
 
     /// A prepared aggregate with no writer bound, for state-machine tests.
     fn prepared_operation(runtime: &IcebergMetadataContext) -> PreparedOperation {
-        let location = "file:///tmp/novarocks-staged-create/table";
+        prepared_operation_at(runtime, "file:///tmp/novarocks-staged-create/table")
+    }
+
+    fn prepared_operation_at(
+        runtime: &IcebergMetadataContext,
+        location: &str,
+    ) -> PreparedOperation {
         let schema = crate::iceberg::spec::Schema::builder()
             .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
                 1,
@@ -3758,7 +3790,7 @@ mod tests {
         }
     }
 
-    fn stage_http_adapter(
+    pub(super) fn stage_http_adapter(
         server: &crate::rest_protocol::test_server::TestServer,
     ) -> (tokio::runtime::Runtime, IcebergStagedCreateAdapter) {
         let executor = tokio::runtime::Runtime::new().unwrap();
@@ -4490,8 +4522,9 @@ mod tests {
 
     #[test]
     fn a_foreign_receipt_is_refused_rather_than_read_as_an_empty_write() {
-        let runtime = rest_runtime();
+        let runtime = Arc::new(rest_runtime());
         let prepared = prepared_operation(&runtime);
+        let owner = adapter_for(runtime).owner();
         let metadata = prepared.staged.table.metadata().clone();
 
         let foreign = ConnectorStagedWriteProof::try_new(
@@ -4502,22 +4535,432 @@ mod tests {
             7,
         )
         .expect("write proof");
-        let error = sealed_artifacts(&foreign, &metadata).expect_err("a foreign receipt");
+        let error = crate::write_codec::open_staged_files(foreign.receipt(), &metadata, &owner)
+            .expect_err("a foreign receipt");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
 
         // The real payload this generation's seal produces round-trips, so the
         // refusal above is about provenance and not about the decoder being
         // unable to read anything at all.
-        let sealed = crate::write_codec::encode_writer_reports(&[], &metadata).expect("seal");
-        let mine = ConnectorStagedWriteProof::try_new(
-            novarocks_spi::connector::ConnectorWriteReceipt::try_new(sealed).expect("receipt"),
-            0,
-        )
-        .expect("write proof");
+        let receipt = crate::write_codec::seal_staged_files(Vec::new(), &metadata, [9; 16], &owner)
+            .expect("seal");
+        let mine = ConnectorStagedWriteProof::try_new(receipt, 0).expect("write proof");
         assert!(
-            sealed_artifacts(&mine, &metadata)
+            crate::write_codec::open_staged_files(mine.receipt(), &metadata, &owner)
                 .expect("own receipt")
                 .is_empty()
         );
+    }
+    #[test]
+    fn binding_rejects_missing_changed_or_foreign_seal_before_catalog_and_preserves_original_owner()
+    {
+        use crate::commit::write_stack::domain::{
+            IcebergCommitFragment, IcebergDataFileArtifact, IcebergWriteFlavor,
+            IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
+        };
+        use crate::commit::write_stack::planning::{
+            IcebergWriteSessionPlanInput, plan_write_session,
+        };
+        use crate::commit::write_stack::test_support::{
+            data_branch_plan, sample_metrics, sample_partition,
+        };
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        use novarocks_spi::connector::write_stack::{
+            ConnectorPreparedWriteSet, ConnectorWriteControl, ConnectorWriteFinishRequest,
+            WriteTargetOrdinal,
+        };
+        use novarocks_spi::connector::{
+            ConnectorWriteAdmissionPurpose, ConnectorWriteReceipt, ExternalMutationOutcome,
+        };
+        for case in [
+            "missing",
+            "wire",
+            "digest",
+            "foreign_generation",
+            "target_schema",
+            "promoted_schema",
+        ] {
+            let server = TestServer::start(Script::new());
+            let (_executor, adapter) = stage_http_adapter(&server);
+            let scratch = tempfile::tempdir().unwrap();
+            let location = format!("file://{}/table", scratch.path().display());
+            let mut target = prepared_operation_at(&adapter.runtime, &location);
+            let metadata = Arc::new(if case == "promoted_schema" {
+                let schema = crate::iceberg::spec::Schema::builder()
+                    .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        crate::iceberg::spec::Type::Primitive(
+                            crate::iceberg::spec::PrimitiveType::Int,
+                        ),
+                    ))])
+                    .build()
+                    .unwrap();
+                target
+                    .staged
+                    .table
+                    .metadata()
+                    .clone()
+                    .into_builder(None)
+                    .add_current_schema(schema)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .metadata
+            } else {
+                target.staged.table.metadata().clone()
+            });
+            let operation_id = target.operation_id();
+            let owner = adapter.owner();
+            let handle = ConnectorStagedTableHandle::try_new(
+                owner.clone(),
+                operation_id,
+                Bytes::from_static(b"unpublished-target"),
+            )
+            .unwrap();
+            target.handle_digest = handle.digest();
+            let planning = adapter
+                .provider
+                .staged_write_table_handle(&target.staged.table, operation_id, &context())
+                .unwrap();
+            target.planning = Some(
+                ConnectorStagedWritePlanningBinding::try_new(
+                    &handle,
+                    planning,
+                    Bytes::new(),
+                    context(),
+                )
+                .unwrap(),
+            );
+            let original_target = target.clone();
+            adapter.record_terminal(operation_id, OperationState::Prepared(target));
+            let data = scratch.path().join("table/data/owned.parquet");
+            std::fs::create_dir_all(data.parent().unwrap()).unwrap();
+            std::fs::write(&data, b"owned output").unwrap();
+            let path = format!("file://{}", data.display());
+            let session_id = IcebergWriteSessionId::new();
+            let facts = IcebergWriteTableFacts::try_new(
+                metadata.uuid().to_string(),
+                "db".into(),
+                "t".into(),
+                location.clone(),
+                format!("{location}/data"),
+                "main".into(),
+                None,
+                0,
+                metadata.current_schema_id(),
+                metadata.default_partition_spec_id(),
+                2,
+            )
+            .unwrap();
+            let (session, _) = plan_write_session(
+                session_id,
+                IcebergWriteSessionPlanInput {
+                    flavor: IcebergWriteFlavor::StagedCreate,
+                    purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                    table: facts,
+                    base_version_digest: None,
+                    staged_metadata: Some(metadata.clone()),
+                    data: data_branch_plan(),
+                    deletes: vec![],
+                },
+            )
+            .unwrap();
+            let catalog_handle = CatalogHandle::new(
+                owner.instance_id.clone(),
+                CatalogVersion::from_bytes([1; 32]),
+            );
+            let source_adapter = crate::commit::write_stack::runtime::build_write_adapter(
+                adapter.descriptor.clone(),
+                catalog_handle.clone(),
+            );
+            let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+                adapter.descriptor.clone(),
+                owner.incarnation,
+                catalog_handle,
+                adapter.runtime.clone(),
+            );
+            let expected = session.expected_targets();
+            let commit = source_adapter.wrap_commit_session(session);
+            let fragment = IcebergCommitFragment::data_file(
+                IcebergDataFileArtifact::try_new(
+                    path.clone(),
+                    crate::delete_file::IcebergFileFormat::Parquet,
+                    sample_partition(),
+                    if matches!(case, "target_schema" | "promoted_schema") {
+                        let (lower, upper) = if case == "promoted_schema" {
+                            (1_i32.to_le_bytes().to_vec(), 3_i32.to_le_bytes().to_vec())
+                        } else {
+                            (1_i64.to_le_bytes().to_vec(), 3_i64.to_le_bytes().to_vec())
+                        };
+                        crate::commit::write_stack::domain::IcebergArtifactMetrics::try_new(
+                            3,
+                            12,
+                            Vec::new(),
+                            Some(crate::commit::report::IcebergColumnStats {
+                                lower_bounds: BTreeMap::from([(1, lower)]),
+                                upper_bounds: BTreeMap::from([(1, upper)]),
+                                ..Default::default()
+                            }),
+                        )
+                        .unwrap()
+                    } else {
+                        sample_metrics(3, 12)
+                    },
+                    None,
+                )
+                .unwrap(),
+            );
+            let set = ConnectorPreparedWriteSet::try_new(
+                3,
+                vec![(
+                    WriteTargetOrdinal::try_new(0).unwrap(),
+                    source_adapter.wrap_commit_fragment(fragment),
+                )],
+                &expected,
+            )
+            .unwrap();
+            let outcome = control.finish_write(ConnectorWriteFinishRequest {
+                commit: &commit, prepared: set, statistics: vec![],
+                publication: novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
+                context: context(),
+            }).unwrap();
+            let ExternalMutationOutcome::KnownCommitted {
+                receipt,
+                effect: ExternalMutationEffect::NoOp,
+                ..
+            } = outcome
+            else {
+                panic!("the source only seals its accepted files");
+            };
+            let files = crate::write_codec::open_staged_files(&receipt, &metadata, &owner).unwrap();
+            if case == "promoted_schema" {
+                assert_eq!(files[0].lower_bounds[&1].to_bytes().unwrap().len(), 4);
+                let valid = ConnectorStagedWriteProof::try_new(receipt.clone(), 3).unwrap();
+                adapter.bind_write(handle.clone(), valid.clone()).unwrap();
+                {
+                    let operations = adapter.operations.lock().unwrap();
+                    let Some(OperationState::Prepared(target)) = operations.get(&operation_id)
+                    else {
+                        panic!("binding preserves the target");
+                    };
+                    let normalized = &target.write.as_ref().unwrap().files;
+                    assert!(!Arc::ptr_eq(&files, normalized));
+                    assert_eq!(
+                        normalized[0].lower_bounds[&1],
+                        crate::iceberg::spec::Datum::long(1)
+                    );
+                    assert_eq!(
+                        normalized[0].upper_bounds[&1],
+                        crate::iceberg::spec::Datum::long(3)
+                    );
+                    assert_eq!(normalized[0].path, files[0].path);
+                }
+                // The source attachment remains immutable after permitted promotion.
+                assert_eq!(files[0].lower_bounds[&1].to_bytes().unwrap().len(), 4);
+                assert!(Arc::ptr_eq(
+                    &files,
+                    &crate::write_codec::open_staged_files(&receipt, &metadata, &owner).unwrap(),
+                ));
+                let aborted = adapter
+                    .abort(ConnectorStagedCreateAbortRequest {
+                        operation_id,
+                        handle,
+                        write: Some(valid),
+                        context: context(),
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    aborted,
+                    ConnectorStagedCreateAbortOutcome::Aborted {
+                        finalization: ExternalMutationFinalization::Complete,
+                        ..
+                    }
+                ));
+                assert!(!data.exists());
+                assert!(server.requests().is_empty());
+                continue;
+            }
+            if case == "target_schema" {
+                assert_eq!(files[0].lower_bounds[&1].to_bytes().unwrap().len(), 8);
+                let schema = crate::iceberg::spec::Schema::builder()
+                    .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        crate::iceberg::spec::Type::Primitive(
+                            crate::iceberg::spec::PrimitiveType::Int,
+                        ),
+                    ))])
+                    .build()
+                    .unwrap();
+                let narrowed = original_target
+                    .staged
+                    .table
+                    .metadata()
+                    .clone()
+                    .into_builder(None)
+                    .add_current_schema(schema)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .metadata;
+                let mut operations = adapter.operations.lock().unwrap();
+                let Some(OperationState::Prepared(target)) = operations.get_mut(&operation_id)
+                else {
+                    panic!("the target is prepared");
+                };
+                target.staged.table = crate::iceberg::table::Table::builder()
+                    .runtime(
+                        adapter
+                            .runtime
+                            .resources()
+                            .catalog_runtime()
+                            .iceberg_runtime()
+                            .clone(),
+                    )
+                    .identifier(target.staged.table.identifier().clone())
+                    .file_io(target.staged.table.file_io().clone())
+                    .metadata(narrowed)
+                    .build()
+                    .unwrap();
+                // Complete owner and digest validation still pass. The original
+                // target-schema author must reject Long's eight bytes as Int.
+                assert!(
+                    crate::write_codec::open_staged_files(
+                        &receipt,
+                        target.staged.table.metadata(),
+                        &owner,
+                    )
+                    .is_ok()
+                );
+            }
+            let offered = match case {
+                "target_schema" => receipt.clone(),
+                "missing" => ConnectorWriteReceipt::try_new(receipt.payload().clone()).unwrap(),
+                "wire" => {
+                    ConnectorWriteReceipt::try_from_wire_v1(&receipt.try_to_wire_v1().unwrap())
+                        .unwrap()
+                }
+                "digest" => {
+                    let mut facts: serde_json::Value =
+                        serde_json::from_slice(receipt.payload()).unwrap();
+                    let first = facts["files_digest"][0].as_u64().unwrap();
+                    facts["files_digest"][0] = serde_json::Value::from(first ^ 1);
+                    ConnectorWriteReceipt::try_new(Bytes::from(serde_json::to_vec(&facts).unwrap()))
+                        .unwrap()
+                        .with_process_local_payload(
+                            &owner,
+                            receipt
+                                .process_local_payload(&owner)
+                                .unwrap()
+                                .unwrap()
+                                .clone(),
+                        )
+                        .unwrap()
+                }
+                "foreign_generation" => {
+                    let foreign = ConnectorProviderBindingKey {
+                        instance_id: owner.instance_id.clone(),
+                        incarnation: ProviderBindingEpoch::new(),
+                    };
+                    crate::write_codec::seal_staged_files(
+                        files.to_vec(),
+                        &metadata,
+                        session_id.to_bytes(),
+                        &foreign,
+                    )
+                    .unwrap()
+                }
+                _ => unreachable!(),
+            };
+            let error = adapter
+                .bind_write(
+                    handle.clone(),
+                    ConnectorStagedWriteProof::try_new(offered, 3).unwrap(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if case == "foreign_generation" {
+                    ConnectorErrorKind::InvalidRequest
+                } else {
+                    ConnectorErrorKind::CorruptData
+                }
+            );
+            if case == "target_schema" {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("decode column stat lower_bounds[1]")
+                );
+            }
+            assert!(
+                server.requests().is_empty(),
+                "{case}: binding must not call Catalog"
+            );
+            assert!(data.exists());
+            assert!(matches!(
+                source_adapter
+                    .commit_session(&commit)
+                    .unwrap()
+                    .state()
+                    .unwrap(),
+                IcebergWriteSessionState::Sealed
+            ));
+            assert_eq!(
+                control.cleanup_responsibility(&commit).unwrap(),
+                novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
+            );
+            {
+                let operations = adapter.operations.lock().unwrap();
+                let Some(OperationState::Prepared(target)) = operations.get(&operation_id) else {
+                    panic!("failed binding preserves the original target");
+                };
+                assert!(target.write.is_none());
+                assert!(target.publication.is_none());
+            }
+            if case == "target_schema" {
+                assert!(Arc::ptr_eq(
+                    &files,
+                    &crate::write_codec::open_staged_files(&receipt, &metadata, &owner).unwrap(),
+                ));
+                // Restore the actual correct target and its original planning
+                // binding, then use the normal bind/abort path for real cleanup.
+                let mut operations = adapter.operations.lock().unwrap();
+                let Some(OperationState::Prepared(target)) = operations.get_mut(&operation_id)
+                else {
+                    panic!("failed binding preserves the original target");
+                };
+                *target = original_target;
+            }
+            // The exact original receipt remains usable after refusal. Its
+            // successful binding can then authorize the target's real cleanup.
+            let valid = ConnectorStagedWriteProof::try_new(receipt, 3).unwrap();
+            adapter.bind_write(handle.clone(), valid.clone()).unwrap();
+            {
+                let operations = adapter.operations.lock().unwrap();
+                let Some(OperationState::Prepared(target)) = operations.get(&operation_id) else {
+                    panic!("binding preserves the target");
+                };
+                assert!(Arc::ptr_eq(&files, &target.write.as_ref().unwrap().files));
+            }
+            let aborted = adapter
+                .abort(ConnectorStagedCreateAbortRequest {
+                    operation_id,
+                    handle,
+                    write: Some(valid),
+                    context: context(),
+                })
+                .unwrap();
+            assert!(matches!(
+                aborted,
+                ConnectorStagedCreateAbortOutcome::Aborted {
+                    finalization: ExternalMutationFinalization::Complete,
+                    ..
+                }
+            ));
+            assert!(!data.exists());
+            assert!(server.requests().is_empty());
+        }
     }
 }

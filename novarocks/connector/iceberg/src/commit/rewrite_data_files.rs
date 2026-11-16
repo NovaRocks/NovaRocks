@@ -270,9 +270,20 @@ pub(crate) async fn prepare_physical_rewrite(
             .or_default()
             .push(added.clone());
     }
-    let snapshot_id = super::staging::new_snapshot_id(metadata);
+    let snapshot_id = view.stage_snapshot_id()?;
     let mut additions = Vec::new();
-    for ((spec_id, assigned), added) in added_groups {
+    for (ordinal, ((spec_id, assigned), added)) in added_groups.into_iter().enumerate() {
+        let basis = super::model::ManifestReuseBasis::added(
+            view.stage_key(),
+            super::model::AddedManifestAuthor::PhysicalRewrite,
+            ordinal,
+            super::manifest_encoding::encoding_basis(metadata)?,
+            added.iter().map(|file| file.file().file_path()),
+        );
+        if let Some(manifest) = view.artifacts().find_reusable_manifest(&basis)? {
+            additions.push(manifest);
+            continue;
+        }
         let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
             rewrite_invalid(format!("Rewrite partition spec {spec_id} is absent"))
         })?;
@@ -305,6 +316,8 @@ pub(crate) async fn prepare_physical_rewrite(
                     .map_err(|_| rewrite_invalid("Assigned rewrite row ID must be nonnegative"))?,
             );
         }
+        view.artifacts()
+            .remember_reusable_manifest(basis, manifest.clone())?;
         additions.push(manifest);
     }
     let deleted = live

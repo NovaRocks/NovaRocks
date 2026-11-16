@@ -18,6 +18,7 @@
 //! Logical entries are distinct from the physical objects that contain them.
 
 use std::fmt;
+use std::sync::Arc;
 
 use novarocks_spi::connector::ConnectorMutationOperationId;
 #[cfg(test)]
@@ -59,7 +60,7 @@ impl EntryIdentity {
 
     pub fn object(&self) -> ObjectIdentity {
         ObjectIdentity {
-            path: self.path().to_owned(),
+            path: Arc::from(self.path()),
         }
     }
 
@@ -119,7 +120,7 @@ impl TryFrom<&DataFile> for EntryIdentity {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ObjectIdentity {
-    path: String,
+    path: Arc<str>,
 }
 
 impl ObjectIdentity {
@@ -128,7 +129,9 @@ impl ObjectIdentity {
         if path.is_empty() {
             return Err(invalid("Iceberg object path must not be empty"));
         }
-        Ok(Self { path })
+        Ok(Self {
+            path: Arc::from(path),
+        })
     }
     pub fn path(&self) -> &str {
         &self.path

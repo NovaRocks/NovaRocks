@@ -377,7 +377,7 @@ impl Preparer for Arc<MaterializedDeleteStep> {
             })
             .transpose()?;
         let summary = summary.finish(total)?;
-        let snapshot = crate::commit::staging::new_snapshot_id(view.metadata());
+        let snapshot = view.stage_snapshot_id()?;
         let historical = crate::read_snapshot::frozen_partition_types(
             observed.scope.metadata(),
             observed.scope.schema(),

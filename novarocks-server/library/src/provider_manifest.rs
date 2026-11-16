@@ -599,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn statement_geometry_includes_the_same_write_factory_and_recovery_encoder() {
+    fn statement_geometry_uses_the_same_provider_authored_components() {
         let manifest = ServerProviderManifest::seal().unwrap();
         let actual = manifest.statement_io_geometry().unwrap();
         let write = novarocks_connector_iceberg::write_control_io_geometry().unwrap();
@@ -626,11 +626,6 @@ mod tests {
                 .max(maintenance.initial_owned_bytes())
                 .max(iceberg_read.initial_owned_bytes())
         );
-        assert_eq!(
-            write.initial_owned_bytes().get(),
-            (8 * 1024 * 1024) + (2 * 64 * 1024)
-        );
-        assert!(actual.initial_owned_bytes() > maintenance.initial_owned_bytes());
     }
 
     fn drifted_control_factory(

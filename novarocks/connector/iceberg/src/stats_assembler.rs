@@ -315,10 +315,7 @@ pub(crate) async fn write_puffin_artifacts_allocated(
         return Ok(None);
     }
     let object = writer
-        .allocate(
-            crate::commit::model::ArtifactClass::Attempt,
-            crate::commit::model::ArtifactKind::Statistics,
-        )
+        .allocate(crate::commit::model::ArtifactKind::Statistics)
         .map_err(|error| error.to_string())?;
     let statistics = write_puffin_artifacts(
         writer.file_io(),
@@ -373,10 +370,7 @@ pub(crate) async fn write_puffin_artifacts_allocated_scoped(
     if drafts.is_empty() {
         return Ok(None);
     }
-    let object = writer.allocate(
-        crate::commit::model::ArtifactClass::Attempt,
-        crate::commit::model::ArtifactKind::Statistics,
-    )?;
+    let object = writer.allocate(crate::commit::model::ArtifactKind::Statistics)?;
     let result = write_puffin_artifacts_original(
         writer.file_io(),
         object.path(),

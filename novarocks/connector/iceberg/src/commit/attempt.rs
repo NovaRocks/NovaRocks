@@ -20,7 +20,7 @@
 pub(crate) mod observation;
 pub(crate) mod prepared;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -32,8 +32,8 @@ use novarocks_spi::connector::{
 use super::dependency::ValidationInputs;
 use super::dependency::{self, Verdict};
 use super::model::{
-    ArtifactClass, ArtifactWriter, CleanupScope, FrozenRequest, IcebergCleanupReport,
-    ObjectIdentity, OperationIntent, PublicationOutcome, PublicationReport, RequestShape,
+    ArtifactWriter, CleanupScope, FrozenRequest, IcebergCleanupReport, ObjectIdentity,
+    OperationIntent, PublicationOutcome, PublicationReport, RequestShape,
 };
 use super::operation::{IcebergCommitAttempt, IcebergCommitOperation};
 use super::staging::{PreparedChange, Preparer, StagingBase, StagingEngine};
@@ -284,7 +284,7 @@ impl RetryPolicy {
 
 /// Neither cancellation nor elapsed retry time interrupts an already-issued dispatch.
 /// Once publication is possible, its typed outcome alone decides cleanup and retry.
-// Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
+// Design: ADR-0234 (docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)
 #[derive(Clone, Copy)]
 enum CommittedCleanupPhase {
     Inline,
@@ -340,6 +340,13 @@ async fn run_in_phase(
     policy: RetryPolicy,
     cleanup_phase: CommittedCleanupPhase,
 ) -> Report {
+    if let Err(error) = operation.enter_commit_loop() {
+        // Re-entry is an implementation error, not another cleanup opportunity.
+        return Report {
+            publication: PublicationOutcome::KnownUncommitted(before_dispatch_failure(&error)),
+            cleanup: IcebergCleanupReport::NotAttempted,
+        };
+    }
     if operation.token() != intent.token() {
         return rejected(
             operation,
@@ -440,7 +447,6 @@ async fn run_in_phase(
                         failure,
                         evidence,
                         operation: operation.token(),
-                        artifacts: operation.recovery_artifacts(),
                     },
                     cleanup: IcebergCleanupReport::NotAttempted,
                 };
@@ -450,17 +456,17 @@ async fn run_in_phase(
                     && intent.permits_conflict_retry()
                     && attempt_number < policy.retries =>
             {
-                // An unsuccessful bounded cleanup remains in the ledger; it never permits path reuse.
-                let _ = operation
-                    .cleanup(CleanupScope::ThisAttempt(attempt.attempt_token()))
-                    .await;
+                if let Err(error) =
+                    operation.retire_attempt_bound_artifacts(attempt.attempt_token())
+                {
+                    return rejected(operation, before_dispatch_failure(&error)).await;
+                }
                 let wait = policy.backoff(attempt_number);
                 let left = policy.total_timeout.saturating_sub(started.elapsed());
                 if wait >= left {
                     return rejected(operation, failure).await;
                 }
-                // Conflict cleanup is complete before this waiting segment;
-                // a stopped backoff remains a typed pre-dispatch failure.
+                // Retired objects remain owned until a terminal result. Backoff starts no deletion.
                 if let Err(error) = operation
                     .runtime()
                     .observe_preparation_async(operation.pause(wait), before_dispatch_failure)
@@ -572,6 +578,13 @@ async fn prepare(
     preparers: &[&dyn Preparer],
     captured_merge_policy: &mut Option<super::preparation::CapturedMergePolicy>,
 ) -> std::result::Result<(FrozenRequest, Vec<ObjectIdentity>), ConnectorMutationFailure> {
+    let metadata = match &base {
+        StagingBase::Existing { metadata, .. } => metadata,
+        StagingBase::Create { staged, .. } => staged.initial_metadata(),
+    };
+    attempt
+        .check_stage_snapshot_ids(metadata)
+        .map_err(|error| before_dispatch_failure(&error))?;
     if let StagingBase::Existing { metadata, .. } = &base {
         if intent.target().uuid != Some(metadata.uuid()) {
             return Err(ConnectorMutationFailure::new(
@@ -612,100 +625,10 @@ async fn prepare(
             .await
             .map_err(|e| before_dispatch_failure(&e))?;
     }
-    // New DV coalescing may supersede a BE Puffin. Retain physical reachability,
-    // not all original added paths; a carried blob can keep a shared object live.
-    let ledger = attempt
-        .operation_artifacts()
-        .map_err(|e| before_dispatch_failure(&e))?;
-    let cross_attempt: BTreeSet<_> = ledger
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.class,
-                ArtifactClass::Operation | ArtifactClass::SessionData
-            )
-        })
-        .map(|r| r.object.clone())
-        .collect();
-    let mut references: BTreeSet<_> = attempt
-        .publication_references()
-        .map_err(|e| before_dispatch_failure(&e))?
-        .into_iter()
-        .collect();
-    if !cross_attempt.is_empty() {
-        // Every snapshot published in this request remains readable by time travel,
-        // even when a later stage removes its files from the final head.
-        let mut snapshots: BTreeSet<_> = engine
-            .updates()
-            .iter()
-            .filter_map(|update| match update {
-                crate::iceberg::TableUpdate::AddSnapshot { snapshot } => {
-                    Some(snapshot.snapshot_id())
-                }
-                _ => None,
-            })
-            .collect();
-        snapshots.extend(
-            engine
-                .metadata()
-                .snapshot_for_ref(intent.target_ref())
-                .map(|s| s.snapshot_id()),
-        );
-        for snapshot in snapshots {
-            // Data live sets omit manifest objects. Freeze the exact physical
-            // roots of every AddSnapshot, including intermediate snapshots.
-            let snapshot_ref = engine.metadata().snapshot_by_id(snapshot).ok_or_else(|| {
-                ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::InvalidRequest,
-                    "Staged publication snapshot is missing",
-                )
-            })?;
-            let sources = engine
-                .snapshot_sources(snapshot_ref)
-                .await
-                .map_err(|error| before_dispatch_failure(&error))?;
-            for path in std::iter::once(snapshot_ref.manifest_list()).chain(
-                sources
-                    .sources()
-                    .map(|source| source.descriptor.manifest_path.as_str()),
-            ) {
-                let object =
-                    ObjectIdentity::new(path).map_err(|error| before_dispatch_failure(&error))?;
-                if cross_attempt.contains(&object) {
-                    references.insert(object);
-                }
-            }
-            let mut observed = BTreeSet::new();
-            sources
-                .fold(
-                    attempt.file_io(),
-                    || attempt.check_active(),
-                    |_| true,
-                    |entry| {
-                        if entry.raw.is_alive() {
-                            let identity =
-                                super::model::EntryIdentity::try_from(entry.raw.data_file())?;
-                            let object = identity.object();
-                            if !observed.insert(identity.clone()) {
-                                return Err(super::manifest_sources::duplicate_identity(&identity));
-                            }
-                            if cross_attempt.contains(&object) {
-                                references.insert(object);
-                            }
-                        }
-                        Ok(())
-                    },
-                )
-                .await
-                .map_err(|error| before_dispatch_failure(&error))?;
-        }
-    }
     let request = engine
-        .freeze(&references.into_iter().collect::<Vec<_>>())
-        .map_err(|e| before_dispatch_failure(&e))?;
-    let mut retained = request.artifacts().attempt_owned().to_vec();
-    retained.extend_from_slice(request.artifacts().operation_references());
-    retained.extend_from_slice(request.artifacts().session_references());
+        .freeze()
+        .map_err(|error| before_dispatch_failure(&error))?;
+    let retained = request.artifacts().references().to_vec();
     Ok((request, retained))
 }
 
@@ -767,6 +690,7 @@ mod tests {
         load_modes: Mutex<Vec<crate::catalog::SnapshotLoading>>,
         loads: AtomicUsize,
         requests: Mutex<Vec<serde_json::Value>>,
+        artifact_requests: Mutex<Vec<Vec<ObjectIdentity>>>,
     }
     impl<'a> ControlledPublisher<'a> {
         fn new(fixture: &'a Fixture, metadata: TableMetadata, dispatch: Dispatch) -> Self {
@@ -782,6 +706,7 @@ mod tests {
                 load_modes: Mutex::new(Vec::new()),
                 loads: AtomicUsize::new(0),
                 requests: Mutex::new(Vec::new()),
+                artifact_requests: Mutex::new(Vec::new()),
             }
         }
     }
@@ -844,6 +769,11 @@ mod tests {
         }
 
         async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
+            crate::fs_io::note_test_storage_request("dispatch", "db.t");
+            self.artifact_requests
+                .lock()
+                .unwrap()
+                .push(request.artifacts().references().to_vec());
             let call = {
                 let mut requests = self.requests.lock().unwrap();
                 requests.push(request.to_rest_json().unwrap());
@@ -1006,7 +936,7 @@ mod tests {
 
     #[tokio::test]
     async fn mor_frozen_before_another_branch_commit_inherits_actual_publication_sequence() {
-        use super::super::model::{ArtifactClass, ArtifactKind, ArtifactWriter, StartSnapshot};
+        use super::super::model::StartSnapshot;
         use super::super::row_delta_dv_metadata::{LiveFile, WrittenDvFile, dv_data_file};
         use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
         let source_fixture = Fixture::new();
@@ -1028,19 +958,27 @@ mod tests {
             Struct::empty(),
         );
         let writer = fixture.operation.begin_attempt().unwrap();
-        let object = writer
-            .allocate(ArtifactClass::Operation, ArtifactKind::DeletionVector)
-            .unwrap();
+        let object = ObjectIdentity::new(format!(
+            "file://{}/received.puffin",
+            fixture.directory.path().display()
+        ))
+        .unwrap();
+        let received_io =
+            crate::fs_io::build_file_io_for_location(object.path(), writer.read_binding());
         let mut vector = super::super::DeletionVector::new();
         vector.insert(1).unwrap();
         let written = super::super::write_single_deletion_vector_puffin(
-            writer.file_io(),
+            &received_io,
             object.path(),
             source_data.file_path(),
             &vector,
         )
         .await
         .unwrap();
+        fixture
+            .operation
+            .adopt_session_data(object.clone())
+            .unwrap();
         let dv = dv_data_file(
             &WrittenDvFile::from(written),
             &LiveFile {
@@ -1226,6 +1164,7 @@ mod tests {
             snapshots[1]["sequence-number"],
             raced.next_sequence_number()
         );
+        assert_eq!(snapshots[0]["snapshot-id"], snapshots[1]["snapshot-id"]);
         assert_eq!(snapshots[1]["first-row-id"], raced.next_row_id());
         assert_eq!(snapshots[1]["added-rows"], 3);
         assert_ne!(snapshots[0]["manifest-list"], snapshots[1]["manifest-list"]);
@@ -1249,6 +1188,348 @@ mod tests {
             )
             .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn a_second_commit_loop_is_an_internal_error_without_another_dispatch() {
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V2);
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
+        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
+        let first = invoke(&fixture, &intent, &publisher).await;
+        assert!(matches!(
+            first.publication,
+            PublicationOutcome::Committed(_)
+        ));
+        let before = fixture.operation.artifacts().unwrap();
+        let second = invoke(&fixture, &intent, &publisher).await;
+        let PublicationOutcome::KnownUncommitted(failure) = second.publication else {
+            panic!("a second commit loop must be refused");
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Internal);
+        assert_eq!(publisher.requests.lock().unwrap().len(), 1);
+        assert_eq!(fixture.operation.artifacts().unwrap(), before);
+        let read = fixture.operation.begin_attempt().unwrap();
+        for artifact in before {
+            assert!(read.file_io().exists(artifact.object.path()).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn each_stage_keeps_its_distinct_snapshot_id_across_conflict_retries() {
+        let baseline = Fixture::new();
+        let metadata = append_state(&baseline, baseline.metadata(FormatVersion::V3), 2).await;
+        let competitor = Fixture::new();
+        let raced = append_state(&competitor, metadata.clone(), 4).await;
+        let fixture = Fixture::new();
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
+        let publisher =
+            ControlledPublisher::new(&fixture, metadata, Dispatch::ConflictThen(Box::new(raced)));
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&FastAppendPreparer, &RemoveAfterAppend],
+            &publisher,
+            policy(),
+        )
+        .await;
+        assert!(
+            matches!(report.publication, PublicationOutcome::Committed(_)),
+            "{report:?}"
+        );
+        let requests = publisher.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let ids: Vec<Vec<_>> = requests
+            .iter()
+            .map(|request| {
+                request["updates"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|update| update["action"] == "add-snapshot")
+                    .map(|update| update["snapshot"]["snapshot-id"].as_i64().unwrap())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(ids[0].len(), 2);
+        assert_ne!(ids[0][0], ids[0][1]);
+        assert_eq!(ids[0], ids[1]);
+    }
+
+    #[tokio::test]
+    async fn stage_id_in_refreshed_base_refuses_dispatch_and_withholds_cleanup() {
+        use crate::commit::model::ArtifactWriter;
+        use crate::iceberg::spec::{Operation, Snapshot, Summary};
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V2);
+        let writer = fixture.operation.begin_attempt().unwrap();
+        let id = writer.stage_snapshot_id(0, &metadata).unwrap();
+        let object = super::super::staging::write_manifest_list(
+            &writer,
+            &metadata,
+            id,
+            None,
+            std::iter::empty(),
+        )
+        .await
+        .unwrap()
+        .object;
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(id)
+            .with_sequence_number(metadata.next_sequence_number())
+            .with_timestamp_ms(metadata.last_updated_ms())
+            .with_manifest_list(object.path().to_owned())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(metadata.current_schema_id())
+            .build();
+        let metadata = TableUpdate::AddSnapshot { snapshot }
+            .apply(metadata.into_builder(None))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
+        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
+        let before = fixture.operation.artifacts().unwrap();
+        let report = invoke(&fixture, &intent, &publisher).await;
+        let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
+            panic!("an existing stage ID must refuse publication");
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Internal);
+        assert!(failure.message().contains(&id.to_string()));
+        assert!(publisher.requests.lock().unwrap().is_empty());
+        assert!(
+            matches!(report.cleanup, IcebergCleanupReport::Withheld { ref reason } if reason.contains(&id.to_string()))
+        );
+        assert_eq!(fixture.operation.artifacts().unwrap(), before);
+        assert!(writer.file_io().exists(object.path()).await.unwrap());
+        let later = fixture
+            .operation
+            .cleanup(CleanupScope::EntireOperation)
+            .await;
+        assert_eq!(later, report.cleanup);
+        assert!(writer.file_io().exists(object.path()).await.unwrap());
+    }
+
+    fn receive_append_data(fixture: &Fixture, intent: &OperationIntent) -> ObjectIdentity {
+        let path = ObjectIdentity::new(intent.changes().added[0].file().file_path()).unwrap();
+        std::fs::write(path.path().trim_start_matches("file://"), b"received data").unwrap();
+        fixture.operation.adopt_session_data(path.clone()).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn append_freezes_authored_references_without_reading_any_manifest() {
+        let baseline = Fixture::new();
+        let base = append_state(&baseline, baseline.metadata(FormatVersion::V3), 2).await;
+        let old_list = base.current_snapshot().unwrap().manifest_list().to_owned();
+        let fixture = Fixture::new();
+        let intent = append_intent(&fixture, &base, vec![Dependency::NoRead]);
+        let data = receive_append_data(&fixture, &intent);
+        let publisher = ControlledPublisher::new(&fixture, base, Dispatch::Commit);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let report = crate::fs_io::TEST_STORAGE_REQUESTS
+            .scope(trace.clone(), invoke(&fixture, &intent, &publisher))
+            .await;
+        assert!(
+            matches!(report.publication, PublicationOutcome::Committed(_)),
+            "{report:?}"
+        );
+        let after = publisher.metadata.lock().unwrap().clone();
+        let snapshot = after.current_snapshot().unwrap();
+        let list_path = snapshot.manifest_list().to_owned();
+        {
+            let events = trace.lock().unwrap();
+            assert!(events.iter().any(|event| event.operation == "read"));
+            assert!(
+                events
+                    .iter()
+                    .filter(|event| event.operation == "read")
+                    .all(|event| event.path == old_list || event.path == list_path),
+                "{events:?}"
+            );
+        }
+
+        let reader = fixture.operation.begin_attempt().unwrap();
+        let list = crate::manifest::load_manifest_list(snapshot, reader.file_io(), &after)
+            .await
+            .unwrap();
+        let manifest = list
+            .entries()
+            .iter()
+            .find(|entry| entry.added_snapshot_id == snapshot.snapshot_id())
+            .unwrap();
+        let expected = std::collections::BTreeSet::from([
+            data.clone(),
+            ObjectIdentity::new(list_path).unwrap(),
+            ObjectIdentity::new(&manifest.manifest_path).unwrap(),
+        ]);
+        assert_eq!(
+            publisher.artifact_requests.lock().unwrap()[0]
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert!(fixture.operation.artifacts().unwrap().is_empty());
+        fixture
+            .operation
+            .cleanup(CleanupScope::EntireOperation)
+            .await;
+        for object in expected {
+            assert!(reader.file_io().exists(object.path()).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn uncovered_received_object_is_an_internal_predispatch_failure() {
+        let fixture = Fixture::new();
+        let base = fixture.metadata(FormatVersion::V2);
+        let intent = append_intent(&fixture, &base, vec![Dependency::NoRead]);
+        let missing = ObjectIdentity::new(format!(
+            "file://{}/uncovered.parquet",
+            fixture.directory.path().display()
+        ))
+        .unwrap();
+        std::fs::write(missing.path().trim_start_matches("file://"), b"received").unwrap();
+        fixture
+            .operation
+            .adopt_session_data(missing.clone())
+            .unwrap();
+        let publisher = ControlledPublisher::new(&fixture, base, Dispatch::Commit);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let report = crate::fs_io::TEST_STORAGE_REQUESTS
+            .scope(trace.clone(), invoke(&fixture, &intent, &publisher))
+            .await;
+        let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
+            panic!("uncovered input must refuse publication")
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Internal);
+        assert!(failure.message().contains(missing.path()));
+        assert!(publisher.requests.lock().unwrap().is_empty());
+        assert_eq!(publisher.loads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            report.cleanup,
+            IcebergCleanupReport::Complete { deleted: 3 }
+        );
+        assert!(
+            trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.operation == "delete" && event.path == missing.path())
+        );
+        assert!(!std::path::Path::new(missing.path().trim_start_matches("file://")).exists());
+    }
+
+    #[tokio::test]
+    async fn conflict_keeps_objects_until_terminal_cleanup_without_delete_between_dispatches() {
+        let baseline = Fixture::new();
+        let base = append_state(&baseline, baseline.metadata(FormatVersion::V3), 2).await;
+        let competitor = Fixture::new();
+        let raced = append_state(&competitor, base.clone(), 4).await;
+        let fixture = Fixture::new();
+        let intent = append_intent(&fixture, &base, vec![Dependency::NoRead]);
+        receive_append_data(&fixture, &intent);
+        let publisher =
+            ControlledPublisher::new(&fixture, base, Dispatch::ConflictThen(Box::new(raced)));
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let report = crate::fs_io::TEST_STORAGE_REQUESTS
+            .scope(trace.clone(), invoke(&fixture, &intent, &publisher))
+            .await;
+        assert!(
+            matches!(report.publication, PublicationOutcome::Committed(_)),
+            "{report:?}"
+        );
+        let events = trace.lock().unwrap();
+        let dispatches = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.operation == "dispatch")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(dispatches.len(), 2);
+        let deletes = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.operation == "delete")
+            .collect::<Vec<_>>();
+        assert!(
+            !deletes.is_empty(),
+            "terminal DELETE must be observed before using the zero-DELETE oracle"
+        );
+        assert!(
+            deletes.iter().all(|(index, _)| *index > dispatches[1]),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_merge_deletes_only_the_replaced_produced_manifest() {
+        let baseline = Fixture::new();
+        let base = append_state(&baseline, baseline.metadata(FormatVersion::V2), 2).await;
+        let base = TableUpdate::SetProperties {
+            updates: HashMap::from([("commit.manifest.min-count-to-merge".into(), "2".into())]),
+        }
+        .apply(base.into_builder(None))
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let fixture = Fixture::new();
+        let intent = append_intent(&fixture, &base, vec![Dependency::NoRead]);
+        let data = receive_append_data(&fixture, &intent);
+        let publisher = ControlledPublisher::new(&fixture, base, Dispatch::Commit);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let report = crate::fs_io::TEST_STORAGE_REQUESTS
+            .scope(trace.clone(), invoke(&fixture, &intent, &publisher))
+            .await;
+        assert!(
+            matches!(report.publication, PublicationOutcome::Committed(_)),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.cleanup,
+            IcebergCleanupReport::Complete { deleted: 1 }
+        );
+        let after = publisher.metadata.lock().unwrap().clone();
+        let snapshot = after.current_snapshot().unwrap();
+        let reader = fixture.operation.begin_attempt().unwrap();
+        let list = crate::manifest::load_manifest_list(snapshot, reader.file_io(), &after)
+            .await
+            .unwrap();
+        assert_eq!(list.entries().len(), 1);
+        let expected = std::collections::BTreeSet::from([
+            data,
+            ObjectIdentity::new(snapshot.manifest_list()).unwrap(),
+            ObjectIdentity::new(&list.entries()[0].manifest_path).unwrap(),
+        ]);
+        assert_eq!(
+            publisher.artifact_requests.lock().unwrap()[0]
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        let events = trace.lock().unwrap();
+        let deletes = events
+            .iter()
+            .filter(|event| event.operation == "delete")
+            .collect::<Vec<_>>();
+        assert_eq!(deletes.len(), 1);
+        assert!(
+            !expected
+                .iter()
+                .any(|object| object.path() == deletes[0].path)
+        );
+        assert!(!std::path::Path::new(deletes[0].path.trim_start_matches("file://")).exists());
+        for object in expected {
+            assert!(std::path::Path::new(object.path().trim_start_matches("file://")).exists());
+        }
     }
 
     #[tokio::test]
@@ -1495,15 +1776,11 @@ mod tests {
                 .unwrap();
             let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Unknown);
             let report = invoke(&fixture, &intent, &publisher).await;
-            let PublicationOutcome::Unknown {
-                artifacts,
-                operation,
-                ..
-            } = report.publication
-            else {
+            let PublicationOutcome::Unknown { operation, .. } = report.publication else {
                 panic!("unknown")
             };
             assert_eq!(operation, fixture.operation.token());
+            let artifacts = fixture.operation.artifacts().unwrap();
             assert_eq!(artifacts.len(), 3);
             assert_eq!(report.cleanup, IcebergCleanupReport::NotAttempted);
             assert_eq!(publisher.requests.lock().unwrap().len(), 1);
@@ -1560,7 +1837,13 @@ mod tests {
             report.cleanup,
             IcebergCleanupReport::Complete { deleted: 0 }
         );
-        assert_eq!(fixture.operation.artifacts().unwrap().len(), 2);
+        assert!(fixture.operation.artifacts().unwrap().is_empty());
+        let published = publisher.artifact_requests.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].len(), 2);
+        for object in &published[0] {
+            assert!(std::path::Path::new(object.path().trim_start_matches("file://")).is_file());
+        }
     }
 
     #[tokio::test]
@@ -1568,15 +1851,16 @@ mod tests {
         let fixture = Fixture::new();
         let metadata = fixture.metadata(FormatVersion::V3);
         let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
-        let discarded = ObjectIdentity::new(format!(
-            "file://{}/superseded-owned.puffin",
-            fixture.directory.path().display(),
-        ))
-        .unwrap();
-        std::fs::write(discarded.path().strip_prefix("file://").unwrap(), b"owned").unwrap();
-        fixture
-            .operation
-            .adopt_session_data(discarded.clone())
+        let unused = fixture.operation.begin_attempt().unwrap();
+        let discarded = unused
+            .allocate(crate::commit::model::ArtifactKind::Manifest)
+            .unwrap();
+        unused
+            .file_io()
+            .new_output(discarded.path())
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"unselected manifest"))
+            .await
             .unwrap();
         let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
         let report = run_to_committed_frontier(
@@ -1609,24 +1893,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_cleanup_uses_physical_reachability_for_shared_puffin() {
+    async fn committed_cleanup_settles_all_received_puffins_and_never_selects_them_again() {
         let fixture = Fixture::new();
-        let mut paths = Vec::new();
-        for file in ["shared.puffin", "superseded.puffin"] {
-            let path = format!("file://{}/{file}", fixture.directory.path().display());
-            std::fs::write(path.strip_prefix("file://").unwrap(), b"owned puffin").unwrap();
-            let object = ObjectIdentity::new(path).unwrap();
+        let paths = ["shared.puffin", "another.puffin"].map(|file| {
+            let path = ObjectIdentity::new(format!(
+                "file://{}/{file}",
+                fixture.directory.path().display()
+            ))
+            .unwrap();
+            std::fs::write(
+                path.path().trim_start_matches("file://"),
+                b"received puffin",
+            )
+            .unwrap();
+            fixture.operation.adopt_session_data(path.clone()).unwrap();
+            path
+        });
+        assert_eq!(
+            fixture.operation.cleanup_after_commit(&paths[..1]).await,
+            IcebergCleanupReport::Complete { deleted: 0 }
+        );
+        assert!(fixture.operation.artifacts().unwrap().is_empty());
+        assert_eq!(
             fixture
                 .operation
-                .adopt_session_data(object.clone())
-                .unwrap();
-            paths.push(object);
+                .cleanup(CleanupScope::EntireOperation)
+                .await,
+            IcebergCleanupReport::Complete { deleted: 0 }
+        );
+        for path in paths {
+            assert!(std::path::Path::new(path.path().trim_start_matches("file://")).exists());
         }
-        let report = fixture.operation.cleanup_after_commit(&paths[..1]).await;
-        assert_eq!(report, IcebergCleanupReport::Complete { deleted: 1 });
-        assert!(std::path::Path::new(paths[0].path().strip_prefix("file://").unwrap()).exists());
-        assert!(!std::path::Path::new(paths[1].path().strip_prefix("file://").unwrap()).exists());
-        assert_eq!(fixture.operation.artifacts().unwrap()[0].object, paths[0]);
     }
 
     #[tokio::test]
@@ -1935,9 +2232,7 @@ mod tests {
             .unwrap();
         let mut objects = Vec::new();
         for _ in 0..2 {
-            let object = attempt
-                .allocate(ArtifactClass::Operation, ArtifactKind::Manifest)
-                .unwrap();
+            let object = attempt.allocate(ArtifactKind::Manifest).unwrap();
             let mut writer = attempt
                 .file_io()
                 .new_output(object.path())
@@ -1974,14 +2269,26 @@ mod tests {
         )
         .await
         .unwrap();
+        let mut expected = std::collections::BTreeSet::from([selected_object.clone()]);
+        expected.extend(request.updates().iter().filter_map(|update| match update {
+            TableUpdate::AddSnapshot { snapshot } => {
+                Some(ObjectIdentity::new(snapshot.manifest_list()).unwrap())
+            }
+            _ => None,
+        }));
         assert_eq!(
-            request.artifacts().operation_references(),
-            std::slice::from_ref(&selected_object)
+            request
+                .artifacts()
+                .references()
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
         );
         fixture
             .operation
-            .cleanup(CleanupScope::ThisAttempt(first.attempt_token()))
-            .await;
+            .retire_attempt_bound_artifacts(first.attempt_token())
+            .unwrap();
         assert!(
             first
                 .file_io()
@@ -2003,9 +2310,21 @@ mod tests {
         )
         .await
         .unwrap();
+        let mut expected = std::collections::BTreeSet::from([selected_object.clone()]);
+        expected.extend(request.updates().iter().filter_map(|update| match update {
+            TableUpdate::AddSnapshot { snapshot } => {
+                Some(ObjectIdentity::new(snapshot.manifest_list()).unwrap())
+            }
+            _ => None,
+        }));
         assert_eq!(
-            request.artifacts().operation_references(),
-            std::slice::from_ref(&selected_object)
+            request
+                .artifacts()
+                .references()
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
         );
         assert!(!retained.contains(&unused));
         fixture.operation.cleanup_after_commit(&retained).await;
@@ -2087,9 +2406,25 @@ mod tests {
                 .iter()
                 .all(|entry| { entry.status == crate::iceberg::spec::ManifestStatus::Deleted })
         );
+        let expected = snapshots
+            .iter()
+            .map(|snapshot| ObjectIdentity::new(snapshot.manifest_list()).unwrap())
+            .chain(
+                earlier
+                    .entries()
+                    .iter()
+                    .chain(final_head.entries())
+                    .map(|manifest| ObjectIdentity::new(&manifest.manifest_path).unwrap()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            request.artifacts().operation_references(),
-            std::slice::from_ref(&selected_object)
+            request
+                .artifacts()
+                .references()
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
         );
         assert!(!retained.contains(&unused));
         fixture.operation.cleanup_after_commit(&retained).await;
@@ -2157,7 +2492,20 @@ mod tests {
         // the parent's existing manifests and must not clean them on rejection.
         let source = Fixture::new();
         let metadata = source.metadata_with_data_and_delete_manifests().await;
-        let source_objects = source.operation.artifacts().unwrap();
+        let read = source.operation.begin_attempt().unwrap();
+        let source_snapshot = metadata.current_snapshot().unwrap();
+        let source_list =
+            crate::manifest::load_manifest_list(source_snapshot, read.file_io(), &metadata)
+                .await
+                .unwrap();
+        let source_objects: Vec<_> = std::iter::once(source_snapshot.manifest_list().to_owned())
+            .chain(
+                source_list
+                    .entries()
+                    .iter()
+                    .map(|manifest| manifest.manifest_path.clone()),
+            )
+            .collect();
         assert_eq!(source_objects.len(), 3); // data manifest + delete manifest + list
         let fixture = Fixture::new();
         let intent = OperationIntent::new(OperationIntentParts {
@@ -2246,10 +2594,862 @@ mod tests {
         assert!(!std::path::Path::new(list.strip_prefix("file://").unwrap()).exists());
         assert!(fixture.operation.artifacts().unwrap().is_empty());
         for original in source_objects {
+            assert!(std::path::Path::new(original.strip_prefix("file://").unwrap()).exists());
+        }
+    }
+    use std::collections::BTreeMap;
+
+    // These tests observe the real operation's FileIO requests. Independent local
+    // Avro reads are deliberately outside that observer, so the oracle does not
+    // contribute reads to the product request counts.
+    #[derive(Clone, Debug)]
+    struct ObservedManifest {
+        descriptor: crate::iceberg::spec::ManifestFile,
+        live: BTreeMap<String, u64>,
+    }
+    fn independent_manifest(path: &str) -> BTreeMap<String, u64> {
+        let bytes = std::fs::read(path.strip_prefix("file://").unwrap()).unwrap();
+        let manifest = crate::iceberg::spec::Manifest::parse_avro(&bytes).unwrap();
+        let mut files = BTreeMap::new();
+        for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
             assert!(
-                std::path::Path::new(original.object.path().strip_prefix("file://").unwrap())
-                    .exists()
+                files
+                    .insert(
+                        entry.data_file().file_path().to_owned(),
+                        entry.data_file().record_count()
+                    )
+                    .is_none(),
+                "A physical file must occur once in a manifest"
             );
+        }
+        files
+    }
+    fn independent_list(metadata: &TableMetadata) -> Vec<crate::iceberg::spec::ManifestFile> {
+        let path = metadata.current_snapshot().unwrap().manifest_list();
+        let bytes = std::fs::read(path.strip_prefix("file://").unwrap()).unwrap();
+        crate::iceberg::spec::ManifestList::parse_with_version(&bytes, metadata.format_version())
+            .unwrap()
+            .entries()
+            .to_vec()
+    }
+    struct ReuseObservingPublisher<'a> {
+        inner: ControlledPublisher<'a>,
+        snapshots: Mutex<Vec<Vec<ObservedManifest>>>,
+    }
+    #[async_trait]
+    impl Publisher for ReuseObservingPublisher<'_> {
+        async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
+            self.inner.load_target(attempt).await
+        }
+        fn preflight_recovery(
+            &self,
+            request: &FrozenRequest,
+            operation: &IcebergCommitOperation,
+        ) -> Result<()> {
+            self.inner.preflight_recovery(request, operation)
+        }
+        async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
+            let rest = request.to_rest_json().unwrap();
+            let snapshot = &rest["updates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|update| update["action"] == "add-snapshot")
+                .unwrap()["snapshot"];
+            let path = snapshot["manifest-list"].as_str().unwrap();
+            let bytes = std::fs::read(path.strip_prefix("file://").unwrap()).unwrap();
+            let version = self.inner.metadata.lock().unwrap().format_version();
+            let list =
+                crate::iceberg::spec::ManifestList::parse_with_version(&bytes, version).unwrap();
+            let observed = list
+                .entries()
+                .iter()
+                .map(|descriptor| ObservedManifest {
+                    descriptor: descriptor.clone(),
+                    live: independent_manifest(&descriptor.manifest_path),
+                })
+                .collect();
+            // The second dispatch is also a direct physical-existence observation:
+            // terminal cleanup has not removed any object of the rejected round.
+            for refs in self.inner.artifact_requests.lock().unwrap().iter() {
+                for object in refs {
+                    assert!(
+                        std::path::Path::new(object.path().trim_start_matches("file://")).exists()
+                    );
+                }
+            }
+            self.snapshots.lock().unwrap().push(observed);
+            self.inner.dispatch_once(request).await
+        }
+    }
+    fn observed_publisher<'a>(
+        fixture: &'a Fixture,
+        base: TableMetadata,
+        raced: TableMetadata,
+    ) -> ReuseObservingPublisher<'a> {
+        ReuseObservingPublisher {
+            inner: ControlledPublisher::new(fixture, base, Dispatch::ConflictThen(Box::new(raced))),
+            snapshots: Mutex::new(Vec::new()),
+        }
+    }
+    fn with_layout(
+        metadata: TableMetadata,
+        enabled: bool,
+        min_count: usize,
+        target: u64,
+    ) -> TableMetadata {
+        TableUpdate::SetProperties {
+            updates: HashMap::from([
+                ("commit.manifest-merge.enabled".into(), enabled.to_string()),
+                (
+                    "commit.manifest.min-count-to-merge".into(),
+                    min_count.to_string(),
+                ),
+                (
+                    "commit.manifest.target-size-bytes".into(),
+                    target.to_string(),
+                ),
+            ]),
+        }
+        .apply(metadata.into_builder(None))
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+    }
+    fn data_for_group(fixture: &Fixture, group: &str, ordinal: usize) -> AddedContent {
+        use sha2::Digest;
+        let suffix = format!("{:x}", sha2::Sha256::digest(format!("{group}-{ordinal}")));
+        AddedContent::new_logical_data(
+            data(
+                &format!(
+                    "file://{}/{group}-{suffix}.parquet",
+                    fixture.directory.path().display()
+                ),
+                1,
+                Struct::empty(),
+            ),
+            0,
+        )
+        .unwrap()
+    }
+    async fn seed_group(
+        fixture: &Fixture,
+        metadata: TableMetadata,
+        group: &str,
+        count: usize,
+    ) -> TableMetadata {
+        let intent = fixture.intent(
+            &metadata,
+            "main",
+            (0..count)
+                .map(|ordinal| data_for_group(fixture, group, ordinal))
+                .collect(),
+        );
+        fixture
+            .stage(metadata, &intent, &FastAppendPreparer)
+            .await
+            .0
+    }
+    fn dispatch_intervals(
+        events: &[crate::fs_io::TestStorageRequest],
+    ) -> (
+        &[crate::fs_io::TestStorageRequest],
+        &[crate::fs_io::TestStorageRequest],
+        usize,
+    ) {
+        let cuts = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.operation == "dispatch")
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert_eq!(cuts.len(), 2, "{events:?}");
+        (&events[..cuts[0]], &events[cuts[0] + 1..cuts[1]], cuts[1])
+    }
+    fn event_paths(
+        events: &[crate::fs_io::TestStorageRequest],
+        operation: &str,
+    ) -> std::collections::BTreeSet<String> {
+        events
+            .iter()
+            .filter(|event| event.operation == operation)
+            .map(|event| event.path.clone())
+            .collect()
+    }
+    fn request_list_paths(publisher: &ReuseObservingPublisher<'_>) -> Vec<String> {
+        publisher
+            .inner
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| {
+                request["updates"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|u| u["action"] == "add-snapshot")
+                    .unwrap()["snapshot"]["manifest-list"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+    fn assert_final_files(
+        publisher: &ReuseObservingPublisher<'_>,
+        expected: &BTreeMap<String, u64>,
+    ) {
+        let metadata = publisher.inner.metadata.lock().unwrap().clone();
+        let mut actual = BTreeMap::new();
+        for descriptor in independent_list(&metadata) {
+            for (path, rows) in independent_manifest(&descriptor.manifest_path) {
+                assert!(
+                    actual.insert(path, rows).is_none(),
+                    "Published files must occur once"
+                );
+            }
+        }
+        assert_eq!(&actual, expected);
+    }
+
+    #[tokio::test]
+    async fn append_retry_reuses_added_manifest_and_only_writes_the_new_list() {
+        let seed = Fixture::new();
+        let base = with_layout(
+            seed.metadata(FormatVersion::V2),
+            false,
+            100,
+            8 * 1024 * 1024,
+        );
+        let base = seed_group(&seed, base, "original", 2).await;
+        let competitor = Fixture::new();
+        let raced = seed_group(&competitor, base.clone(), "concurrent", 1).await;
+        let fixture = Fixture::new();
+        let intent = append_intent(&fixture, &base, vec![Dependency::NoRead]);
+        let received = receive_append_data(&fixture, &intent);
+        let publisher = observed_publisher(&fixture, base, raced.clone());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let report = crate::fs_io::TEST_STORAGE_REQUESTS
+            .scope(trace.clone(), invoke(&fixture, &intent, &publisher))
+            .await;
+        assert!(
+            matches!(report.publication, PublicationOutcome::Committed(_)),
+            "{report:?}"
+        );
+        let rounds = publisher.snapshots.lock().unwrap();
+        assert_eq!(rounds.len(), 2);
+        let created = |round: &Vec<ObservedManifest>| {
+            round
+                .iter()
+                .find(|manifest| manifest.live.contains_key(received.path()))
+                .unwrap()
+                .descriptor
+                .manifest_path
+                .clone()
+        };
+        let first = created(&rounds[0]);
+        let second = created(&rounds[1]);
+        assert_eq!(first, second);
+        let lists = request_list_paths(&publisher);
+        assert_ne!(lists[0], lists[1]);
+        let events = trace.lock().unwrap();
+        let (before, after, last_dispatch) = dispatch_intervals(&events);
+        assert!(event_paths(before, "write").contains(&first));
+        assert_eq!(
+            event_paths(after, "write"),
+            std::collections::BTreeSet::from([lists[1].clone()])
+        );
+        assert!(!after.iter().any(|event| event.operation == "delete"));
+        assert!(
+            events[last_dispatch + 1..]
+                .iter()
+                .any(|event| event.operation == "delete" && event.path == lists[0])
+        );
+        assert!(!std::path::Path::new(lists[0].trim_start_matches("file://")).exists());
+        assert!(std::path::Path::new(received.path().trim_start_matches("file://")).exists());
+        let mut expected = independent_list(&raced)
+            .iter()
+            .flat_map(|m| independent_manifest(&m.manifest_path))
+            .collect::<BTreeMap<_, _>>();
+        expected.insert(received.path().to_owned(), 3);
+        drop(events);
+        drop(rounds);
+        assert_final_files(&publisher, &expected);
+    }
+
+    struct FrozenRemovalPreparer {
+        source_path: String,
+        selection: crate::commit::manifest_sources::LocatedEntry,
+    }
+    #[async_trait]
+    impl Preparer for FrozenRemovalPreparer {
+        async fn prepare(
+            &self,
+            view: &crate::commit::staging::StagedView<'_>,
+            intent: &OperationIntent,
+        ) -> Result<PreparedChange> {
+            let sources = view.target_sources().await?.unwrap();
+            let mut selection = self.selection.clone();
+            selection.source_index = sources
+                .sources()
+                .position(|source| source.descriptor.manifest_path == self.source_path)
+                .unwrap();
+            let id = view.stage_snapshot_id()?;
+            let manifests = crate::commit::manifest_transform::ordinary_manifests(
+                view,
+                id,
+                Some(&sources),
+                &[&selection],
+                vec![],
+            )
+            .await?;
+            let mut summary = HashMap::new();
+            let manifests = manifests.into_snapshot_manifests(&mut summary);
+            crate::commit::overwrite::prepare_snapshot_change(
+                view,
+                intent,
+                id,
+                crate::iceberg::spec::Operation::Delete,
+                manifests,
+                summary,
+                false,
+            )
+            .await
+        }
+    }
+    #[tokio::test]
+    async fn filter_retry_skips_unchanged_source_reads_and_output_writes() {
+        let seed = Fixture::new();
+        let base = with_layout(
+            seed.metadata(FormatVersion::V2),
+            false,
+            100,
+            8 * 1024 * 1024,
+        );
+        let base = seed_group(&seed, base, "selected", 2).await;
+        let source_path = independent_list(&base)[0].manifest_path.clone();
+        let reader = seed.operation.begin_attempt().unwrap();
+        let sources = crate::commit::manifest_sources::SnapshotSources::load(
+            &base,
+            base.current_snapshot().unwrap(),
+            reader.file_io(),
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        let live = sources
+            .live_entries(reader.file_io(), || Ok(()))
+            .await
+            .unwrap();
+        let selection = live.values().next().unwrap().clone();
+        let removed = selection.frozen.identity().object().path().to_owned();
+        let competitor = Fixture::new();
+        let raced = seed_group(&competitor, base.clone(), "concurrent", 1).await;
+        let fixture = Fixture::new();
+        let intent = OperationIntent::new(OperationIntentParts {
+            target: TableTarget {
+                ident: crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+                uuid: Some(base.uuid()),
+            },
+            target_ref: "main".into(),
+            start: None,
+            changes: FileChanges {
+                added: vec![],
+                removed: vec![selection.frozen.clone()],
+            },
+            dependencies: vec![Dependency::NoRead],
+            isolation: IsolationLevel::Snapshot,
+            shape: RequestShape::SnapshotProducing,
+            summary: Default::default(),
+            token: fixture.operation.token(),
+        })
+        .unwrap();
+        // A frozen, still-current selection isolates the filter author. Production
+        // Overwrite's independent live observation is intentionally not counted here.
+        let preparer = FrozenRemovalPreparer {
+            source_path: source_path.clone(),
+            selection,
+        };
+        let publisher = observed_publisher(&fixture, base, raced.clone());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let report = crate::fs_io::TEST_STORAGE_REQUESTS
+            .scope(
+                trace.clone(),
+                run(
+                    &fixture.operation,
+                    &intent,
+                    &PreparedChange::default(),
+                    &[&preparer],
+                    &publisher,
+                    policy(),
+                ),
+            )
+            .await;
+        assert!(
+            matches!(report.publication, PublicationOutcome::Committed(_)),
+            "{report:?}"
+        );
+        let rounds = publisher.snapshots.lock().unwrap();
+        let filtered = |round: &Vec<ObservedManifest>| {
+            round
+                .iter()
+                .find(|manifest| {
+                    manifest.live.len() == 1
+                        && !manifest.live.contains_key(&removed)
+                        && manifest.descriptor.manifest_path != source_path
+                        && manifest.live.keys().any(|p| p.contains("selected-"))
+                })
+                .unwrap()
+                .descriptor
+                .manifest_path
+                .clone()
+        };
+        let first = filtered(&rounds[0]);
+        assert_eq!(first, filtered(&rounds[1]));
+        let lists = request_list_paths(&publisher);
+        let events = trace.lock().unwrap();
+        let (before, after, _) = dispatch_intervals(&events);
+        assert!(event_paths(before, "read").contains(&source_path));
+        assert!(event_paths(before, "write").contains(&first));
+        assert!(!event_paths(after, "read").contains(&source_path));
+        assert_eq!(
+            event_paths(after, "write"),
+            std::collections::BTreeSet::from([lists[1].clone()])
+        );
+        let mut expected = independent_list(&raced)
+            .iter()
+            .flat_map(|m| independent_manifest(&m.manifest_path))
+            .collect::<BTreeMap<_, _>>();
+        expected.remove(&removed);
+        drop(events);
+        drop(rounds);
+        assert_final_files(&publisher, &expected);
+    }
+
+    struct RewriteOneSource {
+        source_path: String,
+    }
+    #[async_trait]
+    impl Preparer for RewriteOneSource {
+        async fn prepare(
+            &self,
+            view: &crate::commit::staging::StagedView<'_>,
+            intent: &OperationIntent,
+        ) -> Result<PreparedChange> {
+            use crate::commit::manifest_encoding::{ManifestWriteSource, SourcedManifestEntry};
+            let sources = view.target_sources().await?.unwrap();
+            let id = view.stage_snapshot_id()?;
+            let mut manifests = Vec::new();
+            for source in sources.sources() {
+                if source.descriptor.manifest_path != self.source_path {
+                    manifests.push(source.descriptor.clone());
+                    continue;
+                }
+                let raw = source.load(view.artifacts().file_io()).await?;
+                let encoding = Arc::new(ManifestWriteSource::from_header(raw.metadata())?);
+                let mut entries = Vec::new();
+                for bound in source.bind(&raw)? {
+                    let bound = bound?;
+                    if bound.raw.is_alive() {
+                        entries.push(SourcedManifestEntry {
+                            source: encoding.clone(),
+                            entry: crate::commit::staging::ManifestEntryWrite::Existing {
+                                file: bound.raw.data_file().clone(),
+                                frozen: crate::commit::model::FrozenEntry::from_bound_entry(
+                                    &bound,
+                                )?,
+                            },
+                        });
+                    }
+                }
+                manifests.push(
+                    crate::commit::staging::write_sourced_manifest(
+                        view.artifacts(),
+                        view.metadata(),
+                        id,
+                        view.metadata()
+                            .partition_spec_by_id(source.descriptor.partition_spec_id)
+                            .unwrap(),
+                        source.descriptor.content,
+                        entries,
+                        std::slice::from_ref(&self.source_path),
+                    )
+                    .await?,
+                );
+            }
+            crate::commit::overwrite::prepare_snapshot_change(
+                view,
+                intent,
+                id,
+                crate::iceberg::spec::Operation::Replace,
+                manifests,
+                HashMap::new(),
+                false,
+            )
+            .await
+        }
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum ReuseMutation {
+        Append,
+        AppendWithMergedHead,
+        ReplaceSource,
+        Schema,
+        PartitionSpec,
+    }
+    async fn check_real_bin_retry(mutation: ReuseMutation) {
+        let seed = Fixture::new();
+        let mut base = with_layout(
+            seed.metadata(FormatVersion::V2),
+            false,
+            100,
+            8 * 1024 * 1024,
+        );
+        // Real manifest sizes close the tail bin [C,D]. Head A/B and the new N
+        // are small; the selected min-count controls whether that head merges.
+        for (group, count) in [("D", 256), ("C", 256), ("B", 1), ("A", 1)] {
+            base = seed_group(&seed, base, group, count).await;
+        }
+        let original = independent_list(&base);
+        assert_eq!(original.len(), 4);
+        let tail = original[2..]
+            .iter()
+            .flat_map(|m| independent_manifest(&m.manifest_path))
+            .collect::<BTreeMap<_, _>>();
+        let mut target = (original[2].manifest_length + original[3].manifest_length) as u64;
+        assert!(
+            target > 6 * original[0].manifest_length.max(original[1].manifest_length) as u64,
+            "Seed sizes must prove this layout"
+        );
+        let min = if matches!(mutation, ReuseMutation::AppendWithMergedHead) {
+            2
+        } else {
+            100
+        };
+        base = with_layout(base, true, min, target);
+        let competitor = Fixture::new();
+        let mut raced = match mutation {
+            ReuseMutation::Append | ReuseMutation::AppendWithMergedHead => {
+                // The concurrent producer appends E without compacting the old
+                // list; restore the unchanged public layout properties afterward.
+                let unmerged = with_layout(base.clone(), false, min, target);
+                with_layout(
+                    seed_group(&competitor, unmerged, "E", 1).await,
+                    true,
+                    min,
+                    target,
+                )
+            }
+            ReuseMutation::ReplaceSource => {
+                let intent = competitor.intent(&base, "main", vec![]);
+                competitor
+                    .stage(
+                        base.clone(),
+                        &intent,
+                        &RewriteOneSource {
+                            source_path: original[2].manifest_path.clone(),
+                        },
+                    )
+                    .await
+                    .0
+            }
+            ReuseMutation::Schema => {
+                use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+                let mut fields = base.current_schema().as_struct().fields().to_vec();
+                fields.push(Arc::new(NestedField::optional(
+                    2,
+                    "note",
+                    Type::Primitive(PrimitiveType::String),
+                )));
+                base.clone()
+                    .into_builder(None)
+                    .add_current_schema(Schema::builder().with_fields(fields).build().unwrap())
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .metadata
+            }
+            ReuseMutation::PartitionSpec => {
+                use crate::iceberg::spec::{PartitionSpec, Transform};
+                let spec = PartitionSpec::builder(base.current_schema().clone())
+                    .add_partition_field("id", "id_bucket", Transform::Bucket(8))
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                base.clone()
+                    .into_builder(None)
+                    .add_partition_spec(spec.into_unbound())
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .metadata
+            }
+        };
+        if matches!(mutation, ReuseMutation::ReplaceSource) {
+            let replacements = independent_list(&raced);
+            target = target
+                .max((replacements[2].manifest_length + replacements[3].manifest_length) as u64);
+            // Keeping B outside the closed tail is a verified input condition,
+            // never a fake descriptor length or bypass of the actual packer.
+            assert!(
+                target
+                    < (original[1].manifest_length
+                        + original[2].manifest_length
+                        + original[3].manifest_length) as u64
+            );
+            base = with_layout(base, true, min, target);
+            raced = with_layout(raced, true, min, target);
+        }
+        let fixture = Fixture::new();
+        let intent = append_intent(&fixture, &base, vec![Dependency::NoRead]);
+        let received = receive_append_data(&fixture, &intent);
+        let publisher = observed_publisher(&fixture, base, raced.clone());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let report = crate::fs_io::TEST_STORAGE_REQUESTS
+            .scope(trace.clone(), invoke(&fixture, &intent, &publisher))
+            .await;
+        assert!(
+            matches!(report.publication, PublicationOutcome::Committed(_)),
+            "{mutation:?}: {report:?}"
+        );
+        let rounds = publisher.snapshots.lock().unwrap();
+        assert_eq!(rounds.len(), 2);
+        let first_tail = rounds[0]
+            .iter()
+            .find(|m| m.live == tail)
+            .expect("The real first tail bin must contain exactly C,D");
+        let second_tail = rounds[1]
+            .iter()
+            .find(|m| m.live == tail)
+            .expect("The second tail bin must retain exactly C,D");
+        let encoding_changed = matches!(
+            mutation,
+            ReuseMutation::Schema | ReuseMutation::PartitionSpec
+        );
+        let tail_changed = encoding_changed || matches!(mutation, ReuseMutation::ReplaceSource);
+        assert_eq!(
+            first_tail.descriptor.manifest_path == second_tail.descriptor.manifest_path,
+            !tail_changed,
+            "{mutation:?}"
+        );
+        let first_head = rounds[0]
+            .iter()
+            .find(|m| m.live.contains_key(received.path()))
+            .unwrap();
+        let second_head = rounds[1]
+            .iter()
+            .find(|m| m.live.contains_key(received.path()))
+            .unwrap();
+        let head_changed =
+            encoding_changed || matches!(mutation, ReuseMutation::AppendWithMergedHead);
+        assert_eq!(
+            first_head.descriptor.manifest_path == second_head.descriptor.manifest_path,
+            !head_changed,
+            "{mutation:?}"
+        );
+        let lists = request_list_paths(&publisher);
+        let events = trace.lock().unwrap();
+        let (before, after, last_dispatch) = dispatch_intervals(&events);
+        let reads1 = event_paths(before, "read");
+        let reads2 = event_paths(after, "read");
+        for source in &original[2..] {
+            assert!(reads1.contains(&source.manifest_path));
+        }
+        if !tail_changed {
+            for source in &original[2..] {
+                assert!(
+                    !reads2.contains(&source.manifest_path),
+                    "{mutation:?}: {events:?}"
+                );
+            }
+        }
+        if encoding_changed {
+            for source in &original[2..] {
+                assert!(reads2.contains(&source.manifest_path), "{mutation:?}");
+            }
+        }
+        if matches!(mutation, ReuseMutation::ReplaceSource) {
+            let replacement = independent_list(&raced)[2].manifest_path.clone();
+            assert!(reads2.contains(&replacement));
+            assert!(reads2.contains(&original[3].manifest_path));
+            assert!(!reads2.contains(&original[2].manifest_path));
+        }
+        if matches!(mutation, ReuseMutation::AppendWithMergedHead) {
+            for source in &original[..2] {
+                assert!(reads2.contains(&source.manifest_path));
+            }
+        }
+        let writes2 = event_paths(after, "write");
+        let expected_writes = std::iter::once(lists[1].clone())
+            .chain(tail_changed.then(|| second_tail.descriptor.manifest_path.clone()))
+            .chain(head_changed.then(|| second_head.descriptor.manifest_path.clone()))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(writes2, expected_writes, "{mutation:?}: {events:?}");
+        assert!(!after.iter().any(|event| event.operation == "delete"));
+        assert!(
+            events[last_dispatch + 1..]
+                .iter()
+                .any(|event| event.operation == "delete" && event.path == lists[0])
+        );
+        for unused in [
+            tail_changed.then_some(first_tail),
+            head_changed.then_some(first_head),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                events[last_dispatch + 1..]
+                    .iter()
+                    .any(|event| event.operation == "delete"
+                        && event.path == unused.descriptor.manifest_path)
+            );
+            assert!(
+                !std::path::Path::new(
+                    unused
+                        .descriptor
+                        .manifest_path
+                        .trim_start_matches("file://")
+                )
+                .exists()
+            );
+        }
+        assert!(std::path::Path::new(received.path().trim_start_matches("file://")).exists());
+        let mut expected = independent_list(&raced)
+            .iter()
+            .flat_map(|m| independent_manifest(&m.manifest_path))
+            .collect::<BTreeMap<_, _>>();
+        expected.insert(received.path().to_owned(), 3);
+        drop(events);
+        drop(rounds);
+        assert_final_files(&publisher, &expected);
+    }
+    #[tokio::test]
+    async fn retry_reuses_the_closed_tail_bin_and_rebuilds_only_changed_dependencies() {
+        for mutation in [
+            ReuseMutation::Append,
+            ReuseMutation::AppendWithMergedHead,
+            ReuseMutation::ReplaceSource,
+            ReuseMutation::Schema,
+            ReuseMutation::PartitionSpec,
+        ] {
+            check_real_bin_retry(mutation).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrite_policy_reuses_its_previous_group_before_considering_concurrent_append() {
+        use crate::commit::snapshot_lifecycle_helpers::rewrite_manifests::RewriteManifestsPreparer;
+        for replace_source in [false, true] {
+            let seed = Fixture::new();
+            let base = with_layout(
+                seed.metadata(FormatVersion::V2),
+                false,
+                100,
+                8 * 1024 * 1024,
+            );
+            let base = seed_group(&seed, base, "B", 2).await;
+            let base = seed_group(&seed, base, "A", 2).await;
+            let original = independent_list(&base);
+            let original_content = original
+                .iter()
+                .flat_map(|m| independent_manifest(&m.manifest_path))
+                .collect::<BTreeMap<_, _>>();
+            let competitor = Fixture::new();
+            let raced = if replace_source {
+                let intent = competitor.intent(&base, "main", vec![]);
+                competitor
+                    .stage(
+                        base.clone(),
+                        &intent,
+                        &RewriteOneSource {
+                            source_path: original[0].manifest_path.clone(),
+                        },
+                    )
+                    .await
+                    .0
+            } else {
+                seed_group(&competitor, base.clone(), "E", 1).await
+            };
+            let fixture = Fixture::new();
+            let intent = fixture.intent(&base, "main", vec![]);
+            let preparer = RewriteManifestsPreparer::new();
+            let publisher = observed_publisher(&fixture, base, raced.clone());
+            let trace = Arc::new(Mutex::new(Vec::new()));
+            let report = crate::fs_io::TEST_STORAGE_REQUESTS
+                .scope(
+                    trace.clone(),
+                    run(
+                        &fixture.operation,
+                        &intent,
+                        &PreparedChange::default(),
+                        &[&preparer],
+                        &publisher,
+                        policy(),
+                    ),
+                )
+                .await;
+            assert!(
+                matches!(report.publication, PublicationOutcome::Committed(_)),
+                "replace_source={replace_source}: {report:?}"
+            );
+            let rounds = publisher.snapshots.lock().unwrap();
+            assert_eq!(rounds[0].len(), 1);
+            let first = &rounds[0][0];
+            assert_eq!(first.live, original_content);
+            let second = rounds[1]
+                .iter()
+                .find(|m| m.live == original_content)
+                .unwrap();
+            assert_eq!(
+                first.descriptor.manifest_path == second.descriptor.manifest_path,
+                !replace_source
+            );
+            let lists = request_list_paths(&publisher);
+            let events = trace.lock().unwrap();
+            let (before, after, last_dispatch) = dispatch_intervals(&events);
+            for source in &original {
+                assert!(event_paths(before, "read").contains(&source.manifest_path));
+            }
+            let mut writes = std::collections::BTreeSet::from([lists[1].clone()]);
+            if replace_source {
+                writes.insert(second.descriptor.manifest_path.clone());
+                for source in independent_list(&raced) {
+                    assert!(event_paths(after, "read").contains(&source.manifest_path));
+                }
+                assert!(
+                    events[last_dispatch + 1..]
+                        .iter()
+                        .any(|event| event.operation == "delete"
+                            && event.path == first.descriptor.manifest_path)
+                );
+                assert!(
+                    !std::path::Path::new(
+                        first.descriptor.manifest_path.trim_start_matches("file://")
+                    )
+                    .exists()
+                );
+            } else {
+                assert_eq!(
+                    rounds[1].len(),
+                    2,
+                    "Concurrent E is retained separately from the previous whole selection"
+                );
+                for source in &original {
+                    assert!(!event_paths(after, "read").contains(&source.manifest_path));
+                }
+            }
+            assert_eq!(event_paths(after, "write"), writes);
+            assert!(!after.iter().any(|event| event.operation == "delete"));
+            let expected = independent_list(&raced)
+                .iter()
+                .flat_map(|m| independent_manifest(&m.manifest_path))
+                .collect::<BTreeMap<_, _>>();
+            drop(events);
+            drop(rounds);
+            assert_final_files(&publisher, &expected);
         }
     }
 }

@@ -225,11 +225,7 @@ mod preparer_tests {
         fn file_io(&self) -> &FileIO {
             &self.io
         }
-        fn allocate(
-            &self,
-            class: ArtifactClass,
-            kind: ArtifactKind,
-        ) -> crate::iceberg::Result<ObjectIdentity> {
+        fn allocate(&self, kind: ArtifactKind) -> crate::iceberg::Result<ObjectIdentity> {
             let mut ledger = self.ledger.lock().unwrap();
             let object = ObjectIdentity::new(format!(
                 "file://{}/object-{}.{}",
@@ -237,12 +233,11 @@ mod preparer_tests {
                 ledger.records().count(),
                 kind.extension()
             ))?;
-            ledger.register(ArtifactRecord {
-                object: object.clone(),
-                class,
-                attempt: (class == ArtifactClass::Attempt).then_some(self.attempt),
-                write_state: ArtifactWriteState::Allocated,
-            })?;
+            ledger.register(ArtifactRecord::produced(
+                object.clone(),
+                self.attempt_token(),
+                kind,
+            ))?;
             Ok(object)
         }
         fn attempt_token(&self) -> AttemptToken {
@@ -253,12 +248,49 @@ mod preparer_tests {
         }
         fn snapshot_artifacts(
             &self,
-            refs: &[ObjectIdentity],
-        ) -> crate::iceberg::Result<AttemptArtifacts> {
-            self.ledger
-                .lock()
-                .unwrap()
-                .snapshot_for_attempt(self.attempt, refs.iter().cloned())
+            lists: &[crate::commit::model::ObjectIdentity],
+            statistics: &[crate::commit::model::ObjectIdentity],
+        ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
+            self.ledger.lock().unwrap().snapshot_for_request(
+                self.attempt_token(),
+                lists,
+                statistics,
+            )
+        }
+
+        fn record_manifest(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            live_paths: &[String],
+            replaces: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest(object, live_paths, replaces)
+        }
+
+        fn record_manifest_list(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            paths: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest_list(object, paths)
         }
     }
     fn data(path: &str, first: Option<i64>) -> DataFile {
@@ -411,9 +443,7 @@ mod preparer_tests {
                 }
             });
             let written = super::super::puffin_dv::write_multi_deletion_vector_puffin_allocated(
-                writer,
-                ArtifactClass::Operation,
-                &inputs,
+                writer, &inputs,
             )
             .await
             .unwrap();
@@ -615,7 +645,6 @@ mod preparer_tests {
         dv.insert(1).unwrap();
         let blob = super::super::puffin_dv::write_single_deletion_vector_puffin_allocated(
             &writer,
-            ArtifactClass::Operation,
             "file:///source-a.parquet",
             &dv,
         )
@@ -707,13 +736,10 @@ mod preparer_tests {
                 deletion_vector: dv.clone(),
             }
         });
-        let blobs = super::super::puffin_dv::write_multi_deletion_vector_puffin_allocated(
-            &writer,
-            ArtifactClass::Attempt,
-            &inputs,
-        )
-        .await
-        .unwrap();
+        let blobs =
+            super::super::puffin_dv::write_multi_deletion_vector_puffin_allocated(&writer, &inputs)
+                .await
+                .unwrap();
         assert_eq!(blobs[0].path, blobs[1].path);
         let added = blobs
             .into_iter()
@@ -787,17 +813,6 @@ mod preparer_tests {
             assert_eq!(entry.frozen.facts().data_sequence, Some(1));
             assert_eq!(entry.frozen.facts().file_sequence, Some(3));
         }
-        let before = writer.ledger.lock().unwrap().records().count();
-        assert!(
-            super::super::puffin_dv::write_multi_deletion_vector_puffin_allocated(
-                &writer,
-                ArtifactClass::ExternalRegistered,
-                &inputs
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(writer.ledger.lock().unwrap().records().count(), before);
     }
 
     #[tokio::test]
@@ -903,6 +918,16 @@ mod preparer_tests {
                 .await
                 .unwrap()
                 .unwrap();
+        // This double uses raw FileIO, so record completion only after its
+        // actual Puffin write has returned successfully.
+        writer
+            .ledger
+            .lock()
+            .unwrap()
+            .confirm_written_for_test(
+                &ObjectIdentity::new(statistics.statistics_path.clone()).unwrap(),
+            )
+            .unwrap();
         let mut staging = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
         let preparer = super::super::statistics::StatisticsPreparer {
             statistics: statistics.clone(),
@@ -914,7 +939,7 @@ mod preparer_tests {
             serde_json::json!([{"action":"set-statistics","snapshot-id":10,"statistics":statistics}])
         );
         staging.stage(&preparer).await.unwrap();
-        let frozen = staging.freeze(&[]).unwrap();
+        let frozen = staging.freeze().unwrap();
         assert_eq!(frozen.requirements().len(), 1);
         assert!(matches!(
             frozen.requirements()[0],

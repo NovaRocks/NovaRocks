@@ -522,7 +522,7 @@ mod tests {
                     requirements: vec![],
                 })
                 .unwrap();
-            let request = engine.freeze(&[]).unwrap();
+            let request = engine.freeze().unwrap();
             let descriptor = PublicationDescriptor::frozen(&request).unwrap();
             assert_eq!(descriptor.base_format_version, Some(3));
             assert_eq!(

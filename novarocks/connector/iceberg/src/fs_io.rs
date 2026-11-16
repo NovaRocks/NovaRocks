@@ -45,6 +45,27 @@ tokio::task_local! {
     pub(crate) static HADOOP_TEST_LIST_CALLS: std::cell::Cell<usize>;
 }
 
+/// Unit-test observation of original storage requests; no product control route is installed.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TestStorageRequest {
+    pub operation: &'static str,
+    pub path: String,
+}
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_STORAGE_REQUESTS: std::sync::Arc<std::sync::Mutex<Vec<TestStorageRequest>>>;
+}
+#[cfg(test)]
+pub(crate) fn note_test_storage_request(operation: &'static str, path: &str) {
+    let _ = TEST_STORAGE_REQUESTS.try_with(|requests| {
+        requests.lock().unwrap().push(TestStorageRequest {
+            operation,
+            path: path.to_owned(),
+        });
+    });
+}
+
 #[cfg(test)]
 fn note_hadoop_test_list() {
     let _ = HADOOP_TEST_LIST_CALLS.try_with(|calls| calls.set(calls.get() + 1));
@@ -441,6 +462,8 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn read(&self, path: &str) -> Result<Bytes> {
+        #[cfg(test)]
+        note_test_storage_request("read", path);
         self.check_read_active("read")?;
         let _io = optional_io_permit(self.admission.as_ref()).await?;
         let _phase = self.non_http_phase(path).await?;
@@ -456,6 +479,8 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+        #[cfg(test)]
+        note_test_storage_request("read", path);
         self.check_read_active("reader")?;
         let _io = optional_io_permit(self.admission.as_ref()).await?;
         let (access, relative_path) = self.resolve_path("reader", path).await?;
@@ -471,6 +496,8 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+        #[cfg(test)]
+        note_test_storage_request("write", path);
         if self.creation.is_some() {
             let mut writer = self.writer(path).await?;
             writer.write(bs).await?;
@@ -507,6 +534,8 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        #[cfg(test)]
+        note_test_storage_request("write", path);
         if let Some(creation) = &self.creation {
             let binding = self.binding.as_ref().ok_or_else(|| {
                 Error::new(
@@ -596,6 +625,8 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
+        #[cfg(test)]
+        note_test_storage_request("delete", path);
         if let Some(creation) = &self.creation {
             creation
                 .journal
@@ -2389,9 +2420,8 @@ pub(crate) mod manifest_stream_tests {
 
     use super::*;
     use crate::commit::model::{
-        AddedContent, ArtifactClass, ArtifactKind, ArtifactWriteState, ArtifactWriter,
-        AttemptArtifacts, AttemptToken, CleanupRemainingReason, CleanupScope, IcebergCleanupReport,
-        ObjectIdentity,
+        AddedContent, ArtifactKind, ArtifactWriteState, ArtifactWriter, AttemptToken,
+        CleanupRemainingReason, CleanupScope, IcebergCleanupReport, ObjectIdentity,
     };
     use crate::commit::operation::{
         CleanupBudget, IcebergCommitAttempt, IcebergCommitOperation, OperationLimits,
@@ -2643,11 +2673,39 @@ pub(crate) mod manifest_stream_tests {
         fn check_active(&self) -> Result<()> {
             self.attempt.check_active()
         }
-        fn allocate(&self, class: ArtifactClass, kind: ArtifactKind) -> Result<ObjectIdentity> {
-            self.attempt.allocate(class, kind)
+        fn allocate(&self, kind: ArtifactKind) -> Result<ObjectIdentity> {
+            self.attempt.allocate(kind)
         }
-        fn snapshot_artifacts(&self, references: &[ObjectIdentity]) -> Result<AttemptArtifacts> {
-            self.attempt.snapshot_artifacts(references)
+        fn snapshot_artifacts(
+            &self,
+            lists: &[crate::commit::model::ObjectIdentity],
+            statistics: &[crate::commit::model::ObjectIdentity],
+        ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
+            self.attempt.snapshot_artifacts(lists, statistics)
+        }
+
+        fn record_manifest(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            live_paths: &[String],
+            replaces: &[String],
+        ) -> crate::iceberg::Result<()> {
+            self.attempt.record_manifest(object, live_paths, replaces)
+        }
+
+        fn record_manifest_list(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            paths: &[String],
+        ) -> crate::iceberg::Result<()> {
+            self.attempt.record_manifest_list(object, paths)
+        }
+        fn stage_snapshot_id(
+            &self,
+            stage: usize,
+            metadata: &crate::iceberg::spec::TableMetadata,
+        ) -> crate::iceberg::Result<i64> {
+            self.attempt.stage_snapshot_id(stage, metadata)
         }
     }
 
@@ -2680,7 +2738,6 @@ pub(crate) mod manifest_stream_tests {
             io_requests: 1,
             cleanup: CleanupBudget {
                 time: Duration::from_millis(100),
-                objects: 1,
             },
         }
     }
@@ -2709,7 +2766,7 @@ pub(crate) mod manifest_stream_tests {
     }
 
     #[tokio::test]
-    async fn sdk_manifest_streams_register_before_admission_and_obey_cleanup_object_bound() {
+    async fn sdk_manifest_streams_register_before_admission_and_cleanup_completed_outputs() {
         let fixture = Fixture::new_with_limits(limits());
         let metadata = fixture.metadata(FormatVersion::V3);
         let (artifacts, probe) = probe_artifacts(&fixture, None);
@@ -2789,23 +2846,7 @@ pub(crate) mod manifest_stream_tests {
             .operation
             .cleanup(CleanupScope::EntireOperation)
             .await;
-        let IcebergCleanupReport::Partial {
-            deleted: 1,
-            remaining,
-        } = report
-        else {
-            panic!("cleanup must obey the one-object bound: {report:?}")
-        };
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].reason, CleanupRemainingReason::BudgetExhausted);
-        assert_eq!(fixture.operation.artifacts().unwrap().len(), 1);
-        assert!(matches!(
-            fixture
-                .operation
-                .cleanup(CleanupScope::EntireOperation)
-                .await,
-            IcebergCleanupReport::Complete { deleted: 1 }
-        ));
+        assert_eq!(report, IcebergCleanupReport::Complete { deleted: 2 });
         assert!(fixture.operation.artifacts().unwrap().is_empty());
         for record in records {
             assert!(!Path::new(record.object.path().strip_prefix("file://").unwrap()).exists());
@@ -2865,7 +2906,9 @@ pub(crate) mod manifest_stream_tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].object, records[0].object);
         assert_eq!(remaining[0].reason, CleanupRemainingReason::BudgetExhausted);
-        assert_eq!(fixture.operation.artifacts().unwrap(), records);
+        let mut retired = records.clone();
+        retired[0].retired = true;
+        assert_eq!(fixture.operation.artifacts().unwrap(), retired);
         assert!(!task.is_finished());
         assert!(!gate.write_exited.load(Ordering::SeqCst));
         gate.resume.notify_one();

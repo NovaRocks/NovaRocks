@@ -519,7 +519,7 @@ mod tests {
     use crate::catalog_control::data_mutation::tests::{
         exact_provider_with_empty_table, register_plan, table_context, write_external_parquet,
     };
-    use crate::commit::model::{ArtifactClass, ArtifactKind};
+    use crate::commit::model::ArtifactKind;
     use novarocks_spi::connector::ConnectorMetadata;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -569,14 +569,6 @@ mod tests {
             request: &FrozenRequest,
             operation: &IcebergCommitOperation,
         ) -> crate::iceberg::Result<()> {
-            if let Behavior::Capacity(count) = self.behavior {
-                // Operation-lifetime allocations are real ledger entries, even
-                // when preparation later rejects before opening their output.
-                let allocation = operation.begin_attempt()?;
-                for _ in 0..count {
-                    allocation.allocate(ArtifactClass::Operation, ArtifactKind::Manifest)?;
-                }
-            }
             let facts = FrozenPublicationFacts::from_request(request, operation)?;
             let evidence = self
                 .template
@@ -594,7 +586,7 @@ mod tests {
         async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
-                Behavior::Commit => CatalogOutcome::committed(
+                Behavior::Commit | Behavior::Capacity(_) => CatalogOutcome::committed(
                     CommitProof::applied(request.ref_snapshot_after(request.target_ref())),
                     ExternalMutationEffect::Applied,
                 ),
@@ -607,7 +599,7 @@ mod tests {
                     CatalogCommitEvidence::for_target("db.t"),
                 ),
                 Behavior::PanicAfterIssue => panic!("injected data mutation bridge after issue"),
-                Behavior::PanicBeforeLoad | Behavior::Capacity(_) => {
+                Behavior::PanicBeforeLoad => {
                     panic!("undispatched mutation unexpectedly issued")
                 }
             }
@@ -686,6 +678,15 @@ mod tests {
             OperationLimits::default(),
         )
         .unwrap();
+        if let Behavior::Capacity(count) = behavior {
+            // Unselected allocations remain owned, including outputs that were never opened.
+            // Prepare them before the publication attempt so the recovery envelope records
+            // an actual earlier attempt, rather than inventing a future attempt in preflight.
+            let allocation = operation.begin_attempt().unwrap();
+            for _ in 0..count {
+                allocation.allocate(ArtifactKind::Manifest).unwrap();
+            }
+        }
         let journal = PublicationJournal::new(operation.token());
         let calls = Arc::new(AtomicUsize::new(0));
         let checked = Arc::new(Mutex::new(None));
@@ -731,8 +732,10 @@ mod tests {
                 .artifacts()
                 .unwrap()
                 .iter()
-                .all(|record| record.class != ArtifactClass::SessionData
-                    && record.object.path() != format!("file://{}", parquet.display()))
+                .all(|record| !matches!(
+                    record.origin,
+                    crate::commit::model::ArtifactOrigin::Received { .. }
+                ) && record.object.path() != format!("file://{}", parquet.display()))
         );
         match behavior {
             Behavior::Unknown | Behavior::PanicAfterIssue => {
@@ -740,7 +743,7 @@ mod tests {
                 let ExternalMutationOutcome::CommitUnknown { evidence, .. } = outcome else {
                     panic!("issued mutation lost its unknown verdict")
                 };
-                let payload: IcebergDataMutationEvidenceV2 =
+                let payload: IcebergDataMutationEvidenceV3 =
                     decode_canonical_json(evidence.provider_payload(), "actual recovery").unwrap();
                 assert!(matches!(
                     &payload.publication,
@@ -832,9 +835,21 @@ mod tests {
                 assert!(operation.artifacts().unwrap().is_empty());
             }
             Behavior::Capacity(_) => {
-                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
                 assert!(
-                    matches!(outcome, ExternalMutationOutcome::KnownUncommitted { failure, cleanup: ExternalMutationFinalization::Complete } if failure.kind() == ConnectorMutationFailureKind::ResourceExhausted)
+                    matches!(
+                        outcome,
+                        ExternalMutationOutcome::KnownCommitted {
+                            finalization: ExternalMutationFinalization::Complete,
+                            ..
+                        }
+                    ),
+                    "{outcome:?}"
+                );
+                let evidence = checked.lock().unwrap().clone().unwrap();
+                assert!(
+                    evidence.provider_payload().len()
+                        <= novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
                 );
                 assert!(operation.artifacts().unwrap().is_empty());
             }
@@ -858,9 +873,9 @@ mod tests {
     }
 
     #[test]
-    fn mutation_actual_full_ledger_capacity_refuses_before_dispatch() {
-        exercise(Behavior::Capacity(400), false);
-        exercise(Behavior::Capacity(50), true);
+    fn mutation_large_owned_ledger_publishes_with_bounded_recovery() {
+        exercise(Behavior::Capacity(1200), false);
+        exercise(Behavior::Capacity(1200), true);
     }
 
     #[test]

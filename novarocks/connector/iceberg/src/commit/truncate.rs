@@ -47,7 +47,7 @@ impl super::staging::Preparer for TruncatePreparer {
         }
         let (sources, live) = view.observe_live_sources().await?;
         let removed = live.values().collect::<Vec<_>>();
-        let snapshot_id = super::staging::new_snapshot_id(view.metadata());
+        let snapshot_id = view.stage_snapshot_id()?;
         let manifests = super::manifest_transform::ordinary_manifests(
             view,
             snapshot_id,

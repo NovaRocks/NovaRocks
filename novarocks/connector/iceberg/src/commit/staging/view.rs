@@ -26,6 +26,7 @@ use crate::iceberg::spec::{ManifestList, Snapshot, TableMetadata};
 /// Each preparer borrows exactly the canonical prefix and the attempt IO owner.
 pub struct StagedView<'a> {
     metadata: &'a TableMetadata,
+    stage: usize,
     intent: &'a OperationIntent,
     artifacts: &'a dyn ArtifactWriter,
     context: PreparationContext,
@@ -35,6 +36,7 @@ pub struct StagedView<'a> {
 impl<'a> StagedView<'a> {
     pub(super) fn new(
         metadata: &'a TableMetadata,
+        stage: usize,
         intent: &'a OperationIntent,
         artifacts: &'a dyn ArtifactWriter,
         context: PreparationContext,
@@ -42,6 +44,7 @@ impl<'a> StagedView<'a> {
     ) -> Self {
         Self {
             metadata,
+            stage,
             intent,
             artifacts,
             context,
@@ -50,6 +53,12 @@ impl<'a> StagedView<'a> {
     }
     pub fn metadata(&self) -> &TableMetadata {
         self.metadata
+    }
+    pub(crate) fn stage_key(&self) -> usize {
+        self.stage
+    }
+    pub(crate) fn stage_snapshot_id(&self) -> Result<i64> {
+        self.artifacts.stage_snapshot_id(self.stage, self.metadata)
     }
     pub fn artifacts(&self) -> &dyn ArtifactWriter {
         self.artifacts

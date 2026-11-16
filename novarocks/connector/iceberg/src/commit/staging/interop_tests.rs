@@ -712,15 +712,6 @@ fn base(loaded: &LoadTableResult) -> StagingBase {
     }
 }
 
-fn added_references(intent: &OperationIntent) -> Vec<ObjectIdentity> {
-    intent
-        .changes()
-        .added
-        .iter()
-        .map(|a| ObjectIdentity::new(a.file().file_path()).unwrap())
-        .collect()
-}
-
 fn bounded_preflight(request: &FrozenRequest, operation: &IcebergCommitOperation) -> Result<()> {
     let facts = FrozenPublicationFacts::from_request(request, operation)?;
     let bytes = serde_json::to_vec(&facts).map_err(|e| error(e.to_string()))?;
@@ -741,7 +732,7 @@ async fn freeze_append(
     let mut engine = StagingEngine::begin(base(loaded), intent, attempt).unwrap();
     engine.stage(&FastAppendPreparer).await.unwrap();
     let expected = engine.metadata().clone();
-    let request = engine.freeze(&added_references(intent)).unwrap();
+    let request = engine.freeze().unwrap();
     (expected, request)
 }
 
@@ -801,7 +792,7 @@ async fn probe_writer_sizes(java: &Java, metadata: &TableMetadata) {
         ];
         let mut observations = Vec::new();
         for (label, chunks) in cases {
-            let object = attempt.allocate(ArtifactClass::Attempt, ArtifactKind::Metadata)?;
+            let object = attempt.allocate(ArtifactKind::Metadata)?;
             assert_original_storage(object.path());
             objects.push(object.clone());
             let mut writer = attempt.file_io().new_output(object.path())?.writer().await?;
@@ -993,7 +984,7 @@ async fn iru5_java_rest_three_shapes_historic_spec_and_composition() {
     .unwrap();
     engine.stage(&FastAppendPreparer).await.unwrap();
     let expected = engine.metadata().clone();
-    let request = engine.freeze(&added_references(&create)).unwrap();
+    let request = engine.freeze().unwrap();
     assert_eq!(request.requirements(), &[TableRequirement::NotExist]);
     let created = publish(&java, "create", &expected, &request, &operation).await;
     assert_eq!(
@@ -1080,11 +1071,11 @@ async fn iru5_java_rest_three_shapes_historic_spec_and_composition() {
     );
     let expected = engine.metadata().clone();
     // Attempt-owned Puffin is frozen through the attempt ledger; only session data crosses attempts.
-    let request = engine.freeze(&added_references(&append)).unwrap();
+    let request = engine.freeze().unwrap();
     assert!(
         request
             .artifacts()
-            .attempt_owned()
+            .references()
             .iter()
             .any(|object| object.path() == stats.statistics_path)
     );
@@ -1129,11 +1120,11 @@ async fn iru5_java_rest_three_shapes_historic_spec_and_composition() {
         .unwrap();
     let expected = engine.metadata().clone();
     // This metadata-only request owns no cross-attempt/session references.
-    let request = engine.freeze(&[]).unwrap();
+    let request = engine.freeze().unwrap();
     assert!(
         request
             .artifacts()
-            .attempt_owned()
+            .references()
             .iter()
             .any(|object| object.path() == stats.statistics_path)
     );
@@ -1238,7 +1229,7 @@ async fn iru5_java_rest_d12_inheritance_and_physical_rewrite() {
     let mut engine = StagingEngine::begin(base(&added), &rewrite, &attempt).unwrap();
     engine.stage(&RewriteDataFilesPreparer).await.unwrap();
     let expected = engine.metadata().clone();
-    let request = engine.freeze(&added_references(&rewrite)).unwrap();
+    let request = engine.freeze().unwrap();
     let rewritten = publish(&java, "rewrite", &expected, &request, &operation).await;
     let snapshot = rewritten.metadata.current_snapshot().unwrap();
     assert_eq!(snapshot.added_rows_count(), Some(0));
@@ -1510,7 +1501,7 @@ async fn iru5_java_rest_attempt_runner_reloads_and_reprepares_after_real_cas() {
     assert_eq!(traces.len(), 2);
     assert_eq!(traces[0]["attempt"], 0);
     assert_eq!(traces[1]["attempt"], 1);
-    assert_ne!(traces[0]["snapshot"], traces[1]["snapshot"]);
+    assert_eq!(traces[0]["snapshot"], traces[1]["snapshot"]);
     let snapshots = |trace: &Value| {
         trace["request"]["updates"]
             .as_array()
@@ -1541,11 +1532,13 @@ async fn iru5_java_rest_attempt_runner_reloads_and_reprepares_after_real_cas() {
             .parent_snapshot_id(),
         Some(other_snapshot)
     );
-    assert!(
+    assert_eq!(
         actual
             .metadata
             .snapshot_by_id(first[0]["snapshot-id"].as_i64().unwrap())
-            .is_none()
+            .unwrap()
+            .manifest_list(),
+        second[0]["manifest-list"].as_str().unwrap()
     );
     assert_eq!(actual.metadata.next_row_id(), 2);
     let attempt = operation.begin_attempt().unwrap();
@@ -1571,18 +1564,17 @@ async fn iru5_java_rest_attempt_runner_reloads_and_reprepares_after_real_cas() {
                 .to_owned()
         ])
     );
-    for record in operation.artifacts().unwrap().iter().filter(|r| {
-        r.class == ArtifactClass::Attempt && r.attempt.is_some_and(|t| t.ordinal() == 0)
-    }) {
-        assert!(
-            !attempt
+    for (snapshot, expected_exists) in [(&first[0], false), (&second[0], true)] {
+        assert_eq!(
+            attempt
                 .file_io()
-                .new_input(record.object.path())
+                .new_input(snapshot["manifest-list"].as_str().unwrap())
                 .unwrap()
                 .exists()
                 .await
                 .unwrap(),
-            "failed attempt object must be removed"
+            expected_exists,
+            "only the published attempt's manifest list must remain"
         );
     }
     java.record("retry-traces",&json!({"dispatches":traces,"metadata":semantic_facts(&actual.metadata),"cleanup":format!("{:?}",report.cleanup)}));
@@ -2595,7 +2587,7 @@ async fn iru13a_java_rest_stage_create_and_ctas_final_commit() {
             updates: vec![set_property(&marker.0, &marker.1)],
         })
         .unwrap();
-    let request = engine.freeze(&added_references(&create)).unwrap();
+    let request = engine.freeze().unwrap();
     assert_eq!(request.requirements(), &[TableRequirement::NotExist]);
     let snapshot = request.ref_snapshot_after("main").unwrap();
 
@@ -3075,7 +3067,7 @@ async fn iru13b_java_rest_ctas_publishes_staged_metadata_for_every_format_versio
                 updates: vec![set_property(&marker.0, &marker.1)],
             })
             .unwrap();
-        let request = engine.freeze(&added_references(&create)).unwrap();
+        let request = engine.freeze().unwrap();
         let body = request.to_rest_json().unwrap();
         java.record(&format!("{name}-request"), &body);
         let add_schema = body["updates"]

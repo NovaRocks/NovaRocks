@@ -17,7 +17,7 @@
 
 use crate::iceberg::spec::TableMetadata;
 
-/// An attempt owns this ID; refreshed metadata is checked before every allocation.
+/// Generate a candidate ID against the currently loaded metadata; the operation owns stability.
 pub fn new_snapshot_id(metadata: &TableMetadata) -> i64 {
     loop {
         let id = (rand::random::<u64>() & i64::MAX as u64) as i64;

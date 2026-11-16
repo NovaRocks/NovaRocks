@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0234
+    scope: "Artifact lifetime classes, blanket per-attempt retention, conflict-time deletion, the prohibition on manifest reuse, complete-ledger recovery payloads and object-count cleanup budgets; immutable intent, dependency validation, field inheritance, one-dispatch outcomes, path uniqueness and actual-exit ownership remain active"
+    link: "ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md"
   - id: ADR-0198
     scope: "Synchronous control waiting, the undifferentiated finalize/cleanup completion boundary and unconditional age-gated GC continuation; immutable intent, dependencies, field inheritance, the physical artifact ledger, actual-exit observation and protection of Unknown objects remain active"
     link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"

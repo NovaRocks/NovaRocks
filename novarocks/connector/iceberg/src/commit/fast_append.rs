@@ -32,7 +32,7 @@ impl super::staging::Preparer for FastAppendPreparer {
     ) -> crate::iceberg::Result<super::staging::PreparedChange> {
         super::overwrite::validate_added_data(intent)?;
         let sources = view.target_sources().await?;
-        let snapshot_id = super::staging::new_snapshot_id(view.metadata());
+        let snapshot_id = view.stage_snapshot_id()?;
         let added = super::overwrite::write_added_intent_data(view, intent, snapshot_id).await?;
         let manifests = super::manifest_transform::ordinary_manifests(
             view,
