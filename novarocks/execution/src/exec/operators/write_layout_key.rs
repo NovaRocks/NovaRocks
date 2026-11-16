@@ -230,7 +230,7 @@ impl KeyProjection {
         }
         let inputs = batch
             .project(&self.input_ordinals)
-            .map_err(|error| ConstructionFailure::InvalidSource(error.to_string().into()))?;
+            .map_err(|error| ConstructionFailure::InvalidSource(error.to_string()))?;
         let partition_keys = self.evaluator.partition_keys(&inputs).map_err(|cause| {
             ConnectorCallFailure::new(ConnectorOperation::EvaluateWriteLayout, cause)
         })?;
