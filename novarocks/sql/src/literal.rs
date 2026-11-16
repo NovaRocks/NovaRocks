@@ -223,12 +223,6 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
                 .map(|field| expr_to_literal(&field.expression))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
-        ast::Expr::Map(map) => Ok(Literal::Map(
-            map.entries
-                .iter()
-                .map(|entry| Ok((expr_to_literal(&entry.key)?, expr_to_literal(&entry.value)?)))
-                .collect::<Result<Vec<_>, LiteralFailure>>()?,
-        )),
         _ => Err(LiteralFailure::rejected(format_args!(
             "unsupported expression in INSERT VALUES: {}",
             printer::print_expr(expr)

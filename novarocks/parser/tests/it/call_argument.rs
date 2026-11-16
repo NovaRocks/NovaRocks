@@ -674,3 +674,189 @@ fn extract_shared_hooks_and_builder_borrow_real_subtrees_and_keep_field_in_synta
         })
     );
 }
+
+#[test]
+fn row_constructor_preserves_singleton_identity_and_does_not_specialize_ordinary_names() {
+    let source = "ROW(items[2])";
+    let row = expression(source);
+    let Expr::Row(node) = &row else {
+        panic!("ROW constructor");
+    };
+    assert_eq!(node.span, Span::new(0, source.len()));
+    assert_eq!(node.fields.len(), 1);
+    let field = &node.fields[0];
+    assert!(field.name.is_none());
+    assert_eq!(field.span, field.expression.span());
+    assert_eq!(&source[field.span.start()..field.span.end()], "items[2]");
+    assert!(!row.syntax_eq(&expression("(items[2])")));
+    assert_eq!(printer::print_expr(&row), source);
+    assert!(row.syntax_eq(&expression(&printer::print_expr(&row))));
+    let multi = expression("row(a, 2)");
+    assert_eq!(printer::print_expr(&multi), "ROW(a, 2)");
+    assert!(multi.syntax_eq(&expression("(a, 2)")));
+    for source in ["catalog.row(1)", "`row`(1)", "named_struct('x', 1)"] {
+        let ordinary = expression(source);
+        let Expr::FunctionCall(call) = ordinary else {
+            panic!("ordinary source call: {source}");
+        };
+        assert_eq!(
+            call.name.parts.last().unwrap().value,
+            if source.starts_with("named") {
+                "named_struct"
+            } else {
+                "row"
+            }
+        );
+        assert!(call.arguments[0].name.is_none());
+    }
+    for source in [
+        "ROW()",
+        "ROW(ALL 1)",
+        "ROW(ALL)",
+        "ROW(DISTINCT 1)",
+        "ROW(1 ORDER BY 2)",
+        "ROW(1 SEPARATOR ',')",
+        "ROW(1 IGNORE NULLS)",
+        "ROW(1) RESPECT NULLS",
+        "ROW(1) FILTER (WHERE TRUE)",
+        "ROW(1) OVER ()",
+    ] {
+        let tokens = novarocks_parser::lex(source).unwrap();
+        assert!(
+            novarocks_parser::parser::parse_expression(source, &tokens).is_err(),
+            "constructor syntax must reject modifiers: {source}"
+        );
+    }
+}
+
+#[test]
+fn map_literal_produces_plain_variadic_call_with_real_ordered_children_and_spans() {
+    let source = "map{items[2]: ROW(3), 'key': other}";
+    let expr = expression(source);
+    let Expr::FunctionCall(call) = &expr else {
+        panic!("ordinary map call");
+    };
+    assert_eq!(call.span, Span::new(0, source.len()));
+    assert_eq!(call.name.span, novarocks_parser::SYNTHETIC);
+    assert_eq!(call.name.parts.len(), 1);
+    assert_eq!(call.name.parts[0].value, "map");
+    assert!(!call.name.parts[0].quoted);
+    assert_eq!(call.name.parts[0].span, novarocks_parser::SYNTHETIC);
+    assert_eq!(call.quantifier, FunctionQuantifier::None);
+    assert!(call.processing_mode.is_none());
+    assert!(call.order_by.is_none() && call.separator.is_none() && call.filter.is_none());
+    assert!(call.null_treatment.is_none() && call.window.is_none());
+    assert_eq!(call.arguments.len(), 4);
+    for (argument, expected) in call
+        .arguments
+        .iter()
+        .zip(["items[2]", "ROW(3)", "'key'", "other"])
+    {
+        assert!(argument.name.is_none());
+        assert_eq!(argument.span, argument.value.span());
+        assert_eq!(
+            &source[argument.span.start()..argument.span.end()],
+            expected
+        );
+    }
+    struct Args(Vec<*const Expr>);
+    impl Visit for Args {
+        fn visit_call_argument(&mut self, node: &CallArgument) {
+            self.0.push(&node.value as *const Expr);
+            novarocks_parser::ast::walk_call_argument(self, node);
+        }
+    }
+    let mut args = Args(Vec::new());
+    args.visit_expr(&expr);
+    assert_eq!(
+        args.0,
+        call.arguments
+            .iter()
+            .map(|argument| &argument.value as *const Expr)
+            .collect::<Vec<_>>()
+    );
+    assert!(expr.syntax_eq(&expression("map(items[2], ROW(3), 'key', other)")));
+    assert_eq!(
+        printer::print_expr(&expr),
+        "map(items[2], ROW(3), 'key', other)"
+    );
+    assert!(expr.syntax_eq(&expression(&printer::print_expr(&expr))));
+    let empty = expression("map{}");
+    let Expr::FunctionCall(call) = &empty else {
+        panic!("empty map call");
+    };
+    assert!(call.arguments.is_empty());
+    assert_eq!(call.span, Span::new(0, 5));
+    assert!(empty.syntax_eq(&expression("map()")));
+    assert_eq!(printer::print_expr(&empty), "map()");
+}
+
+#[test]
+fn row_and_map_builders_retain_original_owning_nodes_without_changing_tuple_contracts() {
+    let key = expression("items[2]");
+    let Expr::Subscript(original) = &key else {
+        panic!("key subtree");
+    };
+    let original_pointer = original.as_ref() as *const SubscriptExpr;
+    let key_span = key.span();
+    let val = expression("ROW(3)");
+    let val_span = val.span();
+    let built = build::map(vec![(key, val)]);
+    let Expr::FunctionCall(call) = &built else {
+        panic!("plain variadic map");
+    };
+    let Expr::Subscript(moved) = &call.arguments[0].value else {
+        panic!("original key subtree");
+    };
+    assert_eq!(moved.as_ref() as *const SubscriptExpr, original_pointer);
+    assert_eq!(call.arguments[0].span, key_span);
+    assert_eq!(call.arguments[1].span, val_span);
+    assert!(built.syntax_eq(&expression("map(items[2], ROW(3))")));
+    let mut top = built.clone();
+    let Expr::FunctionCall(call) = &mut top else {
+        unreachable!()
+    };
+    call.arguments.swap(0, 1);
+    assert!(!built.syntax_eq(&top));
+    assert_eq!(build::tuple(Vec::new()), Err(build::BuildError::EmptyTuple));
+    assert_eq!(
+        build::tuple_value(Vec::new()),
+        Err(build::BuildError::EmptyTuple)
+    );
+    assert!(matches!(
+        build::tuple(vec![build::integer(1)]).unwrap(),
+        Expr::Nested(_)
+    ));
+    let singleton = build::tuple_value(vec![build::integer(1)]).unwrap();
+    assert!(matches!(&singleton, Expr::Row(node) if node.fields.len() == 1));
+    assert_eq!(printer::print_expr(&singleton), "ROW(1)");
+    assert!(singleton.syntax_eq(&expression("ROW(1)")));
+    let empty_row = Expr::Row(RowExpr {
+        fields: AstVec::new(),
+        span: Span::new(8, 13),
+    });
+    novarocks_parser::ast::validate_statement(&statement(empty_row)).unwrap();
+    novarocks_parser::ast::validate_statement(&statement(built)).unwrap();
+    let named = Expr::Row(RowExpr {
+        fields: vec![
+            RowField {
+                name: Some(id("x", true, 5)),
+                expression: build::integer(1),
+                span: Span::new(5, 11),
+            },
+            RowField {
+                name: None,
+                expression: build::integer(2),
+                span: Span::new(13, 14),
+            },
+        ]
+        .into(),
+        span: Span::new(0, 15),
+    });
+    let Expr::Row(fields) = &named else {
+        unreachable!()
+    };
+    assert!(fields.fields[0].name.as_ref().unwrap().quoted);
+    assert!(fields.fields[1].name.is_none());
+    assert_eq!(printer::print_expr(&named), "STRUCT(`x` := 1, 2)");
+}

@@ -722,3 +722,100 @@ fn unsupported_access_profiles_refuse_before_base_or_table_resolution() {
         assert_eq!(error.span(), Some(span));
     }
 }
+
+#[test]
+fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly() {
+    use crate::analysis::ExprKind;
+    use novarocks_parser::{Span, ast, build};
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    let scope = ctx.new_scope();
+    for sql in [
+        "SELECT ROW(7)",
+        "SELECT ROW(CAST(1.25 AS DECIMAL(5,2)), [1, NULL])",
+    ] {
+        let parsed = query(sql);
+        let ast::Expr::Row(row) = projection(&parsed) else {
+            panic!("row source");
+        };
+        let ordinary = build::function(
+            ast::ObjectName {
+                parts: vec![build::ident_at("row", false, novarocks_parser::SYNTHETIC)],
+                span: novarocks_parser::SYNTHETIC,
+            },
+            row.fields
+                .iter()
+                .map(|field| field.expression.clone())
+                .collect(),
+        );
+        let actual = ctx.analyze_expr(projection(&parsed), &scope).unwrap();
+        let expected = ctx.analyze_expr(&ordinary, &scope).unwrap();
+        same_typed(&actual, &expected, &control);
+        let ExprKind::FunctionCall {
+            name,
+            binding,
+            args,
+            ..
+        } = &actual.kind
+        else {
+            panic!("row binding");
+        };
+        assert_eq!(name, "row");
+        assert_eq!(args.len(), row.fields.len());
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("scalar");
+        };
+        assert_eq!(result, &actual.value_type);
+        let typeof_call = |value| {
+            build::function(
+                ast::ObjectName {
+                    parts: vec![build::ident_at(
+                        "typeof",
+                        false,
+                        novarocks_parser::SYNTHETIC,
+                    )],
+                    span: novarocks_parser::SYNTHETIC,
+                },
+                vec![value],
+            )
+        };
+        let inspected = ctx
+            .analyze_expr(&typeof_call(projection(&parsed).clone()), &scope)
+            .unwrap();
+        let legacy_inspected = ctx.analyze_expr(&typeof_call(ordinary), &scope).unwrap();
+        same_typed(&inspected, &legacy_inspected, &control);
+    }
+    let names = ctx
+        .analyze_query(&query("SELECT ROW(7), map{}, ROW(7) AS Kept"))
+        .unwrap();
+    assert_eq!(
+        names
+            .output_columns
+            .iter()
+            .map(|field| field.field_name.as_deref())
+            .collect::<Vec<_>>(),
+        vec![None, None, Some("Kept")]
+    );
+    let derived = ctx
+        .analyze_query(&query("SELECT q.Kept FROM (SELECT ROW(7) AS Kept) q"))
+        .unwrap();
+    assert_eq!(
+        derived.output_columns[0].field_name.as_deref(),
+        Some("Kept")
+    );
+    let mut parsed = query("SELECT ROW(1)");
+    let ast::SetExpr::Select(select) = parsed.body.as_mut() else {
+        panic!("select");
+    };
+    let ast::SelectItem::UnnamedExpr(ast::Expr::Row(row)) = &mut select.projection[0] else {
+        panic!("row");
+    };
+    row.fields[0].name = Some(build::ident("Named", true));
+    row.fields[0].expression = build::identifier(build::ident("must_not_resolve", false));
+    let error = ctx.analyze_expr(projection(&parsed), &scope).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+    );
+}

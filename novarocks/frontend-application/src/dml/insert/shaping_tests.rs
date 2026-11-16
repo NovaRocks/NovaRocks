@@ -270,18 +270,21 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         "123456789.123456789"
     );
 
-    let ast::Expr::FunctionCall(structure) = cast_input(
+    let ast::Expr::Row(structure) = cast_input(
         &row[2],
         "STRUCT<`d` DECIMAL(18, 9), `a` ARRAY<DECIMAL(18, 9)>>",
     ) else {
         panic!("expected ROW constructor");
     };
     assert_eq!(
-        number_text(cast_input(&structure.arguments[0].value, "DECIMAL(18, 9)")),
+        number_text(cast_input(
+            &structure.fields[0].expression,
+            "DECIMAL(18, 9)"
+        )),
         "123456789.123456789"
     );
     let ast::Expr::Array(struct_array) =
-        cast_input(&structure.arguments[1].value, "ARRAY<DECIMAL(18, 9)>")
+        cast_input(&structure.fields[1].expression, "ARRAY<DECIMAL(18, 9)>")
     else {
         panic!("expected STRUCT array field");
     };
@@ -502,8 +505,6 @@ fn typed_single_field_struct_defaults_keep_their_values_row() {
         panic!("Struct target cast");
     };
     assert!(matches!(&cast.expression, ast::Expr::Row(tuple) if tuple.fields.len() == 1));
-    // The positional value author keeps one field as Row, and recursive
-    // target shaping casts its child. Ordinary scalar analysis still rejects it.
     let baseline = baseline_default_values(
         ast::Expr::Row(ast::RowExpr {
             fields: vec![ast::RowField {
@@ -525,18 +526,43 @@ fn typed_single_field_struct_defaults_keep_their_values_row() {
         }),
         "STRUCT<`only` BIGINT>",
     );
+    assert!(shaped.syntax_eq(&baseline));
+    // This input originally failed at SQL's unsupported Row branch, not at
+    // the VALUES wrapper. Preserve the exact default value as an independent
+    // literal oracle while the original row binding now owns scalar analysis.
+    let value = novarocks_sql::literal::expr_to_literal(&rows(&shaped)[0][1]).unwrap();
+    assert_eq!(
+        value,
+        novarocks_sql::semantic::Literal::Struct(vec![novarocks_sql::semantic::Literal::Int(7)])
+    );
+    let ast::Expr::Cast(cast) = &rows(&shaped)[0][1] else {
+        panic!("Struct target cast");
+    };
+    let ast::Expr::Row(row) = &cast.expression else {
+        panic!("singleton value row");
+    };
+    assert_eq!(row.fields.len(), 1);
+    assert_eq!(
+        number_text(cast_input(&row.fields[0].expression, "BIGINT")),
+        "7"
+    );
+    assert_eq!(
+        columns[1].declared_value_type().unwrap().data_type(),
+        &DataType::Struct(Fields::from(vec![Arc::new(Field::new(
+            "only",
+            DataType::Int64,
+            true
+        ))]))
+    );
+    // Both actual source forms now reach the original row overload. Its
+    // installed-implementation boundary still rejects the default; preserving
+    // literal values above does not imply successful compilation or execution.
     assert_existing_default_rejection(
         shaped,
         baseline,
-        AnalyzeErrorKind::UnsupportedExpression,
-        "unsupported expression: (CAST(7 AS BIGINT))",
+        AnalyzeErrorKind::UnavailableImplementation,
+        "selected overload `builtin.scalar/row/dynamic-v1` has no installed implementation for the selected carrier",
     );
-    // The old SELECT wrapper reparsed '(7)' as parentheses. Only that wrapper
-    // takes the canonical syntax path; VALUES must keep its typed value row.
-    assert!(matches!(
-        super::canonical_insert_wrapper_expression(original).unwrap(),
-        ast::Expr::Nested(_)
-    ));
 }
 
 #[test]
@@ -611,11 +637,11 @@ fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
             ..
         })
     ));
-    let ast::Expr::Map(map) = &structure.fields[1].expression else {
-        panic!("expected nonempty MAP default");
+    let ast::Expr::FunctionCall(map) = &structure.fields[1].expression else {
+        panic!("expected nonempty ordinary MAP default");
     };
-    assert_eq!(number_text(&map.entries[0].key), "7");
-    assert_eq!(number_text(&map.entries[0].value), "-123456789.123456789");
+    assert_eq!(number_text(&map.arguments[0].value), "7");
+    assert_eq!(number_text(&map.arguments[1].value), "-123456789.123456789");
 
     let columns = [column("id", DataType::Int32), nested];
     let shaped = shape_insert_source(
@@ -874,102 +900,52 @@ fn typed_float_defaults_keep_double_category_and_signed_zero() {
 }
 
 #[test]
-fn wrapper_keeps_admitted_numeric_category_spelling_and_span() {
-    for kind in [
-        ast::LiteralKind::Long {
-            spelling: "0x01".into(),
-            parsed_value: 1,
-        },
-        ast::LiteralKind::Decimal("-12345678901234567890123456789.00100".into()),
-        ast::LiteralKind::Double(ast::DoubleValue::from_f64(-0.0)),
-    ] {
-        let original = ast::Expr::Literal(ast::Literal {
-            kind,
-            span: Span::new(7, 29),
-        });
-        assert_eq!(
-            super::canonical_insert_wrapper_expression(original.clone()).unwrap(),
-            original
-        );
-    }
-}
-
-#[test]
-fn canonical_insert_wrapper_preserves_twenty_thousand_positional_row_layers() {
-    const DEPTH: i64 = 20_000;
-    const LEAF: i64 = 1_000_000;
-    let row_span = novarocks_parser::Span::new(10, 100);
-    let marker_span = novarocks_parser::Span::new(20, 21);
-    let leaf_span = novarocks_parser::Span::new(70, 71);
-    let number = |value: i64, span| {
-        ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Long {
-                spelling: value.to_string(),
-                parsed_value: value,
-            },
-            span,
-        })
-    };
-    let mut original = number(LEAF, leaf_span);
-    for marker in 1..=DEPTH {
-        let child_span = original.span();
-        original = ast::Expr::Row(ast::RowExpr {
-            fields: vec![
-                ast::RowField {
-                    name: None,
-                    expression: number(marker, marker_span),
-                    span: marker_span,
-                },
-                ast::RowField {
-                    name: None,
-                    expression: original,
-                    span: child_span,
-                },
-            ]
-            .into(),
-            span: row_span,
-        });
-    }
-    // Every layer stays a two-field positional value, exercising the actual
-    // FE wrapper traversal, field order and original source locations.
-    let canonical = super::canonical_insert_wrapper_expression(original)
-        .expect("the original positional wrapper traverses its guarded Row owner");
-    let mut cursor = &canonical;
-    for marker in (1..=DEPTH).rev() {
-        let ast::Expr::Row(row) = cursor else {
-            panic!("the two-field positional value keeps its Row shape");
-        };
-        assert_eq!(row.span, row_span);
-        assert_eq!(row.fields.len(), 2);
-        assert!(row.fields.iter().all(|field| field.name.is_none()));
-        assert_eq!(row.fields[0].span, marker_span);
-        let ast::Expr::Literal(literal) = &row.fields[0].expression else {
-            panic!("the first field is the original ordered marker");
-        };
-        assert_eq!(literal.span, marker_span);
-        assert_eq!(
-            literal.kind,
-            ast::LiteralKind::Long {
-                spelling: marker.to_string(),
-                parsed_value: marker,
-            }
-        );
-        assert_eq!(
-            row.fields[1].span,
-            if marker == 1 { leaf_span } else { row_span }
-        );
-        cursor = &row.fields[1].expression;
-    }
-    let ast::Expr::Literal(literal) = cursor else {
-        panic!("the original terminal value survives the FE wrapper");
-    };
-    assert_eq!(literal.span, leaf_span);
-    assert_eq!(
-        literal.kind,
-        ast::LiteralKind::Long {
-            spelling: LEAF.to_string(),
-            parsed_value: LEAF,
-        }
+fn select_projection_keeps_singleton_source_and_default_row_values() {
+    let mut structure = column(
+        "s",
+        DataType::Struct(Fields::from(vec![Arc::new(Field::new(
+            "only",
+            DataType::Int64,
+            true,
+        ))])),
     );
-    drop(canonical);
+    structure.write_default = Some(ColumnDefault::Struct(vec![(
+        "only".into(),
+        ColumnDefault::Int64(7),
+    )]));
+    let source = parse_query("SELECT row(7)");
+    let shaped = shape_insert_source(
+        &source,
+        &["s".into()],
+        &[structure.clone()],
+        &[structure.clone()],
+    )
+    .unwrap()
+    .unwrap();
+    let expression = projection_expr(select(&shaped.body), 0);
+    let ast::Expr::Row(row) = cast_input(expression, "STRUCT<`only` BIGINT>") else {
+        panic!("source singleton Row must keep its value shape");
+    };
+    assert_eq!(row.fields.len(), 1);
+    assert_eq!(
+        novarocks_sql::literal::expr_to_literal(expression).unwrap(),
+        novarocks_sql::semantic::Literal::Struct(vec![novarocks_sql::semantic::Literal::Int(7)])
+    );
+    let columns = [column("id", DataType::Int32), structure];
+    let shaped = shape_insert_source(
+        &parse_query("SELECT 1 AS id"),
+        &["id".into()],
+        &columns,
+        &columns,
+    )
+    .unwrap()
+    .unwrap();
+    let expression = projection_expr(select(&shaped.body), 1);
+    assert!(
+        matches!(cast_input(expression, "STRUCT<`only` BIGINT>"), ast::Expr::Row(row) if row.fields.len() == 1)
+    );
+    assert_eq!(
+        novarocks_sql::literal::expr_to_literal(expression).unwrap(),
+        novarocks_sql::semantic::Literal::Struct(vec![novarocks_sql::semantic::Literal::Int(7)])
+    );
 }

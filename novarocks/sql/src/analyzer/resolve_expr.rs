@@ -406,11 +406,23 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::Literal(value) => self.analyze_literal(value),
 
             ast::Expr::Array(array) => self.analyze_array_literal(array, scope),
-
-            // `MAP{key: value, ...}` is a native literal node. Lower it
-            // through the same typed scalar-function binder as `map(k, v, …)`
-            // so coercion and the resulting Arrow MAP schema stay identical.
-            ast::Expr::Map(map) => self.analyze_map_literal(map, scope),
+            ast::Expr::Row(row) => {
+                for field in &row.fields {
+                    self.check_control()?;
+                    if field.name.is_some() {
+                        return Err(AnalyzeError::unsupported_expression(
+                            "named ROW fields are not supported",
+                            row.span,
+                        ));
+                    }
+                }
+                let arguments = row
+                    .fields
+                    .iter()
+                    .map(|field| &field.expression)
+                    .collect::<Vec<_>>();
+                self.analyze_syntax_function("row", &arguments, row.span, scope)
+            }
 
             // The native parser retains JSON arrows as `AccessKind::Json` and
             // gives them the grammar's intended precedence, so no SQL-text
@@ -564,19 +576,22 @@ impl<'a> super::AnalyzerContext<'a> {
                         node.span,
                     ));
                 };
-                self.analyze_control_call(
+                self.analyze_syntax_function(
                     "if",
                     &[&node.condition, &node.true_value, false_value],
                     node.span,
                     scope,
                 )
             }
-            ast::Expr::NullIf(node) => {
-                self.analyze_control_call("nullif", &[&node.first, &node.second], node.span, scope)
-            }
+            ast::Expr::NullIf(node) => self.analyze_syntax_function(
+                "nullif",
+                &[&node.first, &node.second],
+                node.span,
+                scope,
+            ),
             ast::Expr::Coalesce(node) => {
                 let arguments = node.operands.iter().collect::<Vec<_>>();
-                self.analyze_control_call("coalesce", &arguments, node.span, scope)
+                self.analyze_syntax_function("coalesce", &arguments, node.span, scope)
             }
             ast::Expr::Try(node) => Err(AnalyzeError::unsupported_expression(
                 "TRY expressions are not supported",
@@ -2202,7 +2217,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
     /// Use the existing function owner with the actual dedicated-node children.
     /// The plain metadata carries no source occurrence or selected binding.
-    fn analyze_control_call(
+    fn analyze_syntax_function(
         &self,
         name: &'static str,
         arguments: &[&ast::Expr],
@@ -3427,44 +3442,6 @@ impl<'a> super::AnalyzerContext<'a> {
         }
     }
 
-    fn analyze_map_literal(
-        &self,
-        map: &ast::MapExpr,
-        scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, AnalyzeError> {
-        let mut args = Vec::with_capacity(map.entries.len() * 2);
-        for entry in &map.entries {
-            args.push(self.analyze_expr(&entry.key, scope)?);
-            args.push(self.analyze_expr(&entry.value, scope)?);
-        }
-        let bound = bind_scalar_function_call_with_catalog(
-            self.function_catalog,
-            "map",
-            args,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )
-        .map_err(|error| error.at_invalid_argument(map.span))?;
-        let BoundScalarCall { args, binding } = bound;
-        let return_type = match &binding.selected.result_type {
-            novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
-            novarocks_functions::FunctionResultType::Relation(_) => {
-                unreachable!("scalar function cannot have a relation result")
-            }
-        };
-        Ok(TypedExpr {
-            kind: ExprKind::FunctionCall {
-                volatility: self.function_catalog.volatility("map"),
-                name: "map".to_string(),
-                args,
-                distinct: false,
-                binding,
-            },
-            value_type: return_type,
-        })
-    }
-
     fn analyze_array_sortby_lambda_arguments(
         &self,
         arg_exprs: &[&ast::Expr],
@@ -4533,10 +4510,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 .fields
                 .iter()
                 .any(|field| self.expr_contains_aggregate(&field.expression)),
-            ast::Expr::Map(map) => map.entries.iter().any(|entry| {
-                self.expr_contains_aggregate(&entry.key)
-                    || self.expr_contains_aggregate(&entry.value)
-            }),
             ast::Expr::Access(access) => {
                 self.expr_contains_aggregate(&access.expr)
                     || match &access.kind {

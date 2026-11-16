@@ -895,18 +895,6 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        ast::Expr::Map(map) => format!(
-            "map{{{}}}",
-            map.entries
-                .iter()
-                .map(|entry| format!(
-                    "{}:{}",
-                    expr_display_name(&entry.key),
-                    expr_display_name(&entry.value)
-                ))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
         ast::Expr::Lambda(lambda) => {
             let parameters = lambda
                 .arguments

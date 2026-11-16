@@ -537,7 +537,6 @@ fn wrap_insert_query_with_write_projection(
             ),
             None => crate::dml::insert::omitted_insert_expr(column)?,
         };
-        let expression = crate::dml::insert::canonical_insert_wrapper_expression(expression)?;
         projection.push(build::item(
             expression,
             Some(build::ident(&column.name, true)),
@@ -1306,6 +1305,60 @@ mod tests {
                 "omitted complex NULL waits for full typed target context"
             );
         }
+    }
+    #[test]
+    fn write_projection_keeps_singleton_struct_default_and_quoted_source_identity() {
+        let target_columns = vec![
+            test_column("id", DataType::Int64, None),
+            test_column(
+                "s",
+                test_struct_type(vec![("only", DataType::Int64)]),
+                Some(ColumnDefault::Struct(vec![(
+                    "only".into(),
+                    ColumnDefault::Int64(7),
+                )])),
+            ),
+        ];
+        let source = parse_query("SELECT idx FROM row_util");
+        let query = wrap_insert_query_with_write_projection(
+            &source,
+            &["id".into()],
+            &target_columns,
+            &target_columns,
+        )
+        .unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("outer SELECT");
+        };
+        let ast::SelectItem::ExprWithAlias {
+            expr: ast::Expr::Dereference(reference),
+            alias,
+            ..
+        } = &select.projection[0]
+        else {
+            panic!("source column reference");
+        };
+        assert!(alias.quoted);
+        assert!(reference.field.as_ref().unwrap().quoted);
+        assert!(
+            matches!(&reference.base, ast::Expr::Identifier(qualifier) if qualifier.quoted && qualifier.value == "__nr_insert_src")
+        );
+        assert_eq!(reference.span, insert_source_expression_span(&source, 0));
+        let ast::SelectItem::ExprWithAlias { expr, alias, .. } = &select.projection[1] else {
+            panic!("default projection");
+        };
+        assert!(alias.quoted);
+        assert!(matches!(expr, ast::Expr::Row(row) if row.fields.len() == 1));
+        assert_eq!(
+            novarocks_sql::literal::expr_to_literal(expr).unwrap(),
+            novarocks_sql::semantic::Literal::Struct(vec![novarocks_sql::semantic::Literal::Int(
+                7
+            )])
+        );
+        let ast::TableFactor::Derived { subquery, .. } = &select.from[0].relation else {
+            panic!("source query");
+        };
+        assert_eq!(subquery.as_ref(), &source);
     }
 }
 

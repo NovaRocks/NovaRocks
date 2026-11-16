@@ -3455,10 +3455,6 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
             .fields
             .iter()
             .any(|field| expr_contains_aggregate_function(&field.expression)),
-        Expr::Map(map) => map.entries.iter().any(|entry| {
-            expr_contains_aggregate_function(&entry.key)
-                || expr_contains_aggregate_function(&entry.value)
-        }),
         _ => false,
     }
 }
@@ -3621,12 +3617,6 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
         Expr::Row(record) => {
             for field in &record.fields {
                 reject_unsupported_expr(&field.expression)?;
-            }
-        }
-        Expr::Map(map) => {
-            for entry in &map.entries {
-                reject_unsupported_expr(&entry.key)?;
-                reject_unsupported_expr(&entry.value)?;
             }
         }
         Expr::Interval(interval) => reject_unsupported_expr(&interval.value)?,

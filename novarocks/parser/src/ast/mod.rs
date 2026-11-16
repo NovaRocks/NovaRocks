@@ -68,9 +68,9 @@ pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_
 pub use expr::{
     AccessExpr, AccessKind, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr, BinaryOperator,
     CallArgument, DereferenceExpr, Expr, FunctionCall, FunctionQuantifier, IntervalExpr,
-    IntervalField, JsonOperator, LogicalExpr, LogicalOperator, MapEntry, MapExpr, NestedExpr,
-    NullTreatment, ProcessingMode, ProcessingModeKind, RowExpr, RowField, SubqueryExpr,
-    SubscriptExpr, UnaryExpr, UnaryOperator,
+    IntervalField, JsonOperator, LogicalExpr, LogicalOperator, NestedExpr, NullTreatment,
+    ProcessingMode, ProcessingModeKind, RowExpr, RowField, SubqueryExpr, SubscriptExpr, UnaryExpr,
+    UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,

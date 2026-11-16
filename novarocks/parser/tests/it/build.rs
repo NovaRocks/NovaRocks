@@ -359,13 +359,13 @@ fn expression_combinations_match_parser_without_reparsing_children() {
     );
     assert_expression(
         build::tuple(vec![build::integer(1), build::string("x")]).expect("tuple"),
-        "(1, 'x')",
+        "ROW(1, 'x')",
     );
     assert_expression(
         build::map(vec![(build::string("x"), build::integer(1))]),
-        "MAP{'x': 1}",
+        "map('x', 1)",
     );
-    assert_expression(build::map(Vec::new()), "MAP{}");
+    assert_expression(build::map(Vec::new()), "map()");
 }
 
 #[test]

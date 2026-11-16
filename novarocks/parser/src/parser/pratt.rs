@@ -29,11 +29,11 @@ use crate::{
         AccessExpr, AccessKind, ArrayExpr, AstVec, BinaryExpr, BinaryOperator, CastExpr,
         DataTypeParameter, DereferenceExpr, ExistsExpr, Expr, FunctionCall, FunctionQuantifier,
         Ident, InListExpr, IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration,
-        LambdaExpr, Literal, LiteralKind, MapEntry, MapExpr, NestedExpr, NullOrdering,
-        NullTreatment, ObjectName, OrderBy, RowDataTypeField, RowExpr, RowField, SearchedCaseExpr,
-        SimpleCaseExpr, SortItem, SortOrdering, SubqueryExpr, TypeName, UnaryExpr, UnaryOperator,
-        WhenClause, WhenMatch, Window, WindowFrame, WindowFrameBound, WindowFrameExclusion,
-        WindowFrameUnits, WindowReference, WindowSpecification,
+        LambdaExpr, Literal, LiteralKind, NestedExpr, NullOrdering, NullTreatment, ObjectName,
+        OrderBy, RowDataTypeField, RowExpr, RowField, SearchedCaseExpr, SimpleCaseExpr, SortItem,
+        SortOrdering, SubqueryExpr, TypeName, UnaryExpr, UnaryOperator, WhenClause, WhenMatch,
+        Window, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits,
+        WindowReference, WindowSpecification,
     },
     error::ParseError,
     keyword_class,
@@ -270,11 +270,15 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
 
     /// `expression ::= prefix-expression { infix-operator expression }`
     fn parse_binding_power(&mut self, minimum_precedence: u8) -> Result<Expr, ParseError> {
+        self.skip_trivia();
+        let prefix_start = self.position;
         let mut left = self.parse_prefix_expression()?;
 
         loop {
             self.skip_trivia();
-            if self.current_is_symbol(Symbol::Arrow) && self.arrow_starts_lambda(&left) {
+            if self.current_is_symbol(Symbol::Arrow)
+                && self.arrow_starts_lambda(&left, prefix_start)
+            {
                 let parameters = Self::lambda_parameters(&left)
                     .expect("arrow_starts_lambda only accepts identifier parameters");
                 let start = left.span().start();
@@ -427,8 +431,27 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }))
     }
 
-    fn arrow_starts_lambda(&self, left: &Expr) -> bool {
-        Self::lambda_parameters(left).is_some() && !self.peek_nontrivia_is_string(1)
+    fn arrow_starts_lambda(&self, left: &Expr, prefix_start: usize) -> bool {
+        if Self::lambda_parameters(left).is_none() || self.peek_nontrivia_is_string(1) {
+            return false;
+        }
+        // Constructor ROW(...) and parenthesized parameters share Row nodes.
+        // The original tokens still distinguish calls from lambda parameters,
+        // including a constructor enclosed by additional parentheses.
+        let mut previous_is_name = false;
+        for token in &self.tokens[prefix_start..self.position] {
+            if matches!(token.kind, TokenKind::Trivia(_)) {
+                continue;
+            }
+            if previous_is_name && matches!(token.kind, TokenKind::Symbol(Symbol::LParen)) {
+                return false;
+            }
+            previous_is_name = matches!(
+                token.kind,
+                TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(_)
+            );
+        }
+        true
     }
 
     fn lambda_parameters(expression: &Expr) -> Option<Vec<Ident>> {
@@ -763,6 +786,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             self.advance();
             self.skip_trivia();
             return self.parse_map_expression(start);
+        }
+        if self.current_is_word("ROW") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
+            return self.parse_row_expression();
         }
         if self.current_is_word("SUBSTRING") && self.substring_special_form_follows() {
             return self.parse_substring_expression();
@@ -2044,12 +2070,56 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }))
     }
 
+    /// ROW is a constructor token, not an ordinary function-name specialization.
+    fn parse_row_expression(&mut self) -> Result<Expr, ParseError> {
+        let start = self.current_span().start();
+        self.advance();
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::LParen) {
+            return Err(self.unexpected("'(' after ROW"));
+        }
+        self.advance();
+        self.skip_trivia();
+        if self.current_is_symbol(Symbol::RParen)
+            || self.current_is_keyword(Keyword::Distinct)
+            || self.current_is_word("ALL")
+        {
+            return Err(self.unexpected("expression in ROW constructor"));
+        }
+        // Preserve the original TABLE named-argument nesting boundary.
+        self.function_call_depth += 1;
+        let mut fields = AstVec::new();
+        loop {
+            let expression = self.parse_binding_power(0)?;
+            fields.push(RowField {
+                name: None,
+                span: expression.span(),
+                expression,
+            });
+            self.skip_trivia();
+            if !self.current_is_symbol(Symbol::Comma) {
+                break;
+            }
+            self.advance();
+            self.skip_trivia();
+        }
+        if !self.current_is_symbol(Symbol::RParen) {
+            return Err(self.unexpected("')' after ROW fields"));
+        }
+        let end = self.current_span().end();
+        self.advance();
+        self.function_call_depth -= 1;
+        Ok(Expr::Row(RowExpr {
+            fields,
+            span: Span::new(start, end),
+        }))
+    }
+
     fn parse_map_expression(&mut self, start: usize) -> Result<Expr, ParseError> {
         self.advance();
         self.skip_trivia();
-        let mut entries = Vec::new();
+        let mut arguments = AstVec::new();
         while !self.current_is_symbol(Symbol::RBrace) {
-            let entry_start = self.current_span().start();
             let key = self.parse_binding_power(0)?;
             self.skip_trivia();
             if !self.current_is_symbol(Symbol::Colon) {
@@ -2058,12 +2128,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             self.advance();
             self.skip_trivia();
             let value = self.parse_binding_power(0)?;
-            let entry_end = value.span().end();
-            entries.push(MapEntry {
-                key,
-                value,
-                span: Span::new(entry_start, entry_end),
-            });
+            arguments.push(crate::build::call_argument(key, None));
+            arguments.push(crate::build::call_argument(value, None));
             self.skip_trivia();
             if !self.current_is_symbol(Symbol::Comma) {
                 break;
@@ -2076,10 +2142,25 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
         let end = self.current_span().end();
         self.advance();
-        Ok(Expr::Map(MapExpr {
-            entries,
+        Ok(Expr::FunctionCall(AstBox::new(FunctionCall {
+            name: ObjectName {
+                parts: vec![Ident {
+                    value: "map".to_owned(),
+                    quoted: false,
+                    span: crate::SYNTHETIC,
+                }],
+                span: crate::SYNTHETIC,
+            },
+            arguments,
+            processing_mode: None,
+            quantifier: FunctionQuantifier::None,
+            order_by: None,
+            separator: None,
+            filter: None,
+            null_treatment: None,
+            window: None,
             span: Span::new(start, end),
-        }))
+        })))
     }
 
     fn consume_type_gt(&mut self) -> Result<usize, ParseError> {
@@ -2305,6 +2386,52 @@ mod tests {
     use crate::{lex, parser::parse_expression, printer::Printer};
 
     #[test]
+    fn row_constructor_arrow_and_table_arguments_keep_their_original_grammar() {
+        use crate::ast::{AccessKind, Expr};
+        for source in ["ROW(a, b) -> path", "(ROW(a, b)) -> path"] {
+            let tokens = lex(source).unwrap();
+            let expression = super::PrattParser::new(source, &tokens).parse().unwrap();
+            let Expr::Access(access) = expression else {
+                panic!("ROW constructor must remain a JSON access base: {source}");
+            };
+            assert!(matches!(&access.kind, AccessKind::Json { path, .. }
+                if matches!(path.as_ref(), Expr::Identifier(name) if name.value == "path")));
+        }
+        let source = "(a, b) -> a";
+        let tokens = lex(source).unwrap();
+        let expression = super::PrattParser::new(source, &tokens).parse().unwrap();
+        let Expr::Lambda(lambda) = expression else {
+            panic!("parenthesized parameters retain lambda grammar");
+        };
+        assert_eq!(
+            lambda
+                .arguments
+                .iter()
+                .map(|argument| argument.name.value.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(matches!(&lambda.body, Expr::Identifier(name) if name.value == "a"));
+        let source = "ROW(generate_series(end => 1), x)";
+        let tokens = lex(source).unwrap();
+        assert!(
+            super::PrattParser::new(source, &tokens)
+                .with_table_function_named_arguments()
+                .parse()
+                .is_err()
+        );
+        let source = "generate_series(end => 1)";
+        let tokens = lex(source).unwrap();
+        assert!(matches!(
+            super::PrattParser::new(source, &tokens)
+                .with_table_function_named_arguments()
+                .parse()
+                .unwrap(),
+            Expr::FunctionCall(_)
+        ));
+    }
+
+    #[test]
     fn user_and_system_variables_are_lexically_rejected() {
         for source in [
             "@user",
@@ -2323,14 +2450,14 @@ mod tests {
         let expression =
             parse_expression(expression_source, &tokens).expect("map literal should parse");
         let canonical_expression = Printer::new().expression(&expression);
-        assert_eq!(canonical_expression, "MAP{1: [2, 3], NULL: MAP{4: 5}}");
+        assert_eq!(canonical_expression, "map(1, [2, 3], NULL, map(4, 5))");
 
         let source = format!("SELECT {canonical_expression} AS value_map");
         let statements = crate::parse(&source).expect("map literal should parse in SELECT");
         let canonical_query = Printer::new().statements(&statements);
         assert_eq!(
             canonical_query,
-            "SELECT MAP{1: [2, 3], NULL: MAP{4: 5}} AS value_map"
+            "SELECT map(1, [2, 3], NULL, map(4, 5)) AS value_map"
         );
         crate::parse(&canonical_query).expect("canonical map query should reparse");
     }

@@ -575,12 +575,6 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
                 validate_expr(expression)?;
             }
         }
-        Expr::Map(map) => {
-            for entry in &map.entries {
-                validate_expr(&entry.key)?;
-                validate_expr(&entry.value)?;
-            }
-        }
         Expr::Lambda(lambda) => validate_expr(&lambda.body)?,
         Expr::Access(access) => {
             validate_expr(&access.expr)?;

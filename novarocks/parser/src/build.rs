@@ -678,18 +678,18 @@ pub fn tuple_value(expressions: Vec<Expr>) -> Result<Expr, BuildError> {
     }))
 }
 
+/// Builds the ordinary variadic map call, retaining key/value order and nodes.
 pub fn map(entries: Vec<(Expr, Expr)>) -> Expr {
-    Expr::Map(MapExpr {
-        entries: entries
+    function(
+        ObjectName {
+            parts: vec![ident("map", false)],
+            span: SYNTHETIC,
+        },
+        entries
             .into_iter()
-            .map(|(key, value)| MapEntry {
-                key,
-                value,
-                span: SYNTHETIC,
-            })
+            .flat_map(|(key, value)| [key, value])
             .collect(),
-        span: SYNTHETIC,
-    })
+    )
 }
 
 fn cover(spans: impl IntoIterator<Item = Span>) -> Span {

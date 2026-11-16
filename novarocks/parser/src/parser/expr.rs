@@ -412,7 +412,11 @@ mod tests {
         };
         assert_eq!(hex_literal.kind, LiteralKind::Binary(vec![0xAB, 0x01]));
         assert_eq!(crate::printer::print_expr(&hex), "X'AB01'");
-        assert!(matches!(parse("map{1: [2, 3], NULL: 4}"), Expr::Map(_)));
+        let Expr::FunctionCall(map) = parse("map{1: [2, 3], NULL: 4}") else {
+            panic!("ordinary map call");
+        };
+        assert_eq!(map.name.parts[0].value, "map");
+        assert_eq!(map.arguments.len(), 4);
         let Expr::Row(row) = parse("(a, b)") else {
             panic!("positional row");
         };

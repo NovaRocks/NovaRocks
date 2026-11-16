@@ -260,10 +260,6 @@ fn shape_body(
             // the original SELECT as the row-producing relation so HAVING aliases,
             // filters and DISTINCT observe source types before sink conversion.
             // Each leaf's target projection still precedes UNION common typing.
-            let expressions = expressions
-                .into_iter()
-                .map(canonical_insert_wrapper_expression)
-                .collect::<Result<Vec<_>, _>>()?;
             let inner = build::query(ast::SetExpr::Select(select.clone()));
             let query = build::query(ast::SetExpr::Select(Box::new(
                 build::select(
@@ -505,16 +501,6 @@ fn constrain_literal_in(
                 }
             }
         }
-        ast::Expr::Map(map) => {
-            if map_types(target.data_type()).is_some() {
-                let key = target_child(target, 0)?;
-                let value = target_child(target, 1)?;
-                for entry in &mut map.entries {
-                    entry.key = constrain_literal(entry.key.clone(), &key)?;
-                    entry.value = constrain_literal(entry.value.clone(), &value)?;
-                }
-            }
-        }
         ast::Expr::Row(structure) => {
             if let DataType::Struct(fields) = target.data_type()
                 && fields.len() == structure.fields.len()
@@ -685,57 +671,6 @@ fn tuple(expressions: Vec<ast::Expr>) -> Result<ast::Expr, String> {
 }
 fn map(entries: Vec<(ast::Expr, ast::Expr)>) -> ast::Expr {
     build::map(entries)
-}
-
-/// Normalize only the expressions whose original INSERT wrapper crossed the
-/// printer/parser boundary. VALUES retains its existing typed-value syntax.
-/// Source positions and the shape of every already-admitted user subtree stay
-/// attached to that subtree; no tree is returned after construction fails.
-pub(crate) fn canonical_insert_wrapper_expression(expr: ast::Expr) -> Result<ast::Expr, String> {
-    use ast::Fold;
-    #[derive(Default)]
-    struct WrapperSyntax {
-        error: Option<String>,
-    }
-    impl ast::Fold for WrapperSyntax {
-        fn fold_expr(&mut self, expression: ast::Expr) -> ast::Expr {
-            if self.error.is_some() {
-                return expression;
-            }
-            match expression {
-                // The SELECT wrapper preserves the original positional default
-                // rule: one field becomes parentheses; multiple fields retain
-                // their individual locations and positional value shape.
-                ast::Expr::Row(mut row) if row.fields.iter().all(|field| field.name.is_none()) => {
-                    row = ast::fold_row_expr(self, row);
-                    match row.fields.len() {
-                        0 => {
-                            self.error = Some(build::BuildError::EmptyTuple.to_string());
-                            build::null()
-                        }
-                        1 => {
-                            let mut fields = row.fields.into_iter();
-                            let field = fields.next().expect("one positional field");
-                            let mut canonical = build::nested(field.expression);
-                            let ast::Expr::Nested(nested) = &mut canonical else {
-                                unreachable!("nested constructor returns parentheses");
-                            };
-                            nested.span = row.span;
-                            canonical
-                        }
-                        _ => ast::Expr::Row(row),
-                    }
-                }
-                expression => ast::fold_expr(self, expression),
-            }
-        }
-    }
-    let mut syntax = WrapperSyntax::default();
-    let expression = syntax.fold_expr(expr);
-    match syntax.error {
-        Some(error) => Err(error),
-        None => Ok(expression),
-    }
 }
 
 fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast::Expr, String> {

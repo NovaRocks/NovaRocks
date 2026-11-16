@@ -1368,3 +1368,113 @@ fn extract_input_borrows_original_nonzero_date_pool_and_refuses_foreign_edges() 
     assert_eq!(actual.field(), field.as_ref());
     assert_eq!(actual.value_type(), &ty);
 }
+
+#[test]
+fn row_field_expression_keeps_original_nonzero_full_field_pool() {
+    use arrow::array::{Array, Int32Array};
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_functions::ConstantPool;
+    let control = SqlCompileControl::unbounded();
+    let policy = crate::constant::test_constant_policy();
+    let ty = FunctionValueType::new(DataType::Int32, false);
+    let field = Arc::new(
+        Field::new("original_row_child", DataType::Int32, false).with_metadata(
+            std::collections::HashMap::from([(
+                "provider.unknown".to_string(),
+                "full-field".to_string(),
+            )]),
+        ),
+    );
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        Int32Array::from(vec![13, -23]).to_data(),
+        policy,
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let retained = pool.value(1).unwrap();
+    let query = query("SELECT ROW(1, only_original_row_child)");
+    let constant = |path| {
+        SqlExpressionConstant::new(
+            Vec::new(),
+            SqlConstantExpressionSite::SelectProjection { column: 0 },
+            retained.clone(),
+        )
+        .with_expression_path(path)
+    };
+    let source = MaterializedValues::try_new_expressions(
+        &query,
+        vec![constant(vec![
+            SqlConstantExpressionStep::RowFieldExpression(1),
+        ])]
+        .into(),
+        &control,
+    )
+    .unwrap();
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("select");
+    };
+    let ast::SelectItem::UnnamedExpr(ast::Expr::Row(row)) = &select.projection[0] else {
+        panic!("row");
+    };
+    let original = &row.fields[1].expression;
+    let owned = source.loan(&query, &control).unwrap();
+    let loan = owned.view();
+    let actual = loan.constant_at(original).unwrap();
+    assert_eq!(actual.ordinal(), 1);
+    assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+    assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+    assert_eq!(actual.field(), field.as_ref());
+    assert_eq!(actual.value_type(), &ty);
+    assert!(loan.constant_at(&(*original).clone()).is_none());
+    for path in [
+        vec![SqlConstantExpressionStep::RowFieldExpression(2)],
+        vec![SqlConstantExpressionStep::FunctionArgumentValue(1)],
+        vec![
+            SqlConstantExpressionStep::RowFieldExpression(1),
+            SqlConstantExpressionStep::RowFieldExpression(0),
+        ],
+    ] {
+        assert!(
+            MaterializedValues::try_new_expressions(&query, vec![constant(path)].into(), &control)
+                .is_err()
+        );
+    }
+    let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+    let functions = build_builtin_engine_function_catalog().unwrap();
+    let (resolved, _, _) = crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
+        &query,
+        &catalog,
+        "db",
+        &functions,
+        &crate::sql_mode::SqlSemanticSettings::default(),
+        policy,
+        &control,
+        Some(&source),
+    )
+    .unwrap();
+    let crate::analysis::QueryBody::Select(select) = &resolved.body else {
+        panic!("select");
+    };
+    let crate::analysis::ExprKind::FunctionCall { name, args, .. } =
+        &select.projection[0].expr.kind
+    else {
+        panic!("row binding");
+    };
+    assert_eq!(name, "row");
+    let crate::analysis::ExprKind::Constant(actual) = &args[1].kind else {
+        panic!("original child");
+    };
+    assert_eq!(actual.ordinal(), 1);
+    assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+    assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+    assert_eq!(actual.field(), field.as_ref());
+    assert_eq!(actual.value_type(), &ty);
+    let DataType::Struct(fields) = select.projection[0].expr.value_type.data_type() else {
+        panic!("whole Struct");
+    };
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[1].data_type(), &DataType::Int32);
+}

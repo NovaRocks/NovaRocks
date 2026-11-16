@@ -529,7 +529,6 @@ impl SyntaxEq for Expr {
             (Self::Subquery(left), Self::Subquery(right)) => left.syntax_eq(right),
             (Self::Row(left), Self::Row(right)) => left.syntax_eq(right),
             (Self::Array(left), Self::Array(right)) => left.syntax_eq(right),
-            (Self::Map(left), Self::Map(right)) => left.syntax_eq(right),
             (Self::Access(left), Self::Access(right)) => left.syntax_eq(right),
             (Self::Subscript(left), Self::Subscript(right)) => left.syntax_eq(right),
             (Self::ArrayWildcardSubscript(left), Self::ArrayWildcardSubscript(right)) => {
@@ -620,18 +619,6 @@ impl SyntaxEq for ArrayExpr {
     #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         syntax_eq_slice(&self.values, &other.values)
-    }
-}
-
-impl SyntaxEq for MapExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_slice(&self.entries, &other.entries)
-    }
-}
-
-impl SyntaxEq for MapEntry {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.key.syntax_eq(&other.key) && self.value.syntax_eq(&other.value)
     }
 }
 

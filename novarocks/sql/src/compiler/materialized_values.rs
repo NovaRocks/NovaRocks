@@ -44,6 +44,7 @@ pub enum SqlConstantExpressionStep {
     InListValue(usize),
     CastExpression,
     ExtractInput,
+    RowFieldExpression(usize),
     DereferenceBase,
     SubscriptBase,
     SubscriptIndex,
@@ -302,6 +303,14 @@ pub(crate) fn resolve_expression_site<'a>(
                     .sort_key
             }
             (SqlConstantExpressionStep::ExtractInput, ast::Expr::Extract(node)) => &node.expression,
+            (SqlConstantExpressionStep::RowFieldExpression(index), ast::Expr::Row(row)) => {
+                &row.fields
+                    .get(*index)
+                    .ok_or_else(|| {
+                        invalid("constant source ROW field differs from its owned syntax")
+                    })?
+                    .expression
+            }
             (SqlConstantExpressionStep::IfCondition, ast::Expr::If(node)) => &node.condition,
             (SqlConstantExpressionStep::IfTrue, ast::Expr::If(node)) => &node.true_value,
             (SqlConstantExpressionStep::IfFalse, ast::Expr::If(node)) => {

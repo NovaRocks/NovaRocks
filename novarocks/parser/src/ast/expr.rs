@@ -57,7 +57,6 @@ pub enum Expr {
     Subquery(SubqueryExpr),
     Row(RowExpr),
     Array(ArrayExpr),
-    Map(MapExpr),
     Lambda(AstBox<super::LambdaExpr>),
     Access(AccessExpr),
     Subscript(AstBox<SubscriptExpr>),
@@ -102,7 +101,6 @@ impl Expr {
             Self::Subquery(expression) => expression.span,
             Self::Row(expression) => expression.span,
             Self::Array(expression) => expression.span,
-            Self::Map(expression) => expression.span,
             Self::Lambda(expression) => expression.span,
             Self::Access(expression) => expression.span,
             Self::Subscript(expression) => expression.span,
@@ -210,19 +208,6 @@ pub struct RowField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArrayExpr {
     pub values: AstVec<Expr>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MapExpr {
-    pub entries: Vec<MapEntry>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MapEntry {
-    pub key: Expr,
-    pub value: Expr,
     pub span: Span,
 }
 

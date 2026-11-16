@@ -982,7 +982,6 @@ impl Printer {
             Expr::Subquery(expression) => self.write_subquery_expr(expression),
             Expr::Row(expression) => self.write_row_expr(expression),
             Expr::Array(expression) => self.write_array_expr(expression),
-            Expr::Map(expression) => self.write_map_expr(expression),
             Expr::Lambda(expression) => self.write_lambda_expr(expression),
             Expr::Access(expression) => self.write_access_expr(expression),
             Expr::Subscript(node) => self.write_subscript_expr(node),
@@ -1632,7 +1631,7 @@ impl Printer {
     #[recursive::recursive]
     fn write_row_expr(&mut self, expression: &RowExpr) {
         let named = expression.fields.iter().any(|field| field.name.is_some());
-        self.output.push_str(if named { "STRUCT(" } else { "(" });
+        self.output.push_str(if named { "STRUCT(" } else { "ROW(" });
         for (index, field) in expression.fields.iter().enumerate() {
             if index != 0 {
                 self.output.push_str(", ");
@@ -1649,19 +1648,6 @@ impl Printer {
         self.output.push('[');
         self.write_expr_list(&expression.values);
         self.output.push(']');
-    }
-
-    fn write_map_expr(&mut self, expression: &MapExpr) {
-        self.output.push_str("MAP{");
-        for (index, entry) in expression.entries.iter().enumerate() {
-            if index != 0 {
-                self.output.push_str(", ");
-            }
-            self.write_expr(&entry.key);
-            self.output.push_str(": ");
-            self.write_expr(&entry.value);
-        }
-        self.output.push('}');
     }
 
     fn write_lambda_expr(&mut self, expression: &LambdaExpr) {

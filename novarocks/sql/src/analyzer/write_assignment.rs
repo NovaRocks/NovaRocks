@@ -176,12 +176,6 @@ fn register_literal_assignments<'a>(
                     visit(value, 0)?;
                 }
             }
-            ast::Expr::Map(map) if matches!(assignment.input().data_type(), DataType::Map(..)) => {
-                for entry in &map.entries {
-                    visit(&entry.key, 0)?;
-                    visit(&entry.value, 1)?;
-                }
-            }
             ast::Expr::Row(structure) if matches!(assignment.input().data_type(), DataType::Struct(fields) if fields.len() == structure.fields.len()) => {
                 for (ordinal, field) in structure.fields.iter().enumerate() {
                     visit(&field.expression, ordinal)?;
@@ -392,6 +386,29 @@ fn case_results(
         .chain(default.iter())
 }
 
+/// Only the original INSERT literal-context owner supplies this expectation.
+/// Ordinary SQL function analysis continues to infer each argument independently.
+fn plain_map_arguments(
+    call: &novarocks_parser::ast::FunctionCall,
+) -> Option<&[novarocks_parser::ast::CallArgument]> {
+    use novarocks_parser::{ast, printer};
+    (call.name.parts.len() == 1
+        && printer::print_object_name(&call.name).eq_ignore_ascii_case("map")
+        && matches!(call.quantifier, ast::FunctionQuantifier::None)
+        && call.order_by.is_none()
+        && call.separator.is_none()
+        && call.filter.is_none()
+        && call.null_treatment.is_none()
+        && call.window.is_none()
+        && call.processing_mode.is_none()
+        && call.arguments.len().is_multiple_of(2)
+        && call
+            .arguments
+            .iter()
+            .all(|argument| argument.name.is_none()))
+    .then_some(call.arguments.as_slice())
+}
+
 fn context_hole(
     expression: &novarocks_parser::ast::Expr,
     source: &crate::compiler::materialized_values::MaterializedSourceBorrow<'_>,
@@ -408,7 +425,9 @@ fn context_hole(
         ast::Expr::Nested(nested) => context_hole(&nested.expression, source, control),
         ast::Expr::Literal(literal) => Ok(matches!(literal.kind, ast::LiteralKind::Null)),
         ast::Expr::Array(array) => Ok(array.values.is_empty()),
-        ast::Expr::Map(map) => Ok(map.entries.is_empty()),
+        ast::Expr::FunctionCall(call) if plain_map_arguments(call).is_some() => {
+            Ok(call.arguments.is_empty())
+        }
         ast::Expr::SearchedCase(_) | ast::Expr::SimpleCase(_) => {
             for value in case_results(expression) {
                 if !context_hole(value, source, control)? {
@@ -494,10 +513,11 @@ fn context_literal<'a>(
                 None
             }
         }
-        ast::Expr::Map(map)
-            if matches!(expected.data_type(), arrow::datatypes::DataType::Map(..)) =>
+        ast::Expr::FunctionCall(call)
+            if plain_map_arguments(call).is_some()
+                && matches!(expected.data_type(), arrow::datatypes::DataType::Map(..)) =>
         {
-            if map.entries.is_empty() {
+            if call.arguments.is_empty() {
                 Some(empty_literal(expected, policy, control)?)
             } else {
                 let key = expected
@@ -506,9 +526,9 @@ fn context_literal<'a>(
                 let value = expected
                     .child_at(1)
                     .ok_or_else(|| AnalyzeError::internal("map literal context lost its value"))?;
-                for entry in &map.entries {
-                    context_literal(&entry.key, &key, source, policy, control)?;
-                    context_literal(&entry.value, &value, source, policy, control)?;
+                for pair in call.arguments.as_chunks::<2>().0 {
+                    context_literal(&pair[0].value, &key, source, policy, control)?;
+                    context_literal(&pair[1].value, &value, source, policy, control)?;
                 }
                 None
             }
@@ -523,7 +543,7 @@ fn context_literal<'a>(
             }
             None
         }
-        // Explicit CAST, explicitly typed ARRAY, functions and nonliteral
+        // Explicit CAST, other functions and nonliteral
         // expressions retain their original independent inference boundary.
         _ => None,
     };

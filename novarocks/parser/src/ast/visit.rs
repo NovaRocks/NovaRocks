@@ -875,12 +875,6 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::Subquery(expression) => visitor.visit_query(&expression.query),
         Expr::Row(expression) => visitor.visit_row_expr(expression),
         Expr::Array(expression) => walk_array_expr(visitor, expression),
-        Expr::Map(expression) => {
-            for entry in &expression.entries {
-                visitor.visit_expr(&entry.key);
-                visitor.visit_expr(&entry.value);
-            }
-        }
 
         Expr::Access(expression) => {
             visitor.visit_expr(&expression.expr);
@@ -2058,18 +2052,6 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         }
         Expr::Row(expression) => Expr::Row(folder.fold_row_expr(expression)),
         Expr::Array(expression) => Expr::Array(fold_array_expr(folder, expression)),
-        Expr::Map(mut expression) => {
-            expression.entries = expression
-                .entries
-                .into_iter()
-                .map(|mut entry| {
-                    entry.key = folder.fold_expr(entry.key);
-                    entry.value = folder.fold_expr(entry.value);
-                    entry
-                })
-                .collect();
-            Expr::Map(expression)
-        }
 
         Expr::Access(mut expression) => {
             expression.expr = Box::new(folder.fold_expr(*expression.expr));
