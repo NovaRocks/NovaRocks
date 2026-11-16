@@ -440,11 +440,33 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
         }
         Expr::Subquery(subquery) => validate_query(&subquery.query)?,
         Expr::Exists(exists) => validate_query(&exists.query)?,
-        Expr::InSubquery(in_subquery) => {
-            validate_expr(&in_subquery.expr)?;
-            validate_query(&in_subquery.query)?;
-        }
+
         Expr::Unary(unary) => validate_expr(&unary.expression)?,
+        Expr::Predicated(node) => {
+            validate_expr(&node.value)?;
+            struct Children(Result<(), ValidateError>);
+            impl super::Visit for Children {
+                fn visit_expr(&mut self, expression: &Expr) {
+                    if self.0.is_ok() {
+                        self.0 = validate_expr(expression);
+                    }
+                }
+            }
+            let mut children = Children(Ok(()));
+            super::Visit::visit_predicate(&mut children, &node.predicate);
+            children.0?;
+        }
+        Expr::InList(list) => {
+            if list.values.is_empty() {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::EmptyInList,
+                    list.span,
+                ));
+            }
+            for value in &list.values {
+                validate_expr(value)?;
+            }
+        }
         Expr::Logical(logical) => {
             if logical.terms.len() < 2 {
                 return Err(ValidateError::invalid_structure(
@@ -461,25 +483,7 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             validate_expr(&binary.right)?;
         }
         Expr::Nested(nested) => validate_expr(&nested.expression)?,
-        Expr::Between(between) => {
-            validate_expr(&between.expr)?;
-            validate_expr(&between.low)?;
-            validate_expr(&between.high)?;
-        }
-        Expr::InList(in_list) => {
-            validate_expr(&in_list.expr)?;
-            for item in &in_list.list {
-                validate_expr(item)?;
-            }
-        }
-        Expr::Like(like) => {
-            validate_expr(&like.expr)?;
-            validate_expr(&like.pattern)?;
-            if let Some(escape) = &like.escape {
-                validate_expr(escape)?;
-            }
-        }
-        Expr::IsPredicate(predicate) => validate_expr(&predicate.expr)?,
+
         Expr::Case(case) => {
             if case.conditions.len() != case.results.len() {
                 return Err(ValidateError::invalid_structure(

@@ -60,16 +60,19 @@ fn number(value: &str, span: Span) -> ast::Expr {
 }
 fn comparison(
     left: ast::Expr,
-    operator: ast::BinaryOperator,
+    operator: ast::ComparisonOperator,
     right: ast::Expr,
     span: Span,
 ) -> ast::Expr {
-    ast::Expr::Binary(ast::BinaryExpr {
-        left: Box::new(left),
-        operator,
-        right: Box::new(right),
+    ast::Expr::Predicated(ast::AstBox::new(ast::PredicatedExpr {
+        value: left,
+        predicate: ast::Predicate::Comparison(ast::ComparisonPredicate {
+            operator,
+            right,
+            span,
+        }),
         span,
-    })
+    }))
 }
 
 /// Preserve metadata syntax separately from the ordinary relation name, so
@@ -116,7 +119,7 @@ pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast
             }],
             selection: Some(comparison(
                 column("content", span),
-                ast::BinaryOperator::Equal,
+                ast::ComparisonOperator::Equal,
                 number("0", span),
                 span,
             )),
@@ -131,7 +134,7 @@ pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast
             having: (!partitioned).then(|| {
                 comparison(
                     call("count", "*", span),
-                    ast::BinaryOperator::GreaterThan,
+                    ast::ComparisonOperator::GreaterThan,
                     number("0", span),
                     span,
                 )
@@ -183,12 +186,15 @@ mod tests {
                     parts.iter().map(|p| p.to_lowercase()).collect::<Vec<_>>()
                 );
                 assert_eq!(metadata.as_ref().unwrap().value, "files");
-                let ast::Expr::Binary(filter) = select.selection.as_ref().unwrap() else {
+                let ast::Expr::Predicated(filter) = select.selection.as_ref().unwrap() else {
                     panic!("content filter")
                 };
-                assert_eq!(*filter.left, column("content", span));
-                assert_eq!(filter.operator, ast::BinaryOperator::Equal);
-                assert_eq!(*filter.right, number("0", span));
+                assert_eq!(filter.value, column("content", span));
+                let ast::Predicate::Comparison(predicate) = &filter.predicate else {
+                    panic!("comparison")
+                };
+                assert_eq!(predicate.operator, ast::ComparisonOperator::Equal);
+                assert_eq!(predicate.right, number("0", span));
                 assert_eq!(select.projection.len(), if partitioned { 4 } else { 3 });
                 if partitioned {
                     assert!(
@@ -201,7 +207,7 @@ mod tests {
                         select.having,
                         Some(comparison(
                             call("count", "*", span),
-                            ast::BinaryOperator::GreaterThan,
+                            ast::ComparisonOperator::GreaterThan,
                             number("0", span),
                             span
                         ))

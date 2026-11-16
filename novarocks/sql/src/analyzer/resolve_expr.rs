@@ -93,6 +93,29 @@ fn interval_field_name(field: ast::IntervalField) -> &'static str {
 /// SQL corpus. Removing the bound means making the tree walks iterative too.
 pub const MAX_BOOLEAN_CHAIN_OPERANDS: usize = 2_048;
 
+pub(crate) fn unsupported_predicate_reason(node: &ast::PredicatedExpr) -> Option<&'static str> {
+    match &node.predicate {
+        ast::Predicate::BooleanTest(p) if p.truth_value == ast::TruthValue::Unknown => {
+            Some("IS UNKNOWN predicates are not supported")
+        }
+        ast::Predicate::Between(p) if p.symmetry.is_some() => {
+            Some("explicit BETWEEN symmetry is not supported")
+        }
+        ast::Predicate::Like(p) if p.escape.is_some() => Some("LIKE ESCAPE is not supported"),
+        ast::Predicate::In(p) => match &p.value_list {
+            ast::Expr::InList(list) if !list.values.is_empty() => None,
+            ast::Expr::Subquery(_) => None,
+            _ => Some("IN predicates require a nonempty value list or a subquery"),
+        },
+        ast::Predicate::Overlaps(_) => Some("OVERLAPS predicates are not supported"),
+        ast::Predicate::QuantifiedComparison(_) => {
+            Some("quantified comparison predicates are not supported")
+        }
+        ast::Predicate::Match(_) => Some("MATCH predicates are not supported"),
+        _ => None,
+    }
+}
+
 fn string_literal_expr(value: String, span: Span) -> ast::Expr {
     ast::Expr::Literal(ast::Literal {
         kind: ast::LiteralKind::String(value),
@@ -392,219 +415,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
 
-            // IS predicates are one native syntax node with explicit kind.
-            ast::Expr::IsPredicate(predicate)
-                if matches!(
-                    predicate.predicate,
-                    ast::IsPredicate::Null | ast::IsPredicate::NotNull
-                ) =>
-            {
-                let inner_typed = self.analyze_expr(&predicate.expr, scope)?;
-                Ok(TypedExpr {
-                    kind: ExprKind::IsNull {
-                        expr: Box::new(inner_typed),
-                        negated: matches!(predicate.predicate, ast::IsPredicate::NotNull),
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                })
-            }
-            // IN list
-            ast::Expr::InList(in_list) => {
-                use super::literal_coercion::coerce_literal_for_comparison;
-                let mut expr_typed = self.analyze_expr(&in_list.expr, scope)?;
-                // StarRocks-aligned implicit literal coercion: when the IN
-                // expression is `column IN (lit, lit, ...)`, coerce each
-                // string literal to the column's type before emitting the
-                // InList. Mirrors the binary-op comparison coercion.
-                let mut list_typed = Vec::with_capacity(in_list.list.len());
-                for item in &in_list.list {
-                    let item_typed = self.analyze_expr(item, scope)?;
-                    check_json_comparison_domains(
-                        &expr_typed.value_type,
-                        &item_typed.value_type,
-                        "IN",
-                        in_list.span,
-                    )?;
-                    list_typed.push(coerce_literal_for_comparison(&expr_typed, item_typed));
-                }
-                // BITMAP / HLL operands cannot participate in IN / NOT IN
-                // because they have no scalar identity. Reject upfront so the
-                // user sees a clear error before lowering / codegen.
-                let kw = if in_list.negated { "NOT IN" } else { "IN" };
-                if let Some(logical) = scope
-                    .logical_type_of_expr(&expr_typed)
-                    .filter(is_bitmap_or_hll_type)
-                {
-                    let col = column_name_of_expr(&expr_typed);
-                    return Err(AnalyzeError::invalid_argument(
-                        format!(
-                            "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
-                        ),
-                        in_list.span,
-                    ));
-                }
-                for item in &list_typed {
-                    if let Some(logical) = scope
-                        .logical_type_of_expr(item)
-                        .filter(is_bitmap_or_hll_type)
-                    {
-                        let col = column_name_of_expr(item);
-                        return Err(AnalyzeError::invalid_argument(
-                            format!(
-                                "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
-                            ),
-                            in_list.span,
-                        ));
-                    }
-                }
-                for item in &list_typed {
-                    if incompatible_complex_compare(
-                        expr_typed.value_type.data_type(),
-                        item.value_type.data_type(),
-                    )
-                    .is_some()
-                    {
-                        return Err(AnalyzeError::type_mismatch(
-                            in_predicate_type_error(
-                                expr_typed.value_type.data_type(),
-                                item.value_type.data_type(),
-                            ),
-                            in_list.span,
-                        ));
-                    }
-                }
-                let mut common_type = expr_typed.value_type.clone();
-                for item in &list_typed {
-                    self.check_control()?;
-                    common_type = wider_comparison_value_type(&common_type, &item.value_type)
-                        .map_err(|error| AnalyzeError::type_mismatch_source(error, in_list.span))?;
-                }
-                let target = self.implicit_common_cast_target(&expr_typed.value_type, &common_type);
-                expr_typed = self.cast_to_value_type(expr_typed, target, in_list.span)?;
-                let mut coerced_list = Vec::with_capacity(list_typed.len());
-                for item in list_typed {
-                    self.check_control()?;
-                    let target = self.implicit_common_cast_target(&item.value_type, &common_type);
-                    coerced_list.push(self.cast_to_value_type(item, target, in_list.span)?);
-                }
-                let list_typed = coerced_list;
-                // Three-valued: `NULL IN (1, 2)` and `1 IN (NULL, 2)` are both
-                // NULL, so the result is nullable whenever any operand is.
-                let nullable = expr_typed.value_type.nullable()
-                    || list_typed
-                        .iter()
-                        .any(|candidate| candidate.value_type.nullable());
-                Ok(TypedExpr {
-                    kind: ExprKind::InList {
-                        expr: Box::new(expr_typed),
-                        list: list_typed,
-                        negated: in_list.negated,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        nullable,
-                    ),
-                })
-            }
-
-            // BETWEEN
-            ast::Expr::Between(between) => {
-                use super::literal_coercion::coerce_literal_for_comparison;
-                let expr_typed = self.analyze_expr(&between.expr, scope)?;
-                let low_typed = self.analyze_expr(&between.low, scope)?;
-                let high_typed = self.analyze_expr(&between.high, scope)?;
-                for (left, right) in [
-                    (&expr_typed, &low_typed),
-                    (&expr_typed, &high_typed),
-                    (&low_typed, &high_typed),
-                ] {
-                    check_json_comparison_domains(
-                        &left.value_type,
-                        &right.value_type,
-                        "BETWEEN",
-                        between.span,
-                    )?;
-                }
-                // StarRocks-aligned implicit literal coercion: for
-                // `column BETWEEN lit AND lit`, coerce each string literal
-                // to the column's type. The helper gates on the LHS being a
-                // column ref (same convention as binary-op comparisons), so
-                // `expr_typed BETWEEN ...` where the LHS is a non-column
-                // expression is left unchanged.
-                let low_typed = coerce_literal_for_comparison(&expr_typed, low_typed);
-                let high_typed = coerce_literal_for_comparison(&expr_typed, high_typed);
-                // BITMAP / HLL operands cannot participate in BETWEEN because
-                // they have no ordering. Reject upfront so the user sees a
-                // clear error before lowering / codegen.
-                for operand in [&expr_typed, &low_typed, &high_typed] {
-                    if let Some(logical) = scope
-                        .logical_type_of_expr(operand)
-                        .filter(is_bitmap_or_hll_type)
-                    {
-                        let col = column_name_of_expr(operand);
-                        return Err(AnalyzeError::invalid_argument(
-                            format!(
-                                "BITMAP/HLL columns cannot appear in BETWEEN expressions (operand `{col}` has type {logical:?})"
-                            ),
-                            between.span,
-                        ));
-                    }
-                }
-                let common_type =
-                    wider_comparison_value_type(&expr_typed.value_type, &low_typed.value_type)
-                        .and_then(|common| {
-                            wider_comparison_value_type(&common, &high_typed.value_type)
-                        })
-                        .map_err(|error| AnalyzeError::type_mismatch_source(error, between.span))?;
-                let cast = |operand: TypedExpr| {
-                    let target =
-                        self.implicit_common_cast_target(&operand.value_type, &common_type);
-                    self.cast_to_value_type(operand, target, between.span)
-                };
-                let expr_typed = cast(expr_typed)?;
-                let low_typed = cast(low_typed)?;
-                let high_typed = cast(high_typed)?;
-                // A comparison against NULL is NULL, so the result admits
-                // null whenever any operand does. A filter treating null as
-                // not-matching is the filter's own semantics, not this type's.
-                let nullable = expr_typed.value_type.nullable()
-                    || low_typed.value_type.nullable()
-                    || high_typed.value_type.nullable();
-                Ok(TypedExpr {
-                    kind: ExprKind::Between {
-                        expr: Box::new(expr_typed),
-                        low: Box::new(low_typed),
-                        high: Box::new(high_typed),
-                        negated: between.negated,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        nullable,
-                    ),
-                })
-            }
-
-            // LIKE
-            ast::Expr::Like(like) => {
-                let expr_typed = self.analyze_expr(&like.expr, scope)?;
-                let pattern_typed = self.analyze_expr(&like.pattern, scope)?;
-                let nullable =
-                    expr_typed.value_type.nullable() || pattern_typed.value_type.nullable();
-                Ok(TypedExpr {
-                    kind: ExprKind::Like {
-                        expr: Box::new(expr_typed),
-                        pattern: Box::new(pattern_typed),
-                        negated: like.negated,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        nullable,
-                    ),
-                })
-            }
+            ast::Expr::Predicated(node) => self.analyze_predicated(node, scope),
+            ast::Expr::InList(list) => Err(AnalyzeError::unsupported_expression(
+                "IN lists are only supported as an IN predicate value list",
+                list.span,
+            )),
 
             // CAST
             ast::Expr::Cast(cast) => {
@@ -644,36 +459,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
 
-            // IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE.
-            ast::Expr::IsPredicate(predicate)
-                if matches!(
-                    predicate.predicate,
-                    ast::IsPredicate::True
-                        | ast::IsPredicate::False
-                        | ast::IsPredicate::NotTrue
-                        | ast::IsPredicate::NotFalse
-                ) =>
-            {
-                let inner_typed = self.analyze_expr(&predicate.expr, scope)?;
-                Ok(TypedExpr {
-                    kind: ExprKind::IsTruthValue {
-                        expr: Box::new(inner_typed),
-                        value: matches!(
-                            predicate.predicate,
-                            ast::IsPredicate::True | ast::IsPredicate::NotTrue
-                        ),
-                        negated: matches!(
-                            predicate.predicate,
-                            ast::IsPredicate::NotTrue | ast::IsPredicate::NotFalse
-                        ),
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                })
-            }
-
             // Subquery expression: EXISTS / NOT EXISTS
             ast::Expr::Exists(exists) => {
                 let id = self.alloc_subquery_id();
@@ -696,70 +481,6 @@ impl<'a> super::AnalyzerContext<'a> {
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Boolean,
                         false,
-                    ),
-                })
-            }
-
-            // Subquery expression: col [NOT] IN (SELECT ...)
-            ast::Expr::InSubquery(in_subquery) => {
-                // Multi-column LHS `(a, b) IN (SELECT c, d FROM ...)` arrives
-                // here wrapped as `Expr::Tuple(...)` (or `Expr::Nested(Tuple(...))`).
-                // The whole tuple is not a single scalar expression — the
-                // analyzer's catch-all rejects it as "unsupported expression".
-                // `subquery_rewrite::rewrite_in_subquery` handles the
-                // decomposition (per-column equi-join) downstream, so just
-                // skip the BITMAP / JSON / HLL precheck here: those checks
-                // are per-column and only meaningful for a single-column LHS.
-                let lhs_is_tuple = match in_subquery.expr.as_ref() {
-                    ast::Expr::Tuple(_) => true,
-                    ast::Expr::Nested(inner) => {
-                        matches!(inner.expression.as_ref(), ast::Expr::Tuple(_))
-                    }
-                    _ => false,
-                };
-                let mut json_probe = false;
-                if !lhs_is_tuple {
-                    // BITMAP / HLL operands cannot participate in IN subquery
-                    // because they have no scalar identity. Reject upfront by
-                    // resolving the LHS to detect a logical-type tag; the LHS
-                    // is dropped before the subquery is planned so we cannot
-                    // wait until later.
-                    let in_expr_typed = self.analyze_expr(&in_subquery.expr, scope)?;
-                    json_probe = is_json_in_subquery_operand(&in_expr_typed, scope);
-                    if let Some(logical) = scope
-                        .logical_type_of_expr(&in_expr_typed)
-                        .filter(is_bitmap_or_hll_type)
-                    {
-                        let col = column_name_of_expr(&in_expr_typed);
-                        let kw = if in_subquery.negated { "NOT IN" } else { "IN" };
-                        return Err(AnalyzeError::invalid_argument(
-                            format!(
-                                "BITMAP/HLL columns cannot appear in {kw} subquery expressions (operand `{col}` has type {logical:?})"
-                            ),
-                            in_subquery.span,
-                        ));
-                    }
-                }
-                let id = self.alloc_subquery_id();
-                let kind = SubqueryKind::InSubquery {
-                    negated: in_subquery.negated,
-                };
-                self.collected_subqueries.borrow_mut().push(SubqueryInfo {
-                    id,
-                    kind: kind.clone(),
-                    subquery: in_subquery.query.clone(),
-                    data_type: DataType::Boolean,
-                    in_expr: Some(in_subquery.expr.clone()),
-                });
-                Ok(TypedExpr {
-                    kind: ExprKind::SubqueryPlaceholder {
-                        id,
-                        kind,
-                        data_type: DataType::Boolean,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        json_probe,
                     ),
                 })
             }
@@ -1430,6 +1151,506 @@ impl<'a> super::AnalyzerContext<'a> {
         )
     }
 
+    fn analyze_predicated(
+        &self,
+        node: &ast::PredicatedExpr,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        if let Some(reason) = unsupported_predicate_reason(node) {
+            return Err(AnalyzeError::unsupported_expression(reason, node.span));
+        }
+        let value = &node.value;
+        let span = node.span;
+        match &node.predicate {
+            ast::Predicate::Comparison(predicate) => {
+                let op = match predicate.operator {
+                    ast::ComparisonOperator::Equal => BinOp::Eq,
+                    ast::ComparisonOperator::NotEqual => BinOp::Ne,
+                    ast::ComparisonOperator::LessThan => BinOp::Lt,
+                    ast::ComparisonOperator::LessThanOrEqual => BinOp::Le,
+                    ast::ComparisonOperator::GreaterThan => BinOp::Gt,
+                    ast::ComparisonOperator::GreaterThanOrEqual => BinOp::Ge,
+                };
+                self.analyze_comparison_predicate(value, op, &predicate.right, scope)
+            }
+            ast::Predicate::DistinctFrom(predicate) => {
+                let equal = self.analyze_comparison_predicate(
+                    value,
+                    BinOp::EqForNull,
+                    &predicate.right,
+                    scope,
+                )?;
+                if predicate.negated {
+                    Ok(equal)
+                } else {
+                    let value_type = equal.value_type.clone();
+                    Ok(TypedExpr {
+                        kind: ExprKind::UnaryOp {
+                            op: UnOp::Not,
+                            expr: Box::new(equal),
+                        },
+                        value_type,
+                    })
+                }
+            }
+            ast::Predicate::IsNull(predicate) => {
+                let inner = self.analyze_expr(value, scope)?;
+                Ok(TypedExpr {
+                    kind: ExprKind::IsNull {
+                        expr: Box::new(inner),
+                        negated: predicate.negated,
+                    },
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+                })
+            }
+            ast::Predicate::BooleanTest(predicate) => {
+                let inner = self.analyze_expr(value, scope)?;
+                Ok(TypedExpr {
+                    kind: ExprKind::IsTruthValue {
+                        expr: Box::new(inner),
+                        value: predicate.truth_value == ast::TruthValue::True,
+                        negated: predicate.negated,
+                    },
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+                })
+            }
+            ast::Predicate::Between(predicate) => {
+                self.analyze_between_predicate(value, predicate, span, scope)
+            }
+            ast::Predicate::Like(predicate) => self.analyze_like_predicate(value, predicate, scope),
+            ast::Predicate::In(predicate) => match &predicate.value_list {
+                ast::Expr::InList(list) => self.analyze_in_list_predicate(
+                    value,
+                    &list.values,
+                    predicate.negated,
+                    span,
+                    scope,
+                ),
+                ast::Expr::Subquery(subquery) => self.analyze_in_subquery_predicate(
+                    value,
+                    &subquery.query,
+                    predicate.negated,
+                    span,
+                    scope,
+                ),
+                _ => unreachable!("the IN profile is checked before child analysis"),
+            },
+            ast::Predicate::Overlaps(_)
+            | ast::Predicate::QuantifiedComparison(_)
+            | ast::Predicate::Match(_) => {
+                unreachable!("unsupported predicate profiles are rejected before child analysis")
+            }
+        }
+    }
+    fn analyze_in_list_predicate(
+        &self,
+        value: &ast::Expr,
+        values: &[ast::Expr],
+        negated: bool,
+        span: Span,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        use super::literal_coercion::coerce_literal_for_comparison;
+        let mut expr_typed = self.analyze_expr(value, scope)?;
+        // StarRocks-aligned implicit literal coercion: when the IN
+        // expression is `column IN (lit, lit, ...)`, coerce each
+        // string literal to the column's type before emitting the
+        // InList. Mirrors the binary-op comparison coercion.
+        let mut list_typed = Vec::with_capacity(values.len());
+        for item in values {
+            let item_typed = self.analyze_expr(item, scope)?;
+            check_json_comparison_domains(
+                &expr_typed.value_type,
+                &item_typed.value_type,
+                "IN",
+                span,
+            )?;
+            list_typed.push(coerce_literal_for_comparison(&expr_typed, item_typed));
+        }
+        // BITMAP / HLL operands cannot participate in IN / NOT IN
+        // because they have no scalar identity. Reject upfront so the
+        // user sees a clear error before lowering / codegen.
+        let kw = if negated { "NOT IN" } else { "IN" };
+        if let Some(logical) = scope
+            .logical_type_of_expr(&expr_typed)
+            .filter(is_bitmap_or_hll_type)
+        {
+            let col = column_name_of_expr(&expr_typed);
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
+                ),
+                span,
+            ));
+        }
+        for item in &list_typed {
+            if let Some(logical) = scope
+                .logical_type_of_expr(item)
+                .filter(is_bitmap_or_hll_type)
+            {
+                let col = column_name_of_expr(item);
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
+                    ),
+                    span,
+                ));
+            }
+        }
+        for item in &list_typed {
+            if incompatible_complex_compare(
+                expr_typed.value_type.data_type(),
+                item.value_type.data_type(),
+            )
+            .is_some()
+            {
+                return Err(AnalyzeError::type_mismatch(
+                    in_predicate_type_error(
+                        expr_typed.value_type.data_type(),
+                        item.value_type.data_type(),
+                    ),
+                    span,
+                ));
+            }
+        }
+        let mut common_type = expr_typed.value_type.clone();
+        for item in &list_typed {
+            self.check_control()?;
+            common_type = wider_comparison_value_type(&common_type, &item.value_type)
+                .map_err(|error| AnalyzeError::type_mismatch_source(error, span))?;
+        }
+        let target = self.implicit_common_cast_target(&expr_typed.value_type, &common_type);
+        expr_typed = self.cast_to_value_type(expr_typed, target, span)?;
+        let mut coerced_list = Vec::with_capacity(list_typed.len());
+        for item in list_typed {
+            self.check_control()?;
+            let target = self.implicit_common_cast_target(&item.value_type, &common_type);
+            coerced_list.push(self.cast_to_value_type(item, target, span)?);
+        }
+        let list_typed = coerced_list;
+        // Three-valued: `NULL IN (1, 2)` and `1 IN (NULL, 2)` are both
+        // NULL, so the result is nullable whenever any operand is.
+        let nullable = expr_typed.value_type.nullable()
+            || list_typed
+                .iter()
+                .any(|candidate| candidate.value_type.nullable());
+        Ok(TypedExpr {
+            kind: ExprKind::InList {
+                expr: Box::new(expr_typed),
+                list: list_typed,
+                negated,
+            },
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                nullable,
+            ),
+        })
+    }
+    fn analyze_between_predicate(
+        &self,
+        value: &ast::Expr,
+        predicate: &ast::BetweenPredicate,
+        span: Span,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        use super::literal_coercion::coerce_literal_for_comparison;
+        let expr_typed = self.analyze_expr(value, scope)?;
+        let low_typed = self.analyze_expr(&predicate.min, scope)?;
+        let high_typed = self.analyze_expr(&predicate.max, scope)?;
+        for (left, right) in [
+            (&expr_typed, &low_typed),
+            (&expr_typed, &high_typed),
+            (&low_typed, &high_typed),
+        ] {
+            check_json_comparison_domains(&left.value_type, &right.value_type, "BETWEEN", span)?;
+        }
+        // StarRocks-aligned implicit literal coercion: for
+        // `column BETWEEN lit AND lit`, coerce each string literal
+        // to the column's type. The helper gates on the LHS being a
+        // column ref (same convention as binary-op comparisons), so
+        // `expr_typed BETWEEN ...` where the LHS is a non-column
+        // expression is left unchanged.
+        let low_typed = coerce_literal_for_comparison(&expr_typed, low_typed);
+        let high_typed = coerce_literal_for_comparison(&expr_typed, high_typed);
+        // BITMAP / HLL operands cannot participate in BETWEEN because
+        // they have no ordering. Reject upfront so the user sees a
+        // clear error before lowering / codegen.
+        for operand in [&expr_typed, &low_typed, &high_typed] {
+            if let Some(logical) = scope
+                .logical_type_of_expr(operand)
+                .filter(is_bitmap_or_hll_type)
+            {
+                let col = column_name_of_expr(operand);
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "BITMAP/HLL columns cannot appear in BETWEEN expressions (operand `{col}` has type {logical:?})"
+                    ),
+                    span,
+                ));
+            }
+        }
+        let common_type =
+            wider_comparison_value_type(&expr_typed.value_type, &low_typed.value_type)
+                .and_then(|common| wider_comparison_value_type(&common, &high_typed.value_type))
+                .map_err(|error| AnalyzeError::type_mismatch_source(error, span))?;
+        let cast = |operand: TypedExpr| {
+            let target = self.implicit_common_cast_target(&operand.value_type, &common_type);
+            self.cast_to_value_type(operand, target, span)
+        };
+        let expr_typed = cast(expr_typed)?;
+        let low_typed = cast(low_typed)?;
+        let high_typed = cast(high_typed)?;
+        // A comparison against NULL is NULL, so the result admits
+        // null whenever any operand does. A filter treating null as
+        // not-matching is the filter's own semantics, not this type's.
+        let nullable = expr_typed.value_type.nullable()
+            || low_typed.value_type.nullable()
+            || high_typed.value_type.nullable();
+        Ok(TypedExpr {
+            kind: ExprKind::Between {
+                expr: Box::new(expr_typed),
+                low: Box::new(low_typed),
+                high: Box::new(high_typed),
+                negated: predicate.negated,
+            },
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                nullable,
+            ),
+        })
+    }
+    fn analyze_like_predicate(
+        &self,
+        value: &ast::Expr,
+        predicate: &ast::LikePredicate,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let expr_typed = self.analyze_expr(value, scope)?;
+        let pattern_typed = self.analyze_expr(&predicate.pattern, scope)?;
+        let nullable = expr_typed.value_type.nullable() || pattern_typed.value_type.nullable();
+        Ok(TypedExpr {
+            kind: ExprKind::Like {
+                expr: Box::new(expr_typed),
+                pattern: Box::new(pattern_typed),
+                negated: predicate.negated,
+            },
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                nullable,
+            ),
+        })
+    }
+    fn analyze_in_subquery_predicate(
+        &self,
+        value: &ast::Expr,
+        query: &ast::Query,
+        negated: bool,
+        span: Span,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        // Multi-column LHS `(a, b) IN (SELECT c, d FROM ...)` arrives
+        // here wrapped as `Expr::Tuple(...)` (or `Expr::Nested(Tuple(...))`).
+        // The whole tuple is not a single scalar expression — the
+        // analyzer's catch-all rejects it as "unsupported expression".
+        // `subquery_rewrite::rewrite_in_subquery` handles the
+        // decomposition (per-column equi-join) downstream, so just
+        // skip the BITMAP / JSON / HLL precheck here: those checks
+        // are per-column and only meaningful for a single-column LHS.
+        let lhs_is_tuple = match value {
+            ast::Expr::Tuple(_) => true,
+            ast::Expr::Nested(inner) => {
+                matches!(inner.expression.as_ref(), ast::Expr::Tuple(_))
+            }
+            _ => false,
+        };
+        let mut json_probe = false;
+        if !lhs_is_tuple {
+            // BITMAP / HLL operands cannot participate in IN subquery
+            // because they have no scalar identity. Reject upfront by
+            // resolving the LHS to detect a logical-type tag; the LHS
+            // is dropped before the subquery is planned so we cannot
+            // wait until later.
+            let in_expr_typed = self.analyze_expr(value, scope)?;
+            json_probe = is_json_in_subquery_operand(&in_expr_typed, scope);
+            if let Some(logical) = scope
+                .logical_type_of_expr(&in_expr_typed)
+                .filter(is_bitmap_or_hll_type)
+            {
+                let col = column_name_of_expr(&in_expr_typed);
+                let kw = if negated { "NOT IN" } else { "IN" };
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "BITMAP/HLL columns cannot appear in {kw} subquery expressions (operand `{col}` has type {logical:?})"
+                    ),
+                    span,
+                ));
+            }
+        }
+        let id = self.alloc_subquery_id();
+        let kind = SubqueryKind::InSubquery { negated: negated };
+        self.collected_subqueries.borrow_mut().push(SubqueryInfo {
+            id,
+            kind: kind.clone(),
+            subquery: Box::new(query.clone()),
+            data_type: DataType::Boolean,
+            in_expr: Some(Box::new(value.clone())),
+        });
+        Ok(TypedExpr {
+            kind: ExprKind::SubqueryPlaceholder {
+                id,
+                kind,
+                data_type: DataType::Boolean,
+            },
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                json_probe,
+            ),
+        })
+    }
+    fn analyze_comparison_predicate(
+        &self,
+        left: &ast::Expr,
+        op: BinOp,
+        right: &ast::Expr,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let left_typed = self.analyze_expr(left, scope)?;
+        let right_typed = self.analyze_expr(right, scope)?;
+        let (left_typed, right_typed) = {
+            use super::literal_coercion::coerce_literal_for_comparison;
+            // BITMAP / HLL columns have no scalar identity and cannot be
+            // compared with `=`, `<`, etc. Reject before the operand type
+            // is dropped to `Boolean` so the user sees a clear error.
+            let op_sym = match op {
+                BinOp::Eq => "=",
+                BinOp::Ne => "!=",
+                BinOp::Lt => "<",
+                BinOp::Le => "<=",
+                BinOp::Gt => ">",
+                BinOp::Ge => ">=",
+                BinOp::EqForNull => "<=>",
+                _ => unreachable!(),
+            };
+            check_json_comparison_domains(
+                &left_typed.value_type,
+                &right_typed.value_type,
+                op_sym,
+                left.span(),
+            )?;
+            if let Some(logical) = scope
+                .logical_type_of_expr(&left_typed)
+                .filter(is_bitmap_or_hll_type)
+            {
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "comparison operator `{op_sym}` is not supported for BITMAP/HLL (left operand has type {logical:?})"
+                    ),
+                    left.span(),
+                ));
+            }
+            if let Some(logical) = scope
+                .logical_type_of_expr(&right_typed)
+                .filter(is_bitmap_or_hll_type)
+            {
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
+                    ),
+                    right.span(),
+                ));
+            }
+            // Ordering operators (`<`, `<=`, `>`, `>=`) are undefined on
+            // ARRAY / MAP / STRUCT values in standalone SQL. Keep equality
+            // and null-safe equality on ARRAY available, but reject
+            // ordering predicates at analysis time so join predicates fail
+            // before reaching execution.
+            let is_ordering_op = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+            if is_ordering_op {
+                let unsupported_complex_kind = |dt: &DataType| match dt {
+                    DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+                        Some("ARRAY")
+                    }
+                    DataType::Map(_, _) => Some("MAP"),
+                    DataType::Struct(_) => Some("STRUCT"),
+                    _ => None,
+                };
+                if let Some(kind) = unsupported_complex_kind(left_typed.value_type.data_type())
+                    .or_else(|| unsupported_complex_kind(right_typed.value_type.data_type()))
+                {
+                    return Err(AnalyzeError::invalid_argument(
+                        format!(
+                            "comparison operator `{op_sym}` does not support binary predicate operation on {kind} values"
+                        ),
+                        left.span(),
+                    ));
+                }
+            }
+            // Reject comparisons between complex types whose element /
+            // entry / field layouts are fundamentally incompatible.
+            // Cases like `array<int> = [map{...}, null]` would otherwise
+            // fall through to a runtime CAST that produces a confusing
+            // error; surface a clear analyzer-level message instead.
+            if let Some(reason) = incompatible_complex_compare(
+                left_typed.value_type.data_type(),
+                right_typed.value_type.data_type(),
+            ) {
+                return Err(AnalyzeError::type_mismatch(
+                    format!(
+                        "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                    ),
+                    left.span(),
+                ));
+            }
+            let right_coerced = coerce_literal_for_comparison(&left_typed, right_typed);
+            let left_coerced = coerce_literal_for_comparison(&right_coerced, left_typed);
+            // StarRocks ImplicitCastRule analog for `col op col`: coerce the
+            // two operands to a common numeric/decimal type and materialize a
+            // Cast on each differing side, BEFORE the optimizer / runtime-filter
+            // pass. This lets mixed-type equi-joins (e.g. int32 = int64) carry
+            // matching key types so the RF gate (rf_key_types_match) passes.
+            // Non-numeric pairs return None and are left to literal coercion /
+            // execution-time comparison coercion.
+            match comparison_common_value_type(&left_coerced.value_type, &right_coerced.value_type)
+                .map_err(|message| AnalyzeError::type_mismatch_source(message, left.span()))?
+            {
+                Some(common) => {
+                    let left_target =
+                        self.implicit_common_cast_target(&left_coerced.value_type, &common);
+                    let right_target =
+                        self.implicit_common_cast_target(&right_coerced.value_type, &common);
+                    (
+                        self.cast_to_value_type(left_coerced, left_target, left.span())?,
+                        self.cast_to_value_type(right_coerced, right_target, right.span())?,
+                    )
+                }
+                None => (left_coerced, right_coerced),
+            }
+        };
+        let nullable = op != BinOp::EqForNull
+            && (left_typed.value_type.nullable()
+                || right_typed.value_type.nullable()
+                || compares_element_wise_with_nulls(left_typed.value_type.data_type())
+                || compares_element_wise_with_nulls(right_typed.value_type.data_type()));
+        Ok(TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left_typed),
+                op,
+                right: Box::new(right_typed),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                nullable,
+            ),
+        })
+    }
+
     /// Analyze original logical terms in source order, then balance only the
     /// typed IR. Each term keeps its actual materialized-source identity.
     /// See [`MAX_BOOLEAN_CHAIN_OPERANDS`] for the current downstream width bound.
@@ -1526,143 +1747,6 @@ impl<'a> super::AnalyzerContext<'a> {
         let left_typed = self.analyze_expr(left, scope)?;
         let right_typed = self.analyze_expr(right, scope)?;
 
-        // StarRocks-aligned implicit literal coercion: when a comparison has
-        // (column, literal) we coerce the literal to the column's type before
-        // emitting the BinaryOp. Mirrors LiteralExprFactory.create(value, ty).
-        let (left_typed, right_typed) = {
-            use super::literal_coercion::coerce_literal_for_comparison;
-            let coerce_for_compare = matches!(
-                op,
-                ast::BinaryOperator::Equal
-                    | ast::BinaryOperator::NotEqual
-                    | ast::BinaryOperator::LessThan
-                    | ast::BinaryOperator::LessThanOrEqual
-                    | ast::BinaryOperator::GreaterThan
-                    | ast::BinaryOperator::GreaterThanOrEqual
-                    | ast::BinaryOperator::NullSafeEqual
-            );
-            if coerce_for_compare {
-                // BITMAP / HLL columns have no scalar identity and cannot be
-                // compared with `=`, `<`, etc. Reject before the operand type
-                // is dropped to `Boolean` so the user sees a clear error.
-                let op_sym = match op {
-                    ast::BinaryOperator::Equal => "=",
-                    ast::BinaryOperator::NotEqual => "!=",
-                    ast::BinaryOperator::LessThan => "<",
-                    ast::BinaryOperator::LessThanOrEqual => "<=",
-                    ast::BinaryOperator::GreaterThan => ">",
-                    ast::BinaryOperator::GreaterThanOrEqual => ">=",
-                    ast::BinaryOperator::NullSafeEqual => "<=>",
-                    _ => unreachable!(),
-                };
-                check_json_comparison_domains(
-                    &left_typed.value_type,
-                    &right_typed.value_type,
-                    op_sym,
-                    left.span(),
-                )?;
-                if let Some(logical) = scope
-                    .logical_type_of_expr(&left_typed)
-                    .filter(is_bitmap_or_hll_type)
-                {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!(
-                            "comparison operator `{op_sym}` is not supported for BITMAP/HLL (left operand has type {logical:?})"
-                        ),
-                        left.span(),
-                    ));
-                }
-                if let Some(logical) = scope
-                    .logical_type_of_expr(&right_typed)
-                    .filter(is_bitmap_or_hll_type)
-                {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!(
-                            "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
-                        ),
-                        right.span(),
-                    ));
-                }
-                // Ordering operators (`<`, `<=`, `>`, `>=`) are undefined on
-                // ARRAY / MAP / STRUCT values in standalone SQL. Keep equality
-                // and null-safe equality on ARRAY available, but reject
-                // ordering predicates at analysis time so join predicates fail
-                // before reaching execution.
-                let is_ordering_op = matches!(
-                    op,
-                    ast::BinaryOperator::LessThan
-                        | ast::BinaryOperator::LessThanOrEqual
-                        | ast::BinaryOperator::GreaterThan
-                        | ast::BinaryOperator::GreaterThanOrEqual
-                );
-                if is_ordering_op {
-                    let unsupported_complex_kind = |dt: &DataType| match dt {
-                        DataType::List(_)
-                        | DataType::LargeList(_)
-                        | DataType::FixedSizeList(_, _) => Some("ARRAY"),
-                        DataType::Map(_, _) => Some("MAP"),
-                        DataType::Struct(_) => Some("STRUCT"),
-                        _ => None,
-                    };
-                    if let Some(kind) = unsupported_complex_kind(left_typed.value_type.data_type())
-                        .or_else(|| unsupported_complex_kind(right_typed.value_type.data_type()))
-                    {
-                        return Err(AnalyzeError::invalid_argument(
-                            format!(
-                                "comparison operator `{op_sym}` does not support binary predicate operation on {kind} values"
-                            ),
-                            left.span(),
-                        ));
-                    }
-                }
-                // Reject comparisons between complex types whose element /
-                // entry / field layouts are fundamentally incompatible.
-                // Cases like `array<int> = [map{...}, null]` would otherwise
-                // fall through to a runtime CAST that produces a confusing
-                // error; surface a clear analyzer-level message instead.
-                if let Some(reason) = incompatible_complex_compare(
-                    left_typed.value_type.data_type(),
-                    right_typed.value_type.data_type(),
-                ) {
-                    return Err(AnalyzeError::type_mismatch(
-                        format!(
-                            "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
-                        ),
-                        left.span(),
-                    ));
-                }
-                let right_coerced = coerce_literal_for_comparison(&left_typed, right_typed);
-                let left_coerced = coerce_literal_for_comparison(&right_coerced, left_typed);
-                // StarRocks ImplicitCastRule analog for `col op col`: coerce the
-                // two operands to a common numeric/decimal type and materialize a
-                // Cast on each differing side, BEFORE the optimizer / runtime-filter
-                // pass. This lets mixed-type equi-joins (e.g. int32 = int64) carry
-                // matching key types so the RF gate (rf_key_types_match) passes.
-                // Non-numeric pairs return None and are left to literal coercion /
-                // execution-time comparison coercion.
-                match comparison_common_value_type(
-                    &left_coerced.value_type,
-                    &right_coerced.value_type,
-                )
-                .map_err(|message| AnalyzeError::type_mismatch_source(message, left.span()))?
-                {
-                    Some(common) => {
-                        let left_target =
-                            self.implicit_common_cast_target(&left_coerced.value_type, &common);
-                        let right_target =
-                            self.implicit_common_cast_target(&right_coerced.value_type, &common);
-                        (
-                            self.cast_to_value_type(left_coerced, left_target, left.span())?,
-                            self.cast_to_value_type(right_coerced, right_target, right.span())?,
-                        )
-                    }
-                    None => (left_coerced, right_coerced),
-                }
-            } else {
-                (left_typed, right_typed)
-            }
-        };
-
         // A boolean is a one-bit number once it reaches arithmetic: TRUE is 1
         // and FALSE is 0, and `x + any_match(...)` is how a lambda counts the
         // elements that matched. Spelling that as a cast to the width a
@@ -1733,36 +1817,6 @@ impl<'a> super::AnalyzerContext<'a> {
             })
         };
         let (bin_op, result_type) = match op {
-            // Comparison operators -> Boolean
-            ast::BinaryOperator::Equal => (
-                BinOp::Eq,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-            ast::BinaryOperator::NotEqual => (
-                BinOp::Ne,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-            ast::BinaryOperator::LessThan => (
-                BinOp::Lt,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-            ast::BinaryOperator::LessThanOrEqual => (
-                BinOp::Le,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-            ast::BinaryOperator::GreaterThan => (
-                BinOp::Gt,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-            ast::BinaryOperator::GreaterThanOrEqual => (
-                BinOp::Ge,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-            ast::BinaryOperator::NullSafeEqual => (
-                BinOp::EqForNull,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-
             // Arithmetic operators -> inferred type
             ast::BinaryOperator::Add => {
                 let dt = arithmetic_type(ArithmeticOperator::Add)?;
@@ -4238,26 +4292,31 @@ impl<'a> super::AnalyzerContext<'a> {
                 .iter()
                 .any(|term| self.expr_contains_aggregate(term)),
             ast::Expr::Unary(unary) => self.expr_contains_aggregate(&unary.expression),
-            ast::Expr::IsPredicate(predicate) => self.expr_contains_aggregate(&predicate.expr),
-            ast::Expr::InList(in_list) => {
-                self.expr_contains_aggregate(&in_list.expr)
-                    || in_list
-                        .list
-                        .iter()
-                        .any(|item| self.expr_contains_aggregate(item))
+            ast::Expr::Predicated(node) => {
+                self.expr_contains_aggregate(&node.value)
+                    || match &node.predicate {
+                        ast::Predicate::Comparison(p) => self.expr_contains_aggregate(&p.right),
+                        ast::Predicate::DistinctFrom(p) => self.expr_contains_aggregate(&p.right),
+                        ast::Predicate::Between(p) => {
+                            self.expr_contains_aggregate(&p.min)
+                                || self.expr_contains_aggregate(&p.max)
+                        }
+                        ast::Predicate::Like(p) => {
+                            self.expr_contains_aggregate(&p.pattern)
+                                || p.escape
+                                    .as_ref()
+                                    .is_some_and(|e| self.expr_contains_aggregate(e))
+                        }
+                        ast::Predicate::In(p) => match &p.value_list {
+                            ast::Expr::InList(list) => {
+                                list.values.iter().any(|e| self.expr_contains_aggregate(e))
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    }
             }
-            // The probe is in this SELECT's domain; aggregates inside the
-            // subquery belong to its own SELECT and must not leak outward.
-            ast::Expr::InSubquery(in_subquery) => self.expr_contains_aggregate(&in_subquery.expr),
-            ast::Expr::Between(between) => {
-                self.expr_contains_aggregate(&between.expr)
-                    || self.expr_contains_aggregate(&between.low)
-                    || self.expr_contains_aggregate(&between.high)
-            }
-            ast::Expr::Like(like) => {
-                self.expr_contains_aggregate(&like.expr)
-                    || self.expr_contains_aggregate(&like.pattern)
-            }
+            ast::Expr::InList(list) => list.values.iter().any(|e| self.expr_contains_aggregate(e)),
             ast::Expr::Nested(nested) => self.expr_contains_aggregate(&nested.expression),
             ast::Expr::Cast(cast) => self.expr_contains_aggregate(&cast.expr),
             ast::Expr::Tuple(tuple) => tuple

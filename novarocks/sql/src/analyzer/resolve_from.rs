@@ -1280,19 +1280,25 @@ fn generate_series_named_arg_is_some(expr: &ast::Expr) -> bool {
 }
 
 fn generate_series_named_arg(expr: &ast::Expr) -> Option<(&ast::Ident, &ast::Expr)> {
-    let ast::Expr::Binary(binary) = expr else {
+    let (left, right) = match expr {
+        ast::Expr::Binary(binary) if binary.operator == ast::BinaryOperator::NamedArgument => {
+            (binary.left.as_ref(), binary.right.as_ref())
+        }
+        ast::Expr::Predicated(node) => {
+            let ast::Predicate::Comparison(p) = &node.predicate else {
+                return None;
+            };
+            if p.operator != ast::ComparisonOperator::Equal {
+                return None;
+            }
+            (&node.value, &p.right)
+        }
+        _ => return None,
+    };
+    let ast::Expr::Identifier(name) = left else {
         return None;
     };
-    if !matches!(
-        binary.operator,
-        ast::BinaryOperator::NamedArgument | ast::BinaryOperator::Equal
-    ) {
-        return None;
-    }
-    let ast::Expr::Identifier(name) = binary.left.as_ref() else {
-        return None;
-    };
-    Some((name, binary.right.as_ref()))
+    Some((name, right))
 }
 
 fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {

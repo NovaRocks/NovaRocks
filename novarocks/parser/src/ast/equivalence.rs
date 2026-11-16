@@ -496,13 +496,10 @@ impl SyntaxEq for Expr {
             (Self::Unary(left), Self::Unary(right)) => left.syntax_eq(right),
             (Self::Binary(left), Self::Binary(right)) => left.syntax_eq(right),
             (Self::Logical(left), Self::Logical(right)) => left.syntax_eq(right),
-            (Self::Nested(left), Self::Nested(right)) => left.syntax_eq(right),
-            (Self::Between(left), Self::Between(right)) => left.syntax_eq(right),
+            (Self::Predicated(left), Self::Predicated(right)) => left.syntax_eq(right),
             (Self::InList(left), Self::InList(right)) => left.syntax_eq(right),
-            (Self::InSubquery(left), Self::InSubquery(right)) => left.syntax_eq(right),
+            (Self::Nested(left), Self::Nested(right)) => left.syntax_eq(right),
             (Self::Exists(left), Self::Exists(right)) => left.syntax_eq(right),
-            (Self::Like(left), Self::Like(right)) => left.syntax_eq(right),
-            (Self::IsPredicate(left), Self::IsPredicate(right)) => left.syntax_eq(right),
             (Self::Case(left), Self::Case(right)) => left.syntax_eq(right),
             (Self::Cast(left), Self::Cast(right)) => left.syntax_eq(right),
             (Self::Interval(left), Self::Interval(right)) => left.syntax_eq(right),
@@ -567,50 +564,9 @@ impl SyntaxEq for NestedExpr {
     }
 }
 
-impl SyntaxEq for BetweenExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.expr.syntax_eq(&other.expr)
-            && self.negated == other.negated
-            && self.low.syntax_eq(&other.low)
-            && self.high.syntax_eq(&other.high)
-    }
-}
-
-impl SyntaxEq for InListExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.expr.syntax_eq(&other.expr)
-            && self.negated == other.negated
-            && syntax_eq_slice(&self.list, &other.list)
-    }
-}
-
-impl SyntaxEq for InSubqueryExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.expr.syntax_eq(&other.expr)
-            && self.negated == other.negated
-            && self.query.syntax_eq(&other.query)
-    }
-}
-
 impl SyntaxEq for ExistsExpr {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.negated == other.negated && self.query.syntax_eq(&other.query)
-    }
-}
-
-impl SyntaxEq for LikeExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.expr.syntax_eq(&other.expr)
-            && self.negated == other.negated
-            && self.operator == other.operator
-            && self.pattern.syntax_eq(&other.pattern)
-            && syntax_eq_option(&self.escape, &other.escape)
-    }
-}
-
-impl SyntaxEq for IsPredicateExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.expr.syntax_eq(&other.expr) && self.predicate == other.predicate
     }
 }
 
@@ -814,11 +770,14 @@ mod tests {
                 kind: LiteralKind::String(",".to_owned()),
                 span: span(start + 10),
             }))),
-            filter: Some(Box::new(Expr::IsPredicate(IsPredicateExpr {
-                expr: Box::new(Expr::Identifier(ident("present", start + 11))),
-                predicate: IsPredicate::NotNull,
+            filter: Some(Box::new(Expr::Predicated(AstBox::new(PredicatedExpr {
+                value: Expr::Identifier(ident("present", start + 11)),
+                predicate: Predicate::IsNull(IsNullPredicate {
+                    negated: true,
+                    span: span(start + 12),
+                }),
                 span: span(start + 12),
-            }))),
+            })))),
             null_treatment: Some(NullTreatment::IgnoreNulls),
             over: Some(Box::new(WindowSpec {
                 existing_window_name: Some(ident("base", start + 13)),

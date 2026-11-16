@@ -317,10 +317,7 @@ fn reject_subqueries(
                 self.error = Some(AnalyzeError::control(cause));
                 return;
             }
-            if matches!(
-                expression,
-                ast::Expr::Subquery(_) | ast::Expr::InSubquery(_) | ast::Expr::Exists(_)
-            ) {
+            if matches!(expression, ast::Expr::Subquery(_) | ast::Expr::Exists(_)) {
                 self.error = Some(AnalyzeError::unsupported_expression(
                     "required constants cannot contain subqueries",
                     expression.span(),

@@ -258,3 +258,246 @@ fn logical_term_paths_borrow_only_the_authored_occurrence_and_reject_wrong_edges
     assert_eq!(retained.ordinal(), 1);
     assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
 }
+
+#[test]
+fn predicate_source_paths_keep_actual_children_and_refuse_wrong_fields_or_clones() {
+    use SqlConstantExpressionStep as Edge;
+    let control = SqlCompileControl::unbounded();
+    let retained = value(crate::constant::test_constant_policy(), &control);
+    type Case = (
+        &'static str,
+        Vec<Edge>,
+        fn(&ast::PredicatedExpr) -> &ast::Expr,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "SELECT source_value = 1",
+            vec![Edge::PredicatedValue],
+            |p| &p.value,
+        ),
+        (
+            "SELECT 1 = source_value",
+            vec![Edge::ComparisonRight],
+            |p| {
+                let ast::Predicate::Comparison(p) = &p.predicate else {
+                    panic!("comparison")
+                };
+                &p.right
+            },
+        ),
+        (
+            "SELECT 1 <=> source_value",
+            vec![Edge::ComparisonRight],
+            |p| {
+                let ast::Predicate::DistinctFrom(p) = &p.predicate else {
+                    panic!("null-safe equality")
+                };
+                &p.right
+            },
+        ),
+        (
+            "SELECT 1 BETWEEN source_value AND 3",
+            vec![Edge::BetweenMin],
+            |p| {
+                let ast::Predicate::Between(p) = &p.predicate else {
+                    panic!("between")
+                };
+                &p.min
+            },
+        ),
+        (
+            "SELECT 1 BETWEEN 0 AND source_value",
+            vec![Edge::BetweenMax],
+            |p| {
+                let ast::Predicate::Between(p) = &p.predicate else {
+                    panic!("between")
+                };
+                &p.max
+            },
+        ),
+        (
+            "SELECT 'a' LIKE source_value",
+            vec![Edge::LikePattern],
+            |p| {
+                let ast::Predicate::Like(p) = &p.predicate else {
+                    panic!("like")
+                };
+                &p.pattern
+            },
+        ),
+        (
+            "SELECT 1 IN (2,source_value)",
+            vec![Edge::InValueList, Edge::InListValue(1)],
+            |p| {
+                let ast::Predicate::In(p) = &p.predicate else {
+                    panic!("in")
+                };
+                let ast::Expr::InList(list) = &p.value_list else {
+                    panic!("list")
+                };
+                &list.values[1]
+            },
+        ),
+    ];
+    for (sql, path, selected) in cases {
+        let query = query(sql);
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("select")
+        };
+        let ast::SelectItem::UnnamedExpr(ast::Expr::Predicated(node)) = &select.projection[0]
+        else {
+            panic!("predicated projection")
+        };
+        let source = MaterializedValues::try_new_expressions(
+            &query,
+            vec![
+                SqlExpressionConstant::new(
+                    vec![],
+                    SqlConstantExpressionSite::SelectProjection { column: 0 },
+                    retained.clone(),
+                )
+                .with_expression_path(path),
+            ]
+            .into(),
+            &control,
+        )
+        .unwrap();
+        let owned = source.loan(&query, &control).unwrap();
+        let selected = selected(node);
+        assert!(owned.view().constant_at(selected).is_some(), "{sql}");
+        assert!(
+            owned.view().constant_at(&selected.clone()).is_none(),
+            "{sql}"
+        );
+        assert!(
+            owned
+                .view()
+                .constant_at(
+                    &select
+                        .projection
+                        .iter()
+                        .find_map(|item| match item {
+                            ast::SelectItem::UnnamedExpr(expr) => Some(expr),
+                            _ => None,
+                        })
+                        .unwrap()
+                        .clone()
+                )
+                .is_none()
+        );
+    }
+    let query = query("SELECT 1 IN (2,3)");
+    for path in [
+        vec![Edge::ComparisonRight],
+        vec![Edge::BetweenMin],
+        vec![Edge::LikePattern],
+        vec![Edge::InListValue(0)],
+        vec![Edge::InValueList, Edge::InListValue(2)],
+        vec![
+            Edge::InValueList,
+            Edge::InListValue(0),
+            Edge::ComparisonRight,
+        ],
+    ] {
+        assert!(
+            MaterializedValues::try_new_expressions(
+                &query,
+                vec![
+                    SqlExpressionConstant::new(
+                        vec![],
+                        SqlConstantExpressionSite::SelectProjection { column: 0 },
+                        retained.clone()
+                    )
+                    .with_expression_path(path)
+                ]
+                .into(),
+                &control
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn actual_in_predicate_preserves_nonzero_constant_sources_on_both_sides() {
+    use SqlConstantExpressionStep as Edge;
+    use arrow::array::{Array, Int32Array};
+    use novarocks_functions::ConstantPool;
+    let control = SqlCompileControl::unbounded();
+    let policy = crate::constant::test_constant_policy();
+    let ty = FunctionValueType::new(arrow::datatypes::DataType::Int32, false);
+    let field = Arc::new(arrow::datatypes::Field::new(
+        "original_in_source",
+        arrow::datatypes::DataType::Int32,
+        false,
+    ));
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        Int32Array::from(vec![99, 2]).to_data(),
+        policy,
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let retained = pool.value(1).unwrap();
+    let query = query("SELECT original_probe IN (1,original_candidate)");
+    let constants = [
+        vec![Edge::PredicatedValue],
+        vec![Edge::InValueList, Edge::InListValue(1)],
+    ]
+    .into_iter()
+    .map(|path| {
+        SqlExpressionConstant::new(
+            vec![],
+            SqlConstantExpressionSite::SelectProjection { column: 0 },
+            retained.clone(),
+        )
+        .with_expression_path(path)
+    })
+    .collect::<Vec<_>>()
+    .into();
+    let source = MaterializedValues::try_new_expressions(&query, constants, &control).unwrap();
+    let (resolved, _, _) = crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
+        &query,
+        &crate::planning::catalog::PlannerMemoryCatalog::default(),
+        "db",
+        &build_builtin_engine_function_catalog().unwrap(),
+        &crate::sql_mode::SqlSemanticSettings::default(),
+        policy,
+        &control,
+        Some(&source),
+    )
+    .unwrap();
+    let crate::analysis::QueryBody::Select(select) = resolved.body else {
+        panic!("resolved select")
+    };
+    assert_eq!(
+        select.projection[0].expr.value_type,
+        FunctionValueType::new(arrow::datatypes::DataType::Boolean, false)
+    );
+    let crate::analysis::ExprKind::InList {
+        expr,
+        list,
+        negated,
+    } = &select.projection[0].expr.kind
+    else {
+        panic!("original IN typed owner")
+    };
+    assert!(!negated);
+    assert_eq!(list.len(), 2);
+    assert!(matches!(
+        list[0].kind,
+        crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(1))
+    ));
+    for original in [expr.as_ref(), &list[1]] {
+        assert_eq!(original.value_type, ty);
+        let crate::analysis::ExprKind::Constant(value) = &original.kind else {
+            panic!("original source constant")
+        };
+        assert_eq!(value.ordinal(), 1);
+        assert_eq!(value.pool().backing_identity(), pool.backing_identity());
+        assert_eq!(value.field(), field.as_ref());
+        assert_eq!(value.value_type(), &ty);
+    }
+}

@@ -90,6 +90,28 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                 return;
             }
             match expression {
+                Expr::Predicated(node) => {
+                    if let Some(reason) = super::unsupported_predicate_reason(node) {
+                        self.0 = Some((reason, node.span));
+                        return;
+                    }
+                    self.visit_expr(&node.value);
+                    if let novarocks_parser::ast::Predicate::In(predicate) = &node.predicate
+                        && let Expr::InList(list) = &predicate.value_list
+                    {
+                        for value in &list.values {
+                            self.visit_expr(value);
+                        }
+                    } else {
+                        novarocks_parser::ast::walk_predicate(self, &node.predicate);
+                    }
+                }
+                Expr::InList(list) => {
+                    self.0 = Some((
+                        "IN lists are only supported as an IN predicate value list",
+                        list.span,
+                    ));
+                }
                 Expr::JsonConstructor(_)
                 | Expr::JsonExists(_)
                 | Expr::JsonValue(_)

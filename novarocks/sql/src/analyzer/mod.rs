@@ -54,12 +54,15 @@ mod literal_coercion;
 #[cfg(test)]
 mod load_op_column;
 mod logical_output;
+#[cfg(test)]
+mod predicate_tests;
 #[allow(
     dead_code,
     reason = "The T4 typed-query contract flip wires this staged pre-analysis module."
 )]
 pub(crate) mod query_prepass;
 mod resolve_expr;
+pub(crate) use resolve_expr::unsupported_predicate_reason;
 #[cfg(test)]
 mod scalar_rebind_contract_tests;
 mod value_conversion;

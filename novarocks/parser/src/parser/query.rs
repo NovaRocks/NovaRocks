@@ -238,14 +238,27 @@ fn legacy_session_properties(hints: &[SelectHint]) -> Vec<crate::ast::SessionPro
             {
                 for argument in arguments {
                     let (name, value) = match argument {
-                        Expr::Binary(binary) => (
-                            &*binary.left,
-                            if binary.operator == crate::ast::BinaryOperator::Equal {
-                                &*binary.right
-                            } else {
-                                argument
-                            },
-                        ),
+                        Expr::Predicated(node)
+                            if matches!(
+                                node.predicate,
+                                crate::ast::Predicate::Comparison(_)
+                                    | crate::ast::Predicate::DistinctFrom(_)
+                            ) =>
+                        {
+                            (
+                                &node.value,
+                                match &node.predicate {
+                                    crate::ast::Predicate::Comparison(predicate)
+                                        if predicate.operator
+                                            == crate::ast::ComparisonOperator::Equal =>
+                                    {
+                                        &predicate.right
+                                    }
+                                    _ => argument,
+                                },
+                            )
+                        }
+                        Expr::Binary(binary) => (&*binary.left, argument),
                         other => (other, other),
                     };
                     let name = match name {
@@ -1393,7 +1406,10 @@ fn expression_end(parser: &StatementParser<'_, '_>, words: &[&str], symbols: &[S
                 nesting -= 1
             }
             TokenKind::Symbol(symbol) if nesting == 0 && symbols.contains(&symbol) => break,
-            _ if nesting == 0 && words.iter().any(|word| token_is_word(parser, token, word)) => {
+            _ if nesting == 0
+                && words.iter().any(|word| token_is_word(parser, token, word))
+                && !is_distinct_from_separator(parser, begin, end) =>
+            {
                 break;
             }
             _ => {}
@@ -1401,6 +1417,38 @@ fn expression_end(parser: &StatementParser<'_, '_>, words: &[&str], symbols: &[S
         end += 1;
     }
     end
+}
+
+// FROM in IS [NOT] DISTINCT FROM belongs to the expression, before any
+// subsequent FROM that starts the relation clause.
+fn is_distinct_from_separator(
+    parser: &StatementParser<'_, '_>,
+    begin: usize,
+    index: usize,
+) -> bool {
+    if !token_is_word(parser, &parser.tokens[index], "FROM") {
+        return false;
+    }
+    let mut previous = parser.tokens[begin..index]
+        .iter()
+        .rev()
+        .filter(|token| !matches!(token.kind, TokenKind::Trivia(_)));
+    if !previous
+        .next()
+        .is_some_and(|token| token_is_word(parser, token, "DISTINCT"))
+    {
+        return false;
+    }
+    let Some(mut token) = previous.next() else {
+        return false;
+    };
+    if token_is_word(parser, token, "NOT") {
+        let Some(before_not) = previous.next() else {
+            return false;
+        };
+        token = before_not;
+    }
+    token_is_word(parser, token, "IS")
 }
 
 fn parse_expression_range(

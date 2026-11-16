@@ -422,9 +422,9 @@ fn select_relation_aliases_and_grouping_match_parser() {
         left,
         JoinOperator::LeftOuter,
         derived,
-        JoinConstraint::On(build::binary(
+        JoinConstraint::On(build::comparison(
             build::column(build::ident("s", None), build::ident("k1", None)),
-            BinaryOperator::Equal,
+            ast::ComparisonOperator::Equal,
             build::column(build::ident("v", None), build::ident("k1", None)),
         )),
     );
@@ -799,4 +799,77 @@ fn actual_recursive_logical_storage_guards_clone_walk_fold_compare_validation_pr
     select.projection[0] = ast::SelectItem::UnnamedExpr(folded);
     ast::validate_statement(&ast::Statement::Query(parsed)).unwrap();
     drop(node);
+}
+
+#[test]
+fn public_predicate_producers_print_and_reparse_without_losing_their_fields() {
+    for source in [
+        "a = b",
+        "a != b",
+        "a < b",
+        "a <= b",
+        "a > b",
+        "a >= b",
+        "a <=> b",
+        "a IS NOT DISTINCT FROM b",
+        "a IS DISTINCT FROM b",
+        "a BETWEEN 1 AND 3",
+        "a NOT BETWEEN 1 AND 3",
+        "a IS NULL",
+        "a IS NOT NULL",
+        "a IS TRUE",
+        "a IS NOT FALSE",
+        "a IS UNKNOWN",
+        "a LIKE 'x%'",
+        "a NOT LIKE 'x%' ESCAPE '_'",
+        "a IN (1, 2, NULL)",
+        "a NOT IN (SELECT b FROM t)",
+        "(a + 1) >= 2 AND (b IS NULL OR c NOT IN (3, 4))",
+    ] {
+        let parsed = expression(source);
+        let rendered = novarocks_parser::printer::print_expr(&parsed);
+        assert!(
+            parsed.syntax_eq(&expression(&rendered)),
+            "{source} -> {rendered}"
+        );
+    }
+    let nullsafe = expression("a <=> b");
+    assert!(nullsafe.syntax_eq(&expression("a IS NOT DISTINCT FROM b")));
+    assert!(!nullsafe.syntax_eq(&expression("a IS DISTINCT FROM b")));
+    let Expr::Predicated(in_node) = expression("a NOT IN (1, 2)") else {
+        panic!("IN predicate")
+    };
+    let ast::Predicate::In(in_node) = &in_node.predicate else {
+        unreachable!()
+    };
+    assert!(in_node.negated);
+    let Expr::InList(list) = &in_node.value_list else {
+        panic!("real IN list expression")
+    };
+    assert_eq!(list.values.len(), 2);
+    assert!(matches!(
+        build::in_list(id("a"), Vec::new(), false),
+        Err(BuildError::EmptyInList)
+    ));
+    assert!(novarocks_parser::parse("SELECT a IN ()").is_err());
+}
+
+#[test]
+fn distinct_from_in_projection_keeps_the_later_relation_boundary() {
+    for source in [
+        "SELECT NULL IS DISTINCT FROM NULL",
+        "SELECT NULL IS NOT DISTINCT FROM NULL",
+        "SELECT a IS /* boundary */ NOT DISTINCT /* value */ FROM b AS result FROM t",
+        "SELECT a IS DISTINCT FROM b, c IS NOT DISTINCT FROM d FROM t WHERE a IS DISTINCT FROM b",
+    ] {
+        let parsed = novarocks_parser::parse(source).unwrap();
+        let rendered = novarocks_parser::printer::print_statement(&parsed[0]);
+        let reparsed = novarocks_parser::parse(&rendered).unwrap();
+        let (ast::Statement::Query(left), ast::Statement::Query(right)) =
+            (&parsed[0], &reparsed[0])
+        else {
+            panic!("query")
+        };
+        assert!(left.syntax_eq(right), "{source} -> {rendered}");
+    }
 }

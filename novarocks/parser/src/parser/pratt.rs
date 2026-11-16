@@ -17,18 +17,21 @@
 
 //! Data-driven Pratt parsing machinery for the initial expression grammar.
 
-use crate::ast::{AstBox, LogicalExpr, LogicalOperator, TypeKind, TypeParameter};
+use crate::ast::{
+    AstBox, BetweenPredicate, BooleanTestPredicate, ComparisonOperator, ComparisonPredicate,
+    DistinctFromPredicate, InPredicate, IsNullPredicate, LikePredicate, LogicalExpr,
+    LogicalOperator, Predicate, PredicatedExpr, TruthValue, TypeKind, TypeParameter,
+};
 
 use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
-        AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr,
-        CastExpr, CastKind, DataTypeParameter, ExistsExpr, Expr, FunctionCall, FunctionOrderBy,
-        FunctionQuantifier, Ident, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField,
-        IsPredicate, IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, Literal,
-        LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment, ObjectName, RowDataTypeField,
-        SubqueryExpr, TupleExpr, TypeName, UnaryExpr, UnaryOperator, WindowFrame, WindowFrameBound,
-        WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+        AccessExpr, AccessKind, ArrayExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr,
+        CastKind, DataTypeParameter, ExistsExpr, Expr, FunctionCall, FunctionOrderBy,
+        FunctionQuantifier, Ident, InListExpr, IntervalExpr, IntervalField, JsonOperator,
+        LambdaExpr, Literal, LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment, ObjectName,
+        RowDataTypeField, SubqueryExpr, TupleExpr, TypeName, UnaryExpr, UnaryOperator, WindowFrame,
+        WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -63,6 +66,8 @@ impl TokenPattern {
 
 #[derive(Clone, Copy)]
 enum InfixOperator {
+    Comparison(ComparisonOperator),
+    NullSafeEqual,
     Binary(BinaryOperator),
     Logical(LogicalOperator),
 }
@@ -95,37 +100,37 @@ const INFIX_BINDINGS: &[InfixBinding] = &[
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Eq),
-        operator: InfixOperator::Binary(BinaryOperator::Equal),
+        operator: InfixOperator::Comparison(ComparisonOperator::Equal),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::NullSafeEq),
-        operator: InfixOperator::Binary(BinaryOperator::NullSafeEqual),
+        operator: InfixOperator::NullSafeEqual,
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Neq),
-        operator: InfixOperator::Binary(BinaryOperator::NotEqual),
+        operator: InfixOperator::Comparison(ComparisonOperator::NotEqual),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Lt),
-        operator: InfixOperator::Binary(BinaryOperator::LessThan),
+        operator: InfixOperator::Comparison(ComparisonOperator::LessThan),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Lte),
-        operator: InfixOperator::Binary(BinaryOperator::LessThanOrEqual),
+        operator: InfixOperator::Comparison(ComparisonOperator::LessThanOrEqual),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Gt),
-        operator: InfixOperator::Binary(BinaryOperator::GreaterThan),
+        operator: InfixOperator::Comparison(ComparisonOperator::GreaterThan),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Gte),
-        operator: InfixOperator::Binary(BinaryOperator::GreaterThanOrEqual),
+        operator: InfixOperator::Comparison(ComparisonOperator::GreaterThanOrEqual),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
@@ -304,6 +309,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 break;
             }
 
+            let predicate_start = self.current_span().start();
             self.advance();
             // Incrementing the minimum implements left associativity for every
             // current table entry. A right-associative future entry can carry a
@@ -311,6 +317,30 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             let right = self.parse_binding_power(binding.precedence + 1)?;
             let span = Span::new(left.span().start(), right.span().end());
             left = match binding.operator {
+                InfixOperator::Comparison(operator) => {
+                    let predicate_span = Span::new(predicate_start, right.span().end());
+                    Expr::Predicated(AstBox::new(PredicatedExpr {
+                        value: left,
+                        predicate: Predicate::Comparison(ComparisonPredicate {
+                            operator,
+                            right,
+                            span: predicate_span,
+                        }),
+                        span,
+                    }))
+                }
+                InfixOperator::NullSafeEqual => {
+                    let predicate_span = Span::new(predicate_start, right.span().end());
+                    Expr::Predicated(AstBox::new(PredicatedExpr {
+                        value: left,
+                        predicate: Predicate::DistinctFrom(DistinctFromPredicate {
+                            negated: true,
+                            right,
+                            span: predicate_span,
+                        }),
+                        span,
+                    }))
+                }
                 InfixOperator::Binary(operator) => Expr::Binary(BinaryExpr {
                     left: Box::new(left),
                     operator,
@@ -465,42 +495,35 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     }
 
     fn parse_comparison_special(&mut self, left: Expr) -> Result<Expr, ParseError> {
+        let start = self.current_span().start();
         let negated = if self.current_is_keyword(Keyword::Not) {
-            let is_special = self.peek_keyword(1, Keyword::Between)
-                || self.peek_keyword(1, Keyword::In)
-                || self.peek_keyword(1, Keyword::Like)
-                || self.peek_keyword(1, Keyword::Ilike)
-                || self.peek_keyword(1, Keyword::Rlike)
-                || self.peek_keyword(1, Keyword::Similar);
-            if is_special {
-                self.advance();
-                self.skip_trivia();
-                true
-            } else {
-                false
-            }
+            self.advance();
+            self.skip_trivia();
+            true
         } else {
             false
         };
-
         if self.current_is_keyword(Keyword::Between) {
             self.advance();
             self.skip_trivia();
-            let low = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+            let min = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
             if !self.current_is_keyword(Keyword::And) {
                 return Err(self.unexpected("AND in BETWEEN expression"));
             }
             self.advance();
             self.skip_trivia();
-            let high = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
-            let span = Span::new(left.span().start(), high.span().end());
-            return Ok(Expr::Between(BetweenExpr {
-                expr: Box::new(left),
-                negated,
-                low: Box::new(low),
-                high: Box::new(high),
-                span,
-            }));
+            let max = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+            let span = Span::new(start, max.span().end());
+            return Ok(predicate_node(
+                left,
+                Predicate::Between(BetweenPredicate {
+                    negated,
+                    symmetry: None,
+                    min,
+                    max,
+                    span,
+                }),
+            ));
         }
         if self.current_is_keyword(Keyword::In) {
             self.advance();
@@ -508,57 +531,62 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             if !self.current_is_symbol(Symbol::LParen) {
                 return Err(self.unexpected("'(' after IN"));
             }
-            let start = left.span().start();
+            let list_start = self.current_span().start();
             self.advance();
             self.skip_trivia();
             if self.query_follows() {
-                let (query, span) = self.parse_subquery_body(start)?;
-                return Ok(Expr::InSubquery(InSubqueryExpr {
-                    expr: Box::new(left),
-                    negated,
-                    query,
-                    span,
-                }));
+                let (query, span) = self.parse_subquery_body(list_start)?;
+                let predicate_span = Span::new(start, span.end());
+                return Ok(predicate_node(
+                    left,
+                    Predicate::In(InPredicate {
+                        negated,
+                        value_list: Expr::Subquery(SubqueryExpr { query, span }),
+                        span: predicate_span,
+                    }),
+                ));
             }
-            let mut list = Vec::new();
-            if !self.current_is_symbol(Symbol::RParen) {
-                loop {
-                    list.push(self.parse_binding_power(0)?);
-                    self.skip_trivia();
-                    if !self.current_is_symbol(Symbol::Comma) {
-                        break;
-                    }
-                    self.advance();
-                    self.skip_trivia();
+            if self.current_is_symbol(Symbol::RParen) {
+                return Err(self.unexpected("expression in IN list"));
+            }
+            let mut values = Vec::new();
+            loop {
+                values.push(self.parse_binding_power(0)?);
+                self.skip_trivia();
+                if !self.current_is_symbol(Symbol::Comma) {
+                    break;
                 }
+                self.advance();
+                self.skip_trivia();
             }
             if !self.current_is_symbol(Symbol::RParen) {
                 return Err(self.unexpected("')' after IN list"));
             }
             let end = self.current_span().end();
             self.advance();
-            return Ok(Expr::InList(InListExpr {
-                expr: Box::new(left),
-                negated,
-                list,
-                span: Span::new(start, end),
+            let value_list = Expr::InList(AstBox::new(InListExpr {
+                values: values.into(),
+                span: Span::new(list_start, end),
             }));
+            return Ok(predicate_node(
+                left,
+                Predicate::In(InPredicate {
+                    negated,
+                    value_list,
+                    span: Span::new(start, end),
+                }),
+            ));
         }
-        let operator = if self.current_is_keyword(Keyword::Like) {
-            Some(LikeOperator::Like)
-        } else if self.current_is_keyword(Keyword::Ilike) {
-            Some(LikeOperator::ILike)
-        } else if self.current_is_keyword(Keyword::Rlike) {
-            Some(LikeOperator::RLike)
-        } else if self.current_is_keyword(Keyword::Similar) {
-            Some(LikeOperator::SimilarTo)
-        } else {
-            None
-        };
-        if let Some(operator) = operator {
+        if self.current_is_keyword(Keyword::Like)
+            || self.current_is_keyword(Keyword::Ilike)
+            || self.current_is_keyword(Keyword::Rlike)
+            || self.current_is_keyword(Keyword::Similar)
+        {
+            // The retiring operators all selected the original LIKE kernel.
+            let similar = self.current_is_keyword(Keyword::Similar);
             self.advance();
             self.skip_trivia();
-            if operator == LikeOperator::SimilarTo && self.current_is_keyword(Keyword::To) {
+            if similar && self.current_is_keyword(Keyword::To) {
                 self.advance();
                 self.skip_trivia();
             }
@@ -566,24 +594,22 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             let escape = if self.current_is_keyword(Keyword::Escape) {
                 self.advance();
                 self.skip_trivia();
-                Some(Box::new(
-                    self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?,
-                ))
+                Some(self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?)
             } else {
                 None
             };
             let end = escape
                 .as_ref()
-                .map_or_else(|| pattern.span().end(), |escape| escape.span().end());
-            let start = left.span().start();
-            return Ok(Expr::Like(LikeExpr {
-                expr: Box::new(left),
-                negated,
-                operator,
-                pattern: Box::new(pattern),
-                escape,
-                span: Span::new(start, end),
-            }));
+                .map_or_else(|| pattern.span().end(), |v| v.span().end());
+            return Ok(predicate_node(
+                left,
+                Predicate::Like(LikePredicate {
+                    negated,
+                    pattern,
+                    escape,
+                    span: Span::new(start, end),
+                }),
+            ));
         }
         if self.current_is_keyword(Keyword::Is) {
             if negated {
@@ -607,40 +633,49 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 self.advance();
                 self.skip_trivia();
                 let right = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
-                let operator = if negated {
-                    BinaryOperator::IsNotDistinctFrom
-                } else {
-                    BinaryOperator::IsDistinctFrom
-                };
-                let span = Span::new(left.span().start(), right.span().end());
-                return Ok(Expr::Binary(BinaryExpr {
-                    left: Box::new(left),
-                    operator,
-                    right: Box::new(right),
-                    span,
-                }));
+                let span = Span::new(start, right.span().end());
+                return Ok(predicate_node(
+                    left,
+                    Predicate::DistinctFrom(DistinctFromPredicate {
+                        negated,
+                        right,
+                        span,
+                    }),
+                ));
             }
-            let predicate = match (negated, self.current().map(|token| &token.kind)) {
-                (false, Some(TokenKind::Keyword(Keyword::Null))) => IsPredicate::Null,
-                (true, Some(TokenKind::Keyword(Keyword::Null))) => IsPredicate::NotNull,
-                (false, Some(TokenKind::Keyword(Keyword::True))) => IsPredicate::True,
-                (true, Some(TokenKind::Keyword(Keyword::True))) => IsPredicate::NotTrue,
-                (false, Some(TokenKind::Keyword(Keyword::False))) => IsPredicate::False,
-                (true, Some(TokenKind::Keyword(Keyword::False))) => IsPredicate::NotFalse,
-                (false, Some(TokenKind::Keyword(Keyword::Unknown))) => IsPredicate::Unknown,
-                (true, Some(TokenKind::Keyword(Keyword::Unknown))) => IsPredicate::NotUnknown,
+            let token = self.current().cloned().ok_or_else(|| {
+                self.unexpected("NULL, TRUE, FALSE, UNKNOWN, or DISTINCT after IS")
+            })?;
+            let span = Span::new(start, token.span.end());
+            let predicate = match token.kind {
+                TokenKind::Keyword(Keyword::Null) => {
+                    Predicate::IsNull(IsNullPredicate { negated, span })
+                }
+                TokenKind::Keyword(Keyword::True) => Predicate::BooleanTest(BooleanTestPredicate {
+                    negated,
+                    truth_value: TruthValue::True,
+                    span,
+                }),
+                TokenKind::Keyword(Keyword::False) => {
+                    Predicate::BooleanTest(BooleanTestPredicate {
+                        negated,
+                        truth_value: TruthValue::False,
+                        span,
+                    })
+                }
+                TokenKind::Keyword(Keyword::Unknown) => {
+                    Predicate::BooleanTest(BooleanTestPredicate {
+                        negated,
+                        truth_value: TruthValue::Unknown,
+                        span,
+                    })
+                }
                 _ => {
                     return Err(self.unexpected("NULL, TRUE, FALSE, UNKNOWN, or DISTINCT after IS"));
                 }
             };
-            let end = self.current_span().end();
             self.advance();
-            let start = left.span().start();
-            return Ok(Expr::IsPredicate(IsPredicateExpr {
-                expr: Box::new(left),
-                predicate,
-                span: Span::new(start, end),
-            }));
+            return Ok(predicate_node(left, predicate));
         }
         Err(self.unexpected("comparison special form"))
     }
@@ -2220,4 +2255,13 @@ mod tests {
             ));
         }
     }
+}
+
+fn predicate_node(value: Expr, predicate: Predicate) -> Expr {
+    let span = value.span().cover(predicate.span());
+    Expr::Predicated(AstBox::new(PredicatedExpr {
+        value,
+        predicate,
+        span,
+    }))
 }

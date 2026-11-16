@@ -25,7 +25,9 @@ mod expr;
 pub(crate) mod iceberg;
 pub(crate) mod maintenance;
 pub(crate) mod materialized_view;
+mod predicate;
 mod query;
+pub use predicate::*;
 mod relation;
 mod routine;
 
@@ -60,12 +62,11 @@ pub use dml::{
 };
 pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
-    AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr,
-    CastKind, CompoundIdentifier, ExistsExpr, Expr, FunctionCall, FunctionOrderBy,
-    FunctionQuantifier, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField, IsPredicate,
-    IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, LogicalExpr,
-    LogicalOperator, MapEntry, MapExpr, NestedExpr, NullTreatment, StructExpr, StructExprField,
-    SubqueryExpr, TupleExpr, UnaryExpr, UnaryOperator,
+    AccessExpr, AccessKind, ArrayExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr, CastKind,
+    CompoundIdentifier, ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier,
+    IntervalExpr, IntervalField, JsonOperator, LambdaExpr, LogicalExpr, LogicalOperator, MapEntry,
+    MapExpr, NestedExpr, NullTreatment, StructExpr, StructExprField, SubqueryExpr, TupleExpr,
+    UnaryExpr, UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,

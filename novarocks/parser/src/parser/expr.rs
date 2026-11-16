@@ -77,7 +77,7 @@ mod tests {
             panic!("expected NOT to bind below comparison and above AND");
         };
         assert_eq!(not.operator, UnaryOperator::Not);
-        assert!(matches!(*not.expression, Expr::Binary(_)));
+        assert!(matches!(*not.expression, Expr::Predicated(_)));
     }
 
     #[test]
@@ -334,15 +334,35 @@ mod tests {
 
     #[test]
     fn comparison_special_forms_keep_their_dedicated_ast_nodes() {
-        assert!(matches!(parse("a NOT BETWEEN 1 AND 3"), Expr::Between(_)));
-        assert!(matches!(parse("a IN (1, 2, 3)"), Expr::InList(_)));
-        assert!(matches!(parse("a NOT LIKE 'x%' ESCAPE '_'"), Expr::Like(_)));
-        assert!(matches!(parse("a IS NOT NULL"), Expr::IsPredicate(_)));
-
-        let Expr::Binary(expression) = parse("a IS DISTINCT FROM b") else {
-            panic!("expected binary IS DISTINCT FROM");
+        for (source, expected) in [
+            ("a NOT BETWEEN 1 AND 3", "between"),
+            ("a IN (1, 2, 3)", "in"),
+            ("a NOT LIKE 'x%' ESCAPE '_'", "like"),
+            ("a IS NOT NULL", "null"),
+        ] {
+            let Expr::Predicated(node) = parse(source) else {
+                panic!("predicated")
+            };
+            assert!(match (&node.predicate, expected) {
+                (crate::ast::Predicate::Between(node), "between") => node.negated,
+                (crate::ast::Predicate::In(node), "in") =>
+                    matches!(&node.value_list, Expr::InList(list) if list.values.len()==3),
+                (crate::ast::Predicate::Like(node), "like") =>
+                    node.negated && node.escape.is_some(),
+                (crate::ast::Predicate::IsNull(node), "null") => node.negated,
+                _ => false,
+            });
+        }
+        let Expr::Predicated(expression) = parse("a IS DISTINCT FROM b") else {
+            panic!("distinct predicate")
         };
-        assert_eq!(expression.operator, BinaryOperator::IsDistinctFrom);
+        assert!(matches!(
+            expression.predicate,
+            crate::ast::Predicate::DistinctFrom(crate::ast::DistinctFromPredicate {
+                negated: false,
+                ..
+            })
+        ));
 
         assert!(matches!(
             parse("CASE WHEN a THEN CAST(b AS DECIMAL(10, 2)) ELSE TRY_CAST(c AS INT) END"),
@@ -357,10 +377,12 @@ mod tests {
         assert!(call.over.is_some());
 
         assert!(matches!(parse("EXISTS (SELECT 1)"), Expr::Exists(_)));
-        assert!(matches!(
-            parse("a NOT IN (SELECT b FROM t)"),
-            Expr::InSubquery(_)
-        ));
+        let Expr::Predicated(node) = parse("a NOT IN (SELECT b FROM t)") else {
+            panic!("predicated IN")
+        };
+        assert!(
+            matches!(&node.predicate, crate::ast::Predicate::In(node) if node.negated && matches!(node.value_list, Expr::Subquery(_)))
+        );
         assert!(matches!(parse("(SELECT 1) + 2"), Expr::Binary(_)));
         assert!(matches!(parse("[1, 2, 3]"), Expr::Array(_)));
         let Expr::Array(typed_array) = parse("ARRAY<double>[0.25, 0.5]") else {

@@ -21,6 +21,46 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_predicated_expr(&mut self, node: &PredicatedExpr) {
+        walk_predicated_expr(self, node);
+    }
+    fn visit_comparison_predicate(&mut self, node: &ComparisonPredicate) {
+        walk_comparison_predicate(self, node);
+    }
+    fn visit_distinct_from_predicate(&mut self, node: &DistinctFromPredicate) {
+        walk_distinct_from_predicate(self, node);
+    }
+    fn visit_between_predicate(&mut self, node: &BetweenPredicate) {
+        walk_between_predicate(self, node);
+    }
+    fn visit_boolean_test_predicate(&mut self, node: &BooleanTestPredicate) {
+        walk_boolean_test_predicate(self, node);
+    }
+    fn visit_is_null_predicate(&mut self, node: &IsNullPredicate) {
+        walk_is_null_predicate(self, node);
+    }
+    fn visit_like_predicate(&mut self, node: &LikePredicate) {
+        walk_like_predicate(self, node);
+    }
+    fn visit_in_predicate(&mut self, node: &InPredicate) {
+        walk_in_predicate(self, node);
+    }
+    fn visit_overlaps_predicate(&mut self, node: &OverlapsPredicate) {
+        walk_overlaps_predicate(self, node);
+    }
+    fn visit_quantified_comparison_predicate(&mut self, node: &QuantifiedComparisonPredicate) {
+        walk_quantified_comparison_predicate(self, node);
+    }
+    fn visit_match_predicate(&mut self, node: &MatchPredicate) {
+        walk_match_predicate(self, node);
+    }
+    fn visit_in_list_expr(&mut self, node: &InListExpr) {
+        walk_in_list_expr(self, node);
+    }
+    fn visit_predicate(&mut self, node: &Predicate) {
+        walk_predicate(self, node);
+    }
+
     fn visit_type_name(&mut self, node: &TypeName) {
         walk_type_name(self, node);
     }
@@ -686,31 +726,12 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::Unary(expression) => visitor.visit_unary_expr(expression),
         Expr::Binary(expression) => visitor.visit_binary_expr(expression),
         Expr::Logical(expression) => visitor.visit_logical_expr(expression),
+        Expr::Predicated(node) => visitor.visit_predicated_expr(node),
+        Expr::InList(node) => visitor.visit_in_list_expr(node),
         Expr::Nested(expression) => visitor.visit_nested_expr(expression),
-        Expr::Between(expression) => {
-            visitor.visit_expr(&expression.expr);
-            visitor.visit_expr(&expression.low);
-            visitor.visit_expr(&expression.high);
-        }
-        Expr::InList(expression) => {
-            visitor.visit_expr(&expression.expr);
-            for item in &expression.list {
-                visitor.visit_expr(item);
-            }
-        }
-        Expr::InSubquery(expression) => {
-            visitor.visit_expr(&expression.expr);
-            visitor.visit_query(&expression.query);
-        }
+
         Expr::Exists(expression) => visitor.visit_query(&expression.query),
-        Expr::Like(expression) => {
-            visitor.visit_expr(&expression.expr);
-            visitor.visit_expr(&expression.pattern);
-            if let Some(escape) = &expression.escape {
-                visitor.visit_expr(escape);
-            }
-        }
-        Expr::IsPredicate(expression) => visitor.visit_expr(&expression.expr),
+
         Expr::Case(expression) => {
             if let Some(operand) = &expression.operand {
                 visitor.visit_expr(operand);
@@ -820,6 +841,52 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_predicated_expr(&mut self, node: PredicatedExpr) -> PredicatedExpr {
+        fold_predicated_expr(self, node)
+    }
+    fn fold_comparison_predicate(&mut self, node: ComparisonPredicate) -> ComparisonPredicate {
+        fold_comparison_predicate(self, node)
+    }
+    fn fold_distinct_from_predicate(
+        &mut self,
+        node: DistinctFromPredicate,
+    ) -> DistinctFromPredicate {
+        fold_distinct_from_predicate(self, node)
+    }
+    fn fold_between_predicate(&mut self, node: BetweenPredicate) -> BetweenPredicate {
+        fold_between_predicate(self, node)
+    }
+    fn fold_boolean_test_predicate(&mut self, node: BooleanTestPredicate) -> BooleanTestPredicate {
+        fold_boolean_test_predicate(self, node)
+    }
+    fn fold_is_null_predicate(&mut self, node: IsNullPredicate) -> IsNullPredicate {
+        fold_is_null_predicate(self, node)
+    }
+    fn fold_like_predicate(&mut self, node: LikePredicate) -> LikePredicate {
+        fold_like_predicate(self, node)
+    }
+    fn fold_in_predicate(&mut self, node: InPredicate) -> InPredicate {
+        fold_in_predicate(self, node)
+    }
+    fn fold_overlaps_predicate(&mut self, node: OverlapsPredicate) -> OverlapsPredicate {
+        fold_overlaps_predicate(self, node)
+    }
+    fn fold_quantified_comparison_predicate(
+        &mut self,
+        node: QuantifiedComparisonPredicate,
+    ) -> QuantifiedComparisonPredicate {
+        fold_quantified_comparison_predicate(self, node)
+    }
+    fn fold_match_predicate(&mut self, node: MatchPredicate) -> MatchPredicate {
+        fold_match_predicate(self, node)
+    }
+    fn fold_in_list_expr(&mut self, node: InListExpr) -> InListExpr {
+        fold_in_list_expr(self, node)
+    }
+    fn fold_predicate(&mut self, node: Predicate) -> Predicate {
+        fold_predicate(self, node)
+    }
+
     fn fold_type_name(&mut self, node: TypeName) -> TypeName {
         fold_type_name(self, node)
     }
@@ -1732,43 +1799,19 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::Unary(expression) => Expr::Unary(folder.fold_unary_expr(expression)),
         Expr::Binary(expression) => Expr::Binary(folder.fold_binary_expr(expression)),
         Expr::Logical(expression) => Expr::Logical(folder.fold_logical_expr(expression)),
+        Expr::Predicated(node) => {
+            Expr::Predicated(AstBox::new(folder.fold_predicated_expr(node.into_inner())))
+        }
+        Expr::InList(node) => {
+            Expr::InList(AstBox::new(folder.fold_in_list_expr(node.into_inner())))
+        }
         Expr::Nested(expression) => Expr::Nested(folder.fold_nested_expr(expression)),
-        Expr::Between(mut expression) => {
-            expression.expr = Box::new(folder.fold_expr(*expression.expr));
-            expression.low = Box::new(folder.fold_expr(*expression.low));
-            expression.high = Box::new(folder.fold_expr(*expression.high));
-            Expr::Between(expression)
-        }
-        Expr::InList(mut expression) => {
-            expression.expr = Box::new(folder.fold_expr(*expression.expr));
-            expression.list = expression
-                .list
-                .into_iter()
-                .map(|item| folder.fold_expr(item))
-                .collect();
-            Expr::InList(expression)
-        }
-        Expr::InSubquery(mut expression) => {
-            expression.expr = Box::new(folder.fold_expr(*expression.expr));
-            expression.query = Box::new(folder.fold_query(*expression.query));
-            Expr::InSubquery(expression)
-        }
+
         Expr::Exists(mut expression) => {
             expression.query = Box::new(folder.fold_query(*expression.query));
             Expr::Exists(expression)
         }
-        Expr::Like(mut expression) => {
-            expression.expr = Box::new(folder.fold_expr(*expression.expr));
-            expression.pattern = Box::new(folder.fold_expr(*expression.pattern));
-            expression.escape = expression
-                .escape
-                .map(|escape| Box::new(folder.fold_expr(*escape)));
-            Expr::Like(expression)
-        }
-        Expr::IsPredicate(mut expression) => {
-            expression.expr = Box::new(folder.fold_expr(*expression.expr));
-            Expr::IsPredicate(expression)
-        }
+
         Expr::Case(mut expression) => {
             expression.operand = expression
                 .operand

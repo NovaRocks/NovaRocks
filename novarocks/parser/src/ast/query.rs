@@ -190,7 +190,7 @@ pub enum SelectItem {
 }
 
 impl SelectItem {
-    pub const fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         match self {
             Self::UnnamedExpr(expr) => expr.span(),
             Self::ExprWithAlias { span, .. }

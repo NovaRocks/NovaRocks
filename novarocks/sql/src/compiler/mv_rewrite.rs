@@ -3074,8 +3074,12 @@ impl Visit for CompletionRetainedBytes {
             Expr::Logical(expression) => {
                 self.add_vec_capacity::<Expr>(expression.terms.capacity());
             }
+            Expr::Predicated(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::PredicatedExpr>())
+            }
             Expr::InList(expression) => {
-                self.add_vec_capacity::<Expr>(expression.list.capacity());
+                self.add(std::mem::size_of::<novarocks_parser::ast::InListExpr>());
+                self.add_vec_capacity::<Expr>(expression.values.capacity());
             }
             Expr::Case(expression) => {
                 self.add_vec_capacity::<Expr>(expression.conditions.capacity());
@@ -3106,11 +3110,7 @@ impl Visit for CompletionRetainedBytes {
             | Expr::Unary(_)
             | Expr::Binary(_)
             | Expr::Nested(_)
-            | Expr::Between(_)
-            | Expr::InSubquery(_)
             | Expr::Exists(_)
-            | Expr::Like(_)
-            | Expr::IsPredicate(_)
             | Expr::Cast(_)
             | Expr::Interval(_)
             | Expr::Subquery(_)

@@ -794,12 +794,9 @@ impl Printer {
             Expr::Binary(expression) => self.write_binary_expr(expression),
             Expr::Logical(expression) => self.write_logical_expr(expression),
             Expr::Nested(expression) => self.write_nested_expr(expression),
-            Expr::Between(expression) => self.write_between_expr(expression),
             Expr::InList(expression) => self.write_in_list_expr(expression),
-            Expr::InSubquery(expression) => self.write_in_subquery_expr(expression),
+            Expr::Predicated(expression) => self.write_predicated_expr(expression),
             Expr::Exists(expression) => self.write_exists_expr(expression),
-            Expr::Like(expression) => self.write_like_expr(expression),
-            Expr::IsPredicate(expression) => self.write_is_predicate_expr(expression),
             Expr::Case(expression) => self.write_case_expr(expression),
             Expr::Cast(expression) => self.write_cast_expr(expression),
             Expr::Interval(expression) => self.write_interval_expr(expression),
@@ -1165,13 +1162,7 @@ impl Printer {
     fn requires_parentheses_for_prefix(&self, expression: &Expr) -> bool {
         matches!(
             expression,
-            Expr::Binary(_)
-                | Expr::Logical(_)
-                | Expr::Between(_)
-                | Expr::InList(_)
-                | Expr::InSubquery(_)
-                | Expr::Like(_)
-                | Expr::IsPredicate(_)
+            Expr::Binary(_) | Expr::Logical(_) | Expr::Predicated(_)
         )
     }
 
@@ -1218,11 +1209,7 @@ impl Printer {
                     || (child.operator.precedence() == parent.precedence()
                         && matches!(side, BinarySide::Right))
             }
-            Expr::Between(_)
-            | Expr::InList(_)
-            | Expr::InSubquery(_)
-            | Expr::Like(_)
-            | Expr::IsPredicate(_) => parent.precedence() > LogicalOperator::And.precedence(),
+            Expr::Predicated(_) => parent.precedence() > LogicalOperator::And.precedence(),
             _ => false,
         };
         if requires_parentheses {
@@ -1234,42 +1221,123 @@ impl Printer {
         }
     }
 
+    #[recursive::recursive]
+    fn write_predicated_expr(&mut self, expression: &PredicatedExpr) {
+        self.write_predicate_operand(&expression.value, false);
+        match &expression.predicate {
+            Predicate::Comparison(node) => {
+                self.output.push(' ');
+                self.output.push_str(node.operator.sql());
+                self.output.push(' ');
+                self.write_predicate_operand(&node.right, true);
+            }
+            Predicate::DistinctFrom(node) => {
+                self.output.push_str(if node.negated {
+                    " IS NOT DISTINCT FROM "
+                } else {
+                    " IS DISTINCT FROM "
+                });
+                self.write_predicate_operand(&node.right, true);
+            }
+            Predicate::Between(node) => {
+                self.output.push_str(if node.negated {
+                    " NOT BETWEEN "
+                } else {
+                    " BETWEEN "
+                });
+                if let Some(symmetry) = node.symmetry {
+                    self.output.push_str(match symmetry {
+                        BetweenSymmetry::Symmetric => "SYMMETRIC ",
+                        BetweenSymmetry::Asymmetric => "ASYMMETRIC ",
+                    });
+                }
+                self.write_predicate_operand(&node.min, true);
+                self.output.push_str(" AND ");
+                self.write_predicate_operand(&node.max, true);
+            }
+            Predicate::BooleanTest(node) => {
+                self.output
+                    .push_str(if node.negated { " IS NOT " } else { " IS " });
+                self.output.push_str(match node.truth_value {
+                    TruthValue::True => "TRUE",
+                    TruthValue::False => "FALSE",
+                    TruthValue::Unknown => "UNKNOWN",
+                });
+            }
+            Predicate::IsNull(node) => self.output.push_str(if node.negated {
+                " IS NOT NULL"
+            } else {
+                " IS NULL"
+            }),
+            Predicate::Like(node) => {
+                self.output
+                    .push_str(if node.negated { " NOT LIKE " } else { " LIKE " });
+                self.write_predicate_operand(&node.pattern, true);
+                if let Some(escape) = &node.escape {
+                    self.output.push_str(" ESCAPE ");
+                    self.write_predicate_operand(escape, true);
+                }
+            }
+            Predicate::In(node) => {
+                self.output
+                    .push_str(if node.negated { " NOT IN " } else { " IN " });
+                self.write_expr(&node.value_list);
+            }
+            Predicate::Overlaps(node) => {
+                self.output.push_str(" OVERLAPS ");
+                self.write_predicate_operand(&node.right, true);
+            }
+            Predicate::QuantifiedComparison(node) => {
+                self.output.push(' ');
+                self.output.push_str(node.operator.sql());
+                self.output.push(' ');
+                self.output.push_str(match node.quantifier {
+                    ComparisonQuantifier::All => "ALL ",
+                    ComparisonQuantifier::Any => "ANY ",
+                    ComparisonQuantifier::Some => "SOME ",
+                });
+                self.write_expr(&node.subquery);
+            }
+            Predicate::Match(node) => {
+                self.output.push_str(" MATCH ");
+                if node.unique {
+                    self.output.push_str("UNIQUE ");
+                }
+                self.output.push_str(match node.match_type {
+                    MatchType::Simple => "SIMPLE ",
+                    MatchType::Partial => "PARTIAL ",
+                    MatchType::Full => "FULL ",
+                });
+                self.write_expr(&node.subquery);
+            }
+        }
+    }
+
+    fn write_predicate_operand(&mut self, expression: &Expr, right: bool) {
+        let parentheses = matches!(expression, Expr::Logical(_))
+            || (right && matches!(expression, Expr::Predicated(_)))
+            || matches!(expression, Expr::Binary(node) if node.operator.precedence() < 30);
+        if parentheses {
+            self.output.push('(');
+        }
+        self.write_expr(expression);
+        if parentheses {
+            self.output.push(')');
+        }
+    }
+
+    fn write_in_list_expr(&mut self, expression: &InListExpr) {
+        self.output.push('(');
+        self.write_expr_list(&expression.values);
+        self.output.push(')');
+    }
+
     fn write_nested_expr(&mut self, expression: &NestedExpr) {
         self.output.push('(');
         self.write_expr(&expression.expression);
         self.output.push(')');
     }
-    fn write_between_expr(&mut self, expression: &BetweenExpr) {
-        self.write_expr(&expression.expr);
-        self.output.push_str(if expression.negated {
-            " NOT BETWEEN "
-        } else {
-            " BETWEEN "
-        });
-        self.write_expr(&expression.low);
-        self.output.push_str(" AND ");
-        self.write_expr(&expression.high);
-    }
-    fn write_in_list_expr(&mut self, expression: &InListExpr) {
-        self.write_expr(&expression.expr);
-        self.output.push_str(if expression.negated {
-            " NOT IN ("
-        } else {
-            " IN ("
-        });
-        self.write_expr_list(&expression.list);
-        self.output.push(')');
-    }
-    fn write_in_subquery_expr(&mut self, expression: &InSubqueryExpr) {
-        self.write_expr(&expression.expr);
-        self.output.push_str(if expression.negated {
-            " NOT IN ("
-        } else {
-            " IN ("
-        });
-        self.write_query(&expression.query);
-        self.output.push(')');
-    }
+
     fn write_exists_expr(&mut self, expression: &ExistsExpr) {
         if expression.negated {
             self.output.push_str("NOT ");
@@ -1277,40 +1345,6 @@ impl Printer {
         self.output.push_str("EXISTS (");
         self.write_query(&expression.query);
         self.output.push(')');
-    }
-
-    fn write_like_expr(&mut self, expression: &LikeExpr) {
-        self.write_expr(&expression.expr);
-        if expression.negated {
-            self.output.push_str(" NOT");
-        }
-        self.output.push(' ');
-        self.output.push_str(match expression.operator {
-            LikeOperator::Like => "LIKE",
-            LikeOperator::ILike => "ILIKE",
-            LikeOperator::RLike => "RLIKE",
-            LikeOperator::SimilarTo => "SIMILAR TO",
-        });
-        self.output.push(' ');
-        self.write_expr(&expression.pattern);
-        if let Some(escape) = &expression.escape {
-            self.output.push_str(" ESCAPE ");
-            self.write_expr(escape);
-        }
-    }
-
-    fn write_is_predicate_expr(&mut self, expression: &IsPredicateExpr) {
-        self.write_expr(&expression.expr);
-        self.output.push_str(match expression.predicate {
-            IsPredicate::Null => " IS NULL",
-            IsPredicate::NotNull => " IS NOT NULL",
-            IsPredicate::True => " IS TRUE",
-            IsPredicate::NotTrue => " IS NOT TRUE",
-            IsPredicate::False => " IS FALSE",
-            IsPredicate::NotFalse => " IS NOT FALSE",
-            IsPredicate::Unknown => " IS UNKNOWN",
-            IsPredicate::NotUnknown => " IS NOT UNKNOWN",
-        });
     }
 
     fn write_case_expr(&mut self, expression: &CaseExpr) {
@@ -1553,19 +1587,23 @@ impl LogicalOperator {
     }
 }
 
+impl ComparisonOperator {
+    const fn sql(self) -> &'static str {
+        match self {
+            Self::Equal => "=",
+            Self::NotEqual => "!=",
+            Self::LessThan => "<",
+            Self::LessThanOrEqual => "<=",
+            Self::GreaterThan => ">",
+            Self::GreaterThanOrEqual => ">=",
+        }
+    }
+}
+
 impl BinaryOperator {
     const fn precedence(self) -> u8 {
         match self {
             Self::NamedArgument => 1,
-            Self::Equal
-            | Self::NotEqual
-            | Self::NullSafeEqual
-            | Self::LessThan
-            | Self::LessThanOrEqual
-            | Self::GreaterThan
-            | Self::GreaterThanOrEqual
-            | Self::IsDistinctFrom
-            | Self::IsNotDistinctFrom => 30,
             Self::BitwiseOr => 35,
             Self::BitwiseXor => 36,
             Self::BitwiseAnd => 37,
@@ -1577,13 +1615,6 @@ impl BinaryOperator {
     const fn sql(self) -> &'static str {
         match self {
             Self::NamedArgument => "=>",
-            Self::Equal => "=",
-            Self::NotEqual => "!=",
-            Self::NullSafeEqual => "<=>",
-            Self::LessThan => "<",
-            Self::LessThanOrEqual => "<=",
-            Self::GreaterThan => ">",
-            Self::GreaterThanOrEqual => ">=",
             Self::Add => "+",
             Self::Subtract => "-",
             Self::Multiply => "*",
@@ -1595,8 +1626,6 @@ impl BinaryOperator {
             Self::ShiftLeft => "<<",
             Self::ShiftRight => ">>",
             Self::StringConcat => "||",
-            Self::IsDistinctFrom => "IS DISTINCT FROM",
-            Self::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
         }
     }
 }
@@ -2331,11 +2360,7 @@ mod tests {
             quantifier: FunctionQuantifier::Distinct,
             order_by: Vec::new(),
             separator: None,
-            filter: Some(Box::new(Expr::IsPredicate(IsPredicateExpr {
-                expr: Box::new(identifier("b")),
-                predicate: IsPredicate::NotNull,
-                span: span(),
-            }))),
+            filter: Some(Box::new(crate::build::is_null(identifier("b"), true))),
             null_treatment: Some(NullTreatment::IgnoreNulls),
             over: Some(Box::new(WindowSpec {
                 existing_window_name: None,
@@ -2352,17 +2377,17 @@ mod tests {
             "Coalesce(DISTINCT a, 1 IGNORE NULLS) FILTER (WHERE b IS NOT NULL) OVER (PARTITION BY partition_key)"
         );
 
-        let between = Expr::Between(BetweenExpr {
-            expr: Box::new(binary(
-                identifier("a"),
-                BinaryOperator::Add,
-                identifier("b"),
-            )),
-            negated: true,
-            low: Box::new(number("1")),
-            high: Box::new(number("2")),
+        let between = Expr::Predicated(AstBox::new(PredicatedExpr {
+            value: binary(identifier("a"), BinaryOperator::Add, identifier("b")),
+            predicate: Predicate::Between(BetweenPredicate {
+                negated: true,
+                symmetry: None,
+                min: number("1"),
+                max: number("2"),
+                span: span(),
+            }),
             span: span(),
-        });
+        }));
         assert_eq!(print_expr(&between), "a + b NOT BETWEEN 1 AND 2");
         assert_eq!(
             print_expr(&Expr::Access(AccessExpr {

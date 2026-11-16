@@ -38,6 +38,7 @@ pub enum BuildError {
     EmptyValuesRow,
     EmptyCase,
     EmptyTuple,
+    EmptyInList,
     EmptyUnion,
     EmptyWildcardPrefix,
     Number(ParserError),
@@ -52,6 +53,9 @@ impl fmt::Display for BuildError {
             Self::EmptyValuesRow => formatter.write_str("VALUES row must not be empty"),
             Self::EmptyCase => formatter.write_str("CASE must contain at least one branch"),
             Self::EmptyTuple => formatter.write_str("tuple must contain at least one expression"),
+            Self::EmptyInList => {
+                formatter.write_str("IN list must contain at least one expression")
+            }
             Self::EmptyUnion => formatter.write_str("UNION ALL must contain at least one operand"),
             Self::EmptyWildcardPrefix => {
                 formatter.write_str("qualified wildcard must contain a name prefix")
@@ -316,17 +320,60 @@ fn boolean_chain(mut operands: Vec<Expr>, operator: LogicalOperator) -> Option<E
     }
 }
 
+pub fn comparison(left: Expr, operator: ComparisonOperator, right: Expr) -> Expr {
+    let span = left.span().cover(right.span());
+    Expr::Predicated(AstBox::new(PredicatedExpr {
+        value: left,
+        predicate: Predicate::Comparison(ComparisonPredicate {
+            operator,
+            span: right.span(),
+            right,
+        }),
+        span,
+    }))
+}
+
+pub fn is_distinct_from(left: Expr, right: Expr, negated: bool) -> Expr {
+    let span = left.span().cover(right.span());
+    Expr::Predicated(AstBox::new(PredicatedExpr {
+        value: left,
+        predicate: Predicate::DistinctFrom(DistinctFromPredicate {
+            negated,
+            span: right.span(),
+            right,
+        }),
+        span,
+    }))
+}
+
 pub fn is_null(expr: Expr, negated: bool) -> Expr {
     let span = expr.span();
-    Expr::IsPredicate(IsPredicateExpr {
-        expr: Box::new(expr),
-        predicate: if negated {
-            IsPredicate::NotNull
-        } else {
-            IsPredicate::Null
-        },
+    Expr::Predicated(AstBox::new(PredicatedExpr {
+        value: expr,
+        predicate: Predicate::IsNull(IsNullPredicate { negated, span }),
         span,
-    })
+    }))
+}
+
+pub fn in_list(expr: Expr, values: Vec<Expr>, negated: bool) -> Result<Expr, BuildError> {
+    if values.is_empty() {
+        return Err(BuildError::EmptyInList);
+    }
+    let list_span = cover(values.iter().map(Expr::span));
+    let span = expr.span().cover(list_span);
+    let value_list = Expr::InList(AstBox::new(InListExpr {
+        values: values.into(),
+        span: list_span,
+    }));
+    Ok(Expr::Predicated(AstBox::new(PredicatedExpr {
+        value: expr,
+        predicate: Predicate::In(InPredicate {
+            negated,
+            value_list,
+            span: list_span,
+        }),
+        span,
+    })))
 }
 
 pub fn case_when(

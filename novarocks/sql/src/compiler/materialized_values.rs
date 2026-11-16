@@ -35,6 +35,13 @@ pub enum SqlConstantQueryStep {
 pub enum SqlConstantExpressionStep {
     Nested,
     LogicalTerm(usize),
+    PredicatedValue,
+    ComparisonRight,
+    BetweenMin,
+    BetweenMax,
+    LikePattern,
+    InValueList,
+    InListValue(usize),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlConstantExpressionSite {
@@ -148,6 +155,57 @@ pub(crate) fn resolve_expression_site<'a>(
             (SqlConstantExpressionStep::LogicalTerm(index), ast::Expr::Logical(logical)) => {
                 logical.terms.get(*index).ok_or_else(|| {
                     invalid("constant source logical term index differs from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::PredicatedValue, ast::Expr::Predicated(node)) => {
+                &node.value
+            }
+            (SqlConstantExpressionStep::ComparisonRight, ast::Expr::Predicated(node)) => {
+                match &node.predicate {
+                    ast::Predicate::Comparison(p) => &p.right,
+                    ast::Predicate::DistinctFrom(p) => &p.right,
+                    _ => {
+                        return Err(invalid(
+                            "constant source comparison edge differs from its owned syntax",
+                        ));
+                    }
+                }
+            }
+            (SqlConstantExpressionStep::BetweenMin, ast::Expr::Predicated(node)) => {
+                let ast::Predicate::Between(p) = &node.predicate else {
+                    return Err(invalid(
+                        "constant source BETWEEN edge differs from its owned syntax",
+                    ));
+                };
+                &p.min
+            }
+            (SqlConstantExpressionStep::BetweenMax, ast::Expr::Predicated(node)) => {
+                let ast::Predicate::Between(p) = &node.predicate else {
+                    return Err(invalid(
+                        "constant source BETWEEN edge differs from its owned syntax",
+                    ));
+                };
+                &p.max
+            }
+            (SqlConstantExpressionStep::LikePattern, ast::Expr::Predicated(node)) => {
+                let ast::Predicate::Like(p) = &node.predicate else {
+                    return Err(invalid(
+                        "constant source LIKE edge differs from its owned syntax",
+                    ));
+                };
+                &p.pattern
+            }
+            (SqlConstantExpressionStep::InValueList, ast::Expr::Predicated(node)) => {
+                let ast::Predicate::In(p) = &node.predicate else {
+                    return Err(invalid(
+                        "constant source IN edge differs from its owned syntax",
+                    ));
+                };
+                &p.value_list
+            }
+            (SqlConstantExpressionStep::InListValue(index), ast::Expr::InList(list)) => {
+                list.values.get(*index).ok_or_else(|| {
+                    invalid("constant source IN value index differs from its owned syntax")
                 })?
             }
             _ => {

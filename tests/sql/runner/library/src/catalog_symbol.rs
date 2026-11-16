@@ -660,25 +660,34 @@ impl Visit for CatalogEdits<'_> {
         self.aliases = previous_aliases;
         self.relations = previous_relations;
     }
-    fn visit_binary_expr(&mut self, e: &BinaryExpr) {
+    fn visit_predicated_expr(&mut self, e: &PredicatedExpr) {
+        let right = match &e.predicate {
+            Predicate::Comparison(predicate)
+                if matches!(
+                    predicate.operator,
+                    ComparisonOperator::Equal | ComparisonOperator::NotEqual
+                ) =>
+            {
+                Some(&predicate.right)
+            }
+            Predicate::DistinctFrom(predicate) if predicate.negated => Some(&predicate.right),
+            _ => None,
+        };
         if self.metadata
-            && matches!(
-                e.operator,
-                BinaryOperator::Equal | BinaryOperator::NotEqual | BinaryOperator::NullSafeEqual
-            )
+            && let Some(right) = right
         {
-            if catalog_column(&e.left).is_some()
-                && let Expr::Literal(l) = &*e.right
+            if catalog_column(&e.value).is_some()
+                && let Expr::Literal(l) = right
             {
                 self.literal(l);
             }
-            if catalog_column(&e.right).is_some()
-                && let Expr::Literal(l) = &*e.left
+            if catalog_column(right).is_some()
+                && let Expr::Literal(l) = &e.value
             {
                 self.literal(l);
             }
         }
-        walk_binary_expr(self, e);
+        walk_predicated_expr(self, e);
     }
 }
 fn catalog_column(expr: &Expr) -> Option<&Ident> {
@@ -1005,6 +1014,32 @@ mod tests {
         let rewritten = symbols.rewrite_source(source).unwrap();
         assert_eq!(rewritten, expected);
         assert_eq!(symbols.rewrite_source(&rewritten).unwrap(), rewritten);
+    }
+
+    #[test]
+    fn null_safe_metadata_comparisons_rewrite_both_source_spellings() {
+        let symbols = symbols();
+        let catalog = symbols.lookup("owned").unwrap();
+        let source = "SELECT 'owned' AS business FROM system.metadata.materialized_views \
+                      WHERE catalog_name <=> 'owned' OR 'owned' IS NOT DISTINCT FROM storage_catalog;";
+        let expected = format!(
+            "SELECT 'owned' AS business FROM system.metadata.materialized_views \
+             WHERE catalog_name <=> '{catalog}' OR '{catalog}' IS NOT DISTINCT FROM storage_catalog;"
+        );
+        let rewritten = symbols.rewrite_source(source).unwrap();
+        assert_eq!(rewritten, expected);
+        assert_eq!(symbols.rewrite_source(&rewritten).unwrap(), rewritten);
+    }
+
+    #[test]
+    fn other_metadata_predicates_preserve_catalog_and_business_strings() {
+        let symbols = symbols();
+        let source = "SELECT 'owned' AS business FROM system.metadata.materialized_views \
+                      WHERE catalog_name > 'owned' OR storage_catalog LIKE 'owned' \
+                      OR catalog_name IN ('owned') OR catalog_name BETWEEN 'owned' AND 'owned' \
+                      OR catalog_name IS DISTINCT FROM 'owned' OR name = 'owned';";
+        novarocks_parser::parse(source).unwrap();
+        assert_eq!(symbols.rewrite_source(source).unwrap(), source);
     }
 
     #[test]

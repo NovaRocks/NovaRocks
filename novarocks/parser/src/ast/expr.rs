@@ -17,7 +17,7 @@
 
 use crate::{
     Span,
-    ast::{AstVec, Ident, Literal, ObjectName, Query, TypeName, window::WindowSpec},
+    ast::{AstBox, AstVec, Ident, Literal, ObjectName, Query, TypeName, window::WindowSpec},
 };
 
 /// A SQL expression with source spans retained at every syntax node.
@@ -39,12 +39,9 @@ pub enum Expr {
     Binary(BinaryExpr),
     Logical(LogicalExpr),
     Nested(NestedExpr),
-    Between(BetweenExpr),
-    InList(InListExpr),
-    InSubquery(InSubqueryExpr),
+    Predicated(AstBox<super::PredicatedExpr>),
+    InList(AstBox<super::InListExpr>),
     Exists(ExistsExpr),
-    Like(LikeExpr),
-    IsPredicate(IsPredicateExpr),
     Case(CaseExpr),
     Cast(CastExpr),
     Interval(IntervalExpr),
@@ -58,7 +55,7 @@ pub enum Expr {
 }
 
 impl Expr {
-    pub const fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         match self {
             Self::JsonConstructor(node) => node.span,
             Self::JsonExists(node) => node.span,
@@ -76,12 +73,9 @@ impl Expr {
             Self::Binary(expression) => expression.span,
             Self::Logical(expression) => expression.span,
             Self::Nested(expression) => expression.span,
-            Self::Between(expression) => expression.span,
             Self::InList(expression) => expression.span,
-            Self::InSubquery(expression) => expression.span,
+            Self::Predicated(expression) => expression.span,
             Self::Exists(expression) => expression.span,
-            Self::Like(expression) => expression.span,
-            Self::IsPredicate(expression) => expression.span,
             Self::Case(expression) => expression.span,
             Self::Cast(expression) => expression.span,
             Self::Interval(expression) => expression.span,
@@ -164,72 +158,10 @@ pub struct NestedExpr {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BetweenExpr {
-    pub expr: Box<Expr>,
-    pub negated: bool,
-    pub low: Box<Expr>,
-    pub high: Box<Expr>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InListExpr {
-    pub expr: Box<Expr>,
-    pub negated: bool,
-    pub list: Vec<Expr>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InSubqueryExpr {
-    pub expr: Box<Expr>,
-    pub negated: bool,
-    pub query: Box<Query>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExistsExpr {
     pub negated: bool,
     pub query: Box<Query>,
     pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LikeExpr {
-    pub expr: Box<Expr>,
-    pub negated: bool,
-    pub operator: LikeOperator,
-    pub pattern: Box<Expr>,
-    pub escape: Option<Box<Expr>>,
-    pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LikeOperator {
-    Like,
-    ILike,
-    RLike,
-    SimilarTo,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IsPredicateExpr {
-    pub expr: Box<Expr>,
-    pub predicate: IsPredicate,
-    pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IsPredicate {
-    Null,
-    NotNull,
-    True,
-    NotTrue,
-    False,
-    NotFalse,
-    Unknown,
-    NotUnknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -387,13 +319,6 @@ pub enum UnaryOperator {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BinaryOperator {
     NamedArgument,
-    Equal,
-    NullSafeEqual,
-    NotEqual,
-    LessThan,
-    LessThanOrEqual,
-    GreaterThan,
-    GreaterThanOrEqual,
     Add,
     Subtract,
     Multiply,
@@ -405,6 +330,4 @@ pub enum BinaryOperator {
     ShiftLeft,
     ShiftRight,
     StringConcat,
-    IsDistinctFrom,
-    IsNotDistinctFrom,
 }

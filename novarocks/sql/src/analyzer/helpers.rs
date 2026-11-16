@@ -924,7 +924,7 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
             )
         }
         ast::Expr::FunctionCall(function) => format_function_display_name(function),
-        ast::Expr::IsPredicate(predicate) => format_is_predicate_display_name(predicate),
+        ast::Expr::Predicated(node) => format_predicated_display_name(expr, node),
         ast::Expr::Cast(cast) => {
             if type_name_is(&cast.data_type, "array")
                 && matches!(cast.expr.as_ref(), ast::Expr::Array(_))
@@ -968,29 +968,14 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
             }
             level.join(separator)
         }
-        ast::Expr::InList(in_list) => {
-            let not = if in_list.negated { " NOT" } else { "" };
-            let items = in_list
-                .list
+        ast::Expr::InList(list) => format!(
+            "({})",
+            list.values
                 .iter()
                 .map(expr_display_name_with_parens)
                 .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "{}{} IN ({items})",
-                expr_display_name_with_parens(&in_list.expr),
-                not
-            )
-        }
-        ast::Expr::InSubquery(in_subquery) => {
-            let not = if in_subquery.negated { " NOT" } else { "" };
-            format!(
-                "{}{} IN ((({})))",
-                expr_display_name_with_parens(&in_subquery.expr),
-                not,
-                format_subquery_display_name(&in_subquery.query)
-            )
-        }
+                .join(", ")
+        ),
         other => lowercase_leading_keyword(&printer::print_expr(other)),
     }
 }
@@ -1156,33 +1141,78 @@ fn expr_display_name_with_parens(expr: &ast::Expr) -> String {
     }
 }
 
-fn format_is_predicate_display_name(predicate: &ast::IsPredicateExpr) -> String {
-    let suffix = match predicate.predicate {
-        ast::IsPredicate::Null => "IS NULL",
-        ast::IsPredicate::NotNull => "IS NOT NULL",
-        ast::IsPredicate::True => "IS TRUE",
-        ast::IsPredicate::NotTrue => "IS NOT TRUE",
-        ast::IsPredicate::False => "IS FALSE",
-        ast::IsPredicate::NotFalse => "IS NOT FALSE",
-        ast::IsPredicate::Unknown => "IS UNKNOWN",
-        ast::IsPredicate::NotUnknown => "IS NOT UNKNOWN",
-    };
-    format!(
-        "{} {suffix}",
-        expr_display_name_with_parens(&predicate.expr)
-    )
+fn format_predicated_display_name(expression: &ast::Expr, node: &ast::PredicatedExpr) -> String {
+    let value = || expr_display_name_with_parens(&node.value);
+    match &node.predicate {
+        ast::Predicate::Comparison(p) => {
+            let operator = match p.operator {
+                ast::ComparisonOperator::Equal => "=",
+                ast::ComparisonOperator::NotEqual => "!=",
+                ast::ComparisonOperator::LessThan => "<",
+                ast::ComparisonOperator::LessThanOrEqual => "<=",
+                ast::ComparisonOperator::GreaterThan => ">",
+                ast::ComparisonOperator::GreaterThanOrEqual => ">=",
+            };
+            format!(
+                "{} {operator} {}",
+                value(),
+                expr_display_name_with_parens(&p.right)
+            )
+        }
+        ast::Predicate::DistinctFrom(p) => {
+            let equal = format!(
+                "{} <=> {}",
+                value(),
+                expr_display_name_with_parens(&p.right)
+            );
+            if p.negated {
+                equal
+            } else {
+                format!("NOT ({equal})")
+            }
+        }
+        ast::Predicate::IsNull(p) => {
+            format!("{} IS {}NULL", value(), if p.negated { "NOT " } else { "" })
+        }
+        ast::Predicate::BooleanTest(p) => {
+            let truth = match p.truth_value {
+                ast::TruthValue::True => "TRUE",
+                ast::TruthValue::False => "FALSE",
+                ast::TruthValue::Unknown => "UNKNOWN",
+            };
+            format!(
+                "{} IS {}{truth}",
+                value(),
+                if p.negated { "NOT " } else { "" }
+            )
+        }
+        ast::Predicate::In(p) => {
+            let not = if p.negated { " NOT" } else { "" };
+            match &p.value_list {
+                ast::Expr::InList(list) => format!(
+                    "{}{not} IN ({})",
+                    value(),
+                    list.values
+                        .iter()
+                        .map(expr_display_name_with_parens)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                ast::Expr::Subquery(subquery) => format!(
+                    "{}{not} IN ((({})))",
+                    value(),
+                    format_subquery_display_name(&subquery.query)
+                ),
+                _ => lowercase_leading_keyword(&printer::print_expr(expression)),
+            }
+        }
+        _ => lowercase_leading_keyword(&printer::print_expr(expression)),
+    }
 }
 
 fn binary_operator_display(operator: ast::BinaryOperator) -> &'static str {
     match operator {
         ast::BinaryOperator::NamedArgument => "=>",
-        ast::BinaryOperator::Equal => "=",
-        ast::BinaryOperator::NullSafeEqual => "<=>",
-        ast::BinaryOperator::NotEqual => "!=",
-        ast::BinaryOperator::LessThan => "<",
-        ast::BinaryOperator::LessThanOrEqual => "<=",
-        ast::BinaryOperator::GreaterThan => ">",
-        ast::BinaryOperator::GreaterThanOrEqual => ">=",
         ast::BinaryOperator::Add => "+",
         ast::BinaryOperator::Subtract => "-",
         ast::BinaryOperator::Multiply => "*",
@@ -1194,8 +1224,6 @@ fn binary_operator_display(operator: ast::BinaryOperator) -> &'static str {
         ast::BinaryOperator::ShiftLeft => "<<",
         ast::BinaryOperator::ShiftRight => ">>",
         ast::BinaryOperator::StringConcat => "||",
-        ast::BinaryOperator::IsDistinctFrom => "IS DISTINCT FROM",
-        ast::BinaryOperator::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
     }
 }
 

@@ -2499,18 +2499,22 @@ fn collect_join_equality_predicates(
             }
             Ok(())
         }
-        ast::Expr::Binary(binary) => match binary.operator {
-            ast::BinaryOperator::Equal => {
-                predicates.push(SqlMvJoinPredicateColumns {
-                    left: join_column_ref(&binary.left)?,
-                    right: join_column_ref(&binary.right)?,
-                });
-                Ok(())
+        ast::Expr::Predicated(node) => {
+            let ast::Predicate::Comparison(predicate) = &node.predicate else {
+                return Err("extract_join_equality_predicates: an ON condition may only conjoin ordinary equalities".into());
+            };
+            if predicate.operator != ast::ComparisonOperator::Equal {
+                return Err(format!(
+                    "extract_join_equality_predicates: an ON condition may only conjoin equalities, not {:?}",
+                    predicate.operator
+                ));
             }
-            other => Err(format!(
-                "extract_join_equality_predicates: an ON condition may only conjoin equalities, not {other:?}"
-            )),
-        },
+            predicates.push(SqlMvJoinPredicateColumns {
+                left: join_column_ref(&node.value)?,
+                right: join_column_ref(&predicate.right)?,
+            });
+            Ok(())
+        }
         other => Err(format!(
             "extract_join_equality_predicates: unsupported ON condition shape {:?}",
             std::mem::discriminant(other)
@@ -2961,22 +2965,32 @@ fn collect_equi_join_keys(
             }
             Ok(())
         }
-        Expr::Binary(binary) if binary.operator == ast::BinaryOperator::Equal => {
-            let left_q = qualified_column_alias(&binary.left)?;
-            let right_q = qualified_column_alias(&binary.right)?;
+        Expr::Predicated(node) => {
+            let ast::Predicate::Comparison(predicate) = &node.predicate else {
+                return Err(
+                    "incremental join MV supports only AND-combined equi-join predicates".into(),
+                );
+            };
+            if predicate.operator != ast::ComparisonOperator::Equal {
+                return Err(
+                    "incremental join MV supports only AND-combined equi-join predicates".into(),
+                );
+            }
+            let left_q = qualified_column_alias(&node.value)?;
+            let right_q = qualified_column_alias(&predicate.right)?;
             if left_q.eq_ignore_ascii_case(left_alias) && right_q.eq_ignore_ascii_case(right_alias)
             {
                 out.push(JoinKeyPairShape {
-                    left_expr: (*binary.left).clone(),
-                    right_expr: (*binary.right).clone(),
+                    left_expr: node.value.clone(),
+                    right_expr: predicate.right.clone(),
                 });
                 Ok(())
             } else if left_q.eq_ignore_ascii_case(right_alias)
                 && right_q.eq_ignore_ascii_case(left_alias)
             {
                 out.push(JoinKeyPairShape {
-                    left_expr: (*binary.right).clone(),
-                    right_expr: (*binary.left).clone(),
+                    left_expr: predicate.right.clone(),
+                    right_expr: node.value.clone(),
                 });
                 Ok(())
             } else {
@@ -3320,6 +3334,22 @@ fn select_item_contains_aggregate_function(item: &SelectItem) -> bool {
     }
 }
 
+/// Borrow only the predicate's actual expression fields. Query scope is
+/// handled by the consumer's existing Subquery branch.
+fn predicate_exprs(predicate: &ast::Predicate) -> Vec<&Expr> {
+    match predicate {
+        ast::Predicate::Comparison(p) => vec![&p.right],
+        ast::Predicate::DistinctFrom(p) => vec![&p.right],
+        ast::Predicate::Between(p) => vec![&p.min, &p.max],
+        ast::Predicate::Like(p) => std::iter::once(&p.pattern).chain(p.escape.iter()).collect(),
+        ast::Predicate::In(p) => vec![&p.value_list],
+        ast::Predicate::Overlaps(p) => vec![&p.right],
+        ast::Predicate::QuantifiedComparison(p) => vec![&p.subquery],
+        ast::Predicate::Match(p) => vec![&p.subquery],
+        ast::Predicate::BooleanTest(_) | ast::Predicate::IsNull(_) => vec![],
+    }
+}
+
 fn expr_contains_aggregate_function(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall(function) => {
@@ -3347,15 +3377,13 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
         Expr::Unary(unary) => expr_contains_aggregate_function(&unary.expression),
         Expr::Nested(nested) => expr_contains_aggregate_function(&nested.expression),
         Expr::Cast(cast) => expr_contains_aggregate_function(&cast.expr),
-        Expr::InList(list) => {
-            expr_contains_aggregate_function(&list.expr)
-                || list.list.iter().any(expr_contains_aggregate_function)
+        Expr::Predicated(node) => {
+            expr_contains_aggregate_function(&node.value)
+                || predicate_exprs(&node.predicate)
+                    .into_iter()
+                    .any(expr_contains_aggregate_function)
         }
-        Expr::Between(between) => {
-            expr_contains_aggregate_function(&between.expr)
-                || expr_contains_aggregate_function(&between.low)
-                || expr_contains_aggregate_function(&between.high)
-        }
+        Expr::InList(list) => list.values.iter().any(expr_contains_aggregate_function),
         Expr::Case(case) => {
             case.operand
                 .as_ref()
@@ -3464,32 +3492,28 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
         | Expr::JsonValue(_)
         | Expr::JsonSerialize(_) => return Err(projection_filter_error()),
 
-        Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => {
+        Expr::Subquery(_) | Expr::Exists(_) => {
             return Err(projection_filter_error());
         }
         Expr::FunctionCall(function) => reject_unsupported_function(function)?,
         Expr::Access(access) => reject_unsupported_access_expr(access)?,
         Expr::Unary(unary) => reject_unsupported_expr(&unary.expression)?,
         Expr::Nested(nested) => reject_unsupported_expr(&nested.expression)?,
-        Expr::InList(list) => {
-            reject_unsupported_expr(&list.expr)?;
-            reject_unsupported_exprs(&list.list)?;
+        Expr::Predicated(node) => {
+            if crate::analyzer::unsupported_predicate_reason(node).is_some() {
+                return Err(projection_filter_error());
+            }
+            reject_unsupported_expr(&node.value)?;
+            for child in predicate_exprs(&node.predicate) {
+                reject_unsupported_expr(child)?;
+            }
         }
-        Expr::Between(between) => {
-            reject_unsupported_expr(&between.expr)?;
-            reject_unsupported_expr(&between.low)?;
-            reject_unsupported_expr(&between.high)?;
-        }
+        Expr::InList(list) => reject_unsupported_exprs(&list.values)?,
         Expr::Binary(binary) => {
             reject_unsupported_expr(&binary.left)?;
             reject_unsupported_expr(&binary.right)?;
         }
         Expr::Logical(logical) => reject_unsupported_exprs(&logical.terms)?,
-        Expr::Like(like) => {
-            reject_unsupported_expr(&like.expr)?;
-            reject_unsupported_expr(&like.pattern)?;
-        }
-        Expr::IsPredicate(predicate) => reject_unsupported_expr(&predicate.expr)?,
         Expr::Cast(cast) => reject_unsupported_expr(&cast.expr)?,
         Expr::Case(case) => {
             if let Some(operand) = &case.operand {

@@ -40,8 +40,8 @@ use crate::query_execution::planning::write_sink::{
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
 use novarocks_parser::ast::{
-    BinaryOperator, Delete, Expr, FunctionCall, IsPredicate, LiteralKind,
-    ObjectName as ParserObjectName, Query, UnaryOperator,
+    Delete, Expr, FunctionCall, LiteralKind, ObjectName as ParserObjectName, Predicate, Query,
+    UnaryOperator,
 };
 use novarocks_parser::{SYNTHETIC, ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
@@ -449,49 +449,43 @@ fn validate_where_predicate(
             }
             Ok(())
         }
-        Expr::Binary(binary) => match binary.operator {
-            BinaryOperator::Equal
-            | BinaryOperator::NotEqual
-            | BinaryOperator::LessThan
-            | BinaryOperator::LessThanOrEqual
-            | BinaryOperator::GreaterThan
-            | BinaryOperator::GreaterThanOrEqual => {
+        Expr::Predicated(expression) => match &expression.predicate {
+            Predicate::Comparison(comparison) => {
                 // Detect scalar_fn(col) <op> literal pattern first.
                 // Function-call predicates cannot be pushed into Iceberg column
                 // statistics (the function obscures the underlying column value),
                 // so we return AlwaysTrue here to scan all files and leave
                 // correctness to the per-row evaluator in evaluate_where_at_row.
-                if extract_scalar_fn_comparison(&binary.left, &binary.right).is_some()
-                    || extract_variant_get_comparison(&binary.left, &binary.right).is_some()
+                if extract_scalar_fn_comparison(&expression.value, &comparison.right).is_some()
+                    || extract_variant_get_comparison(&expression.value, &comparison.right)
+                        .is_some()
                 {
                     return Ok(());
                 }
                 let (col_name, value_expr, _flipped) =
-                    extract_comparison(&binary.left, &binary.right)?;
+                    extract_comparison(&expression.value, &comparison.right)?;
                 validate_literal_for_column(value_expr, columns, &col_name).map_err(Into::into)
             }
-            other => Err(format!(
-                "phase 1 DELETE WHERE does not support binary operator `{other:?}`"
-            )
-            .into()),
-        },
-        Expr::InList(in_list) => {
-            let col_name = expr_to_column_name(&in_list.expr)?;
-            for literal in &in_list.list {
-                validate_literal_for_column(literal, columns, &col_name)?;
+            Predicate::In(predicate) => {
+                let Expr::InList(list) = &predicate.value_list else {
+                    return Err("phase 1 DELETE WHERE IN requires a literal value list".into());
+                };
+                if list.values.is_empty() {
+                    return Err("phase 1 DELETE WHERE IN requires a nonempty value list".into());
+                }
+                let col_name = expr_to_column_name(&expression.value)?;
+                for literal in &list.values {
+                    validate_literal_for_column(literal, columns, &col_name)?;
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        Expr::IsPredicate(predicate)
-            if matches!(
-                predicate.predicate,
-                IsPredicate::Null | IsPredicate::NotNull
-            ) =>
-        {
-            expr_to_column_name(&predicate.expr)
+            Predicate::IsNull(_) => expr_to_column_name(&expression.value)
                 .map(|_| ())
-                .map_err(Into::into)
-        }
+                .map_err(Into::into),
+            other => {
+                Err(format!("phase 1 DELETE WHERE does not support predicate `{other:?}`").into())
+            }
+        },
         Expr::Nested(nested) => validate_where_predicate(&nested.expression, columns),
         other => Err(format!(
             "phase 1 DELETE WHERE supports comparison / IN / IS NULL / AND / OR \
@@ -831,6 +825,43 @@ mod tests {
             column("id", DataType::Int32),
             column("v", DataType::LargeBinary),
         ]
+    }
+
+    #[test]
+    fn delete_predicates_keep_advanced_and_malformed_in_shapes_unsupported() {
+        let columns = [column("n", DataType::Int32)];
+        for source in ["n <=> 1", "n BETWEEN 1 AND 2", "n IS TRUE", "n LIKE '1%'"] {
+            let error = super::validate_where(&where_expr(source), &columns).unwrap_err();
+            let crate::dml::error::DmlExecutionError::Engine(error) = error else {
+                panic!("unsupported predicate error");
+            };
+            assert!(
+                error.contains("does not support predicate"),
+                "{source}: {error}"
+            );
+        }
+        let mut predicate = where_expr("n IN (1, 2)");
+        let Expr::Predicated(expression) = &mut predicate else {
+            panic!("IN predicate");
+        };
+        let novarocks_parser::ast::Predicate::In(in_predicate) = &mut expression.predicate else {
+            panic!("IN payload");
+        };
+        let bare_list = in_predicate.value_list.clone();
+        assert!(super::validate_where(&bare_list, &columns).is_err());
+        let Expr::InList(list) = &mut in_predicate.value_list else {
+            panic!("IN list");
+        };
+        list.values.clear();
+        assert!(super::validate_where(&predicate, &columns).is_err());
+        let Expr::Predicated(expression) = &mut predicate else {
+            unreachable!();
+        };
+        let novarocks_parser::ast::Predicate::In(in_predicate) = &mut expression.predicate else {
+            unreachable!();
+        };
+        in_predicate.value_list = novarocks_parser::build::string("not a value list");
+        assert!(super::validate_where(&predicate, &columns).is_err());
     }
 
     #[test]

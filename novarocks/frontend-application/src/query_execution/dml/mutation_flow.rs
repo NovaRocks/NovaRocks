@@ -1942,16 +1942,8 @@ mod tests {
         };
         assert_eq!(case.conditions.len(), 2);
         for (index, (original, guard, result)) in [
-            (
-                &matched,
-                ast::IsPredicate::NotNull,
-                MERGE_ACTION_MATCHED_UPDATE,
-            ),
-            (
-                &inserted,
-                ast::IsPredicate::Null,
-                MERGE_ACTION_NOT_MATCHED_INSERT,
-            ),
+            (&matched, true, MERGE_ACTION_MATCHED_UPDATE),
+            (&inserted, false, MERGE_ACTION_NOT_MATCHED_INSERT),
         ]
         .into_iter()
         .enumerate()
@@ -1961,8 +1953,14 @@ mod tests {
             };
             assert_eq!(condition.operator, ast::LogicalOperator::And);
             assert_eq!(condition.terms.len(), 2);
+            let ast::Expr::Predicated(predicate) = &condition.terms[0] else {
+                panic!("action null guard");
+            };
             assert!(
-                matches!(&condition.terms[0], ast::Expr::IsPredicate(predicate) if predicate.predicate == guard)
+                matches!(&predicate.predicate, ast::Predicate::IsNull(null) if null.negated == guard)
+            );
+            assert!(
+                matches!(&predicate.value, ast::Expr::CompoundIdentifier(name) if name.parts.last().is_some_and(|name| name.value == "_file"))
             );
             let ast::Expr::Nested(clause) = &condition.terms[1] else {
                 panic!("original clause boundary");
