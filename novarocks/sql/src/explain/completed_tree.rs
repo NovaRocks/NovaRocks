@@ -1553,6 +1553,9 @@ impl TreeContext<'_> {
             NodeKind::AssertOneRow(_) => {
                 out.push(format_args!("{prefix}ASSERT ONE ROW{stats}"))?;
             }
+            NodeKind::WriteLayoutKey { .. } => {
+                out.push(format_args!("{prefix}WRITE_LAYOUT_KEY{stats}"))?;
+            }
             NodeKind::PositionShard(spec) => {
                 out.push(format_args!(
                     "{prefix}POSITION_SHARD_AGGREGATION(routes={}){stats}",

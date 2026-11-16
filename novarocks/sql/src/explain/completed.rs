@@ -3245,6 +3245,11 @@ condition,
                         ))
                 ))
         )),
+        NodeKind::WriteLayoutKey { key_inputs, output_key } => lines.push(format_args!(
+            "{pad}  partition-inputs=[{}], layout-key=v{}",
+            format_value_ids(key_inputs),
+            output_key.get(),
+        )),
         NodeKind::PositionShard(spec) => lines.push(format_args!(
             "{pad}  target={}, contribution-routes={}",
             spec.target.get(),
@@ -3842,6 +3847,7 @@ impl fmt::Display for NodeHeaderDisplay<'_> {
             )?,
             NodeKind::AssertOneRow(_) => formatter.write_str("ASSERT ONE ROW")?,
             NodeKind::ChangeEventExpand { .. } => formatter.write_str("CHANGE EVENT EXPAND")?,
+            NodeKind::WriteLayoutKey { .. } => formatter.write_str("WRITE LAYOUT KEY")?,
             NodeKind::PositionShard(_) => formatter.write_str("POSITION SHARD AGGREGATION")?,
             NodeKind::ExchangeSource { edge, .. } => {
                 let label = context.plan.edges().get(edge).map_or("EXCHANGE", |edge| {

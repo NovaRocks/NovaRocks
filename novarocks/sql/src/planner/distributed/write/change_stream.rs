@@ -366,7 +366,8 @@ fn validate_requirement_tokens(
         ConnectorWriteColocation::None | ConnectorWriteColocation::Singleton => &[],
     };
     let layout = match &requirements.layout {
-        ConnectorWriteLayoutPreference::ClusterBy(keys) => keys.as_slice(),
+        ConnectorWriteLayoutPreference::ClusterBy(keys)
+        | ConnectorWriteLayoutPreference::PartitionAffinity { inputs: keys, .. } => keys.as_slice(),
         ConnectorWriteLayoutPreference::None => &[],
     };
     for token in colocation.iter().chain(layout) {
