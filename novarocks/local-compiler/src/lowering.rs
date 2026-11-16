@@ -431,6 +431,7 @@ fn lower_with_creation<
             .into());
         }
     };
+    let mut routing_receivers = BTreeSet::new();
     for cut in package.cuts().inbound.iter() {
         work.step()?;
         if cut.kind != EdgeKind::Stream && cut.kind != EdgeKind::ChangeStreamRouter {
@@ -439,6 +440,9 @@ fn lower_with_creation<
                 feature: "inbound CTE edge",
             })
             .into());
+        }
+        if !cut.partitioning.routing_only.is_empty() {
+            routing_receivers.insert(cut.destination_node);
         }
     }
     // Provider reads and writes are admitted per scan and writer below; each
@@ -852,15 +856,15 @@ fn lower_with_creation<
         }
         let sorted = node.inputs.len() == 1 && properties.get(&node.inputs[0]).is_some_and(|p| p.1);
         let changes = matches!(node.kind, NodeKind::ChangeEventExpand { .. });
-        // A table function keeps each outer row on its driver and emits its
-        // rows in outer order; the property law keeps exactly the input
-        // ordering prefix its pass-through values carry.
+        // A table function and a write layout key keep each outer row on its
+        // driver and preserve the ordering of the pass-through occurrences.
         let transparent = matches!(
             node.kind,
             NodeKind::Project { .. }
                 | NodeKind::Filter { .. }
                 | NodeKind::Limit { .. }
                 | NodeKind::TableFunction { .. }
+                | NodeKind::WriteLayoutKey { .. }
         );
         let partial_rows = matches!(
             node.kind,
@@ -942,7 +946,12 @@ fn lower_with_creation<
         // placement. Keep that placement fact, not a guessed distribution.
         // Network join admissibility was checked by orient_join above.
         let join_placed = probe_input.is_some() && node.inputs.iter().all(checked_input_placement);
-        let scan_rooted = matches!(node.kind, NodeKind::Scan { .. })
+        // The exact inbound cut places each row even when the routing key
+        // was consumed at the exchange and the node has no visible hash key.
+        let routed_exchange =
+            matches!(node.kind, NodeKind::ExchangeSource { .. }) && routing_receivers.contains(&id);
+        let runtime_placed = matches!(node.kind, NodeKind::Scan { .. })
+            || routed_exchange
             || projected_placement
             || repeat_placed
             || join_placed
@@ -958,7 +967,7 @@ fn lower_with_creation<
         // descendant could consume.
         let writer_rooted = matches!(node.kind, NodeKind::TableWriter { .. });
         work.step()?;
-        if unknown && !expanded && !changes && !scan_rooted && !writer_rooted {
+        if unknown && !expanded && !changes && !runtime_placed && !writer_rooted {
             return Err((FragmentCompileError::Unsupported {
                 node: Some(id),
                 feature: "unconstrained distribution without a runtime-split scan placement",
@@ -1000,7 +1009,7 @@ fn lower_with_creation<
             })
             .into());
         }
-        properties.insert(id, (expanded || changes, ordered, scan_rooted));
+        properties.insert(id, (expanded || changes, ordered, runtime_placed));
     }
     work.flush()?;
     let channels_plan =
