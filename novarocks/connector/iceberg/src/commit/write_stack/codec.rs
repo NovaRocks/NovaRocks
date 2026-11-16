@@ -91,12 +91,6 @@ pub(crate) fn encode_write_layout(
         partition_source_schema_json: serde_json::to_string(schema).map_err(serialize)?,
         partition_spec_json: serde_json::to_string(spec).map_err(serialize)?,
     };
-    if wire.encoded_len() > MAX_CONNECTOR_WRITER_HANDLE_BYTES {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "Iceberg partition layout exceeds the write recipe byte envelope",
-        ));
-    }
     Ok(Bytes::from(wire.encode_to_vec()))
 }
 
@@ -110,13 +104,6 @@ pub(crate) fn decode_write_layout(
     ConnectorCodecError,
 > {
     let path = ConnectorFieldPath::root("iceberg_write_layout");
-    if payload.payload().len() > MAX_CONNECTOR_WRITER_HANDLE_BYTES {
-        return Err(ConnectorCodecError::new(
-            path,
-            ConnectorCodecErrorKind::Capacity,
-            "Iceberg partition layout exceeds the write recipe byte envelope",
-        ));
-    }
     let wire =
         dto::IcebergWriteLayoutRecipe::decode(payload.payload().clone()).map_err(|error| {
             ConnectorCodecError::new(
