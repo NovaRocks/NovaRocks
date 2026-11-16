@@ -52,14 +52,6 @@ pub enum WriterFailure {
         limit: usize,
     },
     AlreadyBound,
-    InputBatchRows {
-        rows: usize,
-        limit: usize,
-    },
-    InputBatchBytes {
-        bytes: usize,
-        limit: usize,
-    },
     QueueCapacity {
         dimension: ResourceDimension,
         incoming: usize,
@@ -110,14 +102,6 @@ impl fmt::Display for WriterFailure {
             Self::OutputBytes { bytes, limit } => write!(
                 f,
                 "table writer output requires {bytes} bytes under a {limit} byte construction profile"
-            ),
-            Self::InputBatchRows { rows, limit } => write!(
-                f,
-                "connector writer input batch has {rows} rows, above the per-batch limit of {limit} rows"
-            ),
-            Self::InputBatchBytes { bytes, limit } => write!(
-                f,
-                "connector writer input batch retains {bytes} bytes, above the per-batch limit of {limit} bytes"
             ),
             Self::QueueCapacity {
                 dimension,
@@ -190,14 +174,6 @@ impl FailureProjection for WriterFailure {
             Self::OutputBytes { .. } => {
                 (FailureClass::Resource, ExecutionReason::WriterOutputBytes)
             }
-            Self::InputBatchRows { .. } => (
-                FailureClass::Resource,
-                ExecutionReason::WriterInputBatchRows,
-            ),
-            Self::InputBatchBytes { .. } => (
-                FailureClass::Resource,
-                ExecutionReason::WriterInputBatchBytes,
-            ),
             Self::QueueCapacity { .. } => {
                 (FailureClass::Resource, ExecutionReason::WriterQueueCapacity)
             }
@@ -246,22 +222,13 @@ impl FailureProjection for WriterFailure {
             ),
         };
         let fact = FailureFact::new(class, code.reason());
-        let capacity = match self {
-            Self::InputBatchRows { rows, limit } => {
-                Some((ResourceDimension::Positions, *rows, None, *limit))
-            }
-            Self::InputBatchBytes { bytes, limit } => {
-                Some((ResourceDimension::Bytes, *bytes, None, *limit))
-            }
-            Self::QueueCapacity {
-                dimension,
-                incoming,
-                live,
-                limit,
-            } => Some((*dimension, *incoming, Some(*live), *limit)),
-            _ => None,
-        };
-        if let Some((dimension, incoming, live, limit)) = capacity {
+        if let Self::QueueCapacity {
+            dimension,
+            incoming,
+            live,
+            limit,
+        } = *self
+        {
             return fact.with_resource(ResourceFacts {
                 request_scope: Some(ResourceScope::Request),
                 constraint_scope: Some(ResourceScope::Operator),
@@ -269,7 +236,7 @@ impl FailureProjection for WriterFailure {
                 requested: u64::try_from(incoming).ok(),
                 required_growth: None,
                 limit: u64::try_from(limit).ok(),
-                live: live.and_then(|live| u64::try_from(live).ok()),
+                live: u64::try_from(live).ok(),
                 committed: None,
             });
         }
