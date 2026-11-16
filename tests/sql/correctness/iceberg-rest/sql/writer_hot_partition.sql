@@ -25,8 +25,8 @@ CREATE DATABASE iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0};
 CREATE TABLE iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}.t (p BIGINT, id BIGINT, payload VARCHAR)
 PARTITION BY (p);
 INSERT INTO iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}.t
-SELECT CAST(11 AS BIGINT), generate_series, repeat('x', 4096)
-FROM TABLE(generate_series(1, 120000));
+SELECT CAST(11 AS BIGINT), generate_series, repeat('x', 2048)
+FROM TABLE(generate_series(1, 240000));
 
 -- query 2
 SELECT count(*) > 1 AS spread, sum(record_count) AS rows_in_files
