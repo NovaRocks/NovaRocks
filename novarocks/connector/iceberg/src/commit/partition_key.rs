@@ -298,6 +298,12 @@ impl IcebergPartitionKeyEvaluator {
 
 impl ConnectorPartitionKeyEvaluator for IcebergPartitionKeyEvaluator {
     fn partition_keys(&self, input: &RecordBatch) -> Result<Int64Array, ConnectorError> {
+        if input.num_columns() != self.input.fields().len() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "Iceberg partition evaluator input differs from its bound width",
+            ));
+        }
         if input.num_rows() == 0 {
             return Ok(Int64Array::new_null(0));
         }
