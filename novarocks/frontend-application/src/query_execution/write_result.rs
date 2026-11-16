@@ -54,11 +54,6 @@ use arrow::array::{
 #[cfg(test)]
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_native_adapter::root_write_commit_codec::WriteCommitRecordView;
-use novarocks_spi::connector::write_stack::{
-    PreparedWriteSetLedger, RootRowKind, RootWriteResultMembershipValidator,
-    RootWriteResultRowShape, WriteRowCountAccumulator, WriteStatisticsArtifact, WriteTargetOrdinal,
-    row_count_from_wire, target_ordinal_from_wire, validate_artifact_draft_nested_values,
-};
 #[cfg(test)]
 use novarocks_spi::connector::write_stack::{
     ROOT_WRITE_RESULT_BLOB_TYPE_INDEX, ROOT_WRITE_RESULT_BODY_INDEX,
@@ -68,10 +63,13 @@ use novarocks_spi::connector::write_stack::{
     ROOT_WRITE_RESULT_PROPERTIES_INDEX, ROOT_WRITE_RESULT_REQUESTED_INDEX,
     ROOT_WRITE_RESULT_ROW_COUNT_INDEX, ROOT_WRITE_RESULT_TARGET_INDEX, RootWriteResultSchema,
 };
+use novarocks_spi::connector::write_stack::{
+    RootRowKind, RootWriteResultMembershipValidator, RootWriteResultRowShape,
+    WriteRowCountAccumulator, WriteStatisticsArtifact, WriteTargetOrdinal, row_count_from_wire,
+    target_ordinal_from_wire, validate_artifact_draft_nested_values,
+};
 use novarocks_spi::connector::{
-    MAX_CONNECTOR_STATISTICS_ARTIFACTS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-    MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES, StatisticsArtifactDraft,
-    StatisticsArtifactIdentity,
+    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, StatisticsArtifactDraft, StatisticsArtifactIdentity,
 };
 
 pub(crate) type RootWriteResultParts = (
@@ -285,26 +283,37 @@ impl DecodedPreparedWriteSet {
     /// production author is never converted into a local decode permission.
     pub(crate) fn fragment_decode_author(
         &self,
-    ) -> Result<
-        Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
-        RootWriteDecodeFailure,
-    > {
+    ) -> Result<novarocks_spi::connector::ConnectorPayloadRetentionGuard, RootWriteDecodeFailure>
+    {
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
         if let Some(retention) = &self.retention {
             return retention
                 .try_spi_guard()
-                .map(Some)
                 .map_err(RootWriteDecodeFailure::source);
         }
         #[cfg(test)]
         if self.local_decode {
-            return Ok(None);
+            use novarocks_spi::connector::{
+                ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard,
+            };
+
+            struct LocalAuthor;
+            impl ConnectorPayloadByteBudget for LocalAuthor {
+                fn reserve_bytes(
+                    &self,
+                    _bytes: usize,
+                ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+                    Ok(ConnectorPayloadRetentionGuard::new(()))
+                }
+            }
+            return Ok(ConnectorPayloadRetentionGuard::from_byte_budget(
+                std::sync::Arc::new(LocalAuthor),
+            ));
         }
-        Err(RootWriteDecodeFailure::source(
-            novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                "prepared write decoding requires its original byte-budget author",
-            ),
-        ))
+        Err(RootWriteDecodeFailure::source(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "prepared write decoding requires its original byte-budget author",
+        )))
     }
 
     pub(crate) fn into_parts(self) -> RootWriteResultParts {
@@ -363,9 +372,6 @@ impl RootWriteDecodeContract {
                 }
             }
         }
-        if expected_artifacts.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
-            return Err("write Root contract exceeds the statistics artifact limit".into());
-        }
         Ok(Self {
             expected_targets,
             expected_artifacts,
@@ -411,11 +417,9 @@ pub(crate) struct RootWriteResultDecoder {
     contract: RootWriteDecodeContract,
     rows: WriteRowCountAccumulator,
     delete_verification: Option<DeleteVerificationCounts>,
-    ledger: PreparedWriteSetLedger,
     fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
     statistics: BTreeMap<(WriteTargetOrdinal, StatisticsArtifactIdentity), WriteStatisticsArtifact>,
     membership: RootWriteResultMembershipValidator,
-    body_bytes: usize,
     property_bytes: usize,
     root_eof: bool,
     retention: Option<InternalResultRetention>,
@@ -438,11 +442,9 @@ impl RootWriteResultDecoder {
             contract,
             rows: WriteRowCountAccumulator::new(),
             delete_verification: None,
-            ledger: PreparedWriteSetLedger::new(),
             fragments: Vec::new(),
             statistics: BTreeMap::new(),
             membership: RootWriteResultMembershipValidator::default(),
-            body_bytes: 0,
             property_bytes: 0,
             root_eof: false,
             retention: None,
@@ -788,11 +790,6 @@ impl RootWriteResultDecoder {
                     .into());
                 }
                 let fragment = fragment.expect("validated above");
-                self.ledger
-                    .reserve_fragment(fragment.len())
-                    .map_err(|error| {
-                        RootWriteDecodeFailure::source(error).context("prepared write set budget")
-                    })?;
                 if let Some(retention) = &self.retention {
                     retention.reserve_bytes(fragment.len()).map_err(|error| {
                         RootWriteDecodeFailure::source(error)
@@ -845,21 +842,7 @@ impl RootWriteResultDecoder {
                     )
                     .into());
                 }
-                if self.statistics.len() >= MAX_CONNECTOR_STATISTICS_ARTIFACTS {
-                    return Err(RootWriteDecodeFailure::source(
-                        novarocks_spi::connector::ConnectorError::new(
-                            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
-                            "write Root statistics artifact budget exceeded",
-                        ),
-                    ));
-                }
                 let body = body.expect("validated above");
-                self.body_bytes = charge_total(
-                    self.body_bytes,
-                    body.len(),
-                    MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
-                    "write Root artifact body",
-                )?;
                 let mut property_map = BTreeMap::new();
                 let mut row_property_bytes = 0usize;
                 for (key, value) in pairs {
@@ -1249,11 +1232,10 @@ pub(crate) mod tests {
     #[test]
     fn relayed_record_sink_keeps_original_resource_fact_through_domain_projection() {
         use novarocks_failure_contract::FailureProjection;
-        let original = PreparedWriteSetLedger::new()
-            .reserve_fragment(
-                novarocks_spi::connector::write_stack::MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1,
-            )
-            .unwrap_err();
+        let original = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+            "original test resource refused a write record",
+        );
         let expected = original.failure_fact();
         let body = records(vec![summary(1)]).remove(0);
         let mut assembly = RootRecordAssembly::new(RootRecordDomain::WriteCommit, 1 << 20);
@@ -1424,11 +1406,10 @@ pub(crate) mod tests {
         assert_eq!(observations, [(header, 0), (record.len(), header as u64)]);
         assert_eq!(assembly.retained_bytes(), record.len());
         assert_eq!(window.retained_payload_bytes(), record.len() as u64);
-        let original = PreparedWriteSetLedger::new()
-            .reserve_fragment(
-                novarocks_spi::connector::write_stack::MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1,
-            )
-            .unwrap_err();
+        let original = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+            "original test resource refused a write record",
+        );
         let error = assembly
             .push_budgeted(
                 &record[header..],
@@ -1738,25 +1719,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_frontend_recharges_the_budgets_the_backend_already_charged() {
-        use novarocks_spi::connector::write_stack::MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES;
-
+    fn the_frontend_receives_a_fragment_larger_than_one_mib() {
         let mut decoder = new_decoder(1);
+        let bytes = 1024 * 1024 + 1;
         decoder
-            .apply_chunk(&chunk(vec![fragment(
-                0,
-                MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES,
-            )]))
-            .expect("exactly at the single-fragment bound");
-
-        let mut decoder = new_decoder(1);
-        let error = decoder
-            .apply_chunk(&chunk(vec![fragment(
-                0,
-                MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1,
-            )]))
-            .expect_err("over the single-fragment bound");
-        assert!(error.contains("budget"), "unexpected error: {error}");
+            .apply_chunk(&chunk(vec![fragment(0, bytes), summary(0)]))
+            .expect("large fragment");
+        let prepared = finish(decoder).expect("complete write");
+        assert_eq!(prepared.fragments()[0].1.len(), bytes);
     }
 
     #[test]

@@ -112,16 +112,6 @@ impl std::error::Error for StatisticsDecodeFailure {
     }
 }
 
-fn charge_statistics_body_bytes(
-    current: usize,
-    body_bytes: usize,
-) -> Result<usize, StatisticsDecodeFailure> {
-    novarocks_native_adapter::root_statistics_codec::StatisticsCodecTotals::checked_body_total(
-        current, body_bytes,
-    )
-    .map_err(StatisticsDecodeFailure::Record)
-}
-
 #[cfg(test)]
 fn artifact_input_fields_type() -> DataType {
     DataType::List(Arc::new(Field::new("item", DataType::Int32, false)))
@@ -359,7 +349,6 @@ pub struct StatisticsRootResultDecoder {
     relayed_record_count: u64,
     expected: BTreeSet<StatisticsArtifactIdentity>,
     observed: BTreeMap<StatisticsArtifactIdentity, StatisticsArtifactDraft>,
-    body_bytes: usize,
     root_eof: bool,
     execution_succeeded: bool,
     #[cfg(test)]
@@ -393,7 +382,6 @@ impl StatisticsRootResultDecoder {
             relay_assembly: RootRecordAssembly::new(RootRecordDomain::Statistics, 32 * 1024 * 1024),
             expected: expected.into_iter().collect(),
             observed: BTreeMap::new(),
-            body_bytes: 0,
             root_eof: false,
             execution_succeeded: false,
             retention: None,
@@ -437,11 +425,6 @@ impl StatisticsRootResultDecoder {
             )
             .into());
         }
-        novarocks_native_adapter::root_statistics_codec::StatisticsCodecTotals::checked_row_total(
-            self.observed.len(),
-            batch.num_rows(),
-        )
-        .map_err(StatisticsDecodeFailure::Record)?;
         let input_fields = batch
             .column(0)
             .as_any()
@@ -571,11 +554,6 @@ impl StatisticsRootResultDecoder {
         if self.root_eof {
             return Err("statistics Root emitted a trailing record after EOF".into());
         }
-        novarocks_native_adapter::root_statistics_codec::StatisticsCodecTotals::checked_row_total(
-            self.observed.len(),
-            1,
-        )
-        .map_err(StatisticsDecodeFailure::Record)?;
         let view =
             novarocks_native_adapter::root_statistics_codec::StatisticsArtifactRecordView::parse(
                 record,
@@ -607,7 +585,6 @@ impl StatisticsRootResultDecoder {
             )
             .into());
         }
-        self.body_bytes = charge_statistics_body_bytes(self.body_bytes, body.len())?;
         if let Some(retention) = &self.retention {
             retention.reserve_bytes(body.len()).map_err(|error| {
                 StatisticsDecodeFailure::Connector(novarocks_spi::connector::ConnectorError::new(
@@ -680,9 +657,7 @@ mod tests {
     use novarocks_spi::connector::StatisticsArtifactIdentity;
     use novarocks_types::SlotId;
 
-    use super::{
-        StatisticsDecodeFailure, StatisticsRootResultDecoder, charge_statistics_body_bytes,
-    };
+    use super::{StatisticsDecodeFailure, StatisticsRootResultDecoder};
 
     fn identity(field_id: i32, blob_type: &str) -> StatisticsArtifactIdentity {
         StatisticsArtifactIdentity::try_new(vec![field_id], Arc::<str>::from(blob_type))
@@ -1184,20 +1159,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn statistics_root_body_budget_admits_every_maximal_theta_requirement() {
-        const MAX_COMPACT_THETA_BYTES: usize = 65_560;
-        let mut charged = 0;
-        for _ in 0..novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_COLUMNS {
-            charged = charge_statistics_body_bytes(charged, MAX_COMPACT_THETA_BYTES)
-                .expect("all maximal Theta bodies fit the result budget");
-        }
-        assert_eq!(
-            charged,
-            novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_COLUMNS * MAX_COMPACT_THETA_BYTES
-        );
-    }
-
     fn original_statistics_source(
         error: super::StatisticsDecodeFailure,
     ) -> novarocks_failure_contract::SharedFailureCause {
@@ -1275,76 +1236,25 @@ mod tests {
     }
 
     #[test]
-    fn statistics_body_budget_preserves_typed_overflow_and_exceeded_refusals() {
-        use novarocks_failure_contract::{FailureClass, FailureProjection};
-        use novarocks_native_adapter::root_statistics_codec::StatisticsCodecError;
-        use novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES;
-        let limit = MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES;
-        assert_eq!(charge_statistics_body_bytes(limit - 1, 1).unwrap(), limit);
-        assert_eq!(charge_statistics_body_bytes(limit, 0).unwrap(), limit);
-        for (current, additional) in [(limit, 1), (usize::MAX, 1)] {
-            let source = original_statistics_source(
-                charge_statistics_body_bytes(current, additional).unwrap_err(),
-            );
-            assert_eq!(
-                source.downcast_ref::<StatisticsCodecError>(),
-                Some(&StatisticsCodecError::BodyLimit)
-            );
-            assert_eq!(
-                source.failure_fact(),
-                StatisticsCodecError::BodyLimit.failure_fact()
-            );
-            assert_eq!(source.failure_fact().class(), FailureClass::Resource);
-        }
-    }
-
-    #[test]
-    fn statistics_row_budget_preserves_the_typed_refusal_after_the_supported_limit() {
-        use novarocks_failure_contract::{FailureClass, FailureProjection};
-        use novarocks_native_adapter::root_statistics_codec::{
-            StatisticsCodecError, StatisticsCodecTotals,
-        };
-        use novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_ARTIFACTS;
-        let limit = MAX_CONNECTOR_STATISTICS_ARTIFACTS;
+    fn statistics_root_receives_more_than_4096_expected_artifacts() {
+        let count = 4097;
         let mut decoder = StatisticsRootResultDecoder::for_test_local(
-            (1..=limit).map(|field| identity(field as i32, "x")),
+            (1..=count).map(|field| identity(field, "x")),
         );
-        let record = |field: i32| {
+        for field in 1..=count {
             let mut record = Vec::from(*b"STA1");
             for word in [29u32, 1, 1, 0, 0] {
                 record.extend_from_slice(&word.to_le_bytes());
             }
             record.extend_from_slice(&field.to_le_bytes());
             record.push(b'x');
-            record
-        };
-        for field in 1..=limit {
-            decoder.apply_relay_body(&record(field as i32)).unwrap();
+            decoder.apply_relay_body(&record).unwrap();
         }
-        assert_eq!(decoder.observed.len(), limit);
-        assert_eq!(decoder.relayed_record_count, limit as u64);
-        decoder.apply_chunk(&chunk(&[])).unwrap();
-        let record_error = decoder.apply_relay_body(&record(1)).unwrap_err();
-        let chunk_error = decoder
-            .apply_chunk(&chunk(&[(&[1], "x", b"", &[])]))
-            .unwrap_err();
-        for error in [record_error, chunk_error] {
-            let source = original_statistics_source(error);
-            assert_eq!(
-                source.downcast_ref::<StatisticsCodecError>(),
-                Some(&StatisticsCodecError::RowLimit)
-            );
-            assert_eq!(
-                source.failure_fact(),
-                StatisticsCodecError::RowLimit.failure_fact()
-            );
-            assert_eq!(source.failure_fact().class(), FailureClass::Resource);
-        }
-        assert_eq!(decoder.observed.len(), limit);
-        assert_eq!(decoder.relayed_record_count, limit as u64);
-        assert_eq!(
-            StatisticsCodecTotals::checked_row_total(usize::MAX, 1),
-            Err(StatisticsCodecError::RowLimit)
-        );
+        assert_eq!(decoder.relayed_record_count, count as u64);
+        decoder.observe_root_eof().expect("complete Root stream");
+        decoder
+            .observe_execution_success()
+            .expect("execution success");
+        assert_eq!(decoder.finish().unwrap().len(), count as usize);
     }
 }

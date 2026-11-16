@@ -37,9 +37,7 @@ pub(crate) fn statistics_publication_owned_bytes(
     table: &crate::iceberg::table::Table,
     expectations: &[novarocks_spi::connector::StatisticsArtifactIdentity],
 ) -> Result<std::num::NonZeroU64, novarocks_spi::connector::ConnectorError> {
-    use novarocks_spi::connector::{
-        ConnectorError, ConnectorErrorKind, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
-    };
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
     use std::mem::size_of;
     let overflow = || {
         ConnectorError::new(
@@ -47,12 +45,6 @@ pub(crate) fn statistics_publication_owned_bytes(
             "Statistics publication formation invoice overflow",
         )
     };
-    if drafts.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "Statistics artifact count exceeds its original contract",
-        ));
-    }
     let mut metadata = drafts
         .len()
         .checked_mul(

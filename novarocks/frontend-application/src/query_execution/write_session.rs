@@ -42,8 +42,8 @@ use novarocks_proto_models::connector_write as write_dto;
 use novarocks_spi::connector::write_stack::{
     ConnectorPreparedWriteSet, ConnectorWriteBeginRequest, ConnectorWriteFinishPublication,
     ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
-    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, PreparedWriteSetLedger,
-    UniqueWriterHandleLedger, WriteRowCountAccumulator, WriteTargetOrdinal,
+    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, UniqueWriterHandleLedger,
+    WriteRowCountAccumulator, WriteTargetOrdinal,
 };
 use novarocks_spi::connector::{
     ConnectorDocumentPublicationDeclaration, ConnectorError, ConnectorErrorKind,
@@ -167,7 +167,6 @@ struct ReceivedWriteInput {
 struct AccumulatedWriteSet {
     received: Option<Arc<ReceivedWriteInput>>,
     rows: WriteRowCountAccumulator,
-    ledger: PreparedWriteSetLedger,
     fragments: Vec<(
         WriteTargetOrdinal,
         novarocks_spi::connector::write_stack::ConnectorCommitFragment,
@@ -177,7 +176,6 @@ struct AccumulatedWriteSet {
         WriteTargetOrdinal,
         novarocks_spi::connector::StatisticsArtifactIdentity,
     )>,
-    statistics_body_bytes: usize,
     statistics_property_bytes: usize,
     retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
 }
@@ -360,7 +358,6 @@ impl ConnectorWriteSession {
             && union.fragments.is_empty()
             && union.statistics.is_empty()
             && union.statistics_identities.is_empty()
-            && union.statistics_body_bytes == 0
             && union.statistics_property_bytes == 0
             && union.retention.is_none()
             && union.received.is_none()
@@ -1151,6 +1148,7 @@ pub(crate) mod tests {
         row_change_prepared_address: Option<usize>,
         finish_prepared_address: Option<usize>,
         retain_decoded_payload: bool,
+        pub(crate) decoded_fragment_charge: Option<usize>,
         row_change_payload: Option<bytes::Bytes>,
         /// What the last terminal request could actually read object storage
         /// with. A real provider resolves this before it reloads table metadata
@@ -1725,16 +1723,28 @@ pub(crate) mod tests {
         fn decode_commit_fragment_payload(
             &self,
             _fragment: &ConnectorEncodedPayload,
+            author: &novarocks_spi::connector::ConnectorPayloadRetentionGuard,
         ) -> Result<ConnectorCommitFragment, novarocks_spi::connector::ConnectorCodecError>
         {
-            let retain = {
+            let (retain, charge) = {
                 let mut recorded = self.recorded.lock().unwrap();
                 recorded.decoded_fragments += 1;
-                recorded.retain_decoded_payload
+                (
+                    recorded.retain_decoded_payload,
+                    recorded.decoded_fragment_charge,
+                )
             };
-            Ok(self
-                .adapter
-                .wrap_commit_fragment(FakeFragment(0, retain.then(|| _fragment.payload().clone()))))
+            let value = FakeFragment(0, retain.then(|| _fragment.payload().clone()));
+            let Some(bytes) = charge else {
+                return Ok(self.adapter.wrap_commit_fragment(value));
+            };
+            let receipt = author.reserve_owned_bytes(bytes).map_err(|error| {
+                novarocks_spi::connector::ConnectorCodecError::from_domain(
+                    novarocks_spi::connector::ConnectorFieldPath::root("fake_fragment"),
+                    error,
+                )
+            })?;
+            Ok(self.adapter.wrap_retained_commit_fragment(value, receipt))
         }
     }
 
@@ -3585,44 +3595,6 @@ pub(crate) mod tests {
         let recorded = fixture.recorded.lock().expect("recorded");
         assert_eq!(recorded.statistics.len(), 1);
         assert_eq!(recorded.statistics[0].draft().body().as_ref(), b"valid");
-    }
-
-    #[test]
-    fn the_frozen_budgets_bound_the_union_rather_than_each_query() {
-        use novarocks_spi::connector::write_stack::MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES;
-
-        let fixture = fixture(1, 16);
-        let target = WriteTargetOrdinal::try_new(0).expect("ordinal");
-        // Each query stays far inside the entry budget; together they exceed
-        // it. Charging per query would have accepted every one of them.
-        let per_query = MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES / 2;
-        let fragment = commit_fragment_bytes();
-        for _ in 0..2 {
-            fixture
-                .session
-                .receive_for_test(DecodedPreparedWriteSet::for_test(
-                    0,
-                    vec![(target, fragment.clone()); per_query],
-                ))
-                .expect("within the union budget");
-        }
-        assert_eq!(
-            fixture.session.lock_accumulated().unwrap().fragments.len(),
-            MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES,
-        );
-        let error = fixture
-            .session
-            .receive_for_test(DecodedPreparedWriteSet::for_test(
-                0,
-                vec![(target, fragment)],
-            ))
-            .expect_err("over the union budget");
-        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
-        assert_eq!(
-            fixture.session.lock_accumulated().unwrap().fragments.len(),
-            MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES,
-            "a refused next segment cannot mutate the existing union",
-        );
     }
 
     #[test]

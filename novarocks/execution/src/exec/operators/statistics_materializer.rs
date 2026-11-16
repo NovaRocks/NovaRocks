@@ -35,9 +35,8 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_result_contract::RootProfileV1;
 use novarocks_spi::connector::{
-    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
-    MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-    MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES, MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
+    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_COLUMNS,
+    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
 };
 use novarocks_types::SlotId;
 
@@ -220,10 +219,8 @@ impl StatisticsMaterializerFactory {
             || value_slot != slots[2]
             || literal_slots.as_slice() != [slots[0], slots[1], slots[3]]
             || max_rows == 0
-            || max_rows > MAX_CONNECTOR_STATISTICS_ARTIFACTS
             || max_bytes != MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
             || mappings.is_empty()
-            || mappings.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS
         {
             return Err(statistics_contract(
                 "statistics materializer roles or bounds differ from its frozen domain",
@@ -443,8 +440,6 @@ impl OperatorFactory for StatisticsMaterializerFactory {
             input: None,
             workspace: None,
             cursor: 0,
-            rows: 0,
-            body_bytes: 0,
             metadata_bytes: 0,
             finishing: false,
         })
@@ -461,8 +456,6 @@ struct StatisticsMaterializer {
     input: Option<Chunk>,
     workspace: Option<Workspace>,
     cursor: usize,
-    rows: usize,
-    body_bytes: usize,
     metadata_bytes: usize,
     finishing: bool,
 }
@@ -613,22 +606,10 @@ impl StatisticsMaterializer {
             if self.input.is_some() {
                 return Err(statistics_contract("statistics input position is full"));
             }
-            let expanded = chunk
+            chunk
                 .len()
                 .checked_mul(self.definition.mappings.len())
                 .ok_or_else(|| statistics_contract("statistics expanded row count overflow"))?;
-            if self
-                .rows
-                .checked_add(expanded)
-                .is_none_or(|n| n > MAX_CONNECTOR_STATISTICS_ARTIFACTS)
-            {
-                return Err(statistics_limit(
-                    "statistics expanded row count",
-                    novarocks_failure_contract::ResourceDimension::Items,
-                    self.rows as u128 + expanded as u128,
-                    MAX_CONNECTOR_STATISTICS_ARTIFACTS,
-                ));
-            }
             if chunk.chunk_schema_ref().slot_ids() != self.definition.input_slots {
                 return Err(statistics_contract(
                     "statistics input order differs from its frozen port",
@@ -668,18 +649,6 @@ impl StatisticsMaterializer {
                         ));
                     }
                     let next = sizes.add(ids.len(), blob.len(), body.len())?;
-                    if self
-                        .body_bytes
-                        .checked_add(next.body)
-                        .is_none_or(|n| n > MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES)
-                    {
-                        return Err(statistics_limit(
-                            "statistics result body",
-                            novarocks_failure_contract::ResourceDimension::Bytes,
-                            self.body_bytes as u128 + next.body as u128,
-                            MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
-                        ));
-                    }
                     if self
                         .metadata_bytes
                         .checked_add(next.metadata(rows + 1)?)
@@ -734,14 +703,11 @@ impl StatisticsMaterializer {
             }
             let workspace = self.workspace.take().unwrap();
             let rows = workspace.rows;
-            let body = workspace.sizes.body;
             let metadata = workspace.sizes.metadata(rows)?;
             let chunk = workspace.finish(self.output.as_ref().ok_or_else(|| {
                 statistics_contract("statistics output schema has not been prepared")
             })?)?;
             self.cursor += rows;
-            self.rows += rows;
-            self.body_bytes += body;
             self.metadata_bytes += metadata;
             if self.cursor == input.len() * self.definition.mappings.len() {
                 drop(self.input.take());
@@ -1408,8 +1374,6 @@ mod tests {
             input: None,
             workspace: None,
             cursor: 0,
-            rows: 0,
-            body_bytes: 0,
             metadata_bytes: 0,
             finishing: false,
         }

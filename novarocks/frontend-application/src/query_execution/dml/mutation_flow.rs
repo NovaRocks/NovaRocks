@@ -2429,6 +2429,7 @@ mod tests {
         fn decode_commit_fragment_payload(
             &self,
             _fragment: &novarocks_spi::connector::ConnectorEncodedPayload,
+            _author: &novarocks_spi::connector::ConnectorPayloadRetentionGuard,
         ) -> Result<
             novarocks_spi::connector::write_stack::ConnectorCommitFragment,
             novarocks_spi::connector::ConnectorCodecError,

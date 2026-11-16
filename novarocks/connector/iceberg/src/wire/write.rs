@@ -26,11 +26,10 @@
 use std::collections::BTreeSet;
 use std::mem::size_of;
 
-use novarocks_spi::connector::write_stack::{
-    MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
-};
+use novarocks_spi::connector::write_stack::MAX_CONNECTOR_WRITER_HANDLE_BYTES;
 use novarocks_spi::connector::{
-    ConnectorCodecError, ConnectorCodecErrorKind, ConnectorDecodeContext, ConnectorFieldPath,
+    ConnectorCodecError, ConnectorCodecErrorKind, ConnectorDecodeContext, ConnectorDecodeLimits,
+    ConnectorFieldPath,
 };
 use prost::Message;
 
@@ -41,13 +40,9 @@ const MAX_NAME_BYTES: usize = 1024;
 const MAX_SCHEMA_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PARTITION_VALUES: usize = 4096;
 const MAX_PARTITION_VALUE_BYTES: usize = 64 * 1024;
-const MAX_COLUMN_STAT_ENTRIES: usize = 4096;
-const MAX_COLUMN_STAT_BOUND_BYTES: usize = 64 * 1024;
-const MAX_SPLIT_OFFSETS: usize = 4096;
 const MAX_PARTITION_COLUMNS: usize = 4096;
 const MAX_TRANSFORM_EXPRS: usize = 4096;
 const MAX_TRANSFORM_EXPR_BYTES: usize = 64 * 1024;
-const MAX_MERGED_OLD_REFERENCES: usize = 1024;
 const MAX_EQUALITY_DELETE_COLUMNS: usize = 4096;
 
 pub(crate) use crate::contract_revision::ICEBERG_CONTRACT_REVISION as WRITE_CODEC_REVISION;
@@ -98,33 +93,44 @@ impl ValidatedCommitFragmentWire {
     }
 }
 
+/// The private scanner charges each field tag or packed value once, so the
+/// input itself bounds those entries and every scalar byte. Use the same
+/// retained-size estimate as the scanner, with the input's maximum entry count.
+pub(crate) fn fragment_decode_limits(payload_bytes: usize) -> ConnectorDecodeLimits {
+    let input = payload_bytes.max(1);
+    ConnectorDecodeLimits::try_new(
+        input,
+        fragment_retained_bytes(input, input),
+        input,
+        input,
+        64,
+    )
+    .expect("Iceberg commit fragment decode limits are non-zero")
+}
+
+fn fragment_retained_bytes(encoded_len: usize, items: usize) -> usize {
+    let container_bytes = items.saturating_mul(size_of::<usize>() * 2);
+    encoded_len
+        .saturating_add(size_of::<dto::IcebergCommitFragment>())
+        .saturating_add(container_bytes)
+}
+
 pub(crate) fn decode_commit_fragment(
     payload: &[u8],
     context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<ValidatedCommitFragmentWire, ConnectorCodecError> {
     let result = (|| {
         let path = ConnectorFieldPath::root("commit_fragment").field("iceberg");
-        if payload.len() > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
-            return Err(capacity(
-                path,
-                "Iceberg commit fragment exceeds its hard byte limit",
-            ));
-        }
         context.ledger().charge_raw(payload.len())?;
         scan_message(payload, MessageKind::CommitFragment, &path, 1, context)?;
         let value = observe_opaque(context, || dto::IcebergCommitFragment::decode(payload))?
             .map_err(|error| invalid(path.clone(), format!("malformed protobuf: {error}")))?;
         validate_commit_fragment(&value, &path, context)?;
-        let container_bytes = context
-            .ledger()
-            .items()
-            .saturating_mul(size_of::<usize>().saturating_mul(2));
         let encoded_len = observe_opaque(context, || value.encoded_len())?;
-        context.ledger().charge_retained(
-            encoded_len
-                .saturating_add(size_of::<dto::IcebergCommitFragment>())
-                .saturating_add(container_bytes),
-        )?;
+        let items = context.ledger().items();
+        context
+            .ledger()
+            .charge_retained(fragment_retained_bytes(encoded_len, items))?;
         Ok(ValidatedCommitFragmentWire(value))
     })();
     context.observe_compile_step()?;
@@ -644,7 +650,12 @@ fn validate_writer_handle(
                     "position rewrite requires a nonempty data file",
                 ));
             }
-            validate_partition(target.partition.as_ref(), field.field("partition"), context)?;
+            validate_partition(
+                target.partition.as_ref(),
+                field.field("partition"),
+                PartitionCarrier::WriterHandle,
+                context,
+            )?;
         }
         match branch {
             dto::IcebergWriteBranch::Data => {
@@ -957,12 +968,7 @@ fn validate_commit_fragment(
                 )?;
             }
             dto::iceberg_commit_fragment::Artifact::DataFile(file) => {
-                bounded_text(
-                    &file.path,
-                    MAX_PATH_BYTES,
-                    path.field("data_file").field("path"),
-                    false,
-                )?;
+                required_text(&file.path, path.field("data_file").field("path"))?;
                 named_file_format(
                     file.file_format,
                     path.field("data_file").field("file_format"),
@@ -970,6 +976,7 @@ fn validate_commit_fragment(
                 validate_partition(
                     file.partition.as_ref(),
                     path.field("data_file").field("partition"),
+                    PartitionCarrier::CommitFragment,
                     context,
                 )?;
                 validate_metrics(
@@ -1001,14 +1008,14 @@ fn validate_commit_fragment(
             }
             dto::iceberg_commit_fragment::Artifact::EqualityDeleteFile(file) => {
                 let base = path.field("equality_delete_file");
-                bounded_text(&file.path, MAX_PATH_BYTES, base.field("path"), false)?;
-                validate_partition(file.partition.as_ref(), base.field("partition"), context)?;
-                validate_metrics(file.metrics.as_ref(), base.field("metrics"), context)?;
-                bounded_count(
-                    file.equality_field_ids.len(),
-                    MAX_EQUALITY_DELETE_COLUMNS,
-                    base.field("equality_field_ids"),
+                required_text(&file.path, base.field("path"))?;
+                validate_partition(
+                    file.partition.as_ref(),
+                    base.field("partition"),
+                    PartitionCarrier::CommitFragment,
+                    context,
                 )?;
+                validate_metrics(file.metrics.as_ref(), base.field("metrics"), context)?;
                 if file.equality_field_ids.is_empty()
                     || any_observed(file.equality_field_ids.iter(), context, |value| *value < 0)?
                     || any_observed(file.equality_field_ids.windows(2), context, |pair| {
@@ -1070,12 +1077,7 @@ fn validate_final_delete(
         ("manifest_path", target.manifest_path.as_str()),
         ("data_file_path", target.data_file_path.as_str()),
     ] {
-        bounded_text(
-            value,
-            MAX_PATH_BYTES,
-            path.field("target").field(name),
-            false,
-        )?;
+        required_text(value, path.field("target").field(name))?;
         context.observe_compile_step()?;
     }
     if effect.newly_deleted_rows == 0 || effect.newly_deleted_rows > target.record_count {
@@ -1087,7 +1089,12 @@ fn validate_final_delete(
     match effect.effect.as_ref() {
         Some(Effect::RemoveDataFile(remove)) if !created => {
             let field = path.field("remove_data_file");
-            validate_partition(remove.partition.as_ref(), field.field("partition"), context)?;
+            validate_partition(
+                remove.partition.as_ref(),
+                field.field("partition"),
+                PartitionCarrier::CommitFragment,
+                context,
+            )?;
             validate_merged_references(
                 &remove.old_exclusive_deletes,
                 field.field("old_exclusive_deletes"),
@@ -1114,14 +1121,14 @@ fn validate_delete_artifact_common(
     context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<(), ConnectorCodecError> {
     let result = (|| {
-        bounded_text(path_value, MAX_PATH_BYTES, path.field("path"), false)?;
-        bounded_text(
-            referenced_data_file,
-            MAX_PATH_BYTES,
-            path.field("referenced_data_file"),
-            false,
+        required_text(path_value, path.field("path"))?;
+        required_text(referenced_data_file, path.field("referenced_data_file"))?;
+        validate_partition(
+            partition,
+            path.field("partition"),
+            PartitionCarrier::CommitFragment,
+            context,
         )?;
-        validate_partition(partition, path.field("partition"), context)?;
         validate_metrics(metrics, path.field("metrics"), context)?;
         validate_merged_references(merged, path.field("merged_old_references"), context)
     })();
@@ -1134,7 +1141,6 @@ fn validate_merged_references(
     path: ConnectorFieldPath,
     context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<(), ConnectorCodecError> {
-    bounded_count(values.len(), MAX_MERGED_OLD_REFERENCES, path.clone())?;
     let mut previous: Option<LogicalDeleteReference<'_>> = None;
     for (index, value) in values.iter().enumerate() {
         let entry_path = path.index(index);
@@ -1172,22 +1178,15 @@ impl LogicalDeleteReference<'_> {
     ) -> Result<(), ConnectorCodecError> {
         let result = (|| {
             match self {
-                Self::File(value) => {
-                    bounded_text(value, MAX_PATH_BYTES, path.field("path"), false)?
-                }
+                Self::File(value) => required_text(value, path.field("path"))?,
                 Self::Vector {
                     path: value,
                     offset,
                     length,
                     referenced_data_file,
                 } => {
-                    bounded_text(value, MAX_PATH_BYTES, path.field("path"), false)?;
-                    bounded_text(
-                        referenced_data_file,
-                        MAX_PATH_BYTES,
-                        path.field("referenced_data_file"),
-                        false,
-                    )?;
+                    required_text(value, path.field("path"))?;
+                    required_text(referenced_data_file, path.field("referenced_data_file"))?;
                     nonnegative(offset, path.field("content_offset"))?;
                     if length <= 0 || offset.checked_add(length).is_none() {
                         return Err(inconsistent(
@@ -1279,26 +1278,35 @@ fn validate_merged_reference<'a>(
     result
 }
 
+#[derive(Clone, Copy)]
+enum PartitionCarrier {
+    WriterHandle,
+    CommitFragment,
+}
+
 fn validate_partition(
     partition: Option<&dto::IcebergArtifactPartition>,
     path: ConnectorFieldPath,
+    carrier: PartitionCarrier,
     context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<(), ConnectorCodecError> {
     let result = (|| {
         let partition =
             partition.ok_or_else(|| missing(path.clone(), "artifact requires partition"))?;
-        bounded_text(
-            &partition.partition_path,
-            MAX_PATH_BYTES,
-            path.field("partition_path"),
-            true,
-        )?;
-        bounded_text(
-            &partition.null_fingerprint,
-            MAX_NAME_BYTES,
-            path.field("null_fingerprint"),
-            true,
-        )?;
+        if matches!(carrier, PartitionCarrier::WriterHandle) {
+            bounded_text(
+                &partition.partition_path,
+                MAX_PATH_BYTES,
+                path.field("partition_path"),
+                true,
+            )?;
+            bounded_text(
+                &partition.null_fingerprint,
+                MAX_NAME_BYTES,
+                path.field("null_fingerprint"),
+                true,
+            )?;
+        }
         nonnegative(
             i64::from(partition.partition_spec_id),
             path.field("partition_spec_id"),
@@ -1307,11 +1315,13 @@ fn validate_partition(
             .descriptor
             .as_ref()
             .ok_or_else(|| missing(path.field("descriptor"), "partition requires descriptor"))?;
-        bounded_count(
-            descriptor.values.len(),
-            MAX_PARTITION_VALUES,
-            path.field("descriptor").field("values"),
-        )?;
+        if matches!(carrier, PartitionCarrier::WriterHandle) {
+            bounded_count(
+                descriptor.values.len(),
+                MAX_PARTITION_VALUES,
+                path.field("descriptor").field("values"),
+            )?;
+        }
         for (index, value) in descriptor.values.iter().enumerate() {
             let value_path = path.field("descriptor").field("values").index(index);
             match (value.is_null, value.datum_bytes.as_ref()) {
@@ -1321,7 +1331,10 @@ fn validate_partition(
                         "partition null marker and datum presence disagree",
                     ));
                 }
-                (false, Some(bytes)) if bytes.len() > MAX_PARTITION_VALUE_BYTES => {
+                (false, Some(bytes))
+                    if matches!(carrier, PartitionCarrier::WriterHandle)
+                        && bytes.len() > MAX_PARTITION_VALUE_BYTES =>
+                {
                     return Err(capacity(
                         value_path,
                         "partition value exceeds its byte limit",
@@ -1345,11 +1358,6 @@ fn validate_metrics(
 ) -> Result<(), ConnectorCodecError> {
     let result = (|| {
         let metrics = metrics.ok_or_else(|| missing(path.clone(), "artifact requires metrics"))?;
-        bounded_count(
-            metrics.split_offsets.len(),
-            MAX_SPLIT_OFFSETS,
-            path.field("split_offsets"),
-        )?;
         if any_observed(metrics.split_offsets.iter(), context, |value| *value < 0)? {
             return Err(invalid(
                 path.field("split_offsets"),
@@ -1365,35 +1373,10 @@ fn validate_metrics(
             ("null_value_counts", &stats.null_value_counts),
             ("nan_value_counts", &stats.nan_value_counts),
         ] {
-            bounded_count(
-                values.len(),
-                MAX_COLUMN_STAT_ENTRIES,
-                path.field("column_stats").field(name),
-            )?;
             if any_observed(values.values(), context, |value| *value < 0)? {
                 return Err(invalid(
                     path.field("column_stats").field(name),
                     "column statistic count must be nonnegative",
-                ));
-            }
-
-            context.observe_compile_step()?;
-        }
-        for (name, values) in [
-            ("lower_bounds", &stats.lower_bounds),
-            ("upper_bounds", &stats.upper_bounds),
-        ] {
-            bounded_count(
-                values.len(),
-                MAX_COLUMN_STAT_ENTRIES,
-                path.field("column_stats").field(name),
-            )?;
-            if any_observed(values.values(), context, |value| {
-                value.len() > MAX_COLUMN_STAT_BOUND_BYTES
-            })? {
-                return Err(capacity(
-                    path.field("column_stats").field(name),
-                    "column statistic bound exceeds its byte limit",
                 ));
             }
 
@@ -1446,6 +1429,13 @@ fn named_file_format(
         }
         Ok(value) => Ok(value),
     }
+}
+
+fn required_text(value: &str, path: ConnectorFieldPath) -> Result<(), ConnectorCodecError> {
+    if value.is_empty() {
+        return Err(invalid(path, "text value must not be empty"));
+    }
+    Ok(())
 }
 
 fn bounded_text(
@@ -1937,6 +1927,42 @@ mod compile_control_tests {
             assert_eq!(trace.last().unwrap().1, 1);
         }
     }
+    #[test]
+    fn a_fragment_can_carry_more_than_4096_offsets_and_column_statistics() {
+        use dto::iceberg_commit_fragment::Artifact;
+        let mut raw = fragments().remove(0);
+        let Some(Artifact::DataFile(file)) = raw.artifact.as_mut() else {
+            panic!("expected the data-file fixture");
+        };
+        let metrics = file.metrics.as_mut().unwrap();
+        metrics.split_offsets = (0..4097).collect();
+        metrics.column_stats.as_mut().unwrap().column_sizes =
+            (1..=4097).map(|id| (id, 512)).collect();
+        let wire = raw.encode_to_vec();
+        let expected = header(ConnectorCodecCategory::CommitFragment);
+        let mut budget = ConnectorDecodeLedger::new(fragment_decode_limits(wire.len()));
+        let decoded = decode_commit_fragment(
+            &wire,
+            &mut ConnectorDecodeContext::new(&expected, &mut budget),
+        )
+        .expect("large valid commit fragment");
+        assert_eq!(decoded.as_dto(), &raw);
+
+        let Some(Artifact::DataFile(file)) = raw.artifact.as_mut() else {
+            unreachable!();
+        };
+        file.metrics.as_mut().unwrap().split_offsets[4096] = -1;
+        let invalid_wire = raw.encode_to_vec();
+        let mut budget = ConnectorDecodeLedger::new(fragment_decode_limits(invalid_wire.len()));
+        let error = decode_commit_fragment(
+            &invalid_wire,
+            &mut ConnectorDecodeContext::new(&expected, &mut budget),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
+        assert!(error.path().to_string().contains("split_offsets"));
+    }
+
     #[test]
     fn actual_writer_scanner_validation_and_publication_keep_each_original_control() {
         for raw in handles() {

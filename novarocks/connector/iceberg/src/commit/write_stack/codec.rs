@@ -48,16 +48,15 @@ use bytes::Bytes;
 use novarocks_proto_codec::connector_write::ConnectorWriteCodecError;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_spi::connector::write_stack::{
-    ConnectorCommitFragment, ConnectorWriterHandle, MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES,
-    MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+    ConnectorCommitFragment, ConnectorWriterHandle, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
 };
 use novarocks_spi::connector::{
     ConnectorCodecCategory, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision,
     ConnectorDecodeContext, ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEncodedPayload,
     ConnectorEnvelopeHeader, ConnectorError, ConnectorErrorKind, ConnectorFieldPath,
-    ConnectorPrivateDecoder, ConnectorPrivateEncoder, ConnectorWriteFragmentWireDecoder,
-    ConnectorWriteFragmentWireEncoder, ConnectorWriteHandleWireDecoder,
-    ConnectorWriteHandleWireEncoder,
+    ConnectorPayloadRetentionGuard, ConnectorPrivateDecoder, ConnectorPrivateEncoder,
+    ConnectorWriteFragmentWireDecoder, ConnectorWriteFragmentWireEncoder,
+    ConnectorWriteHandleWireDecoder, ConnectorWriteHandleWireEncoder,
 };
 use parquet::basic::{Compression, GzipLevel, ZstdLevel};
 use prost::Message;
@@ -1640,20 +1639,11 @@ impl ConnectorPrivateEncoder<IcebergCommitFragment> for IcebergWriteFragmentEnco
         &self,
         fragment: &IcebergCommitFragment,
     ) -> Result<Bytes, ConnectorCodecError> {
-        let bytes = self
-            .0
+        self.0
             .values
             .encode_commit_fragment_value(fragment)
             .map(|value| Bytes::from(value.encode_to_vec()))
-            .map_err(spi_codec_error)?;
-        if bytes.len() > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
-            return Err(ConnectorCodecError::new(
-                ConnectorFieldPath::root("commit_fragment").field("iceberg"),
-                ConnectorCodecErrorKind::Capacity,
-                "Iceberg commit fragment exceeds its hard byte limit",
-            ));
-        }
-        Ok(bytes)
+            .map_err(spi_codec_error)
     }
 }
 
@@ -1663,6 +1653,16 @@ pub(crate) struct IcebergWriteFragmentDecoder(IcebergWriteCodec);
 impl IcebergWriteFragmentDecoder {
     pub(crate) fn new(adapter: IcebergWriteAdapter) -> Self {
         Self(IcebergWriteCodec::new(adapter))
+    }
+
+    fn decode_private_wire(
+        &self,
+        payload: &[u8],
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<crate::wire::write::ValidatedCommitFragmentWire, ConnectorCodecError> {
+        self.0
+            .validate_private_header(context, ConnectorCodecCategory::CommitFragment)?;
+        crate::wire::write::decode_commit_fragment(payload, context)
     }
 }
 
@@ -1674,25 +1674,41 @@ impl ConnectorWriteFragmentWireDecoder for IcebergWriteFragmentDecoder {
     fn decode_commit_fragment_payload(
         &self,
         envelope: &ConnectorEncodedPayload,
+        author: &ConnectorPayloadRetentionGuard,
     ) -> Result<ConnectorCommitFragment, ConnectorCodecError> {
-        let mut ledger = ConnectorDecodeLedger::new(IcebergWriteValueCodec::decode_limits(
-            MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES,
+        let mut ledger = ConnectorDecodeLedger::new(crate::wire::write::fragment_decode_limits(
+            envelope.payload().len(),
         ));
         let mut context = ConnectorDecodeContext::new(envelope.header(), &mut ledger);
-        let value = self.decode_private(envelope.payload(), &mut context)?;
-        Ok(self.0.adapter.wrap_commit_fragment(value))
+        let wire = self.decode_private_wire(envelope.payload(), &mut context)?;
+        // The domain graph mirrors the private DTO's owned strings and containers.
+        // Reserve its estimate before projecting the graph while the wire value is live.
+        let bytes = context
+            .ledger()
+            .retained_bytes()
+            .max(std::mem::size_of::<IcebergCommitFragment>());
+        let receipt = author.reserve_owned_bytes(bytes).map_err(|error| {
+            ConnectorCodecError::from_domain(
+                ConnectorFieldPath::root("commit_fragment").field("iceberg"),
+                error,
+            )
+        })?;
+        let value = self
+            .0
+            .values
+            .decode_commit_fragment_value(&wire, &mut context)?;
+        Ok(self.0.adapter.wrap_retained_commit_fragment(value, receipt))
     }
 }
 
+#[cfg(test)]
 impl ConnectorPrivateDecoder<IcebergCommitFragment> for IcebergWriteFragmentDecoder {
     fn decode_private(
         &self,
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<IcebergCommitFragment, ConnectorCodecError> {
-        self.0
-            .validate_private_header(context, ConnectorCodecCategory::CommitFragment)?;
-        let value = crate::wire::write::decode_commit_fragment(payload, context)?;
+        let value = self.decode_private_wire(payload, context)?;
         self.0.values.decode_commit_fragment_value(&value, context)
     }
 }
@@ -1731,6 +1747,22 @@ pub(crate) fn spi_codec_error(error: ConnectorWriteCodecError) -> ConnectorCodec
         ProtocolErrorKind::Domain(source) => ConnectorCodecErrorKind::Domain(source.clone()),
     };
     ConnectorCodecError::new(path, kind, protocol.detail())
+}
+
+#[cfg(test)]
+pub(crate) fn test_fragment_decode_author() -> ConnectorPayloadRetentionGuard {
+    use novarocks_spi::connector::ConnectorPayloadByteBudget;
+
+    struct LocalAuthor;
+    impl ConnectorPayloadByteBudget for LocalAuthor {
+        fn reserve_bytes(
+            &self,
+            _bytes: usize,
+        ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+            Ok(ConnectorPayloadRetentionGuard::new(()))
+        }
+    }
+    ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(LocalAuthor))
 }
 
 #[cfg(test)]
@@ -2306,7 +2338,7 @@ mod tests {
             .unwrap();
         let decoded = facets
             .fragment_decoder
-            .decode_commit_fragment(&parse_fragment(raw.clone()))
+            .decode_commit_fragment(&parse_fragment(raw.clone()), &test_fragment_decode_author())
             .unwrap();
         let result = facets.adapter.commit_fragment(&decoded).unwrap();
         let IcebergCommitArtifact::FinalDelete(result_effect) = result.artifact() else {
@@ -2338,7 +2370,10 @@ mod tests {
         assert!(
             facets
                 .fragment_decoder
-                .decode_commit_fragment(&parse_fragment(with_receipt))
+                .decode_commit_fragment(
+                    &parse_fragment(with_receipt),
+                    &test_fragment_decode_author()
+                )
                 .is_err()
         );
     }
@@ -2394,7 +2429,7 @@ mod tests {
             .expect("encode commit fragment");
         let decoded = facets
             .fragment_decoder
-            .decode_commit_fragment(&parse_fragment(raw.clone()))
+            .decode_commit_fragment(&parse_fragment(raw.clone()), &test_fragment_decode_author())
             .expect("decode commit fragment");
         let recovered = facets
             .adapter
@@ -3324,7 +3359,7 @@ mod tests {
         });
         let error = facets
             .fragment_decoder
-            .decode_commit_fragment(&parse_fragment(raw))
+            .decode_commit_fragment(&parse_fragment(raw), &test_fragment_decode_author())
             .expect_err("a deletion vector that disagrees with itself");
         assert_eq!(
             error.protocol().kind(),
@@ -3367,7 +3402,7 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_handle_or_fragment_is_refused_by_the_codec_layer() {
+    fn an_oversized_writer_handle_is_refused_by_the_codec_layer() {
         fn assert_original_capacity(
             error: &ConnectorWriteCodecError,
             path: ConnectorFieldPath,
@@ -3430,12 +3465,39 @@ mod tests {
             "Iceberg writer handle exceeds its hard byte limit",
         );
         assert_public_provider_error_path(&error, "writer_handle.iceberg");
+    }
 
-        // One path past the 1 MiB commit-fragment bound.
-        let huge = format!("/wh/db/t/data/{}.parquet", "x".repeat(1024 * 1024 + 16));
+    #[test]
+    fn a_large_commit_fragment_round_trips_with_its_retention_receipt() {
+        use novarocks_spi::connector::ConnectorPayloadByteBudget;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Receipt(Arc<AtomicUsize>, usize);
+        impl Drop for Receipt {
+            fn drop(&mut self) {
+                self.0.fetch_sub(self.1, Ordering::AcqRel);
+            }
+        }
+
+        struct TestAuthor(Arc<AtomicUsize>);
+        impl ConnectorPayloadByteBudget for TestAuthor {
+            fn reserve_bytes(
+                &self,
+                bytes: usize,
+            ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+                self.0.fetch_add(bytes, Ordering::AcqRel);
+                Ok(ConnectorPayloadRetentionGuard::new(Receipt(
+                    self.0.clone(),
+                    bytes,
+                )))
+            }
+        }
+
+        let facets = generation();
+        let path = format!("/wh/db/t/data/{}.parquet", "x".repeat(1024 * 1024 + 16));
         let fragment = IcebergCommitFragment::data_file(
             IcebergDataFileArtifact::try_new(
-                huge,
+                path.clone(),
                 IcebergFileFormat::Parquet,
                 sample_partition(),
                 sample_metrics(1, 4096),
@@ -3444,17 +3506,26 @@ mod tests {
             .expect("data file"),
         );
         let neutral = facets.adapter.wrap_commit_fragment(fragment);
-        let error = facets
+        let raw = facets
             .fragment_encoder
             .encode_commit_fragment(&neutral)
-            .expect_err("an oversized commit fragment");
-        assert_original_capacity(
-            &error,
-            ConnectorFieldPath::root("commit_fragment").field("iceberg"),
-            "Iceberg commit fragment exceeds its hard byte limit",
+            .expect("encode large artifact");
+        let live = Arc::new(AtomicUsize::new(0));
+        let author =
+            ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(TestAuthor(live.clone())));
+        let decoded = facets
+            .fragment_decoder
+            .decode_commit_fragment(&parse_fragment(raw), &author)
+            .expect("decode large artifact");
+        assert_eq!(
+            facets.adapter.commit_fragment(&decoded).unwrap().path(),
+            path
         );
-        assert_public_provider_error_path(&error, "commit_fragment.iceberg");
+        assert!(live.load(Ordering::Acquire) >= path.len());
+        drop(decoded);
+        assert_eq!(live.load(Ordering::Acquire), 0);
     }
+
     fn unpartitioned() -> IcebergArtifactPartition {
         IcebergArtifactPartition::try_new(
             String::new(),
@@ -3528,7 +3599,7 @@ mod tests {
             .expect("the carrier is structurally valid");
         let recovered = facets
             .fragment_decoder
-            .decode_commit_fragment(&validated)
+            .decode_commit_fragment(&validated, &test_fragment_decode_author())
             .expect("decode");
         let recovered = facets
             .adapter

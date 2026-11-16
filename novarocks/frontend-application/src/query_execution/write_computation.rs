@@ -43,7 +43,6 @@ pub(crate) struct SessionDecodedWriteSegment {
     )>,
     prepared: ConnectorPreparedWriteSet,
     delete_verification: Option<DeleteVerificationCounts>,
-    fragment_sizes: Vec<usize>,
     statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
     retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
 }
@@ -92,7 +91,6 @@ impl WriteComputationDecode {
             retention,
             production_execution,
         ) = prepared.into_parts();
-        let fragment_sizes = fragments.iter().map(|(_, bytes)| bytes.len()).collect();
         drop(fragments);
         if let Some(retention) = &retention {
             retention
@@ -104,7 +102,6 @@ impl WriteComputationDecode {
             production_execution,
             prepared: decoded,
             delete_verification,
-            fragment_sizes,
             statistics,
             retention,
         })
@@ -123,9 +120,7 @@ impl WriteComputationDecode {
             // carrier. Its encoded length bounds those actual byte copies;
             // this is not an invoice for the Provider's decoded SDK graph.
             let receipt = author
-                .as_ref()
-                .map(|author| author.reserve_owned_bytes(bytes.len()))
-                .transpose()
+                .reserve_owned_bytes(bytes.len())
                 .map_err(RootWriteDecodeFailure::source)?;
             let raw =
                 write_dto::ConnectorCommitFragment::decode(bytes.as_slice()).map_err(|error| {
@@ -140,13 +135,10 @@ impl WriteComputationDecode {
                 FieldPath::root("prepared_write_set").index(index),
             )
             .map_err(RootWriteDecodeFailure::source)?;
-            let validated = match receipt {
-                Some(receipt) => validated.retain_provider_payload(receipt),
-                None => validated, // explicit local test constructor only
-            };
+            let validated = validated.retain_provider_payload(receipt);
             let fragment = self
                 .decoder
-                .decode_commit_fragment(&validated)
+                .decode_commit_fragment(&validated, &author)
                 .map_err(|error| {
                     RootWriteDecodeFailure::source(OriginalFragmentCodecFailure(error))
                 })?;
@@ -340,19 +332,12 @@ impl ConnectorWriteSession {
         let SessionDecodedWriteSegment {
             prepared,
             delete_verification,
-            fragment_sizes,
             statistics,
             retention,
             ..
         } = segment;
         let row_count = prepared.row_count();
         let fragments = prepared.into_fragments();
-        if fragments.len() != fragment_sizes.len() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "interpreted write lost its canonical byte ledger",
-            ));
-        }
         let empty = fragments.is_empty();
         let mut accumulated = self.lock_accumulated()?;
         if let (Some(current), Some(incoming)) = (&accumulated.retention, &retention) {
@@ -374,26 +359,8 @@ impl ConnectorWriteSession {
         }
         let mut next_rows = accumulated.rows;
         next_rows.add(row_count)?;
-        let mut next_ledger = accumulated.ledger;
-        for bytes in fragment_sizes {
-            next_ledger.reserve_fragment(bytes)?;
-        }
         let expected = &self.statistics_expected;
         let mut observed = std::collections::BTreeSet::new();
-        if accumulated
-            .statistics
-            .len()
-            .checked_add(statistics.len())
-            .is_none_or(|count| {
-                count > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_ARTIFACTS
-            })
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "write session statistics artifact count exceeded its limit",
-            ));
-        }
-        let mut next_body_bytes = accumulated.statistics_body_bytes;
         let mut next_property_bytes = accumulated.statistics_property_bytes;
         for artifact in &statistics {
             let key = (artifact.target(), artifact.draft().identity().clone());
@@ -406,17 +373,6 @@ impl ConnectorWriteSession {
                     "write session accumulated an unknown or duplicate statistics artifact",
                 ));
             }
-            next_body_bytes = next_body_bytes
-                .checked_add(artifact.draft().body().len())
-                .filter(|bytes| {
-                    *bytes <= novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES
-                })
-                .ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        "write session statistics body bytes exceeded their limit",
-                    )
-                })?;
             let property_bytes =
                 artifact
                     .draft()
@@ -445,9 +401,7 @@ impl ConnectorWriteSession {
             _ => {}
         }
         accumulated.rows = next_rows;
-        accumulated.ledger = next_ledger;
         accumulated.fragments.extend(fragments);
-        accumulated.statistics_body_bytes = next_body_bytes;
         accumulated.statistics_property_bytes = next_property_bytes;
         accumulated.statistics_identities.extend(observed);
         accumulated.statistics.extend(statistics);
@@ -502,6 +456,7 @@ mod outer_byte_budget_tests {
         fn decode_commit_fragment_payload(
             &self,
             payload: &ConnectorEncodedPayload,
+            _author: &novarocks_spi::connector::ConnectorPayloadRetentionGuard,
         ) -> Result<
             novarocks_spi::connector::write_stack::ConnectorCommitFragment,
             ConnectorCodecError,
@@ -593,6 +548,73 @@ mod outer_byte_budget_tests {
         let last = alias.lock().unwrap().take().unwrap();
         assert!(!last.is_empty());
         drop(last);
+        assert_eq!(window.retained_payload_bytes(), 0);
+        drop((binding, window));
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[test]
+    fn large_write_set_keeps_each_decoded_objects_receipt_until_drop() {
+        use crate::query_execution::write_session::tests::{fixture_with_outcome, known_committed};
+        let (_control, root, binding, _) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let window = binding.window_alias();
+        let fixture = fixture_with_outcome(1, 1, known_committed());
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let count = 16_385;
+        let retained_per_value = 256;
+        fixture.recorded.lock().unwrap().decoded_fragment_charge = Some(retained_per_value);
+        let bytes = super::super::tests::commit_fragment_bytes();
+        let prepared = DecodedPreparedWriteSet::for_test(1, vec![(target, bytes); count])
+            .with_test_capacity(&binding);
+        let decoder = fixture.session.computation_decode(&[target]).unwrap();
+        let segment = decoder
+            .interpret(prepared)
+            .expect("a complete large write set");
+        assert_eq!(segment.prepared.fragments().len(), count);
+        fixture.session.receiving_port().accept(segment).unwrap();
+        assert_eq!(
+            window.retained_payload_bytes(),
+            (count * retained_per_value) as u64
+        );
+        drop(fixture);
+        assert_eq!(window.retained_payload_bytes(), 0);
+        drop((binding, window));
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[test]
+    fn decoded_object_refusal_returns_already_admitted_receipts() {
+        use crate::query_execution::write_session::tests::{fixture_with_outcome, known_committed};
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let (_control, root, binding, _) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let window = binding.window_alias();
+        let fixture = fixture_with_outcome(1, 1, known_committed());
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let charge = 256;
+        fixture.recorded.lock().unwrap().decoded_fragment_charge = Some(charge);
+        let bytes = super::super::tests::commit_fragment_bytes();
+        let outer_bytes = bytes.len() as u64;
+        let prepared = DecodedPreparedWriteSet::for_test(1, vec![(target, bytes); 2])
+            .with_test_capacity(&binding);
+        let limit = novarocks_workload_control::ResultCapacityConfig::V1.all_objects_bytes[2];
+        let capacity_for_one_decoded_object = outer_bytes + charge as u64;
+        let other = window
+            .reserve_payload_bytes(limit - 2 * outer_bytes - capacity_for_one_decoded_object)
+            .unwrap();
+        let before = window.retained_payload_bytes();
+        let decoder = fixture.session.computation_decode(&[target]).unwrap();
+        let error = decoder.interpret_borrowed(&prepared).unwrap_err();
+        let (_, cause) = error.into_parts();
+        assert_eq!(
+            cause.unwrap().failure_fact().class(),
+            FailureClass::Resource
+        );
+        assert_eq!(window.retained_payload_bytes(), before);
+        drop((other, prepared));
         assert_eq!(window.retained_payload_bytes(), 0);
         drop((binding, window));
         root.owner.complete();

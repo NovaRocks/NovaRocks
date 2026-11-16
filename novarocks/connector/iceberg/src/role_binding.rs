@@ -834,6 +834,7 @@ mod tests {
             .decode_commit_fragment(
                 &ValidatedCommitFragment::parse(raw, FieldPath::root("commit_fragment"))
                     .expect("canonical carrier"),
+                &crate::commit::write_stack::codec::test_fragment_decode_author(),
             )
             .expect("the frontend decodes the fragments it receives");
         assert_eq!(

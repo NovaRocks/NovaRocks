@@ -49,8 +49,8 @@ use crate::connector::{
 };
 use crate::connector::{ConnectorMutationRouteInput, ConnectorWriteFieldToken};
 use crate::connector::{
-    ExternalMutationEvidence, ExternalMutationOutcome, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
-    StatisticsArtifactDraft, StatisticsRequiredAggregation,
+    ExternalMutationEvidence, ExternalMutationOutcome, StatisticsArtifactDraft,
+    StatisticsRequiredAggregation,
 };
 
 /// An actual KnownCommitted receipt after its necessary finalization ended.
@@ -328,12 +328,6 @@ impl WriteStatisticsContract {
         input: &ConnectorWriteInputShape,
         requirements: Vec<StatisticsRequiredAggregation>,
     ) -> Result<Self, ConnectorError> {
-        if requirements.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "write statistics requirement count exceeds the artifact limit",
-            ));
-        }
         let fields = input.fields();
         let mut identities = std::collections::BTreeSet::new();
         for requirement in &requirements {

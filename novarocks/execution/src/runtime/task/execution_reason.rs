@@ -32,7 +32,7 @@ pub(crate) enum ExecutionReason {
     WriterPanicked = 11,
     WriterAbortTimeout = 12,
     WriterAcceptedRowsOverflow = 13,
-    WriterCommitFragmentLimit = 14,
+    // 14 was WriterCommitFragmentLimit.
     WriterInterrupted = 15,
     SourceInputEdge = 16,
     SourceInputEos = 17,

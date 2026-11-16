@@ -31,10 +31,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_native_adapter::root_write_commit_codec::*;
 use novarocks_result_render::RenderTurnStatus;
 use novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES;
-use novarocks_spi::connector::write_stack::{
-    MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES, RootRowKind,
-    root_write_result_schema,
-};
+use novarocks_spi::connector::write_stack::{RootRowKind, root_write_result_schema};
 
 thread_local! {
     static TRACK: Cell<bool> = const { Cell::new(false) };
@@ -330,9 +327,6 @@ fn summary_fragment_and_artifact_records_are_exact() {
     assert_eq!(records[2].0.row_count(), 41);
     assert!(records[2].1.is_empty());
     assert!(encoded.totals.row_count_seen());
-    assert_eq!(encoded.totals.fragments(), 1);
-    assert_eq!(encoded.totals.fragment_bytes(), 4);
-    assert_eq!(encoded.totals.artifacts(), 1);
     encoded.totals.finish().unwrap();
 }
 
@@ -380,34 +374,15 @@ fn a_second_summary_is_refused_before_its_header_and_across_batches() {
 }
 
 #[test]
-fn fragment_single_value_and_entry_budgets_are_refused_before_emission() {
-    let oversized = encode(
-        batch(&[ExpectedRecord::Fragment(
-            1,
-            vec![0; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1],
-        )]),
-        WriteCommitTotals::default(),
-        1 << 20,
-    );
-    assert_eq!(oversized.error, Some(WriteCommitCodecError::FragmentLimit));
-    assert!(oversized.bytes.is_empty());
-    let exact = encode(
-        batch(&[ExpectedRecord::Fragment(
-            1,
-            vec![0; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
-        )]),
-        WriteCommitTotals::default(),
-        1 << 20,
-    );
-    assert!(exact.error.is_none());
-    let many =
-        vec![ExpectedRecord::Fragment(1, vec![1]); MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES + 1];
-    let entries = encode(batch(&many), WriteCommitTotals::default(), 1 << 20);
-    assert_eq!(entries.error, Some(WriteCommitCodecError::FragmentLimit));
-    assert_eq!(
-        entries.totals.fragments(),
-        MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES
-    );
+fn fragments_larger_than_one_mib_and_more_than_16384_records_are_emitted() {
+    let mut fragments = vec![ExpectedRecord::Fragment(1, vec![1]); 16_384];
+    let large = vec![7; 1024 * 1024 + 1];
+    fragments.push(ExpectedRecord::Fragment(1, large.clone()));
+    let encoded = encode(batch(&fragments), WriteCommitTotals::default(), 1 << 20);
+    assert!(encoded.error.is_none());
+    let observed = records(&encoded.bytes);
+    assert_eq!(observed.len(), fragments.len());
+    assert_eq!(observed.last().unwrap().1, large);
 }
 
 #[test]

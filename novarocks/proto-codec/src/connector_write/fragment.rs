@@ -23,10 +23,9 @@ use novarocks_spi::connector::{
 };
 use prost::Message;
 
-use super::MAX_COMMIT_FRAGMENT_ENCODED_BYTES;
-use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
+use crate::{FieldPath, ProtocolError};
 
-/// A commit fragment whose public envelope is structurally valid and bounded.
+/// A commit fragment whose public envelope is structurally valid.
 ///
 /// Provider-private artifact semantics are validated only by the exact
 /// provider binding selected by the envelope header.
@@ -42,19 +41,10 @@ impl ValidatedCommitFragment {
         path: FieldPath,
     ) -> Result<Self, ProtocolError> {
         let encoded_len = raw.encoded_len();
-        if encoded_len > MAX_COMMIT_FRAGMENT_ENCODED_BYTES {
-            return Err(ProtocolError::new(
-                path,
-                ProtocolErrorKind::OutOfRange,
-                format!(
-                    "commit fragment encodes to {encoded_len} bytes, over the hard limit {MAX_COMMIT_FRAGMENT_ENCODED_BYTES}"
-                ),
-            ));
-        }
         let provider_payload = crate::connector_common::decode_embedded_owned_connector_payload(
             raw.provider_payload,
             ConnectorCodecCategory::CommitFragment,
-            MAX_COMMIT_FRAGMENT_ENCODED_BYTES,
+            encoded_len,
             path.field("provider_payload"),
         )?;
         Ok(Self {

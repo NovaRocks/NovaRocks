@@ -75,10 +75,6 @@ pub enum WriterFailure {
     PartialDemandClosed,
     ActorInterrupted,
     ExitUnresolved,
-    CommitFragmentLimit {
-        requested: usize,
-        limit: usize,
-    },
     Panicked {
         operation: Option<ConnectorOperation>,
         detail: BoundedDetail,
@@ -129,10 +125,6 @@ impl fmt::Display for WriterFailure {
                 write!(f, "connector writer {operation} mailbox is closed")
             }
             Self::AlreadyBound => f.write_str("connector writer actor is already bound"),
-            Self::CommitFragmentLimit { requested, limit } => write!(
-                f,
-                "table writer commit fragment of {requested} bytes exceeds the frozen single-fragment budget of {limit} bytes"
-            ),
             Self::PartialDemandClosed => {
                 f.write_str("writer partial aggregate closed before the writer input ended")
             }
@@ -208,10 +200,6 @@ impl FailureProjection for WriterFailure {
             Self::ActorInterrupted => {
                 (FailureClass::Unexpected, ExecutionReason::WriterInterrupted)
             }
-            Self::CommitFragmentLimit { .. } => (
-                FailureClass::Resource,
-                ExecutionReason::WriterCommitFragmentLimit,
-            ),
             Self::Panicked { .. } => (FailureClass::Unexpected, ExecutionReason::WriterPanicked),
             Self::AbortTimeout { .. } => {
                 (FailureClass::Control, ExecutionReason::WriterAbortTimeout)
@@ -251,8 +239,7 @@ impl FailureProjection for WriterFailure {
                 live: None,
                 committed: Some(*current),
             })
-        } else if let Self::CommitFragmentLimit { requested, limit }
-        | Self::OutputBytes {
+        } else if let Self::OutputBytes {
             bytes: requested,
             limit,
         } = self
