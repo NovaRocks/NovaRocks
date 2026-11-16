@@ -158,6 +158,29 @@ impl SessionPropertyRegistry {
     }
 }
 
+pub fn admit_catalog_properties(
+    port: &dyn SessionCatalogPropertyPort,
+    catalog: &str,
+) -> Result<Arc<CatalogPropertyMetadata>, SessionPropertyError> {
+    match port
+        .session_property_catalog(catalog)
+        .map_err(SessionPropertyError::Source)?
+    {
+        SessionCatalogPropertyAdmission::Absent => Err(SessionPropertyError::CatalogNotFound {
+            catalog: catalog.to_owned(),
+        }),
+        SessionCatalogPropertyAdmission::Unavailable(error) => {
+            Err(SessionPropertyError::Source(error))
+        }
+        SessionCatalogPropertyAdmission::Ready(metadata) if metadata.catalog() == catalog => {
+            Ok(metadata)
+        }
+        SessionCatalogPropertyAdmission::Ready(_) => {
+            Err(SessionPropertyError::CatalogIdentityMismatch)
+        }
+    }
+}
+
 pub enum SessionCatalogPropertyAdmission {
     Absent,
     Unavailable(QueryServiceError),

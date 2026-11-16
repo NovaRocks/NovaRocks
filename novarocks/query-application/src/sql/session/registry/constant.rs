@@ -21,27 +21,53 @@ use super::*;
 use novarocks_constant_contract::{ConstantError, ConstantValue};
 use novarocks_type_contract::{CompilePhase, PureCompileControl, ValueKind, ValueLogicalType};
 
+pub struct SqlPropertyDeclaration {
+    declaration: Arc<PropertyDeclaration>,
+    scope: SessionPropertyScope,
+}
+
+impl SqlPropertyDeclaration {
+    pub fn value_type(&self) -> SessionPropertyType {
+        self.declaration.value_type()
+    }
+
+    pub fn qualified_name(&self) -> String {
+        self.scope.qualified_name(self.declaration.name())
+    }
+
+    pub fn validate_value(
+        self,
+        constant: &ConstantValue,
+        control: &dyn PureCompileControl,
+    ) -> Result<ValidatedSessionProperty, SessionPropertyError> {
+        self.declaration
+            .validate_scoped_sql_value(constant, control, self.scope)
+    }
+}
+
 impl PropertyDeclaration {
-    /// SQL has already performed the permitted conversion and evaluation.
-    /// Keep the complete source binding and selected ordinal through handoff.
-    pub fn validate_sql_value(
+    /// SQL has already performed conversion and evaluation. Keep the selected
+    /// source binding through the handoff to the session owner.
+    fn validate_scoped_sql_value(
         self: &Arc<Self>,
         constant: &ConstantValue,
         control: &dyn PureCompileControl,
+        scope: SessionPropertyScope,
     ) -> Result<ValidatedSessionProperty, SessionPropertyError> {
         let phase = CompilePhase::Validate;
         control
             .checkpoint(phase, 0)
             .map_err(ConstantError::from)
             .map_err(SessionPropertyError::Constant)?;
+        let qualify = || scope.qualified_name(self.name());
         let invalid_type = || SessionPropertyError::InvalidValue {
-            name: self.name.clone(),
+            name: qualify(),
             detail: format!(
                 "Expected {} after SQL conversion",
                 self.value_type.sql_name()
             ),
         };
-        if self.project.is_none() {
+        if self.project.is_some() != matches!(scope, SessionPropertyScope::System) {
             return Err(SessionPropertyError::ProjectionInvariant);
         }
         let binding = constant.value_type();
@@ -61,9 +87,7 @@ impl PropertyDeclaration {
             .is_null_observed(phase, control)
             .map_err(SessionPropertyError::Constant)?
         {
-            return Err(SessionPropertyError::NullValue {
-                name: self.name.clone(),
-            });
+            return Err(SessionPropertyError::NullValue { name: qualify() });
         }
         let missing = || SessionPropertyError::ProjectionInvariant;
         let value = match self.value_type {
@@ -102,7 +126,15 @@ impl PropertyDeclaration {
                     .to_owned(),
             ),
         };
-        self.validate_value(&value)?;
+        self.validate_value(&value).map_err(|error| match error {
+            SessionPropertyError::InvalidValue { detail, .. } => {
+                SessionPropertyError::InvalidValue {
+                    name: qualify(),
+                    detail,
+                }
+            }
+            original => original,
+        })?;
         let raw = value.render()?;
         control
             .checkpoint(phase, 0)
@@ -112,19 +144,40 @@ impl PropertyDeclaration {
             declaration: self.clone(),
             value,
             raw,
-            scope: SessionPropertyScope::System,
+            scope,
             constant_source: Some(constant.clone()),
         })
     }
 }
+impl CatalogPropertyMetadata {
+    pub fn lookup_sql(&self, name: &str) -> Result<SqlPropertyDeclaration, SessionPropertyError> {
+        Ok(SqlPropertyDeclaration {
+            declaration: self.lookup(&name.to_ascii_lowercase())?,
+            scope: SessionPropertyScope::Catalog {
+                catalog: self.catalog().to_owned(),
+                identity: self.identity().cloned(),
+            },
+        })
+    }
+}
+
 impl SessionPropertyRegistry {
+    pub fn lookup_sql_system(
+        &self,
+        name: &str,
+    ) -> Result<SqlPropertyDeclaration, SessionPropertyError> {
+        Ok(SqlPropertyDeclaration {
+            declaration: self.lookup_system(name, SessionPropertyOrigin::Sql)?,
+            scope: SessionPropertyScope::System,
+        })
+    }
+
     pub fn prepare_sql_constant(
         &self,
         name: &str,
         value: &ConstantValue,
         control: &dyn PureCompileControl,
     ) -> Result<ValidatedSessionProperty, SessionPropertyError> {
-        self.lookup_system(name, SessionPropertyOrigin::Sql)?
-            .validate_sql_value(value, control)
+        self.lookup_sql_system(name)?.validate_value(value, control)
     }
 }

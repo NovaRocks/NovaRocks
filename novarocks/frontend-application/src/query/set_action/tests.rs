@@ -148,6 +148,9 @@ impl Fixture {
             set,
             staged: self.live.clone(),
             registry: Arc::clone(&self.registry),
+            catalog_properties: Arc::new(
+                crate::query::session_property_computation::NoCatalogProperties,
+            ),
             interpreter: Arc::new(
                 crate::query_execution::required_constant_eval::test_required_constant_interpreter(
                 ),

@@ -735,6 +735,49 @@ fn checked_sql_constants_reject_actual_null_and_nominal_lookalikes() {
 }
 
 #[test]
+fn catalog_sql_constant_keeps_the_bound_generation_and_qualified_errors() {
+    use arrow::{array::Int32Array, datatypes::DataType};
+    use novarocks_type_contract::FunctionValueType;
+
+    let registry = catalog_registry();
+    let catalog = registry
+        .bind_catalog(
+            "first",
+            identity("first", 1),
+            &[("default".into(), "4".into())],
+        )
+        .unwrap();
+    let pool = constant_pool(
+        Arc::new(Int32Array::from(vec![7, -1])),
+        FunctionValueType::new(DataType::Int32, false),
+    );
+    let property = catalog
+        .lookup_sql("LIMIT")
+        .unwrap()
+        .validate_value(&pool.value(0).unwrap(), &ConstantControl(None))
+        .unwrap();
+    assert_eq!(property.qualified_name(), "first.limit");
+    assert_eq!(
+        property.scope(),
+        &SessionPropertyScope::Catalog {
+            catalog: "first".into(),
+            identity: catalog.identity().cloned(),
+        }
+    );
+    assert_eq!(property.value(), &SessionPropertyValue::Integer(7));
+    assert!(property.constant_source().is_some());
+    let invalid = catalog
+        .lookup_sql("limit")
+        .unwrap()
+        .validate_value(&pool.value(1).unwrap(), &ConstantControl(None))
+        .unwrap_err();
+    assert!(matches!(
+        invalid,
+        SessionPropertyError::InvalidValue { name, .. } if name == "first.limit"
+    ));
+}
+
+#[test]
 fn checked_sql_constant_control_refusals_remain_typed() {
     use arrow::{array::Int32Array, datatypes::DataType};
     use novarocks_type_contract::{CompileControlError, FunctionValueType};

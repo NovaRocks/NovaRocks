@@ -115,6 +115,10 @@ impl Printer {
                         SetScope::Local => self.output.push_str("LOCAL "),
                         SetScope::Global => self.output.push_str("GLOBAL "),
                     }
+                    if let Some(catalog) = &assignment.catalog {
+                        self.write_ident(catalog);
+                        self.output.push('.');
+                    }
                     self.write_ident(&assignment.name);
                     self.output.push_str(" = ");
                     self.write_expr(&assignment.value);

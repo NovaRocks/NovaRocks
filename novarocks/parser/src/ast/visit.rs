@@ -791,6 +791,9 @@ pub fn walk_session_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Se
     match statement {
         SessionStatement::Set(statement) => {
             for assignment in &statement.assignments {
+                if let Some(catalog) = &assignment.catalog {
+                    visitor.visit_ident(catalog);
+                }
                 visitor.visit_ident(&assignment.name);
                 visitor.visit_expr(&assignment.value);
             }
@@ -808,6 +811,10 @@ pub fn fold_session_statement<F: Fold + ?Sized>(
     match statement {
         SessionStatement::Set(mut statement) => {
             for assignment in &mut statement.assignments {
+                assignment.catalog = assignment
+                    .catalog
+                    .take()
+                    .map(|name| folder.fold_ident(name));
                 assignment.name = folder.fold_ident(assignment.name.clone());
                 assignment.value = folder.fold_expr(assignment.value.clone());
             }

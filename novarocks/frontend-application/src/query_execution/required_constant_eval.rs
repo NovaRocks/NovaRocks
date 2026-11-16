@@ -170,7 +170,10 @@ impl RequiredConstantInterpreter {
             ));
         }
         let (_, package) = packages.pop_first().expect("one checked required fragment");
-        if !package.scans().is_empty() || !package.writes().is_empty() {
+        if !package.scans().is_empty()
+            || !package.writes().is_empty()
+            || !package.layouts().is_empty()
+        {
             return Err(invariant(
                 "required constant contains a provider occurrence",
             ));

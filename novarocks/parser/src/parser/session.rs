@@ -106,12 +106,18 @@ fn parse_set(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseErr
 fn parse_assignment(parser: &mut StatementParser<'_, '_>) -> Result<SetAssignment, ParseError> {
     let start = parser.current_span().start();
     let scope = parse_optional_scope(parser);
-    let name = parser.parse_contextual_ident()?;
+    let first = parser.parse_contextual_ident()?;
+    let (catalog, name) = if parser.consume_if_symbol(Symbol::Dot) {
+        (Some(first), parser.parse_contextual_ident()?)
+    } else {
+        (None, first)
+    };
     parser.consume_symbol(Symbol::Eq)?;
     let value = parse_expression_until_assignment_end(parser)?;
     let end = value.span().end();
     Ok(SetAssignment {
         scope,
+        catalog,
         name,
         value,
         span: Span::new(start, end),
@@ -232,6 +238,22 @@ mod tests {
         assert_eq!(set.assignments[1].scope, SetScope::Global);
         assert_eq!(set.assignments[2].scope, SetScope::Local);
         assert_eq!(set.assignments[2].name.value, "sql_mode");
+    }
+
+    #[test]
+    fn parses_and_prints_catalog_qualified_set_assignments() {
+        let sql = r#"SET SESSION "iceberg_prod".max_partitions_per_writer = 2, pipeline_dop = 1"#;
+        let statements = parser::parse(sql).unwrap();
+        let Statement::Session(SessionStatement::Set(set)) = &statements[0] else {
+            panic!("expected SET session statement");
+        };
+        let catalog = set.assignments[0].catalog.as_ref().unwrap();
+        assert_eq!(catalog.value, "iceberg_prod");
+        assert!(catalog.quoted);
+        assert_eq!(set.assignments[0].name.value, "max_partitions_per_writer");
+        assert!(set.assignments[1].catalog.is_none());
+        assert_eq!(print_statement(&statements[0]), sql);
+        assert!(parser::parse("SET SESSION catalog.schema.property = 1").is_err());
     }
 
     #[test]
