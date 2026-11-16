@@ -1,0 +1,9 @@
+-- query 2
+-- types	boolean	bigint
+spread	rows_in_files
+true	120000
+
+-- query 3
+-- types	bigint	bigint	bigint
+n	id_sum	payload_chars
+120000	7200060000	491520000
