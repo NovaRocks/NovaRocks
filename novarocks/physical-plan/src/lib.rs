@@ -94,6 +94,19 @@ pub use structure_input::FragmentStructureInput;
 pub use validation::*;
 pub use write_execution::*;
 
+/// Whether a complete grouping key can be compared and partitioned for a
+/// `TopNReduction::GroupedStates` reduction.
+///
+/// Planning and validation use this same installation domain so an optional
+/// reduction cannot make a supported query fail during preparation.
+pub fn grouped_state_topn_key_supported(
+    comparator: OrderedComparisonAlgorithm,
+    ty: &FunctionValueType,
+) -> bool {
+    comparator.supports_value_type(ty)
+        && PartitionHashAlgorithm::NativeExchangeV1.supports_partition_key(ty.data_type())
+}
+
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
