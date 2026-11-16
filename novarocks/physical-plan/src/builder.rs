@@ -803,9 +803,9 @@ impl FragmentBuilder {
 
     /// Adds an operator that adds columns to the rows it passes through.
     ///
-    /// A window leaves layout, multiplicity and ordering exactly as it found
-    /// them - it only widens rows - so all three are taken from the input
-    /// rather than restated.
+    /// A window or write layout key preserves layout, multiplicity and
+    /// ordering. Both the input requirement and output take those properties
+    /// from the input.
     pub fn add_row_widening(
         &mut self,
         node: NodeId,

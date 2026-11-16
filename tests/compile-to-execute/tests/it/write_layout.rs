@@ -108,17 +108,10 @@ fn sender_package() -> FragmentPackage {
             },
         )
         .unwrap();
-    let distribution = builder
-        .node_output_properties(values)
-        .unwrap()
-        .distribution
-        .clone();
     builder
-        .add_row_consuming(
+        .add_row_widening(
             root,
-            Box::new([values]),
-            RequiredInputs::AsProduced,
-            distribution,
+            values,
             Box::new([columns[0], columns[1], key]),
             NodeKind::WriteLayoutKey {
                 key_inputs: Box::new([columns[1]]),

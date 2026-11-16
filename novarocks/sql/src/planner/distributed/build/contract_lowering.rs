@@ -3435,11 +3435,9 @@ impl<'a> ContractLoweringVisitor<'a> {
         )?;
         let mut output = source.output.to_vec();
         output.push(output_key);
-        self.fragment_mut().add_row_consuming(
+        self.fragment_mut().add_row_widening(
             node,
-            Box::new([source.node]),
-            RequiredInputs::AsProduced,
-            source.properties.distribution.clone(),
+            source.node,
             output.into_boxed_slice(),
             NodeKind::WriteLayoutKey {
                 key_inputs,
