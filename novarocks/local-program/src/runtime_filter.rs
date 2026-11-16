@@ -619,6 +619,12 @@ pub fn encode_filter_key_type(
     })
 }
 
+/// Whether the canonical membership schema can represent this physical key.
+/// Planner placement and preparation share the canonical encoder's domain.
+pub fn is_filter_key_type(data_type: &DataType) -> bool {
+    visit_filter_key_type::<FilterMembershipSchemaError>(data_type, |_| Ok(())).is_ok()
+}
+
 /// Visit canonical physical key bytes without allocating a shadow buffer.
 /// Membership and ordered artifact encoders share this exact vocabulary.
 pub fn visit_filter_key_type<E: From<FilterMembershipSchemaError>>(
@@ -895,6 +901,32 @@ mod tests {
             )
             .unwrap();
             assert_eq!(actual, (digest(comparator), digest(order)));
+        }
+    }
+
+    #[test]
+    fn membership_key_predicate_uses_the_canonical_schema_domain() {
+        for data_type in [
+            DataType::Boolean,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::FixedSizeBinary(16),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Decimal128(38, 3),
+            DataType::Binary,
+            DataType::Decimal256(40, 0),
+            DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                DataType::Int32,
+                true,
+            ))),
+        ] {
+            assert_eq!(
+                is_filter_key_type(&data_type),
+                encode_filter_key_type(&data_type, &mut Vec::new()).is_ok(),
+                "{data_type:?}",
+            );
         }
     }
 
