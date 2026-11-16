@@ -2671,7 +2671,7 @@ fn lower_with_creation<
     reason = "The sealed recipe and lowered occurrences have independent owners."
 )]
 fn lower_write_layout_key<H>(
-    package: &FragmentPackage,
+    package: &novarocks_physical_plan::FragmentPackage,
     node: &novarocks_physical_plan::PhysicalNode,
     (key_inputs, output_key): (
         &[novarocks_physical_plan::ValueId],

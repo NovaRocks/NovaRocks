@@ -1304,6 +1304,7 @@ fn render_sink(
                     match &route.requirements.layout {
                         novarocks_physical_plan::WriteLayoutPreference::None => "none",
                         novarocks_physical_plan::WriteLayoutPreference::ClusterBy(_) => "cluster-by",
+                        novarocks_physical_plan::WriteLayoutPreference::PartitionAffinity(_) => "partition-affinity",
                     },
                     joined(route.requirements.layout_keys(), ",", |value: &ValueId, output: &mut fmt::Formatter<'_>| context.value_name(fragment_id, *value).fmt(output)),
                     route.edge.get()

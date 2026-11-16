@@ -124,8 +124,11 @@ impl CompiledWriterBindings {
         Ok(())
     }
 
-    fn bind_layout_destinations(&mut self, assignment: &super::instance::TaskSinkAssignment) {
-        use super::instance::TaskSinkAssignment;
+    fn bind_layout_destinations(
+        &mut self,
+        assignment: &crate::runtime::task::instance::TaskSinkAssignment,
+    ) {
+        use crate::runtime::task::instance::TaskSinkAssignment;
         if self.layouts.is_empty() {
             return;
         }
