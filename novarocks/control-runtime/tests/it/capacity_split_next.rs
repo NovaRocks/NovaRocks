@@ -19,6 +19,7 @@
     clippy::disallowed_methods,
     reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
 )]
+
 use novarocks_control_runtime::{
     completion::ReportSlot,
     history::HistoryCapture,
