@@ -22,8 +22,8 @@ use crate::{
     ast::{
         Cte, ExplainFormat, ExplainQuery, Expr, Fetch, GroupBy, Ident, Join, JoinConstraint,
         JoinOperator, NamedWindow, Offset, OffsetRows, OrderByExpr, Query, Select, SelectItem,
-        SelectQuantifier, SetExpr, SetOperation, SetOperator, SetQuantifier, Statement,
-        TableFactor, TableVersion, TableVersionKind, TableWithJoins, Values, WildcardOptions, With,
+        SelectQuantifier, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
+        TableVersion, TableVersionKind, TableWithJoins, Values, WildcardOptions, With,
     },
     lex,
     token::{Keyword, Symbol},
@@ -101,50 +101,6 @@ pub(super) fn parse(
     Ok(Some(Statement::Query(parse_query(parser)?)))
 }
 
-/// Bound the syntax-tree depth of a homogeneous UNION ALL chain. Analysis
-/// still folds its operands in source order, retaining pairwise type widening.
-pub(crate) fn balance_union_all(expression: SetExpr) -> SetExpr {
-    if !matches!(&expression, SetExpr::SetOperation(operation)
-        if operation.operator == SetOperator::Union && operation.quantifier == SetQuantifier::All)
-    {
-        return expression;
-    }
-    let mut pending = vec![expression];
-    let mut operands = Vec::new();
-    while let Some(current) = pending.pop() {
-        match current {
-            SetExpr::SetOperation(operation)
-                if operation.operator == SetOperator::Union
-                    && operation.quantifier == SetQuantifier::All =>
-            {
-                pending.push(*operation.right);
-                pending.push(*operation.left);
-            }
-            other => operands.push(other),
-        }
-    }
-    while operands.len() > 1 {
-        let mut next_level = Vec::with_capacity(operands.len().div_ceil(2));
-        let mut values = operands.into_iter();
-        while let Some(left) = values.next() {
-            if let Some(right) = values.next() {
-                let span = left.span().cover(right.span());
-                next_level.push(SetExpr::SetOperation(SetOperation {
-                    left: Box::new(left),
-                    operator: SetOperator::Union,
-                    quantifier: SetQuantifier::All,
-                    right: Box::new(right),
-                    span,
-                }));
-            } else {
-                next_level.push(left);
-            }
-        }
-        operands = next_level;
-    }
-    operands.pop().expect("a UNION ALL chain has operands")
-}
-
 pub(super) fn parse_query(
     parser: &mut StatementParser<'_, '_>,
 ) -> Result<Query, crate::ParseError> {
@@ -156,29 +112,17 @@ pub(super) fn parse_query(
     };
     let (mut body, mut session_properties) = parse_set_expr(parser)?;
     while let Some(operator) = parse_set_operator(parser) {
-        let operator_start = body.span().start();
         let quantifier = if parser.consume_if_word("ALL") {
             SetQuantifier::All
         } else if parser.consume_if_word("DISTINCT") {
             SetQuantifier::Distinct
         } else {
-            SetQuantifier::None
+            SetQuantifier::Distinct
         };
         let (right, _) = parse_set_expr(parser)?;
         session_properties.clear();
-        if operator != SetOperator::Union || quantifier != SetQuantifier::All {
-            body = balance_union_all(body);
-        }
-        let span = Span::new(operator_start, right.span().end());
-        body = SetExpr::SetOperation(SetOperation {
-            left: Box::new(body),
-            operator,
-            quantifier,
-            right: Box::new(right),
-            span,
-        });
+        body = crate::build::set_operation(body, operator, quantifier, right, None);
     }
-    body = balance_union_all(body);
 
     let mut order_by = Vec::new();
     if parser.consume_if_word("ORDER") {

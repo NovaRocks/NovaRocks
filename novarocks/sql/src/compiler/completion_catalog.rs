@@ -559,8 +559,10 @@ impl<'a> CatalogNeedCollector<'a> {
             }
             ast::SetExpr::Query(query) => self.collect_query(query, scope),
             ast::SetExpr::SetOperation(operation) => {
-                self.collect_set_expr(&operation.left, scope)?;
-                self.collect_set_expr(&operation.right, scope)
+                for input in &operation.inputs {
+                    self.collect_set_expr(input, scope)?;
+                }
+                Ok(())
             }
         }
     }
@@ -1554,7 +1556,7 @@ mod tests {
         fn branch_count(body: &ast::SetExpr) -> usize {
             match body {
                 ast::SetExpr::SetOperation(operation) => {
-                    branch_count(&operation.left) + branch_count(&operation.right)
+                    operation.inputs.iter().map(branch_count).sum()
                 }
                 _ => 1,
             }

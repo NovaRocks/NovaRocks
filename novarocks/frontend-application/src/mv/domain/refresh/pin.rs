@@ -372,8 +372,9 @@ fn walk_set_expr(
             }
         }
         novarocks_parser::ast::SetExpr::SetOperation(operation) => {
-            walk_set_expr(operation.left.as_mut(), visible_ctes, state);
-            walk_set_expr(operation.right.as_mut(), visible_ctes, state);
+            for input in &mut operation.inputs {
+                walk_set_expr(input, visible_ctes, state);
+            }
         }
         SetExpr::Query(query) => walk_query(query.as_mut(), visible_ctes, state),
         _ => {}

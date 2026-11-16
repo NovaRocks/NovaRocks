@@ -4249,7 +4249,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_union_first_refresh_balances_four_original_branch_outputs() {
+    fn branch_union_first_refresh_preserves_four_original_branch_outputs() {
         let queries = (0..4)
             .map(|index| format!("SELECT k, sum(v) AS total FROM ice.db.t{index} GROUP BY k"))
             .collect::<Vec<_>>();
@@ -4273,8 +4273,54 @@ mod tests {
         let ast::SetExpr::SetOperation(root) = prepared.query().body.as_ref() else {
             panic!("expected UNION ALL");
         };
-        assert!(matches!(root.left.as_ref(), ast::SetExpr::SetOperation(_)));
-        assert!(matches!(root.right.as_ref(), ast::SetExpr::SetOperation(_)));
+        assert_eq!(root.operator, ast::SetOperator::Union);
+        assert_eq!(root.quantifier, ast::SetQuantifier::All);
+        assert!(root.corresponding.is_none());
+        assert_eq!(root.inputs.len(), 4);
+        for (index, input) in root.inputs.iter().enumerate() {
+            let branch = build::query(input.clone());
+            assert_eq!(snapshot_literals(&branch), vec![(10 + index).to_string()]);
+            let ast::SetExpr::Select(select) = input else {
+                panic!("branch SELECT");
+            };
+            for name in ["k", "total", SQL_MV_ROW_ID_COLUMN, BRANCH_ID_COLUMN_NAME] {
+                assert!(
+                    select.projection.iter().any(|item| matches!(item,
+                        ast::SelectItem::ExprWithAlias { alias, .. }
+                            if alias.value == name && alias.quoted && alias.quote_style == Some('`')
+                    )),
+                    "branch {index} lost exact output alias {name}"
+                );
+            }
+            let [from] = select.from.as_slice() else {
+                panic!("state source");
+            };
+            let ast::TableFactor::Derived {
+                subquery,
+                alias: Some(alias),
+                ..
+            } = &from.relation
+            else {
+                panic!("derived state source");
+            };
+            assert_eq!(alias.name.value, "state");
+            let ast::SetExpr::Select(state) = subquery.body.as_ref() else {
+                panic!("state SELECT");
+            };
+            let [from] = state.from.as_slice() else {
+                panic!("original branch scan");
+            };
+            let ast::TableFactor::Table { name, .. } = &from.relation else {
+                panic!("original table");
+            };
+            assert_eq!(
+                name.parts
+                    .iter()
+                    .map(|part| part.value.clone())
+                    .collect::<Vec<_>>(),
+                vec!["ice".to_string(), "db".to_string(), format!("t{index}")]
+            );
+        }
         assert_eq!(
             snapshot_literals(prepared.query()),
             vec!["10", "11", "12", "13"]
@@ -4282,8 +4328,9 @@ mod tests {
         fn collect_branch_ids(body: &ast::SetExpr, ids: &mut Vec<String>) {
             match body {
                 ast::SetExpr::SetOperation(operation) => {
-                    collect_branch_ids(&operation.left, ids);
-                    collect_branch_ids(&operation.right, ids);
+                    for input in &operation.inputs {
+                        collect_branch_ids(input, ids);
+                    }
                 }
                 ast::SetExpr::Select(select) => {
                     let expr = select

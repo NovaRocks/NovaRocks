@@ -954,8 +954,9 @@ fn mark_set_expr_aliases_explicit(set_expr: &mut ast::SetExpr) {
         }
         ast::SetExpr::Query(query) => mark_query_aliases_explicit(query),
         ast::SetExpr::SetOperation(operation) => {
-            mark_set_expr_aliases_explicit(&mut operation.left);
-            mark_set_expr_aliases_explicit(&mut operation.right);
+            for input in &mut operation.inputs {
+                mark_set_expr_aliases_explicit(input);
+            }
         }
         ast::SetExpr::Values(_) => {}
     }

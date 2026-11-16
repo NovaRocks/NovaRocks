@@ -143,10 +143,16 @@ impl SyntaxEq for SetExpr {
 
 impl SyntaxEq for SetOperation {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.left.syntax_eq(&other.left)
+        syntax_eq_slice(&self.inputs, &other.inputs)
             && self.operator == other.operator
             && self.quantifier == other.quantifier
-            && self.right.syntax_eq(&other.right)
+            && syntax_eq_option(&self.corresponding, &other.corresponding)
+    }
+}
+
+impl SyntaxEq for Corresponding {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        syntax_eq_slice(&self.columns, &other.columns)
     }
 }
 

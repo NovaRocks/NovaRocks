@@ -169,8 +169,8 @@ fn body_has_distinct_set(body: &ast::SetExpr) -> bool {
         ast::SetExpr::SetOperation(operation) => {
             !matches!(operation.operator, ast::SetOperator::Union)
                 || !matches!(operation.quantifier, ast::SetQuantifier::All)
-                || body_has_distinct_set(&operation.left)
-                || body_has_distinct_set(&operation.right)
+                || operation.corresponding.is_some()
+                || operation.inputs.iter().any(body_has_distinct_set)
         }
         ast::SetExpr::Query(query) => body_has_distinct_set(&query.body),
         _ => false,
@@ -330,15 +330,17 @@ fn shape_body(
         ast::SetExpr::SetOperation(operation) => {
             if !matches!(operation.operator, ast::SetOperator::Union)
                 || !matches!(operation.quantifier, ast::SetQuantifier::All)
+                || operation.corresponding.is_some()
             {
-                return Err("INSERT literal source requires UNION ALL".to_string());
+                return Err(
+                    "INSERT literal source requires UNION ALL without CORRESPONDING".to_string(),
+                );
             }
-            constants.push(novarocks_sql::compiler::SqlConstantQueryStep::UnionLeft);
-            shape_body(&mut operation.left, mapping, width, columns, constants)?;
-            constants.pop();
-            constants.push(novarocks_sql::compiler::SqlConstantQueryStep::UnionRight);
-            shape_body(&mut operation.right, mapping, width, columns, constants)?;
-            constants.pop();
+            for (index, input) in operation.inputs.iter_mut().enumerate() {
+                constants.push(novarocks_sql::compiler::SqlConstantQueryStep::SetOperand { index });
+                shape_body(input, mapping, width, columns, constants)?;
+                constants.pop();
+            }
         }
     }
     Ok(())
@@ -1148,8 +1150,8 @@ fn source_assignment_before_common_type(query: &ast::Query) -> bool {
             ast::SetExpr::SetOperation(operation) => {
                 matches!(operation.operator, ast::SetOperator::Union)
                     && operation.quantifier == ast::SetQuantifier::All
-                    && eligible(&operation.left)
-                    && eligible(&operation.right)
+                    && operation.corresponding.is_none()
+                    && operation.inputs.iter().all(eligible)
             }
         }
     }
@@ -1227,11 +1229,8 @@ fn append_write_literal_sites(
             path.pop();
         }
         ast::SetExpr::SetOperation(operation) => {
-            for (step, child) in [
-                (Step::UnionLeft, &operation.left),
-                (Step::UnionRight, &operation.right),
-            ] {
-                path.push(step);
+            for (index, child) in operation.inputs.iter().enumerate() {
+                path.push(Step::SetOperand { index });
                 append_write_literal_sites(
                     child,
                     source_ordinal,
@@ -1372,14 +1371,14 @@ fn capture_typed_write_body(
         }
         ast::SetExpr::SetOperation(operation)
             if matches!(operation.operator, ast::SetOperator::Union)
-                && matches!(operation.quantifier, ast::SetQuantifier::All) =>
+                && matches!(operation.quantifier, ast::SetQuantifier::All)
+                && operation.corresponding.is_none() =>
         {
-            source.push(Step::UnionLeft);
-            capture_typed_write_body(&mut operation.left, mapping, columns, source)?;
-            source.pop();
-            source.push(Step::UnionRight);
-            capture_typed_write_body(&mut operation.right, mapping, columns, source)?;
-            source.pop();
+            for (index, input) in operation.inputs.iter_mut().enumerate() {
+                source.push(Step::SetOperand { index });
+                capture_typed_write_body(input, mapping, columns, source)?;
+                source.pop();
+            }
         }
         // The existing constant holder never admitted DISTINCT set paths.
         ast::SetExpr::SetOperation(_) => {}
@@ -1444,6 +1443,26 @@ mod typed_write_source_tests {
             assert!(source.syntax_eq(&query(sql)));
         }
     }
+    #[test]
+    fn corresponding_union_does_not_enter_positional_literal_assignment() {
+        let columns = vec![column("p", DataType::Int64)];
+        let mut source = query("SELECT 1 AS p UNION ALL SELECT 2 AS p UNION ALL SELECT 3 AS p");
+        let ast::SetExpr::SetOperation(operation) = source.body.as_mut() else {
+            panic!("set operation");
+        };
+        operation.corresponding = Some(ast::Corresponding {
+            columns: Vec::new(),
+            span: operation.span,
+        });
+        assert!(!source_assignment_before_common_type(&source));
+        assert!(body_has_distinct_set(&source.body));
+        assert!(
+            shape_typed_write_source(&source, &[], &columns, &columns, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn explicit_variant_capture_keeps_source_domain_and_constant_holder() {
         use novarocks_sql::compiler::SqlCompileControl;

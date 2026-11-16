@@ -2790,8 +2790,13 @@ impl CompletionRetainedBytes {
             SetExpr::Query(_) => {}
             SetExpr::SetOperation(operation) => {
                 self.add(std::mem::size_of::<novarocks_parser::ast::SetOperation>());
-                self.add_set_expr_containers(&operation.left);
-                self.add_set_expr_containers(&operation.right);
+                self.add_vec_capacity::<SetExpr>(operation.inputs.capacity());
+                if let Some(corresponding) = &operation.corresponding {
+                    self.add_vec_capacity::<Ident>(corresponding.columns.capacity());
+                }
+                for input in &operation.inputs {
+                    self.add_set_expr_containers(input);
+                }
             }
         }
     }

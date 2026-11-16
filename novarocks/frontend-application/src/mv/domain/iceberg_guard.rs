@@ -476,10 +476,10 @@ fn set_expr_projects_target_wildcard(
         novarocks_parser::ast::SetExpr::Query(query) => {
             query_projects_target_wildcard(query, target)
         }
-        novarocks_parser::ast::SetExpr::SetOperation(operation) => {
-            set_expr_projects_target_wildcard(&operation.left, target)
-                || set_expr_projects_target_wildcard(&operation.right, target)
-        }
+        novarocks_parser::ast::SetExpr::SetOperation(operation) => operation
+            .inputs
+            .iter()
+            .any(|input| set_expr_projects_target_wildcard(input, target)),
         _ => false,
     }
 }

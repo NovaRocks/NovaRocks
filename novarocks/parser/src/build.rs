@@ -490,19 +490,56 @@ pub fn query(body: SetExpr) -> Query {
     }
 }
 
+/// Constructs a set operation without balancing syntax into a binary tree.
+/// Only homogeneous, unparenthesized UNION ALL inputs are merged.
+pub fn set_operation(
+    left: SetExpr,
+    operator: SetOperator,
+    quantifier: SetQuantifier,
+    right: SetExpr,
+    corresponding: Option<Corresponding>,
+) -> SetExpr {
+    let span = left.span().cover(right.span());
+    let flatten = operator == SetOperator::Union
+        && quantifier == SetQuantifier::All
+        && corresponding.is_none();
+    let mut inputs = match left {
+        SetExpr::SetOperation(operation)
+            if flatten
+                && operation.operator == SetOperator::Union
+                && operation.quantifier == SetQuantifier::All
+                && operation.corresponding.is_none() =>
+        {
+            operation.inputs
+        }
+        other => vec![other],
+    };
+    match right {
+        SetExpr::SetOperation(operation)
+            if flatten
+                && operation.operator == SetOperator::Union
+                && operation.quantifier == SetQuantifier::All
+                && operation.corresponding.is_none() =>
+        {
+            inputs.extend(operation.inputs)
+        }
+        other => inputs.push(other),
+    }
+    SetExpr::SetOperation(SetOperation {
+        inputs,
+        operator,
+        quantifier,
+        corresponding,
+        span,
+    })
+}
+
 pub fn union_all(parts: Vec<SetExpr>) -> Result<SetExpr, BuildError> {
     let mut parts = parts.into_iter();
     let first = parts.next().ok_or(BuildError::EmptyUnion)?;
-    let expression = parts.fold(first, |left, right| {
-        SetExpr::SetOperation(SetOperation {
-            span: left.span().cover(right.span()),
-            left: Box::new(left),
-            operator: SetOperator::Union,
-            quantifier: SetQuantifier::All,
-            right: Box::new(right),
-        })
-    });
-    Ok(parser::balance_union_all(expression))
+    Ok(parts.fold(first, |left, right| {
+        set_operation(left, SetOperator::Union, SetQuantifier::All, right, None)
+    }))
 }
 
 pub fn group_by(expressions: Vec<Expr>) -> GroupBy {

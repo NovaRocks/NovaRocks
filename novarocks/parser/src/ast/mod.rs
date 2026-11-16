@@ -73,9 +73,9 @@ pub use materialized_view::{
     MaterializedViewRefreshPolicy, MaterializedViewStatement, RefreshMaterializedView,
 };
 pub use query::{
-    Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, Offset, OffsetRows, OrderByExpr, Query,
-    ReplaceSelectItem, Select, SelectItem, SelectQuantifier, SessionProperty, SetExpr,
-    SetOperation, SetOperator, SetQuantifier, Values, WildcardOptions, With,
+    Corresponding, Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, Offset, OffsetRows,
+    OrderByExpr, Query, ReplaceSelectItem, Select, SelectItem, SelectQuantifier, SessionProperty,
+    SetExpr, SetOperation, SetOperator, SetQuantifier, Values, WildcardOptions, With,
 };
 pub use relation::{
     Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableVersion,

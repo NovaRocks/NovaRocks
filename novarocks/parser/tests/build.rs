@@ -415,7 +415,7 @@ fn select_relation_aliases_and_grouping_match_parser() {
 }
 
 #[test]
-fn values_and_union_shapes_match_parser_balancing() {
+fn values_and_union_shapes_retain_ordered_inputs() {
     let values = build::values(vec![
         vec![build::integer(1), build::string("a")],
         vec![build::integer(2), build::string("b")],
@@ -430,6 +430,45 @@ fn values_and_union_shapes_match_parser_balancing() {
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
         assert!(build::query(body).syntax_eq(&query(&source)));
+    }
+}
+
+#[test]
+fn union_all_preserves_input_order_and_set_boundaries() {
+    let parsed = query("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3");
+    let SetExpr::SetOperation(operation) = parsed.body.as_ref() else {
+        panic!("UNION ALL")
+    };
+    assert_eq!(operation.inputs.len(), 3);
+    let values = operation
+        .inputs
+        .iter()
+        .map(|input| {
+            let SetExpr::Select(select) = input else {
+                panic!("SELECT operand")
+            };
+            let ast::SelectItem::UnnamedExpr(Expr::Literal(value)) = &select.projection[0] else {
+                panic!("literal projection")
+            };
+            value.kind.clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        [1, 2, 3].map(|n| ast::LiteralKind::Number(n.to_string()))
+    );
+    assert!(query("SELECT 1 UNION SELECT 2").syntax_eq(&query("SELECT 1 UNION DISTINCT SELECT 2")));
+    for source in [
+        "SELECT 1 UNION SELECT 2 UNION ALL SELECT 3",
+        "(SELECT 1 UNION ALL SELECT 2) UNION ALL SELECT 3",
+        "SELECT 1 UNION ALL (SELECT 2 UNION ALL SELECT 3)",
+    ] {
+        let parsed = query(source);
+        let SetExpr::SetOperation(operation) = parsed.body.as_ref() else {
+            panic!("set operation")
+        };
+        assert_eq!(operation.inputs.len(), 2, "{source}");
+        assert!(parsed.syntax_eq(&query(&novarocks_parser::printer::print_query(&parsed))));
     }
 }
 

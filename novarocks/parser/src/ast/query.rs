@@ -98,10 +98,16 @@ impl SetExpr {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetOperation {
-    pub left: Box<SetExpr>,
+    pub inputs: Vec<SetExpr>,
     pub operator: SetOperator,
     pub quantifier: SetQuantifier,
-    pub right: Box<SetExpr>,
+    pub corresponding: Option<Corresponding>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Corresponding {
+    pub columns: Vec<Ident>,
     pub span: Span,
 }
 
@@ -116,7 +122,6 @@ pub enum SetOperator {
 pub enum SetQuantifier {
     Distinct,
     All,
-    None,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

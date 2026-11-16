@@ -149,9 +149,7 @@ fn literal_body(body: &ast::SetExpr) -> bool {
                 })
         }
         ast::SetExpr::Query(query) => literal_query(query),
-        ast::SetExpr::SetOperation(operation) => {
-            literal_body(&operation.left) && literal_body(&operation.right)
-        }
+        ast::SetExpr::SetOperation(operation) => operation.inputs.iter().all(literal_body),
     }
 }
 
@@ -282,9 +280,7 @@ fn legacy_literal_query(query: &ast::Query) -> bool {
                 .flatten()
                 .all(|value| legacy_literal_shape(value).is_some()),
             ast::SetExpr::Query(query) => legacy_literal_query(query),
-            ast::SetExpr::SetOperation(operation) => {
-                body_is_literal(&operation.left) && body_is_literal(&operation.right)
-            }
+            ast::SetExpr::SetOperation(operation) => operation.inputs.iter().all(body_is_literal),
         }
     }
     body_is_literal(&query.body)
@@ -302,8 +298,13 @@ fn validate_literal_set_operations(body: &ast::SetExpr) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            validate_literal_set_operations(&operation.left)?;
-            validate_literal_set_operations(&operation.right)
+            if operation.corresponding.is_some() {
+                return Err("INSERT SELECT CORRESPONDING is unsupported".to_string());
+            }
+            for input in &operation.inputs {
+                validate_literal_set_operations(input)?;
+            }
+            Ok(())
         }
         ast::SetExpr::Query(query) => validate_literal_set_operations(&query.body),
         _ => Ok(()),
@@ -346,6 +347,8 @@ mod tests {
             "INSERT INTO t SELECT 40 + 2 WHERE false",
             "INSERT INTO t SELECT DISTINCT 1 LIMIT 0",
             "INSERT INTO t SELECT 1 UNION ALL SELECT 2",
+            "INSERT INTO t SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3",
+            "INSERT INTO t SELECT 1 UNION ALL (SELECT 2 UNION ALL SELECT 3)",
             "INSERT INTO t SELECT id FROM src ORDER BY id LIMIT 3",
             "INSERT INTO t VALUES (to_bitmap(11), hll_hash(5))",
         ] {
@@ -367,6 +370,25 @@ mod tests {
             convert("INSERT INTO t SELECT 1 UNION SELECT 2")
                 .unwrap_err()
                 .contains("requires UNION ALL")
+        );
+        let statements =
+            novarocks_parser::parse("INSERT INTO t SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+                .unwrap();
+        let [ast::Statement::Dml(ast::DmlStatement::Insert(insert))] = statements.as_slice() else {
+            panic!("INSERT");
+        };
+        let mut source = insert.source.clone();
+        let ast::SetExpr::SetOperation(operation) = source.body.as_mut() else {
+            panic!("set operation");
+        };
+        operation.corresponding = Some(ast::Corresponding {
+            columns: Vec::new(),
+            span: operation.span,
+        });
+        assert!(
+            validate_literal_set_operations(&source.body)
+                .unwrap_err()
+                .contains("CORRESPONDING is unsupported")
         );
         assert!(convert("INSERT INTO t SELECT id FROM src UNION SELECT id FROM other").is_ok());
         assert!(

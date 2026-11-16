@@ -122,8 +122,18 @@ fn validate_set_expr(set_expr: &SetExpr) -> Result<(), ValidateError> {
         SetExpr::Values(values) => validate_values(values),
         SetExpr::Query(query) => validate_query(query),
         SetExpr::SetOperation(operation) => {
-            validate_set_expr(&operation.left)?;
-            validate_set_expr(&operation.right)
+            if operation.inputs.len() < 2
+                || (operation.operator == super::SetOperator::Except && operation.inputs.len() != 2)
+            {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::InvalidSetOperationOperandCount,
+                    operation.span,
+                ));
+            }
+            for input in &operation.inputs {
+                validate_set_expr(input)?;
+            }
+            Ok(())
         }
     }
 }

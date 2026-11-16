@@ -27,8 +27,7 @@ fn invalid(detail: &'static str) -> SqlCompileError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlConstantQueryStep {
     NestedQuery,
-    UnionLeft,
-    UnionRight,
+    SetOperand { index: usize },
     SelectFromDerived { from: usize },
 }
 /// Exact expression edges below a producer-authored projection or VALUES cell.
@@ -99,19 +98,15 @@ pub(crate) fn resolve_expression_site<'a>(
         work.step()?;
         body = match (step, body) {
             (SqlConstantQueryStep::NestedQuery, ast::SetExpr::Query(query)) => query.body.as_ref(),
-            (SqlConstantQueryStep::UnionLeft, ast::SetExpr::SetOperation(op))
-                if allow_set_operations
-                    || (matches!(op.operator, ast::SetOperator::Union)
-                        && matches!(op.quantifier, ast::SetQuantifier::All)) =>
+            (SqlConstantQueryStep::SetOperand { index }, ast::SetExpr::SetOperation(op))
+                if op.corresponding.is_none()
+                    && (allow_set_operations
+                        || (op.operator == ast::SetOperator::Union
+                            && op.quantifier == ast::SetQuantifier::All)) =>
             {
-                op.left.as_ref()
-            }
-            (SqlConstantQueryStep::UnionRight, ast::SetExpr::SetOperation(op))
-                if allow_set_operations
-                    || (matches!(op.operator, ast::SetOperator::Union)
-                        && matches!(op.quantifier, ast::SetQuantifier::All)) =>
-            {
-                op.right.as_ref()
+                op.inputs.get(*index).ok_or_else(|| {
+                    invalid("constant source set operand index differs from its owned query")
+                })?
             }
             (SqlConstantQueryStep::SelectFromDerived { from }, ast::SetExpr::Select(select)) => {
                 let Some(ast::TableFactor::Derived { subquery, .. }) =

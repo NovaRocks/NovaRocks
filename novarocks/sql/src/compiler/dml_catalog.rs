@@ -478,14 +478,18 @@ mod tests {
     fn constant_union_branches_are_typed_before_their_common_type() {
         use super::super::{SqlConstantExpressionSite::SelectProjection, SqlConstantQueryStep};
         use arrow::datatypes::DataType;
-        let text = "SELECT 123456789.123456789 UNION ALL SELECT 1e0";
+        let text = "SELECT 123456789.123456789 UNION ALL SELECT 1e0 UNION ALL SELECT 2e0";
         let assignments = numeric_source_assignments(vec![
             (
-                vec![SqlConstantQueryStep::UnionLeft],
+                vec![SqlConstantQueryStep::SetOperand { index: 0 }],
                 SelectProjection { column: 0 },
             ),
             (
-                vec![SqlConstantQueryStep::UnionRight],
+                vec![SqlConstantQueryStep::SetOperand { index: 1 }],
+                SelectProjection { column: 0 },
+            ),
+            (
+                vec![SqlConstantQueryStep::SetOperand { index: 2 }],
                 SelectProjection { column: 0 },
             ),
         ]);

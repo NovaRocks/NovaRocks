@@ -190,8 +190,7 @@ fn has_time_travel_in_set_expr(expr: &SetExpr) -> bool {
             false
         }
         SetExpr::SetOperation(operation) => {
-            has_time_travel_in_set_expr(&operation.left)
-                || has_time_travel_in_set_expr(&operation.right)
+            operation.inputs.iter().any(has_time_travel_in_set_expr)
         }
         SetExpr::Query(q) => has_time_travel_in_query(q),
         _ => false,
@@ -356,22 +355,17 @@ fn rewrite_time_travel_in_set_expr_async<'a>(
                 Ok(())
             }
             SetExpr::SetOperation(operation) => {
-                rewrite_time_travel_in_set_expr_async(
-                    resolver,
-                    current_catalog,
-                    current_database,
-                    operation.left.as_mut(),
-                    connector_context,
-                )
-                .await?;
-                rewrite_time_travel_in_set_expr_async(
-                    resolver,
-                    current_catalog,
-                    current_database,
-                    operation.right.as_mut(),
-                    connector_context,
-                )
-                .await
+                for input in &mut operation.inputs {
+                    rewrite_time_travel_in_set_expr_async(
+                        resolver,
+                        current_catalog,
+                        current_database,
+                        input,
+                        connector_context,
+                    )
+                    .await?;
+                }
+                Ok(())
             }
             SetExpr::Query(q) => {
                 rewrite_time_travel_in_query_async(

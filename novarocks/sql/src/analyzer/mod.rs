@@ -960,62 +960,48 @@ impl<'a> AnalyzerContext<'a> {
         }
     }
 
-    /// Resolve a set operation chain without using one Rust stack frame per
-    /// branch. A balanced UNION ALL syntax tree is folded in source order so
-    /// pairwise type widening and output names retain left association.
+    /// Lower ordered syntax inputs into the existing pairwise semantic IR.
+    /// The left spine is consumed iteratively, preserving widening and names.
     fn analyze_set_operation_chain(
         &self,
         set_expr: &ast::SetExpr,
     ) -> Result<(QueryBody, Vec<OutputColumn>), AnalyzeError> {
-        let (leftmost, operations): (_, Vec<_>) = if matches!(set_expr, ast::SetExpr::SetOperation(operation)
-                if operation.operator == ast::SetOperator::Union
-                    && operation.quantifier == ast::SetQuantifier::All)
-        {
-            let mut pending = vec![set_expr];
-            let mut operands = Vec::new();
-            while let Some(current) = pending.pop() {
-                self.check_control()?;
-                match current {
-                    ast::SetExpr::SetOperation(operation)
-                        if operation.operator == ast::SetOperator::Union
-                            && operation.quantifier == ast::SetQuantifier::All =>
-                    {
-                        pending.push(&operation.right);
-                        pending.push(&operation.left);
-                    }
-                    other => operands.push(other),
-                }
+        let mut operations = Vec::new();
+        let mut leftmost = set_expr;
+        while let ast::SetExpr::SetOperation(operation) = leftmost {
+            self.check_control()?;
+            if operation.corresponding.is_some() {
+                return Err(AnalyzeError::unsupported_expression(
+                    "CORRESPONDING set operations are not supported",
+                    operation.span,
+                ));
             }
-            let first = operands.remove(0);
-            let operations = operands
-                .into_iter()
-                .map(|right| {
-                    self.check_control()?;
-                    Ok((
-                        ast::SetOperator::Union,
-                        ast::SetQuantifier::All,
-                        right,
-                        set_expr.span(),
-                    ))
-                })
-                .collect::<Result<Vec<_>, AnalyzeError>>()?;
-            (first, operations)
-        } else {
-            let mut operations = Vec::new();
-            let mut leftmost = set_expr;
-            while let ast::SetExpr::SetOperation(operation) = leftmost {
+            let Some(first) = operation.inputs.first() else {
+                return Err(AnalyzeError::invalid_query_shape(
+                    "set operation has no input",
+                    operation.span,
+                ));
+            };
+            if operation.inputs.len() < 2
+                || (operation.operator == ast::SetOperator::Except && operation.inputs.len() != 2)
+            {
+                return Err(AnalyzeError::invalid_query_shape(
+                    "invalid set operation input count",
+                    operation.span,
+                ));
+            }
+            for right in operation.inputs.iter().skip(1).rev() {
                 self.check_control()?;
                 operations.push((
                     operation.operator,
                     operation.quantifier,
-                    operation.right.as_ref(),
+                    right,
                     operation.span,
                 ));
-                leftmost = &operation.left;
             }
-            operations.reverse();
-            (leftmost, operations)
-        };
+            leftmost = first;
+        }
+        operations.reverse();
         let mut left_query = self.analyze_set_operand(leftmost)?;
         for (operator, quantifier, right, span) in operations {
             self.check_control()?;
@@ -3192,6 +3178,26 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     struct TestCatalog;
+
+    #[test]
+    fn corresponding_set_operations_are_rejected_before_operand_analysis() {
+        for columns in [vec![], vec![novarocks_parser::build::ident("x", None)]] {
+            let mut query = parse_native_query("SELECT 1 AS x UNION ALL SELECT 2 AS x").unwrap();
+            let ast::SetExpr::SetOperation(operation) = query.body.as_mut() else {
+                panic!("UNION")
+            };
+            operation.corresponding = Some(ast::Corresponding {
+                columns,
+                span: operation.span,
+            });
+            let error = analyze(&query, &TestCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+            );
+            assert!(error.to_string().contains("CORRESPONDING"));
+        }
+    }
 
     #[test]
     fn table_column_lists_remain_relation_local_in_order_by_rebuild() {

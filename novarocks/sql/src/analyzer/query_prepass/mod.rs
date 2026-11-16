@@ -25,8 +25,8 @@ use novarocks_parser::{
     Span,
     ast::{
         Expr, Fold, GroupBy, Ident, JoinConstraint, JoinOperator, LiteralKind, Query, Select,
-        SelectItem, SetExpr, SetOperation, SetOperator, SetQuantifier, TableAlias, TableFactor,
-        TableWithJoins, Visit,
+        SelectItem, SetExpr, SetOperator, SetQuantifier, TableAlias, TableFactor, TableWithJoins,
+        Visit,
     },
 };
 
@@ -222,7 +222,7 @@ fn extract_union_chain(expr: &SetExpr) -> Option<Result<(SetQuantifier, Vec<SetE
         mixed: &mut bool,
     ) {
         if let SetExpr::SetOperation(operation) = expr {
-            if operation.operator != SetOperator::Union {
+            if operation.operator != SetOperator::Union || operation.corresponding.is_some() {
                 parts.push(expr.clone());
                 return;
             }
@@ -231,8 +231,9 @@ fn extract_union_chain(expr: &SetExpr) -> Option<Result<(SetQuantifier, Vec<SetE
                 Some(_) => {}
                 None => *quantifier = Some(operation.quantifier),
             }
-            visit(operation.left.as_ref(), quantifier, parts, mixed);
-            visit(operation.right.as_ref(), quantifier, parts, mixed);
+            for input in &operation.inputs {
+                visit(input, quantifier, parts, mixed);
+            }
         } else {
             parts.push(expr.clone());
         }
@@ -312,8 +313,9 @@ fn pin_projection_aliases(expr: &mut SetExpr, aliases: &[Ident]) {
         }
         SetExpr::Query(query) => pin_projection_aliases(query.body.as_mut(), aliases),
         SetExpr::SetOperation(operation) => {
-            pin_projection_aliases(operation.left.as_mut(), aliases);
-            pin_projection_aliases(operation.right.as_mut(), aliases);
+            for input in &mut operation.inputs {
+                pin_projection_aliases(input, aliases);
+            }
         }
         SetExpr::Values(_) => {}
     }
@@ -335,18 +337,16 @@ fn query_with_body(template: &Query, body: SetExpr) -> Query {
 
 fn build_set_operation_chain(quantifier: SetQuantifier, parts: &[SetExpr]) -> SetExpr {
     let mut parts = parts.iter();
-    let mut combined = parts.next().expect("recursive CTE has an anchor").clone();
-    for part in parts {
-        let span = Span::new(combined.span().start(), part.span().end());
-        combined = SetExpr::SetOperation(SetOperation {
-            left: Box::new(combined),
-            operator: SetOperator::Union,
+    let first = parts.next().expect("recursive CTE has an anchor").clone();
+    parts.fold(first, |left, right| {
+        novarocks_parser::build::set_operation(
+            left,
+            SetOperator::Union,
             quantifier,
-            right: Box::new(part.clone()),
-            span,
-        });
-    }
-    combined
+            right.clone(),
+            None,
+        )
+    })
 }
 
 fn inline_iteration(
@@ -544,8 +544,9 @@ fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, ex
         }
         SetExpr::Query(query) => scan_query_for_table_reference(visitor, query),
         SetExpr::SetOperation(operation) => {
-            scan_set_expr_for_table_reference(visitor, operation.left.as_ref());
-            scan_set_expr_for_table_reference(visitor, operation.right.as_ref());
+            for input in &operation.inputs {
+                scan_set_expr_for_table_reference(visitor, input);
+            }
         }
     }
 }
@@ -669,8 +670,9 @@ fn normalize_cross_set_expr(expr: &mut SetExpr) {
         }
         SetExpr::Query(query) => normalize_cross_joins(query),
         SetExpr::SetOperation(operation) => {
-            normalize_cross_set_expr(operation.left.as_mut());
-            normalize_cross_set_expr(operation.right.as_mut());
+            for input in &mut operation.inputs {
+                normalize_cross_set_expr(input);
+            }
         }
         SetExpr::Values(_) => {}
     }

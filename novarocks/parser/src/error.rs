@@ -121,6 +121,7 @@ pub enum StructuralViolation {
     EmptyValuesRowList,
     EmptyValuesRow,
     EmptySelectProjection,
+    InvalidSetOperationOperandCount,
     EmptyUnnestExpressionList,
     MismatchedCaseArms,
     DuplicateTableColumnName,

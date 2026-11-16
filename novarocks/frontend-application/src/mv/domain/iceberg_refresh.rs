@@ -1223,9 +1223,7 @@ fn validate_composed_aggregate_join(
 fn union_branch_count(query: &ast::Query) -> u32 {
     fn count(body: &ast::SetExpr) -> u32 {
         match body {
-            ast::SetExpr::SetOperation(operation) => {
-                count(&operation.left) + count(&operation.right)
-            }
+            ast::SetExpr::SetOperation(operation) => operation.inputs.iter().map(count).sum(),
             ast::SetExpr::Query(inner) => count(inner.body.as_ref()),
             _ => 1,
         }

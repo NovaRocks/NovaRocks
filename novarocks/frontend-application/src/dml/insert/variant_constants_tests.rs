@@ -271,6 +271,41 @@ fn all_original_select_nested_and_union_leaves_keep_encoded_constants() {
     }
 }
 #[test]
+fn nary_and_parenthesized_union_constants_keep_original_order_and_source_paths() {
+    let columns = vec![columns().remove(1)];
+    for sql in [
+        "SELECT parse_json('42') UNION ALL SELECT parse_json('null') UNION ALL SELECT parse_json('{\"a\":1}')",
+        "(SELECT parse_json('42') UNION ALL SELECT parse_json('null')) UNION ALL SELECT parse_json('{\"a\":1}')",
+        "SELECT parse_json('42') UNION ALL (SELECT parse_json('null') UNION ALL SELECT parse_json('{\"a\":1}'))",
+    ] {
+        let (query, constants) = shape_insert_source_with_constants(
+            &parse_query(sql),
+            &[],
+            &columns,
+            &columns,
+            crate::application::test_constant_policy(),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .unwrap();
+        let constants = constants.unwrap();
+        assert_eq!(constants.len(), 3, "one authored value per original branch");
+        for (constant, json) in constants.iter().zip(["42", "null", r#"{"a":1}"#]) {
+            let bytes =
+                novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(json)
+                    .unwrap();
+            assert_eq!(
+                constant.value().try_binary().unwrap(),
+                Some(bytes.as_slice())
+            );
+        }
+        // Real compiler replay checks every published ordinal against this
+        // exact shaped tree, including retained Query parentheses.
+        analyze(query, Some(constants)).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+}
+
+#[test]
 fn select_filter_having_and_distinct_keep_the_original_inner_owner() {
     let source =
         parse_query("SELECT DISTINCT parse_json('42') AS v WHERE false HAVING v IS NOT NULL");

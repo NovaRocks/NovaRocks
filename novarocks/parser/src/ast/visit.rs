@@ -255,8 +255,14 @@ pub fn walk_set_expr<V: Visit + ?Sized>(visitor: &mut V, set_expr: &SetExpr) {
         }
         SetExpr::Query(query) => visitor.visit_query(query),
         SetExpr::SetOperation(operation) => {
-            walk_set_expr(visitor, &operation.left);
-            walk_set_expr(visitor, &operation.right);
+            if let Some(corresponding) = &operation.corresponding {
+                for column in &corresponding.columns {
+                    visitor.visit_ident(column);
+                }
+            }
+            for input in &operation.inputs {
+                walk_set_expr(visitor, input);
+            }
         }
     }
 }
@@ -937,8 +943,17 @@ pub fn fold_set_expr<F: Fold + ?Sized>(folder: &mut F, set_expr: SetExpr) -> Set
         }
         SetExpr::Query(query) => SetExpr::Query(Box::new(folder.fold_query(*query))),
         SetExpr::SetOperation(mut operation) => {
-            operation.left = Box::new(fold_set_expr(folder, *operation.left));
-            operation.right = Box::new(fold_set_expr(folder, *operation.right));
+            operation.inputs = operation
+                .inputs
+                .into_iter()
+                .map(|input| fold_set_expr(folder, input))
+                .collect();
+            if let Some(corresponding) = &mut operation.corresponding {
+                corresponding.columns = std::mem::take(&mut corresponding.columns)
+                    .into_iter()
+                    .map(|column| folder.fold_ident(column))
+                    .collect();
+            }
             SetExpr::SetOperation(operation)
         }
     }

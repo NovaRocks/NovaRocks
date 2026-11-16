@@ -368,8 +368,9 @@ fn context_body<'a>(
         ast::SetExpr::SetOperation(operation) => {
             // Only literal holes are contextualized here; actual ordinary
             // value conversions remain ABOVE the complete set operation.
-            context_body(&operation.left, assignments, source, policy, control)?;
-            context_body(&operation.right, assignments, source, policy, control)?;
+            for input in &operation.inputs {
+                context_body(input, assignments, source, policy, control)?;
+            }
         }
     }
     Ok(())

@@ -274,24 +274,30 @@ impl Printer {
                 self.output.push(')');
             }
             SetExpr::SetOperation(operation) => {
-                // The parser folds unparenthesized set operations from the
-                // left, so retaining a left wrapper here would manufacture a
-                // `SetExpr::Query` node on reparse. Only the right side needs
-                // parentheses to preserve a non-default nesting shape.
-                self.write_set_expr(&operation.left);
-                self.output.push(' ');
-                self.output.push_str(match operation.operator {
-                    SetOperator::Union => "UNION",
-                    SetOperator::Intersect => "INTERSECT",
-                    SetOperator::Except => "EXCEPT",
-                });
-                match operation.quantifier {
-                    SetQuantifier::Distinct => self.output.push_str(" DISTINCT"),
-                    SetQuantifier::All => self.output.push_str(" ALL"),
-                    SetQuantifier::None => {}
+                if let Some(first) = operation.inputs.first() {
+                    self.write_set_expr(first);
                 }
-                self.output.push(' ');
-                self.write_set_right_operand(&operation.right);
+                for input in operation.inputs.iter().skip(1) {
+                    self.output.push(' ');
+                    self.output.push_str(match operation.operator {
+                        SetOperator::Union => "UNION",
+                        SetOperator::Intersect => "INTERSECT",
+                        SetOperator::Except => "EXCEPT",
+                    });
+                    if operation.quantifier == SetQuantifier::All {
+                        self.output.push_str(" ALL");
+                    }
+                    if let Some(corresponding) = &operation.corresponding {
+                        self.output.push_str(" CORRESPONDING");
+                        if !corresponding.columns.is_empty() {
+                            self.output.push_str(" BY (");
+                            self.write_ident_list(&corresponding.columns);
+                            self.output.push(')');
+                        }
+                    }
+                    self.output.push(' ');
+                    self.write_set_right_operand(input);
+                }
             }
         }
     }

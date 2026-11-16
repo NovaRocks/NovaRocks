@@ -123,8 +123,10 @@ fn validate_imv_aggregate_star_set_expr(expr: &SetExpr) -> Result<(), AnalyzeErr
             Ok(())
         }
         SetExpr::SetOperation(operation) => {
-            validate_imv_aggregate_star_set_expr(&operation.left)?;
-            validate_imv_aggregate_star_set_expr(&operation.right)
+            for input in &operation.inputs {
+                validate_imv_aggregate_star_set_expr(input)?;
+            }
+            Ok(())
         }
         SetExpr::Query(query) => validate_imv_aggregate_star_set_expr(query.body.as_ref()),
         SetExpr::Values(_) => Ok(()),
@@ -2088,31 +2090,13 @@ fn output_column_facts(
 }
 
 fn first_union_branch_query(query: &Query) -> Result<Query, String> {
-    fn first_branch_body(body: &SetExpr) -> Result<&SetExpr, String> {
-        match body {
-            SetExpr::SetOperation(ast::SetOperation {
-                operator,
-                quantifier,
-                left,
-                ..
-            }) if *operator == ast::SetOperator::Union
-                && matches!(quantifier, ast::SetQuantifier::All) =>
-            {
-                first_branch_body(left)
-            }
-            SetExpr::SetOperation(_) => {
-                Err("aggregate MV first branch requires UNION ALL set operations".to_string())
-            }
-            SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
-            _ => Ok(body),
-        }
-    }
-
-    let body = first_branch_body(query.body.as_ref())?;
-    // `SqlMvAggregateLayoutFacts` needs a full query wrapper for the existing
-    // FROM-agnostic aggregate extractor. Keep the wrapper private to SQL.
+    let mut branches = Vec::new();
+    flatten_union_all(query.body.as_ref(), &mut branches)?;
+    let body = branches.first().ok_or_else(union_all_error)?;
+    // This private wrapper selects the actual first source branch, without
+    // rebuilding the source set-operation association or its inputs.
     let mut branch = query.clone();
-    branch.body = Box::new(body.clone());
+    branch.body = Box::new((*body).clone());
     Ok(branch)
 }
 
@@ -2634,17 +2618,25 @@ fn flatten_union_all<'a>(body: &'a SetExpr, out: &mut Vec<&'a SetExpr>) -> Resul
         SetExpr::SetOperation(ast::SetOperation {
             operator,
             quantifier,
-            left,
-            right,
+            inputs,
+            corresponding,
             ..
         }) => {
+            if corresponding.is_some() {
+                return Err("incremental UNION ALL MV does not support CORRESPONDING".to_string());
+            }
             if !matches!(operator, ast::SetOperator::Union)
                 || !matches!(quantifier, ast::SetQuantifier::All)
             {
                 return Err(union_all_non_all_error());
             }
-            flatten_union_all(left, out)?;
-            flatten_union_all(right, out)
+            if inputs.len() < 2 {
+                return Err(union_all_error());
+            }
+            for input in inputs {
+                flatten_union_all(input, out)?;
+            }
+            Ok(())
         }
         SetExpr::Select(_) => {
             out.push(body);
@@ -3955,6 +3947,24 @@ mod tests {
                 || err.starts_with(NATIVE_PARSE_REJECTION),
             "unexpected: {err}"
         );
+        for columns in [Vec::new(), vec![novarocks_parser::build::ident("k1", None)]] {
+            let mut query =
+                parse_query("select k1 from ice.ns.t1 union all select k1 from ice.ns.t2");
+            let SetExpr::SetOperation(operation) = query.body.as_mut() else {
+                panic!("UNION ALL");
+            };
+            operation.corresponding = Some(ast::Corresponding {
+                columns,
+                span: Span::new(0, 0),
+            });
+            let error = classify_incremental_mv_query(&query).unwrap_err();
+            assert!(error.contains("CORRESPONDING"), "{error}");
+            assert!(
+                first_union_branch_query(&query)
+                    .unwrap_err()
+                    .contains("CORRESPONDING")
+            );
+        }
     }
 
     #[test]

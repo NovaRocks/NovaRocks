@@ -175,8 +175,10 @@ fn validate_mv_select_raw_clauses_in_set_expr(expr: &SetExpr) -> Result<(), Stri
             Ok(())
         }
         SetExpr::SetOperation(operation) => {
-            validate_mv_select_raw_clauses_in_set_expr(operation.left.as_ref())?;
-            validate_mv_select_raw_clauses_in_set_expr(operation.right.as_ref())
+            for input in &operation.inputs {
+                validate_mv_select_raw_clauses_in_set_expr(input)?;
+            }
+            Ok(())
         }
         SetExpr::Query(query) => validate_mv_select_raw_query_clauses(query),
         SetExpr::Values(_) => Ok(()),
@@ -304,16 +306,9 @@ fn qualify_current_catalog_refs_in_set_expr(
             }
         }
         SetExpr::SetOperation(operation) => {
-            qualify_current_catalog_refs_in_set_expr(
-                operation.left.as_mut(),
-                catalog,
-                current_database,
-            );
-            qualify_current_catalog_refs_in_set_expr(
-                operation.right.as_mut(),
-                catalog,
-                current_database,
-            );
+            for input in &mut operation.inputs {
+                qualify_current_catalog_refs_in_set_expr(input, catalog, current_database);
+            }
         }
         SetExpr::Query(query) => {
             qualify_current_catalog_refs_in_set_expr(
@@ -506,18 +501,9 @@ fn collect_table_refs_from_set_expr(
             }
         }
         SetExpr::SetOperation(operation) => {
-            collect_table_refs_from_set_expr(
-                &operation.left,
-                current_catalog,
-                current_database,
-                refs,
-            );
-            collect_table_refs_from_set_expr(
-                &operation.right,
-                current_catalog,
-                current_database,
-                refs,
-            );
+            for input in &operation.inputs {
+                collect_table_refs_from_set_expr(input, current_catalog, current_database, refs);
+            }
         }
         SetExpr::Query(query) => {
             collect_table_refs_from_set_expr(
