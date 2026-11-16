@@ -314,6 +314,7 @@ code-anchors:
 
 领域哲学：SQL compiler 只消费一次 statement admission 冻结的 SQL 事实，并只产出 SQL facts；application owner 保留 session、目录观察、topology、native encoding 与 lifecycle assembly。catalog、statistics 与 scan preparation 对同一表必须复用同一 exact Connector binding，缺失事实必须显式失败或保守降级，不能重新读取 latest。
 
+- [ADR-0236](ADR-0236-installed-optimization-domains-and-partition-rank-retention.md) — 可选优化为何只在共享安装域内规划、分区限额为何共用排序名次保留作者、改写为何显式核对键等式（active；语义规则与原生验收分别核对）
 - [ADR-0226](ADR-0226-engine-metadata-through-typed-system-relations.md) — 引擎元数据为何通过原语句的类型化批快照进入独立系统关系，名称、只读、Provider与真实退出为何各守原所有者（active；旧 SHOW 保留条款由 ADR-0232 部分替代，类型化系统关系与真实退出保留，验证范围独立核对）
 - [ADR-0222](ADR-0222-session-property-declarations-and-required-constant-evaluation.md) — 会话属性为何共用唯一声明、分离四层输入与实例代次，并由原受监督 CPU 必求值后一次提交（active；补充 ADR-0100/0191/0203，optional folding 与原协议生命周期保留）
 - [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）

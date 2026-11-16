@@ -203,6 +203,9 @@ pub enum FilterLateApplyGranularity {
     File,
 }
 
+/// CompleteOnce membership live delivery applies its sole complete snapshot
+/// from the next batch boundary; MonotonicUpdates applies successive updates.
+/// Activation does not change the channel's declared lifecycle or reduction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilterConsumerActivation {
     BlockingSnapshot,
@@ -621,6 +624,7 @@ pub fn encode_filter_key_type(
 
 /// Whether the canonical membership schema can represent this physical key.
 /// Planner placement and preparation share the canonical encoder's domain.
+// Design: ADR-0236 (docs/adr/ADR-0236-installed-optimization-domains-and-partition-rank-retention.md)
 pub fn is_filter_key_type(data_type: &DataType) -> bool {
     visit_filter_key_type::<FilterMembershipSchemaError>(data_type, |_| Ok(())).is_ok()
 }

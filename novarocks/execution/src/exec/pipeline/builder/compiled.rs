@@ -988,11 +988,11 @@ fn build_node(
             Ok(build)
         }
         ProgramNodeKind::Sort { input, .. } => {
-            // Global and analytic Sort and every row-count TopN phase order
-            // the whole instance input on one driver. An analytic Sort reads
-            // an input the plan co-locates by its partition keys per instance,
+            // Full/partitioned Sort and every row-count/partition-rank TopN
+            // order the whole instance input on one driver. Partitioned Sort
+            // and partition TopN read an input co-located by partition keys,
             // so one driver holds each partition whole. Single and Final read a Singleton
-            // input, so the instance input is the relation. A Partial keeps
+            // input, so the instance input is the relation. A row-count Partial keeps
             // its input distribution and declares its order keys as its
             // output ordering, which the TopN sequence trace matches against
             // the Final; one gathered driver is what makes the instance's

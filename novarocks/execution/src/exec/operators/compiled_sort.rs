@@ -39,10 +39,12 @@
 //!
 //! Semantics: rows are ordered by the keys with each key's direction and
 //! NULL placement, ties keep arrival order (stable), and the output is the
-//! sorted rows `[offset, offset + limit)`. TopN bounds its buffer by keeping
-//! only the first `offset + limit` sorted rows once enough rows arrive; this
-//! is exact because a row outside that prefix can never re-enter it. A full
-//! sort buffers its whole input in memory (no spill, ADR-0162).
+//! sorted rows. Row-count TopN emits `[offset, offset + limit)` and retains
+//! its first `offset + limit` rows. Partition TopN retains rows whose selected
+//! rank is at most K, including complete boundary peer groups for Rank and
+//! DenseRank. Retained rows precede new arrivals in later sorts. Rank ties can
+//! retain arbitrarily many rows; K is not a memory bound. Full sorts buffer
+//! their whole input in memory (no spill, ADR-0162).
 
 use crate::exec::fragment::error::{
     FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
@@ -401,6 +403,7 @@ impl CompiledSortProcessor {
 
     /// One rank-retention author for pruning and final output. Row-count
     /// TopN is the unpartitioned RowNumber fast path.
+    // Design: ADR-0236 (docs/adr/ADR-0236-installed-optimization-domains-and-partition-rank-retention.md)
     fn retain(&self, keep_keys: bool) -> ExecutionResult<Option<SortedRun>> {
         let Some(retention) = self.retention else {
             return self.sort_runs(None, keep_keys);

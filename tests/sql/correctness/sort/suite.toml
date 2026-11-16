@@ -18,7 +18,12 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/execution/src/exec/operators/sort/**"]
+paths = [
+    "novarocks/execution/src/exec/operators/sort/**",
+    "novarocks/execution/src/exec/operators/compiled_sort.rs",
+    "novarocks/local-compiler/src/sort.rs",
+    "novarocks/local-compiler/src/topn.rs",
+]
 
 [reuse]
 scope = "suite"

@@ -73,6 +73,7 @@ fn count_unique_signatures(window_exprs: &[ScalarWindowSpec]) -> usize {
         .len()
 }
 
+// Design: ADR-0236 (docs/adr/ADR-0236-installed-optimization-domains-and-partition-rank-retention.md)
 fn sort_matches_window_signature(sort: &SortOp, signature: &WindowSignatureKey) -> bool {
     let partition_len = signature.partition_by.len();
     sort.analytic_partition_exprs == signature.partition_by

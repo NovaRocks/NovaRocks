@@ -99,6 +99,7 @@ pub use write_execution::*;
 ///
 /// Planning and validation use this same installation domain so an optional
 /// reduction cannot make a supported query fail during preparation.
+// Design: ADR-0236 (docs/adr/ADR-0236-installed-optimization-domains-and-partition-rank-retention.md)
 pub fn grouped_state_topn_key_supported(
     comparator: OrderedComparisonAlgorithm,
     ty: &FunctionValueType,

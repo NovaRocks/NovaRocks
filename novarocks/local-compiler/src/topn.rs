@@ -206,7 +206,10 @@ pub(crate) fn lower_grouped_topn_with_creation<H>(
                 .ok_or(FragmentCompileError::Invalid("missing GroupedTopN key"))?;
             work.step()?;
             if !matches!(definition.kind, novarocks_physical_plan::ExprKind::Value(source) if source == *value)
-                || !comparator.supports_value_type(&definition.ty)
+                || !novarocks_physical_plan::grouped_state_topn_key_supported(
+                    *comparator,
+                    &definition.ty,
+                )
             {
                 return Err((FragmentCompileError::Invalid(
                     "GroupedTopN key is not an exact supported direct value",

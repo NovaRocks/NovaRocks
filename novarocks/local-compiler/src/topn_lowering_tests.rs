@@ -1460,3 +1460,77 @@ fn grouped_topn_refuses_invalid_phase_offset_and_empty_keys_before_construction(
         ));
     }
 }
+
+#[test]
+fn grouped_topn_rejects_a_key_outside_the_partition_domain() {
+    let pool = checked_pool(
+        Arc::new(
+            arrow_array::FixedSizeBinaryArray::try_from_iter(
+                [b"12345678", b"abcdefgh", b"87654321"].into_iter(),
+            )
+            .unwrap(),
+        ),
+        false,
+        ValueLogicalType::Physical,
+    );
+    // The original package is a valid row-count TopN. Only the private
+    // grouped lowering author receives this standalone contract input.
+    let package = package(&pool, 1, false, 2, 0);
+    let mut node = package.fragment().nodes()[&NodeId::new(0)].clone();
+    let NodeKind::TopN {
+        phase,
+        reduction,
+        order_by,
+        ..
+    } = &mut node.kind
+    else {
+        unreachable!()
+    };
+    let expr = order_by[0].expr;
+    let definition = package.fragment().expressions().get(expr).unwrap();
+    let ExprKind::Value(value) = definition.kind else {
+        unreachable!()
+    };
+    let comparator = novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1;
+    assert!(
+        !novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
+            .supports_partition_key(definition.ty.data_type())
+    );
+    assert!(!novarocks_physical_plan::grouped_state_topn_key_supported(
+        comparator,
+        &definition.ty
+    ));
+    *phase = TopNPhase::Partial {
+        sequence: TopNSequenceId::new(3),
+    };
+    *reduction = novarocks_physical_plan::TopNReduction::GroupedStates {
+        group_by: Box::from([(expr, value)]),
+        calls: Box::default(),
+        comparator,
+    };
+    let mut request =
+        |_| -> Result<(), std::convert::Infallible> { panic!("reject before value construction") };
+    let mut opaque =
+        |_| -> Result<(), std::convert::Infallible> { panic!("reject before value construction") };
+    let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut opaque,
+    );
+    let error = crate::topn::lower_grouped_topn_with_creation(
+        &package,
+        &node,
+        ProgramNodeId::new(0),
+        &BTreeMap::new(),
+        &[novarocks_types::SlotId(0)],
+        &Control::good(),
+        &mut creation,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::FragmentCreationError::Compile(FragmentCompileError::Invalid(
+            "GroupedTopN key is not an exact supported direct value"
+        ))
+    ));
+}
