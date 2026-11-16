@@ -2901,6 +2901,7 @@ impl IcebergWriteSessionControl {
         };
         let material = IcebergSessionMaterial {
             write_binding: self.adapter.binding().clone(),
+            write_partition_spec_id: writer_metadata.default_partition_spec_id(),
             data_output: freeze_writer_output(
                 writer_metadata.properties(),
                 self.runtime.control_state().configuration().write,

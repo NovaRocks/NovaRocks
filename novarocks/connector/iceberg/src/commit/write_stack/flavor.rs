@@ -85,6 +85,8 @@ pub(crate) struct IcebergSessionMaterial {
     /// The exact table generation the session is frozen against.
     pub table: IcebergWriteTableFacts,
     pub write_binding: ConnectorWriteBinding,
+    /// The writer's spec may be newly prepared for a managed repartition.
+    pub write_partition_spec_id: i32,
     /// The provider-signed input shape the caller's fields were bound into.
     pub input: ConnectorWriteInputShape,
     /// The physical output every data branch writes.
@@ -123,7 +125,7 @@ impl IcebergSessionMaterial {
     ) -> Result<Option<ConnectorWriteLayoutPreference>, ConnectorError> {
         crate::commit::partition_key::partition_layout(
             &self.write_binding,
-            &self.table,
+            self.write_partition_spec_id,
             &self.data_recipe,
             consumed,
         )

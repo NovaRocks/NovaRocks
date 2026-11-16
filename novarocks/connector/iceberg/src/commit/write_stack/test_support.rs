@@ -388,9 +388,11 @@ pub(crate) fn session_material(input: ConnectorWriteInputShape) -> IcebergSessio
         },
         CatalogHandle::new(instance_id, CatalogVersion::from_bytes([1; 32])),
     );
+    let table = table_facts();
     IcebergSessionMaterial {
         write_binding,
-        table: table_facts(),
+        write_partition_spec_id: table.default_partition_spec_id(),
+        table,
         input,
         data_output: data.output,
         data_recipe: data.recipe,

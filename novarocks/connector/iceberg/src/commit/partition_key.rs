@@ -38,7 +38,7 @@ use novarocks_spi::connector::{
 use super::frozen_write::parse_partition_transform;
 use super::write_adaptation::{adapt_batch, validate_batch_schema};
 use super::write_stack::codec::{decode_write_layout, encode_write_layout};
-use super::write_stack::domain::{IcebergDataBranchRecipe, IcebergWriteTableFacts};
+use super::write_stack::domain::IcebergDataBranchRecipe;
 use crate::iceberg::arrow::{
     PartitionValueCalculator, arrow_struct_to_literal, schema_to_arrow_schema,
 };
@@ -46,7 +46,7 @@ use crate::iceberg::spec::{Literal, PartitionSpec, Schema, Transform};
 
 pub(crate) fn partition_layout(
     binding: &ConnectorWriteBinding,
-    table: &IcebergWriteTableFacts,
+    spec_id: i32,
     data: &IcebergDataBranchRecipe,
     consumed: &[&ConnectorWriteFieldBinding],
 ) -> Result<Option<ConnectorWriteLayoutPreference>, ConnectorError> {
@@ -60,8 +60,7 @@ pub(crate) fn partition_layout(
     let schema: Schema = crate::metadata_json::from_str(schema_json)
         .map_err(|error| bad_metadata(error.to_string()))?;
     let schema = Arc::new(schema);
-    let mut partition_spec =
-        PartitionSpec::builder(schema.clone()).with_spec_id(table.default_partition_spec_id());
+    let mut partition_spec = PartitionSpec::builder(schema.clone()).with_spec_id(spec_id);
     let mut sources = BTreeSet::new();
     let mut tokens = Vec::new();
     let mut fields = Vec::new();

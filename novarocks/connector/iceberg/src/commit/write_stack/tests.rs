@@ -744,6 +744,8 @@ fn partitioned_ordinary_data_target_declares_affinity_and_refuses_unknown_transf
     let adapter = adapter("partitioned_ordinary", 1);
     let mut material = session_material(data_input_shape());
     material.write_binding = adapter.binding().clone();
+    // Previewed managed repartition supplies writer-side spec identity here.
+    material.write_partition_spec_id = 7;
     let schema = material
         .data_recipe
         .target_schema_json()
@@ -764,9 +766,17 @@ fn partitioned_ordinary_data_target_declares_affinity_and_refuses_unknown_transf
     let sealed = neutral_plan(&adapter, flavor_session(plan)).unwrap();
     let target = &sealed.targets()[0];
     let token = target.input().fields()[0].token();
-    assert!(matches!(&target.route().unwrap().requirements().layout,
-        ConnectorWriteLayoutPreference::PartitionAffinity { inputs, recipe }
-            if inputs == &[token] && recipe.binding() == adapter.binding()));
+    let ConnectorWriteLayoutPreference::PartitionAffinity {
+        inputs,
+        recipe: layout,
+    } = &target.route().unwrap().requirements().layout
+    else {
+        panic!("partitioned data target must declare affinity");
+    };
+    assert_eq!(inputs, &[token]);
+    assert_eq!(layout.binding(), adapter.binding());
+    let (_, spec) = crate::commit::partition_key::layout_facts(layout).unwrap();
+    assert_eq!(spec.spec_id(), 7);
 
     material.data_recipe = recipe("unknown");
     let error = plan_ordinary_branches(IcebergWriteFlavor::Append, &material).unwrap_err();
