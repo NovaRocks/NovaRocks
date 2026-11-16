@@ -620,3 +620,275 @@ fn actual_row_fields_preserve_names_order_spans_and_deep_semantic_children() {
     drop(statement);
     drop(tree);
 }
+
+#[test]
+fn actual_access_owning_cycles_keep_both_child_positions_and_deep_traits() {
+    use crate::ast::{
+        ArrayWildcardSubscriptExpr, DereferenceExpr, Expr, LiteralKind, SubscriptExpr,
+    };
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    let mut tree = build::integer(7);
+    for marker in 1..=DEPTH {
+        tree = match marker % 3 {
+            0 => Expr::Subscript(AstBox::new(SubscriptExpr {
+                base: build::integer(marker),
+                index: tree,
+                span: Span::new(10, 100),
+            })),
+            1 => Expr::ArrayWildcardSubscript(AstBox::new(ArrayWildcardSubscriptExpr {
+                base: tree,
+                span: Span::new(10, 100),
+            })),
+            _ => Expr::Dereference(AstBox::new(DereferenceExpr {
+                base: tree,
+                field: Some(build::ident_at(
+                    format!("f{marker}"),
+                    true,
+                    Span::new(20, 30),
+                )),
+                span: Span::new(10, 100),
+            })),
+        };
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    let mut cursor = &mut copy;
+    for marker in (1..=DEPTH).rev() {
+        cursor = match (marker % 3, cursor) {
+            (0, Expr::Subscript(node)) => {
+                assert_eq!(node.span, Span::new(10, 100));
+                assert!(
+                    matches!(&node.base, Expr::Literal(value) if matches!(&value.kind, LiteralKind::Long { spelling, parsed_value } if spelling == &marker.to_string() && *parsed_value == marker))
+                );
+                &mut node.index
+            }
+            (1, Expr::ArrayWildcardSubscript(node)) => {
+                assert_eq!(node.span, Span::new(10, 100));
+                &mut node.base
+            }
+            (2, Expr::Dereference(node)) => {
+                assert_eq!(node.span, Span::new(10, 100));
+                let field = node.field.as_ref().unwrap();
+                assert_eq!(field.value, format!("f{marker}"));
+                assert!(field.quoted);
+                assert_eq!(field.span, Span::new(20, 30));
+                &mut node.base
+            }
+            _ => panic!("the actual access owning edge keeps its original position"),
+        };
+    }
+    let Expr::Literal(literal) = cursor else {
+        panic!("original terminal literal")
+    };
+    assert!(matches!(
+        literal.kind,
+        LiteralKind::Long {
+            parsed_value: 7,
+            ..
+        }
+    ));
+    literal.kind = LiteralKind::Long {
+        spelling: "8".into(),
+        parsed_value: 8,
+    };
+    assert_ne!(tree, copy);
+    drop(copy);
+    let Expr::Dereference(top) = tree else {
+        unreachable!("DEPTH selects Dereference")
+    };
+    let top = top.into_inner();
+    assert_eq!(top.field.unwrap().value, format!("f{DEPTH}"));
+    drop(top.base);
+}
+
+#[test]
+fn actual_access_children_keep_deep_visit_fold_equivalence_validation_and_printing() {
+    use crate::ast::{
+        ArrayWildcardSubscriptExpr, DereferenceExpr, Expr, Fold, GroupBy, Ident, Literal,
+        LiteralKind, SetExpr, Statement, SubscriptExpr, SyntaxEq, Visit,
+    };
+    use crate::{Span, build};
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Event {
+        Number(i64),
+        Name(String, bool),
+    }
+    #[derive(Default)]
+    struct Events(Vec<Event>);
+    impl Visit for Events {
+        fn visit_literal(&mut self, node: &Literal) {
+            let LiteralKind::Long {
+                spelling,
+                parsed_value,
+            } = &node.kind
+            else {
+                panic!("fixture Long")
+            };
+            assert_eq!(spelling, &parsed_value.to_string());
+            self.0.push(Event::Number(*parsed_value));
+        }
+        fn visit_ident(&mut self, name: &Ident) {
+            self.0.push(Event::Name(name.value.clone(), name.quoted));
+        }
+    }
+    let absent = Expr::Dereference(AstBox::new(DereferenceExpr {
+        base: build::integer(7),
+        field: None,
+        span: Span::new(10, 100),
+    }));
+    let present_empty = Expr::Dereference(AstBox::new(DereferenceExpr {
+        base: build::integer(7),
+        field: Some(build::ident("", true)),
+        span: Span::new(10, 100),
+    }));
+    assert!(!absent.syntax_eq(&present_empty));
+    let present = Expr::Dereference(AstBox::new(DereferenceExpr {
+        base: build::integer(7),
+        field: Some(build::ident("场 \"`\\", true)),
+        span: Span::new(10, 100),
+    }));
+    let mut unquoted = present.clone();
+    let Expr::Dereference(node) = &mut unquoted else {
+        unreachable!()
+    };
+    node.field.as_mut().unwrap().quoted = false;
+    assert!(!present.syntax_eq(&unquoted));
+    let wildcard = Expr::ArrayWildcardSubscript(AstBox::new(ArrayWildcardSubscriptExpr {
+        base: build::integer(7),
+        span: Span::new(10, 100),
+    }));
+    assert!(!absent.syntax_eq(&wildcard));
+
+    const DEPTH: i64 = 20_000;
+    const LEAF: i64 = 1_000_000;
+    let mut tree = build::integer(LEAF);
+    let mut expected = vec![Event::Number(LEAF)];
+    let mut expected_text = LEAF.to_string();
+    for marker in 1..=DEPTH {
+        tree = match marker % 3 {
+            0 => {
+                expected.push(Event::Number(marker));
+                expected_text.push_str(&format!("[{marker}]"));
+                Expr::Subscript(AstBox::new(SubscriptExpr {
+                    base: tree,
+                    index: build::integer(marker),
+                    span: Span::new(10, 100),
+                }))
+            }
+            1 => {
+                expected_text.push_str("[*]");
+                Expr::ArrayWildcardSubscript(AstBox::new(ArrayWildcardSubscriptExpr {
+                    base: tree,
+                    span: Span::new(10, 100),
+                }))
+            }
+            _ => {
+                let field = if marker % 2 == 0 {
+                    expected_text.push_str(".*");
+                    None
+                } else {
+                    let value = format!("f{marker}");
+                    expected.push(Event::Name(value.clone(), true));
+                    expected_text.push_str(&format!(".`{value}`"));
+                    Some(build::ident_at(value, true, Span::new(20, 30)))
+                };
+                Expr::Dereference(AstBox::new(DereferenceExpr {
+                    base: tree,
+                    field,
+                    span: Span::new(10, 100),
+                }))
+            }
+        };
+    }
+    let mut actual = Events::default();
+    actual.visit_expr(&tree);
+    assert_eq!(actual.0, expected);
+    // The real legacy printer is exercised as a typed AST operation. The
+    // legacy grammar does not parse wildcard/label-only forms, so no reparse
+    // or execution capability is inferred from this text equality.
+    assert_eq!(crate::printer::print_expr(&tree), expected_text);
+    struct Relocate;
+    impl Fold for Relocate {
+        fn fold_subscript_expr(&mut self, node: SubscriptExpr) -> SubscriptExpr {
+            let mut node = crate::ast::fold_subscript_expr(self, node);
+            node.span = Span::new(101, 201);
+            node
+        }
+        fn fold_array_wildcard_subscript_expr(
+            &mut self,
+            node: ArrayWildcardSubscriptExpr,
+        ) -> ArrayWildcardSubscriptExpr {
+            let mut node = crate::ast::fold_array_wildcard_subscript_expr(self, node);
+            node.span = Span::new(101, 201);
+            node
+        }
+        fn fold_dereference_expr(&mut self, node: DereferenceExpr) -> DereferenceExpr {
+            let mut node = crate::ast::fold_dereference_expr(self, node);
+            node.span = Span::new(101, 201);
+            node
+        }
+        fn fold_ident(&mut self, mut name: Ident) -> Ident {
+            name.span = Span::new(121, 181);
+            name
+        }
+        fn fold_literal(&mut self, mut node: Literal) -> Literal {
+            node.span = Span::new(131, 171);
+            node
+        }
+    }
+    let relocated = Relocate.fold_expr(tree.clone());
+    assert!(tree.syntax_eq(&relocated));
+    assert_ne!(tree, relocated);
+    let mut actual = Events::default();
+    actual.visit_expr(&relocated);
+    assert_eq!(actual.0, expected);
+    struct Change;
+    impl Fold for Change {
+        fn fold_ident(&mut self, mut name: Ident) -> Ident {
+            name.value.push('!');
+            name
+        }
+        fn fold_literal(&mut self, mut node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = &node.kind else {
+                unreachable!()
+            };
+            let next = *parsed_value + 1;
+            node.kind = LiteralKind::Long {
+                spelling: next.to_string(),
+                parsed_value: next,
+            };
+            node
+        }
+    }
+    let changed = Change.fold_expr(relocated);
+    assert!(!tree.syntax_eq(&changed));
+    let expected_changed = expected
+        .into_iter()
+        .map(|event| match event {
+            Event::Number(value) => Event::Number(value + 1),
+            Event::Name(mut value, quoted) => {
+                value.push('!');
+                Event::Name(value, quoted)
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut actual = Events::default();
+    actual.visit_expr(&changed);
+    assert_eq!(actual.0, expected_changed);
+    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
+        build::select(
+            vec![build::item(changed, None, false)],
+            Vec::new(),
+            None,
+            GroupBy::None,
+        )
+        .unwrap(),
+    ))));
+    crate::ast::validate_statement(&statement).unwrap();
+    drop(statement);
+    drop(tree);
+}

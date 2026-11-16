@@ -26,6 +26,7 @@ mod expr;
 pub(crate) mod iceberg;
 pub(crate) mod maintenance;
 pub(crate) mod materialized_view;
+mod name_chain;
 mod predicate;
 pub use control_expr::*;
 mod query;
@@ -64,10 +65,10 @@ pub use dml::{
 };
 pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
-    AccessExpr, AccessKind, ArrayExpr, BinaryExpr, BinaryOperator, CompoundIdentifier, Expr,
-    FunctionCall, FunctionOrderBy, FunctionQuantifier, IntervalExpr, IntervalField, JsonOperator,
-    LogicalExpr, LogicalOperator, MapEntry, MapExpr, NestedExpr, NullTreatment, RowExpr, RowField,
-    SubqueryExpr, UnaryExpr, UnaryOperator,
+    AccessExpr, AccessKind, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr, BinaryOperator,
+    DereferenceExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier, IntervalExpr,
+    IntervalField, JsonOperator, LogicalExpr, LogicalOperator, MapEntry, MapExpr, NestedExpr,
+    NullTreatment, RowExpr, RowField, SubqueryExpr, SubscriptExpr, UnaryExpr, UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -364,3 +365,9 @@ pub use json::{
 mod control_expr_tests;
 
 pub use visit::{fold_row_expr, fold_row_field, walk_row_expr, walk_row_field};
+
+pub use name_chain::{IdentifierChain, identifier_chain_observed};
+pub use visit::{
+    fold_array_wildcard_subscript_expr, fold_dereference_expr, fold_subscript_expr,
+    walk_array_wildcard_subscript_expr, walk_dereference_expr, walk_subscript_expr,
+};

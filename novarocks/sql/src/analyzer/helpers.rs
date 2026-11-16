@@ -878,12 +878,13 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
         ast::Expr::Nested(nested) => expr_display_name(&nested.expression),
         ast::Expr::Literal(literal) => format_literal_display_name(literal),
         ast::Expr::Identifier(ident) => ident.value.clone(),
-        ast::Expr::CompoundIdentifier(identifier) if !identifier.parts.is_empty() => identifier
-            .parts
-            .last()
-            .expect("non-empty compound identifier")
-            .value
-            .clone(),
+        ast::Expr::Dereference(node) => format_dereference_display_name(node, expr),
+        ast::Expr::Subscript(node) => format!(
+            "{}[{}]",
+            expr_display_name_preserve_path(&node.base),
+            expr_display_name(&node.index),
+        ),
+        ast::Expr::ArrayWildcardSubscript(_) => printer::print_expr(expr),
         ast::Expr::Access(access) => format_access_display_name(access),
         ast::Expr::Array(array) => format!(
             "[{}]",
@@ -1051,19 +1052,8 @@ fn mark_table_factor_aliases_explicit(factor: &mut ast::TableFactor) {
 }
 
 fn format_access_display_name(access: &ast::AccessExpr) -> String {
-    if let ast::AccessKind::Field(field) = &access.kind
-        && matches!(
-            access.expr.as_ref(),
-            ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)
-        )
-    {
-        return field.value.clone();
-    }
-
     let base = expr_display_name_preserve_path(&access.expr);
     match &access.kind {
-        ast::AccessKind::Field(field) => format!("{base}.{}", field.value),
-        ast::AccessKind::Subscript(index) => format!("{base}[{}]", expr_display_name(index)),
         ast::AccessKind::Json { operator, path } => {
             let operator = match operator {
                 ast::JsonOperator::Arrow => "->",
@@ -1074,27 +1064,12 @@ fn format_access_display_name(access: &ast::AccessExpr) -> String {
                 expr_display_name_preserve_path(path)
             )
         }
-    }
-}
-fn expr_display_name_preserve_path(expr: &ast::Expr) -> String {
-    match expr {
-        ast::Expr::Nested(nested) => expr_display_name_preserve_path(&nested.expression),
-        ast::Expr::CompoundIdentifier(identifier) => identifier
-            .parts
-            .iter()
-            .map(|part| part.value.as_str())
-            .collect::<Vec<_>>()
-            .join("."),
-        ast::Expr::Access(access) => format_access_display_name_preserve_path(access),
-        _ => expr_display_name(expr),
     }
 }
 
 fn format_access_display_name_preserve_path(access: &ast::AccessExpr) -> String {
     let base = expr_display_name_preserve_path(&access.expr);
     match &access.kind {
-        ast::AccessKind::Field(field) => format!("{base}.{}", field.value),
-        ast::AccessKind::Subscript(index) => format!("{base}[{}]", expr_display_name(index)),
         ast::AccessKind::Json { operator, path } => {
             let operator = match operator {
                 ast::JsonOperator::Arrow => "->",
@@ -1108,6 +1083,54 @@ fn format_access_display_name_preserve_path(access: &ast::AccessExpr) -> String 
     }
 }
 
+fn pure_identifier_chain(expr: &ast::Expr) -> Option<ast::IdentifierChain<'_>> {
+    ast::identifier_chain_observed(expr, |_| Ok::<(), std::convert::Infallible>(()))
+        .unwrap_or_else(|never| match never {})
+}
+
+fn format_dereference_display_name(node: &ast::DereferenceExpr, whole: &ast::Expr) -> String {
+    let Some(field) = &node.field else {
+        return printer::print_expr(whole);
+    };
+    if pure_identifier_chain(&node.base).is_some() {
+        return field.value.clone();
+    }
+    format!(
+        "{}.{}",
+        expr_display_name_preserve_path(&node.base),
+        field.value
+    )
+}
+
+fn expr_display_name_preserve_path(expr: &ast::Expr) -> String {
+    if let Some(chain) = pure_identifier_chain(expr) {
+        let mut parts = chain
+            .iter_rev()
+            .map(|part| part.value.as_str())
+            .collect::<Vec<_>>();
+        parts.reverse();
+        return parts.join(".");
+    }
+    match expr {
+        ast::Expr::Nested(nested) => expr_display_name_preserve_path(&nested.expression),
+        ast::Expr::Dereference(node) => match &node.field {
+            Some(field) => format!(
+                "{}.{}",
+                expr_display_name_preserve_path(&node.base),
+                field.value
+            ),
+            None => printer::print_expr(expr),
+        },
+        ast::Expr::Subscript(node) => format!(
+            "{}[{}]",
+            expr_display_name_preserve_path(&node.base),
+            expr_display_name(&node.index)
+        ),
+        ast::Expr::ArrayWildcardSubscript(_) => printer::print_expr(expr),
+        ast::Expr::Access(access) => format_access_display_name_preserve_path(access),
+        _ => expr_display_name(expr),
+    }
+}
 fn format_literal_display_name(literal: &ast::Literal) -> String {
     match &literal.kind {
         ast::LiteralKind::String(value) => format!("'{}'", value.replace('\'', "''")),
@@ -1126,10 +1149,11 @@ fn format_literal_display_name(literal: &ast::Literal) -> String {
 }
 
 fn expr_display_name_with_parens(expr: &ast::Expr) -> String {
+    if pure_identifier_chain(expr).is_some() {
+        return expr_display_name(expr);
+    }
     match expr {
-        ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_) | ast::Expr::Literal(_) => {
-            expr_display_name(expr)
-        }
+        ast::Expr::Identifier(_) | ast::Expr::Literal(_) => expr_display_name(expr),
         ast::Expr::Unary(unary)
             if unary.operator == ast::UnaryOperator::Minus
                 && matches!(unary.expression.as_ref(), ast::Expr::Literal(_)) =>

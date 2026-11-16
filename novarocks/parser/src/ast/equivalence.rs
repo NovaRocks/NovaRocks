@@ -486,9 +486,6 @@ impl SyntaxEq for Expr {
             (Self::JsonArray(left), Self::JsonArray(right)) => left.syntax_eq(right),
 
             (Self::Identifier(left), Self::Identifier(right)) => left.syntax_eq(right),
-            (Self::CompoundIdentifier(left), Self::CompoundIdentifier(right)) => {
-                syntax_eq_slice(&left.parts, &right.parts)
-            }
             (Self::Literal(left), Self::Literal(right)) => left.syntax_eq(right),
             (Self::FunctionCall(left), Self::FunctionCall(right)) => left.syntax_eq(right),
             (Self::Unary(left), Self::Unary(right)) => left.syntax_eq(right),
@@ -509,6 +506,11 @@ impl SyntaxEq for Expr {
             (Self::Array(left), Self::Array(right)) => left.syntax_eq(right),
             (Self::Map(left), Self::Map(right)) => left.syntax_eq(right),
             (Self::Access(left), Self::Access(right)) => left.syntax_eq(right),
+            (Self::Subscript(left), Self::Subscript(right)) => left.syntax_eq(right),
+            (Self::ArrayWildcardSubscript(left), Self::ArrayWildcardSubscript(right)) => {
+                left.syntax_eq(right)
+            }
+            (Self::Dereference(left), Self::Dereference(right)) => left.syntax_eq(right),
             _ => false,
         }
     }
@@ -624,8 +626,6 @@ impl SyntaxEq for AccessExpr {
 impl SyntaxEq for AccessKind {
     fn syntax_eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Field(left), Self::Field(right)) => left.syntax_eq(right),
-            (Self::Subscript(left), Self::Subscript(right)) => left.syntax_eq(right),
             (
                 Self::Json {
                     operator: left_operator,
@@ -636,8 +636,26 @@ impl SyntaxEq for AccessKind {
                     path: right_path,
                 },
             ) => left_operator == right_operator && left_path.syntax_eq(right_path),
-            _ => false,
         }
+    }
+}
+
+impl SyntaxEq for SubscriptExpr {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.base.syntax_eq(&other.base) && self.index.syntax_eq(&other.index)
+    }
+}
+impl SyntaxEq for ArrayWildcardSubscriptExpr {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.base.syntax_eq(&other.base)
+    }
+}
+impl SyntaxEq for DereferenceExpr {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.base.syntax_eq(&other.base) && syntax_eq_option(&self.field, &other.field)
     }
 }
 
@@ -705,10 +723,11 @@ mod tests {
                 span: span(start + 2),
             },
             arguments: vec![Expr::Access(AccessExpr {
-                expr: Box::new(Expr::CompoundIdentifier(CompoundIdentifier {
-                    parts: vec![ident("t", start + 3), ident("payload", start + 4)],
+                expr: Box::new(Expr::Dereference(AstBox::new(DereferenceExpr {
+                    base: Expr::Identifier(ident("t", start + 3)),
+                    field: Some(ident("payload", start + 4)),
                     span: span(start + 5),
-                })),
+                }))),
                 kind: AccessKind::Json {
                     operator: JsonOperator::ArrowText,
                     path: Box::new(Expr::Literal(Literal {

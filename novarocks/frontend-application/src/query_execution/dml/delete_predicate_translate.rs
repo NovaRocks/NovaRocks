@@ -238,14 +238,9 @@ fn extract_col_lit<'a>(
 }
 
 fn expr_to_col_name(e: &Expr) -> Result<String, String> {
-    match e {
-        Expr::Identifier(id) => Ok(id.value.to_lowercase()),
-        Expr::CompoundIdentifier(parts) => parts
-            .parts
-            .last()
-            .map(|p| p.value.to_lowercase())
-            .ok_or_else(|| "empty compound identifier".to_string()),
-        other => Err(format!("expected column reference, got {other:?}")),
+    match novarocks_parser::ast::identifier_chain_observed(e, |_| Ok::<(), String>(()))? {
+        Some(chain) => Ok(chain.last().value.to_lowercase()),
+        None => Err(format!("expected column reference, got {e:?}")),
     }
 }
 

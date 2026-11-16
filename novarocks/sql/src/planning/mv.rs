@@ -2523,21 +2523,27 @@ fn collect_join_equality_predicates(
 }
 
 fn join_column_ref(expr: &ast::Expr) -> Result<SqlMvJoinColumnRef, String> {
-    let ast::Expr::CompoundIdentifier(compound) = expr else {
+    let Some(chain) = ast::identifier_chain_observed(expr, |_| Ok::<(), String>(()))? else {
         return Err(
             "extract_join_equality_predicates: each side of an equality must be a qualified column"
                 .to_string(),
         );
     };
-    let [qualifier, column] = compound.parts.as_slice() else {
+    if chain.len() < 2 {
+        return Err(
+            "extract_join_equality_predicates: each side of an equality must be a qualified column"
+                .to_string(),
+        );
+    }
+    if chain.len() != 2 {
         return Err(format!(
             "extract_join_equality_predicates: expected `qualifier`.`column`, found {} parts",
-            compound.parts.len()
+            chain.len()
         ));
-    };
+    }
     Ok(SqlMvJoinColumnRef {
-        qualifier: qualifier.value.clone(),
-        column: column.value.clone(),
+        qualifier: chain.first().value.clone(),
+        column: chain.last().value.clone(),
     })
 }
 
@@ -3004,19 +3010,19 @@ fn collect_equi_join_keys(
     }
 }
 
-fn qualified_column_alias(expr: &Expr) -> Result<String, String> {
-    if let Expr::Nested(inner) = expr {
-        return qualified_column_alias(&inner.expression);
+fn qualified_column_alias(mut expr: &Expr) -> Result<String, String> {
+    while let Expr::Nested(inner) = expr {
+        expr = &inner.expression;
     }
-    let Expr::CompoundIdentifier(parts) = expr else {
-        return Err(
-            "incremental join MV join key must be a qualified column reference".to_string(),
-        );
-    };
-    let [alias, _column] = parts.parts.as_slice() else {
+    let chain = ast::identifier_chain_observed(expr, |_| Ok::<(), String>(()))?
+        .filter(|chain| chain.len() > 1)
+        .ok_or_else(|| {
+            "incremental join MV join key must be a qualified column reference".to_string()
+        })?;
+    if chain.len() != 2 {
         return Err("incremental join MV join key must be <alias>.<column>".to_string());
-    };
-    Ok(alias.value.clone())
+    }
+    Ok(chain.first().value.clone())
 }
 
 fn is_probably_join_query(query: &Query) -> bool {
@@ -3397,6 +3403,12 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
                 || case_contains_aggregate_function(&case.when_clauses, case.default_value.as_ref())
         }
         Expr::Array(array) => array.values.iter().any(expr_contains_aggregate_function),
+        Expr::Dereference(node) => expr_contains_aggregate_function(&node.base),
+        Expr::ArrayWildcardSubscript(node) => expr_contains_aggregate_function(&node.base),
+        Expr::Subscript(node) => {
+            expr_contains_aggregate_function(&node.base)
+                || expr_contains_aggregate_function(&node.index)
+        }
         Expr::Row(record) => record
             .fields
             .iter()
@@ -3508,6 +3520,21 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
         }
         Expr::FunctionCall(function) => reject_unsupported_function(function)?,
         Expr::Access(access) => reject_unsupported_access_expr(access)?,
+        Expr::Dereference(node) => {
+            if node.field.is_none() {
+                return Err(projection_filter_error());
+            }
+            let qualified = ast::identifier_chain_observed(expr, |_| Ok::<(), String>(()))?
+                .is_some_and(|chain| chain.len() >= 2);
+            if !qualified {
+                reject_unsupported_expr(&node.base)?;
+            }
+        }
+        Expr::Subscript(node) => {
+            reject_unsupported_expr(&node.base)?;
+            reject_unsupported_expr(&node.index)?;
+        }
+        Expr::ArrayWildcardSubscript(_) => return Err(projection_filter_error()),
         Expr::Unary(unary) => reject_unsupported_expr(&unary.expression)?,
         Expr::Nested(nested) => reject_unsupported_expr(&nested.expression)?,
         Expr::Predicated(node) => {
@@ -3555,7 +3582,7 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
                 );
             }
         }
-        Expr::CompoundIdentifier(_) | Expr::Literal(_) => {}
+        Expr::Literal(_) => {}
     }
     Ok(())
 }
@@ -3571,8 +3598,6 @@ fn reject_unsupported_access_expr(access: &ast::AccessExpr) -> Result<(), String
     let ast::AccessExpr { expr, kind, .. } = access;
     reject_unsupported_expr(expr)?;
     match kind {
-        ast::AccessKind::Field(_) => Ok(()),
-        ast::AccessKind::Subscript(index) => reject_unsupported_expr(index),
         ast::AccessKind::Json { path, .. } => reject_unsupported_expr(path),
     }
 }
@@ -4817,6 +4842,11 @@ mod tests {
 
     #[test]
     fn rejects_non_deterministic_now() {
+        // A qualified column keeps its original atomic name eligibility even
+        // when the table alias spells a nondeterministic bare identifier.
+        assert!(
+            parse_shape("select `current_date`.k1 from ice.ns.orders as `current_date`",).is_ok()
+        );
         assert_rejects_with("select k1, now() from ice.ns.orders", "non-deterministic");
         assert_rejects_with(
             "select k1, current_timestamp from ice.ns.orders",

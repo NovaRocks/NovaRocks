@@ -107,10 +107,12 @@ pub fn identifier(name: Ident) -> Expr {
 }
 
 pub fn column(qualifier: Ident, name: Ident) -> Expr {
-    Expr::CompoundIdentifier(CompoundIdentifier {
-        span: qualifier.span.cover(name.span),
-        parts: vec![qualifier, name],
-    })
+    let span = qualifier.span.cover(name.span);
+    Expr::Dereference(AstBox::new(DereferenceExpr {
+        base: Expr::Identifier(qualifier),
+        field: Some(name),
+        span,
+    }))
 }
 
 /// Builds an admitted or program-authored numeric spelling without reparsing SQL.

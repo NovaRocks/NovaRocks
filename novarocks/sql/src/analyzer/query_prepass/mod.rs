@@ -407,7 +407,13 @@ fn projection_alias(item: &SelectItem) -> Option<Ident> {
     match item {
         SelectItem::ExprWithAlias { alias, .. } => Some(alias.clone()),
         SelectItem::UnnamedExpr(Expr::Identifier(ident)) => Some(ident.clone()),
-        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(ident)) => ident.parts.last().cloned(),
+        SelectItem::UnnamedExpr(expression @ Expr::Dereference(_)) => {
+            novarocks_parser::ast::identifier_chain_observed(expression, |_| {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap_or_else(|never| match never {})
+            .map(|chain| chain.last().clone())
+        }
         SelectItem::UnnamedExpr(_)
         | SelectItem::Wildcard { .. }
         | SelectItem::QualifiedWildcard { .. } => None,

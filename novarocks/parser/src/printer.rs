@@ -785,9 +785,6 @@ impl Printer {
             Expr::JsonArray(node) => self.write_json_array(node),
 
             Expr::Identifier(ident) => self.write_ident(ident),
-            Expr::CompoundIdentifier(ident) => {
-                self.write_ident_list_with_separator(&ident.parts, ".")
-            }
             Expr::Literal(literal) => self.write_literal(literal),
             Expr::FunctionCall(call) => self.write_function_call(call),
             Expr::Unary(expression) => self.write_unary_expr(expression),
@@ -817,6 +814,9 @@ impl Printer {
             Expr::Map(expression) => self.write_map_expr(expression),
             Expr::Lambda(expression) => self.write_lambda_expr(expression),
             Expr::Access(expression) => self.write_access_expr(expression),
+            Expr::Subscript(node) => self.write_subscript_expr(node),
+            Expr::ArrayWildcardSubscript(node) => self.write_array_wildcard_subscript_expr(node),
+            Expr::Dereference(node) => self.write_dereference_expr(node),
         }
     }
 
@@ -1494,15 +1494,6 @@ impl Printer {
     fn write_access_expr(&mut self, expression: &AccessExpr) {
         self.write_expr(&expression.expr);
         match &expression.kind {
-            AccessKind::Field(name) => {
-                self.output.push('.');
-                self.write_ident(name);
-            }
-            AccessKind::Subscript(index) => {
-                self.output.push('[');
-                self.write_expr(index);
-                self.output.push(']');
-            }
             AccessKind::Json { operator, path } => {
                 self.output.push_str(match operator {
                     JsonOperator::Arrow => " -> ",
@@ -1510,6 +1501,28 @@ impl Printer {
                 });
                 self.write_expr(path);
             }
+        }
+    }
+    #[recursive::recursive]
+    fn write_subscript_expr(&mut self, node: &SubscriptExpr) {
+        self.write_expr(&node.base);
+        self.output.push('[');
+        self.write_expr(&node.index);
+        self.output.push(']');
+    }
+    #[recursive::recursive]
+    fn write_array_wildcard_subscript_expr(&mut self, node: &ArrayWildcardSubscriptExpr) {
+        self.write_expr(&node.base);
+        self.output.push_str("[*]");
+    }
+    #[recursive::recursive]
+    fn write_dereference_expr(&mut self, node: &DereferenceExpr) {
+        self.write_expr(&node.base);
+        self.output.push('.');
+        if let Some(field) = &node.field {
+            self.write_ident(field);
+        } else {
+            self.output.push('*');
         }
     }
     fn write_expr_list(&mut self, expressions: &[Expr]) {

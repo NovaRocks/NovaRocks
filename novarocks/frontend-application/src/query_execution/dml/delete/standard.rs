@@ -650,20 +650,10 @@ fn is_literal_expr(expr: &Expr) -> bool {
 }
 
 fn expr_to_column_name(expr: &Expr) -> Result<String, String> {
-    match expr {
-        Expr::Identifier(ident) => Ok(ident.value.to_lowercase()),
-        Expr::CompoundIdentifier(parts) => {
-            // a.b.c → take the last part (the column name); table-qualified
-            // refs work because the Predicate is bound against the
-            // single-table schema via TableScan.with_filter.
-            parts
-                .parts
-                .last()
-                .map(|p| p.value.to_lowercase())
-                .ok_or_else(|| "compound identifier has no parts".to_string())
-        }
-        other => Err(format!(
-            "phase 1 DELETE WHERE expected a column identifier here, got {other:?}"
+    match novarocks_parser::ast::identifier_chain_observed(expr, |_| Ok::<(), String>(()))? {
+        Some(chain) => Ok(chain.last().value.to_lowercase()),
+        None => Err(format!(
+            "phase 1 DELETE WHERE expected a column identifier here, got {expr:?}"
         )),
     }
 }

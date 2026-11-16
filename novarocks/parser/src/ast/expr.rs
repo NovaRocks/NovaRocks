@@ -32,7 +32,6 @@ pub enum Expr {
     JsonArray(Box<super::JsonArray>),
 
     Identifier(Ident),
-    CompoundIdentifier(CompoundIdentifier),
     Literal(Literal),
     FunctionCall(FunctionCall),
     Unary(UnaryExpr),
@@ -53,6 +52,9 @@ pub enum Expr {
     Map(MapExpr),
     Lambda(AstBox<super::LambdaExpr>),
     Access(AccessExpr),
+    Subscript(AstBox<SubscriptExpr>),
+    ArrayWildcardSubscript(AstBox<ArrayWildcardSubscriptExpr>),
+    Dereference(AstBox<DereferenceExpr>),
 }
 
 impl Expr {
@@ -67,7 +69,6 @@ impl Expr {
             Self::JsonArray(node) => node.span,
 
             Self::Identifier(ident) => ident.span,
-            Self::CompoundIdentifier(ident) => ident.span,
             Self::Literal(literal) => literal.span,
             Self::FunctionCall(call) => call.span,
             Self::Unary(expression) => expression.span,
@@ -88,14 +89,11 @@ impl Expr {
             Self::Map(expression) => expression.span,
             Self::Lambda(expression) => expression.span,
             Self::Access(expression) => expression.span,
+            Self::Subscript(expression) => expression.span,
+            Self::ArrayWildcardSubscript(expression) => expression.span,
+            Self::Dereference(expression) => expression.span,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompoundIdentifier {
-    pub parts: Vec<Ident>,
-    pub span: Span,
 }
 
 /// A function name and its argument expressions.
@@ -222,6 +220,26 @@ pub struct MapEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptExpr {
+    pub base: Expr,
+    pub index: Expr,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArrayWildcardSubscriptExpr {
+    pub base: Expr,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DereferenceExpr {
+    pub base: Expr,
+    pub field: Option<Ident>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccessExpr {
     pub expr: Box<Expr>,
     pub kind: AccessKind,
@@ -230,8 +248,6 @@ pub struct AccessExpr {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AccessKind {
-    Field(Ident),
-    Subscript(Box<Expr>),
     Json {
         operator: JsonOperator,
         path: Box<Expr>,

@@ -1041,12 +1041,17 @@ pub(crate) fn attach_write_literal_contexts(
         else {
             continue;
         };
-        let ast::Expr::CompoundIdentifier(parts) = expr else {
+        let Some(chain) = ast::identifier_chain_observed(expr, |_| {
+            control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+        })?
+        else {
             continue;
         };
-        let [qualifier, name] = parts.parts.as_slice() else {
+        if chain.len() != 2 {
             continue;
-        };
+        }
+        let qualifier = chain.first();
+        let name = chain.last();
         if qualifier.value != alias.name.value {
             continue;
         }

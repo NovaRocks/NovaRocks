@@ -3229,17 +3229,21 @@ fn sync_output_columns_from_projection(
 
 /// A computed-base dereference never acquires a SQL field name from its suffix.
 fn natural_field_name(expr: &ast::Expr) -> Option<String> {
-    match expr {
-        ast::Expr::Identifier(ident) => Some(ident.value.clone()),
-        ast::Expr::CompoundIdentifier(parts) => parts.parts.last().map(|ident| ident.value.clone()),
-        ast::Expr::Nested(nested) => natural_field_name(&nested.expression),
-        ast::Expr::Access(access) if natural_field_name(&access.expr).is_some() => {
-            match &access.kind {
-                ast::AccessKind::Field(field) => Some(field.value.clone()),
-                _ => None,
+    let mut current = expr;
+    let mut terminal = None;
+    loop {
+        match current {
+            ast::Expr::Identifier(ident) => {
+                return Some(terminal.unwrap_or(ident).value.clone());
             }
+            ast::Expr::Nested(nested) => current = &nested.expression,
+            ast::Expr::Dereference(node) => {
+                let field = node.field.as_ref()?;
+                terminal.get_or_insert(field);
+                current = &node.base;
+            }
+            _ => return None,
         }
-        _ => None,
     }
 }
 

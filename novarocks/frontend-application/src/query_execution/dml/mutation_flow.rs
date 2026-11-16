@@ -1971,7 +1971,12 @@ mod tests {
                 matches!(&predicate.predicate, ast::Predicate::IsNull(null) if null.negated == guard)
             );
             assert!(
-                matches!(&predicate.value, ast::Expr::CompoundIdentifier(name) if name.parts.last().is_some_and(|name| name.value == "_file"))
+                ast::identifier_chain_observed(&predicate.value, |_| Ok::<
+                    (),
+                    std::convert::Infallible,
+                >(()))
+                .unwrap_or_else(|never| match never {})
+                .is_some_and(|chain| chain.last().value == "_file")
             );
             let ast::Expr::Nested(clause) = &condition.terms[1] else {
                 panic!("original clause boundary");

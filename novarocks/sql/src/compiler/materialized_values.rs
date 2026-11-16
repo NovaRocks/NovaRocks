@@ -43,6 +43,9 @@ pub enum SqlConstantExpressionStep {
     InValueList,
     InListValue(usize),
     CastExpression,
+    DereferenceBase,
+    SubscriptBase,
+    SubscriptIndex,
     CaseOperand,
     CaseWhenOperand(usize),
     CaseResult(usize),
@@ -216,6 +219,11 @@ pub(crate) fn resolve_expression_site<'a>(
                 })?
             }
             (SqlConstantExpressionStep::CastExpression, ast::Expr::Cast(cast)) => &cast.expression,
+            (SqlConstantExpressionStep::DereferenceBase, ast::Expr::Dereference(node)) => {
+                &node.base
+            }
+            (SqlConstantExpressionStep::SubscriptBase, ast::Expr::Subscript(node)) => &node.base,
+            (SqlConstantExpressionStep::SubscriptIndex, ast::Expr::Subscript(node)) => &node.index,
             (SqlConstantExpressionStep::CaseOperand, ast::Expr::SimpleCase(case)) => &case.operand,
             (SqlConstantExpressionStep::CaseWhenOperand(index), ast::Expr::SearchedCase(case)) => {
                 case_when_operand(&case.when_clauses, *index)?

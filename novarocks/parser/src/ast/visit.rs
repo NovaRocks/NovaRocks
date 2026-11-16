@@ -21,6 +21,15 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_subscript_expr(&mut self, node: &SubscriptExpr) {
+        walk_subscript_expr(self, node);
+    }
+    fn visit_array_wildcard_subscript_expr(&mut self, node: &ArrayWildcardSubscriptExpr) {
+        walk_array_wildcard_subscript_expr(self, node);
+    }
+    fn visit_dereference_expr(&mut self, node: &DereferenceExpr) {
+        walk_dereference_expr(self, node);
+    }
     fn visit_row_expr(&mut self, node: &RowExpr) {
         walk_row_expr(self, node);
     }
@@ -757,11 +766,6 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::JsonArray(node) => visitor.visit_json_array(node),
 
         Expr::Identifier(ident) => visitor.visit_ident(ident),
-        Expr::CompoundIdentifier(ident) => {
-            for part in &ident.parts {
-                visitor.visit_ident(part);
-            }
-        }
         Expr::Literal(literal) => visitor.visit_literal(literal),
         Expr::FunctionCall(call) => visitor.visit_function_call(call),
         Expr::Unary(expression) => visitor.visit_unary_expr(expression),
@@ -799,11 +803,12 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::Access(expression) => {
             visitor.visit_expr(&expression.expr);
             match &expression.kind {
-                AccessKind::Field(name) => visitor.visit_ident(name),
-                AccessKind::Subscript(index) => visitor.visit_expr(index),
                 AccessKind::Json { path, .. } => visitor.visit_expr(path),
             }
         }
+        Expr::Subscript(node) => visitor.visit_subscript_expr(node),
+        Expr::ArrayWildcardSubscript(node) => visitor.visit_array_wildcard_subscript_expr(node),
+        Expr::Dereference(node) => visitor.visit_dereference_expr(node),
     }
 }
 
@@ -841,6 +846,18 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_subscript_expr(&mut self, node: SubscriptExpr) -> SubscriptExpr {
+        fold_subscript_expr(self, node)
+    }
+    fn fold_array_wildcard_subscript_expr(
+        &mut self,
+        node: ArrayWildcardSubscriptExpr,
+    ) -> ArrayWildcardSubscriptExpr {
+        fold_array_wildcard_subscript_expr(self, node)
+    }
+    fn fold_dereference_expr(&mut self, node: DereferenceExpr) -> DereferenceExpr {
+        fold_dereference_expr(self, node)
+    }
     fn fold_row_expr(&mut self, node: RowExpr) -> RowExpr {
         fold_row_expr(self, node)
     }
@@ -1833,14 +1850,7 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::JsonArray(node) => Expr::JsonArray(Box::new(folder.fold_json_array(*node))),
 
         Expr::Identifier(ident) => Expr::Identifier(folder.fold_ident(ident)),
-        Expr::CompoundIdentifier(mut ident) => {
-            ident.parts = ident
-                .parts
-                .into_iter()
-                .map(|part| folder.fold_ident(part))
-                .collect();
-            Expr::CompoundIdentifier(ident)
-        }
+
         Expr::Literal(literal) => Expr::Literal(folder.fold_literal(literal)),
         Expr::FunctionCall(call) => Expr::FunctionCall(folder.fold_function_call(call)),
         Expr::Unary(expression) => Expr::Unary(folder.fold_unary_expr(expression)),
@@ -1896,16 +1906,21 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::Access(mut expression) => {
             expression.expr = Box::new(folder.fold_expr(*expression.expr));
             expression.kind = match expression.kind {
-                AccessKind::Field(name) => AccessKind::Field(folder.fold_ident(name)),
-                AccessKind::Subscript(index) => {
-                    AccessKind::Subscript(Box::new(folder.fold_expr(*index)))
-                }
                 AccessKind::Json { operator, path } => AccessKind::Json {
                     operator,
                     path: Box::new(folder.fold_expr(*path)),
                 },
             };
             Expr::Access(expression)
+        }
+        Expr::Subscript(node) => {
+            Expr::Subscript(AstBox::new(folder.fold_subscript_expr(node.into_inner())))
+        }
+        Expr::ArrayWildcardSubscript(node) => Expr::ArrayWildcardSubscript(AstBox::new(
+            folder.fold_array_wildcard_subscript_expr(node.into_inner()),
+        )),
+        Expr::Dereference(node) => {
+            Expr::Dereference(AstBox::new(folder.fold_dereference_expr(node.into_inner())))
         }
     }
 }
@@ -2011,5 +2026,51 @@ pub fn fold_row_expr<F: Fold + ?Sized>(folder: &mut F, mut node: RowExpr) -> Row
 pub fn fold_row_field<F: Fold + ?Sized>(folder: &mut F, mut node: RowField) -> RowField {
     node.name = node.name.map(|name| folder.fold_ident(name));
     node.expression = folder.fold_expr(node.expression);
+    node
+}
+
+#[recursive::recursive]
+pub fn walk_subscript_expr<V: Visit + ?Sized>(visitor: &mut V, node: &SubscriptExpr) {
+    visitor.visit_expr(&node.base);
+    visitor.visit_expr(&node.index);
+}
+#[recursive::recursive]
+pub fn walk_array_wildcard_subscript_expr<V: Visit + ?Sized>(
+    visitor: &mut V,
+    node: &ArrayWildcardSubscriptExpr,
+) {
+    visitor.visit_expr(&node.base);
+}
+#[recursive::recursive]
+pub fn walk_dereference_expr<V: Visit + ?Sized>(visitor: &mut V, node: &DereferenceExpr) {
+    visitor.visit_expr(&node.base);
+    if let Some(field) = &node.field {
+        visitor.visit_ident(field);
+    }
+}
+#[recursive::recursive]
+pub fn fold_subscript_expr<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut node: SubscriptExpr,
+) -> SubscriptExpr {
+    node.base = folder.fold_expr(node.base);
+    node.index = folder.fold_expr(node.index);
+    node
+}
+#[recursive::recursive]
+pub fn fold_array_wildcard_subscript_expr<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut node: ArrayWildcardSubscriptExpr,
+) -> ArrayWildcardSubscriptExpr {
+    node.base = folder.fold_expr(node.base);
+    node
+}
+#[recursive::recursive]
+pub fn fold_dereference_expr<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut node: DereferenceExpr,
+) -> DereferenceExpr {
+    node.base = folder.fold_expr(node.base);
+    node.field = node.field.map(|field| folder.fold_ident(field));
     node
 }

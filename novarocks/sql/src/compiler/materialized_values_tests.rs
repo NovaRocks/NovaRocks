@@ -672,3 +672,127 @@ fn control_expression_edges_resolve_only_real_fields_and_reject_partial_or_absen
         .is_err()
     );
 }
+
+#[test]
+fn dereference_borrows_its_original_interior_constant_before_name_resolution() {
+    use arrow::array::{Array, Int32Array, StructArray};
+    use arrow::datatypes::{DataType, Field, Fields};
+    use novarocks_functions::ConstantPool;
+    let control = SqlCompileControl::unbounded();
+    let policy = crate::constant::test_constant_policy();
+    let fields = Fields::from(vec![Arc::new(Field::new(
+        "payload",
+        DataType::Int32,
+        false,
+    ))]);
+    let ty = FunctionValueType::new(DataType::Struct(fields.clone()), false);
+    let field = Arc::new(
+        Field::new("original_struct_source", ty.data_type().clone(), false).with_metadata(
+            std::collections::HashMap::from([(
+                "provider.unknown".to_string(),
+                "full-field".to_string(),
+            )]),
+        ),
+    );
+    let array =
+        StructArray::try_new(fields, vec![Arc::new(Int32Array::from(vec![11, 23]))], None).unwrap();
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        array.to_data(),
+        policy,
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let retained = pool.value(1).unwrap();
+    let query = query("SELECT only_original_source.payload");
+    let constant = |path| {
+        SqlExpressionConstant::new(
+            Vec::new(),
+            SqlConstantExpressionSite::SelectProjection { column: 0 },
+            retained.clone(),
+        )
+        .with_expression_path(path)
+    };
+    let source = MaterializedValues::try_new_expressions(
+        &query,
+        vec![constant(vec![SqlConstantExpressionStep::DereferenceBase])].into(),
+        &control,
+    )
+    .unwrap();
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("select");
+    };
+    let ast::SelectItem::UnnamedExpr(ast::Expr::Dereference(node)) = &select.projection[0] else {
+        panic!("dereference");
+    };
+    let owned = source.loan(&query, &control).unwrap();
+    let loan = owned.view();
+    let original = loan.constant_at(&node.base).unwrap();
+    assert_eq!(original.ordinal(), 1);
+    assert_eq!(original.pool().backing_identity(), pool.backing_identity());
+    assert_eq!(original.field(), field.as_ref());
+    assert!(Arc::ptr_eq(original.pool().field_ref(), &field));
+    assert_eq!(
+        original
+            .field()
+            .metadata()
+            .get("provider.unknown")
+            .map(String::as_str),
+        Some("full-field")
+    );
+    assert_eq!(original.value_type(), &ty);
+    assert!(loan.constant_at(&node.base.clone()).is_none());
+    for path in [
+        vec![SqlConstantExpressionStep::SubscriptBase],
+        vec![SqlConstantExpressionStep::SubscriptIndex],
+        vec![
+            SqlConstantExpressionStep::DereferenceBase,
+            SqlConstantExpressionStep::DereferenceBase,
+        ],
+    ] {
+        assert!(
+            MaterializedValues::try_new_expressions(&query, vec![constant(path)].into(), &control,)
+                .is_err()
+        );
+    }
+    let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+    let functions = build_builtin_engine_function_catalog().unwrap();
+    let (resolved, _, _) = crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
+        &query,
+        &catalog,
+        "db",
+        &functions,
+        &crate::sql_mode::SqlSemanticSettings::default(),
+        policy,
+        &control,
+        Some(&source),
+    )
+    .unwrap();
+    let crate::analysis::QueryBody::Select(select) = resolved.body else {
+        panic!("select");
+    };
+    let expression = &select.projection[0].expr;
+    let crate::analysis::ExprKind::FunctionCall { name, args, .. } = &expression.kind else {
+        panic!("original struct subfield binding");
+    };
+    assert_eq!(name, "__struct_subfield");
+    assert_eq!(expression.value_type.data_type(), &DataType::Int32);
+    let crate::analysis::ExprKind::Constant(actual) = &args[0].kind else {
+        panic!("original interior constant");
+    };
+    assert_eq!(actual.ordinal(), 1);
+    assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+    assert_eq!(actual.field(), field.as_ref());
+    assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+    assert_eq!(
+        actual
+            .field()
+            .metadata()
+            .get("provider.unknown")
+            .map(String::as_str),
+        Some("full-field")
+    );
+    assert_eq!(actual.value_type(), &ty);
+}

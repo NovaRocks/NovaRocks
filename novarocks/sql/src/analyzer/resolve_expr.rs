@@ -122,6 +122,12 @@ pub(crate) fn unsupported_control_expression_reason(
         ast::Expr::SearchedCase(case) => Some(case.when_clauses.as_slice()),
         ast::Expr::SimpleCase(case) => Some(case.when_clauses.as_slice()),
         ast::Expr::Unique(_) => return Some("UNIQUE subquery predicates are not supported"),
+        ast::Expr::Dereference(node) if node.field.is_none() => {
+            return Some("label-only dereference expressions are not supported");
+        }
+        ast::Expr::ArrayWildcardSubscript(_) => {
+            return Some("array wildcard subscripts are not supported");
+        }
         ast::Expr::Exists(exists) if !matches!(exists.subquery, ast::Expr::Subquery(_)) => {
             return Some("EXISTS requires a subquery expression");
         }
@@ -335,12 +341,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
 
-            // Qualified column reference or STRUCT field chain encoded by the
-            // native parser as a compound identifier (for example `c13.a`).
-            ast::Expr::CompoundIdentifier(parts) if parts.parts.len() >= 2 => {
-                self.analyze_compound_identifier(&parts.parts, scope)
-            }
-
             ast::Expr::Literal(value) => self.analyze_literal(value),
 
             ast::Expr::Array(array) => self.analyze_array_literal(array, scope),
@@ -498,6 +498,51 @@ impl<'a> super::AnalyzerContext<'a> {
             // Function call
             ast::Expr::FunctionCall(func) => self.analyze_function(func, scope),
 
+            ast::Expr::Dereference(node) => {
+                let mut interior_source = false;
+                let chain = ast::identifier_chain_observed(expr, |occurrence| {
+                    self.check_control()?;
+                    if !std::ptr::eq(occurrence, expr)
+                        && self.materialized_values.is_some_and(|source| {
+                            source.constant_at(occurrence).is_some()
+                                || source.write_assignment_at(occurrence).is_some()
+                        })
+                    {
+                        interior_source = true;
+                    }
+                    Ok::<(), AnalyzeError>(())
+                })?;
+                if let Some(chain) = chain.filter(|_| !interior_source) {
+                    let mut parts = Vec::new();
+                    parts.try_reserve_exact(chain.len()).map_err(|_| {
+                        AnalyzeError::control(
+                            novarocks_type_contract::CompileControlError::ResourceExhausted,
+                        )
+                    })?;
+                    for ident in chain.iter_rev() {
+                        self.check_control()?;
+                        parts.push(ident);
+                    }
+                    for index in 0..parts.len() / 2 {
+                        self.check_control()?;
+                        let other = parts.len() - 1 - index;
+                        parts.swap(index, other);
+                    }
+                    return self.analyze_compound_identifier(&parts, scope);
+                }
+                let Some(field) = &node.field else {
+                    return Err(AnalyzeError::unsupported_expression(
+                        "label-only dereference expressions are not supported",
+                        node.span,
+                    ));
+                };
+                let base = self.analyze_expr(&node.base, scope)?;
+                self.analyze_struct_field_access(base, field.value.clone(), field.span)
+            }
+            ast::Expr::Subscript(node) => {
+                let base = self.analyze_expr(&node.base, scope)?;
+                self.analyze_subscript(base, &node.index, scope, node.span)
+            }
             ast::Expr::Access(access) => {
                 let base = self.analyze_expr(&access.expr, scope)?;
                 self.analyze_access(base, &access.kind, scope, access.span)
@@ -564,113 +609,114 @@ impl<'a> super::AnalyzerContext<'a> {
         }
     }
 
+    fn analyze_subscript(
+        &self,
+        base: TypedExpr,
+        index: &ast::Expr,
+        scope: &AnalyzerScope,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let mut index_typed = self.analyze_expr(index, scope)?;
+        let output_type = match &base.value_type.data_type() {
+            DataType::List(item) => {
+                index_typed = cast_null_preserving_target_type(
+                    index_typed,
+                    &DataType::Int32,
+                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                );
+                item.data_type().clone()
+            }
+            DataType::Map(entries, _) => {
+                let DataType::Struct(fields) = entries.data_type() else {
+                    return Err(AnalyzeError::invalid_argument(
+                        "map subscript expects STRUCT map entries",
+                        span,
+                    ));
+                };
+                if fields.len() != 2 {
+                    return Err(AnalyzeError::invalid_argument(
+                        "map subscript expects key/value entries",
+                        span,
+                    ));
+                }
+                // The map owns its complete key declaration. Its carrier
+                // alone cannot author the probe's nominal identity.
+                let key = container_child_value_type_observed(&base.value_type, 0, self.control)?;
+                if !novarocks_functions::builtin::map_lookup_core::has_uninhabited_map_key(
+                    &base.value_type,
+                ) {
+                    let target = self.implicit_common_cast_target(&index_typed.value_type, &key);
+                    index_typed = self.cast_to_value_type(index_typed, target, index.span())?;
+                }
+                fields[1].data_type().clone()
+            }
+            DataType::Struct(fields) => {
+                return match &index_typed.kind {
+                    ExprKind::Literal(LiteralValue::String(field_name)) => {
+                        self.analyze_struct_field_access(base, field_name.clone(), span)
+                    }
+                    // 1-based positional access: `struct_val[1]` →
+                    // first field of the STRUCT. Matches StarRocks /
+                    // Spark / Trino convention.
+                    ExprKind::Literal(LiteralValue::Int(pos)) => {
+                        if *pos < 1 || (*pos as usize) > fields.len() {
+                            return Err(AnalyzeError::invalid_argument(
+                                format!(
+                                    "struct subscript {} is out of range (1..{})",
+                                    pos,
+                                    fields.len()
+                                ),
+                                span,
+                            ));
+                        }
+                        let field_name = fields[(*pos as usize) - 1].name().clone();
+                        self.analyze_struct_field_access(base, field_name, span)
+                    }
+                    _ => Err(AnalyzeError::invalid_argument(
+                        format!(
+                            "struct subscript requires a string literal field name or 1-based integer index, got {:?}",
+                            index_typed.kind
+                        ),
+                        span,
+                    )),
+                };
+            }
+            other => {
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "subscript access expects ARRAY, MAP, or STRUCT input, got {:?}",
+                        other
+                    ),
+                    span,
+                ));
+            }
+        };
+        let function_name = match &base.value_type.data_type() {
+            DataType::List(_) => "__array_element_at",
+            DataType::Map(_, _) => "__map_element_at",
+            _ => unreachable!("only array/map subscripts reach this branch"),
+        };
+        let result = resolved_scalar_call_at(
+            self.function_catalog,
+            function_name,
+            vec![base, index_typed],
+            span,
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
+            self.control,
+        )?;
+        debug_assert_eq!(result.value_type.data_type(), &output_type);
+        Ok(result)
+    }
+
     fn analyze_access(
         &self,
         base: TypedExpr,
         access: &ast::AccessKind,
         scope: &AnalyzerScope,
-        span: Span,
+        _span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
         match access {
-            ast::AccessKind::Field(ident) => {
-                self.analyze_struct_field_access(base, ident.value.clone(), ident.span)
-            }
-            ast::AccessKind::Subscript(index) => {
-                let mut index_typed = self.analyze_expr(index, scope)?;
-                let output_type = match &base.value_type.data_type() {
-                    DataType::List(item) => {
-                        index_typed = cast_null_preserving_target_type(
-                            index_typed,
-                            &DataType::Int32,
-                            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                        );
-                        item.data_type().clone()
-                    }
-                    DataType::Map(entries, _) => {
-                        let DataType::Struct(fields) = entries.data_type() else {
-                            return Err(AnalyzeError::invalid_argument(
-                                "map subscript expects STRUCT map entries",
-                                span,
-                            ));
-                        };
-                        if fields.len() != 2 {
-                            return Err(AnalyzeError::invalid_argument(
-                                "map subscript expects key/value entries",
-                                span,
-                            ));
-                        }
-                        // The map owns its complete key declaration. Its carrier
-                        // alone cannot author the probe's nominal identity.
-                        let key =
-                            container_child_value_type_observed(&base.value_type, 0, self.control)?;
-                        if !novarocks_functions::builtin::map_lookup_core::has_uninhabited_map_key(
-                            &base.value_type,
-                        ) {
-                            let target =
-                                self.implicit_common_cast_target(&index_typed.value_type, &key);
-                            index_typed =
-                                self.cast_to_value_type(index_typed, target, index.span())?;
-                        }
-                        fields[1].data_type().clone()
-                    }
-                    DataType::Struct(fields) => {
-                        return match &index_typed.kind {
-                            ExprKind::Literal(LiteralValue::String(field_name)) => {
-                                self.analyze_struct_field_access(base, field_name.clone(), span)
-                            }
-                            // 1-based positional access: `struct_val[1]` →
-                            // first field of the STRUCT. Matches StarRocks /
-                            // Spark / Trino convention.
-                            ExprKind::Literal(LiteralValue::Int(pos)) => {
-                                if *pos < 1 || (*pos as usize) > fields.len() {
-                                    return Err(AnalyzeError::invalid_argument(
-                                        format!(
-                                            "struct subscript {} is out of range (1..{})",
-                                            pos,
-                                            fields.len()
-                                        ),
-                                        span,
-                                    ));
-                                }
-                                let field_name = fields[(*pos as usize) - 1].name().clone();
-                                self.analyze_struct_field_access(base, field_name, span)
-                            }
-                            _ => Err(AnalyzeError::invalid_argument(
-                                format!(
-                                    "struct subscript requires a string literal field name or 1-based integer index, got {:?}",
-                                    index_typed.kind
-                                ),
-                                span,
-                            )),
-                        };
-                    }
-                    other => {
-                        return Err(AnalyzeError::invalid_argument(
-                            format!(
-                                "subscript access expects ARRAY, MAP, or STRUCT input, got {:?}",
-                                other
-                            ),
-                            span,
-                        ));
-                    }
-                };
-                let function_name = match &base.value_type.data_type() {
-                    DataType::List(_) => "__array_element_at",
-                    DataType::Map(_, _) => "__map_element_at",
-                    _ => unreachable!("only array/map subscripts reach this branch"),
-                };
-                let result = resolved_scalar_call_at(
-                    self.function_catalog,
-                    function_name,
-                    vec![base, index_typed],
-                    span,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    self.constant_policy,
-                    self.control,
-                )?;
-                debug_assert_eq!(result.value_type.data_type(), &output_type);
-                Ok(result)
-            }
             ast::AccessKind::Json { operator: _, path } => {
                 self.analyze_json_arrow_from_typed(base, path, scope)
             }
@@ -717,7 +763,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
     fn analyze_compound_identifier(
         &self,
-        parts: &[ast::Ident],
+        parts: &[&ast::Ident],
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         // A compound identifier `a.b.c.d...` can mean several different things
@@ -4323,11 +4369,15 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::Access(access) => {
                 self.expr_contains_aggregate(&access.expr)
                     || match &access.kind {
-                        ast::AccessKind::Subscript(index) => self.expr_contains_aggregate(index),
                         ast::AccessKind::Json { path, .. } => self.expr_contains_aggregate(path),
-                        ast::AccessKind::Field(_) => false,
                     }
             }
+            ast::Expr::Subscript(node) => {
+                self.expr_contains_aggregate(&node.base)
+                    || self.expr_contains_aggregate(&node.index)
+            }
+            ast::Expr::Dereference(node) => self.expr_contains_aggregate(&node.base),
+            ast::Expr::ArrayWildcardSubscript(node) => self.expr_contains_aggregate(&node.base),
             ast::Expr::SearchedCase(case) => {
                 self.case_contains_aggregate(&case.when_clauses, case.default_value.as_ref())
             }
@@ -4343,9 +4393,6 @@ impl<'a> super::AnalyzerContext<'a> {
 fn slice_boundary_keyword(expr: &ast::Expr) -> Option<String> {
     let token = match expr {
         ast::Expr::Identifier(ident) => ident.value.to_ascii_lowercase(),
-        ast::Expr::CompoundIdentifier(parts) if parts.parts.len() == 1 => {
-            parts.parts[0].value.to_ascii_lowercase()
-        }
         ast::Expr::Nested(nested) => return slice_boundary_keyword(&nested.expression),
         _ => return None,
     };
@@ -6580,28 +6627,26 @@ fn format_percentile_error_value(value: f64) -> String {
 }
 
 fn extract_lambda_field_chain(expr: &ast::Expr, param_name: &str) -> Result<Vec<String>, String> {
-    match expr {
-        ast::Expr::Nested(inner) => extract_lambda_field_chain(&inner.expression, param_name),
-        ast::Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case(param_name) => {
-            Ok(vec![])
+    let mut current = expr;
+    let mut fields = Vec::new();
+    loop {
+        match current {
+            ast::Expr::Nested(inner) => current = &inner.expression,
+            ast::Expr::Dereference(node) => {
+                let Some(field) = &node.field else {
+                    return Err("array_sortby lambda rewrite only supports dotted struct field access".to_string());
+                };
+                fields.push(field.value.clone());
+                current = &node.base;
+            }
+            ast::Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case(param_name) => {
+                fields.reverse();
+                return Ok(fields);
+            }
+            _ => return Err(
+                "array_sortby lambda rewrite only supports direct struct field access like (x) -> x.item".to_string(),
+            ),
         }
-        ast::Expr::CompoundIdentifier(parts)
-            if !parts.parts.is_empty() && parts.parts[0].value.eq_ignore_ascii_case(param_name) =>
-        {
-            Ok(parts.parts[1..].iter().map(|part| part.value.clone()).collect())
-        }
-        ast::Expr::Access(access) => {
-            let mut fields = extract_lambda_field_chain(&access.expr, param_name)?;
-            let ast::AccessKind::Field(ident) = &access.kind else {
-                return Err("array_sortby lambda rewrite only supports dotted struct field access".to_string());
-            };
-            fields.push(ident.value.clone());
-            Ok(fields)
-        }
-        _ => Err(
-            "array_sortby lambda rewrite only supports direct struct field access like (x) -> x.item"
-                .to_string(),
-        ),
     }
 }
 

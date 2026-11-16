@@ -27,12 +27,12 @@ use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
         AccessExpr, AccessKind, ArrayExpr, BinaryExpr, BinaryOperator, CastExpr, DataTypeParameter,
-        ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier, Ident, InListExpr,
-        IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration, LambdaExpr, Literal,
-        LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment, ObjectName, RowDataTypeField,
-        RowExpr, RowField, SearchedCaseExpr, SimpleCaseExpr, SubqueryExpr, TypeName, UnaryExpr,
-        UnaryOperator, WhenClause, WhenMatch, WindowFrame, WindowFrameBound, WindowFrameExclusion,
-        WindowFrameUnits, WindowSpec,
+        DereferenceExpr, ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier,
+        Ident, InListExpr, IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration,
+        LambdaExpr, Literal, LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment, ObjectName,
+        RowDataTypeField, RowExpr, RowField, SearchedCaseExpr, SimpleCaseExpr, SubqueryExpr,
+        TypeName, UnaryExpr, UnaryOperator, WhenClause, WhenMatch, WindowFrame, WindowFrameBound,
+        WindowFrameExclusion, WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -369,9 +369,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         Ok(left)
     }
 
-    fn parse_postfix_access(&mut self, expr: Expr) -> Result<Expr, ParseError> {
-        let start = expr.span().start();
-        let kind = if self.current_is_symbol(Symbol::LBracket) {
+    fn parse_postfix_access(&mut self, base: Expr) -> Result<Expr, ParseError> {
+        let start = base.span().start();
+        if self.current_is_symbol(Symbol::LBracket) {
             self.advance();
             self.skip_trivia();
             let index = self.parse_binding_power(0)?;
@@ -382,12 +382,13 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             let end = self.current_span().end();
             self.advance();
             self.skip_trivia();
-            return Ok(Expr::Access(AccessExpr {
-                expr: Box::new(expr),
-                kind: AccessKind::Subscript(Box::new(index)),
+            return Ok(Expr::Subscript(AstBox::new(crate::ast::SubscriptExpr {
+                base,
+                index,
                 span: Span::new(start, end),
-            }));
-        } else if self.current_is_symbol(Symbol::Dot) {
+            })));
+        }
+        if self.current_is_symbol(Symbol::Dot) {
             self.advance();
             self.skip_trivia();
             let Some(token) = self.current().cloned() else {
@@ -400,12 +401,13 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 return Err(self.unexpected("field name after '.'"));
             }
             let field = self.parse_identifier(token.span);
-            return Ok(Expr::Access(AccessExpr {
-                expr: Box::new(expr),
+            return Ok(Expr::Dereference(AstBox::new(DereferenceExpr {
                 span: Span::new(start, field.span.end()),
-                kind: AccessKind::Field(field),
-            }));
-        } else if self.current_is_symbol(Symbol::Arrow) {
+                base,
+                field: Some(field),
+            })));
+        }
+        let kind = if self.current_is_symbol(Symbol::Arrow) {
             JsonOperator::Arrow
         } else {
             JsonOperator::ArrowText
@@ -415,7 +417,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let path = self.parse_binding_power(UNARY_ARITHMETIC_PRECEDENCE + 1)?;
         let end = path.span().end();
         Ok(Expr::Access(AccessExpr {
-            expr: Box::new(expr),
+            expr: Box::new(base),
             kind: AccessKind::Json {
                 operator: kind,
                 path: Box::new(path),
@@ -1402,14 +1404,17 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         };
         self.skip_trivia();
         if !self.current_is_symbol(Symbol::LParen) {
-            return Ok(if name.parts.len() == 1 {
-                Expr::Identifier(name.parts.into_iter().next().expect("one identifier"))
-            } else {
-                Expr::CompoundIdentifier(crate::ast::CompoundIdentifier {
-                    span: name.span,
-                    parts: name.parts,
-                })
-            });
+            let mut parts = name.parts.into_iter();
+            let mut expression = Expr::Identifier(parts.next().expect("nonempty name"));
+            for field in parts {
+                let span = expression.span().cover(field.span);
+                expression = Expr::Dereference(AstBox::new(DereferenceExpr {
+                    base: expression,
+                    field: Some(field),
+                    span,
+                }));
+            }
+            return Ok(expression);
         }
 
         self.advance();

@@ -593,17 +593,23 @@ impl Visit for CatalogEdits<'_> {
         walk_function_call(self, call);
     }
     fn visit_expr(&mut self, e: &Expr) {
-        if let Expr::CompoundIdentifier(name) = e
-            && name.parts.len() >= 4
-            && self.relations.contains(
-                &name.parts[..3]
-                    .iter()
+        if let Some(chain) = syntax_identifier_chain(e) {
+            if chain.len() >= 4 {
+                let mut relation = chain
+                    .iter_rev()
+                    .skip(chain.len() - 3)
                     .map(|part| key(&part.value))
-                    .collect::<Vec<_>>(),
-            )
-            && !self.aliases.contains(&key(&name.parts[0].value))
-        {
-            self.ident(&name.parts[0]);
+                    .collect::<Vec<_>>();
+                relation.reverse();
+                if self.relations.contains(&relation)
+                    && !self.aliases.contains(&key(&chain.first().value))
+                {
+                    self.ident(chain.first());
+                }
+            }
+            // Inspect one complete reference; its prefixes share this same
+            // catalog occurrence and cannot own a separate catalog edit.
+            return;
         }
         walk_expr(self, e);
     }
@@ -690,12 +696,12 @@ impl Visit for CatalogEdits<'_> {
         walk_predicated_expr(self, e);
     }
 }
+fn syntax_identifier_chain(expr: &Expr) -> Option<IdentifierChain<'_>> {
+    identifier_chain_observed(expr, |_| Ok::<(), std::convert::Infallible>(()))
+        .unwrap_or_else(|never| match never {})
+}
 fn catalog_column(expr: &Expr) -> Option<&Ident> {
-    let ident = match expr {
-        Expr::Identifier(n) => n,
-        Expr::CompoundIdentifier(n) => n.parts.last()?,
-        _ => return None,
-    };
+    let ident = syntax_identifier_chain(expr)?.last();
     CATALOG_COLUMNS
         .contains(&ident.value.to_ascii_lowercase().as_str())
         .then_some(ident)
@@ -713,11 +719,7 @@ fn metadata_query(q: &Query) -> bool {
 
 const RELATION_ARRAY_COLUMNS: &[&str] = &["base_tables", "upstream_materialized_views"];
 fn relation_array_column(expr: &Expr) -> Option<&Ident> {
-    let ident = match expr {
-        Expr::Identifier(name) => name,
-        Expr::CompoundIdentifier(name) => name.parts.last()?,
-        _ => return None,
-    };
+    let ident = syntax_identifier_chain(expr)?.last();
     RELATION_ARRAY_COLUMNS
         .contains(&ident.value.to_ascii_lowercase().as_str())
         .then_some(ident)
@@ -785,12 +787,12 @@ fn catalog_output_plan(sql: &str) -> Vec<OutputColumn> {
                         let current = select.from.is_empty()
                             && matches!(expr,Expr::FunctionCall(call) if call.name.parts.len()==1 && call.name.parts[0].value.eq_ignore_ascii_case("current_catalog") && call.arguments.is_empty());
                         let catalog = (metadata && catalog_column(expr).is_some()) || current;
-                        let header = alias.unwrap_or_else(|| match expr {
-                            Expr::Identifier(name) => name.value.clone(),
-                            Expr::CompoundIdentifier(name) => {
-                                name.parts.last().unwrap().value.clone()
-                            }
-                            _ => sql[expr.span().start()..expr.span().end()].to_string(),
+                        let header = alias.unwrap_or_else(|| {
+                            syntax_identifier_chain(expr)
+                                .map(|chain| chain.last().value.clone())
+                                .unwrap_or_else(|| {
+                                    sql[expr.span().start()..expr.span().end()].to_string()
+                                })
                         });
                         let relations = state_table && relation_array_column(expr).is_some();
                         result.push(OutputColumn::Named {

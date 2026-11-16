@@ -527,12 +527,16 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
         Expr::Access(access) => {
             validate_expr(&access.expr)?;
             match &access.kind {
-                super::AccessKind::Field(_) => {}
-                super::AccessKind::Subscript(index) => validate_expr(index)?,
                 super::AccessKind::Json { path, .. } => validate_expr(path)?,
             }
         }
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Literal(_) => {}
+        Expr::Subscript(node) => {
+            validate_expr(&node.base)?;
+            validate_expr(&node.index)?;
+        }
+        Expr::ArrayWildcardSubscript(node) => validate_expr(&node.base)?,
+        Expr::Dereference(node) => validate_expr(&node.base)?,
+        Expr::Identifier(_) | Expr::Literal(_) => {}
     }
     Ok(())
 }

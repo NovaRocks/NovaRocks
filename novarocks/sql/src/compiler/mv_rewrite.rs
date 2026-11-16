@@ -3068,9 +3068,15 @@ impl Visit for CompletionRetainedBytes {
             }
             Expr::JsonArray(_) => self.add(std::mem::size_of::<novarocks_parser::ast::JsonArray>()),
 
-            Expr::CompoundIdentifier(identifier) => {
-                self.add_vec_capacity::<Ident>(identifier.parts.capacity());
+            Expr::Dereference(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::DereferenceExpr>())
             }
+            Expr::Subscript(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::SubscriptExpr>())
+            }
+            Expr::ArrayWildcardSubscript(_) => self.add(std::mem::size_of::<
+                novarocks_parser::ast::ArrayWildcardSubscriptExpr,
+            >()),
             Expr::Logical(expression) => {
                 self.add_vec_capacity::<Expr>(expression.terms.capacity());
             }

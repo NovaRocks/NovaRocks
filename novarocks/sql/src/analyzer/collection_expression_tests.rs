@@ -694,3 +694,31 @@ fn multi_column_in_decomposes_only_anonymous_row_fields() {
     assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
     assert!(ctx.collected_subqueries.borrow().is_empty());
 }
+
+#[test]
+fn unsupported_access_profiles_refuse_before_base_or_table_resolution() {
+    use crate::analyze_error::AnalyzeErrorKind;
+    use novarocks_parser::{Span, build};
+    let span = Span::new(7, 31);
+    for expression in [
+        ast::Expr::Dereference(ast::AstBox::new(ast::DereferenceExpr {
+            base: build::identifier(build::ident("unknown_base", false)),
+            field: None,
+            span,
+        })),
+        ast::Expr::ArrayWildcardSubscript(ast::AstBox::new(ast::ArrayWildcardSubscriptExpr {
+            base: build::identifier(build::ident("unknown_base", false)),
+            span,
+        })),
+    ] {
+        let mut parsed = query("SELECT 1 FROM unknown_table");
+        let ast::SetExpr::Select(select) = parsed.body.as_mut() else {
+            panic!("SELECT fixture");
+        };
+        select.projection[0] = ast::SelectItem::UnnamedExpr(expression);
+        // NoTables panics on lookup, so this also protects public prepass order.
+        let error = crate::analyzer::analyze(&parsed, &NoTables, "default").unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+        assert_eq!(error.span(), Some(span));
+    }
+}

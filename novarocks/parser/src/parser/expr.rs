@@ -439,8 +439,8 @@ mod tests {
             ),
             Expr::Cast(_)
         ));
-        assert!(matches!(parse("items[1]"), Expr::Access(_)));
-        assert!(matches!(parse("items[1].field"), Expr::Access(_)));
+        assert!(matches!(parse("items[1]"), Expr::Subscript(_)));
+        assert!(matches!(parse("items[1].field"), Expr::Dereference(_)));
         assert!(matches!(parse("left('value', 2)"), Expr::FunctionCall(_)));
         assert!(matches!(parse("right('value', 2)"), Expr::FunctionCall(_)));
         assert!(matches!(
@@ -548,6 +548,100 @@ mod tests {
         ] {
             let tokens = lex(source).unwrap();
             assert!(parse_expression(source, &tokens).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn qualified_names_keep_original_identifier_quotes_and_source_spans() {
+        let source = "`db`.`table`.`a b`";
+        let expression = parse(source);
+        let view = crate::ast::identifier_chain_observed(&expression, |_| Ok::<_, ()>(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.len(), 3);
+        let actual = view
+            .iter_rev()
+            .map(|id| {
+                (
+                    id.value.as_str(),
+                    id.quoted,
+                    &source[id.span.start()..id.span.end()],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                ("a b", true, "`a b`"),
+                ("table", true, "`table`"),
+                ("db", true, "`db`")
+            ]
+        );
+        assert_eq!(expression.span(), Span::new(0, source.len()));
+    }
+
+    #[test]
+    fn subscript_and_computed_field_preserve_their_real_children() {
+        let source = "items[slot].`Field`";
+        let expression = parse(source);
+        let Expr::Dereference(node) = &expression else {
+            panic!("dereference");
+        };
+        let field = node.field.as_ref().unwrap();
+        assert_eq!((&*field.value, field.quoted), ("Field", true));
+        assert_eq!(&source[field.span.start()..field.span.end()], "`Field`");
+        let Expr::Subscript(subscript) = &node.base else {
+            panic!("subscript base");
+        };
+        assert_eq!(
+            &source[subscript.base.span().start()..subscript.base.span().end()],
+            "items"
+        );
+        assert_eq!(
+            &source[subscript.index.span().start()..subscript.index.span().end()],
+            "slot"
+        );
+        assert_eq!(
+            &source[subscript.span.start()..subscript.span.end()],
+            "items[slot]"
+        );
+        assert!(
+            crate::ast::identifier_chain_observed(&expression, |_| Ok::<_, ()>(()))
+                .unwrap()
+                .is_none()
+        );
+        for source in ["items[*]", "items.*"] {
+            let tokens = lex(source).unwrap();
+            assert!(
+                parse_expression(source, &tokens).is_err(),
+                "legacy grammar stays unchanged: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_json_arrows_retain_their_original_operator_and_dynamic_path() {
+        for (operator, expected) in [
+            ("->", crate::ast::JsonOperator::Arrow),
+            ("->>", crate::ast::JsonOperator::ArrowText),
+        ] {
+            let source = format!("`payload`.value {operator} path_column");
+            let expression = parse(&source);
+            let Expr::Access(node) = &expression else {
+                panic!("JSON access");
+            };
+            let crate::ast::AccessKind::Json { operator, path } = &node.kind;
+            assert_eq!(*operator, expected);
+            assert_eq!(
+                &source[node.expr.span().start()..node.expr.span().end()],
+                "`payload`.value"
+            );
+            assert_eq!(
+                &source[path.span().start()..path.span().end()],
+                "path_column"
+            );
+            assert!(matches!(path.as_ref(), Expr::Identifier(_)));
+            assert!(matches!(node.expr.as_ref(), Expr::Dereference(_)));
+            assert_eq!(node.span, Span::new(0, source.len()));
         }
     }
 }
