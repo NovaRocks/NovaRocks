@@ -352,3 +352,181 @@ fn eq_option<T: SyntaxEq>(left: &Option<T>, right: &Option<T>) -> bool {
         _ => false,
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IfExpr {
+    pub condition: Expr,
+    pub true_value: Expr,
+    pub false_value: Option<Expr>,
+    pub span: Span,
+}
+
+impl IfExpr {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+
+#[recursive::recursive]
+pub fn walk_if_expr<V: Visit + ?Sized>(visitor: &mut V, node: &IfExpr) {
+    visitor.visit_expr(&node.condition);
+    visitor.visit_expr(&node.true_value);
+    if let Some(child) = &node.false_value {
+        visitor.visit_expr(child);
+    }
+}
+
+#[recursive::recursive]
+pub fn fold_if_expr<F: Fold + ?Sized>(folder: &mut F, mut node: IfExpr) -> IfExpr {
+    node.condition = folder.fold_expr(node.condition);
+    node.true_value = folder.fold_expr(node.true_value);
+    node.false_value = node.false_value.map(|child| folder.fold_expr(child));
+    node
+}
+
+impl SyntaxEq for IfExpr {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.condition.syntax_eq(&other.condition)
+            && self.true_value.syntax_eq(&other.true_value)
+            && eq_option(&self.false_value, &other.false_value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NullIfExpr {
+    pub first: Expr,
+    pub second: Expr,
+    pub span: Span,
+}
+
+impl NullIfExpr {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+
+#[recursive::recursive]
+pub fn walk_null_if_expr<V: Visit + ?Sized>(visitor: &mut V, node: &NullIfExpr) {
+    visitor.visit_expr(&node.first);
+    visitor.visit_expr(&node.second);
+}
+
+#[recursive::recursive]
+pub fn fold_null_if_expr<F: Fold + ?Sized>(folder: &mut F, mut node: NullIfExpr) -> NullIfExpr {
+    node.first = folder.fold_expr(node.first);
+    node.second = folder.fold_expr(node.second);
+    node
+}
+
+impl SyntaxEq for NullIfExpr {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.first.syntax_eq(&other.first) && self.second.syntax_eq(&other.second)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoalesceExpr {
+    pub operands: AstVec<Expr>,
+    pub span: Span,
+}
+
+impl CoalesceExpr {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+
+#[recursive::recursive]
+pub fn walk_coalesce_expr<V: Visit + ?Sized>(visitor: &mut V, node: &CoalesceExpr) {
+    for child in &node.operands {
+        visitor.visit_expr(child);
+    }
+}
+
+#[recursive::recursive]
+pub fn fold_coalesce_expr<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut node: CoalesceExpr,
+) -> CoalesceExpr {
+    node.operands = node
+        .operands
+        .into_iter()
+        .map(|child| folder.fold_expr(child))
+        .collect();
+    node
+}
+
+impl SyntaxEq for CoalesceExpr {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        eq_slice(&self.operands, &other.operands)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TryExpr {
+    pub inner: Expr,
+    pub span: Span,
+}
+
+impl TryExpr {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+
+#[recursive::recursive]
+pub fn walk_try_expr<V: Visit + ?Sized>(visitor: &mut V, node: &TryExpr) {
+    visitor.visit_expr(&node.inner);
+}
+
+#[recursive::recursive]
+pub fn fold_try_expr<F: Fold + ?Sized>(folder: &mut F, mut node: TryExpr) -> TryExpr {
+    node.inner = folder.fold_expr(node.inner);
+    node
+}
+
+impl SyntaxEq for TryExpr {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.inner.syntax_eq(&other.inner)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FormatExpr {
+    pub arguments: AstVec<Expr>,
+    pub span: Span,
+}
+
+impl FormatExpr {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+
+#[recursive::recursive]
+pub fn walk_format_expr<V: Visit + ?Sized>(visitor: &mut V, node: &FormatExpr) {
+    for child in &node.arguments {
+        visitor.visit_expr(child);
+    }
+}
+
+#[recursive::recursive]
+pub fn fold_format_expr<F: Fold + ?Sized>(folder: &mut F, mut node: FormatExpr) -> FormatExpr {
+    node.arguments = node
+        .arguments
+        .into_iter()
+        .map(|child| folder.fold_expr(child))
+        .collect();
+    node
+}
+
+impl SyntaxEq for FormatExpr {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        eq_slice(&self.arguments, &other.arguments)
+    }
+}

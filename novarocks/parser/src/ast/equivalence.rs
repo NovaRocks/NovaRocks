@@ -505,6 +505,12 @@ impl SyntaxEq for Expr {
             (Self::Identifier(left), Self::Identifier(right)) => left.syntax_eq(right),
             (Self::Literal(left), Self::Literal(right)) => left.syntax_eq(right),
             (Self::FunctionCall(left), Self::FunctionCall(right)) => left.syntax_eq(right),
+            (Self::If(left), Self::If(right)) => left.syntax_eq(right),
+            (Self::NullIf(left), Self::NullIf(right)) => left.syntax_eq(right),
+            (Self::Coalesce(left), Self::Coalesce(right)) => left.syntax_eq(right),
+            (Self::Try(left), Self::Try(right)) => left.syntax_eq(right),
+            (Self::Format(left), Self::Format(right)) => left.syntax_eq(right),
+
             (Self::WindowOperation(left), Self::WindowOperation(right)) => left.syntax_eq(right),
             (Self::Unary(left), Self::Unary(right)) => left.syntax_eq(right),
             (Self::Binary(left), Self::Binary(right)) => left.syntax_eq(right),

@@ -47,6 +47,14 @@ pub enum SqlConstantExpressionStep {
     SubscriptBase,
     SubscriptIndex,
     FunctionArgumentValue(usize),
+    IfCondition,
+    IfTrue,
+    IfFalse,
+    NullIfFirst,
+    NullIfSecond,
+    CoalesceOperand(usize),
+    TryInner,
+    FormatArgument(usize),
     FunctionOrderByKey(usize),
     WindowOrderByKey(usize),
     CaseOperand,
@@ -291,6 +299,26 @@ pub(crate) fn resolve_expression_site<'a>(
                         invalid("constant source window ORDER BY key differs from its owned syntax")
                     })?
                     .sort_key
+            }
+            (SqlConstantExpressionStep::IfCondition, ast::Expr::If(node)) => &node.condition,
+            (SqlConstantExpressionStep::IfTrue, ast::Expr::If(node)) => &node.true_value,
+            (SqlConstantExpressionStep::IfFalse, ast::Expr::If(node)) => {
+                node.false_value.as_ref().ok_or_else(|| {
+                    invalid("constant source IF false value is absent from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::NullIfFirst, ast::Expr::NullIf(node)) => &node.first,
+            (SqlConstantExpressionStep::NullIfSecond, ast::Expr::NullIf(node)) => &node.second,
+            (SqlConstantExpressionStep::CoalesceOperand(index), ast::Expr::Coalesce(node)) => {
+                node.operands.get(*index).ok_or_else(|| {
+                    invalid("constant source COALESCE operand differs from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::TryInner, ast::Expr::Try(node)) => &node.inner,
+            (SqlConstantExpressionStep::FormatArgument(index), ast::Expr::Format(node)) => {
+                node.arguments.get(*index).ok_or_else(|| {
+                    invalid("constant source FORMAT argument differs from its owned syntax")
+                })?
             }
             (SqlConstantExpressionStep::CaseOperand, ast::Expr::SimpleCase(case)) => &case.operand,
             (SqlConstantExpressionStep::CaseWhenOperand(index), ast::Expr::SearchedCase(case)) => {

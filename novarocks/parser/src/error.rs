@@ -131,6 +131,8 @@ pub enum StructuralViolation {
     JsonConstructorInvariant(crate::ast::JsonAstInvariantError),
     EmptyUnnestExpressionList,
     EmptyCaseBranches,
+    TooFewCoalesceOperands,
+    TooFewFormatArguments,
     DuplicateTableColumnName,
 }
 

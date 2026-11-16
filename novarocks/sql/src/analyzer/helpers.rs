@@ -924,6 +924,21 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
                 expr_display_name_preserve_path(&lambda.body)
             )
         }
+        ast::Expr::If(node) => {
+            let mut arguments = vec![&node.condition, &node.true_value];
+            arguments.extend(node.false_value.iter());
+            format_control_call_display("if", &arguments)
+        }
+        ast::Expr::NullIf(node) => {
+            format_control_call_display("nullif", &[&node.first, &node.second])
+        }
+        ast::Expr::Coalesce(node) => {
+            format_control_call_display("coalesce", &node.operands.iter().collect::<Vec<_>>())
+        }
+        ast::Expr::Try(node) => format_control_call_display("try", &[&node.inner]),
+        ast::Expr::Format(node) => {
+            format_control_call_display("format", &node.arguments.iter().collect::<Vec<_>>())
+        }
         ast::Expr::FunctionCall(function)
             if function.processing_mode.is_some()
                 || function
@@ -1395,6 +1410,17 @@ fn canonical_display_function_name(name: &str) -> String {
         "struct" => "row".to_string(),
         other => other.to_string(),
     }
+}
+
+fn format_control_call_display(name: &str, arguments: &[&ast::Expr]) -> String {
+    format!(
+        "{name}({})",
+        arguments
+            .iter()
+            .map(|argument| expr_display_name_preserve_path(argument))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn format_function_display_name(function: &ast::FunctionCall) -> String {

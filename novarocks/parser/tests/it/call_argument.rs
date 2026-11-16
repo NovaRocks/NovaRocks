@@ -245,3 +245,236 @@ fn public_validation_preserves_named_mode_facts_and_checks_argument_then_filter_
         );
     }
 }
+
+#[test]
+fn control_call_producers_keep_optional_else_decoded_full_names_and_ordered_terms() {
+    let absent = expression("IF(flag, first)");
+    let explicit_null = expression("IF(flag, first, NULL)");
+    let Expr::If(node) = &absent else {
+        panic!("IF");
+    };
+    assert!(node.false_value.is_none());
+    assert_eq!(
+        (
+            printer::print_expr(&absent),
+            printer::print_expr(&explicit_null)
+        ),
+        (
+            "IF(flag, first)".to_owned(),
+            "IF(flag, first, NULL)".to_owned()
+        )
+    );
+    assert!(!absent.syntax_eq(&explicit_null));
+    assert!(absent.syntax_eq(&expression("`iF`(flag, first)")));
+    assert!(absent.syntax_eq(&expression("IF(ALL flag, first)")));
+    for source in ["schema.if(flag, first)", "`schema.if`(flag, first)"] {
+        assert!(
+            matches!(expression(source), Expr::FunctionCall(_)),
+            "{source}"
+        );
+    }
+    for (source, canonical) in [
+        ("nullif(first, second)", "NULLIF(first, second)"),
+        ("coalesce(a, b, c, d)", "COALESCE(a, b, c, d)"),
+        ("try(inner_value)", "TRY(inner_value)"),
+        ("format('%s', a, b, c)", "FORMAT('%s', a, b, c)"),
+    ] {
+        let node = expression(source);
+        assert_eq!(node.span(), Span::new(0, source.len()));
+        assert_eq!(printer::print_expr(&node), canonical);
+        assert!(node.syntax_eq(&expression(canonical)));
+    }
+    let source = "coalesce(a, b, c, d)";
+    let node = expression(source);
+    let Expr::Coalesce(node) = node else {
+        panic!("COALESCE");
+    };
+    assert_eq!(node.operands.len(), 4);
+    assert_eq!(
+        node.operands
+            .iter()
+            .map(|term| &source[term.span().start()..term.span().end()])
+            .collect::<Vec<_>>(),
+        ["a", "b", "c", "d"]
+    );
+}
+
+#[test]
+fn control_call_parser_enforces_real_arity_metadata_and_pinned_order_by_normalization() {
+    use novarocks_parser::ParseError;
+    for source in [
+        "if()",
+        "if(a)",
+        "if(a,b,c,d)",
+        "nullif(a)",
+        "nullif(a,b,c)",
+        "coalesce()",
+        "coalesce(a)",
+        "try()",
+        "try(a,b)",
+        "format()",
+        "format('fmt')",
+    ] {
+        let tokens = novarocks_parser::lex(source).unwrap();
+        assert!(
+            matches!(novarocks_parser::parser::parse_expression(source,&tokens),Err(ParseError::UnexpectedToken{span,..}) if span==Span::new(0,source.len())),
+            "{source}"
+        );
+    }
+    for (name, args) in [
+        ("if", "a, b"),
+        ("nullif", "a, b"),
+        ("coalesce", "a, b, c, d"),
+        ("try", "a"),
+        ("format", "'%s', a"),
+    ] {
+        for source in [
+            format!("{name}(DISTINCT {args})"),
+            format!("{name}({args}) OVER w"),
+            format!("{name}({args}) FILTER (WHERE flag)"),
+            format!("{name}({args}) IGNORE NULLS"),
+            format!("{name}({args} SEPARATOR ',')"),
+        ] {
+            let tokens = novarocks_parser::lex(&source).unwrap();
+            assert!(
+                novarocks_parser::parser::parse_expression(&source, &tokens).is_err(),
+                "{source}"
+            );
+        }
+    }
+    let source = "if(a) OVER w";
+    let tokens = novarocks_parser::lex(source).unwrap();
+    let error = novarocks_parser::parser::parse_expression(source, &tokens).unwrap_err();
+    assert!(
+        matches!(error,ParseError::UnexpectedToken{expected,..} if expected.contains("arguments"))
+    );
+    assert!(novarocks_parser::parse("SELECT * FROM TABLE(if(named => a, b))").is_err());
+    // The exact pinned builder visits ORDER BY and then omits it from these
+    // dedicated nodes. This assertion is syntax, not execution capability.
+    let with_order = expression("coalesce(a, b, c, d ORDER BY ignored)");
+    assert!(with_order.syntax_eq(&expression("coalesce(a, b, c, d)")));
+    assert_eq!(printer::print_expr(&with_order), "COALESCE(a, b, c, d)");
+}
+
+#[test]
+fn control_builders_hooks_syntax_equality_and_public_constructor_guards_keep_real_children() {
+    let source = "IF(flag, first, coalesce(a, b, c, d))";
+    let original = expression(source);
+    let Expr::If(node) = &original else {
+        panic!("IF");
+    };
+    let Expr::Coalesce(fallback) = node.false_value.as_ref().unwrap() else {
+        panic!("COALESCE");
+    };
+    struct Seen(Vec<*const Expr>);
+    impl Visit for Seen {
+        fn visit_expr(&mut self, node: &Expr) {
+            self.0.push(node);
+            walk_expr(self, node);
+        }
+    }
+    let mut seen = Seen(Vec::new());
+    seen.visit_expr(&original);
+    let expected = vec![
+        &original as *const Expr,
+        &node.condition,
+        &node.true_value,
+        node.false_value.as_ref().unwrap(),
+        &fallback.operands[0],
+        &fallback.operands[1],
+        &fallback.operands[2],
+        &fallback.operands[3],
+    ];
+    assert_eq!(seen.0, expected);
+    struct Rename;
+    impl Fold for Rename {
+        fn fold_ident(&mut self, mut name: Ident) -> Ident {
+            name.value.push_str("_new");
+            name
+        }
+    }
+    let changed = Rename.fold_expr(original.clone());
+    assert_eq!(
+        printer::print_expr(&changed),
+        "IF(flag_new, first_new, COALESCE(a_new, b_new, c_new, d_new))"
+    );
+    assert_eq!(changed.span(), original.span());
+    assert!(!original.syntax_eq(&changed));
+    let mut shifted = original.clone();
+    let Expr::If(node) = &mut shifted else {
+        unreachable!()
+    };
+    node.span = Span::new(1000, 1001);
+    assert!(original.syntax_eq(&shifted));
+    for (built, source) in [
+        (
+            build::if_expr(value("flag", 11), value("first", 21), None),
+            "IF(flag, first)",
+        ),
+        (
+            build::null_if(value("a", 11), value("b", 21)),
+            "NULLIF(a, b)",
+        ),
+        (
+            build::coalesce(vec![
+                value("a", 11),
+                value("b", 21),
+                value("c", 31),
+                value("d", 41),
+            ])
+            .unwrap(),
+            "COALESCE(a, b, c, d)",
+        ),
+        (build::try_expr(value("a", 11)), "TRY(a)"),
+        (
+            build::format_expr(vec![
+                expression("'%s'"),
+                value("a", 11),
+                value("b", 21),
+                value("c", 31),
+            ])
+            .unwrap(),
+            "FORMAT('%s', a, b, c)",
+        ),
+    ] {
+        assert!(built.syntax_eq(&expression(source)));
+        validate_statement(&statement(built)).unwrap();
+    }
+    assert_eq!(
+        build::coalesce(vec![value("a", 11)]).unwrap_err(),
+        build::BuildError::TooFewCoalesceOperands
+    );
+    assert_eq!(
+        build::format_expr(vec![value("a", 11)]).unwrap_err(),
+        build::BuildError::TooFewFormatArguments
+    );
+    for (invalid, violation) in [
+        (
+            Expr::Coalesce(AstBox::new(CoalesceExpr {
+                operands: vec![value("a", 11)].into(),
+                span: Span::new(5, 25),
+            })),
+            StructuralViolation::TooFewCoalesceOperands,
+        ),
+        (
+            Expr::Format(AstBox::new(FormatExpr {
+                arguments: vec![value("a", 11)].into(),
+                span: Span::new(5, 25),
+            })),
+            StructuralViolation::TooFewFormatArguments,
+        ),
+    ] {
+        assert_eq!(
+            validate_statement(&statement(invalid)),
+            Err(ValidateError::InvalidStructure {
+                violation,
+                span: Span::new(5, 25)
+            })
+        );
+    }
+    let metadata = build::function(
+        build::object_name(vec![build::ident("if", false)]).unwrap(),
+        Vec::new(),
+    );
+    assert!(matches!(metadata, Expr::FunctionCall(_)));
+}

@@ -1955,3 +1955,288 @@ fn actual_call_argument_value_cycle_keeps_ordered_children_and_named_metadata() 
 fn actual_function_filter_cycle_keeps_original_argument_and_filter_children() {
     assert_actual_call_argument_or_filter_cycle(true);
 }
+
+#[test]
+fn actual_control_call_cycles_keep_all_alternative_child_slots_and_order() {
+    use crate::ast::{
+        CoalesceExpr, Expr, Fold, FormatExpr, IfExpr, Literal, LiteralKind, NullIfExpr, SyntaxEq,
+        TryExpr, Visit,
+    };
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    let span = Span::new(10, 100);
+    let mut tree = build::integer(-1);
+    for marker in 1..=DEPTH {
+        let first = build::integer(marker * 10 + 1);
+        let second = build::integer(marker * 10 + 2);
+        let third = build::integer(marker * 10 + 3);
+        tree = match marker % 10 {
+            0 => Expr::If(AstBox::new(IfExpr {
+                condition: tree,
+                true_value: second,
+                false_value: Some(third),
+                span,
+            })),
+            1 => Expr::If(AstBox::new(IfExpr {
+                condition: first,
+                true_value: tree,
+                false_value: Some(third),
+                span,
+            })),
+            2 => Expr::If(AstBox::new(IfExpr {
+                condition: first,
+                true_value: second,
+                false_value: Some(tree),
+                span,
+            })),
+            3 => Expr::NullIf(AstBox::new(NullIfExpr {
+                first: tree,
+                second,
+                span,
+            })),
+            4 => Expr::NullIf(AstBox::new(NullIfExpr {
+                first,
+                second: tree,
+                span,
+            })),
+            5 => Expr::Coalesce(AstBox::new(CoalesceExpr {
+                operands: vec![tree, first, second].into(),
+                span,
+            })),
+            6 => Expr::Coalesce(AstBox::new(CoalesceExpr {
+                operands: vec![first, second, tree].into(),
+                span,
+            })),
+            7 => Expr::Try(AstBox::new(TryExpr { inner: tree, span })),
+            8 => Expr::Format(AstBox::new(FormatExpr {
+                arguments: vec![tree, first, second].into(),
+                span,
+            })),
+            9 => Expr::Format(AstBox::new(FormatExpr {
+                arguments: vec![first, second, tree].into(),
+                span,
+            })),
+            _ => unreachable!(),
+        };
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    fn number(expression: &Expr) -> i64 {
+        let Expr::Literal(Literal {
+            kind: LiteralKind::Long { parsed_value, .. },
+            ..
+        }) = expression
+        else {
+            panic!("original scalar marker")
+        };
+        *parsed_value
+    }
+    let mut cursor = &mut copy;
+    for marker in (1..=DEPTH).rev() {
+        cursor = match (marker % 10, cursor) {
+            (0, Expr::If(node)) => {
+                assert_eq!(node.span, span);
+                assert_eq!(number(&node.true_value), marker * 10 + 2);
+                assert_eq!(number(node.false_value.as_ref().unwrap()), marker * 10 + 3);
+                &mut node.condition
+            }
+            (1, Expr::If(node)) => {
+                assert_eq!(node.span, span);
+                assert_eq!(number(&node.condition), marker * 10 + 1);
+                assert_eq!(number(node.false_value.as_ref().unwrap()), marker * 10 + 3);
+                &mut node.true_value
+            }
+            (2, Expr::If(node)) => {
+                assert_eq!(node.span, span);
+                assert_eq!(number(&node.condition), marker * 10 + 1);
+                assert_eq!(number(&node.true_value), marker * 10 + 2);
+                node.false_value.as_mut().unwrap()
+            }
+            (3, Expr::NullIf(node)) => {
+                assert_eq!(node.span, span);
+                assert_eq!(number(&node.second), marker * 10 + 2);
+                &mut node.first
+            }
+            (4, Expr::NullIf(node)) => {
+                assert_eq!(node.span, span);
+                assert_eq!(number(&node.first), marker * 10 + 1);
+                &mut node.second
+            }
+            (5, Expr::Coalesce(node)) => {
+                assert_eq!(node.span, span);
+                assert_eq!(node.operands.len(), 3);
+                assert_eq!(number(&node.operands[1]), marker * 10 + 1);
+                assert_eq!(number(&node.operands[2]), marker * 10 + 2);
+                &mut node.operands[0]
+            }
+            (6, Expr::Coalesce(node)) => {
+                assert_eq!(node.span, span);
+                assert_eq!(node.operands.len(), 3);
+                assert_eq!(number(&node.operands[0]), marker * 10 + 1);
+                assert_eq!(number(&node.operands[1]), marker * 10 + 2);
+                &mut node.operands[2]
+            }
+            (7, Expr::Try(node)) => {
+                assert_eq!(node.span, span);
+                &mut node.as_mut().inner
+            }
+            (8, Expr::Format(node)) => {
+                assert_eq!(node.span, span);
+                assert_eq!(node.arguments.len(), 3);
+                assert_eq!(number(&node.arguments[1]), marker * 10 + 1);
+                assert_eq!(number(&node.arguments[2]), marker * 10 + 2);
+                &mut node.arguments[0]
+            }
+            (9, Expr::Format(node)) => {
+                assert_eq!(node.span, span);
+                assert_eq!(node.arguments.len(), 3);
+                assert_eq!(number(&node.arguments[0]), marker * 10 + 1);
+                assert_eq!(number(&node.arguments[1]), marker * 10 + 2);
+                &mut node.arguments[2]
+            }
+            _ => panic!("actual five-family AstBox/AstVec child path"),
+        };
+    }
+    assert_eq!(number(cursor), -1);
+    *cursor = build::integer(-2);
+    assert_ne!(tree, copy);
+    assert!(!tree.syntax_eq(&copy));
+    drop(copy);
+
+    #[derive(Default)]
+    struct Events {
+        nodes: [usize; 5],
+        numbers: Vec<i64>,
+    }
+    impl Visit for Events {
+        fn visit_if_expr(&mut self, node: &IfExpr) {
+            self.nodes[0] += 1;
+            crate::ast::walk_if_expr(self, node);
+        }
+        fn visit_null_if_expr(&mut self, node: &NullIfExpr) {
+            self.nodes[1] += 1;
+            crate::ast::walk_null_if_expr(self, node);
+        }
+        fn visit_coalesce_expr(&mut self, node: &CoalesceExpr) {
+            self.nodes[2] += 1;
+            crate::ast::walk_coalesce_expr(self, node);
+        }
+        fn visit_try_expr(&mut self, node: &TryExpr) {
+            self.nodes[3] += 1;
+            crate::ast::walk_try_expr(self, node);
+        }
+        fn visit_format_expr(&mut self, node: &FormatExpr) {
+            self.nodes[4] += 1;
+            crate::ast::walk_format_expr(self, node);
+        }
+        fn visit_literal(&mut self, node: &Literal) {
+            let LiteralKind::Long { parsed_value, .. } = &node.kind else {
+                panic!("actual ordered integer child")
+            };
+            self.numbers.push(*parsed_value);
+        }
+    }
+    let mut expected = Vec::new();
+    // Prefix children appear from the outermost owner toward the terminal.
+    for marker in (1..=DEPTH).rev() {
+        match marker % 10 {
+            1 | 4 => expected.push(marker * 10 + 1),
+            2 | 6 | 9 => expected.extend([marker * 10 + 1, marker * 10 + 2]),
+            _ => {}
+        }
+    }
+    expected.push(-1);
+    // Suffix children return from the terminal toward the outermost owner.
+    for marker in 1..=DEPTH {
+        match marker % 10 {
+            0 => expected.extend([marker * 10 + 2, marker * 10 + 3]),
+            1 => expected.push(marker * 10 + 3),
+            3 => expected.push(marker * 10 + 2),
+            5 | 8 => expected.extend([marker * 10 + 1, marker * 10 + 2]),
+            _ => {}
+        }
+    }
+    let expected_nodes = [6_000, 4_000, 4_000, 2_000, 4_000];
+    let mut events = Events::default();
+    events.visit_expr(&tree);
+    assert_eq!(events.nodes, expected_nodes);
+    assert_eq!(events.numbers, expected);
+    struct Relocate;
+    impl Fold for Relocate {
+        fn fold_expr(&mut self, node: Expr) -> Expr {
+            let mut node = crate::ast::fold_expr(self, node);
+            let span = Span::new(101, 201);
+            match &mut node {
+                Expr::If(node) => node.span = span,
+                Expr::NullIf(node) => node.span = span,
+                Expr::Coalesce(node) => node.span = span,
+                Expr::Try(node) => node.span = span,
+                Expr::Format(node) => node.span = span,
+                Expr::Literal(node) => node.span = span,
+                _ => panic!("actual control-call or literal child"),
+            }
+            node
+        }
+    }
+    let relocated = Relocate.fold_expr(tree.clone());
+    assert_ne!(tree, relocated);
+    assert!(tree.syntax_eq(&relocated));
+    let mut events = Events::default();
+    events.visit_expr(&relocated);
+    assert_eq!(events.nodes, expected_nodes);
+    assert_eq!(events.numbers, expected);
+    struct Change;
+    impl Fold for Change {
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                panic!("actual integer child")
+            };
+            let Expr::Literal(changed) = build::integer(parsed_value + 1) else {
+                unreachable!()
+            };
+            changed
+        }
+    }
+    let changed = Change.fold_expr(relocated);
+    assert!(!tree.syntax_eq(&changed));
+    let mut events = Events::default();
+    events.visit_expr(&changed);
+    assert_eq!(events.nodes, expected_nodes);
+    assert_eq!(
+        events.numbers,
+        expected.iter().map(|n| n + 1).collect::<Vec<_>>()
+    );
+    drop(changed);
+    let statement =
+        crate::ast::Statement::Query(build::query(crate::ast::SetExpr::Select(Box::new(
+            build::select(
+                vec![build::item(tree.clone(), None, false)],
+                Vec::new(),
+                None,
+                crate::ast::GroupBy::None,
+            )
+            .unwrap(),
+        ))));
+    crate::ast::validate_statement(&statement).unwrap();
+    drop(statement);
+    let printed = crate::printer::print_expr(&tree).to_ascii_uppercase();
+    assert_eq!(printed.matches("NULLIF(").count(), 4_000);
+    // NULLIF also contains the suffix IF; subtract its separately counted owners.
+    assert_eq!(
+        printed.matches("IF(").count() - printed.matches("NULLIF(").count(),
+        6_000
+    );
+    assert_eq!(printed.matches("COALESCE(").count(), 4_000);
+    assert_eq!(printed.matches("TRY(").count(), 2_000);
+    assert_eq!(printed.matches("FORMAT(").count(), 4_000);
+    let Expr::If(root) = tree else {
+        unreachable!("DEPTH selects a condition-child If owner")
+    };
+    let root = root.into_inner();
+    assert_eq!(number(&root.true_value), DEPTH * 10 + 2);
+    assert_eq!(number(root.false_value.as_ref().unwrap()), DEPTH * 10 + 3);
+    drop(root.condition);
+}

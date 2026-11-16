@@ -3381,6 +3381,28 @@ fn case_contains_aggregate_function(clauses: &[ast::WhenClause], default: Option
 
 fn expr_contains_aggregate_function(expr: &Expr) -> bool {
     match expr {
+        Expr::If(node) => {
+            expr_contains_aggregate_function(&node.condition)
+                || expr_contains_aggregate_function(&node.true_value)
+                || node
+                    .false_value
+                    .as_ref()
+                    .is_some_and(|value| expr_contains_aggregate_function(value))
+        }
+        Expr::NullIf(node) => {
+            expr_contains_aggregate_function(&node.first)
+                || expr_contains_aggregate_function(&node.second)
+        }
+        Expr::Coalesce(node) => node
+            .operands
+            .iter()
+            .any(|value| expr_contains_aggregate_function(value)),
+        Expr::Try(node) => expr_contains_aggregate_function(&node.inner),
+        Expr::Format(node) => node
+            .arguments
+            .iter()
+            .any(|value| expr_contains_aggregate_function(value)),
+
         Expr::FunctionCall(function) => {
             let name = printer::print_object_name(&function.name).to_ascii_lowercase();
             is_aggregate_function(&name)
@@ -3537,6 +3559,20 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
         Expr::Subquery(_) | Expr::Exists(_) | Expr::Unique(_) | Expr::WindowOperation(_) => {
             return Err(projection_filter_error());
         }
+        Expr::If(node) => {
+            reject_unsupported_expr(&node.condition)?;
+            reject_unsupported_expr(&node.true_value)?;
+            if let Some(value) = &node.false_value {
+                reject_unsupported_expr(value)?;
+            }
+        }
+        Expr::NullIf(node) => {
+            reject_unsupported_expr(&node.first)?;
+            reject_unsupported_expr(&node.second)?;
+        }
+        Expr::Coalesce(node) => reject_unsupported_exprs(&node.operands)?,
+        Expr::Try(node) => reject_unsupported_expr(&node.inner)?,
+        Expr::Format(node) => reject_unsupported_exprs(&node.arguments)?,
         Expr::FunctionCall(function) => reject_unsupported_function(function)?,
         Expr::Access(access) => reject_unsupported_access_expr(access)?,
         Expr::Dereference(node) => {

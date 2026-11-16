@@ -443,6 +443,40 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             validate_json_root(|visitor| super::Visit::visit_json_array(visitor, node))?
         }
 
+        Expr::If(node) => {
+            validate_expr(&node.condition)?;
+            validate_expr(&node.true_value)?;
+            if let Some(value) = &node.false_value {
+                validate_expr(value)?;
+            }
+        }
+        Expr::NullIf(node) => {
+            validate_expr(&node.first)?;
+            validate_expr(&node.second)?;
+        }
+        Expr::Coalesce(node) => {
+            if node.operands.len() < 2 {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::TooFewCoalesceOperands,
+                    node.span,
+                ));
+            }
+            for value in &node.operands {
+                validate_expr(value)?;
+            }
+        }
+        Expr::Try(node) => validate_expr(&node.inner)?,
+        Expr::Format(node) => {
+            if node.arguments.len() < 2 {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::TooFewFormatArguments,
+                    node.span,
+                ));
+            }
+            for value in &node.arguments {
+                validate_expr(value)?;
+            }
+        }
         Expr::WindowOperation(node) => validate_window(&node.window)?,
         Expr::FunctionCall(function) => {
             for argument in &function.arguments {

@@ -70,6 +70,12 @@ pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
         StructuralViolation::EmptyUnnestExpressionList => {
             "invalid SQL structure: empty UNNEST expression list".to_owned()
         }
+        StructuralViolation::TooFewCoalesceOperands => {
+            "invalid SQL structure: COALESCE requires at least two operands".to_owned()
+        }
+        StructuralViolation::TooFewFormatArguments => {
+            "invalid SQL structure: FORMAT requires at least two arguments".to_owned()
+        }
         StructuralViolation::EmptyCaseBranches => {
             "invalid SQL structure: empty CASE branch list".to_owned()
         }

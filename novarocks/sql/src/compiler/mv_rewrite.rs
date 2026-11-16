@@ -3144,6 +3144,17 @@ impl Visit for CompletionRetainedBytes {
                     expression.when_clauses.capacity(),
                 );
             }
+            Expr::If(_) => self.add(std::mem::size_of::<novarocks_parser::ast::IfExpr>()),
+            Expr::NullIf(_) => self.add(std::mem::size_of::<novarocks_parser::ast::NullIfExpr>()),
+            Expr::Coalesce(node) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::CoalesceExpr>());
+                self.add_vec_capacity::<Expr>(node.operands.capacity());
+            }
+            Expr::Try(_) => self.add(std::mem::size_of::<novarocks_parser::ast::TryExpr>()),
+            Expr::Format(node) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::FormatExpr>());
+                self.add_vec_capacity::<Expr>(node.arguments.capacity());
+            }
             Expr::Cast(_) => self.add(std::mem::size_of::<novarocks_parser::ast::CastExpr>()),
             Expr::Exists(_) => self.add(std::mem::size_of::<novarocks_parser::ast::ExistsExpr>()),
             Expr::Unique(_) => self.add(std::mem::size_of::<novarocks_parser::ast::UniqueExpr>()),

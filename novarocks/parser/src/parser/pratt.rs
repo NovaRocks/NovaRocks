@@ -1626,6 +1626,85 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             |window| window.span().end(),
         );
         self.function_call_depth -= 1;
+        let call_span = Span::new(span.start(), span_end);
+        // QualifiedName.toString() joins all decoded parts. Only a single
+        // part can equal one of these undotted names; quoting does not exempt it.
+        let special = match name.parts.as_slice() {
+            [part] if part.value.eq_ignore_ascii_case("if") => Some("if"),
+            [part] if part.value.eq_ignore_ascii_case("nullif") => Some("nullif"),
+            [part] if part.value.eq_ignore_ascii_case("coalesce") => Some("coalesce"),
+            [part] if part.value.eq_ignore_ascii_case("try") => Some("try"),
+            [part] if part.value.eq_ignore_ascii_case("format") => Some("format"),
+            _ => None,
+        };
+        if let Some(special) = special {
+            let arity = arguments.len();
+            let expected = match special {
+                "if" if !matches!(arity, 2 | 3) => Some("two or three IF arguments"),
+                "nullif" if arity != 2 => Some("two NULLIF arguments"),
+                "coalesce" if arity < 2 => Some("at least two COALESCE arguments"),
+                "try" if arity != 1 => Some("one TRY argument"),
+                "format" if arity < 2 => Some("at least two FORMAT arguments"),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                return Err(ParseError::UnexpectedToken {
+                    expected,
+                    found: format!("{arity} arguments"),
+                    span: call_span,
+                });
+            }
+            let metadata_error = if window.is_some() { Some(("a control expression without OVER","OVER")) }
+                else if quantifier == FunctionQuantifier::Distinct { Some(("a control expression without DISTINCT","DISTINCT")) }
+                else if null_treatment.is_some() { Some(("a control expression without null treatment","NULL treatment")) }
+                // The current grammar has no RUNNING/FINAL producer. P05
+                // checks that mode at this same stage before constructing a node.
+                else if filter.is_some() { Some(("a control expression without FILTER","FILTER")) }
+                else if arguments.iter().any(|value| matches!(value,Expr::Binary(binary) if binary.operator==BinaryOperator::NamedArgument)) { Some(("positional control-expression arguments","named argument")) }
+                else if separator.is_some() { Some(("a control expression without SEPARATOR","SEPARATOR")) }
+                else { None };
+            if let Some((expected, found)) = metadata_error {
+                return Err(ParseError::UnexpectedToken {
+                    expected,
+                    found: found.to_owned(),
+                    span: call_span,
+                });
+            }
+            // The pinned builder visits ORDER BY but does not retain it for
+            // these five nodes; ALL likewise carries no distinct fact.
+            return Ok(match special {
+                "if" => {
+                    let mut values = arguments.into_iter();
+                    Expr::If(AstBox::new(crate::ast::IfExpr {
+                        condition: values.next().expect("checked IF arity"),
+                        true_value: values.next().expect("checked IF arity"),
+                        false_value: values.next(),
+                        span: call_span,
+                    }))
+                }
+                "nullif" => {
+                    let mut values = arguments.into_iter();
+                    Expr::NullIf(AstBox::new(crate::ast::NullIfExpr {
+                        first: values.next().expect("checked NULLIF arity"),
+                        second: values.next().expect("checked NULLIF arity"),
+                        span: call_span,
+                    }))
+                }
+                "coalesce" => Expr::Coalesce(AstBox::new(crate::ast::CoalesceExpr {
+                    operands: arguments.into(),
+                    span: call_span,
+                })),
+                "try" => Expr::Try(AstBox::new(crate::ast::TryExpr {
+                    inner: arguments.into_iter().next().expect("checked TRY arity"),
+                    span: call_span,
+                })),
+                "format" => Expr::Format(AstBox::new(crate::ast::FormatExpr {
+                    arguments: arguments.into(),
+                    span: call_span,
+                })),
+                _ => unreachable!("recognized control expression"),
+            });
+        }
         Ok(Expr::FunctionCall(AstBox::new(FunctionCall {
             name,
             arguments: arguments

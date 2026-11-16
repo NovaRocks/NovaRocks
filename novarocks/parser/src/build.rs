@@ -37,6 +37,8 @@ pub enum BuildError {
     EmptyValues,
     EmptyValuesRow,
     EmptyCase,
+    TooFewCoalesceOperands,
+    TooFewFormatArguments,
     EmptyTuple,
     EmptyInList,
     EmptyOrderBy,
@@ -52,6 +54,12 @@ impl fmt::Display for BuildError {
             Self::EmptyProjection => formatter.write_str("SELECT projection must not be empty"),
             Self::EmptyValues => formatter.write_str("VALUES must contain at least one row"),
             Self::EmptyValuesRow => formatter.write_str("VALUES row must not be empty"),
+            Self::TooFewCoalesceOperands => {
+                formatter.write_str("COALESCE requires at least two operands")
+            }
+            Self::TooFewFormatArguments => {
+                formatter.write_str("FORMAT requires at least two arguments")
+            }
             Self::EmptyCase => formatter.write_str("CASE must contain at least one branch"),
             Self::EmptyTuple => formatter.write_str("tuple must contain at least one expression"),
             Self::EmptyInList => {
@@ -717,4 +725,50 @@ pub fn call_argument(value: Expr, name: Option<Ident>) -> CallArgument {
         .as_ref()
         .map_or_else(|| value.span(), |name| name.span.cover(value.span()));
     CallArgument { name, value, span }
+}
+
+/// Builds the exact optional-else IF syntax while retaining original operands.
+pub fn if_expr(condition: Expr, true_value: Expr, false_value: Option<Expr>) -> Expr {
+    let span = condition
+        .span()
+        .cover(true_value.span())
+        .cover(false_value.as_ref().map_or(SYNTHETIC, Expr::span));
+    Expr::If(AstBox::new(IfExpr {
+        condition,
+        true_value,
+        false_value,
+        span,
+    }))
+}
+pub fn null_if(first: Expr, second: Expr) -> Expr {
+    let span = first.span().cover(second.span());
+    Expr::NullIf(AstBox::new(NullIfExpr {
+        first,
+        second,
+        span,
+    }))
+}
+pub fn coalesce(operands: Vec<Expr>) -> Result<Expr, BuildError> {
+    if operands.len() < 2 {
+        return Err(BuildError::TooFewCoalesceOperands);
+    }
+    let span = cover(operands.iter().map(Expr::span));
+    Ok(Expr::Coalesce(AstBox::new(CoalesceExpr {
+        operands: operands.into(),
+        span,
+    })))
+}
+pub fn try_expr(inner: Expr) -> Expr {
+    let span = inner.span();
+    Expr::Try(AstBox::new(TryExpr { inner, span }))
+}
+pub fn format_expr(arguments: Vec<Expr>) -> Result<Expr, BuildError> {
+    if arguments.len() < 2 {
+        return Err(BuildError::TooFewFormatArguments);
+    }
+    let span = cover(arguments.iter().map(Expr::span));
+    Ok(Expr::Format(AstBox::new(FormatExpr {
+        arguments: arguments.into(),
+        span,
+    })))
 }

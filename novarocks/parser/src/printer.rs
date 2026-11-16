@@ -946,6 +946,12 @@ impl Printer {
             Expr::Identifier(ident) => self.write_ident(ident),
             Expr::Literal(literal) => self.write_literal(literal),
             Expr::FunctionCall(call) => self.write_function_call(call),
+            Expr::If(node) => self.write_if_expr(node),
+            Expr::NullIf(node) => self.write_null_if_expr(node),
+            Expr::Coalesce(node) => self.write_coalesce_expr(node),
+            Expr::Try(node) => self.write_try_expr(node),
+            Expr::Format(node) => self.write_format_expr(node),
+
             Expr::WindowOperation(node) => {
                 self.write_ident(&node.name);
                 self.output.push_str(" OVER ");
@@ -1206,6 +1212,45 @@ impl Printer {
             }
         }
         self.output.push('\'');
+    }
+
+    #[recursive::recursive]
+    fn write_if_expr(&mut self, node: &IfExpr) {
+        self.output.push_str("IF(");
+        self.write_expr(&node.condition);
+        self.output.push_str(", ");
+        self.write_expr(&node.true_value);
+        if let Some(value) = &node.false_value {
+            self.output.push_str(", ");
+            self.write_expr(value);
+        }
+        self.output.push(')');
+    }
+    #[recursive::recursive]
+    fn write_null_if_expr(&mut self, node: &NullIfExpr) {
+        self.output.push_str("NULLIF(");
+        self.write_expr(&node.first);
+        self.output.push_str(", ");
+        self.write_expr(&node.second);
+        self.output.push(')');
+    }
+    #[recursive::recursive]
+    fn write_coalesce_expr(&mut self, node: &CoalesceExpr) {
+        self.output.push_str("COALESCE(");
+        self.write_expr_list(&node.operands);
+        self.output.push(')');
+    }
+    #[recursive::recursive]
+    fn write_try_expr(&mut self, node: &TryExpr) {
+        self.output.push_str("TRY(");
+        self.write_expr(&node.inner);
+        self.output.push(')');
+    }
+    #[recursive::recursive]
+    fn write_format_expr(&mut self, node: &FormatExpr) {
+        self.output.push_str("FORMAT(");
+        self.write_expr_list(&node.arguments);
+        self.output.push(')');
     }
 
     #[recursive::recursive]

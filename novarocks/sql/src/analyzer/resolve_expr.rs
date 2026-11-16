@@ -557,6 +557,36 @@ impl<'a> super::AnalyzerContext<'a> {
                 case.span,
             ),
 
+            ast::Expr::If(node) => {
+                let Some(false_value) = node.false_value.as_ref() else {
+                    return Err(AnalyzeError::unsupported_expression(
+                        "two-argument IF is not supported",
+                        node.span,
+                    ));
+                };
+                self.analyze_control_call(
+                    "if",
+                    &[&node.condition, &node.true_value, false_value],
+                    node.span,
+                    scope,
+                )
+            }
+            ast::Expr::NullIf(node) => {
+                self.analyze_control_call("nullif", &[&node.first, &node.second], node.span, scope)
+            }
+            ast::Expr::Coalesce(node) => {
+                let arguments = node.operands.iter().collect::<Vec<_>>();
+                self.analyze_control_call("coalesce", &arguments, node.span, scope)
+            }
+            ast::Expr::Try(node) => Err(AnalyzeError::unsupported_expression(
+                "TRY expressions are not supported",
+                node.span,
+            )),
+            ast::Expr::Format(node) => Err(AnalyzeError::unsupported_expression(
+                "FORMAT expressions are not supported",
+                node.span,
+            )),
+
             // Function call
             ast::Expr::FunctionCall(func) => self.analyze_function(func, scope),
 
@@ -2110,6 +2140,29 @@ impl<'a> super::AnalyzerContext<'a> {
             .map(|argument| &argument.value)
             .collect::<Vec<_>>();
         self.analyze_function_with_original_arguments(func, &original_arguments, scope)
+    }
+
+    /// Use the existing function owner with the actual dedicated-node children.
+    /// The plain metadata carries no source occurrence or selected binding.
+    fn analyze_control_call(
+        &self,
+        name: &'static str,
+        arguments: &[&ast::Expr],
+        span: Span,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let mut metadata = novarocks_parser::build::function(
+            ast::ObjectName {
+                parts: vec![novarocks_parser::build::ident_at(name, false, span)],
+                span,
+            },
+            Vec::new(),
+        );
+        let ast::Expr::FunctionCall(call) = &mut metadata else {
+            unreachable!("the function builder produces a FunctionCall");
+        };
+        call.span = span;
+        self.analyze_function_with_original_arguments(call, arguments, scope)
     }
 
     /// Share the original function admission/binding path while preserving
@@ -4384,6 +4437,27 @@ impl<'a> super::AnalyzerContext<'a> {
     /// Window functions (with OVER) are NOT counted as aggregates.
     pub(super) fn expr_contains_aggregate(&self, expr: &ast::Expr) -> bool {
         match expr {
+            ast::Expr::If(node) => {
+                self.expr_contains_aggregate(&node.condition)
+                    || self.expr_contains_aggregate(&node.true_value)
+                    || node
+                        .false_value
+                        .as_ref()
+                        .is_some_and(|value| self.expr_contains_aggregate(value))
+            }
+            ast::Expr::NullIf(node) => {
+                self.expr_contains_aggregate(&node.first)
+                    || self.expr_contains_aggregate(&node.second)
+            }
+            ast::Expr::Coalesce(node) => node
+                .operands
+                .iter()
+                .any(|value| self.expr_contains_aggregate(value)),
+            ast::Expr::Try(node) => self.expr_contains_aggregate(&node.inner),
+            ast::Expr::Format(node) => node
+                .arguments
+                .iter()
+                .any(|value| self.expr_contains_aggregate(value)),
             ast::Expr::FunctionCall(f) => {
                 // A function with OVER is a window function, not an aggregate
                 if f.window.is_some() {

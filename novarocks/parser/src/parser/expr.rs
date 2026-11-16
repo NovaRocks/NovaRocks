@@ -98,13 +98,13 @@ mod tests {
         assert_eq!(not.span, Span::new(0, 11));
         assert!(matches!(*not.expression, Expr::Nested(_)));
 
-        let Expr::FunctionCall(call) = terms.next().unwrap() else {
-            panic!("expected function call");
+        let Expr::Coalesce(call) = terms.next().unwrap() else {
+            panic!("expected COALESCE");
         };
         assert_eq!(call.span, Span::new(16, source.len()));
-        assert_eq!(call.arguments.len(), 2);
-        assert!(matches!(call.arguments[0].value, Expr::Unary(_)));
-        let Expr::Literal(literal) = &call.arguments[1].value else {
+        assert_eq!(call.operands.len(), 2);
+        assert!(matches!(call.operands[0], Expr::Unary(_)));
+        let Expr::Literal(literal) = &call.operands[1] else {
             panic!("expected string literal");
         };
         assert_eq!(literal.kind, LiteralKind::String("it's".to_owned()));

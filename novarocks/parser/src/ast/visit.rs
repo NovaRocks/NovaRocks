@@ -21,6 +21,22 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_if_expr(&mut self, node: &IfExpr) {
+        super::control_expr::walk_if_expr(self, node);
+    }
+    fn visit_null_if_expr(&mut self, node: &NullIfExpr) {
+        super::control_expr::walk_null_if_expr(self, node);
+    }
+    fn visit_coalesce_expr(&mut self, node: &CoalesceExpr) {
+        super::control_expr::walk_coalesce_expr(self, node);
+    }
+    fn visit_try_expr(&mut self, node: &TryExpr) {
+        super::control_expr::walk_try_expr(self, node);
+    }
+    fn visit_format_expr(&mut self, node: &FormatExpr) {
+        super::control_expr::walk_format_expr(self, node);
+    }
+
     fn visit_call_argument(&mut self, node: &CallArgument) {
         walk_call_argument(self, node);
     }
@@ -823,6 +839,12 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::Identifier(ident) => visitor.visit_ident(ident),
         Expr::Literal(literal) => visitor.visit_literal(literal),
         Expr::FunctionCall(call) => visitor.visit_function_call(call),
+        Expr::If(node) => visitor.visit_if_expr(node),
+        Expr::NullIf(node) => visitor.visit_null_if_expr(node),
+        Expr::Coalesce(node) => visitor.visit_coalesce_expr(node),
+        Expr::Try(node) => visitor.visit_try_expr(node),
+        Expr::Format(node) => visitor.visit_format_expr(node),
+
         Expr::WindowOperation(node) => visitor.visit_window_operation(node),
         Expr::Unary(expression) => visitor.visit_unary_expr(expression),
         Expr::Binary(expression) => visitor.visit_binary_expr(expression),
@@ -906,6 +928,22 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_if_expr(&mut self, node: IfExpr) -> IfExpr {
+        super::control_expr::fold_if_expr(self, node)
+    }
+    fn fold_null_if_expr(&mut self, node: NullIfExpr) -> NullIfExpr {
+        super::control_expr::fold_null_if_expr(self, node)
+    }
+    fn fold_coalesce_expr(&mut self, node: CoalesceExpr) -> CoalesceExpr {
+        super::control_expr::fold_coalesce_expr(self, node)
+    }
+    fn fold_try_expr(&mut self, node: TryExpr) -> TryExpr {
+        super::control_expr::fold_try_expr(self, node)
+    }
+    fn fold_format_expr(&mut self, node: FormatExpr) -> FormatExpr {
+        super::control_expr::fold_format_expr(self, node)
+    }
+
     fn fold_call_argument(&mut self, node: CallArgument) -> CallArgument {
         fold_call_argument(self, node)
     }
@@ -1961,6 +1999,15 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::FunctionCall(call) => {
             Expr::FunctionCall(AstBox::new(folder.fold_function_call(call.into_inner())))
         }
+        Expr::If(node) => Expr::If(AstBox::new(folder.fold_if_expr(node.into_inner()))),
+        Expr::NullIf(node) => {
+            Expr::NullIf(AstBox::new(folder.fold_null_if_expr(node.into_inner())))
+        }
+        Expr::Coalesce(node) => {
+            Expr::Coalesce(AstBox::new(folder.fold_coalesce_expr(node.into_inner())))
+        }
+        Expr::Try(node) => Expr::Try(AstBox::new(folder.fold_try_expr(node.into_inner()))),
+        Expr::Format(node) => Expr::Format(AstBox::new(folder.fold_format_expr(node.into_inner()))),
         Expr::WindowOperation(node) => {
             Expr::WindowOperation(AstBox::new(folder.fold_window_operation(node.into_inner())))
         }

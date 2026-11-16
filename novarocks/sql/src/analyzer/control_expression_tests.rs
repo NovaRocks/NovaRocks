@@ -540,3 +540,68 @@ fn named_arguments_and_processing_modes_refuse_before_ordinary_or_table_lookup()
         }
     }
 }
+
+#[test]
+fn dedicated_controls_keep_original_bindings_display_and_direct_refusals() {
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    let scope = ctx.new_scope();
+    for (sql, name, arguments) in [
+        (
+            "SELECT if(TRUE, 1, 2)",
+            "if",
+            vec![build::boolean(true), build::integer(1), build::integer(2)],
+        ),
+        (
+            "SELECT nullif(1, 2)",
+            "nullif",
+            vec![build::integer(1), build::integer(2)],
+        ),
+        (
+            "SELECT coalesce(1, 2)",
+            "coalesce",
+            vec![build::integer(1), build::integer(2)],
+        ),
+    ] {
+        let parsed = query(sql);
+        let actual = ctx.analyze_expr(projection(&parsed), &scope).unwrap();
+        let ordinary = build::function(
+            ast::ObjectName {
+                parts: vec![build::ident_at(name, false, novarocks_parser::SYNTHETIC)],
+                span: novarocks_parser::SYNTHETIC,
+            },
+            arguments,
+        );
+        let expected = ctx.analyze_expr(&ordinary, &scope).unwrap();
+        same_typed(&actual, &expected, &control);
+        assert_eq!(
+            super::helpers::expr_display_name(projection(&parsed)),
+            super::helpers::expr_display_name(&ordinary)
+        );
+    }
+    for sql in [
+        "SELECT if(TRUE, missing_value)",
+        "SELECT try(missing_value)",
+        "SELECT format(missing_format, missing_value)",
+    ] {
+        let parsed = query(sql);
+        let error = ctx.analyze_expr(projection(&parsed), &scope).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AnalyzeErrorKind::UnsupportedExpression,
+            "{sql}: {error}"
+        );
+    }
+    for sql in [
+        "SELECT typeof(CAST(if(TRUE, missing_value) AS INT))",
+        "SELECT typeof(CAST(try(missing_value) AS INT))",
+        "SELECT typeof(CAST(format(missing_format, missing_value) AS INT))",
+    ] {
+        let parsed = query(sql);
+        let actual = ctx.analyze_expr(projection(&parsed), &scope).unwrap();
+        assert!(
+            matches!(&actual.kind, ExprKind::Literal(crate::analysis::LiteralValue::String(value)) if value == "int"),
+            "{sql}: {actual:?}"
+        );
+    }
+}

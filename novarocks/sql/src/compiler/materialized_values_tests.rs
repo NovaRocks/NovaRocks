@@ -1117,3 +1117,144 @@ fn function_argument_value_borrows_original_nonzero_full_field_and_refuses_forei
     assert_eq!(actual.field(), field.as_ref());
     assert_eq!(actual.value_type(), &ty);
 }
+
+#[test]
+fn dedicated_control_children_keep_mixed_original_pool_occurrences() {
+    use SqlConstantExpressionStep::*;
+    use arrow::array::{Array, Int32Array};
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_functions::ConstantPool;
+    let control = SqlCompileControl::unbounded();
+    let policy = crate::constant::test_constant_policy();
+    let ty = FunctionValueType::new(DataType::Int32, false);
+    let field = Arc::new(
+        Field::new("original_control_value", DataType::Int32, false).with_metadata(
+            std::collections::HashMap::from([(
+                "provider.unknown".to_string(),
+                "full-field".to_string(),
+            )]),
+        ),
+    );
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        Int32Array::from(vec![13, -23]).to_data(),
+        policy,
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let retained = pool.value(1).unwrap();
+    let query = query("SELECT if(TRUE, coalesce(first_original, 1), nullif(2, second_original))");
+    let constant = |path| {
+        SqlExpressionConstant::new(
+            Vec::new(),
+            SqlConstantExpressionSite::SelectProjection { column: 0 },
+            retained.clone(),
+        )
+        .with_expression_path(path)
+    };
+    let source = MaterializedValues::try_new_expressions(
+        &query,
+        vec![
+            constant(vec![IfTrue, CoalesceOperand(0)]),
+            constant(vec![IfFalse, NullIfSecond]),
+        ]
+        .into(),
+        &control,
+    )
+    .unwrap();
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("select");
+    };
+    let ast::SelectItem::UnnamedExpr(ast::Expr::If(node)) = &select.projection[0] else {
+        panic!("if");
+    };
+    let ast::Expr::Coalesce(coalesce) = &node.true_value else {
+        panic!("coalesce");
+    };
+    let Some(ast::Expr::NullIf(nullif)) = node.false_value.as_ref() else {
+        panic!("nullif");
+    };
+    let owned = source.loan(&query, &control).unwrap();
+    let loan = owned.view();
+    for expression in [&coalesce.operands[0], &nullif.second] {
+        let actual = loan.constant_at(expression).unwrap();
+        assert_eq!(actual.ordinal(), 1);
+        assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+        assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+        assert_eq!(actual.field(), field.as_ref());
+        assert_eq!(actual.value_type(), &ty);
+        assert_eq!(
+            actual
+                .field()
+                .metadata()
+                .get("provider.unknown")
+                .map(String::as_str),
+            Some("full-field")
+        );
+        assert!(loan.constant_at(&(*expression).clone()).is_none());
+    }
+    for path in [
+        vec![CoalesceOperand(0)],
+        vec![IfTrue, CoalesceOperand(2)],
+        vec![IfFalse, NullIfSecond, IfTrue],
+        vec![IfTrue, FunctionArgumentValue(0)],
+    ] {
+        assert!(
+            MaterializedValues::try_new_expressions(&query, vec![constant(path)].into(), &control)
+                .is_err()
+        );
+    }
+    let missing_false = {
+        let statements = novarocks_parser::parse("SELECT if(TRUE, 1)").unwrap();
+        let [ast::Statement::Query(value)] = statements.as_slice() else {
+            panic!("query");
+        };
+        value.clone()
+    };
+    assert!(
+        MaterializedValues::try_new_expressions(
+            &missing_false,
+            vec![constant(vec![IfFalse])].into(),
+            &control
+        )
+        .is_err()
+    );
+    let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+    let functions = build_builtin_engine_function_catalog().unwrap();
+    let (resolved, _, _) = crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
+        &query,
+        &catalog,
+        "db",
+        &functions,
+        &crate::sql_mode::SqlSemanticSettings::default(),
+        policy,
+        &control,
+        Some(&source),
+    )
+    .unwrap();
+    let crate::analysis::QueryBody::Select(select) = &resolved.body else {
+        panic!("select");
+    };
+    let crate::analysis::ExprKind::FunctionCall { name, args, .. } =
+        &select.projection[0].expr.kind
+    else {
+        panic!("if binding");
+    };
+    assert_eq!(name, "if");
+    for (branch, child, expected) in [(1, 0, "coalesce"), (2, 1, "nullif")] {
+        let crate::analysis::ExprKind::FunctionCall { name, args, .. } = &args[branch].kind else {
+            panic!("branch binding");
+        };
+        assert_eq!(name, expected);
+        let crate::analysis::ExprKind::Constant(actual) = &args[child].kind else {
+            panic!("original constant");
+        };
+        assert_eq!(actual.ordinal(), 1);
+        assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+        assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+        assert_eq!(actual.field(), field.as_ref());
+        assert_eq!(actual.value_type(), &ty);
+    }
+}
