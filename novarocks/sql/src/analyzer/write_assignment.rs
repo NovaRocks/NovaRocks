@@ -193,7 +193,7 @@ fn register_literal_assignments<'a>(
                     && function.separator.is_none()
                     && function.filter.is_none()
                     && function.null_treatment.is_none()
-                    && function.over.is_none() =>
+                    && function.window.is_none() =>
             {
                 // These are only the original INSERT literal syntax forms.
                 // Normal analysis still resolves or rejects the actual call.

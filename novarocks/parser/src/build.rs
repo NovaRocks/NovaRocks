@@ -418,7 +418,7 @@ pub fn function(name: ObjectName, arguments: Vec<Expr>) -> Expr {
         separator: None,
         filter: None,
         null_treatment: None,
-        over: None,
+        window: None,
         substring_from_syntax: false,
         span,
     })
@@ -552,7 +552,7 @@ pub fn select(
         group_by,
         having: None,
         qualify: None,
-        windows: Vec::new(),
+        windows: AstVec::new(),
         modifiers: Default::default(),
         span: SYNTHETIC,
     })

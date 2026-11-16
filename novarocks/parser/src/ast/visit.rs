@@ -21,6 +21,49 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_window(&mut self, node: &Window) {
+        walk_window(self, node);
+    }
+    fn visit_window_reference(&mut self, node: &WindowReference) {
+        walk_window_reference(self, node);
+    }
+    fn visit_window_specification(&mut self, node: &WindowSpecification) {
+        walk_window_specification(self, node);
+    }
+    fn visit_window_definition(&mut self, node: &WindowDefinition) {
+        walk_window_definition(self, node);
+    }
+    fn visit_window_frame(&mut self, node: &WindowFrame) {
+        walk_window_frame(self, node);
+    }
+    fn visit_window_operation(&mut self, node: &WindowOperation) {
+        walk_window_operation(self, node);
+    }
+    fn visit_measure_definition(&mut self, node: &MeasureDefinition) {
+        super::row_pattern::walk_measure_definition(self, node);
+    }
+    fn visit_subset_definition(&mut self, node: &SubsetDefinition) {
+        super::row_pattern::walk_subset_definition(self, node);
+    }
+    fn visit_variable_definition(&mut self, node: &VariableDefinition) {
+        super::row_pattern::walk_variable_definition(self, node);
+    }
+    fn visit_pattern_search_mode(&mut self, node: &PatternSearchMode) {
+        super::row_pattern::walk_pattern_search_mode(self, node);
+    }
+    fn visit_pattern_integer(&mut self, node: &PatternInteger) {
+        super::row_pattern::walk_pattern_integer(self, node);
+    }
+    fn visit_skip_to(&mut self, node: &SkipTo) {
+        super::row_pattern::walk_skip_to(self, node);
+    }
+    fn visit_row_pattern(&mut self, node: &RowPattern) {
+        super::row_pattern::walk_row_pattern(self, node);
+    }
+    fn visit_pattern_quantifier(&mut self, node: &PatternQuantifier) {
+        super::row_pattern::walk_pattern_quantifier(self, node);
+    }
+
     fn visit_order_by(&mut self, node: &OrderBy) {
         walk_order_by(self, node);
     }
@@ -611,7 +654,7 @@ pub fn walk_select<V: Visit + ?Sized>(visitor: &mut V, select: &Select) {
         visitor.visit_expr(qualify);
     }
     for window in &select.windows {
-        walk_named_window(visitor, window);
+        visitor.visit_window_definition(window);
     }
     walk_query_modifiers(visitor, &select.modifiers);
 }
@@ -722,12 +765,14 @@ pub fn walk_table_alias<V: Visit + ?Sized>(visitor: &mut V, alias: &TableAlias) 
     }
 }
 
-pub fn walk_named_window<V: Visit + ?Sized>(visitor: &mut V, window: &NamedWindow) {
+#[recursive::recursive]
+pub fn walk_window_definition<V: Visit + ?Sized>(visitor: &mut V, window: &WindowDefinition) {
     visitor.visit_ident(&window.name);
-    walk_window_spec(visitor, &window.specification);
+    visitor.visit_window_specification(&window.specification);
 }
 
-pub fn walk_window_spec<V: Visit + ?Sized>(visitor: &mut V, window: &WindowSpec) {
+#[recursive::recursive]
+pub fn walk_window_specification<V: Visit + ?Sized>(visitor: &mut V, window: &WindowSpecification) {
     if let Some(existing) = &window.existing_window_name {
         visitor.visit_ident(existing);
     }
@@ -738,13 +783,11 @@ pub fn walk_window_spec<V: Visit + ?Sized>(visitor: &mut V, window: &WindowSpec)
         visitor.visit_order_by(order);
     }
     if let Some(frame) = &window.window_frame {
-        walk_window_frame_bound(visitor, &frame.start_bound);
-        if let Some(end) = &frame.end_bound {
-            walk_window_frame_bound(visitor, end);
-        }
+        visitor.visit_window_frame(frame);
     }
 }
 
+#[recursive::recursive]
 pub fn walk_window_frame_bound<V: Visit + ?Sized>(visitor: &mut V, bound: &WindowFrameBound) {
     match bound {
         WindowFrameBound::Preceding(Some(expr), _) | WindowFrameBound::Following(Some(expr), _) => {
@@ -774,6 +817,7 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::Identifier(ident) => visitor.visit_ident(ident),
         Expr::Literal(literal) => visitor.visit_literal(literal),
         Expr::FunctionCall(call) => visitor.visit_function_call(call),
+        Expr::WindowOperation(node) => visitor.visit_window_operation(node),
         Expr::Unary(expression) => visitor.visit_unary_expr(expression),
         Expr::Binary(expression) => visitor.visit_binary_expr(expression),
         Expr::Logical(expression) => visitor.visit_logical_expr(expression),
@@ -832,8 +876,8 @@ pub fn walk_function_call<V: Visit + ?Sized>(visitor: &mut V, call: &FunctionCal
     if let Some(filter) = &call.filter {
         visitor.visit_expr(filter);
     }
-    if let Some(over) = &call.over {
-        walk_window_spec(visitor, over);
+    if let Some(over) = &call.window {
+        visitor.visit_window(over);
     }
 }
 
@@ -852,6 +896,49 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_window(&mut self, node: Window) -> Window {
+        fold_window(self, node)
+    }
+    fn fold_window_reference(&mut self, node: WindowReference) -> WindowReference {
+        fold_window_reference(self, node)
+    }
+    fn fold_window_specification(&mut self, node: WindowSpecification) -> WindowSpecification {
+        fold_window_specification(self, node)
+    }
+    fn fold_window_definition(&mut self, node: WindowDefinition) -> WindowDefinition {
+        fold_window_definition(self, node)
+    }
+    fn fold_window_frame(&mut self, node: WindowFrame) -> WindowFrame {
+        fold_window_frame(self, node)
+    }
+    fn fold_window_operation(&mut self, node: WindowOperation) -> WindowOperation {
+        fold_window_operation(self, node)
+    }
+    fn fold_measure_definition(&mut self, node: MeasureDefinition) -> MeasureDefinition {
+        super::row_pattern::fold_measure_definition(self, node)
+    }
+    fn fold_subset_definition(&mut self, node: SubsetDefinition) -> SubsetDefinition {
+        super::row_pattern::fold_subset_definition(self, node)
+    }
+    fn fold_variable_definition(&mut self, node: VariableDefinition) -> VariableDefinition {
+        super::row_pattern::fold_variable_definition(self, node)
+    }
+    fn fold_pattern_search_mode(&mut self, node: PatternSearchMode) -> PatternSearchMode {
+        super::row_pattern::fold_pattern_search_mode(self, node)
+    }
+    fn fold_pattern_integer(&mut self, node: PatternInteger) -> PatternInteger {
+        super::row_pattern::fold_pattern_integer(self, node)
+    }
+    fn fold_skip_to(&mut self, node: SkipTo) -> SkipTo {
+        super::row_pattern::fold_skip_to(self, node)
+    }
+    fn fold_row_pattern(&mut self, node: RowPattern) -> RowPattern {
+        super::row_pattern::fold_row_pattern(self, node)
+    }
+    fn fold_pattern_quantifier(&mut self, node: PatternQuantifier) -> PatternQuantifier {
+        super::row_pattern::fold_pattern_quantifier(self, node)
+    }
+
     fn fold_order_by(&mut self, node: OrderBy) -> OrderBy {
         fold_order_by(self, node)
     }
@@ -1609,7 +1696,7 @@ pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Sele
     select.windows = select
         .windows
         .into_iter()
-        .map(|window| fold_named_window(folder, window))
+        .map(|window| folder.fold_window_definition(window))
         .collect();
     select.modifiers = fold_query_modifiers(folder, select.modifiers);
     select
@@ -1782,13 +1869,21 @@ pub fn fold_table_alias<F: Fold + ?Sized>(folder: &mut F, mut alias: TableAlias)
     alias
 }
 
-pub fn fold_named_window<F: Fold + ?Sized>(folder: &mut F, mut window: NamedWindow) -> NamedWindow {
+#[recursive::recursive]
+pub fn fold_window_definition<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut window: WindowDefinition,
+) -> WindowDefinition {
     window.name = folder.fold_ident(window.name);
-    window.specification = fold_window_spec(folder, window.specification);
+    window.specification = folder.fold_window_specification(window.specification);
     window
 }
 
-pub fn fold_window_spec<F: Fold + ?Sized>(folder: &mut F, mut window: WindowSpec) -> WindowSpec {
+#[recursive::recursive]
+pub fn fold_window_specification<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut window: WindowSpecification,
+) -> WindowSpecification {
     window.existing_window_name = window
         .existing_window_name
         .map(|name| folder.fold_ident(name));
@@ -1798,16 +1893,13 @@ pub fn fold_window_spec<F: Fold + ?Sized>(folder: &mut F, mut window: WindowSpec
         .map(|expr| folder.fold_expr(expr))
         .collect();
     window.order_by = window.order_by.map(|order| folder.fold_order_by(order));
-    window.window_frame = window.window_frame.map(|mut frame| {
-        frame.start_bound = fold_window_frame_bound(folder, frame.start_bound);
-        frame.end_bound = frame
-            .end_bound
-            .map(|bound| fold_window_frame_bound(folder, bound));
-        frame
-    });
+    window.window_frame = window
+        .window_frame
+        .map(|frame| folder.fold_window_frame(frame));
     window
 }
 
+#[recursive::recursive]
 pub fn fold_window_frame_bound<F: Fold + ?Sized>(
     folder: &mut F,
     bound: WindowFrameBound,
@@ -1851,6 +1943,9 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
 
         Expr::Literal(literal) => Expr::Literal(folder.fold_literal(literal)),
         Expr::FunctionCall(call) => Expr::FunctionCall(folder.fold_function_call(call)),
+        Expr::WindowOperation(node) => {
+            Expr::WindowOperation(AstBox::new(folder.fold_window_operation(node.into_inner())))
+        }
         Expr::Unary(expression) => Expr::Unary(folder.fold_unary_expr(expression)),
         Expr::Binary(expression) => Expr::Binary(folder.fold_binary_expr(expression)),
         Expr::Logical(expression) => Expr::Logical(folder.fold_logical_expr(expression)),
@@ -1940,9 +2035,7 @@ pub fn fold_function_call<F: Fold + ?Sized>(
     call.filter = call
         .filter
         .map(|filter| Box::new(folder.fold_expr(*filter)));
-    call.over = call
-        .over
-        .map(|over| Box::new(fold_window_spec(folder, *over)));
+    call.window = call.window.map(|window| folder.fold_window(window));
     call
 }
 
@@ -2091,5 +2184,105 @@ pub fn fold_order_by<F: Fold + ?Sized>(folder: &mut F, mut node: OrderBy) -> Ord
 #[recursive::recursive]
 pub fn fold_sort_item<F: Fold + ?Sized>(folder: &mut F, mut node: SortItem) -> SortItem {
     node.sort_key = folder.fold_expr(node.sort_key);
+    node
+}
+
+#[recursive::recursive]
+pub fn walk_window_frame<V: Visit + ?Sized>(visitor: &mut V, node: &WindowFrame) {
+    super::visit::walk_window_frame_bound(visitor, &node.start_bound);
+    if let Some(child) = &node.end_bound {
+        super::visit::walk_window_frame_bound(visitor, child);
+    }
+    for child in &node.measures {
+        visitor.visit_measure_definition(child);
+    }
+    if let Some(child) = &node.after_match_skip_to {
+        visitor.visit_skip_to(child);
+    }
+    if let Some(child) = &node.pattern_search_mode {
+        visitor.visit_pattern_search_mode(child);
+    }
+    if let Some(child) = &node.pattern {
+        visitor.visit_row_pattern(child);
+    }
+    for child in &node.subsets {
+        visitor.visit_subset_definition(child);
+    }
+    for child in &node.variable_definitions {
+        visitor.visit_variable_definition(child);
+    }
+}
+
+#[recursive::recursive]
+pub fn fold_window_frame<F: Fold + ?Sized>(folder: &mut F, mut node: WindowFrame) -> WindowFrame {
+    node.start_bound = super::visit::fold_window_frame_bound(folder, node.start_bound);
+    node.end_bound = node
+        .end_bound
+        .map(|child| super::visit::fold_window_frame_bound(folder, child));
+    node.measures = node
+        .measures
+        .into_iter()
+        .map(|child| folder.fold_measure_definition(child))
+        .collect();
+    node.after_match_skip_to = node
+        .after_match_skip_to
+        .map(|child| folder.fold_skip_to(child));
+    node.pattern_search_mode = node
+        .pattern_search_mode
+        .map(|child| folder.fold_pattern_search_mode(child));
+    node.pattern = node.pattern.map(|child| folder.fold_row_pattern(child));
+    node.subsets = node
+        .subsets
+        .into_iter()
+        .map(|child| folder.fold_subset_definition(child))
+        .collect();
+    node.variable_definitions = node
+        .variable_definitions
+        .into_iter()
+        .map(|child| folder.fold_variable_definition(child))
+        .collect();
+    node
+}
+
+#[recursive::recursive]
+pub fn walk_window<V: Visit + ?Sized>(visitor: &mut V, node: &Window) {
+    match node {
+        Window::Reference(node) => visitor.visit_window_reference(node),
+        Window::Specification(node) => visitor.visit_window_specification(node),
+    }
+}
+#[recursive::recursive]
+pub fn walk_window_reference<V: Visit + ?Sized>(visitor: &mut V, node: &WindowReference) {
+    visitor.visit_ident(&node.name);
+}
+#[recursive::recursive]
+pub fn walk_window_operation<V: Visit + ?Sized>(visitor: &mut V, node: &WindowOperation) {
+    visitor.visit_ident(&node.name);
+    visitor.visit_window(&node.window);
+}
+#[recursive::recursive]
+pub fn fold_window<F: Fold + ?Sized>(folder: &mut F, node: Window) -> Window {
+    match node {
+        Window::Reference(node) => Window::Reference(folder.fold_window_reference(node)),
+        Window::Specification(node) => Window::Specification(AstBox::new(
+            folder.fold_window_specification(node.into_inner()),
+        )),
+    }
+}
+#[recursive::recursive]
+pub fn fold_window_reference<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut node: WindowReference,
+) -> WindowReference {
+    node.name = folder.fold_ident(node.name);
+    node
+}
+#[recursive::recursive]
+pub fn fold_window_operation<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut node: WindowOperation,
+) -> WindowOperation {
+    node.name = folder.fold_ident(node.name);
+    node.window = folder.fold_window(node.window);
     node
 }

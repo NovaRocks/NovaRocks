@@ -41,7 +41,7 @@ fn call(name: &str, argument: &str, span: Span) -> ast::Expr {
         separator: None,
         filter: None,
         null_treatment: None,
-        over: None,
+        window: None,
         substring_from_syntax: false,
         span,
     })
@@ -139,7 +139,7 @@ pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast
                 )
             }),
             qualify: None,
-            windows: Vec::new(),
+            windows: Vec::new().into(),
             modifiers: Default::default(),
             span,
         }))),

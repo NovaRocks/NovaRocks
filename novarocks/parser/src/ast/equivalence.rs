@@ -445,13 +445,15 @@ impl SyntaxEq for JoinConstraint {
     }
 }
 
-impl SyntaxEq for NamedWindow {
+impl SyntaxEq for WindowDefinition {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         self.name.syntax_eq(&other.name) && self.specification.syntax_eq(&other.specification)
     }
 }
 
-impl SyntaxEq for WindowSpec {
+impl SyntaxEq for WindowSpecification {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         syntax_eq_option(&self.existing_window_name, &other.existing_window_name)
             && syntax_eq_slice(&self.partition_by, &other.partition_by)
@@ -461,11 +463,18 @@ impl SyntaxEq for WindowSpec {
 }
 
 impl SyntaxEq for WindowFrame {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         self.units == other.units
             && self.start_bound.syntax_eq(&other.start_bound)
             && syntax_eq_option(&self.end_bound, &other.end_bound)
             && self.exclusion == other.exclusion
+            && syntax_eq_slice(&self.measures, &other.measures)
+            && syntax_eq_option(&self.after_match_skip_to, &other.after_match_skip_to)
+            && syntax_eq_option(&self.pattern_search_mode, &other.pattern_search_mode)
+            && syntax_eq_option(&self.pattern, &other.pattern)
+            && syntax_eq_slice(&self.subsets, &other.subsets)
+            && syntax_eq_slice(&self.variable_definitions, &other.variable_definitions)
     }
 }
 
@@ -496,6 +505,7 @@ impl SyntaxEq for Expr {
             (Self::Identifier(left), Self::Identifier(right)) => left.syntax_eq(right),
             (Self::Literal(left), Self::Literal(right)) => left.syntax_eq(right),
             (Self::FunctionCall(left), Self::FunctionCall(right)) => left.syntax_eq(right),
+            (Self::WindowOperation(left), Self::WindowOperation(right)) => left.syntax_eq(right),
             (Self::Unary(left), Self::Unary(right)) => left.syntax_eq(right),
             (Self::Binary(left), Self::Binary(right)) => left.syntax_eq(right),
             (Self::Logical(left), Self::Logical(right)) => left.syntax_eq(right),
@@ -533,7 +543,7 @@ impl SyntaxEq for FunctionCall {
             && syntax_eq_option(&self.separator, &other.separator)
             && syntax_eq_option(&self.filter, &other.filter)
             && self.null_treatment == other.null_treatment
-            && syntax_eq_option(&self.over, &other.over)
+            && syntax_eq_option(&self.window, &other.window)
             && self.substring_from_syntax == other.substring_from_syntax
     }
 }
@@ -761,9 +771,9 @@ mod tests {
                 span: span(start + 12),
             })))),
             null_treatment: Some(NullTreatment::IgnoreNulls),
-            over: Some(Box::new(WindowSpec {
+            window: Some(Window::Specification(AstBox::new(WindowSpecification {
                 existing_window_name: Some(ident("base", start + 13)),
-                partition_by: vec![Expr::Identifier(ident("k", start + 14))],
+                partition_by: vec![Expr::Identifier(ident("k", start + 14))].into(),
                 order_by: Some(OrderBy {
                     items: vec![SortItem {
                         sort_key: Expr::Identifier(ident("ts", start + 15)),
@@ -782,10 +792,16 @@ mod tests {
                     ),
                     end_bound: Some(WindowFrameBound::CurrentRow(span(start + 19))),
                     exclusion: WindowFrameExclusion::Ties,
+                    measures: AstVec::new(),
+                    after_match_skip_to: None,
+                    pattern_search_mode: None,
+                    pattern: None,
+                    subsets: AstVec::new(),
+                    variable_definitions: AstVec::new(),
                     span: span(start + 20),
                 }),
                 span: span(start + 21),
-            })),
+            }))),
             substring_from_syntax: false,
             span: span(start + 22),
         })
@@ -835,7 +851,7 @@ mod tests {
                 },
                 having: None,
                 qualify: None,
-                windows: Vec::new(),
+                windows: AstVec::new(),
                 modifiers: QueryModifiers {
                     order_by: Some(OrderBy {
                         items: vec![SortItem {
@@ -905,5 +921,27 @@ mod tests {
         call.null_treatment = Some(NullTreatment::RespectNulls);
 
         assert!(!syntax_eq_expr(&left, &right));
+    }
+}
+
+impl SyntaxEq for Window {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Reference(a), Self::Reference(b)) => a.syntax_eq(b),
+            (Self::Specification(a), Self::Specification(b)) => a.syntax_eq(b),
+            _ => false,
+        }
+    }
+}
+impl SyntaxEq for WindowReference {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.name.syntax_eq(&other.name)
+    }
+}
+impl SyntaxEq for WindowOperation {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.name.syntax_eq(&other.name) && self.window.syntax_eq(&other.window)
     }
 }

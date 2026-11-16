@@ -18,9 +18,9 @@
 use novarocks_parser::{
     ParserError, Span, ValidateError,
     ast::{
-        NamedWindow, Query, Select, SelectItem, SelectQuantifier, SetExpr, Statement, Values,
-        WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
-        validate_statement,
+        AstVec, Query, Select, SelectItem, SelectQuantifier, SetExpr, Statement, Values,
+        WindowDefinition, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits,
+        WindowSpecification, validate_statement,
     },
     parse,
 };
@@ -117,6 +117,12 @@ fn contradictory_window_frame_bounds_are_rejected_without_analyze() {
         start_bound: WindowFrameBound::Following(Some(number("1")), Span::new(20, 31)),
         end_bound: Some(WindowFrameBound::CurrentRow(Span::new(36, 47))),
         exclusion: WindowFrameExclusion::NoOthers,
+        measures: AstVec::new(),
+        after_match_skip_to: None,
+        pattern_search_mode: None,
+        pattern: None,
+        subsets: AstVec::new(),
+        variable_definitions: AstVec::new(),
         span: Span::new(15, 47),
     };
     let statement = select_statement(vec![named_window("w", false, Span::new(7, 8), Some(frame))]);
@@ -142,6 +148,12 @@ fn impossible_unbounded_window_frame_endpoints_are_rejected() {
             start_bound: WindowFrameBound::Following(None, Span::new(20, 39)),
             end_bound: None,
             exclusion: WindowFrameExclusion::NoOthers,
+            measures: AstVec::new(),
+            after_match_skip_to: None,
+            pattern_search_mode: None,
+            pattern: None,
+            subsets: AstVec::new(),
+            variable_definitions: AstVec::new(),
             span: Span::new(15, 39),
         },
         WindowFrame {
@@ -149,6 +161,12 @@ fn impossible_unbounded_window_frame_endpoints_are_rejected() {
             start_bound: WindowFrameBound::CurrentRow(Span::new(20, 31)),
             end_bound: Some(WindowFrameBound::Preceding(None, Span::new(36, 55))),
             exclusion: WindowFrameExclusion::NoOthers,
+            measures: AstVec::new(),
+            after_match_skip_to: None,
+            pattern_search_mode: None,
+            pattern: None,
+            subsets: AstVec::new(),
+            variable_definitions: AstVec::new(),
             span: Span::new(15, 55),
         },
     ] {
@@ -160,7 +178,7 @@ fn impossible_unbounded_window_frame_endpoints_are_rejected() {
     }
 }
 
-fn select_statement(windows: Vec<NamedWindow>) -> Statement {
+fn select_statement(windows: Vec<WindowDefinition>) -> Statement {
     Statement::Query(Query {
         session_properties: Vec::new(),
         functions: Vec::new(),
@@ -173,7 +191,7 @@ fn select_statement(windows: Vec<NamedWindow>) -> Statement {
             group_by: novarocks_parser::ast::GroupBy::None,
             having: None,
             qualify: None,
-            windows,
+            windows: windows.into(),
             modifiers: Default::default(),
             span: SPAN,
         }))),
@@ -187,16 +205,16 @@ fn named_window(
     quoted: bool,
     name_span: Span,
     frame: Option<WindowFrame>,
-) -> NamedWindow {
-    NamedWindow {
+) -> WindowDefinition {
+    WindowDefinition {
         name: novarocks_parser::ast::Ident {
             value: name.to_owned(),
             quoted,
             span: name_span,
         },
-        specification: WindowSpec {
+        specification: WindowSpecification {
             existing_window_name: None,
-            partition_by: Vec::new(),
+            partition_by: AstVec::new(),
             order_by: None,
             window_frame: frame,
             span: SPAN,

@@ -3153,7 +3153,7 @@ fn classify_aggregate_call(expr: &Expr, output_name: String) -> Result<Aggregate
     };
     if function.name.parts.len() != 1
         || function.null_treatment.is_some()
-        || function.over.is_some()
+        || function.window.is_some()
         || function.filter.is_some()
         || function.order_by.is_some()
     {
@@ -3516,7 +3516,7 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
         | Expr::JsonValue(_)
         | Expr::JsonSerialize(_) => return Err(projection_filter_error()),
 
-        Expr::Subquery(_) | Expr::Exists(_) | Expr::Unique(_) => {
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::Unique(_) | Expr::WindowOperation(_) => {
             return Err(projection_filter_error());
         }
         Expr::FunctionCall(function) => reject_unsupported_function(function)?,
@@ -3617,7 +3617,7 @@ fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), Strin
         || is_unsafe_scalar_function(&function_name)
         || function_name == "match"
         || function.null_treatment.is_some()
-        || function.over.is_some()
+        || function.window.is_some()
         || function.order_by.is_some()
         || function.separator.is_some()
         || function.filter.is_some()

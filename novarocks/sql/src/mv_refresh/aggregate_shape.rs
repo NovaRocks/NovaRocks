@@ -234,7 +234,7 @@ fn classify_aggregate_call(
     };
     if function.name.parts.len() != 1
         || function.null_treatment.is_some()
-        || function.over.is_some()
+        || function.window.is_some()
         || function.filter.is_some()
         || function.order_by.is_some()
     {

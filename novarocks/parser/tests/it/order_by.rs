@@ -84,7 +84,10 @@ fn all_three_order_owners_capture_their_real_keyword_and_original_keys() {
             panic!("call");
         };
         let order = if window {
-            call.over.as_ref().unwrap().order_by.as_ref().unwrap()
+            match call.window.as_ref().unwrap() {
+                Window::Specification(spec) => spec.order_by.as_ref().unwrap(),
+                _ => panic!("specification"),
+            }
         } else {
             call.order_by.as_ref().unwrap()
         };
@@ -210,7 +213,10 @@ fn checked_build_and_public_validation_reject_each_empty_order_owner() {
             if owner == 1 {
                 call.order_by = Some(empty);
             } else {
-                call.over.as_mut().unwrap().order_by = Some(empty);
+                let Window::Specification(spec) = call.window.as_mut().unwrap() else {
+                    panic!("specification");
+                };
+                spec.order_by = Some(empty);
             }
         }
         assert_eq!(

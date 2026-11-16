@@ -866,3 +866,148 @@ fn window_wide_rebound_gate_observes_original_nested_source_and_terminal_control
         }
     }
 }
+
+#[test]
+fn complete_window_metadata_refuses_before_missing_names_or_catalog_lookup() {
+    use novarocks_parser::{ast::*, build};
+    let functions = crate::compiler::build_builtin_engine_function_catalog().unwrap();
+    let source = crate::planning::catalog::PlannerMemoryCatalog::default();
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    for profile in 0..11 {
+        let sql = if profile >= 8 {
+            "SELECT row_number() OVER (ROWS CURRENT ROW)"
+        } else {
+            "SELECT missing_function(missing_argument) OVER (ROWS CURRENT ROW) FROM missing_table"
+        };
+        let statements = novarocks_parser::parse(sql).unwrap();
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("query");
+        };
+        let mut query = query.clone();
+        let span = query.span;
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select");
+        };
+        let SelectItem::UnnamedExpr(expression) = &mut select.projection[0] else {
+            panic!("expression");
+        };
+        let Expr::FunctionCall(call) = expression else {
+            panic!("function");
+        };
+        let mut window = call.window.take().unwrap();
+        let ident = |name| build::ident_at(name, false, span);
+        if profile == 8 {
+            window = Window::Reference(WindowReference {
+                name: ident("missing_window"),
+                span,
+            });
+        } else {
+            let Window::Specification(specification) = &mut window else {
+                panic!("specification");
+            };
+            if profile == 9 {
+                specification.existing_window_name = Some(ident("missing_inherited_window"));
+            } else {
+                let frame = specification.window_frame.as_mut().unwrap();
+                match profile {
+                    0 => frame.exclusion = WindowFrameExclusion::CurrentRow,
+                    1 => {
+                        frame.measures = vec![MeasureDefinition {
+                            expression: build::identifier(ident("missing_measure")),
+                            name: ident("m"),
+                            span,
+                        }]
+                        .into()
+                    }
+                    2 => frame.after_match_skip_to = Some(SkipTo::Next { span }),
+                    3 => {
+                        frame.pattern_search_mode = Some(PatternSearchMode {
+                            mode: PatternSearchModeKind::Seek,
+                            span,
+                        })
+                    }
+                    4 => {
+                        frame.pattern = Some(RowPattern::Variable {
+                            name: ident("A"),
+                            span,
+                        })
+                    }
+                    5 => {
+                        frame.subsets = vec![SubsetDefinition {
+                            name: ident("U"),
+                            identifiers: vec![ident("A")],
+                            span,
+                        }]
+                        .into()
+                    }
+                    6 => {
+                        frame.variable_definitions = vec![VariableDefinition {
+                            name: ident("A"),
+                            expression: build::identifier(ident("missing_definition")),
+                            span,
+                        }]
+                        .into()
+                    }
+                    7 => {}
+                    10 => frame.units = WindowFrameUnits::Groups,
+                    _ => unreachable!("bounded metadata profiles"),
+                }
+            }
+        }
+        call.window = Some(window);
+        if profile == 7 {
+            let window = call.window.take().unwrap();
+            *expression = Expr::WindowOperation(AstBox::new(WindowOperation {
+                name: ident("missing_measure"),
+                window,
+                span,
+            }));
+        }
+        let error = super::analyze_with_function_catalog_and_sql_semantics(
+            &query,
+            &source,
+            "default",
+            &functions,
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+        .map(|result| result.0)
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression,
+            "profile {profile}: {error}"
+        );
+        let message = error.to_string();
+        let expected = match profile {
+            0 => "EXCLUDE",
+            1..=6 => "pattern recognition",
+            7 => "window operations",
+            8 | 9 => "named window references",
+            10 => "GROUPS",
+            _ => unreachable!(),
+        };
+        assert!(message.contains(expected), "profile {profile}: {message}");
+    }
+}
+
+#[test]
+fn original_typeof_cast_window_metadata_surface_keeps_its_declared_type() {
+    let source = SourceCatalog {
+        offset_nullable: false,
+    };
+    let functions = crate::compiler::build_builtin_engine_function_catalog().unwrap();
+    for sql in [
+        "SELECT typeof(CAST(row_number() OVER missing_window AS INT))",
+        "SELECT typeof(CAST(row_number() OVER (missing_window) AS INT))",
+        "SELECT typeof(CAST(row_number() OVER (GROUPS CURRENT ROW) AS INT))",
+    ] {
+        let resolved = analyze(sql, &source, &functions).unwrap();
+        assert!(
+            matches!(&projection(&resolved, 0).kind,
+            ExprKind::Literal(crate::analysis::LiteralValue::String(value)) if value == "int"),
+            "{sql}"
+        );
+    }
+}

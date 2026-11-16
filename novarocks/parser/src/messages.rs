@@ -48,6 +48,12 @@ pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
         StructuralViolation::InvalidSetOperationOperandCount => {
             "invalid SQL structure: invalid set operation operand count".to_owned()
         }
+        StructuralViolation::EmptyPatternList => {
+            "invalid SQL structure: empty row-pattern list".to_owned()
+        }
+        StructuralViolation::EmptySubsetIdentifierList => {
+            "invalid SQL structure: empty SUBSET identifier list".to_owned()
+        }
         StructuralViolation::EmptyOrderBy => {
             "invalid SQL structure: empty ORDER BY list".to_owned()
         }

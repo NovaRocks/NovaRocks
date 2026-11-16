@@ -17,7 +17,7 @@
 
 use crate::{
     Span,
-    ast::{AstBox, AstVec, Ident, Literal, ObjectName, OrderBy, Query, window::WindowSpec},
+    ast::{AstBox, AstVec, Ident, Literal, ObjectName, OrderBy, Query},
 };
 
 /// A SQL expression with source spans retained at every syntax node.
@@ -34,6 +34,7 @@ pub enum Expr {
     Identifier(Ident),
     Literal(Literal),
     FunctionCall(FunctionCall),
+    WindowOperation(AstBox<super::WindowOperation>),
     Unary(UnaryExpr),
     Binary(BinaryExpr),
     Logical(LogicalExpr),
@@ -71,6 +72,7 @@ impl Expr {
             Self::Identifier(ident) => ident.span,
             Self::Literal(literal) => literal.span,
             Self::FunctionCall(call) => call.span,
+            Self::WindowOperation(node) => node.span,
             Self::Unary(expression) => expression.span,
             Self::Binary(expression) => expression.span,
             Self::Logical(expression) => expression.span,
@@ -106,7 +108,7 @@ pub struct FunctionCall {
     pub separator: Option<Box<Expr>>,
     pub filter: Option<Box<Expr>>,
     pub null_treatment: Option<NullTreatment>,
-    pub over: Option<Box<WindowSpec>>,
+    pub window: Option<super::Window>,
     /// Whether SUBSTRING used its `value FROM start [FOR length]` spelling.
     pub substring_from_syntax: bool,
     pub span: Span,

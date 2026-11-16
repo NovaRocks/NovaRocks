@@ -1480,7 +1480,7 @@ fn format_function_display_name(function: &ast::FunctionCall) -> String {
             ast::NullTreatment::RespectNulls => "respect nulls",
         });
     }
-    if let Some(over) = &function.over {
+    if let Some(over) = &function.window {
         out.push_str(" OVER ");
         out.push_str(&format_window_display_name(over));
     }
@@ -1664,7 +1664,16 @@ fn format_order_by_display_name(
     out
 }
 
-fn format_window_display_name(over: &ast::WindowSpec) -> String {
+fn format_window_display_name(window: &ast::Window) -> String {
+    match window {
+        ast::Window::Reference(reference) => reference.name.value.clone(),
+        ast::Window::Specification(specification) => {
+            format_window_specification_display_name(specification)
+        }
+    }
+}
+
+fn format_window_specification_display_name(over: &ast::WindowSpecification) -> String {
     if let Some(name) = &over.existing_window_name {
         return name.value.clone();
     }

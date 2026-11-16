@@ -27,7 +27,7 @@ use crate::{StructuralViolation, ValidateError};
 
 use super::{
     Cte, Expr, GroupBy, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableStatement,
-    TableWithJoins, Values, WindowFrame, WindowFrameBound, WindowSpec,
+    TableWithJoins, Values, WindowFrame, WindowFrameBound, WindowSpecification,
 };
 
 /// Validates every statement in a public parser result.
@@ -209,7 +209,7 @@ fn validate_select(select: &Select) -> Result<(), ValidateError> {
                 window.name.span,
             ));
         }
-        validate_window_spec(&window.specification)?;
+        validate_window_specification(&window.specification)?;
     }
     for relation in &select.from {
         validate_table_with_joins(relation)?;
@@ -308,7 +308,8 @@ fn validate_table_factor(table_factor: &TableFactor) -> Result<(), ValidateError
     }
 }
 
-fn validate_window_spec(specification: &WindowSpec) -> Result<(), ValidateError> {
+#[recursive::recursive]
+fn validate_window_specification(specification: &WindowSpecification) -> Result<(), ValidateError> {
     for expression in &specification.partition_by {
         validate_expr(expression)?;
     }
@@ -321,6 +322,7 @@ fn validate_window_spec(specification: &WindowSpec) -> Result<(), ValidateError>
     Ok(())
 }
 
+#[recursive::recursive]
 fn validate_window_frame(frame: &WindowFrame) -> Result<(), ValidateError> {
     validate_window_frame_bound(&frame.start_bound)?;
     if let Some(end_bound) = &frame.end_bound {
@@ -339,9 +341,29 @@ fn validate_window_frame(frame: &WindowFrame) -> Result<(), ValidateError> {
     if let Some(end_bound @ WindowFrameBound::Preceding(None, _)) = &frame.end_bound {
         return Err(ValidateError::invalid_window_frame_bounds(end_bound.span()));
     }
+
+    // Optional pattern clauses are syntax facts even when the analyzer cannot execute them.
+    for measure in &frame.measures {
+        validate_expr(&measure.expression)?;
+    }
+    if let Some(pattern) = &frame.pattern {
+        validate_row_pattern(pattern)?;
+    }
+    for subset in &frame.subsets {
+        if subset.identifiers.is_empty() {
+            return Err(ValidateError::invalid_structure(
+                StructuralViolation::EmptySubsetIdentifierList,
+                subset.span,
+            ));
+        }
+    }
+    for variable in &frame.variable_definitions {
+        validate_expr(&variable.expression)?;
+    }
     Ok(())
 }
 
+#[recursive::recursive]
 fn validate_window_frame_bound(bound: &WindowFrameBound) -> Result<(), ValidateError> {
     match bound {
         WindowFrameBound::Preceding(Some(expression), _)
@@ -396,7 +418,7 @@ fn bound_position(bound: &WindowFrameBound) -> FramePosition {
 #[recursive::recursive]
 fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
     // The query validator only needs to descend into syntax nodes that can
-    // contain a Query or WindowSpec. Other expression-local invariants are
+    // contain a Query or WindowSpecification. Other expression-local invariants are
     // enforced by their parser production and remain valid after construction.
     match expression {
         Expr::JsonConstructor(node) => {
@@ -421,6 +443,7 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             validate_json_root(|visitor| super::Visit::visit_json_array(visitor, node))?
         }
 
+        Expr::WindowOperation(node) => validate_window(&node.window)?,
         Expr::FunctionCall(function) => {
             for argument in &function.arguments {
                 validate_expr(argument)?;
@@ -434,8 +457,8 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             if let Some(filter) = &function.filter {
                 validate_expr(filter)?;
             }
-            if let Some(window) = &function.over {
-                validate_window_spec(window)?;
+            if let Some(window) = &function.window {
+                validate_window(window)?;
             }
         }
         Expr::Subquery(subquery) => validate_query(&subquery.query)?,
@@ -677,6 +700,38 @@ fn validate_order_by(order: &super::OrderBy) -> Result<(), ValidateError> {
     }
     for item in &order.items {
         validate_expr(&item.sort_key)?;
+    }
+    Ok(())
+}
+
+#[recursive::recursive]
+fn validate_window(window: &super::Window) -> Result<(), ValidateError> {
+    match window {
+        super::Window::Reference(_) => Ok(()),
+        super::Window::Specification(node) => validate_window_specification(node),
+    }
+}
+#[recursive::recursive]
+fn validate_row_pattern(pattern: &super::RowPattern) -> Result<(), ValidateError> {
+    use super::RowPattern;
+    match pattern {
+        RowPattern::Alternation { patterns, span }
+        | RowPattern::Concatenation { patterns, span }
+        | RowPattern::Permutation { patterns, span } => {
+            if patterns.is_empty() {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::EmptyPatternList,
+                    *span,
+                ));
+            }
+            for child in patterns {
+                validate_row_pattern(child)?;
+            }
+        }
+        RowPattern::Excluded { pattern, .. } | RowPattern::Quantified { pattern, .. } => {
+            validate_row_pattern(pattern)?
+        }
+        RowPattern::Variable { .. } | RowPattern::Empty { .. } | RowPattern::Anchor { .. } => {}
     }
     Ok(())
 }

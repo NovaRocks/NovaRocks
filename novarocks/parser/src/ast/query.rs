@@ -8,7 +8,7 @@
 
 use crate::{
     Span,
-    ast::{AstVec, Expr, Ident, relation::TableWithJoins, window::NamedWindow},
+    ast::{AstVec, Expr, Ident, relation::TableWithJoins, window::WindowDefinition},
 };
 
 /// One top-level query expression and its query-level modifiers.
@@ -157,7 +157,7 @@ pub struct Select {
     pub group_by: GroupBy,
     pub having: Option<Expr>,
     pub qualify: Option<Expr>,
-    pub windows: Vec<NamedWindow>,
+    pub windows: AstVec<WindowDefinition>,
     pub modifiers: QueryModifiers,
     pub span: Span,
 }

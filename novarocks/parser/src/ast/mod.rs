@@ -46,6 +46,7 @@ pub(crate) mod statistics;
 mod storage;
 mod type_literal;
 pub use type_literal::*;
+mod row_pattern;
 pub(crate) mod table;
 mod validate;
 pub(crate) mod view;
@@ -98,6 +99,10 @@ pub use relation::{
     Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableVersion,
     TableVersionKind, TableWithJoins,
 };
+pub use row_pattern::{
+    MeasureDefinition, PatternAnchorKind, PatternInteger, PatternQuantifier, PatternSearchMode,
+    PatternSearchModeKind, RowPattern, SkipTo, SubsetDefinition, VariableDefinition,
+};
 pub use session::ShowProcessList;
 pub use session::{
     KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement,
@@ -119,7 +124,8 @@ pub use visit::{
     walk_statement, walk_table_factor, walk_unary_expr, walk_view_statement,
 };
 pub use window::{
-    NamedWindow, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+    Window, WindowDefinition, WindowFrame, WindowFrameBound, WindowFrameExclusion,
+    WindowFrameUnits, WindowOperation, WindowReference, WindowSpecification,
 };
 
 use crate::Span;
@@ -263,7 +269,7 @@ mod tests {
                 separator: None,
                 filter: None,
                 null_treatment: None,
-                over: None,
+                window: None,
                 substring_from_syntax: false,
                 span: span(4, 10),
             })),
@@ -373,3 +379,16 @@ pub use visit::{
 };
 
 pub use visit::{fold_order_by, fold_sort_item, walk_order_by, walk_sort_item};
+
+pub use row_pattern::{
+    fold_measure_definition, fold_pattern_integer, fold_pattern_quantifier,
+    fold_pattern_search_mode, fold_row_pattern, fold_skip_to, fold_subset_definition,
+    fold_variable_definition, walk_measure_definition, walk_pattern_integer,
+    walk_pattern_quantifier, walk_pattern_search_mode, walk_row_pattern, walk_skip_to,
+    walk_subset_definition, walk_variable_definition,
+};
+pub use visit::{
+    fold_window, fold_window_definition, fold_window_frame, fold_window_operation,
+    fold_window_reference, fold_window_specification, walk_window, walk_window_definition,
+    walk_window_frame, walk_window_operation, walk_window_reference, walk_window_specification,
+};

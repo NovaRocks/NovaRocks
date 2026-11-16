@@ -930,6 +930,30 @@ fn order_key_loans_keep_their_exact_owner_field_ordinal_and_null_rules() {
             )
             .is_err()
         );
+        if matches!(path.first(), Some(Edge::WindowOrderByKey(_))) {
+            let mut reference_query = query.clone();
+            let reference_span = reference_query.span;
+            let ast::SetExpr::Select(select) = reference_query.body.as_mut() else {
+                panic!("select");
+            };
+            let ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(call)) =
+                &mut select.projection[0]
+            else {
+                panic!("call");
+            };
+            call.window = Some(ast::Window::Reference(ast::WindowReference {
+                name: novarocks_parser::build::ident("unresolved_window", false),
+                span: reference_span,
+            }));
+            assert!(
+                MaterializedValues::try_new_expressions(
+                    &reference_query,
+                    vec![constant(site, path.clone())].into(),
+                    &control,
+                )
+                .is_err()
+            );
+        }
         if matches!(site, Site::QueryOrderByKey { .. }) {
             // A set operand cannot borrow the enclosing Query's sort key.
             let wrong_owner = SqlExpressionConstant::new(

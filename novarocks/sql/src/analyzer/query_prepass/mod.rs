@@ -85,6 +85,16 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                 novarocks_parser::ast::walk_query(self, query);
             }
         }
+        fn visit_window_frame(&mut self, frame: &novarocks_parser::ast::WindowFrame) {
+            if self.0.is_some() {
+                return;
+            }
+            if let Some(reason) = super::resolve_expr::unsupported_window_frame_reason(frame) {
+                self.0 = Some((reason, frame.span));
+                return;
+            }
+            novarocks_parser::ast::walk_window_frame(self, frame);
+        }
         fn visit_expr(&mut self, expression: &Expr) {
             if self.0.is_some() {
                 return;
@@ -512,7 +522,7 @@ fn inline_iteration(
         group_by: novarocks_parser::ast::GroupBy::None,
         having: None,
         qualify: None,
-        windows: Vec::new(),
+        windows: Vec::new().into(),
         modifiers: Default::default(),
         span,
     }))

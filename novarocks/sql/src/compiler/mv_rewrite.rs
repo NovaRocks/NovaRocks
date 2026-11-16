@@ -27,8 +27,8 @@ use std::sync::Arc;
 use novarocks_parser::ast::{
     Expr, FunctionCall, GroupBy, Ident, JoinConstraint, Literal, LiteralKind, ObjectName, Query,
     Select, SelectItem, SelectQuantifier, SetExpr, TableAlias, TableFactor, TableWithJoins,
-    TypeName, Visit, WildcardOptions, WindowSpec, walk_expr, walk_function_call, walk_object_name,
-    walk_query, walk_table_factor, walk_type_name,
+    TypeName, Visit, WildcardOptions, WindowSpecification, walk_expr, walk_function_call,
+    walk_object_name, walk_query, walk_table_factor, walk_type_name,
 };
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 
@@ -2841,7 +2841,7 @@ impl CompletionRetainedBytes {
                 }
             }
         }
-        self.add_vec_capacity::<novarocks_parser::ast::NamedWindow>(select.windows.capacity());
+        self.add_vec_capacity::<novarocks_parser::ast::WindowDefinition>(select.windows.capacity());
         for window in &select.windows {
             self.add_window_spec_containers(&window.specification);
         }
@@ -2876,10 +2876,27 @@ impl CompletionRetainedBytes {
         }
     }
 
-    fn add_window_spec_containers(&mut self, window: &WindowSpec) {
-        self.add(std::mem::size_of::<WindowSpec>());
+    fn add_window_spec_containers(&mut self, window: &WindowSpecification) {
         self.add_vec_capacity::<Expr>(window.partition_by.capacity());
         self.add_order_by_containers(&window.order_by);
+        if let Some(frame) = &window.window_frame {
+            self.add_vec_capacity::<novarocks_parser::ast::MeasureDefinition>(
+                frame.measures.capacity(),
+            );
+            self.add_vec_capacity::<novarocks_parser::ast::SubsetDefinition>(
+                frame.subsets.capacity(),
+            );
+            self.add_vec_capacity::<novarocks_parser::ast::VariableDefinition>(
+                frame.variable_definitions.capacity(),
+            );
+        }
+    }
+
+    fn add_window_containers(&mut self, window: &novarocks_parser::ast::Window) {
+        if let novarocks_parser::ast::Window::Specification(specification) = window {
+            self.add(std::mem::size_of::<WindowSpecification>());
+            self.add_window_spec_containers(specification);
+        }
     }
 
     fn finish(self) -> Result<u64, SqlCompileError> {
@@ -2893,6 +2910,32 @@ impl CompletionRetainedBytes {
 }
 
 impl Visit for CompletionRetainedBytes {
+    fn visit_subset_definition(&mut self, subset: &novarocks_parser::ast::SubsetDefinition) {
+        self.add_vec_capacity::<Ident>(subset.identifiers.capacity());
+        novarocks_parser::ast::walk_subset_definition(self, subset);
+    }
+
+    fn visit_pattern_integer(&mut self, value: &novarocks_parser::ast::PatternInteger) {
+        self.add(value.lexeme.capacity());
+        novarocks_parser::ast::walk_pattern_integer(self, value);
+    }
+
+    fn visit_row_pattern(&mut self, pattern: &novarocks_parser::ast::RowPattern) {
+        use novarocks_parser::ast::RowPattern;
+        match pattern {
+            RowPattern::Alternation { patterns, .. }
+            | RowPattern::Concatenation { patterns, .. }
+            | RowPattern::Permutation { patterns, .. } => {
+                self.add_vec_capacity::<RowPattern>(patterns.capacity())
+            }
+            RowPattern::Excluded { .. } | RowPattern::Quantified { .. } => {
+                self.add(std::mem::size_of::<RowPattern>())
+            }
+            RowPattern::Variable { .. } | RowPattern::Empty { .. } | RowPattern::Anchor { .. } => {}
+        }
+        novarocks_parser::ast::walk_row_pattern(self, pattern);
+    }
+
     fn visit_function_specification(
         &mut self,
         function: &novarocks_parser::ast::FunctionSpecification,
@@ -3104,6 +3147,10 @@ impl Visit for CompletionRetainedBytes {
             Expr::Cast(_) => self.add(std::mem::size_of::<novarocks_parser::ast::CastExpr>()),
             Expr::Exists(_) => self.add(std::mem::size_of::<novarocks_parser::ast::ExistsExpr>()),
             Expr::Unique(_) => self.add(std::mem::size_of::<novarocks_parser::ast::UniqueExpr>()),
+            Expr::WindowOperation(operation) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::WindowOperation>());
+                self.add_window_containers(&operation.window);
+            }
             Expr::Array(expression) => {
                 self.add_vec_capacity::<Expr>(expression.values.capacity());
             }
@@ -3230,8 +3277,8 @@ impl Visit for CompletionRetainedBytes {
         self.add(std::mem::size_of::<FunctionCall>());
         self.add_vec_capacity::<Expr>(call.arguments.capacity());
         self.add_order_by_containers(&call.order_by);
-        if let Some(over) = &call.over {
-            self.add_window_spec_containers(over);
+        if let Some(window) = &call.window {
+            self.add_window_containers(window);
         }
         walk_function_call(self, call);
     }

@@ -374,7 +374,7 @@ mod tests {
         ) else {
             panic!("expected window function");
         };
-        assert!(call.over.is_some());
+        assert!(call.window.is_some());
 
         assert!(matches!(parse("EXISTS (SELECT 1)"), Expr::Exists(_)));
         let Expr::Predicated(node) = parse("a NOT IN (SELECT b FROM t)") else {

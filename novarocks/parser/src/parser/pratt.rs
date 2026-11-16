@@ -26,13 +26,14 @@ use crate::ast::{
 use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
-        AccessExpr, AccessKind, ArrayExpr, BinaryExpr, BinaryOperator, CastExpr, DataTypeParameter,
-        DereferenceExpr, ExistsExpr, Expr, FunctionCall, FunctionQuantifier, Ident, InListExpr,
-        IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration, LambdaExpr, Literal,
-        LiteralKind, MapEntry, MapExpr, NestedExpr, NullOrdering, NullTreatment, ObjectName,
-        OrderBy, RowDataTypeField, RowExpr, RowField, SearchedCaseExpr, SimpleCaseExpr, SortItem,
-        SortOrdering, SubqueryExpr, TypeName, UnaryExpr, UnaryOperator, WhenClause, WhenMatch,
-        WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+        AccessExpr, AccessKind, ArrayExpr, AstVec, BinaryExpr, BinaryOperator, CastExpr,
+        DataTypeParameter, DereferenceExpr, ExistsExpr, Expr, FunctionCall, FunctionQuantifier,
+        Ident, InListExpr, IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration,
+        LambdaExpr, Literal, LiteralKind, MapEntry, MapExpr, NestedExpr, NullOrdering,
+        NullTreatment, ObjectName, OrderBy, RowDataTypeField, RowExpr, RowField, SearchedCaseExpr,
+        SimpleCaseExpr, SortItem, SortOrdering, SubqueryExpr, TypeName, UnaryExpr, UnaryOperator,
+        WhenClause, WhenMatch, Window, WindowFrame, WindowFrameBound, WindowFrameExclusion,
+        WindowFrameUnits, WindowReference, WindowSpecification,
     },
     error::ParseError,
     keyword_class,
@@ -1189,7 +1190,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             separator: None,
             filter: None,
             null_treatment: None,
-            over: None,
+            window: None,
             substring_from_syntax: false,
             span: Span::new(start, end),
         }))
@@ -1247,7 +1248,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             separator: None,
             filter: None,
             null_treatment: None,
-            over: None,
+            window: None,
             substring_from_syntax: true,
             span: Span::new(start, end),
         }))
@@ -1586,7 +1587,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         } else {
             None
         };
-        let over = if self.current_is_keyword(Keyword::Over) {
+        let window = if self.current_is_keyword(Keyword::Over) {
+            let over_start = self.current_span().start();
             self.advance();
             self.skip_trivia();
             if matches!(
@@ -1594,27 +1596,26 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 Some(TokenKind::Ident | TokenKind::QuotedIdent)
             ) {
                 let name = self.parse_identifier(self.current_span());
-                Some(Box::new(WindowSpec {
-                    span: name.span,
-                    existing_window_name: Some(name),
-                    partition_by: Vec::new(),
-                    order_by: None,
-                    window_frame: None,
+                Some(Window::Reference(WindowReference {
+                    span: Span::new(over_start, name.span.end()),
+                    name,
                 }))
             } else {
-                Some(Box::new(self.parse_window_spec()?))
+                Some(Window::Specification(AstBox::new(
+                    self.parse_window_specification()?,
+                )))
             }
         } else {
             None
         };
-        let span_end = over.as_ref().map_or_else(
+        let span_end = window.as_ref().map_or_else(
             || {
                 filter.as_ref().map_or_else(
                     || separator.as_ref().map_or(end, |value| value.span().end()),
                     |value| value.span().end(),
                 )
             },
-            |window| window.span.end(),
+            |window| window.span().end(),
         );
         self.function_call_depth -= 1;
         Ok(Expr::FunctionCall(FunctionCall {
@@ -1625,7 +1626,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             separator,
             filter,
             null_treatment,
-            over,
+            window,
             substring_from_syntax: false,
             span: Span::new(span.start(), span_end),
         }))
@@ -1657,7 +1658,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }))
     }
 
-    fn parse_window_spec(&mut self) -> Result<WindowSpec, ParseError> {
+    fn parse_window_specification(&mut self) -> Result<WindowSpecification, ParseError> {
         let start = self.current_span().start();
         if !self.current_is_symbol(Symbol::LParen) {
             return Err(self.unexpected("'(' after OVER"));
@@ -1665,7 +1666,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.advance();
         self.skip_trivia();
         let mut existing_window_name = None;
-        let mut partition_by = Vec::new();
+        let mut partition_by = AstVec::new();
         let mut order_by = None;
         let mut window_frame = None;
         if matches!(
@@ -1792,6 +1793,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 start_bound,
                 end_bound,
                 exclusion: WindowFrameExclusion::NoOthers,
+                measures: AstVec::new(),
+                after_match_skip_to: None,
+                pattern_search_mode: None,
+                pattern: None,
+                subsets: AstVec::new(),
+                variable_definitions: AstVec::new(),
                 span: Span::new(frame_start, frame_end),
             });
         }
@@ -1801,7 +1808,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let end = self.current_span().end();
         self.advance();
         self.skip_trivia();
-        Ok(WindowSpec {
+        Ok(WindowSpecification {
             existing_window_name,
             partition_by,
             order_by,
@@ -2146,9 +2153,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
 /// Parses exactly one parenthesized window specification from a query-clause
 /// token slice. Named `WINDOW name AS (...)` definitions and function `OVER
 /// (...)` deliberately share the same syntax production.
-pub(super) fn parse_window_spec(source: &str, tokens: &[Token]) -> Result<WindowSpec, ParseError> {
+pub(super) fn parse_window_specification(
+    source: &str,
+    tokens: &[Token],
+) -> Result<WindowSpecification, ParseError> {
     let mut parser = PrattParser::new(source, tokens);
-    let specification = parser.parse_window_spec()?;
+    let specification = parser.parse_window_specification()?;
     parser.skip_trivia();
     if parser.is_end() {
         Ok(specification)

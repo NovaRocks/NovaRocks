@@ -124,7 +124,7 @@ pub(crate) fn plain_function(function: &ast::FunctionCall) -> bool {
         && function.separator.is_none()
         && function.filter.is_none()
         && function.null_treatment.is_none()
-        && function.over.is_none()
+        && function.window.is_none()
 }
 
 pub(crate) fn literal_query(query: &ast::Query) -> bool {

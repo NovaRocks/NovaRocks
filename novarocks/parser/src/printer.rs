@@ -701,7 +701,8 @@ impl Printer {
         }
     }
 
-    fn write_window_specification(&mut self, specification: &WindowSpec) {
+    #[recursive::recursive]
+    fn write_window_specification(&mut self, specification: &WindowSpecification) {
         self.output.push('(');
         let mut needs_separator = false;
         if let Some(name) = &specification.existing_window_name {
@@ -733,7 +734,121 @@ impl Printer {
         self.output.push(')');
     }
 
+    #[recursive::recursive]
+    fn write_window(&mut self, window: &Window) {
+        match window {
+            Window::Reference(node) => self.write_ident(&node.name),
+            Window::Specification(node) => self.write_window_specification(node),
+        }
+    }
+    fn write_skip_to(&mut self, skip: &SkipTo) {
+        match skip {
+            SkipTo::PastLast { .. } => self.output.push_str("AFTER MATCH SKIP PAST LAST ROW"),
+            SkipTo::Next { .. } => self.output.push_str("AFTER MATCH SKIP TO NEXT ROW"),
+            SkipTo::First { identifier, .. } => {
+                self.output.push_str("AFTER MATCH SKIP TO FIRST ");
+                self.write_ident(identifier);
+            }
+            SkipTo::Last { identifier, .. } => {
+                self.output.push_str("AFTER MATCH SKIP TO LAST ");
+                self.write_ident(identifier);
+            }
+        }
+    }
+    #[recursive::recursive]
+    fn write_row_pattern(&mut self, pattern: &RowPattern) {
+        match pattern {
+            RowPattern::Variable { name, .. } => self.write_ident(name),
+            RowPattern::Empty { .. } => self.output.push_str("()"),
+            RowPattern::Anchor { kind, .. } => self.output.push_str(match kind {
+                PatternAnchorKind::PartitionStart => "^",
+                PatternAnchorKind::PartitionEnd => "$",
+            }),
+            RowPattern::Alternation { patterns, .. }
+            | RowPattern::Concatenation { patterns, .. }
+            | RowPattern::Permutation { patterns, .. } => {
+                let (prefix, separator) = match pattern {
+                    RowPattern::Alternation { .. } => ("(", " | "),
+                    RowPattern::Concatenation { .. } => ("(", " "),
+                    _ => ("PERMUTE(", ", "),
+                };
+                self.output.push_str(prefix);
+                for (index, child) in patterns.iter().enumerate() {
+                    if index != 0 {
+                        self.output.push_str(separator);
+                    }
+                    self.write_row_pattern(child);
+                }
+                self.output.push(')');
+            }
+            RowPattern::Excluded { pattern, .. } => {
+                self.output.push_str("{-");
+                self.write_row_pattern(pattern);
+                self.output.push_str("-}");
+            }
+            RowPattern::Quantified {
+                pattern,
+                quantifier,
+                ..
+            } => {
+                self.output.push('(');
+                self.write_row_pattern(pattern);
+                self.write_pattern_quantifier(quantifier);
+                self.output.push(')');
+            }
+        }
+    }
+    fn write_pattern_quantifier(&mut self, quantifier: &PatternQuantifier) {
+        let greedy = match quantifier {
+            PatternQuantifier::ZeroOrMore { greedy, .. } => {
+                self.output.push('*');
+                *greedy
+            }
+            PatternQuantifier::OneOrMore { greedy, .. } => {
+                self.output.push('+');
+                *greedy
+            }
+            PatternQuantifier::ZeroOrOne { greedy, .. } => {
+                self.output.push('?');
+                *greedy
+            }
+            PatternQuantifier::Range {
+                greedy,
+                at_least,
+                at_most,
+                ..
+            } => {
+                self.output.push('{');
+                if let Some(value) = at_least {
+                    self.output.push_str(&value.lexeme);
+                }
+                self.output.push(',');
+                if let Some(value) = at_most {
+                    self.output.push_str(&value.lexeme);
+                }
+                self.output.push('}');
+                *greedy
+            }
+        };
+        if !greedy {
+            self.output.push('?');
+        }
+    }
+
+    #[recursive::recursive]
     fn write_window_frame(&mut self, frame: &WindowFrame) {
+        if !frame.measures.is_empty() {
+            self.output.push_str("MEASURES ");
+            for (index, measure) in frame.measures.iter().enumerate() {
+                if index != 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_expr(&measure.expression);
+                self.output.push_str(" AS ");
+                self.write_ident(&measure.name);
+            }
+            self.output.push(' ');
+        }
         self.output.push_str(match frame.units {
             WindowFrameUnits::Rows => "ROWS ",
             WindowFrameUnits::Range => "RANGE ",
@@ -753,8 +868,48 @@ impl Printer {
             WindowFrameExclusion::Group => self.output.push_str(" EXCLUDE GROUP"),
             WindowFrameExclusion::Ties => self.output.push_str(" EXCLUDE TIES"),
         }
+
+        if let Some(skip) = &frame.after_match_skip_to {
+            self.output.push(' ');
+            self.write_skip_to(skip);
+        }
+        if let Some(mode) = &frame.pattern_search_mode {
+            self.output.push_str(match mode.mode {
+                PatternSearchModeKind::Initial => " INITIAL",
+                PatternSearchModeKind::Seek => " SEEK",
+            });
+        }
+        if let Some(pattern) = &frame.pattern {
+            self.output.push_str(" PATTERN(");
+            self.write_row_pattern(pattern);
+            self.output.push(')');
+        }
+        if !frame.subsets.is_empty() {
+            self.output.push_str(" SUBSET ");
+            for (index, subset) in frame.subsets.iter().enumerate() {
+                if index != 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_ident(&subset.name);
+                self.output.push_str(" = (");
+                self.write_ident_list(&subset.identifiers);
+                self.output.push(')');
+            }
+        }
+        if !frame.variable_definitions.is_empty() {
+            self.output.push_str(" DEFINE ");
+            for (index, variable) in frame.variable_definitions.iter().enumerate() {
+                if index != 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_ident(&variable.name);
+                self.output.push_str(" AS ");
+                self.write_expr(&variable.expression);
+            }
+        }
     }
 
+    #[recursive::recursive]
     fn write_window_frame_bound(&mut self, bound: &WindowFrameBound) {
         match bound {
             WindowFrameBound::CurrentRow(_) => self.output.push_str("CURRENT ROW"),
@@ -791,6 +946,11 @@ impl Printer {
             Expr::Identifier(ident) => self.write_ident(ident),
             Expr::Literal(literal) => self.write_literal(literal),
             Expr::FunctionCall(call) => self.write_function_call(call),
+            Expr::WindowOperation(node) => {
+                self.write_ident(&node.name);
+                self.output.push_str(" OVER ");
+                self.write_window(&node.window);
+            }
             Expr::Unary(expression) => self.write_unary_expr(expression),
             Expr::Binary(expression) => self.write_binary_expr(expression),
             Expr::Logical(expression) => self.write_logical_expr(expression),
@@ -1057,7 +1217,7 @@ impl Printer {
             && call.separator.is_none()
             && call.filter.is_none()
             && call.null_treatment.is_none()
-            && call.over.is_none()
+            && call.window.is_none()
         {
             self.output.push_str("EXTRACT(");
             self.write_expr(&call.arguments[0]);
@@ -1075,7 +1235,7 @@ impl Printer {
             && call.separator.is_none()
             && call.filter.is_none()
             && call.null_treatment.is_none()
-            && call.over.is_none()
+            && call.window.is_none()
         {
             self.output.push_str("SUBSTRING(");
             self.write_expr(&call.arguments[0]);
@@ -1122,9 +1282,9 @@ impl Printer {
             self.write_expr(filter);
             self.output.push(')');
         }
-        if let Some(over) = &call.over {
+        if let Some(over) = &call.window {
             self.output.push_str(" OVER ");
-            self.write_window_specification(over);
+            self.write_window(over);
         }
     }
 
@@ -2364,13 +2524,13 @@ mod tests {
             separator: None,
             filter: Some(Box::new(crate::build::is_null(identifier("b"), true))),
             null_treatment: Some(NullTreatment::IgnoreNulls),
-            over: Some(Box::new(WindowSpec {
+            window: Some(Window::Specification(AstBox::new(WindowSpecification {
                 existing_window_name: None,
-                partition_by: vec![identifier("partition_key")],
+                partition_by: vec![identifier("partition_key")].into(),
                 order_by: None,
                 window_frame: None,
                 span: span(),
-            })),
+            }))),
             substring_from_syntax: false,
             span: span(),
         });
@@ -2476,7 +2636,7 @@ mod tests {
                 group_by: GroupBy::None,
                 having: None,
                 qualify: None,
-                windows: Vec::new(),
+                windows: AstVec::new(),
                 modifiers: QueryModifiers {
                     order_by: Some(OrderBy {
                         items: vec![SortItem {

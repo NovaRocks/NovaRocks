@@ -115,6 +115,38 @@ pub(crate) fn unsupported_predicate_reason(node: &ast::PredicatedExpr) -> Option
     }
 }
 
+pub(crate) fn unsupported_window_frame_reason(frame: &ast::WindowFrame) -> Option<&'static str> {
+    if frame.exclusion != ast::WindowFrameExclusion::NoOthers {
+        return Some("window frame EXCLUDE is not supported");
+    }
+    if !frame.measures.is_empty()
+        || frame.after_match_skip_to.is_some()
+        || frame.pattern_search_mode.is_some()
+        || frame.pattern.is_some()
+        || !frame.subsets.is_empty()
+        || !frame.variable_definitions.is_empty()
+    {
+        return Some("pattern recognition in window frames is not supported");
+    }
+    None
+}
+
+pub(crate) fn unsupported_window_reason(window: &ast::Window) -> Option<&'static str> {
+    let specification = match window {
+        ast::Window::Reference(_) => return Some("named window references are not supported"),
+        ast::Window::Specification(specification) => specification,
+    };
+    if specification.existing_window_name.is_some() {
+        return Some("named window references are not supported");
+    }
+    if let Some(frame) = &specification.window_frame {
+        if let Some(reason) = unsupported_window_frame_reason(frame) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
 pub(crate) fn unsupported_control_expression_reason(
     expression: &ast::Expr,
 ) -> Option<&'static str> {
@@ -122,6 +154,19 @@ pub(crate) fn unsupported_control_expression_reason(
         ast::Expr::SearchedCase(case) => Some(case.when_clauses.as_slice()),
         ast::Expr::SimpleCase(case) => Some(case.when_clauses.as_slice()),
         ast::Expr::Unique(_) => return Some("UNIQUE subquery predicates are not supported"),
+        ast::Expr::WindowOperation(_) => return Some("window operations are not supported"),
+        ast::Expr::FunctionCall(call) => {
+            if let Some(reason) = call.window.as_ref().and_then(|window| match window {
+                ast::Window::Specification(specification) => specification
+                    .window_frame
+                    .as_ref()
+                    .and_then(unsupported_window_frame_reason),
+                ast::Window::Reference(_) => None,
+            }) {
+                return Some(reason);
+            }
+            None
+        }
         ast::Expr::Dereference(node) if node.field.is_none() => {
             return Some("label-only dereference expressions are not supported");
         }
@@ -2639,7 +2684,7 @@ impl<'a> super::AnalyzerContext<'a> {
         let func_order_by = self.extract_function_order_by(func, scope, &args_typed)?;
 
         // Check for window function: func(...) OVER (...)
-        if let Some(ref window_type) = func.over {
+        if let Some(ref window_type) = func.window {
             if is_analyzer_aggregate_macro(&original_name) {
                 return Err(AnalyzeError::unsupported_expression(
                     format!("{original_name} is not supported with OVER clause"),
@@ -4085,16 +4130,18 @@ impl<'a> super::AnalyzerContext<'a> {
     /// Analyze a window specification (OVER clause).
     fn analyze_window_spec(
         &self,
-        over: &ast::WindowSpec,
+        window: &ast::Window,
         scope: &AnalyzerScope,
     ) -> Result<WindowSpecAnalysis, AnalyzeError> {
-        if over.existing_window_name.is_some() {
+        if let Some(reason) = unsupported_window_reason(window) {
+            return Err(AnalyzeError::unsupported_expression(reason, window.span()));
+        }
+        let ast::Window::Specification(spec) = window else {
             return Err(AnalyzeError::unsupported_expression(
                 "named window references are not supported",
-                over.span,
+                window.span(),
             ));
-        }
-        let spec = over;
+        };
 
         // PARTITION BY
         let mut partition_by = Vec::new();
@@ -4315,7 +4362,7 @@ impl<'a> super::AnalyzerContext<'a> {
         match expr {
             ast::Expr::FunctionCall(f) => {
                 // A function with OVER is a window function, not an aggregate
-                if f.over.is_some() {
+                if f.window.is_some() {
                     return false;
                 }
                 let name = print_object_name(&f.name).to_ascii_lowercase();

@@ -621,7 +621,7 @@ fn function_expr_args(func: &FunctionCall) -> Option<Vec<&Expr>> {
         && func.order_by.is_none()
         && func.separator.is_none()
         && func.filter.is_none()
-        && func.over.is_none())
+        && func.window.is_none())
     .then(|| func.arguments.iter().collect())
 }
 

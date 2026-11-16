@@ -645,7 +645,7 @@ impl<'a> CatalogNeedCollector<'a> {
 
     fn collect_window_spec(
         &mut self,
-        window: &ast::WindowSpec,
+        window: &ast::WindowSpecification,
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
         for expression in &window.partition_by {

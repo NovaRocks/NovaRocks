@@ -933,7 +933,7 @@ fn actual_function_order_by_owning_cycle_keeps_deep_traits_move_and_drop() {
         };
         assert!(call.arguments.is_empty());
         assert!(call.filter.is_none());
-        assert!(call.over.is_none());
+        assert!(call.window.is_none());
         assert_eq!(call.name.parts[0].value, "deep_order");
         assert_eq!(call.span, Span::new(10, 100));
         let order_by = call.order_by.as_mut().unwrap();
@@ -1236,4 +1236,487 @@ fn actual_function_order_by_preserves_facts_and_deep_semantic_children() {
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
     drop(tree);
+}
+
+#[test]
+fn actual_window_operation_cycle_keeps_partition_and_frame_expression_children() {
+    use crate::ast::{
+        Expr, Fold, GroupBy, Ident, Literal, LiteralKind, SetExpr, Statement, SyntaxEq, Visit,
+        Window, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits,
+        WindowOperation, WindowSpecification,
+    };
+    use crate::{Span, build};
+    fn frame(child: Expr) -> WindowFrame {
+        WindowFrame {
+            units: WindowFrameUnits::Rows,
+            start_bound: WindowFrameBound::Preceding(Some(child), Span::new(30, 90)),
+            end_bound: None,
+            exclusion: WindowFrameExclusion::NoOthers,
+            measures: AstVec::new(),
+            after_match_skip_to: None,
+            pattern_search_mode: None,
+            pattern: None,
+            subsets: AstVec::new(),
+            variable_definitions: AstVec::new(),
+            span: Span::new(20, 95),
+        }
+    }
+    const DEPTH: i64 = 20_000;
+    const LEAF: i64 = 1_000_000;
+    let mut tree = build::integer(LEAF);
+    for marker in 1..=DEPTH {
+        let mut specification = WindowSpecification {
+            existing_window_name: None,
+            partition_by: vec![build::integer(marker)].into(),
+            order_by: None,
+            window_frame: None,
+            span: Span::new(10, 100),
+        };
+        if marker % 2 == 0 {
+            specification.partition_by.push(tree);
+        } else {
+            specification.window_frame = Some(frame(tree));
+        }
+        tree = Expr::WindowOperation(AstBox::new(WindowOperation {
+            name: build::ident_at("deep_window", false, Span::new(1, 9)),
+            window: Window::Specification(AstBox::new(specification)),
+            span: Span::new(0, 101),
+        }));
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    let mut cursor = &mut copy;
+    for marker in (1..=DEPTH).rev() {
+        let Expr::WindowOperation(operation) = cursor else {
+            panic!("actual WindowOperation")
+        };
+        assert_eq!(operation.span, Span::new(0, 101));
+        assert_eq!(operation.name.value, "deep_window");
+        assert!(!operation.name.quoted);
+        let Window::Specification(specification) = &mut operation.window else {
+            panic!("actual specification")
+        };
+        assert_eq!(specification.span, Span::new(10, 100));
+        assert!(specification.existing_window_name.is_none());
+        assert!(specification.order_by.is_none());
+        assert!(
+            matches!(&specification.partition_by[0], Expr::Literal(value) if matches!(&value.kind, LiteralKind::Long { spelling, parsed_value } if spelling == &marker.to_string() && *parsed_value == marker))
+        );
+        if marker % 2 == 0 {
+            assert!(specification.window_frame.is_none());
+            assert_eq!(specification.partition_by.len(), 2);
+            cursor = &mut specification.partition_by[1];
+        } else {
+            assert_eq!(specification.partition_by.len(), 1);
+            let frame = specification.window_frame.as_mut().unwrap();
+            assert_eq!(frame.units, WindowFrameUnits::Rows);
+            assert_eq!(frame.exclusion, WindowFrameExclusion::NoOthers);
+            let WindowFrameBound::Preceding(Some(child), span) = &mut frame.start_bound else {
+                panic!("original expression bound")
+            };
+            assert_eq!(*span, Span::new(30, 90));
+            cursor = child;
+        }
+    }
+    let Expr::Literal(leaf) = cursor else {
+        panic!("original leaf")
+    };
+    assert!(matches!(
+        leaf.kind,
+        LiteralKind::Long {
+            parsed_value: LEAF,
+            ..
+        }
+    ));
+    leaf.kind = LiteralKind::Long {
+        spelling: (LEAF + 1).to_string(),
+        parsed_value: LEAF + 1,
+    };
+    assert_ne!(tree, copy);
+    drop(copy);
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Event {
+        Name(String, bool),
+        Number(i64),
+    }
+    #[derive(Default)]
+    struct Events(Vec<Event>);
+    impl Visit for Events {
+        fn visit_ident(&mut self, name: &Ident) {
+            self.0.push(Event::Name(name.value.clone(), name.quoted));
+        }
+        fn visit_literal(&mut self, node: &Literal) {
+            let LiteralKind::Long {
+                spelling,
+                parsed_value,
+            } = &node.kind
+            else {
+                panic!("fixture Long")
+            };
+            assert_eq!(spelling, &parsed_value.to_string());
+            self.0.push(Event::Number(*parsed_value));
+        }
+    }
+    let mut expected = Vec::new();
+    for marker in (1..=DEPTH).rev() {
+        expected.push(Event::Name("deep_window".into(), false));
+        expected.push(Event::Number(marker));
+    }
+    expected.push(Event::Number(LEAF));
+    let mut seen = Events::default();
+    seen.visit_expr(&tree);
+    assert_eq!(seen.0, expected);
+    let printed = crate::printer::print_expr(&tree);
+    assert_eq!(printed.matches(" OVER (").count(), DEPTH as usize);
+    let leaf_text = LEAF.to_string();
+    assert_eq!(printed.matches(leaf_text.as_str()).count(), 1);
+    struct Relocate;
+    impl Fold for Relocate {
+        fn fold_window_operation(&mut self, node: WindowOperation) -> WindowOperation {
+            let mut node = crate::ast::fold_window_operation(self, node);
+            node.span = Span::new(101, 201);
+            node
+        }
+        fn fold_window_specification(&mut self, node: WindowSpecification) -> WindowSpecification {
+            let mut node = crate::ast::fold_window_specification(self, node);
+            node.span = Span::new(111, 191);
+            node
+        }
+        fn fold_window_frame(&mut self, node: WindowFrame) -> WindowFrame {
+            let mut node = crate::ast::fold_window_frame(self, node);
+            node.span = Span::new(121, 181);
+            node.start_bound = match node.start_bound {
+                WindowFrameBound::Preceding(value, _) => {
+                    WindowFrameBound::Preceding(value, Span::new(131, 171))
+                }
+                _ => unreachable!("fixture bound"),
+            };
+            node
+        }
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.span = Span::new(141, 161);
+            node
+        }
+        fn fold_literal(&mut self, mut node: Literal) -> Literal {
+            node.span = Span::new(145, 155);
+            node
+        }
+    }
+    let relocated = Relocate.fold_expr(tree.clone());
+    assert!(tree.syntax_eq(&relocated));
+    assert_ne!(tree, relocated);
+    let mut seen = Events::default();
+    seen.visit_expr(&relocated);
+    assert_eq!(seen.0, expected);
+    struct Change;
+    impl Fold for Change {
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.value.push_str("_changed");
+            node
+        }
+        fn fold_literal(&mut self, mut node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = &node.kind else {
+                unreachable!()
+            };
+            let value = *parsed_value + 1;
+            node.kind = LiteralKind::Long {
+                spelling: value.to_string(),
+                parsed_value: value,
+            };
+            node
+        }
+    }
+    let changed = Change.fold_expr(relocated);
+    assert!(!tree.syntax_eq(&changed));
+    let expected_changed = expected
+        .into_iter()
+        .map(|event| match event {
+            Event::Name(mut name, quoted) => {
+                name.push_str("_changed");
+                Event::Name(name, quoted)
+            }
+            Event::Number(value) => Event::Number(value + 1),
+        })
+        .collect::<Vec<_>>();
+    let mut seen = Events::default();
+    seen.visit_expr(&changed);
+    assert_eq!(seen.0, expected_changed);
+    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
+        build::select(
+            vec![build::item(changed, None, false)],
+            Vec::new(),
+            None,
+            GroupBy::None,
+        )
+        .unwrap(),
+    ))));
+    crate::ast::validate_statement(&statement).unwrap();
+    drop(statement);
+    let Expr::WindowOperation(operation) = tree else {
+        unreachable!()
+    };
+    let operation = operation.into_inner();
+    let Window::Specification(specification) = operation.window else {
+        unreachable!()
+    };
+    let specification = specification.into_inner();
+    let children = specification.partition_by.into_inner();
+    assert_eq!(children.len(), 2);
+    drop(children.into_iter().nth(1).unwrap());
+}
+
+#[test]
+fn actual_row_pattern_box_vec_cycle_keeps_quantifier_facts_and_real_children() {
+    use crate::ast::{
+        Expr, Fold, GroupBy, Ident, PatternInteger, PatternQuantifier, RowPattern, SetExpr,
+        Statement, SyntaxEq, Visit, Window, WindowFrame, WindowFrameBound, WindowFrameExclusion,
+        WindowFrameUnits, WindowOperation, WindowSpecification,
+    };
+    use crate::{Span, build};
+    fn variable(name: String, quoted: bool) -> RowPattern {
+        RowPattern::Variable {
+            name: build::ident_at(name, quoted, Span::new(20, 30)),
+            span: Span::new(10, 100),
+        }
+    }
+    fn operation(pattern: RowPattern) -> Expr {
+        let frame = WindowFrame {
+            units: WindowFrameUnits::Rows,
+            start_bound: WindowFrameBound::CurrentRow(Span::new(30, 40)),
+            end_bound: None,
+            exclusion: WindowFrameExclusion::NoOthers,
+            measures: AstVec::new(),
+            after_match_skip_to: None,
+            pattern_search_mode: None,
+            pattern: Some(pattern),
+            subsets: AstVec::new(),
+            variable_definitions: AstVec::new(),
+            span: Span::new(10, 100),
+        };
+        Expr::WindowOperation(AstBox::new(WindowOperation {
+            name: build::ident("pattern_output", false),
+            window: Window::Specification(AstBox::new(WindowSpecification {
+                existing_window_name: None,
+                partition_by: AstVec::new(),
+                order_by: None,
+                window_frame: Some(frame),
+                span: Span::new(0, 101),
+            })),
+            span: Span::new(0, 102),
+        }))
+    }
+    const DEPTH: i64 = 20_000;
+    let mut pattern = variable("terminal".into(), true);
+    for marker in 1..=DEPTH {
+        pattern = match marker % 4 {
+            0 => RowPattern::Alternation {
+                patterns: vec![variable(format!("p{marker}"), false), pattern].into(),
+                span: Span::new(10, 100),
+            },
+            1 => RowPattern::Concatenation {
+                patterns: vec![pattern, variable(format!("p{marker}"), false)].into(),
+                span: Span::new(10, 100),
+            },
+            2 => RowPattern::Excluded {
+                pattern: AstBox::new(pattern),
+                span: Span::new(10, 100),
+            },
+            _ => RowPattern::Quantified {
+                pattern: AstBox::new(pattern),
+                quantifier: PatternQuantifier::Range {
+                    greedy: marker % 8 == 3,
+                    at_least: Some(PatternInteger {
+                        lexeme: "01".into(),
+                        parsed_value: 1,
+                        span: Span::new(50, 52),
+                    }),
+                    at_most: None,
+                    span: Span::new(40, 60),
+                },
+                span: Span::new(10, 100),
+            },
+        };
+    }
+    let mut copy = pattern.clone();
+    assert_eq!(pattern, copy);
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{pattern:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    let mut cursor = &mut copy;
+    for marker in (1..=DEPTH).rev() {
+        cursor = match (marker % 4, cursor) {
+            (0, RowPattern::Alternation { patterns, .. }) => {
+                assert_eq!(patterns.len(), 2);
+                assert!(
+                    matches!(&patterns[0], RowPattern::Variable { name, .. } if name.value == format!("p{marker}") && !name.quoted)
+                );
+                &mut patterns[1]
+            }
+            (1, RowPattern::Concatenation { patterns, .. }) => {
+                assert_eq!(patterns.len(), 2);
+                assert!(
+                    matches!(&patterns[1], RowPattern::Variable { name, .. } if name.value == format!("p{marker}") && !name.quoted)
+                );
+                &mut patterns[0]
+            }
+            (2, RowPattern::Excluded { pattern, .. }) => pattern,
+            (
+                3,
+                RowPattern::Quantified {
+                    pattern,
+                    quantifier,
+                    ..
+                },
+            ) => {
+                let PatternQuantifier::Range {
+                    greedy,
+                    at_least,
+                    at_most,
+                    ..
+                } = quantifier
+                else {
+                    unreachable!()
+                };
+                assert_eq!(*greedy, marker % 8 == 3);
+                assert!(at_most.is_none());
+                let lower = at_least.as_ref().unwrap();
+                assert_eq!((lower.lexeme.as_str(), lower.parsed_value), ("01", 1));
+                pattern
+            }
+            _ => panic!("actual RowPattern AstBox/AstVec owning edge"),
+        };
+    }
+    let RowPattern::Variable { name, .. } = cursor else {
+        panic!("original terminal pattern")
+    };
+    assert_eq!(name.value, "terminal");
+    assert!(name.quoted);
+    name.value = "changed_terminal".into();
+    assert_ne!(pattern, copy);
+    drop(copy);
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Event {
+        Name(String, bool),
+        Integer(String, i64),
+    }
+    #[derive(Default)]
+    struct Events(Vec<Event>);
+    impl Visit for Events {
+        fn visit_ident(&mut self, node: &Ident) {
+            self.0.push(Event::Name(node.value.clone(), node.quoted));
+        }
+        fn visit_pattern_integer(&mut self, node: &PatternInteger) {
+            self.0
+                .push(Event::Integer(node.lexeme.clone(), node.parsed_value));
+        }
+    }
+    let mut expected = Vec::new();
+    for marker in (1..=DEPTH).rev() {
+        if marker % 4 == 0 {
+            expected.push(Event::Name(format!("p{marker}"), false));
+        }
+    }
+    expected.push(Event::Name("terminal".into(), true));
+    for marker in 1..=DEPTH {
+        match marker % 4 {
+            1 => expected.push(Event::Name(format!("p{marker}"), false)),
+            3 => expected.push(Event::Integer("01".into(), 1)),
+            _ => {}
+        }
+    }
+    let mut seen = Events::default();
+    seen.visit_row_pattern(&pattern);
+    assert_eq!(seen.0, expected);
+    let expression = operation(pattern.clone());
+    let printed = crate::printer::print_expr(&expression);
+    assert_eq!(printed.matches("terminal").count(), 1);
+    assert_eq!(printed.matches("{01,}").count(), (DEPTH / 4) as usize);
+    assert_eq!(printed.matches(" | ").count(), (DEPTH / 4) as usize);
+    assert_eq!(printed.matches("{-").count(), (DEPTH / 4) as usize);
+    drop(expression);
+    struct Relocate;
+    impl Fold for Relocate {
+        fn fold_row_pattern(&mut self, node: RowPattern) -> RowPattern {
+            let mut node = crate::ast::fold_row_pattern(self, node);
+            match &mut node {
+                RowPattern::Variable { span, .. }
+                | RowPattern::Empty { span }
+                | RowPattern::Alternation { span, .. }
+                | RowPattern::Concatenation { span, .. }
+                | RowPattern::Permutation { span, .. }
+                | RowPattern::Anchor { span, .. }
+                | RowPattern::Excluded { span, .. }
+                | RowPattern::Quantified { span, .. } => *span = Span::new(101, 201),
+            };
+            node
+        }
+        fn fold_pattern_quantifier(&mut self, node: PatternQuantifier) -> PatternQuantifier {
+            let mut node = crate::ast::fold_pattern_quantifier(self, node);
+            match &mut node {
+                PatternQuantifier::ZeroOrMore { span, .. }
+                | PatternQuantifier::OneOrMore { span, .. }
+                | PatternQuantifier::ZeroOrOne { span, .. }
+                | PatternQuantifier::Range { span, .. } => *span = Span::new(111, 191),
+            };
+            node
+        }
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.span = Span::new(121, 181);
+            node
+        }
+        fn fold_pattern_integer(&mut self, mut node: PatternInteger) -> PatternInteger {
+            node.span = Span::new(131, 171);
+            node
+        }
+    }
+    let relocated = Relocate.fold_row_pattern(pattern.clone());
+    assert!(pattern.syntax_eq(&relocated));
+    assert_ne!(pattern, relocated);
+    let mut seen = Events::default();
+    seen.visit_row_pattern(&relocated);
+    assert_eq!(seen.0, expected);
+    struct Change;
+    impl Fold for Change {
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.value.insert_str(0, "changed_");
+            node
+        }
+        fn fold_pattern_integer(&mut self, mut node: PatternInteger) -> PatternInteger {
+            node.parsed_value += 1;
+            node.lexeme = "002".into();
+            node
+        }
+    }
+    let changed = Change.fold_row_pattern(relocated);
+    assert!(!pattern.syntax_eq(&changed));
+    let expected_changed = expected
+        .into_iter()
+        .map(|event| match event {
+            Event::Name(name, quoted) => Event::Name(format!("changed_{name}"), quoted),
+            Event::Integer(_, value) => Event::Integer("002".into(), value + 1),
+        })
+        .collect::<Vec<_>>();
+    let mut seen = Events::default();
+    seen.visit_row_pattern(&changed);
+    assert_eq!(seen.0, expected_changed);
+    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
+        build::select(
+            vec![build::item(operation(changed), None, false)],
+            Vec::new(),
+            None,
+            GroupBy::None,
+        )
+        .unwrap(),
+    ))));
+    crate::ast::validate_statement(&statement).unwrap();
+    drop(statement);
+    let RowPattern::Alternation { patterns, .. } = pattern else {
+        unreachable!("DEPTH selects Alternation")
+    };
+    let children = patterns.into_inner();
+    assert_eq!(children.len(), 2);
+    drop(children.into_iter().nth(1).unwrap());
 }

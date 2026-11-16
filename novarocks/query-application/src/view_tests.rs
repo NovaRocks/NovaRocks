@@ -405,7 +405,7 @@ fn ignore_nulls_uses_the_original_parser_and_preserves_local_and_external_raw_so
         call.null_treatment,
         Some(novarocks_parser::ast::NullTreatment::IgnoreNulls)
     );
-    assert!(call.over.is_some());
+    assert!(call.window.is_some());
     let service = QueryViewService::new();
     let engine = FakeViewEngine::default();
     service

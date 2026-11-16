@@ -263,9 +263,14 @@ pub(crate) fn resolve_expression_site<'a>(
             }
             (SqlConstantExpressionStep::WindowOrderByKey(index), ast::Expr::FunctionCall(call)) => {
                 &call
-                    .over
+                    .window
                     .as_ref()
-                    .and_then(|window| window.order_by.as_ref())
+                    .and_then(|window| match window {
+                        ast::Window::Specification(specification) => {
+                            specification.order_by.as_ref()
+                        }
+                        ast::Window::Reference(_) => None,
+                    })
                     .and_then(|order| order.items.get(*index))
                     .ok_or_else(|| {
                         invalid("constant source window ORDER BY key differs from its owned syntax")

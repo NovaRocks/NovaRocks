@@ -21,10 +21,10 @@ use crate::{
     Span, Token, TokenKind,
     ast::{
         Cte, ExplainFormat, ExplainQuery, Expr, Fetch, GroupBy, Ident, Join, JoinConstraint,
-        JoinOperator, NamedWindow, NullOrdering, Offset, OffsetRows, OrderBy, Query, Select,
-        SelectItem, SelectQuantifier, SetExpr, SetOperator, SetQuantifier, SortItem, SortOrdering,
-        Statement, TableFactor, TableVersion, TableVersionKind, TableWithJoins, Values,
-        WildcardOptions, With,
+        JoinOperator, NullOrdering, Offset, OffsetRows, OrderBy, Query, Select, SelectItem,
+        SelectQuantifier, SetExpr, SetOperator, SetQuantifier, SortItem, SortOrdering, Statement,
+        TableFactor, TableVersion, TableVersionKind, TableWithJoins, Values, WildcardOptions,
+        WindowDefinition, With,
     },
     lex,
     token::{Keyword, Symbol},
@@ -52,7 +52,7 @@ enum SelectHintValue {
 
 use super::{
     StatementParser,
-    pratt::{PrattParser, parse_table_function_expression, parse_window_spec},
+    pratt::{PrattParser, parse_table_function_expression, parse_window_specification},
 };
 
 pub(super) fn parse(
@@ -465,7 +465,7 @@ fn parse_select(
             group_by,
             having,
             qualify,
-            windows,
+            windows: windows.into(),
             modifiers: Default::default(),
             span: Span::new(start, end),
         },
@@ -570,15 +570,15 @@ fn parse_select_hint_payload(
 
 fn parse_named_windows(
     parser: &mut StatementParser<'_, '_>,
-) -> Result<Vec<NamedWindow>, crate::ParseError> {
+) -> Result<Vec<WindowDefinition>, crate::ParseError> {
     let mut windows = Vec::new();
     loop {
         let name = parser.parse_ident()?;
         let start = name.span.start();
         parser.consume_word("AS")?;
-        let specification = parse_window_spec_until(parser)?;
+        let specification = parse_window_specification_until(parser)?;
         let span = Span::new(start, specification.span.end());
-        windows.push(NamedWindow {
+        windows.push(WindowDefinition {
             name,
             specification,
             span,
@@ -590,9 +590,9 @@ fn parse_named_windows(
     Ok(windows)
 }
 
-fn parse_window_spec_until(
+fn parse_window_specification_until(
     parser: &mut StatementParser<'_, '_>,
-) -> Result<crate::ast::WindowSpec, crate::ParseError> {
+) -> Result<crate::ast::WindowSpecification, crate::ParseError> {
     if !parser.current_is_symbol(Symbol::LParen) {
         return Err(parser.unexpected("'(' after WINDOW name AS"));
     }
@@ -623,7 +623,7 @@ fn parse_window_spec_until(
         .map_or_else(|| parser.current_span(), |token| token.span);
     let mut tokens = parser.tokens[begin..end].to_vec();
     tokens.push(Token::new(TokenKind::End, boundary));
-    let specification = parse_window_spec(parser.source, &tokens)?;
+    let specification = parse_window_specification(parser.source, &tokens)?;
     parser.position = end;
     parser.skip_trivia();
     Ok(specification)
