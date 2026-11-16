@@ -36,6 +36,14 @@ use novarocks_control_runtime_core::{
 const INVALID_CARRIER_CHILD: &str = "NR_CONTROL_RUNTIME_INVALID_EXIT_CARRIER_CHILD";
 const INVALID_CARRIER_CHECKPOINT: &str = "invalid-exit-carrier-bound-with-original-custody";
 
+/// Returns the libtest path without the crate segment of `module_path!()`.
+fn test_path(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
+}
+
 fn generation() -> Generation {
     Generation::new(1).unwrap()
 }
@@ -355,7 +363,8 @@ fn a_preobserved_body_cannot_mint_a_new_exit_role_from_original_custody() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "a_preobserved_body_cannot_mint_a_new_exit_role_from_original_custody",
+            test_path("a_preobserved_body_cannot_mint_a_new_exit_role_from_original_custody")
+                .as_str(),
             "--nocapture",
         ])
         .env(INVALID_CARRIER_CHILD, "1")

@@ -35,6 +35,16 @@ use std::{
 };
 
 const CHILD_MODE: &str = "NR_CONTROL_RUNTIME_FAILURE_POLICY_CHILD";
+const CHILD_ENTERED: &str = "failure-policy-child-entered";
+
+/// Returns the libtest path without the crate segment of `module_path!()`.
+fn test_path(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
+}
+
 fn generation() -> Generation {
     Generation::new(1).unwrap()
 }
@@ -256,14 +266,25 @@ fn failure_policy_subprocess_entry() {
     let Ok(mode) = std::env::var(CHILD_MODE) else {
         return;
     };
+    eprintln!("{CHILD_ENTERED}");
     child(&mode);
 }
 fn run_child(mode: &str) -> Output {
-    Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "failure_policy_subprocess_entry", "--nocapture"])
+    let entry = test_path("failure_policy_subprocess_entry");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", entry.as_str(), "--nocapture"])
         .env(CHILD_MODE, mode)
         .output()
-        .unwrap()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line == CHILD_ENTERED),
+        "the child must run {entry}: status={:?}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 #[test]
 fn default_registration_isolates_only_the_original_scope_and_retains_its_failure() {
