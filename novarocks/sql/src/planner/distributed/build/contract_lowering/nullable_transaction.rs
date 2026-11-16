@@ -1418,6 +1418,7 @@ impl ContractLoweringVisitor<'_> {
                     }
                     NodeKind::GenerateSeries { .. }
                     | NodeKind::SystemRelation { .. }
+                    | NodeKind::WriteLayoutKey { .. }
                     | NodeKind::PositionShard(_) => {}
                     NodeKind::Scan { .. }
                     | NodeKind::Filter { .. }
