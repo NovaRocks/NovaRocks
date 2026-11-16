@@ -2675,10 +2675,6 @@ fn lower_with_creation<
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The sealed recipe and lowered occurrences have independent owners."
-)]
 fn lower_write_layout_key<H>(
     package: &novarocks_physical_plan::FragmentPackage,
     node: &novarocks_physical_plan::PhysicalNode,
