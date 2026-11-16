@@ -1091,6 +1091,10 @@ pub struct PlanBuilder {
     next_edge: u32,
     fragments: BTreeMap<FragmentId, Fragment>,
     edges: BTreeMap<EdgeId, Edge>,
+    write_layouts: BTreeMap<
+        (FragmentId, NodeId),
+        novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft,
+    >,
     runtime_filters: BTreeMap<RuntimeFilterId, RuntimeFilter>,
     result_port: Option<ResultPort>,
     required: RequiredContracts,
@@ -1107,6 +1111,7 @@ impl PlanBuilder {
             next_edge: 0,
             fragments: BTreeMap::new(),
             edges: BTreeMap::new(),
+            write_layouts: BTreeMap::new(),
             runtime_filters: BTreeMap::new(),
             result_port: None,
             required: RequiredContracts::default(),
@@ -1151,6 +1156,21 @@ impl PlanBuilder {
             Entry::Occupied(_) => return Err(BuildError::DuplicateFragment(id)),
         }
         Ok(())
+    }
+
+    pub fn add_write_layout(
+        &mut self,
+        fragment: FragmentId,
+        node: NodeId,
+        draft: novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft,
+    ) -> Result<(), BuildError> {
+        match self.write_layouts.entry((fragment, node)) {
+            Entry::Vacant(entry) => {
+                entry.insert(draft);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(BuildError::DuplicateWriteLayout(fragment, node)),
+        }
     }
 
     pub fn reserve_edge_id(&mut self) -> Result<EdgeId, BuildError> {
@@ -1213,6 +1233,7 @@ impl PlanBuilder {
             version: self.version,
             fragments: self.fragments,
             edges: self.edges,
+            write_layouts: self.write_layouts,
             runtime_filters: self.runtime_filters,
             result_port: self.result_port,
             required: self.required,
@@ -1282,6 +1303,7 @@ impl PlanBuilder {
             version: self.version,
             fragments: self.fragments,
             edges: self.edges,
+            write_layouts: self.write_layouts,
             runtime_filters: self.runtime_filters,
             result_port: self.result_port,
             required: self.required,
@@ -1301,6 +1323,7 @@ pub enum BuildError {
     DuplicateValue(ValueId),
     DuplicateExpression(ExprId),
     DuplicateEdge(EdgeId),
+    DuplicateWriteLayout(FragmentId, NodeId),
     DuplicateRuntimeFilter(RuntimeFilterId),
     DuplicateResultPort,
     /// A node names an input that has not been inserted yet. Fragments are
@@ -1394,6 +1417,12 @@ impl fmt::Display for BuildError {
             Self::DuplicateValue(id) => write!(formatter, "duplicate value {}", id.get()),
             Self::DuplicateExpression(id) => write!(formatter, "duplicate expression {}", id.get()),
             Self::DuplicateEdge(id) => write!(formatter, "duplicate edge {}", id.get()),
+            Self::DuplicateWriteLayout(fragment, node) => write!(
+                formatter,
+                "duplicate write layout recipe at fragment {} node {}",
+                fragment.get(),
+                node.get(),
+            ),
             Self::DuplicateRuntimeFilter(id) => {
                 write!(formatter, "duplicate runtime filter {}", id.get())
             }

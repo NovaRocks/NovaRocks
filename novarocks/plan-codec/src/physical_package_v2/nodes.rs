@@ -234,7 +234,8 @@ pub(super) fn prepare_node_encode_in<'node, 'namespace, 'loan, 'source, 'control
         | p::NodeKind::SystemRelation { .. }
         | p::NodeKind::Limit { .. }
         | p::NodeKind::GenerateSeries { .. }
-        | p::NodeKind::PositionShard(_) => {
+        | p::NodeKind::PositionShard(_)
+        | p::NodeKind::WriteLayoutKey { .. } => {
             PreparedNodeEncode::Simple(prepare_simple_node_encode_in(
                 input,
                 context.values,
@@ -397,7 +398,8 @@ pub(super) fn prepare_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
         | Some(wire::physical_node::Kind::SystemRelation(_))
         | Some(wire::physical_node::Kind::Limit(_))
         | Some(wire::physical_node::Kind::GenerateSeries(_))
-        | Some(wire::physical_node::Kind::PositionShard(_)) => {
+        | Some(wire::physical_node::Kind::PositionShard(_))
+        | Some(wire::physical_node::Kind::WriteLayoutKey(_)) => {
             PreparedNodeDecode::Simple(prepare_simple_node_decode_in(
                 input,
                 context.expressions,

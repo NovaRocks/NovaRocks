@@ -110,6 +110,7 @@ fn edge_partition(
         source_multiplicity: RowMultiplicity::SingleCopy,
         destination: distribution_for(kind, destination),
         destination_multiplicity: RowMultiplicity::SingleCopy,
+        routing_only: Box::default(),
     }
 }
 
@@ -229,6 +230,7 @@ fn finish(
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         FragmentPackageAdmission {
             plan_limits: PlanLimits::FROZEN,

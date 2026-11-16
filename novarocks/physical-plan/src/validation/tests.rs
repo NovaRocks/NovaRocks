@@ -520,6 +520,7 @@ mod validation_error_tests {
                 scheme,
             },
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         };
         let mut errors = ValidationContext::new();
 

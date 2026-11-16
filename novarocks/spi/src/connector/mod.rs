@@ -66,9 +66,10 @@ pub use binding::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlWriteBinding,
     ConnectorExecutionReadBinding, ConnectorExecutionRoleBinding, ConnectorExecutionWriteBinding,
     ConnectorMaterializationError, ConnectorMaterializationErrorClass,
-    ConnectorMaterializationRetryDisposition, ConnectorReadAttemptAccess,
-    ConnectorReadAttemptCapabilities, ConnectorReadAttemptCapabilitiesFuture,
-    MaterializationContext, NormalizedCatalogProperties,
+    ConnectorMaterializationRetryDisposition, ConnectorPartitionKeyEvaluator,
+    ConnectorReadAttemptAccess, ConnectorReadAttemptCapabilities,
+    ConnectorReadAttemptCapabilitiesFuture, ConnectorWriteLayoutExecution, MaterializationContext,
+    NormalizedCatalogProperties,
 };
 pub use cancellation::{ConnectorStopOwner, ConnectorStopView};
 pub use catalog::{

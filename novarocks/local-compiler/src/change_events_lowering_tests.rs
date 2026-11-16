@@ -414,6 +414,7 @@ fn try_fixture(
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         admission(),
         &Control,

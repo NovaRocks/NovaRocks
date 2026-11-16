@@ -40,6 +40,7 @@ pub mod mv_refresh_ref;
 pub(crate) mod operation;
 pub(crate) mod overwrite;
 mod overwrite_partitions;
+pub(crate) mod partition_key;
 pub mod position_delete_writer;
 pub(crate) mod preparation;
 pub(crate) mod publication_descriptor;

@@ -289,6 +289,7 @@ pub(super) fn build_typed(
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
                 pruning,
+                layouts: Default::default(),
             },
             package_admission(),
             &Control::good(),

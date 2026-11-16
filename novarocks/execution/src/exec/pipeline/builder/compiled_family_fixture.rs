@@ -300,6 +300,7 @@ pub(crate) fn package_with_sink_and_names(
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             admission(),
             &FixtureControl,

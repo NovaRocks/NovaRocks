@@ -586,6 +586,7 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Unconstrained,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -703,6 +704,7 @@ fn edge_rejects_a_receiver_that_narrows_nullability_before_plan_publication() {
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Unconstrained,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -770,6 +772,7 @@ fn edge_accepts_a_receiver_that_admits_null_the_sender_never_writes() {
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Unconstrained,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -841,6 +844,7 @@ fn broadcast_edge_plan(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Broadcast,
             destination_multiplicity,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -1188,6 +1192,7 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Unconstrained,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
         })
         .unwrap();
@@ -1207,6 +1212,7 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Unconstrained,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
             source_port: crate::FragmentOutputPort::Root,
             payload: crate::ExchangePayloadContract::Relational,
@@ -1804,6 +1810,7 @@ fn exchange_partitioning_maps_source_and_destination_value_domains() {
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: hash_properties(imported).distribution,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -2368,6 +2375,7 @@ fn independent_fragment_cut_checks_complete_valid_value_binding() {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Unconstrained,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
             source_port: crate::FragmentOutputPort::Root,
             payload: crate::ExchangePayloadContract::Relational,

@@ -607,6 +607,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             package_admission(),
             &Control,

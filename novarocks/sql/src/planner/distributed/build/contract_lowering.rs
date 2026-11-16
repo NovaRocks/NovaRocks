@@ -2750,6 +2750,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 source_multiplicity: producer_multiplicity,
                 destination: Distribution::Unconstrained,
                 destination_multiplicity: producer_multiplicity,
+                routing_only: Box::default(),
             },
         };
         self.plan_builder.add_edge(edge_contract.clone())?;
@@ -3996,6 +3997,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Singleton,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
         };
         self.work.flush()?;
@@ -4285,6 +4287,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     source_multiplicity: RowMultiplicity::SingleCopy,
                     destination: destination_distribution,
                     destination_multiplicity: RowMultiplicity::SingleCopy,
+                    routing_only: Box::default(),
                 },
             };
             self.work.flush()?;
@@ -4526,6 +4529,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     source_multiplicity: RowMultiplicity::SingleCopy,
                     destination: Distribution::Singleton,
                     destination_multiplicity: RowMultiplicity::SingleCopy,
+                    routing_only: Box::default(),
                 },
             };
             self.work.flush()?;
@@ -4840,6 +4844,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     destination: Distribution::Singleton,
                     source_multiplicity: RowMultiplicity::SingleCopy,
                     destination_multiplicity: RowMultiplicity::SingleCopy,
+                    routing_only: Box::default(),
                 },
             };
             self.work.flush()?;
@@ -5215,6 +5220,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: destination_distribution,
                 destination_multiplicity,
+                routing_only: Box::default(),
             },
         };
         self.plan_builder.add_edge(edge_contract.clone())?;

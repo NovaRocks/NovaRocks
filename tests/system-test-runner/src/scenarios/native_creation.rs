@@ -795,6 +795,7 @@ pub(super) fn compiled_fragment(
         source_multiplicity: RowMultiplicity::SingleCopy,
         destination: Distribution::Singleton,
         destination_multiplicity: RowMultiplicity::SingleCopy,
+        routing_only: Box::default(),
     };
     let cut_value = || CutValue {
         value,
@@ -1046,6 +1047,7 @@ pub(super) fn compiled_fragment(
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
         &Control,

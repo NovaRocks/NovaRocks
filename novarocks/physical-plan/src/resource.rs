@@ -452,6 +452,10 @@ fn fragment_cut_usage_core<P: TypeValidationPolicy>(
                 ]);
             }
         }
+        usage.add_items(cut.partitioning.routing_only.len());
+        usage.add_bytes(std::mem::size_of_val(
+            cut.partitioning.routing_only.as_ref(),
+        ));
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
         for (ordinal, import) in cut.imports.iter().enumerate() {
@@ -500,6 +504,10 @@ fn fragment_cut_usage_core<P: TypeValidationPolicy>(
                 ]);
             }
         }
+        usage.add_items(cut.partitioning.routing_only.len());
+        usage.add_bytes(std::mem::size_of_val(
+            cut.partitioning.routing_only.as_ref(),
+        ));
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
         for (ordinal, value) in cut.projection.iter().enumerate() {
@@ -747,7 +755,16 @@ fn plan_usage_core<P: TypeValidationPolicy>(
         plan.edges().len(),
         plan.runtime_filters().len(),
         plan.annotations().len(),
+        plan.write_layouts().len(),
     ]);
+    for recipe in plan.write_layouts().values() {
+        if usage.exhausted() {
+            break;
+        }
+        usage.add_items(recipe.inputs().len());
+        usage.add_bytes(std::mem::size_of_val(recipe.inputs()));
+        add_encoded_payload_usage(recipe.payload(), &mut usage);
+    }
     for fragment in plan.fragments().values() {
         if usage.exhausted() {
             break;
@@ -761,6 +778,7 @@ fn plan_usage_core<P: TypeValidationPolicy>(
         usage.add_item_counts([
             edge.source.projection.len(),
             edge.destination.receive_mapping.len(),
+            edge.partitioning.routing_only.len(),
             distribution_items(&edge.partitioning.source),
             distribution_items(&edge.partitioning.destination),
         ]);
@@ -1387,6 +1405,9 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
                     }
                 }
             }
+        }
+        NodeKind::WriteLayoutKey { key_inputs, .. } => {
+            usage.add_items(key_inputs.len().saturating_add(1));
         }
         NodeKind::PositionShard(spec) => {
             usage.add_items(spec.inputs.len());

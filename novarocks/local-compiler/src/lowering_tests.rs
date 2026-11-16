@@ -407,6 +407,7 @@ fn package_with_case(
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             package_admission(),
             &FixtureControl,

@@ -425,6 +425,7 @@ fn package(builder: FragmentBuilder, root: NodeId, scan: NodeId) -> FragmentPack
             scans: BTreeMap::from([(scan, read)]),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         package_admission(),
         &Control::default(),

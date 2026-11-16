@@ -859,6 +859,16 @@ fn decode_fragment_package_factory_core<
     // includes temporary requests; it is neither retained precision nor grant.
     // Subsequent namespace models must not lose newly owned writer backing.
     invoice = invoice.max(writer_facts.coexisting_source_and_request_bytes_upper_bound);
+    let (layouts, layout_invoice) = crate::physical_writer_recipe_v2::decode_write_layouts_in(
+        &wire_package.layouts,
+        &provider_bindings,
+        &payloads,
+        invoice,
+        limits.writers,
+        work,
+    )
+    .map_err(|error| ProjectionFailure::Codec(Error::from(error)))?;
+    invoice = invoice.max(layout_invoice);
     let schemas = if let Some(factory) = factory {
         decode_schemas_with_factory_in(
             &wire_package.schemas,
@@ -1339,6 +1349,7 @@ fn decode_fragment_package_factory_core<
             scans,
             writes,
             annotations: metadata.annotations,
+            layouts,
         },
         limits.admission,
         &mut |_| Ok(()),

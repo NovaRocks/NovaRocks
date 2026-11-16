@@ -1654,6 +1654,7 @@ fn connector_codec_category(
         novarocks_spi::connector::ConnectorCodecCategory::ReadSplit => "read-split",
         novarocks_spi::connector::ConnectorCodecCategory::WriteHandle => "write-handle",
         novarocks_spi::connector::ConnectorCodecCategory::CommitFragment => "commit-fragment",
+        novarocks_spi::connector::ConnectorCodecCategory::WriteLayout => "write-layout",
     }
 }
 

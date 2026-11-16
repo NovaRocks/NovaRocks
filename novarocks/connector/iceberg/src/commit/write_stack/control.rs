@@ -2900,6 +2900,7 @@ impl IcebergWriteSessionControl {
             None
         };
         let material = IcebergSessionMaterial {
+            write_binding: self.adapter.binding().clone(),
             data_output: freeze_writer_output(
                 writer_metadata.properties(),
                 self.runtime.control_state().configuration().write,

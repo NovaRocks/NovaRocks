@@ -649,6 +649,7 @@ fn package_input(
         scans: BTreeMap::new(),
         writes: BTreeMap::new(),
         annotations: Box::default(),
+        layouts: Default::default(),
     }
 }
 fn plan_builder(fragments: &[crate::Fragment], constants: ConstantPools) -> crate::PlanBuilder {

@@ -674,6 +674,20 @@ fn encode_fragment_package_structural_in<'s>(
         work,
     )?;
 
+    let layouts = if package.layouts().is_empty() {
+        Vec::new()
+    } else {
+        let source = grow(source, &requested, &writes)?;
+        crate::physical_writer_recipe_v2::encode_write_layouts_in(
+            package.layouts(),
+            &provider_bindings,
+            &payloads,
+            source,
+            l.writers,
+            work,
+        )?
+        .0
+    };
     let system_relation_units = super::system_relation::encode_headers(
         package,
         &views,
@@ -727,6 +741,7 @@ fn encode_fragment_package_structural_in<'s>(
         result,
         scans,
         writes,
+        layouts,
         annotations: metadata.annotations,
         connector_expressions,
         system_relation_units,

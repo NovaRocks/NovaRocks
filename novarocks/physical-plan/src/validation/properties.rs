@@ -1952,6 +1952,22 @@ fn derive_node_output_properties_from(
             }
             return Ok(Some(expected));
         }
+        NodeKind::WriteLayoutKey { .. } => {
+            let Some(child) = node
+                .inputs
+                .first()
+                .and_then(|id| children.get(fragment, id))
+            else {
+                return Ok(None);
+            };
+            if target.actual(node, child) != child {
+                errors.push(ValidationError::new(
+                    path,
+                    "write layout key must preserve child row properties",
+                ));
+            }
+            return Ok(Some(child.clone()));
+        }
         NodeKind::PositionShard(spec) => {
             let Some(first) = node
                 .inputs

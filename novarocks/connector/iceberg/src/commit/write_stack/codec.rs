@@ -77,6 +77,67 @@ use crate::delete_file::IcebergFileFormat;
 use crate::wire::dto;
 use crate::write_descriptor::{IcebergPartitionDescriptor, IcebergPartitionValueDescriptor};
 
+pub(crate) fn encode_write_layout(
+    schema: &crate::iceberg::spec::Schema,
+    spec: &crate::iceberg::spec::PartitionSpec,
+) -> Result<Bytes, ConnectorError> {
+    let serialize = |error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("cannot freeze Iceberg partition layout: {error}"),
+        )
+    };
+    let wire = dto::IcebergWriteLayoutRecipe {
+        partition_source_schema_json: serde_json::to_string(schema).map_err(serialize)?,
+        partition_spec_json: serde_json::to_string(spec).map_err(serialize)?,
+    };
+    if wire.encoded_len() > MAX_CONNECTOR_WRITER_HANDLE_BYTES {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "Iceberg partition layout exceeds the write recipe byte envelope",
+        ));
+    }
+    Ok(Bytes::from(wire.encode_to_vec()))
+}
+
+pub(crate) fn decode_write_layout(
+    payload: &ConnectorEncodedPayload,
+) -> Result<
+    (
+        crate::iceberg::spec::Schema,
+        crate::iceberg::spec::PartitionSpec,
+    ),
+    ConnectorCodecError,
+> {
+    let path = ConnectorFieldPath::root("iceberg_write_layout");
+    if payload.payload().len() > MAX_CONNECTOR_WRITER_HANDLE_BYTES {
+        return Err(ConnectorCodecError::new(
+            path,
+            ConnectorCodecErrorKind::Capacity,
+            "Iceberg partition layout exceeds the write recipe byte envelope",
+        ));
+    }
+    let wire =
+        dto::IcebergWriteLayoutRecipe::decode(payload.payload().clone()).map_err(|error| {
+            ConnectorCodecError::new(
+                path.clone(),
+                ConnectorCodecErrorKind::InvalidValue,
+                error.to_string(),
+            )
+        })?;
+    let parse = |error: crate::metadata_json::Error| {
+        ConnectorCodecError::new(
+            path.clone(),
+            ConnectorCodecErrorKind::InvalidValue,
+            error.to_string(),
+        )
+    };
+    let schema =
+        crate::metadata_json::from_str(&wire.partition_source_schema_json).map_err(parse)?;
+    let spec = crate::metadata_json::from_str(&wire.partition_spec_json).map_err(parse)?;
+    Ok((schema, spec))
+}
+
 fn encode_merged_reference(identity: &EntryIdentity) -> dto::IcebergMergedDeleteReference {
     let entry = match identity {
         EntryIdentity::DeleteFile { path } => {
@@ -2760,6 +2821,24 @@ mod tests {
             let recovered = decode_private_fragment(&facets, &bytes).expect("private FE decode");
             assert_same_fragment(&fragment, &recovered);
         }
+
+        use crate::iceberg::spec::{PartitionSpec, Schema, Transform};
+        let schema: Schema = crate::metadata_json::from_str(&schema()).unwrap();
+        let spec = PartitionSpec::builder(Arc::new(schema.clone()))
+            .with_spec_id(3)
+            .add_partition_field("k1", "p", Transform::Bucket(8))
+            .unwrap()
+            .build()
+            .unwrap();
+        let body = encode_write_layout(&schema, &spec).expect("private FE layout encoding");
+        let payload = ConnectorEncodedPayload::new(
+            private_header("catalog.iceberg", 1, ConnectorCodecCategory::WriteLayout),
+            body,
+        );
+        let (schema_read, spec_read) =
+            decode_write_layout(&payload).expect("private BE layout decode");
+        assert_eq!(schema_read, schema);
+        assert_eq!(spec_read, spec);
     }
 
     #[test]

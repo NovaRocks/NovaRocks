@@ -505,6 +505,7 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
             source_multiplicity: p::RowMultiplicity::SingleCopy,
             destination: p::Distribution::Singleton,
             destination_multiplicity: p::RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .expect("edge");

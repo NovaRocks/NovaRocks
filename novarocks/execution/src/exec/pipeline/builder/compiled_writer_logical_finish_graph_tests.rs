@@ -142,6 +142,7 @@ mod logical_finish_graph {
                 destination: Distribution::Singleton,
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
             source_port: p::FragmentOutputPort::Summary(p::SummaryKind::WriteCounts),
             payload: p::ExchangePayloadContract::Summary(p::SummaryCut {
@@ -166,6 +167,7 @@ mod logical_finish_graph {
                 scans: original.scans().clone(),
                 writes: original.writes().clone(),
                 annotations: original.annotations().to_vec().into(),
+                layouts: Default::default(),
             },
             admission(),
             &FixtureControl,

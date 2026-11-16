@@ -398,8 +398,13 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
             // frontend's: it decodes the handles it is given and encodes the
             // fragments it produces, and holds no commit authority at all.
             Arc::new(IcebergWriteHandleDecoder::new(adapter.clone())),
-            Arc::new(IcebergWriteFragmentEncoder::new(adapter)),
-        );
+            Arc::new(IcebergWriteFragmentEncoder::new(adapter.clone())),
+        )
+        .with_write_layout(Arc::new(
+            crate::commit::partition_key::IcebergWriteLayoutExecution::new(
+                adapter.binding().clone(),
+            ),
+        ));
         ConnectorExecutionRoleBinding::try_new(properties.clone(), Some(read), Some(write))
             .map_err(ConnectorMaterializationError::from)
     }

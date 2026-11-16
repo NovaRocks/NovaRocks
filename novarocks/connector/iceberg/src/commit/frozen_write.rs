@@ -461,7 +461,7 @@ fn build_staged_partition_spec(
     work.opaque(|| builder.build())
 }
 
-fn parse_partition_transform(raw: &str) -> Result<Transform, String> {
+pub(super) fn parse_partition_transform(raw: &str) -> Result<Transform, String> {
     let normalized = raw.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "identity" => Ok(Transform::Identity),

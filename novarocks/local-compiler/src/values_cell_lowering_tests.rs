@@ -285,6 +285,7 @@ fn cast_package_with_cells(
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
                 pruning,
+                layouts: Default::default(),
             },
             package_admission(),
             &Control::good(),

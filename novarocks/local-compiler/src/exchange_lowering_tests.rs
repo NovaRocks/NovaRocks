@@ -339,6 +339,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -1069,6 +1070,7 @@ fn full_outer_exchange_input_packages(
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
         });
     }

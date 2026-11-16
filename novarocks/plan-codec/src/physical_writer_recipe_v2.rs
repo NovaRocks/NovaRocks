@@ -35,8 +35,9 @@ use crate::{
 };
 use novarocks_connector_contract::{
     ConnectorError, ConnectorWriteFieldBinding, ConnectorWriteFieldRef, ConnectorWriteFieldToken,
-    ConnectorWriteInputRef, ConnectorWriteInputShape, ConnectorWriteRecipeDraft,
-    PureProviderCompileError, WriterOwnedCreationFailure, WriterOwnedResourceFacts,
+    ConnectorWriteInputRef, ConnectorWriteInputShape, ConnectorWriteLayoutRecipeDraft,
+    ConnectorWriteRecipeDraft, PureProviderCompileError, WriterOwnedCreationFailure,
+    WriterOwnedResourceFacts,
 };
 use novarocks_physical_plan::NodeId;
 use novarocks_proto_models::physical_package_v2 as wire;
@@ -610,6 +611,127 @@ fn decode_group<'a>(
 /// Every binding/payload/Field reference must belong to the exact source loan.
 /// The caller retains original source union B and owns entry/ordinary/success
 /// tails; a typed control refusal performs no additional checkpoint here.
+// A layout recipe borrows the same provider and payload namespaces as a writer.
+// Its only additional backing is the exact sequence of input tokens.
+pub(crate) fn encode_write_layouts_in(
+    sources: &std::collections::BTreeMap<NodeId, ConnectorWriteLayoutRecipeDraft>,
+    bindings: &EncodedProviderBindings<'_, '_>,
+    payloads: &EncodedConnectorPayloads<'_, '_>,
+    source: usize,
+    limits: WriterRecipeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(Vec<wire::FrozenWriteLayoutRecipe>, usize), E> {
+    let mut model = Model::new::<wire::FrozenWriteLayoutRecipe>(sources.len(), source)?;
+    for recipe in sources.values() {
+        let count = recipe.inputs().len();
+        model.fields(count)?;
+        model.request(array::<[u8; 32]>(count)?, 1)?;
+        work.step()?;
+    }
+    let facts = model.combined(&Default::default(), limits)?;
+    let mut output = reserve(sources.len(), work)?;
+    for (node, recipe) in sources {
+        let provider_binding_id = bindings.write_source_id_observed(recipe.binding(), work)?;
+        let recipe_payload_id = payloads.source_id_observed(recipe.payload(), work)?;
+        let mut input_field_tokens = reserve(mul(recipe.inputs().len(), 32)?, work)?;
+        for token in recipe.inputs() {
+            input_field_tokens.extend_from_slice(&token.to_bytes());
+            work.step()?;
+        }
+        output.push(wire::FrozenWriteLayoutRecipe {
+            node_id: Some(node.get()),
+            provider_binding_id: Some(provider_binding_id),
+            recipe_payload_id: Some(recipe_payload_id),
+            input_field_tokens,
+        });
+        work.step()?;
+    }
+    Ok((
+        output,
+        facts.coexisting_source_and_request_bytes_upper_bound,
+    ))
+}
+
+pub(crate) fn decode_write_layouts_in(
+    sources: &[wire::FrozenWriteLayoutRecipe],
+    bindings: &DecodedProviderBindings<'_, '_>,
+    payloads: &DecodedConnectorPayloads<'_, '_>,
+    source: usize,
+    limits: WriterRecipeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (
+        std::collections::BTreeMap<NodeId, ConnectorWriteLayoutRecipeDraft>,
+        usize,
+    ),
+    E,
+> {
+    if sources.is_empty() {
+        return Ok((std::collections::BTreeMap::new(), source));
+    }
+    if sources.len() > 1 {
+        return Err(E::InvalidShape(
+            "a fragment has at most one write layout recipe at its root",
+        ));
+    }
+    let mut model = Model::new::<(NodeId, ConnectorWriteLayoutRecipeDraft)>(sources.len(), source)?;
+    for recipe in sources {
+        let count = recipe.input_field_tokens.len() / 32;
+        if count == 0 || !recipe.input_field_tokens.len().is_multiple_of(32) {
+            return Err(E::InvalidShape(
+                "write layout recipe input tokens must have 32 bytes each",
+            ));
+        }
+        model.fields(count)?;
+        model.request(array::<ConnectorWriteFieldToken>(count)?, 2)?;
+        // The set used by the draft constructor admits one occurrence per input.
+        let set_node = btree_resources_v2::node_layout_typed::<&ConnectorWriteFieldToken, ()>()
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        model.request(set_node, count)?;
+        work.step()?;
+    }
+    if !sources.is_empty() {
+        let map_node =
+            btree_resources_v2::node_layout_typed::<NodeId, ConnectorWriteLayoutRecipeDraft>()
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+        model.request(map_node, 1)?;
+    }
+    let facts = model.combined(&Default::default(), limits)?;
+    let mut output = std::collections::BTreeMap::new();
+    for recipe in sources {
+        let node = recipe
+            .node_id
+            .ok_or(E::InvalidShape("write layout node ID is absent"))?;
+        let binding_id = recipe.provider_binding_id.ok_or(E::InvalidShape(
+            "write layout provider binding ID is absent",
+        ))?;
+        let payload_id = recipe
+            .recipe_payload_id
+            .ok_or(E::InvalidShape("write layout payload ID is absent"))?;
+        let binding = bindings
+            .write_binding_observed(binding_id, work)?
+            .ok_or(E::InvalidShape("write layout provider binding is missing"))?;
+        let payload = payloads
+            .payload_observed(payload_id, work)?
+            .ok_or(E::InvalidShape("write layout payload is missing"))?;
+        let mut inputs = reserve(recipe.input_field_tokens.len() / 32, work)?;
+        for token in recipe.input_field_tokens.as_chunks::<32>().0 {
+            inputs.push(ConnectorWriteFieldToken::from_bytes(*token));
+            work.step()?;
+        }
+        work.flush()?;
+        let draft =
+            ConnectorWriteLayoutRecipeDraft::try_new(binding.clone(), payload.clone(), inputs)
+                .map_err(E::Provider)?;
+        output.insert(NodeId::new(node), draft);
+        work.step()?;
+    }
+    Ok((
+        output,
+        facts.coexisting_source_and_request_bytes_upper_bound,
+    ))
+}
+
 pub fn encode_writer_recipes_observed(
     sources: &[WriterRecipeSource<'_>],
     context: WriterRecipeEncodeContext<'_, '_, '_>,

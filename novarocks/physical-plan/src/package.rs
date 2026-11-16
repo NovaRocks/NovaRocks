@@ -61,6 +61,7 @@ pub struct FragmentPackageInput {
     /// The recipe is a structurally checked draft, not a capability proof.
     pub scans: BTreeMap<NodeId, FrozenConnectorRead>,
     pub writes: BTreeMap<NodeId, ConnectorWriteRecipeDraft>,
+    pub layouts: BTreeMap<NodeId, novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft>,
     pub annotations: Box<[PlanAnnotation]>,
 }
 
@@ -490,6 +491,12 @@ impl FragmentPackage {
 
     pub fn writes(&self) -> &BTreeMap<NodeId, ConnectorWriteRecipeDraft> {
         &self.0.writes
+    }
+
+    pub fn layouts(
+        &self,
+    ) -> &BTreeMap<NodeId, novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft> {
+        &self.0.layouts
     }
 
     pub fn annotations(&self) -> &[PlanAnnotation] {
@@ -951,6 +958,11 @@ pub fn extract_fragment_packages(
                 parameters,
                 scans: local_scans,
                 writes: local_writes,
+                layouts: plan
+                    .write_layouts()
+                    .range((fragment.id(), NodeId::new(0))..=(fragment.id(), NodeId::new(u32::MAX)))
+                    .map(|((_, node), recipe)| (*node, recipe.clone()))
+                    .collect(),
                 annotations,
             },
             admission,

@@ -1009,6 +1009,11 @@ pub enum NodeKind {
     },
     /// Emit the complete file's position shards after all input routes end.
     PositionShard(PositionShardAggregation),
+    /// Appends the provider's partition key with the task's layout spread.
+    WriteLayoutKey {
+        key_inputs: Box<[ValueId]>,
+        output_key: ValueId,
+    },
     ExchangeSource {
         edge: EdgeId,
         imports: Box<[(ValueId, ValueId)]>,
@@ -1175,6 +1180,7 @@ impl NodeKind {
             | Self::AssertOneRow(_)
             | Self::ExchangeSource { .. }
             | Self::PositionShard(_)
+            | Self::WriteLayoutKey { .. }
             | Self::TableWriter { .. } => {}
         }
     }
@@ -1337,6 +1343,19 @@ pub struct EdgePartitioning {
     pub destination: Distribution,
     /// Multiplicity observed by the receiving fragment.
     pub destination_multiplicity: RowMultiplicity,
+    /// Ordered (source, destination) values carried after the logical columns.
+    /// These values are consumed by exchange routing and never become node inputs.
+    pub routing_only: Box<[(ValueId, ValueId)]>,
+}
+
+impl EdgePartitioning {
+    pub fn destination_output_distribution(&self) -> Distribution {
+        if self.routing_only.is_empty() {
+            self.destination.clone()
+        } else {
+            Distribution::Unconstrained
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1775,6 +1794,10 @@ pub struct PhysicalPlan {
     version: PlanVersionId,
     fragments: BTreeMap<FragmentId, Fragment>,
     edges: BTreeMap<EdgeId, Edge>,
+    write_layouts: BTreeMap<
+        (FragmentId, NodeId),
+        novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft,
+    >,
     runtime_filters: BTreeMap<RuntimeFilterId, RuntimeFilter>,
     result_port: Option<ResultPort>,
     required: RequiredContracts,
@@ -1830,6 +1853,15 @@ impl PhysicalPlan {
         &self.edges
     }
 
+    pub fn write_layouts(
+        &self,
+    ) -> &BTreeMap<
+        (FragmentId, NodeId),
+        novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft,
+    > {
+        &self.write_layouts
+    }
+
     pub fn runtime_filters(&self) -> &BTreeMap<RuntimeFilterId, RuntimeFilter> {
         &self.runtime_filters
     }
@@ -1853,6 +1885,10 @@ pub(crate) struct PhysicalPlanParts {
     pub version: PlanVersionId,
     pub fragments: BTreeMap<FragmentId, Fragment>,
     pub edges: BTreeMap<EdgeId, Edge>,
+    pub write_layouts: BTreeMap<
+        (FragmentId, NodeId),
+        novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft,
+    >,
     pub runtime_filters: BTreeMap<RuntimeFilterId, RuntimeFilter>,
     pub result_port: Option<ResultPort>,
     pub required: RequiredContracts,
@@ -1867,6 +1903,7 @@ impl From<PhysicalPlanParts> for PhysicalPlan {
             version: parts.version,
             fragments: parts.fragments,
             edges: parts.edges,
+            write_layouts: parts.write_layouts,
             runtime_filters: parts.runtime_filters,
             result_port: parts.result_port,
             required: parts.required,

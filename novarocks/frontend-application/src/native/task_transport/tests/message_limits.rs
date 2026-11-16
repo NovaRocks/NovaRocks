@@ -144,6 +144,7 @@ fn system_fragment(
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
         &control,

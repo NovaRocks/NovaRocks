@@ -486,6 +486,7 @@ pub(crate) fn edge(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     }
 }

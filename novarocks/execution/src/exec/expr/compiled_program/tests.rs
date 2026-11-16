@@ -569,6 +569,7 @@ fn package_with_dictionary(
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             package_admission(),
             &FixtureControl,

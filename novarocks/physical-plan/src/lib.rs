@@ -97,7 +97,7 @@ pub use write_execution::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 25;
+pub const PLAN_CONTRACT_REVISION: u32 = 26;
 
 #[cfg(test)]
 mod tests;

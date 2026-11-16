@@ -537,6 +537,10 @@ pub enum ConnectorWriteColocation {
 pub enum ConnectorWriteLayoutPreference {
     None,
     ClusterBy(Vec<ConnectorWriteFieldToken>),
+    PartitionAffinity {
+        inputs: Vec<ConnectorWriteFieldToken>,
+        recipe: novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -566,8 +570,18 @@ impl ConnectorWriteRouteRequirements {
         if let ConnectorWriteColocation::ByKey(keys) = &self.colocation {
             validate_keys(keys)?;
         }
-        if let ConnectorWriteLayoutPreference::ClusterBy(keys) = &self.layout {
-            validate_keys(keys)?;
+        match &self.layout {
+            ConnectorWriteLayoutPreference::None => {}
+            ConnectorWriteLayoutPreference::ClusterBy(keys) => validate_keys(keys)?,
+            ConnectorWriteLayoutPreference::PartitionAffinity { inputs, recipe } => {
+                validate_keys(inputs)?;
+                if self.colocation != ConnectorWriteColocation::None || inputs != recipe.inputs() {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "partition affinity requires the recipe input sequence and no correctness colocation",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -635,6 +649,7 @@ impl ConnectorWriteRouteFacts {
         let layout_keys = match &requirements.layout {
             ConnectorWriteLayoutPreference::None => &[][..],
             ConnectorWriteLayoutPreference::ClusterBy(keys) => keys.as_slice(),
+            ConnectorWriteLayoutPreference::PartitionAffinity { inputs, .. } => inputs.as_slice(),
         };
         if keys
             .iter()
@@ -852,7 +867,7 @@ impl ConnectorWriteTargetPlan {
         self.rewrite_group_digest
     }
 
-    /// Present exactly for a row-mutation branch.
+    /// Change-event routing and provider-authored layout facts for this target.
     pub const fn route(&self) -> Option<&ConnectorWriteRouteFacts> {
         self.route.as_ref()
     }
@@ -907,6 +922,15 @@ impl ConnectorWriteSessionPlan {
             target.input().validate()?;
             if let Some(route) = target.route() {
                 route.validate_against_input(target.input())?;
+                if let ConnectorWriteLayoutPreference::PartitionAffinity { recipe, .. } =
+                    &route.requirements().layout
+                    && recipe.binding() != commit.binding()
+                {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "write layout recipe does not belong to the begin session's generation",
+                    ));
+                }
             }
             if let Some(group) = target.position_materialization()
                 && (!groups.insert(group.id())

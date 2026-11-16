@@ -450,6 +450,7 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
                 scheme: scheme.clone(),
             },
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -479,6 +480,7 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
                 scheme,
             },
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();

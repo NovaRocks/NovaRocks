@@ -31,6 +31,7 @@ enum ConnectorPayloadCategory {
   CONNECTOR_PAYLOAD_CATEGORY_READ_SPLIT = 4;
   CONNECTOR_PAYLOAD_CATEGORY_WRITE_HANDLE = 5;
   CONNECTOR_PAYLOAD_CATEGORY_COMMIT_FRAGMENT = 6;
+  CONNECTOR_PAYLOAD_CATEGORY_WRITE_LAYOUT = 7;
 }
 
 // Identity shared by all purpose-specific connector carriers.

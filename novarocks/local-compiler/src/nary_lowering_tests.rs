@@ -369,6 +369,7 @@ fn package(fixture: Fixture) -> Arc<FragmentPackage> {
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &Control).unwrap(),
+                layouts: Default::default(),
             },
             package_admission(),
             &Control,

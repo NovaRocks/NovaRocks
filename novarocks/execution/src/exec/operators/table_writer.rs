@@ -2887,6 +2887,7 @@ pub(crate) mod tests {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Singleton,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
             source_port: novarocks_physical_plan::FragmentOutputPort::Root,
             delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
@@ -2926,6 +2927,7 @@ pub(crate) mod tests {
                 scans: BTreeMap::new(),
                 writes: BTreeMap::from([(writer, draft)]),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             FragmentPackageAdmission {
                 plan_limits: PlanLimits::FROZEN,

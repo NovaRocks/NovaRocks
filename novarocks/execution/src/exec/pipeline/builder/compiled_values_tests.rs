@@ -393,6 +393,7 @@ fn package_with_parameters(
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             FragmentPackageAdmission {
                 plan_limits: PlanLimits::FROZEN,

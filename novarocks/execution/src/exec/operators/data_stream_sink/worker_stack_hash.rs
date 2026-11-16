@@ -210,6 +210,7 @@ pub(super) fn constant_key() -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         admission(),
         &Control,
@@ -370,6 +371,7 @@ pub(super) fn id_key(deep: &FunctionValueType) -> (Arc<LocalProgram>, ProgramExp
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Singleton,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
         })
         .unwrap();

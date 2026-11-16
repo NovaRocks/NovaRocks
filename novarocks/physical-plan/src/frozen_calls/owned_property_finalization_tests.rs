@@ -79,6 +79,7 @@ fn input(fixture: Fixture, cuts: FragmentCuts) -> FragmentPackageInput {
         scans: BTreeMap::new(),
         writes: BTreeMap::new(),
         annotations: Box::default(),
+        layouts: Default::default(),
     }
 }
 fn finish(
@@ -364,6 +365,7 @@ fn owned_finalization_runs_final_package_constants_parameters_pruning_contract_a
                         source_multiplicity: RowMultiplicity::Replicated,
                         destination: Distribution::Unconstrained,
                         destination_multiplicity: RowMultiplicity::Replicated,
+                        routing_only: Box::default(),
                     },
                     source_port: crate::FragmentOutputPort::Root,
                     delivery: crate::DeliveryRequirement::DemandDriven,

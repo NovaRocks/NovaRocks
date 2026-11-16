@@ -47,6 +47,12 @@ enum IcebergCompression {
   ICEBERG_COMPRESSION_ZSTD = 5;
 }
 
+// The ordered SDK schema consists only of the recipe's partition-source inputs.
+message IcebergWriteLayoutRecipe {
+  string partition_source_schema_json = 1;
+  string partition_spec_json = 2;
+}
+
 message IcebergPartitionValueDescriptor {
   bool is_null = 1;
   optional bytes datum_bytes = 2;

@@ -139,6 +139,7 @@ fn literal_program(cases: &[(FunctionValueType, LiteralValue)]) -> Arc<LocalProg
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             package_admission(),
             &FixtureControl,

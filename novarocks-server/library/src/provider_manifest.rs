@@ -24,7 +24,9 @@ use anyhow::Context;
 use novarocks_connector_contract::{
     PureProviderManifestEntry, PureProviderProgramCatalog, PureProviderProgramDefinition,
 };
-use novarocks_connector_iceberg::commit::write_stack::IcebergWriteRecipeCompiler;
+use novarocks_connector_iceberg::commit::write_stack::{
+    IcebergWriteLayoutRecipeCompiler, IcebergWriteRecipeCompiler,
+};
 use novarocks_connector_iceberg::resources::IcebergMetadataResources;
 use novarocks_connector_iceberg::typed_read::codec::IcebergReadRecipeCompiler;
 use novarocks_connector_iceberg::{
@@ -341,11 +343,16 @@ impl ServerProviderManifest {
                 })
             })
             .map(|contract| {
-                PureProviderManifestEntry::new(
+                let entry = PureProviderManifestEntry::new(
                     contract.provider_id().clone(),
                     true,
                     contract.write().is_some(),
-                )
+                );
+                if contract.provider_id().as_str() == novarocks_connector_iceberg::PROVIDER_ID {
+                    entry.with_write_layout()
+                } else {
+                    entry
+                }
             })
             .collect::<Vec<_>>();
         let definitions = self
@@ -463,6 +470,7 @@ fn iceberg_pure_program(
         Some(Arc::new(IcebergReadRecipeCompiler)),
         Some(Arc::new(IcebergWriteRecipeCompiler)),
     )
+    .with_write_layout(Arc::new(IcebergWriteLayoutRecipeCompiler))
 }
 
 fn build_paimon_control_factory(

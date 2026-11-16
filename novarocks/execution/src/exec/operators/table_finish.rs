@@ -5576,6 +5576,7 @@ mod tests {
                         source_multiplicity: RowMultiplicity::SingleCopy,
                         destination: Distribution::Singleton,
                         destination_multiplicity: RowMultiplicity::SingleCopy,
+                        routing_only: Box::default(),
                     },
                 })
                 .unwrap();

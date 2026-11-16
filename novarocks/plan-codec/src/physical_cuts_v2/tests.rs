@@ -99,6 +99,7 @@ fn partition() -> p::EdgePartitioning {
         source_multiplicity: p::RowMultiplicity::SingleCopy,
         destination: p::Distribution::Unconstrained,
         destination_multiplicity: p::RowMultiplicity::Replicated,
+        routing_only: Box::default(),
     }
 }
 // Representation-only sparse declarations. Provider-route and writer-result

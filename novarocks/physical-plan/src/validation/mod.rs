@@ -314,6 +314,25 @@ fn validate_plan_with_limits_core<V: PlanWaitValidation>(
     run_validation_stage!(validate_fragment_graph(plan, &mut errors));
     run_validation_stage!(validate_sinks(plan, &mut errors));
     run_validation_stage!(validate_writer_flows(plan, &mut errors));
+    for fragment in plan.fragments().values() {
+        graph::validate_write_layout_recipes(
+            fragment,
+            plan.write_layouts()
+                .range((fragment.id(), NodeId::new(0))..=(fragment.id(), NodeId::new(u32::MAX)))
+                .map(|((_, node), recipe)| (*node, recipe)),
+            &mut errors,
+        );
+    }
+    if plan
+        .write_layouts()
+        .keys()
+        .any(|(id, _)| !plan.fragments().contains_key(id))
+    {
+        errors.push(ValidationError::new(
+            "layouts",
+            "write layout recipe has no fragment owner",
+        ));
+    }
     run_validation_stage!(validate_result(plan, &mut errors));
     run_validation_stage!(validate_runtime_filters(plan, &mut errors));
     if errors.is_empty() {

@@ -524,6 +524,7 @@ fn fixture_with_types(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Singleton,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -1682,6 +1683,7 @@ fn statistics_fixture() -> StatisticsFixture {
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Singleton,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();

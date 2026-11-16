@@ -351,6 +351,7 @@ fn structure_stage_defers_property_derivation_but_definition_and_package_still_r
         scans: BTreeMap::new(),
         writes: BTreeMap::new(),
         annotations: Box::default(),
+        layouts: Default::default(),
     };
     assert!(FragmentPackage::try_new(input, package_admission(), &Control::default()).is_err());
 }

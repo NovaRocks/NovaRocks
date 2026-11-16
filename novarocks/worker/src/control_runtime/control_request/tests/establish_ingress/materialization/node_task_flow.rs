@@ -181,6 +181,7 @@ fn compiled_count_root() -> Arc<LocalProgram> {
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
                 pruning,
+                layouts: Default::default(),
             },
             FragmentPackageAdmission {
                 plan_limits: PlanLimits::FROZEN,

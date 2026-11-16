@@ -738,6 +738,42 @@ fn an_ordinary_session_yields_unrouted_targets() {
 }
 
 #[test]
+fn partitioned_ordinary_data_target_declares_affinity_and_refuses_unknown_transforms() {
+    use novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference;
+
+    let adapter = adapter("partitioned_ordinary", 1);
+    let mut material = session_material(data_input_shape());
+    material.write_binding = adapter.binding().clone();
+    let schema = material
+        .data_recipe
+        .target_schema_json()
+        .unwrap()
+        .to_owned();
+    let recipe = |transform: &str| {
+        super::domain::IcebergDataBranchRecipe::try_new(
+            Some(schema.clone()),
+            vec!["k1".into()],
+            vec!["p".into()],
+            vec![transform.into()],
+            false,
+        )
+        .unwrap()
+    };
+    material.data_recipe = recipe("identity");
+    let plan = plan_ordinary_branches(IcebergWriteFlavor::Append, &material).unwrap();
+    let sealed = neutral_plan(&adapter, flavor_session(plan)).unwrap();
+    let target = &sealed.targets()[0];
+    let token = target.input().fields()[0].token();
+    assert!(matches!(&target.route().unwrap().requirements().layout,
+        ConnectorWriteLayoutPreference::PartitionAffinity { inputs, recipe }
+            if inputs == &[token] && recipe.binding() == adapter.binding()));
+
+    material.data_recipe = recipe("unknown");
+    let error = plan_ordinary_branches(IcebergWriteFlavor::Append, &material).unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+}
+
+#[test]
 fn a_row_mutation_yields_one_routed_target_per_branch() {
     // A merge-on-read mutation carries both halves of a change event in one
     // row: the delete branch consumes the before-image identity and the data
@@ -5576,6 +5612,17 @@ fn partition_replace_routes_after_image_partition_and_old_file_identity() {
         .find(|field| field.field().name() == "_file")
         .unwrap()
         .token();
+    use novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference;
+    let layout = &data.route().unwrap().requirements().layout;
+    assert!(
+        matches!(layout, ConnectorWriteLayoutPreference::PartitionAffinity { inputs, recipe }
+        if inputs == &[new_partition] && recipe.binding() == &material.write_binding)
+    );
+    assert_eq!(
+        delete.route().unwrap().requirements().layout,
+        ConnectorWriteLayoutPreference::ClusterBy(vec![old_file_token])
+    );
+
     assert!(
         data.route()
             .unwrap()

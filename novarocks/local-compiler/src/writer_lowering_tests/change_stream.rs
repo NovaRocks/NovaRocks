@@ -163,6 +163,7 @@ fn edge(
             destination: destination_distribution,
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     }
 }

@@ -152,6 +152,7 @@ fn package(annotations: Vec<p::PlanAnnotation>) -> p::FragmentPackage {
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: annotations.into_boxed_slice(),
+            layouts: Default::default(),
         },
         admission(),
         &control,

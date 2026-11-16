@@ -252,6 +252,7 @@ fn route(
 #[derive(Clone, Copy)]
 pub(super) enum RouterWriterShape {
     Valid,
+    PartitionAffinity,
     OrdinalDrift,
     TokenDrift,
     PartitionDrift,
@@ -274,10 +275,20 @@ fn finish_router_writer_fixture(
     let (mut source_builder, source_root, effect, source_value) = change_event_root();
     let source_summary = add_router_summary(&mut source_builder, summary_edge);
     let route_token = ConnectorWriteFieldToken::from_bytes([3; 32]);
-    let edge_distribution = if matches!(shape, RouterWriterShape::PartitionDrift) {
-        Distribution::RoundRobin
-    } else {
-        Distribution::Singleton
+    let affinity = matches!(shape, RouterWriterShape::PartitionAffinity);
+    let layout = affinity.then(|| {
+        append_write_layout_key(
+            &mut source_builder,
+            source_root,
+            [effect, source_value],
+            source_value,
+        )
+    });
+    let source_root = layout.map_or(source_root, |(node, _)| node);
+    let edge_distribution = match shape {
+        RouterWriterShape::PartitionAffinity => Distribution::Unconstrained,
+        RouterWriterShape::PartitionDrift => Distribution::RoundRobin,
+        _ => Distribution::Singleton,
     };
     let source = source_builder
         .finish_definition(
@@ -290,8 +301,18 @@ fn finish_router_writer_fixture(
                     accepted_effects: Box::from([ConnectorRowMutationEffect::Insert]),
                     input_mapping: Box::from([(route_token, source_value)]),
                     requirements: crate::WriteRouteRequirements {
-                        colocation: crate::WriteColocation::Singleton,
-                        layout: crate::WriteLayoutPreference::None,
+                        colocation: if affinity {
+                            crate::WriteColocation::None
+                        } else {
+                            crate::WriteColocation::Singleton
+                        },
+                        layout: if affinity {
+                            crate::WriteLayoutPreference::PartitionAffinity(Box::new([
+                                source_value,
+                            ]))
+                        } else {
+                            crate::WriteLayoutPreference::None
+                        },
                     },
                     edge,
                 }]),
@@ -309,6 +330,15 @@ fn finish_router_writer_fixture(
             ValueOrigin::ExchangeImport { edge, source_value },
         )
         .unwrap();
+    let routing = layout.map(|(_, source_value)| {
+        let destination = destination_builder
+            .add_value(
+                ty(DataType::Int64, false),
+                ValueOrigin::ExchangeImport { edge, source_value },
+            )
+            .unwrap();
+        (source_value, destination)
+    });
     destination_builder
         .insert_node_unchecked(PhysicalNode {
             id: exchange,
@@ -791,6 +821,7 @@ fn finish_router_writer_fixture(
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Singleton,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
         });
         (
@@ -1019,12 +1050,35 @@ fn finish_router_writer_fixture(
         .unwrap();
 
     let mut plan = PlanBuilder::new(version());
+    if let Some((node, _)) = layout {
+        let draft = novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft::try_new(
+            novarocks_connector_contract::ConnectorWriteBinding::new(
+                binding.descriptor().clone(),
+                binding.catalog_handle().clone(),
+            ),
+            encoded(&binding, ConnectorCodecCategory::WriteLayout, 7),
+            vec![route_token],
+        )
+        .unwrap();
+        plan.add_write_layout(source.id(), node, draft).unwrap();
+    }
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_fragment(finish_fragment.clone()).unwrap();
     if let Some(fragment) = union_writer_fragment {
         plan.add_fragment(fragment).unwrap();
     }
+    let partitioning = if let Some((source, destination)) = routing {
+        affinity_partitioning(source, destination)
+    } else {
+        EdgePartitioning {
+            source: edge_distribution.clone(),
+            source_multiplicity: RowMultiplicity::SingleCopy,
+            destination: edge_distribution,
+            destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
+        }
+    };
     plan.add_edge(Edge {
         role: crate::OutputRole::ProviderRoute {
             target: write_target_ordinal(0),
@@ -1042,12 +1096,7 @@ fn finish_router_writer_fixture(
             node: exchange,
             receive_mapping: Box::from([(source_value, imported)]),
         },
-        partitioning: EdgePartitioning {
-            source: edge_distribution.clone(),
-            source_multiplicity: RowMultiplicity::SingleCopy,
-            destination: edge_distribution,
-            destination_multiplicity: RowMultiplicity::SingleCopy,
-        },
+        partitioning,
     })
     .unwrap();
     plan.add_edge(Edge {
@@ -1074,6 +1123,7 @@ fn finish_router_writer_fixture(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Singleton,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -1103,6 +1153,7 @@ fn finish_router_writer_fixture(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Singleton,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -1110,6 +1161,158 @@ fn finish_router_writer_fixture(
         plan.add_edge(edge).unwrap();
     }
     (finish_fragment, plan.finish())
+}
+
+fn append_write_layout_key(
+    builder: &mut FragmentBuilder,
+    child: NodeId,
+    columns: [ValueId; 2],
+    input: ValueId,
+) -> (NodeId, ValueId) {
+    let node = builder.reserve_node_id().unwrap();
+    let key = builder
+        .add_value(
+            ty(DataType::Int64, false),
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 2,
+            },
+        )
+        .unwrap();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::new([child]),
+            required_inputs: Box::new([unconstrained()]),
+            output: OutputPort {
+                node,
+                columns: Box::new([columns[0], columns[1], key]),
+            },
+            output_properties: unconstrained(),
+            kind: NodeKind::WriteLayoutKey {
+                key_inputs: Box::new([input]),
+                output_key: key,
+            },
+        })
+        .unwrap();
+    (node, key)
+}
+
+fn affinity_partitioning(source: ValueId, destination: ValueId) -> EdgePartitioning {
+    let scheme = crate::HashPartitionScheme {
+        space: crate::PartitionSpaceId::try_new([1; 32]).unwrap(),
+        count: crate::PartitionCountParameter {
+            id: crate::PartitionCountParameterId::try_new([2; 32]).unwrap(),
+            admissible: crate::PartitionCountDomain {
+                min: 1,
+                max: 3,
+                requires_power_of_two: false,
+            },
+        },
+        definition: crate::HashDefinition {
+            algorithm: crate::PartitionHashAlgorithm::NativeHierarchicalV1,
+        },
+    };
+    EdgePartitioning {
+        source: Distribution::Hash {
+            keys: Box::new([source]),
+            scheme: scheme.clone(),
+        },
+        source_multiplicity: RowMultiplicity::SingleCopy,
+        destination: Distribution::Hash {
+            keys: Box::new([destination]),
+            scheme,
+        },
+        destination_multiplicity: RowMultiplicity::SingleCopy,
+        routing_only: Box::new([(source, destination)]),
+    }
+}
+
+#[test]
+fn router_affinity_is_transport_only_and_does_not_satisfy_by_key() {
+    let plan = finish_router_writer_plan(RouterWriterShape::PartitionAffinity).unwrap();
+    let source = plan.fragments().get(&FragmentId::new(721)).unwrap();
+    let cuts = crate::fragment_cuts(&plan, source.id()).unwrap();
+    let cut = cuts
+        .outbound
+        .iter()
+        .find(|cut| !cut.partitioning.routing_only.is_empty())
+        .unwrap();
+    let [(key, imported)] = cut.partitioning.routing_only.as_ref() else {
+        panic!("one affinity key expected")
+    };
+    assert!(cut.projection.iter().all(|value| value.value != *key));
+    assert!(
+        cut.destination_imports
+            .iter()
+            .all(|mapping| mapping.destination != *imported)
+    );
+    let FragmentSink::Router { routes, .. } = source.sink() else {
+        panic!("expected router")
+    };
+    let mut route = routes[0].clone();
+    route.requirements.colocation = crate::WriteColocation::ByKey(Box::new([*key]));
+    let mut errors = crate::validation::ValidationContext::new();
+    crate::validation::validate_router_partitioning(&route, &cut.partitioning, "test", &mut errors);
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn stream_affinity_rejects_layout_key_leakage_and_nested_layout() {
+    let plan = finish_router_writer_plan(RouterWriterShape::PartitionAffinity).unwrap();
+    let writer = plan.fragments().get(&FragmentId::new(722)).unwrap();
+    let mut cuts = crate::fragment_cuts(&plan, writer.id()).unwrap();
+    let cut = &mut cuts.inbound[0];
+    cut.kind = EdgeKind::Stream;
+    cut.payload = crate::ExchangePayloadContract::Relational;
+    validate_fragment(writer, &cuts).unwrap();
+
+    // The ordinary Stream receiver keeps the same exact writer inputs.
+    let cut = &mut cuts.inbound[0];
+    let (source, destination) = cut.partitioning.routing_only[0];
+    let mut imports = cut.imports.to_vec();
+    imports.push(crate::CutImport {
+        source: crate::CutValue {
+            value: source,
+            ty: ty(DataType::Int64, false),
+        },
+        destination,
+    });
+    cut.imports = imports.into_boxed_slice();
+    assert!(validate_fragment(writer, &cuts).is_err());
+
+    let source = plan.fragments().get(&FragmentId::new(721)).unwrap();
+    let old_root = source.root();
+    let old_columns = source.nodes()[&old_root].output.columns.clone();
+    let mut parts = source.clone().into_parts();
+    let wrapper = NodeId::new(128);
+    parts.nodes.insert(
+        wrapper,
+        PhysicalNode {
+            id: wrapper,
+            inputs: Box::new([old_root]),
+            required_inputs: Box::new([unconstrained()]),
+            output: OutputPort {
+                node: wrapper,
+                columns: old_columns,
+            },
+            output_properties: unconstrained(),
+            kind: NodeKind::Limit {
+                limit: Some(3),
+                offset: 0,
+            },
+        },
+    );
+    parts.root = wrapper;
+    let nested = Fragment::from(parts);
+    let cuts = crate::fragment_cuts(&plan, source.id()).unwrap();
+    let errors = validate_fragment(&nested, &cuts).unwrap_err();
+    assert!(
+        errors
+            .errors()
+            .iter()
+            .any(|error| error.message().contains("sending fragment root"))
+    );
 }
 
 #[test]
@@ -1878,6 +2081,7 @@ fn writer_projected_values_cannot_be_transported_by_an_edge() {
         result_port: plan.result_port().cloned(),
         required: plan.required(),
         annotations: plan.annotations().into(),
+        write_layouts: Default::default(),
     });
     let error = crate::validate_plan(&invalid).unwrap_err().to_string();
     assert!(

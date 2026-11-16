@@ -374,8 +374,22 @@ pub(crate) fn merge_on_read_input_shape() -> ConnectorWriteInputShape {
 /// perturbs only the input shape or the merge targets and asserts that the
 /// branch structure is what changes.
 pub(crate) fn session_material(input: ConnectorWriteInputShape) -> IcebergSessionMaterial {
+    use novarocks_connector_contract::ConnectorWriteBinding;
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorProviderId,
+    };
     let data = data_branch_plan();
+    let instance_id = ConnectorInstanceId::parse("unit").unwrap();
+    let write_binding = ConnectorWriteBinding::new(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse(crate::PROVIDER_ID).unwrap(),
+            instance_id: instance_id.clone(),
+        },
+        CatalogHandle::new(instance_id, CatalogVersion::from_bytes([1; 32])),
+    );
     IcebergSessionMaterial {
+        write_binding,
         table: table_facts(),
         input,
         data_output: data.output,

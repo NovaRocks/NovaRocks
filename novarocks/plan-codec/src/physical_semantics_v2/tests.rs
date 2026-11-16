@@ -103,6 +103,7 @@ fn input() -> FragmentPackageInput {
         scans: BTreeMap::new(),
         writes: BTreeMap::new(),
         annotations: Box::default(),
+        layouts: Default::default(),
     }
 }
 

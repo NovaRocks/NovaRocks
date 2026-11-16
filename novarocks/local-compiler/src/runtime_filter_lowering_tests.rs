@@ -421,6 +421,7 @@ fn edge(
             } else {
                 RowMultiplicity::SingleCopy
             },
+            routing_only: Box::default(),
         },
     }
 }
