@@ -266,14 +266,11 @@ fn equality_delete_sink_query_ast(
             let column_name = column.field().name();
             Ok(build::item(
                 build::cast(
-                    build::column(
-                        build::ident(alias, Some('`')),
-                        build::ident(column_name, Some('`')),
-                    ),
+                    build::column(build::ident(alias, true), build::ident(column_name, true)),
                     novarocks_sql::sql_type_syntax(value_type)
                         .map_err(|error| error.to_string())?,
                 ),
-                Some(build::ident(column_name, Some('`'))),
+                Some(build::ident(column_name, true)),
                 true,
             ))
         })
@@ -283,10 +280,10 @@ fn equality_delete_sink_query_ast(
     let source = build::derived(
         build::query(values),
         Some(build::alias(
-            build::ident(alias, Some('`')),
+            build::ident(alias, true),
             delete_columns
                 .iter()
-                .map(|column| build::ident(column.field().name(), Some('`')))
+                .map(|column| build::ident(column.field().name(), true))
                 .collect(),
             true,
         )),
@@ -790,13 +787,8 @@ mod tests {
         let alias = alias.as_ref().expect("VALUES columns");
         assert_eq!(alias.name.value, "__nr_eqdel");
         assert!(alias.explicit_as);
-        assert_eq!(alias.name.quote_style, Some('`'));
-        assert!(
-            alias
-                .columns
-                .iter()
-                .all(|column| column.quote_style == Some('`'))
-        );
+        assert!(alias.name.quoted);
+        assert!(alias.columns.iter().all(|column| column.quoted));
         let novarocks_parser::ast::SetExpr::Values(values) = subquery.body.as_ref() else {
             panic!("VALUES");
         };

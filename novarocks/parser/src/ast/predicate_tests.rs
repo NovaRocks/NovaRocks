@@ -7,7 +7,7 @@ fn span() -> Span {
     Span::new(10, 40)
 }
 fn id(name: &str) -> Expr {
-    build::identifier(build::ident_at(name, None, span()))
+    build::identifier(build::ident_at(name, false, span()))
 }
 fn subquery(name: &str) -> Expr {
     let mut statements = crate::parse(&format!("SELECT {name}")).unwrap();

@@ -532,19 +532,15 @@ fn wrap_insert_query_with_write_projection(
         };
         let expression = match source {
             Some((ordinal, name)) => build::column(
-                build::ident(source_alias, Some('`')),
-                build::ident_at(
-                    name,
-                    Some('`'),
-                    insert_source_expression_span(query, ordinal),
-                ),
+                build::ident(source_alias, true),
+                build::ident_at(name, true, insert_source_expression_span(query, ordinal)),
             ),
             None => crate::dml::insert::omitted_insert_expr(column)?,
         };
         let expression = crate::dml::insert::canonical_insert_wrapper_expression(expression)?;
         projection.push(build::item(
             expression,
-            Some(build::ident(&column.name, Some('`'))),
+            Some(build::ident(&column.name, true)),
             true,
         ));
     }
@@ -565,10 +561,10 @@ fn wrap_insert_query_with_write_projection(
             vec![build::relation(build::derived(
                 query.clone(),
                 Some(build::alias(
-                    build::ident(source_alias, Some('`')),
+                    build::ident(source_alias, true),
                     alias_source_columns
                         .into_iter()
-                        .map(|name| build::ident(name, Some('`')))
+                        .map(|name| build::ident(name, true))
                         .collect(),
                     true,
                 )),

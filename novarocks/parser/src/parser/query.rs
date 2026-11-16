@@ -269,7 +269,6 @@ fn legacy_session_properties(hints: &[SelectHint]) -> Vec<crate::ast::SessionPro
                         }) => crate::ast::Ident {
                             value: value.clone(),
                             quoted: false,
-                            quote_style: None,
                             span: *span,
                         },
                         _ => continue,
@@ -900,7 +899,6 @@ fn parse_table_factor(
             keyword: crate::ast::Ident {
                 value: parser.source_slice(keyword_span).to_owned(),
                 quoted: false,
-                quote_style: None,
                 span: keyword_span,
             },
             lateral,
@@ -1000,7 +998,6 @@ fn split_metadata_table_suffix(
         Some(crate::ast::Ident {
             value: metadata_type,
             quoted: false,
-            quote_style: None,
             span: Span::new(suffix_start + 1, suffix_end),
         }),
     )

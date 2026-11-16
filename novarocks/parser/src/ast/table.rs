@@ -428,10 +428,10 @@ fn name(value: &ObjectName, output: &mut String) {
     }
 }
 fn ident(value: &Ident, output: &mut String) {
-    if let Some(quote) = value.quote_style {
-        output.push(quote);
-        output.push_str(&value.value.replace(quote, &quote.to_string().repeat(2)));
-        output.push(quote);
+    if value.quoted {
+        output.push('`');
+        output.push_str(&value.value.replace('`', "``"));
+        output.push('`');
     } else {
         output.push_str(&value.value);
     }

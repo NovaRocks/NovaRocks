@@ -116,7 +116,7 @@ impl AnalyzerContext<'_> {
     ) -> Result<TypedExpr, AnalyzeError> {
         let mut expression = novarocks_parser::build::function(
             ast::ObjectName {
-                parts: vec![novarocks_parser::build::ident_at(name, None, span)],
+                parts: vec![novarocks_parser::build::ident_at(name, false, span)],
                 span,
             },
             Vec::new(),
@@ -224,7 +224,7 @@ mod tests {
 
     fn ordinary_call(node: &ast::JsonQuery) -> ast::Expr {
         build::function(
-            build::object_name(vec![build::ident("json_query", None)]).unwrap(),
+            build::object_name(vec![build::ident("json_query", false)]).unwrap(),
             vec![
                 node.path_invocation.input_expression.clone(),
                 ast::Expr::Literal(ast::Literal {
@@ -329,7 +329,11 @@ mod tests {
                             .unwrap();
                     let input_id = scope.add_column(None, "document", input_type.clone());
                     let node = plain(
-                        ast::Expr::Identifier(build::ident_at("document", None, Span::new(11, 19))),
+                        ast::Expr::Identifier(build::ident_at(
+                            "document",
+                            false,
+                            Span::new(11, 19),
+                        )),
                         "$.a.b",
                     );
                     let actual = ctx.analyze_json_query_syntax(&node, &scope).unwrap();
@@ -378,7 +382,7 @@ mod tests {
         let ctx = context(&control);
         let scope = ctx.new_scope();
         let input = build::function(
-            build::object_name(vec![build::ident("parse_json", None)]).unwrap(),
+            build::object_name(vec![build::ident("parse_json", false)]).unwrap(),
             vec![build::string("{\"雪'\\\\name\":1}")],
         );
         let path = "lax $.\"雪'\\\\name\"";
@@ -423,13 +427,13 @@ mod tests {
         changed!("path name", |n: &mut ast::JsonQuery| n
             .path_invocation
             .path_name =
-            Some(build::ident("path_name", None)));
+            Some(build::ident("path_name", false)));
         changed!("PASSING", |n: &mut ast::JsonQuery| n
             .path_invocation
             .path_parameters
             .push(ast::JsonPathParameter {
-                name: build::ident("parameter", None),
-                parameter: ast::Expr::Identifier(build::ident("unknown_parameter", None)),
+                name: build::ident("parameter", false),
+                parameter: ast::Expr::Identifier(build::ident("unknown_parameter", false)),
                 format: None,
                 span: Span::new(83, 90),
             }));
@@ -470,7 +474,7 @@ mod tests {
         let ctx = context(&control);
         let scope = ctx.new_scope();
         let unknown =
-            ast::Expr::Identifier(build::ident_at("unknown_input", None, Span::new(11, 24)));
+            ast::Expr::Identifier(build::ident_at("unknown_input", false, Span::new(11, 24)));
         assert_eq!(
             ctx.analyze_expr(&unknown, &scope).unwrap_err().kind(),
             AnalyzeErrorKind::UnknownColumn
@@ -507,7 +511,7 @@ mod tests {
         let ctx = context(&control);
         let scope = ctx.new_scope();
         let unknown =
-            ast::Expr::Identifier(build::ident_at("unknown_input", None, Span::new(11, 24)));
+            ast::Expr::Identifier(build::ident_at("unknown_input", false, Span::new(11, 24)));
         let mut node = plain(unknown, "$.a");
         assert!(is_plain_json_query(&node));
         let error = ctx.analyze_json_query_syntax(&node, &scope).unwrap_err();
@@ -534,7 +538,7 @@ mod tests {
     fn missing_table(name: &str) -> ast::TableWithJoins {
         ast::TableWithJoins {
             relation: build::table(
-                build::object_name(vec![build::ident(name, None)]).unwrap(),
+                build::object_name(vec![build::ident(name, false)]).unwrap(),
                 None,
                 None,
             ),
@@ -556,7 +560,7 @@ mod tests {
         for input in [
             build::string("{\"a\":1}"),
             build::function(
-                build::object_name(vec![build::ident("parse_json", None)]).unwrap(),
+                build::object_name(vec![build::ident("parse_json", false)]).unwrap(),
                 vec![build::string("{\"a\":1}")],
             ),
         ] {
@@ -580,7 +584,7 @@ mod tests {
     fn whole_query_rejects_non_plain_json_before_any_from_table_discovery() {
         for (name, mut node) in non_plain_profiles() {
             node.path_invocation.input_expression =
-                ast::Expr::Identifier(build::ident_at("unknown_input", None, Span::new(11, 24)));
+                ast::Expr::Identifier(build::ident_at("unknown_input", false, Span::new(11, 24)));
             let span = node.span;
             let query = projection_query(
                 ast::Expr::JsonQuery(Box::new(node)),
@@ -604,13 +608,13 @@ mod tests {
         let factor_span = Span::new(200, 290);
         let table = ast::JsonTable::new(
             ast::JsonPathInvocation::plain(
-                ast::Expr::Identifier(build::ident("unknown_json_input", None)),
+                ast::Expr::Identifier(build::ident("unknown_json_input", false)),
                 ast::JsonPathString::new("$[".into(), Span::new(220, 225)),
                 Span::new(210, 225),
             ),
             vec![ast::JsonTableColumn::Ordinality(
                 ast::JsonTableOrdinalityColumn {
-                    name: build::ident("ordinal", None),
+                    name: build::ident("ordinal", false),
                     span: Span::new(230, 240),
                 },
             )],
@@ -641,7 +645,7 @@ mod tests {
         query.with = Some(ast::With {
             recursive: false,
             ctes: vec![ast::Cte {
-                name: build::ident("unused_json", None),
+                name: build::ident("unused_json", false),
                 columns: vec![],
                 query: Box::new(cte_query),
                 span: Span::new(150, 295),
@@ -692,7 +696,7 @@ mod tests {
 
     fn ordinary_constructor(name: &str, arguments: Vec<ast::Expr>, span: Span) -> ast::Expr {
         let mut expression = build::function(
-            build::object_name(vec![build::ident(name, None)]).unwrap(),
+            build::object_name(vec![build::ident(name, false)]).unwrap(),
             arguments,
         );
         let ast::Expr::FunctionCall(call) = &mut expression else {
@@ -871,9 +875,12 @@ mod tests {
         let ctx = context(&control);
         let scope = ctx.new_scope();
         let first =
-            ast::Expr::Identifier(build::ident_at("first_missing", None, Span::new(120, 130)));
-        let second =
-            ast::Expr::Identifier(build::ident_at("second_missing", None, Span::new(140, 150)));
+            ast::Expr::Identifier(build::ident_at("first_missing", false, Span::new(120, 130)));
+        let second = ast::Expr::Identifier(build::ident_at(
+            "second_missing",
+            false,
+            Span::new(140, 150),
+        ));
         for (arguments, error_span) in [
             (vec![first.clone(), second.clone()], first.span()),
             (vec![second, first], Span::new(140, 150)),
@@ -894,7 +901,7 @@ mod tests {
 
     #[test]
     fn nondefault_object_and_array_profiles_reject_before_operands_or_discovery() {
-        let unknown = ast::Expr::Identifier(build::ident("unknown_constructor_operand", None));
+        let unknown = ast::Expr::Identifier(build::ident("unknown_constructor_operand", false));
         let base = object(vec![(unknown.clone(), unknown.clone())]);
         let mut objects = Vec::new();
         let mut node = base.clone();
@@ -1003,7 +1010,7 @@ mod tests {
         let value = pool.value(1).unwrap();
         let placeholder = ast::Expr::Identifier(build::ident_at(
             "only_materialized_source_can_resolve",
-            None,
+            false,
             Span::new(40, 49),
         ));
         let assigned = ast::Expr::Literal(ast::Literal {
@@ -1107,7 +1114,7 @@ mod tests {
         let array = array(
             vec![ast::Expr::Identifier(build::ident(
                 "array_materialized_input",
-                None,
+                false,
             ))],
             true,
         );
@@ -1118,7 +1125,7 @@ mod tests {
                 "json_array",
                 vec![ast::Expr::Identifier(build::ident(
                     "array_materialized_input",
-                    None,
+                    false,
                 ))],
                 array_span,
             ),
@@ -1200,7 +1207,7 @@ mod tests {
         let control = SqlCompileControl::unbounded();
         let ctx = context(&control);
         let scope = ctx.new_scope();
-        let unknown = || build::identifier(build::ident("must_not_resolve", None));
+        let unknown = || build::identifier(build::ident("must_not_resolve", false));
         let object_node = object(vec![(build::string("k"), unknown())]);
         let array_node = array(vec![unknown()], true);
         for (typed, ordinary) in [

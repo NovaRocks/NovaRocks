@@ -2226,7 +2226,7 @@ mod tests {
         let unsupported_types = vec![
             explicit.clone(),
             build::type_name(
-                build::ident("ARRAY", None),
+                build::ident("ARRAY", false),
                 vec![build::type_parameter(explicit)],
             ),
             ast::TypeName {

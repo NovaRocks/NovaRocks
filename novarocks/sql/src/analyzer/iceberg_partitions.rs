@@ -23,7 +23,6 @@ fn ident(value: &str, span: Span) -> ast::Ident {
     ast::Ident {
         value: value.into(),
         quoted: false,
-        quote_style: None,
         span,
     }
 }

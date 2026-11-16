@@ -146,7 +146,7 @@ fn distinct_from_retains_original_null_safe_equality_and_not_results() {
 #[test]
 fn unsupported_predicate_profiles_precede_original_children_and_catalog_discovery() {
     let span = Span::new(7, 20);
-    let unknown = || build::identifier(build::ident_at("must_not_resolve", None, span));
+    let unknown = || build::identifier(build::ident_at("must_not_resolve", false, span));
     let mut cases = vec![
         (
             ast::Predicate::BooleanTest(ast::BooleanTestPredicate {
@@ -163,15 +163,6 @@ fn unsupported_predicate_profiles_precede_original_children_and_catalog_discover
                 span,
             }),
             "IS UNKNOWN predicates are not supported",
-        ),
-        (
-            ast::Predicate::Like(ast::LikePredicate {
-                negated: false,
-                pattern: unknown(),
-                escape: Some(unknown()),
-                span,
-            }),
-            "LIKE ESCAPE is not supported",
         ),
         (
             ast::Predicate::Overlaps(ast::OverlapsPredicate {

@@ -51,6 +51,9 @@ mod f3_scalar;
 #[path = "cast/f3_array.rs"]
 mod f3_array;
 
+#[path = "cast/selected.rs"]
+mod selected;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CastOperation {
     Carrier,
@@ -1012,6 +1015,22 @@ impl PreparedCastRecipe {
             _ => Err(invalid(
                 "selected array invocation requires its prepared CAST body",
             )),
+        }
+    }
+    /// Evaluate the actual selected input through this recipe's result author.
+    /// Identity edges remain with the caller's original materialization path.
+    /// Inherited errors must come from the same selected argument, unchanged.
+    pub fn evaluate_selected<'a>(
+        &self,
+        argument: EvaluatedArgument<'_>,
+        selection: crate::Selection<'a>,
+        inherited: &[RowDataError],
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
+        if self.uses_selected_array() {
+            self.evaluate_selected_array(argument, selection, inherited, control)
+        } else {
+            selected::evaluate(self, argument, selection, inherited, control)
         }
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
@@ -2253,3 +2272,7 @@ fn temporal_row_failure(
         ClassifiedTemporalCastFailure::Outer(cause) => Err(KernelFailure::from_domain(cause)),
     }
 }
+
+#[cfg(test)]
+#[path = "cast/selected_tests.rs"]
+mod selected_tests;

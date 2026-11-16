@@ -1106,14 +1106,12 @@ fn incremental_alias_ident(alias: &str) -> ast::Ident {
         ast::Ident {
             value: alias.to_string(),
             quoted: false,
-            quote_style: None,
             span: Span::new(0, 0),
         }
     } else {
         ast::Ident {
             value: alias.to_string(),
             quoted: true,
-            quote_style: Some('`'),
             span: Span::new(0, 0),
         }
     }
@@ -2838,7 +2836,7 @@ fn aggregate_physical_query(
         .collect::<Vec<_>>();
     projection.push(aggregate_projection_item(
         build::function(
-            build::object_name(vec![build::ident("mv_group_row_id", None)])
+            build::object_name(vec![build::ident("mv_group_row_id", false)])
                 .map_err(|error| error.to_string())?,
             group_key_refs,
         ),
@@ -2926,7 +2924,7 @@ fn aggregate_physical_query(
                     build::function(
                         build::object_name(vec![build::ident(
                             aggregate_visible_function(aggregate.function),
-                            None,
+                            false,
                         )])
                         .map_err(|error| error.to_string())?,
                         arguments,
@@ -2972,7 +2970,7 @@ fn aggregate_physical_query(
             projection,
             vec![build::relation(build::derived(
                 state_query,
-                Some(build::alias(build::ident("state", None), Vec::new(), true)),
+                Some(build::alias(build::ident("state", false), Vec::new(), true)),
             ))],
             None,
             ast::GroupBy::None,
@@ -2982,7 +2980,7 @@ fn aggregate_physical_query(
 }
 
 fn aggregate_projection_item(expr: ast::Expr, alias: &str) -> ast::SelectItem {
-    build::item(expr, Some(build::ident(alias, Some('`'))), true)
+    build::item(expr, Some(build::ident(alias, true)), true)
 }
 
 fn aggregate_visible_type_witness(data_type: &DataType) -> Result<ast::Expr, String> {
@@ -2998,7 +2996,7 @@ fn aggregate_visible_type_witness(data_type: &DataType) -> Result<ast::Expr, Str
         DataType::Date32 => build::simple_type("DATE"),
         DataType::Timestamp(_, _) => build::simple_type("DATETIME"),
         DataType::Decimal128(precision, scale) if *scale >= 0 => build::type_name(
-            build::ident("DECIMAL", None),
+            build::ident("DECIMAL", false),
             [i64::from(*precision), i64::from(*scale)]
                 .into_iter()
                 .map(build::numeric_parameter)
@@ -3063,10 +3061,7 @@ fn aggregate_visible_function(kind: AggregateFunctionKind) -> &'static str {
 }
 
 fn qualified_column(qualifier: &str, column: &str) -> ast::Expr {
-    build::column(
-        build::ident(qualifier, Some('`')),
-        build::ident(column, Some('`')),
-    )
+    build::column(build::ident(qualifier, true), build::ident(column, true))
 }
 
 #[cfg(test)]
@@ -4282,7 +4277,7 @@ mod tests {
                 assert!(
                     select.projection.iter().any(|item| matches!(item,
                         ast::SelectItem::ExprWithAlias { alias, .. }
-                            if alias.value == name && alias.quoted && alias.quote_style == Some('`')
+                            if alias.value == name && alias.quoted
                     )),
                     "branch {index} lost exact output alias {name}"
                 );

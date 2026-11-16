@@ -81,16 +81,15 @@ impl From<ParseError> for BuildError {
 }
 
 /// Builds an identifier with no user source position.
-pub fn ident(value: impl Into<String>, quote_style: Option<char>) -> Ident {
-    ident_at(value, quote_style, SYNTHETIC)
+pub fn ident(value: impl Into<String>, quoted: bool) -> Ident {
+    ident_at(value, quoted, SYNTHETIC)
 }
 
 /// Builds an identifier derived from a particular user name.
-pub fn ident_at(value: impl Into<String>, quote_style: Option<char>, span: Span) -> Ident {
+pub fn ident_at(value: impl Into<String>, quoted: bool, span: Span) -> Ident {
     Ident {
         value: value.into(),
-        quoted: quote_style.is_some(),
-        quote_style,
+        quoted,
         span,
     }
 }
@@ -206,7 +205,7 @@ pub fn simple_type(name: impl Into<String>) -> TypeName {
             span: SYNTHETIC,
         }
     } else {
-        type_name(ident(name, None), Vec::new())
+        type_name(ident(name, false), Vec::new())
     }
 }
 
@@ -422,10 +421,10 @@ pub fn function(name: ObjectName, arguments: Vec<Expr>) -> Expr {
 pub fn count_star() -> Expr {
     function(
         ObjectName {
-            parts: vec![ident("COUNT", None)],
+            parts: vec![ident("COUNT", false)],
             span: SYNTHETIC,
         },
-        vec![identifier(ident("*", None))],
+        vec![identifier(ident("*", false))],
     )
 }
 

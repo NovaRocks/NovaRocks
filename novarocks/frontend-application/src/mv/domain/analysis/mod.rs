@@ -260,7 +260,6 @@ fn synthetic_ident(value: impl Into<String>, span: novarocks_parser::Span) -> Id
     Ident {
         value: value.into(),
         quoted: false,
-        quote_style: None,
         span,
     }
 }

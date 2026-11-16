@@ -302,7 +302,7 @@ fn delete_position_sink_query_ast(
         .iter()
         .map(|column| {
             build::item(
-                build::identifier(build::ident(&column.name, Some('`'))),
+                build::identifier(build::ident(&column.name, true)),
                 None,
                 false,
             )
@@ -311,7 +311,7 @@ fn delete_position_sink_query_ast(
     let name = build::object_name(
         [&target.catalog, &target.namespace, &target.table]
             .into_iter()
-            .map(|part| build::ident(part, Some('`')))
+            .map(|part| build::ident(part, true))
             .collect(),
     )
     .map_err(|error| format!("internal DELETE query construction failed: {error}"))?;
@@ -1018,7 +1018,6 @@ mod tests {
             };
             assert_eq!(name.value, expected);
             assert!(name.quoted);
-            assert_eq!(name.quote_style, Some('`'));
         }
         let novarocks_parser::ast::TableFactor::Table { name, version, .. } =
             &select.from[0].relation
@@ -1032,7 +1031,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["ice", "db", "orders"]
         );
-        assert!(name.parts.iter().all(|part| part.quote_style == Some('`')));
+        assert!(name.parts.iter().all(|part| part.quoted));
         assert!(version.is_none());
     }
 

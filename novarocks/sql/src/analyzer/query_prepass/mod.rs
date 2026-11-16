@@ -516,7 +516,6 @@ fn synthetic_ident(value: String, span: Span) -> Ident {
     Ident {
         value,
         quoted: false,
-        quote_style: None,
         span,
     }
 }
@@ -870,7 +869,7 @@ mod tests {
     fn inline_function() -> novarocks_parser::ast::FunctionSpecification {
         use novarocks_parser::{SYNTHETIC, ast, build};
         ast::FunctionSpecification {
-            name: build::object_name(vec![build::ident("f", None)]).unwrap(),
+            name: build::object_name(vec![build::ident("f", false)]).unwrap(),
             parameters: vec![],
             returns: build::simple_type("bigint"),
             characteristics: vec![],

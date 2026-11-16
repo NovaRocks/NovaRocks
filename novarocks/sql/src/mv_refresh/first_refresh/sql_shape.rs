@@ -269,8 +269,8 @@ fn append_physical_apply_key(mut query: ast::Query) -> Result<ast::Query, String
         }
     }
     select.projection.push(build::item(
-        build::identifier(build::ident("_row_id", None)),
-        Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, None)),
+        build::identifier(build::ident("_row_id", false)),
+        Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, false)),
         true,
     ));
     Ok(query)
@@ -389,8 +389,8 @@ fn append_union_projection_hidden_columns(
                 .checked_add(1)
                 .ok_or_else(|| "iceberg UNION ALL MV branch id overflow".to_string())?;
             select.projection.push(build::item(
-                build::identifier(build::ident("_row_id", None)),
-                Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, None)),
+                build::identifier(build::ident("_row_id", false)),
+                Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, false)),
                 true,
             ));
             select.projection.push(build::item(
@@ -398,7 +398,7 @@ fn append_union_projection_hidden_columns(
                     build::integer(i64::from(branch_id)),
                     build::simple_type("INT"),
                 ),
-                Some(build::ident(BRANCH_ID_COLUMN_NAME, None)),
+                Some(build::ident(BRANCH_ID_COLUMN_NAME, false)),
                 true,
             ));
             Ok(())
@@ -780,7 +780,7 @@ mod tests {
         }
         assert_eq!(union, original_union);
         assert_eq!(pin, original_pin);
-        for columns in [Vec::new(), vec![build::ident("id", None)]] {
+        for columns in [Vec::new(), vec![build::ident("id", false)]] {
             let mut corresponding = union.clone();
             let ast::SetExpr::SetOperation(operation) = corresponding.body.as_mut() else {
                 panic!("UNION ALL");

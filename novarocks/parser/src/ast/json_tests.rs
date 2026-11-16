@@ -34,7 +34,6 @@ fn id(prefix: &str, name: &str, span: Span) -> Ident {
     Ident {
         value: format!("{prefix}{name}"),
         quoted: true,
-        quote_style: Some('"'),
         span,
     }
 }

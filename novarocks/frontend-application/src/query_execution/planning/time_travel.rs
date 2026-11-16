@@ -485,7 +485,6 @@ fn rewrite_time_travel_in_factor_async<'a>(
                         name: Ident {
                             value: original_leaf,
                             quoted: false,
-                            quote_style: None,
                             span: name_span,
                         },
                         columns: vec![],
@@ -503,7 +502,6 @@ fn rewrite_time_travel_in_factor_async<'a>(
                         .map(|value| Ident {
                             value,
                             quoted: false,
-                            quote_style: None,
                             span: name_span,
                         })
                         .collect(),

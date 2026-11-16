@@ -9,7 +9,7 @@ fn s() -> Span {
     Span::new(3, 7)
 }
 fn id(value: &str) -> Ident {
-    build::ident_at(value, None, s())
+    build::ident_at(value, false, s())
 }
 fn generic(name: &str, arguments: Vec<DataTypeParameter>) -> TypeName {
     TypeName {

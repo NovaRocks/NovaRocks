@@ -89,7 +89,7 @@ pub(super) fn bind_mutation_match_read(
         *name = build::object_name(
             [&target.catalog, &target.namespace, &table]
                 .into_iter()
-                .map(|name| build::ident(name, Some('`')))
+                .map(|name| build::ident(name, true))
                 .collect(),
         )
         .map_err(|error| error.to_string())?;

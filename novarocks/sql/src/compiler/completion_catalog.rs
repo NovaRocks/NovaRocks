@@ -1574,7 +1574,7 @@ mod tests {
         use novarocks_parser::{SYNTHETIC, build};
         let mut query = parse_query("SELECT f() FROM missing_table");
         query.functions.push(ast::FunctionSpecification {
-            name: build::object_name(vec![build::ident("f", None)]).unwrap(),
+            name: build::object_name(vec![build::ident("f", false)]).unwrap(),
             parameters: vec![],
             returns: build::simple_type("bigint"),
             characteristics: vec![],

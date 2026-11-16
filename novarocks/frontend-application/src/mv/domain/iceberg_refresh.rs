@@ -2406,7 +2406,6 @@ fn generated_ident(value: &str) -> ast::Ident {
     ast::Ident {
         value: value.to_string(),
         quoted: false,
-        quote_style: None,
         span: Span::new(0, 0),
     }
 }

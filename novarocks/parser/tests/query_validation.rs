@@ -192,7 +192,6 @@ fn named_window(
         name: novarocks_parser::ast::Ident {
             value: name.to_owned(),
             quoted,
-            quote_style: quoted.then_some('`'),
             span: name_span,
         },
         specification: WindowSpec {

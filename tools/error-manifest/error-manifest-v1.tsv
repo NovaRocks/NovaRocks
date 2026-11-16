@@ -8,6 +8,7 @@ query.execution.control	Execution
 query.execution.deadline_exceeded	Execution
 query.execution.dependency	Execution
 query.execution.division_by_zero	Execution
+query.execution.invalid_cast_argument	Execution
 query.execution.invalid_data	Execution
 query.execution.invariant	Execution
 query.execution.merge_target_row_multiple_matches	Execution

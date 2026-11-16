@@ -38,6 +38,7 @@ const TRINO_STANDARD_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("NOT_FOUND", 5, "USER_ERROR"),
     ("FUNCTION_NOT_FOUND", 6, "USER_ERROR"),
     ("DIVISION_BY_ZERO", 8, "USER_ERROR"),
+    ("INVALID_CAST_ARGUMENT", 9, "USER_ERROR"),
     ("INVALID_VIEW", 11, "USER_ERROR"),
     ("ALREADY_EXISTS", 12, "USER_ERROR"),
     ("NOT_SUPPORTED", 13, "USER_ERROR"),
@@ -200,6 +201,7 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         | "query.execution.commit_unknown" => "GENERIC_INTERNAL_ERROR",
         "query.execution.numeric_out_of_range" => "NUMERIC_VALUE_OUT_OF_RANGE",
         "query.execution.division_by_zero" => "DIVISION_BY_ZERO",
+        "query.execution.invalid_cast_argument" => "INVALID_CAST_ARGUMENT",
         "query.execution.cancelled" => "USER_CANCELED",
         "query.execution.deadline_exceeded" => "EXCEEDED_TIME_LIMIT",
         "query.execution.resource_exhausted" | "query.execution.representation" => {
@@ -604,6 +606,82 @@ fn integer_data_reasons_survive_execution_and_service_projection() {
                 sql: "SELECT 1 / 0"
             })
         );
+    }
+}
+
+#[test]
+fn invalid_cast_argument_keeps_the_original_fact_at_both_client_exits() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+    // Independent stable kernel identity and pinned StandardErrorCode oracle.
+    let reason = FailureReason::new(domain::KERNEL, NonZeroU16::new(44).unwrap());
+    let fact = FailureFact::new(FailureClass::Data, reason);
+    let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        fact,
+        SafeDetail::truncating("unrelated numeric overflow"),
+        ExecutionFailureSite::Coordinator,
+    ));
+    let original = error.execution_failure().unwrap();
+    assert_eq!(original.fact(), fact);
+    let wire = query_error(TrinoErrorSource::Execution {
+        error: &error,
+        sql: "SELECT CAST('bad' AS INTEGER)",
+    });
+    assert_wire(&wire, "INVALID_CAST_ARGUMENT");
+    let service = QueryServiceError::from_execution_failure(original.clone());
+    assert_eq!(
+        wire,
+        query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "SELECT CAST('bad' AS INTEGER)"
+        })
+    );
+}
+
+#[test]
+fn invalid_cast_words_do_not_reclassify_other_facts() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+    let kernel = |code| FailureReason::new(domain::KERNEL, NonZeroU16::new(code).unwrap());
+    for (class, reason, expected) in [
+        (
+            FailureClass::Representation,
+            kernel(44),
+            "GENERIC_INSUFFICIENT_RESOURCES",
+        ),
+        (
+            FailureClass::Invariant,
+            kernel(44),
+            "GENERIC_INTERNAL_ERROR",
+        ),
+        (FailureClass::Control, kernel(44), "GENERIC_INTERNAL_ERROR"),
+        (
+            FailureClass::Resource,
+            kernel(44),
+            "GENERIC_INSUFFICIENT_RESOURCES",
+        ),
+        (FailureClass::Unsupported, kernel(44), "NOT_SUPPORTED"),
+        (
+            FailureClass::Data,
+            FailureReason::new(domain::EXECUTION, NonZeroU16::new(44).unwrap()),
+            "GENERIC_USER_ERROR",
+        ),
+        (FailureClass::Data, kernel(40), "GENERIC_USER_ERROR"),
+        (FailureClass::Data, kernel(41), "NUMERIC_VALUE_OUT_OF_RANGE"),
+        (FailureClass::Data, kernel(43), "DIVISION_BY_ZERO"),
+    ] {
+        let fact = FailureFact::new(class, reason);
+        let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            fact,
+            SafeDetail::truncating("invalid cast argument"),
+            ExecutionFailureSite::Coordinator,
+        ));
+        assert_eq!(error.execution_failure().unwrap().fact(), fact);
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &error,
+            sql: "SELECT CAST('bad' AS INTEGER)",
+        });
+        assert_wire(&wire, expected);
     }
 }
 

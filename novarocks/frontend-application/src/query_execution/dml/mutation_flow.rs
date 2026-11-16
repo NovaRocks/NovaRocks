@@ -799,11 +799,11 @@ fn finish_merge_mutation_preparation(
     })
 }
 
-fn generated_name(parts: &[&str], quote: Option<char>) -> Result<ast::ObjectName, String> {
+fn generated_name(parts: &[&str], quoted: bool) -> Result<ast::ObjectName, String> {
     build::object_name(
         parts
             .iter()
-            .map(|part| build::ident(*part, quote))
+            .map(|part| build::ident(*part, quoted))
             .collect(),
     )
     .map_err(|error| error.to_string())
@@ -820,10 +820,7 @@ fn mutation_target_relation(
         span: SYNTHETIC,
     });
     Ok(build::table(
-        generated_name(
-            &[&target.catalog, &target.namespace, &target.table],
-            Some('`'),
-        )?,
+        generated_name(&[&target.catalog, &target.namespace, &target.table], true)?,
         version,
         Some(build::alias(alias, vec![], true)),
     ))
@@ -844,7 +841,7 @@ fn mutation_source_table_name(
     } else {
         vec![resolved.table.as_str()]
     };
-    generated_name(&parts, None)
+    generated_name(&parts, false)
 }
 
 fn mutation_source_relation(
@@ -864,7 +861,7 @@ fn mutation_source_relation(
                 None,
                 alias
                     .clone()
-                    .map(|a| build::alias(build::ident_at(a.value, None, a.span), vec![], true)),
+                    .map(|a| build::alias(build::ident_at(a.value, false, a.span), vec![], true)),
             ))
         }
         PreparedMutationSource::Query { query, alias } => {
@@ -874,7 +871,7 @@ fn mutation_source_relation(
             Ok(build::derived(
                 query.as_ref().clone(),
                 Some(build::alias(
-                    build::ident_at(&alias.value, None, alias.span),
+                    build::ident_at(&alias.value, false, alias.span),
                     vec![],
                     true,
                 )),
@@ -900,7 +897,7 @@ fn update_assignment_projection(
                     )
                 })?;
             Ok((
-                build::ident_at(&column.name, None, assignment.column_span),
+                build::ident_at(&column.name, false, assignment.column_span),
                 build::nested(assignment.value.clone()),
             ))
         })
@@ -928,8 +925,8 @@ fn build_update_match_query(
     .into_iter()
     .map(|(name, alias)| {
         build::item(
-            build::column(target_alias.clone(), build::ident(name, None)),
-            Some(build::ident(alias, None)),
+            build::column(target_alias.clone(), build::ident(name, false)),
+            Some(build::ident(alias, false)),
             true,
         )
     })
@@ -941,7 +938,7 @@ fn build_update_match_query(
             expr,
             Some(build::ident_at(
                 format!("__nr_new_{}", column.value),
-                None,
+                false,
                 column.span,
             )),
             true,
@@ -978,8 +975,8 @@ fn build_update_mor_producer(
     let alias = stmt
         .alias
         .clone()
-        .unwrap_or_else(|| build::ident("__nr_t", None));
-    let alias = build::ident_at(alias.value, None, alias.span);
+        .unwrap_or_else(|| build::ident("__nr_t", false));
+    let alias = build::ident_at(alias.value, false, alias.span);
     let query = build_update_match_query(
         mutation_target_relation(target, alias.clone(), target_ref)?,
         alias,
@@ -1027,7 +1024,7 @@ fn build_merge_match_query(
     matched_action: Option<i32>,
     has_not_matched_insert: bool,
 ) -> Result<ast::Query, String> {
-    let qualify = |name: &str| build::column(target_alias.clone(), build::ident(name, Some('`')));
+    let qualify = |name: &str| build::column(target_alias.clone(), build::ident(name, true));
     let nullable = |name: &str| {
         build::case_when(
             vec![(build::is_null(qualify("_file"), true), qualify(name))],
@@ -1076,19 +1073,19 @@ fn build_merge_match_query(
     ] {
         projection.push(build::item(
             nullable(name)?,
-            Some(build::ident(alias, None)),
+            Some(build::ident(alias, false)),
             true,
         ));
     }
     projection.push(build::item(
         build::nested(action),
-        Some(build::ident("__nr_merge_action", None)),
+        Some(build::ident("__nr_merge_action", false)),
         true,
     ));
     for column in target_columns {
         projection.push(build::item(
             nullable(&column.name)?,
-            Some(build::ident(&column.name, Some('`'))),
+            Some(build::ident(&column.name, true)),
             true,
         ));
     }
@@ -1101,7 +1098,7 @@ fn build_merge_match_query(
                 build::nested(expr),
                 Some(build::ident_at(
                     format!("{prefix}{}", column.value),
-                    None,
+                    false,
                     column.span,
                 )),
                 true,
@@ -1137,15 +1134,15 @@ fn build_merge_mor_producer(
     let alias = stmt
         .target_alias
         .clone()
-        .unwrap_or_else(|| build::ident(MERGE_TARGET_DEFAULT_ALIAS, None));
-    let alias = build::ident_at(alias.value, None, alias.span);
+        .unwrap_or_else(|| build::ident(MERGE_TARGET_DEFAULT_ALIAS, false));
+    let alias = build::ident_at(alias.value, false, alias.span);
     let mut source = mutation_source_relation(&stmt.source, current_catalog, target)?;
     match &mut source {
         ast::TableFactor::Table { alias, .. } | ast::TableFactor::Derived { alias, .. }
             if alias.is_none() =>
         {
             *alias = Some(build::alias(
-                build::ident(MERGE_SOURCE_DEFAULT_ALIAS, None),
+                build::ident(MERGE_SOURCE_DEFAULT_ALIAS, false),
                 vec![],
                 true,
             ))
@@ -1166,7 +1163,7 @@ fn build_merge_mor_producer(
                         )
                     })?;
                 Ok((
-                    build::ident_at(&column.name, None, assignment.column_span),
+                    build::ident_at(&column.name, false, assignment.column_span),
                     build::nested(assignment.value.clone()),
                 ))
             })
@@ -1178,7 +1175,7 @@ fn build_merge_mor_producer(
         for column in columns {
             if let Some(index) = column.value_index {
                 let expr = clause.action.values[index].clone();
-                insert_values.push((build::ident(&column.name, None), build::nested(expr)));
+                insert_values.push((build::ident(&column.name, false), build::nested(expr)));
             }
         }
     }
@@ -1461,7 +1458,7 @@ mod tests {
     ) -> ast::Query {
         build_merge_match_query(
             test_relation(target),
-            build::ident(target_alias, None),
+            build::ident(target_alias, false),
             test_relation(source),
             test_expr(on),
             matched_predicate.map(test_expr),
@@ -1469,11 +1466,11 @@ mod tests {
             columns,
             assignments
                 .iter()
-                .map(|(name, value)| (build::ident(*name, None), test_expr(value)))
+                .map(|(name, value)| (build::ident(*name, false), test_expr(value)))
                 .collect(),
             inserts
                 .iter()
-                .map(|(name, value)| (build::ident(*name, None), test_expr(value)))
+                .map(|(name, value)| (build::ident(*name, false), test_expr(value)))
                 .collect(),
             matched_action,
             insert,
@@ -1567,8 +1564,8 @@ mod tests {
         );
         let columns = [col("id"), col("odd name")];
         let query = build_update_match_query(
-            mutation_target_relation(&iceberg_target(), build::ident("t", None), "main").unwrap(),
-            build::ident("t", None),
+            mutation_target_relation(&iceberg_target(), build::ident("t", false), "main").unwrap(),
+            build::ident("t", false),
             None,
             update_assignment_projection(&prepared.assignments, &columns).unwrap(),
             prepared.selection.clone(),
@@ -1587,7 +1584,7 @@ mod tests {
     #[test]
     fn mor_target_branch_literal_keeps_backslashes_without_text_escaping() {
         let relation =
-            mutation_target_relation(&iceberg_target(), build::ident("t", None), "dev\\branch")
+            mutation_target_relation(&iceberg_target(), build::ident("t", false), "dev\\branch")
                 .unwrap();
         let ast::TableFactor::Table {
             version: Some(version),
@@ -1814,7 +1811,7 @@ mod tests {
         assert!(projected[0].1.syntax_eq(&test_expr("(NULL)")));
         let query = build_update_match_query(
             test_relation("ice.db.t AS t"),
-            build::ident("t", None),
+            build::ident("t", false),
             None,
             projected,
             Some(test_expr("t.id = 1")),
@@ -1834,9 +1831,9 @@ mod tests {
         use ast::SyntaxEq;
         let query = build_update_match_query(
             test_relation("ice.db1.t AS t"),
-            build::ident("t", None),
+            build::ident("t", false),
             Some(test_relation("staging.s AS s")),
-            vec![(build::ident("v", None), test_expr("s.v"))],
+            vec![(build::ident("v", false), test_expr("s.v"))],
             Some(test_expr("t.id = s.id")),
         )
         .unwrap();
@@ -1847,7 +1844,7 @@ mod tests {
     fn update_change_stream_target_pins_branch_read_snapshot() {
         use ast::SyntaxEq;
         let target =
-            mutation_target_relation(&iceberg_target(), build::ident("t", None), "dev").unwrap();
+            mutation_target_relation(&iceberg_target(), build::ident("t", false), "dev").unwrap();
         assert!(target.syntax_eq(&test_relation(
             "`ice`.`db1`.`t` FOR VERSION AS OF 'dev' AS t"
         )));
@@ -1881,8 +1878,8 @@ mod tests {
         )
         .expect("assignment projection");
         let query = build_update_match_query(
-            mutation_target_relation(&iceberg_target(), build::ident("t", None), "main").unwrap(),
-            build::ident("t", None),
+            mutation_target_relation(&iceberg_target(), build::ident("t", false), "main").unwrap(),
+            build::ident("t", false),
             Some(test_relation("staging.s AS s")),
             projected,
             Some(test_expr("t.id = s.id")),
@@ -1907,7 +1904,7 @@ mod tests {
         let inserted = test_expr("s.id > 10 AND (s.v > 0 OR s.v IS NULL)");
         let query = build_merge_match_query(
             test_relation("ice.db1.t AS t"),
-            build::ident("t", None),
+            build::ident("t", false),
             test_relation("staging.s AS s"),
             test_expr("t.id = s.id"),
             Some(matched.clone()),

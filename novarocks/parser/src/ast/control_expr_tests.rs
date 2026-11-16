@@ -15,7 +15,7 @@ fn query_with(expression: Expr) -> Query {
     query
 }
 fn id(value: &str) -> Expr {
-    build::identifier(build::ident_at(value, None, Span::new(11, 17)))
+    build::identifier(build::ident_at(value, false, Span::new(11, 17)))
 }
 fn clause(match_value: WhenMatch, result: Expr) -> WhenClause {
     WhenClause {
@@ -155,7 +155,7 @@ fn cast_lambda_and_subquery_wrappers_visit_all_stored_facts() {
     let body = build::cast(id("input"), build::simple_type("integer"));
     let original = Expr::Lambda(AstBox::new(LambdaExpr {
         arguments: vec![LambdaArgumentDeclaration {
-            name: build::ident_at("Arg", Some('"'), Span::new(1, 6)),
+            name: build::ident_at("Arg", true, Span::new(1, 6)),
             span: Span::new(1, 6),
         }]
         .into(),
@@ -182,7 +182,6 @@ fn cast_lambda_and_subquery_wrappers_visit_all_stored_facts() {
         unreachable!()
     };
     node.arguments[0].name.quoted = false;
-    node.arguments[0].name.quote_style = None;
     assert!(!original.syntax_eq(&changed));
     for wrapped in [
         Expr::Exists(AstBox::new(ExistsExpr {
@@ -223,7 +222,7 @@ fn actual_control_owning_cycles_and_synchronous_walks_grow_the_stack() {
             })),
             _ => Expr::Lambda(AstBox::new(LambdaExpr {
                 arguments: vec![LambdaArgumentDeclaration {
-                    name: build::ident("x", None),
+                    name: build::ident("x", false),
                     span: SYNTHETIC,
                 }]
                 .into(),

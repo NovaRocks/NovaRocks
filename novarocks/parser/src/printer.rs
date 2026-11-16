@@ -822,11 +822,10 @@ impl Printer {
     }
 
     fn write_ident(&mut self, ident: &Ident) {
-        if let Some(quote) = ident.quote_style {
-            self.output.push(quote);
-            self.output
-                .push_str(&ident.value.replace(quote, &format!("{quote}{quote}")));
-            self.output.push(quote);
+        if ident.quoted {
+            self.output.push('`');
+            self.output.push_str(&ident.value.replace('`', "``"));
+            self.output.push('`');
         } else {
             self.output.push_str(&ident.value);
         }
@@ -2329,7 +2328,6 @@ mod tests {
         Ident {
             value: value.to_owned(),
             quoted: false,
-            quote_style: None,
             span: span(),
         }
     }
@@ -2567,12 +2565,12 @@ mod tests {
             panic!("query");
         };
         query.session_properties.push(SessionProperty {
-            name: crate::build::object_name(vec![crate::build::ident("setting", None)]).unwrap(),
+            name: crate::build::object_name(vec![crate::build::ident("setting", false)]).unwrap(),
             value: crate::build::integer(10),
             span: span(),
         });
         query.functions.push(FunctionSpecification {
-            name: crate::build::object_name(vec![crate::build::ident("f", None)]).unwrap(),
+            name: crate::build::object_name(vec![crate::build::ident("f", false)]).unwrap(),
             parameters: vec![],
             returns: crate::build::simple_type("BIGINT"),
             characteristics: vec![],

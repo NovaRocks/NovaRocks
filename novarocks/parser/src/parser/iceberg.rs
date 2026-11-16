@@ -303,7 +303,6 @@ fn parse_property_key(parser: &mut StatementParser<'_, '_>) -> Result<Ident, Par
     Ok(Ident {
         value,
         quoted: false,
-        quote_style: None,
         span: literal.span,
     })
 }
@@ -559,19 +558,14 @@ fn parse_transform_ident(parser: &mut StatementParser<'_, '_>) -> Result<Ident, 
         return Err(parser.unexpected("partition transform"));
     }
     let source = parser.source_slice(token.span);
-    let (value, quoted, quote_style) = if matches!(token.kind, TokenKind::QuotedIdent) {
-        (
-            source[1..source.len() - 1].replace("``", "`"),
-            true,
-            Some('`'),
-        )
+    let (value, quoted) = if matches!(token.kind, TokenKind::QuotedIdent) {
+        (source[1..source.len() - 1].replace("``", "`"), true)
     } else {
-        (source.to_owned(), false, None)
+        (source.to_owned(), false)
     };
     let ident = Ident {
         value,
         quoted,
-        quote_style,
         span: token.span,
     };
     parser.advance();

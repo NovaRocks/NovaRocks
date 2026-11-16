@@ -42,11 +42,11 @@ fn query(source: &str) -> ast::Query {
 }
 
 fn name(value: &str) -> ast::ObjectName {
-    build::object_name(vec![build::ident(value, None)]).expect("one identifier")
+    build::object_name(vec![build::ident(value, false)]).expect("one identifier")
 }
 
 fn id(value: &str) -> Expr {
-    build::identifier(build::ident(value, None))
+    build::identifier(build::ident(value, false))
 }
 
 fn assert_expression(built: Expr, source: &str) {
@@ -138,8 +138,8 @@ fn query_session_assignments_preserve_names_values_and_traversal() {
     let mut built = build::query(select_body(1));
     built.session_properties.push(ast::SessionProperty {
         name: build::object_name(vec![
-            build::ident("iceberg", None),
-            build::ident("property", None),
+            build::ident("iceberg", false),
+            build::ident("property", false),
         ])
         .unwrap(),
         value: build::integer(5),
@@ -205,10 +205,10 @@ fn query_session_assignments_preserve_names_values_and_traversal() {
 #[test]
 fn identifiers_literals_and_unary_nodes_match_parser_shapes() {
     assert_expression(id("field"), "field");
-    assert_expression(build::identifier(build::ident("a b", Some('`'))), "`a b`");
-    assert_expression(build::identifier(build::ident("a`b", Some('`'))), "`a``b`");
+    assert_expression(build::identifier(build::ident("a b", true)), "`a b`");
+    assert_expression(build::identifier(build::ident("a`b", true)), "`a``b`");
     assert_expression(
-        build::column(build::ident("a", None), build::ident("k1", Some('`'))),
+        build::column(build::ident("a", false), build::ident("k1", true)),
         "a.`k1`",
     );
     for value in [
@@ -290,7 +290,7 @@ fn one_field_value_tuples_remain_distinct_from_source_parentheses() {
 #[test]
 fn type_nodes_preserve_nested_arguments_without_comma_trivia() {
     let decimal = build::type_name(
-        build::ident("DECIMAL", None),
+        build::ident("DECIMAL", false),
         vec![build::numeric_parameter(12), build::numeric_parameter(2)],
     );
     assert_expression(
@@ -298,17 +298,17 @@ fn type_nodes_preserve_nested_arguments_without_comma_trivia() {
         "CAST(NULL AS DECIMAL(12, 2))",
     );
     let field = ast::RowDataTypeField {
-        name: Some(build::ident("a b", Some('`'))),
+        name: Some(build::ident("a b", true)),
         data_type: build::simple_type("INT"),
         span: SYNTHETIC,
     };
     let structure = build::row_type(vec![field]);
     let array = build::type_name(
-        build::ident("ARRAY", None),
+        build::ident("ARRAY", false),
         vec![build::type_parameter(structure)],
     );
     let map = build::type_name(
-        build::ident("MAP", None),
+        build::ident("MAP", false),
         vec![
             build::type_parameter(build::simple_type("STRING")),
             build::type_parameter(array),
@@ -396,9 +396,9 @@ fn boolean_chains_preserve_ordered_operands_in_one_logical_node() {
 #[test]
 fn select_relation_aliases_and_grouping_match_parser() {
     let source_name = build::object_name(vec![
-        build::ident("cat", Some('`')),
-        build::ident("db", Some('`')),
-        build::ident("source", Some('`')),
+        build::ident("cat", true),
+        build::ident("db", true),
+        build::ident("source", true),
     ])
     .expect("qualified name");
     let left = build::relation(build::table(
@@ -408,13 +408,13 @@ fn select_relation_aliases_and_grouping_match_parser() {
             value: build::string("branch\\tail"),
             span: SYNTHETIC,
         }),
-        Some(build::alias(build::ident("s", None), Vec::new(), true)),
+        Some(build::alias(build::ident("s", false), Vec::new(), true)),
     ));
     let derived = build::derived(
         build::query(build::values(vec![vec![build::integer(1)]]).expect("values")),
         Some(build::alias(
-            build::ident("v", None),
-            vec![build::ident("k1", None)],
+            build::ident("v", false),
+            vec![build::ident("k1", false)],
             false,
         )),
     );
@@ -423,16 +423,16 @@ fn select_relation_aliases_and_grouping_match_parser() {
         JoinOperator::LeftOuter,
         derived,
         JoinConstraint::On(build::comparison(
-            build::column(build::ident("s", None), build::ident("k1", None)),
+            build::column(build::ident("s", false), build::ident("k1", false)),
             ast::ComparisonOperator::Equal,
-            build::column(build::ident("v", None), build::ident("k1", None)),
+            build::column(build::ident("v", false), build::ident("k1", false)),
         )),
     );
-    let column = build::column(build::ident("s", None), build::ident("k1", None));
+    let column = build::column(build::ident("s", false), build::ident("k1", false));
     let select = build::select(
         vec![
-            build::item(column.clone(), Some(build::ident("k", None)), true),
-            build::item(build::count_star(), Some(build::ident("n", None)), false),
+            build::item(column.clone(), Some(build::ident("k", false)), true),
+            build::item(build::count_star(), Some(build::ident("n", false)), false),
         ],
         vec![joined],
         Some(build::is_null(column.clone(), true)),
@@ -452,7 +452,7 @@ fn select_relation_aliases_and_grouping_match_parser() {
     let select = build::select(
         vec![
             build::wildcard(),
-            build::qualified_wildcard(vec![build::ident("t", None)]).expect("prefix"),
+            build::qualified_wildcard(vec![build::ident("t", false)]).expect("prefix"),
         ],
         vec![build::relation(build::table(name("t"), None, None))],
         None,
@@ -528,7 +528,7 @@ fn union_all_preserves_input_order_and_set_boundaries() {
 #[test]
 fn derived_expressions_retain_source_locations_and_envelopes_are_synthetic() {
     let source_span = Span::new(50, 65);
-    let source = build::identifier(build::ident_at("user_value", None, source_span));
+    let source = build::identifier(build::ident_at("user_value", false, source_span));
     let cast = build::cast(source.clone(), build::simple_type("INT"));
     assert_eq!(cast.span(), source_span);
     assert_eq!(build::nested(cast.clone()).span(), source_span);
@@ -924,4 +924,61 @@ fn control_producers_keep_branch_wrappers_safe_flags_and_declaration_spans() {
     assert_eq!(lambda.arguments[0].span, novarocks_parser::Span::new(1, 2));
     assert_eq!(lambda.arguments[1].span, novarocks_parser::Span::new(4, 5));
     assert!(expression("x -> x").syntax_eq(&expression("(x) -> x")));
+}
+
+#[test]
+fn delimited_identifiers_keep_decoded_value_flag_and_position_through_printing() {
+    use novarocks_parser::printer::print_expr;
+    for (value, expected) in [
+        ("select", "`select`"),
+        ("名", "`名`"),
+        ("a`b", "`a``b`"),
+        ("a\"b", "`a\"b`"),
+    ] {
+        let source_span = Span::new(11, 23);
+        let name = build::ident_at(value, true, source_span);
+        assert_eq!(name.value, value);
+        assert!(name.quoted);
+        assert_eq!(name.span, source_span);
+        let authored = build::identifier(name);
+        let rendered = print_expr(&authored);
+        assert_eq!(rendered, expected);
+        assert!(authored.syntax_eq(&expression(&rendered)));
+    }
+    let quoted = build::ident_at("same", true, Span::new(3, 9));
+    let plain = build::ident_at("same", false, Span::new(3, 9));
+    assert!(!quoted.syntax_eq(&plain));
+    let mut relocated = quoted.clone();
+    relocated.span = Span::new(30, 90);
+    assert!(quoted.syntax_eq(&relocated));
+    let ordered = build::object_name(vec![quoted.clone(), plain.clone()]).unwrap();
+    let reversed = build::object_name(vec![plain, quoted]).unwrap();
+    assert!(!ordered.syntax_eq(&reversed));
+    assert!(ordered.parts[0].quoted);
+    assert!(!ordered.parts[1].quoted);
+}
+
+#[test]
+fn old_input_identifier_delimiters_share_facts_without_reclassifying_strings() {
+    use novarocks_parser::printer::print_statement;
+    let source = "SELECT 1 AS \"a\"\"b\"";
+    let quoted = query(source);
+    let backtick = query("SELECT 1 AS `a\"b`");
+    assert!(quoted.syntax_eq(&backtick));
+    let SetExpr::Select(select) = quoted.body.as_ref() else {
+        panic!("SELECT");
+    };
+    let ast::SelectItem::ExprWithAlias { alias, .. } = &select.projection[0] else {
+        panic!("explicit alias");
+    };
+    assert_eq!(alias.value, "a\"b");
+    assert!(alias.quoted);
+    assert_eq!(alias.span, Span::new(12, source.len()));
+    let rendered = print_statement(&ast::Statement::Query(quoted.clone()));
+    assert_eq!(rendered, "SELECT 1 AS `a\"b`");
+    assert!(quoted.syntax_eq(&query(&rendered)));
+    let Expr::Literal(literal) = expression("\"a\"\"b\"") else {
+        panic!("old expression syntax still produces a String literal");
+    };
+    assert!(matches!(literal.kind, ast::LiteralKind::String(ref value) if value == "a\"b"));
 }

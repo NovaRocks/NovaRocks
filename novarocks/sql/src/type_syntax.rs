@@ -139,7 +139,7 @@ fn declaration_syntax(declaration: &SqlType) -> Result<ast::TypeName, TypeSyntax
                 .iter()
                 .map(|(name, declaration)| {
                     Ok(ast::RowDataTypeField {
-                        name: Some(build::ident(name, Some('`'))),
+                        name: Some(build::ident(name, true)),
                         data_type: declaration_syntax(declaration)?,
                         span: SYNTHETIC,
                     })
@@ -159,7 +159,7 @@ fn parameterized_type(
     name: &str,
     arguments: Vec<ast::DataTypeParameter>,
 ) -> Result<ast::TypeName, TypeSyntaxError> {
-    Ok(build::type_name(build::ident(name, None), arguments))
+    Ok(build::type_name(build::ident(name, false), arguments))
 }
 
 #[cfg(test)]

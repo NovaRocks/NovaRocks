@@ -101,7 +101,6 @@ pub(crate) fn unsupported_predicate_reason(node: &ast::PredicatedExpr) -> Option
         ast::Predicate::Between(p) if p.symmetry.is_some() => {
             Some("explicit BETWEEN symmetry is not supported")
         }
-        ast::Predicate::Like(p) if p.escape.is_some() => Some("LIKE ESCAPE is not supported"),
         ast::Predicate::In(p) => match &p.value_list {
             ast::Expr::InList(list) if !list.values.is_empty() => None,
             ast::Expr::Subquery(_) => None,
@@ -1446,6 +1445,8 @@ impl<'a> super::AnalyzerContext<'a> {
         predicate: &ast::LikePredicate,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        // Preserve the original ignored-ESCAPE behavior during the P04 AST migration.
+        // Trino LIKE escape semantics remain a separate cutover requirement (D12).
         let expr_typed = self.analyze_expr(value, scope)?;
         let pattern_typed = self.analyze_expr(&predicate.pattern, scope)?;
         let nullable = expr_typed.value_type.nullable() || pattern_typed.value_type.nullable();

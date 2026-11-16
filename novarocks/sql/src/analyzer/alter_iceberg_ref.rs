@@ -264,7 +264,6 @@ mod tests {
         Ident {
             value: value.to_string(),
             quoted: false,
-            quote_style: None,
             span: Span::new(0, 0),
         }
     }

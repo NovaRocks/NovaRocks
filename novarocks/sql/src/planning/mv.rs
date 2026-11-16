@@ -3969,7 +3969,7 @@ mod tests {
                 members: vec![ast::JsonObjectMember {
                     key: novarocks_parser::build::string("k"),
                     value: novarocks_parser::build::identifier(novarocks_parser::build::ident(
-                        "k1", None,
+                        "k1", false,
                     )),
                     format: None,
                     span: novarocks_parser::SYNTHETIC,
@@ -3980,7 +3980,7 @@ mod tests {
                 output_format: None,
                 span: novarocks_parser::SYNTHETIC,
             })),
-            Some(novarocks_parser::build::ident("value", None)),
+            Some(novarocks_parser::build::ident("value", false)),
             true,
         );
         assert!(classify_incremental_mv_query(&query).is_ok());
@@ -3996,7 +3996,7 @@ mod tests {
         };
         node.members[0].value = novarocks_parser::build::function(
             novarocks_parser::build::object_name(vec![novarocks_parser::build::ident(
-                "rand", None,
+                "rand", false,
             )])
             .unwrap(),
             vec![],
@@ -4009,13 +4009,15 @@ mod tests {
         select.projection[0] = novarocks_parser::build::item(
             Expr::JsonQuery(Box::new(ast::JsonQuery::plain(
                 ast::JsonPathInvocation::plain(
-                    novarocks_parser::build::identifier(novarocks_parser::build::ident("k1", None)),
+                    novarocks_parser::build::identifier(novarocks_parser::build::ident(
+                        "k1", false,
+                    )),
                     ast::JsonPathString::new("$.a".to_string(), novarocks_parser::SYNTHETIC),
                     novarocks_parser::SYNTHETIC,
                 ),
                 novarocks_parser::SYNTHETIC,
             ))),
-            Some(novarocks_parser::build::ident("value", None)),
+            Some(novarocks_parser::build::ident("value", false)),
             true,
         );
         assert!(classify_incremental_mv_query(&query).is_ok());
@@ -4087,7 +4089,10 @@ mod tests {
                 || err.starts_with(NATIVE_PARSE_REJECTION),
             "unexpected: {err}"
         );
-        for columns in [Vec::new(), vec![novarocks_parser::build::ident("k1", None)]] {
+        for columns in [
+            Vec::new(),
+            vec![novarocks_parser::build::ident("k1", false)],
+        ] {
             let mut query =
                 parse_query("select k1 from ice.ns.t1 union all select k1 from ice.ns.t2");
             let SetExpr::SetOperation(operation) = query.body.as_mut() else {

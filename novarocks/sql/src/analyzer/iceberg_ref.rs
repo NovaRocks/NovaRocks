@@ -603,7 +603,6 @@ mod tests {
             Expr::Identifier(Ident {
                 value: "some_var".to_string(),
                 quoted: false,
-                quote_style: None,
                 span: span(),
             }),
         );

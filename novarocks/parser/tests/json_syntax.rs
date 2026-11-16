@@ -22,7 +22,7 @@ use novarocks_parser::{
 
 fn invocation() -> JsonPathInvocation {
     JsonPathInvocation::plain(
-        build::identifier(build::ident("doc", None)),
+        build::identifier(build::ident("doc", false)),
         JsonPathString::new("lax $".into(), SYNTHETIC),
         SYNTHETIC,
     )
@@ -43,8 +43,8 @@ fn table_query(table: JsonTable) -> Statement {
         relation: TableFactor::JsonTable {
             table: Box::new(table),
             alias: Some(TableAlias {
-                name: build::ident("jt", None),
-                columns: vec![build::ident("x", None)],
+                name: build::ident("jt", false),
+                columns: vec![build::ident("x", false)],
                 explicit_as: true,
                 span: SYNTHETIC,
             }),
@@ -60,7 +60,7 @@ fn table_query(table: JsonTable) -> Statement {
 
 #[test]
 fn every_json_expression_reaches_the_public_printer_and_validator() {
-    let doc = build::identifier(build::ident("doc", None));
+    let doc = build::identifier(build::ident("doc", false));
     let roots = vec![
         (
             Expr::JsonConstructor(Box::new(JsonConstructor {
@@ -141,7 +141,7 @@ fn json_table_public_relation_dispatch_keeps_alias_columns_and_child_facts() {
     let table = JsonTable::new(
         invocation(),
         vec![JsonTableColumn::Ordinality(JsonTableOrdinalityColumn {
-            name: build::ident("ord", None),
+            name: build::ident("ord", false),
             span: SYNTHETIC,
         })],
         None,

@@ -1125,9 +1125,9 @@ mod tests {
         use novarocks_parser::{SYNTHETIC, ast, build};
         use novarocks_types::schema::SqlType;
         let row = build::row_type(vec![ast::RowDataTypeField {
-            name: Some(build::ident("payload", None)),
+            name: Some(build::ident("payload", false)),
             data_type: build::type_name(
-                build::ident("ARRAY", None),
+                build::ident("ARRAY", false),
                 vec![build::type_parameter(build::simple_type("INT"))],
             ),
             span: SYNTHETIC,
@@ -1150,7 +1150,7 @@ mod tests {
                 .contains("named fields")
         );
         let decimal = build::type_name(
-            build::ident("DECIMAL", None),
+            build::ident("DECIMAL", false),
             vec![build::numeric_parameter(38), build::numeric_parameter(9)],
         );
         assert_eq!(
@@ -1161,7 +1161,7 @@ mod tests {
             }
         );
         let overflow = build::type_name(
-            build::ident("DECIMAL", None),
+            build::ident("DECIMAL", false),
             vec![build::numeric_parameter(256)],
         );
         assert!(

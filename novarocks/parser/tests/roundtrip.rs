@@ -38,7 +38,6 @@ fn ident(value: &str) -> Expr {
     Expr::Identifier(Ident {
         value: value.to_owned(),
         quoted: false,
-        quote_style: None,
         span: span(),
     })
 }

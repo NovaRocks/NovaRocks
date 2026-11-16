@@ -274,7 +274,7 @@ fn shape_body(
                     vec![build::relation(build::derived(
                         inner,
                         Some(build::alias(
-                            build::ident("__nr_insert_literal_src", None),
+                            build::ident("__nr_insert_literal_src", false),
                             Vec::new(),
                             true,
                         )),

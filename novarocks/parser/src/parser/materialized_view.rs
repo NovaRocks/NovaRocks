@@ -349,7 +349,6 @@ fn parse_partition_name(parser: &mut StatementParser<'_, '_>) -> Result<Ident, P
     let ident = Ident {
         value: parser.source_slice(span).to_owned(),
         quoted: false,
-        quote_style: None,
         span,
     };
     parser.advance();

@@ -3311,7 +3311,7 @@ mod tests {
 
     #[test]
     fn corresponding_set_operations_are_rejected_before_operand_analysis() {
-        for columns in [vec![], vec![novarocks_parser::build::ident("x", None)]] {
+        for columns in [vec![], vec![novarocks_parser::build::ident("x", false)]] {
             let mut query = parse_native_query("SELECT 1 AS x UNION ALL SELECT 2 AS x").unwrap();
             let ast::SetExpr::SetOperation(operation) = query.body.as_mut() else {
                 panic!("UNION")

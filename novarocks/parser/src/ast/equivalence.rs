@@ -45,9 +45,7 @@ pub fn syntax_eq_explain_query(left: &ExplainQuery, right: &ExplainQuery) -> boo
 
 impl SyntaxEq for Ident {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.value == other.value
-            && self.quoted == other.quoted
-            && self.quote_style == other.quote_style
+        self.value == other.value && self.quoted == other.quoted
     }
 }
 
@@ -694,7 +692,6 @@ mod tests {
         Ident {
             value: value.to_owned(),
             quoted: false,
-            quote_style: None,
             span: span(start),
         }
     }

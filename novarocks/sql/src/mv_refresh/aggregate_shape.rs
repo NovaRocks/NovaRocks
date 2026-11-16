@@ -407,9 +407,9 @@ fn select_alias_ident(alias: &str) -> ast::Ident {
         .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
     if plain {
-        build::ident(alias, None)
+        build::ident(alias, false)
     } else {
-        build::ident(alias, Some('`'))
+        build::ident(alias, true)
     }
 }
 
@@ -420,17 +420,17 @@ fn aggregate_select_item(
 ) -> Result<ast::SelectItem, String> {
     Ok(build::item(
         build::function(
-            build::object_name(vec![build::ident(function_name, None)])
+            build::object_name(vec![build::ident(function_name, false)])
                 .map_err(|error| error.to_string())?,
             vec![argument],
         ),
-        Some(build::ident(alias, None)),
+        Some(build::ident(alias, false)),
         true,
     ))
 }
 
 fn count_star_select_item(alias: &str) -> ast::SelectItem {
-    build::item(build::count_star(), Some(build::ident(alias, None)), true)
+    build::item(build::count_star(), Some(build::ident(alias, false)), true)
 }
 
 #[cfg(test)]

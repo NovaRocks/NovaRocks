@@ -223,25 +223,16 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
                     || self.source[token.span.start()..token.span.end()].starts_with('"') =>
             {
                 let source = &self.source[token.span.start()..token.span.end()];
-                let (value, quoted, quote_style) = if matches!(token.kind, TokenKind::QuotedIdent) {
-                    (
-                        source[1..source.len() - 1].replace("``", "`"),
-                        true,
-                        Some('`'),
-                    )
+                let (value, quoted) = if matches!(token.kind, TokenKind::QuotedIdent) {
+                    (source[1..source.len() - 1].replace("``", "`"), true)
                 } else if matches!(token.kind, TokenKind::String) {
-                    (
-                        source[1..source.len() - 1].replace("\"\"", "\""),
-                        true,
-                        Some('\"'),
-                    )
+                    (source[1..source.len() - 1].replace("\"\"", "\""), true)
                 } else {
-                    (source.to_owned(), false, None)
+                    (source.to_owned(), false)
                 };
                 let ident = Ident {
                     value,
                     quoted,
-                    quote_style,
                     span: token.span,
                 };
                 self.advance();
@@ -254,7 +245,6 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
                 let ident = Ident {
                     value: self.source[token.span.start()..token.span.end()].to_owned(),
                     quoted: false,
-                    quote_style: None,
                     span: token.span,
                 };
                 self.advance();
@@ -277,7 +267,6 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             let ident = Ident {
                 value: self.source[token.span.start()..token.span.end()].to_owned(),
                 quoted: false,
-                quote_style: None,
                 span: token.span,
             };
             self.advance();

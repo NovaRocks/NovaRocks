@@ -1170,7 +1170,6 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 parts: vec![Ident {
                     value: "EXTRACT".to_owned(),
                     quoted: false,
-                    quote_style: None,
                     span: Span::new(start, start + "EXTRACT".len()),
                 }],
                 span: Span::new(start, start + "EXTRACT".len()),
@@ -1229,7 +1228,6 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 parts: vec![Ident {
                     value: self.token_text(name_span).to_owned(),
                     quoted: false,
-                    quote_style: None,
                     span: name_span,
                 }],
                 span: name_span,
@@ -1366,7 +1364,6 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 self.token_text(span).to_owned()
             },
             quoted,
-            quote_style: quoted.then_some('`'),
             span,
         }
     }
@@ -1437,7 +1434,6 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     arguments.push(Expr::Identifier(Ident {
                         value: "*".to_owned(),
                         quoted: false,
-                        quote_style: None,
                         span: star,
                     }));
                 } else if allow_named_arguments && self.table_function_named_argument_ahead() {

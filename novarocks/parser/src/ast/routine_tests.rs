@@ -26,7 +26,7 @@ fn span() -> Span {
     Span::new(3, 9)
 }
 fn ident(name: &str) -> Ident {
-    build::ident_at(name, None, span())
+    build::ident_at(name, false, span())
 }
 fn expr(name: &str) -> Expr {
     Expr::Identifier(ident(name))
@@ -710,7 +710,7 @@ fn routine_signature_preserves_parameter_names_types_order_and_return_type() {
     changed.returns = ty("other_return");
     assert!(!original.syntax_eq(&changed));
     changed = original.clone();
-    changed.name.parts[0] = build::ident("function_name", Some('"'));
+    changed.name.parts[0] = build::ident("function_name", true);
     assert!(
         !original.syntax_eq(&changed),
         "quoted naming facts are retained"

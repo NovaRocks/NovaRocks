@@ -165,7 +165,7 @@ fn case_clauses_keep_original_order_bindings_and_full_branch_declarations() {
 #[test]
 fn partial_case_unique_and_invalid_exists_fail_before_inputs_and_table_lookup() {
     let span = Span::new(7, 24);
-    let unknown = || build::identifier(build::ident_at("must_not_resolve", None, span));
+    let unknown = || build::identifier(build::ident_at("must_not_resolve", false, span));
     let partial = || ast::WhenClause {
         match_value: ast::WhenMatch::Partial(ast::Predicate::Comparison(
             ast::ComparisonPredicate {

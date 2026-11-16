@@ -159,13 +159,11 @@ impl Statement {
     }
 }
 
-/// An SQL identifier preserving its source spelling.
+/// Decoded identifier text and whether its source name was delimited.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ident {
     pub value: String,
     pub quoted: bool,
-    /// Original delimiter when the identifier was quoted.
-    pub quote_style: Option<char>,
     pub span: Span,
 }
 
@@ -191,7 +189,6 @@ mod tests {
             parts: vec![Ident {
                 value: "catalog".to_owned(),
                 quoted: false,
-                quote_style: None,
                 span: span(0, 7),
             }],
             span: span(0, 7),
@@ -241,7 +238,6 @@ mod tests {
             left: Box::new(Expr::Identifier(Ident {
                 value: "a".to_owned(),
                 quoted: false,
-                quote_style: None,
                 span: span(0, 1),
             })),
             operator: BinaryOperator::Add,
@@ -250,7 +246,6 @@ mod tests {
                     parts: vec![Ident {
                         value: "abs".to_owned(),
                         quoted: false,
-                        quote_style: None,
                         span: span(4, 7),
                     }],
                     span: span(4, 7),
@@ -296,7 +291,6 @@ mod tests {
             expression: Box::new(Expr::Identifier(Ident {
                 value: "old".to_owned(),
                 quoted: false,
-                quote_style: None,
                 span: span(1, 4),
             })),
             span: span(0, 5),
@@ -309,7 +303,6 @@ mod tests {
                 expression: Box::new(Expr::Identifier(Ident {
                     value: "new".to_owned(),
                     quoted: false,
-                    quote_style: None,
                     span: span(1, 4),
                 })),
                 span: span(0, 5),
