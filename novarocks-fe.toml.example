@@ -35,6 +35,8 @@ role = "fe"
 # file together with novarocks-catalogs.toml.example and keep the relative path.
 # Use mode = "dynamic-state-store" instead when SQL CREATE/DROP CATALOG must be
 # the catalog authority; StateStore presence never selects that mode implicitly.
+# Set Iceberg write defaults in the catalog properties of that snapshot or
+# the SQL CREATE CATALOG request. See novarocks-catalogs.toml.example.
 [catalog_source]
 mode = "static-file"
 static_file_path = "novarocks-catalogs.toml"
