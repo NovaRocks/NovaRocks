@@ -173,7 +173,7 @@ pub struct ExecutionRuntime {
 ///
 /// Tests get the production type rather than a stub: the authority is the
 /// thing under test in W2A, and a stub would let a wiring mistake pass.
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn test_memory_authority() -> Arc<MemoryAuthority> {
     const BOUND: u64 = 64 * 1024 * 1024;
     Arc::new(
@@ -309,6 +309,13 @@ pub(crate) fn test_execution_function_set() -> Arc<SealedExecutionFunctionSet> {
 
 #[cfg(test)]
 pub(crate) fn test_execution_runtime() -> Arc<ExecutionRuntime> {
+    test_execution_runtime_with_functions(test_execution_function_set())
+}
+
+#[cfg(any(test, novarocks_dev_controls))]
+pub(crate) fn test_execution_runtime_with_functions(
+    functions: Arc<SealedExecutionFunctionSet>,
+) -> Arc<ExecutionRuntime> {
     Arc::new(
         ExecutionRuntime::new(
             ExecutionRuntimeConfig {
@@ -323,7 +330,7 @@ pub(crate) fn test_execution_runtime() -> Arc<ExecutionRuntime> {
                 sink_io_worker_threads: 1,
                 sink_io_max_blocking_threads: 1,
             },
-            test_execution_function_set(),
+            functions,
             test_memory_authority(),
         )
         .expect("test execution runtime"),

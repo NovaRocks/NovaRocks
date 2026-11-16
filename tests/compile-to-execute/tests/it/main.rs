@@ -19,3 +19,5 @@ mod fixtures;
 mod integral_decimal_cast;
 mod numeric_negation;
 mod signed_cast_nullability;
+#[cfg(debug_assertions)]
+mod write_layout;

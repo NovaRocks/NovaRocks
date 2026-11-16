@@ -143,6 +143,18 @@ impl CompiledWriterBindings {
         };
     }
 
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub(crate) fn bind_component_layout(
+        &mut self,
+        node: ProgramNodeId,
+        evaluator: Arc<dyn novarocks_spi::connector::binding::ConnectorPartitionKeyEvaluator>,
+        assignment: &crate::runtime::task::instance::TaskSinkAssignment,
+    ) -> crate::runtime::task::ExecutionResult<()> {
+        self.bind_write_layout(node, evaluator)?;
+        self.bind_layout_destinations(assignment);
+        Ok(())
+    }
+
     pub(crate) fn layout(
         &self,
         node: ProgramNodeId,
