@@ -478,3 +478,199 @@ fn control_builders_hooks_syntax_equality_and_public_constructor_guards_keep_rea
     );
     assert!(matches!(metadata, Expr::FunctionCall(_)));
 }
+
+#[test]
+fn extract_real_producer_keeps_all_seventeen_distinct_fields_and_original_operand_spans() {
+    for (label, field) in [
+        ("YEAR", ExtractField::Year),
+        ("QUARTER", ExtractField::Quarter),
+        ("MONTH", ExtractField::Month),
+        ("WEEK", ExtractField::Week),
+        ("DAY", ExtractField::Day),
+        ("DAY_OF_MONTH", ExtractField::DayOfMonth),
+        ("DAY_OF_WEEK", ExtractField::DayOfWeek),
+        ("DOW", ExtractField::Dow),
+        ("DAY_OF_YEAR", ExtractField::DayOfYear),
+        ("DOY", ExtractField::Doy),
+        ("YEAR_OF_WEEK", ExtractField::YearOfWeek),
+        ("YOW", ExtractField::Yow),
+        ("HOUR", ExtractField::Hour),
+        ("MINUTE", ExtractField::Minute),
+        ("SECOND", ExtractField::Second),
+        ("TIMEZONE_MINUTE", ExtractField::TimezoneMinute),
+        ("TIMEZONE_HOUR", ExtractField::TimezoneHour),
+    ] {
+        let source = format!("EXTRACT({label} FROM source_value)");
+        let parsed = expression(&source);
+        let Expr::Extract(node) = &parsed else {
+            panic!("EXTRACT");
+        };
+        assert_eq!(node.field, field);
+        assert_eq!(field.as_str(), label);
+        assert_eq!(node.span, Span::new(0, source.len()));
+        assert_eq!(
+            &source[node.expression.span().start()..node.expression.span().end()],
+            "source_value"
+        );
+        assert_eq!(printer::print_expr(&parsed), source);
+        assert!(parsed.syntax_eq(&expression(&source.to_ascii_lowercase())));
+    }
+    for source in [
+        "EXTRACT(EPOCH FROM x)",
+        "EXTRACT(MICROSECOND FROM x)",
+        "EXTRACT(`YEAR` FROM x)",
+        "EXTRACT('YEAR' FROM x)",
+    ] {
+        let tokens = novarocks_parser::lex(source).unwrap();
+        assert!(
+            matches!(
+                novarocks_parser::parser::parse_expression(source, &tokens),
+                Err(novarocks_parser::ParseError::UnexpectedToken { .. })
+            ),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn substring_from_normalizes_directly_to_substr_while_ordinary_call_names_stay_real() {
+    for (source, ordinary, expected_values) in [
+        (
+            "SUBSTRING(`payload` FROM position_value FOR length_value)",
+            "substr(`payload`, position_value, length_value)",
+            vec!["`payload`", "position_value", "length_value"],
+        ),
+        (
+            "SUBSTRING(`payload` FROM position_value)",
+            "substr(`payload`, position_value)",
+            vec!["`payload`", "position_value"],
+        ),
+    ] {
+        let parsed = expression(source);
+        assert!(parsed.syntax_eq(&expression(ordinary)));
+        let Expr::FunctionCall(call) = &parsed else {
+            panic!("ordinary normalized call");
+        };
+        assert_eq!(call.name.parts[0].value, "substr");
+        assert_eq!(call.name.span, novarocks_parser::SYNTHETIC);
+        assert_eq!(call.name.parts[0].span, novarocks_parser::SYNTHETIC);
+        assert_eq!(call.span, Span::new(0, source.len()));
+        let actual = call
+            .arguments
+            .iter()
+            .map(|argument| {
+                assert!(argument.name.is_none());
+                assert_eq!(argument.span, argument.value.span());
+                &source[argument.span.start()..argument.span.end()]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected_values);
+        assert_eq!(printer::print_expr(&parsed), ordinary);
+    }
+    let ordinary = expression("substring(payload, position_value, length_value)");
+    let Expr::FunctionCall(call) = &ordinary else {
+        panic!("ordinary call");
+    };
+    assert_eq!(call.name.parts[0].value, "substring");
+    assert!(!ordinary.syntax_eq(&expression("substr(payload, position_value, length_value)")));
+    for source in ["catalog.extract(part, payload)", "`extract`(part, payload)"] {
+        let parsed = expression(source);
+        assert!(matches!(parsed, Expr::FunctionCall(_)));
+        assert_eq!(printer::print_expr(&parsed), source);
+    }
+    let metadata = build::function(
+        build::object_name(vec![build::ident("extract", false)]).unwrap(),
+        vec![value("part", 10), value("payload", 20)],
+    );
+    assert_eq!(printer::print_expr(&metadata), "extract(part, payload)");
+}
+
+#[test]
+fn extract_shared_hooks_and_builder_borrow_real_subtrees_and_keep_field_in_syntax_equality() {
+    let source = "EXTRACT(YEAR FROM items[slot])";
+    let original = expression(source);
+    let Expr::Extract(node) = &original else {
+        panic!("EXTRACT");
+    };
+    let Expr::Subscript(subscript) = &node.expression else {
+        panic!("operand");
+    };
+    struct Seen(Vec<*const Expr>);
+    impl Visit for Seen {
+        fn visit_expr(&mut self, node: &Expr) {
+            self.0.push(node);
+            walk_expr(self, node);
+        }
+    }
+    let mut seen = Seen(Vec::new());
+    seen.visit_expr(&original);
+    assert_eq!(
+        seen.0,
+        vec![
+            &original as *const Expr,
+            &node.expression,
+            &subscript.base,
+            &subscript.index
+        ]
+    );
+    struct Change;
+    impl Fold for Change {
+        fn fold_ident(&mut self, mut id: Ident) -> Ident {
+            id.value.push_str("_new");
+            id
+        }
+        fn fold_extract_expr(&mut self, node: ExtractExpr) -> ExtractExpr {
+            let mut node = fold_extract_expr(self, node);
+            node.field = ExtractField::Quarter;
+            node
+        }
+    }
+    let changed = Change.fold_expr(original.clone());
+    assert_eq!(
+        printer::print_expr(&changed),
+        "EXTRACT(QUARTER FROM items_new[slot_new])"
+    );
+    assert_eq!(changed.span(), original.span());
+    let mut field_changed = original.clone();
+    let Expr::Extract(node) = &mut field_changed else {
+        unreachable!()
+    };
+    node.field = ExtractField::Day;
+    assert!(!original.syntax_eq(&field_changed));
+    let mut shifted = original.clone();
+    let Expr::Extract(node) = &mut shifted else {
+        unreachable!()
+    };
+    node.span = Span::new(1000, 1001);
+    assert!(original.syntax_eq(&shifted));
+    let operand = expression("items[slot]");
+    let Expr::Subscript(node) = &operand else {
+        panic!("operand");
+    };
+    let original_payload = node.as_ref() as *const SubscriptExpr;
+    let original_span = operand.span();
+    let built = build::extract(operand, ExtractField::Year);
+    let Expr::Extract(node) = &built else {
+        unreachable!()
+    };
+    let Expr::Subscript(child) = &node.expression else {
+        unreachable!()
+    };
+    assert_eq!(child.as_ref() as *const SubscriptExpr, original_payload);
+    assert_eq!(node.expression.span(), original_span);
+    validate_statement(&statement(built)).unwrap();
+    let invalid = build::extract(
+        Expr::InList(AstBox::new(InListExpr {
+            values: AstVec::new(),
+            span: Span::new(70, 73),
+        })),
+        ExtractField::TimezoneHour,
+    );
+    assert_eq!(
+        validate_statement(&statement(invalid)),
+        Err(ValidateError::InvalidStructure {
+            violation: StructuralViolation::EmptyInList,
+            span: Span::new(70, 73)
+        })
+    );
+}

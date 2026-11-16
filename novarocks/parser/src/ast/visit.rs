@@ -21,6 +21,9 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_extract_expr(&mut self, node: &ExtractExpr) {
+        super::control_expr::walk_extract_expr(self, node);
+    }
     fn visit_if_expr(&mut self, node: &IfExpr) {
         super::control_expr::walk_if_expr(self, node);
     }
@@ -839,6 +842,7 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::Identifier(ident) => visitor.visit_ident(ident),
         Expr::Literal(literal) => visitor.visit_literal(literal),
         Expr::FunctionCall(call) => visitor.visit_function_call(call),
+        Expr::Extract(node) => visitor.visit_extract_expr(node),
         Expr::If(node) => visitor.visit_if_expr(node),
         Expr::NullIf(node) => visitor.visit_null_if_expr(node),
         Expr::Coalesce(node) => visitor.visit_coalesce_expr(node),
@@ -928,6 +932,9 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_extract_expr(&mut self, node: ExtractExpr) -> ExtractExpr {
+        super::control_expr::fold_extract_expr(self, node)
+    }
     fn fold_if_expr(&mut self, node: IfExpr) -> IfExpr {
         super::control_expr::fold_if_expr(self, node)
     }
@@ -1998,6 +2005,9 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::Literal(literal) => Expr::Literal(folder.fold_literal(literal)),
         Expr::FunctionCall(call) => {
             Expr::FunctionCall(AstBox::new(folder.fold_function_call(call.into_inner())))
+        }
+        Expr::Extract(node) => {
+            Expr::Extract(AstBox::new(folder.fold_extract_expr(node.into_inner())))
         }
         Expr::If(node) => Expr::If(AstBox::new(folder.fold_if_expr(node.into_inner()))),
         Expr::NullIf(node) => {

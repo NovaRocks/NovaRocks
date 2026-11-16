@@ -273,16 +273,12 @@ fn extract_binding_rejects_carrier_only_largeint_and_unsupported_field_at_origin
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select");
     };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(function)) = &select.projection[0]
-    else {
+    let ast::SelectItem::UnnamedExpr(ast::Expr::Extract(extract)) = &select.projection[0] else {
         panic!("extract");
-    };
-    let ast::Expr::Identifier(field) = &function.arguments[0].value else {
-        panic!("field");
     };
     let error = analyze(sql, &catalog, crate::constant::test_constant_policy()).unwrap_err();
     assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-    assert_eq!(error.span(), Some(field.span));
+    assert_eq!(error.span(), Some(extract.span));
     assert_eq!(error.message(), "unsupported EXTRACT field: quarter");
 }
 
@@ -633,4 +629,22 @@ fn extract_binding_custom_same_spelling_result_is_owned_by_actual_selected_decla
             FunctionResultType::Scalar(expected)
         );
     }
+}
+
+#[test]
+fn extract_unsupported_field_keeps_typeof_cast_hint_without_analyzing_input() {
+    let catalog = TemporalCatalog {
+        carrier: DataType::Date32,
+        logical: None,
+        nullable: false,
+    };
+    let query = analyze(
+        "SELECT typeof(CAST(EXTRACT(QUARTER FROM must_not_resolve) AS INT))",
+        &catalog,
+        crate::constant::test_constant_policy(),
+    )
+    .unwrap();
+    assert!(
+        matches!(&project(&query, 0).kind, ExprKind::Literal(crate::analysis::LiteralValue::String(value)) if value == "int")
+    );
 }

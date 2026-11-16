@@ -431,7 +431,6 @@ pub fn function(name: ObjectName, arguments: Vec<Expr>) -> Expr {
         null_treatment: None,
         window: None,
         processing_mode: None,
-        substring_from_syntax: false,
         span,
     }))
 }
@@ -771,4 +770,14 @@ pub fn format_expr(arguments: Vec<Expr>) -> Result<Expr, BuildError> {
         arguments: arguments.into(),
         span,
     })))
+}
+
+/// Builds an EXTRACT node without reinterpreting the original operand.
+pub fn extract(expression: Expr, field: ExtractField) -> Expr {
+    let span = expression.span();
+    Expr::Extract(AstBox::new(ExtractExpr {
+        expression,
+        field,
+        span,
+    }))
 }

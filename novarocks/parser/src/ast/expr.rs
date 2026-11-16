@@ -34,6 +34,7 @@ pub enum Expr {
     Identifier(Ident),
     Literal(Literal),
     FunctionCall(AstBox<FunctionCall>),
+    Extract(AstBox<super::ExtractExpr>),
     If(AstBox<super::IfExpr>),
     NullIf(AstBox<super::NullIfExpr>),
     Coalesce(AstBox<super::CoalesceExpr>),
@@ -78,6 +79,7 @@ impl Expr {
             Self::Identifier(ident) => ident.span,
             Self::Literal(literal) => literal.span,
             Self::FunctionCall(call) => call.span,
+            Self::Extract(node) => node.span,
             Self::If(node) => node.span,
             Self::NullIf(node) => node.span,
             Self::Coalesce(node) => node.span,
@@ -122,8 +124,6 @@ pub struct FunctionCall {
     pub null_treatment: Option<NullTreatment>,
     pub window: Option<super::Window>,
     pub processing_mode: Option<ProcessingMode>,
-    /// Whether SUBSTRING used its `value FROM start [FOR length]` spelling.
-    pub substring_from_syntax: bool,
     pub span: Span,
 }
 

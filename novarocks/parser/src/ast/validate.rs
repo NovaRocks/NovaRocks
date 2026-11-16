@@ -477,6 +477,7 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
                 validate_expr(value)?;
             }
         }
+        Expr::Extract(node) => validate_expr(&node.expression)?,
         Expr::WindowOperation(node) => validate_window(&node.window)?,
         Expr::FunctionCall(function) => {
             for argument in &function.arguments {

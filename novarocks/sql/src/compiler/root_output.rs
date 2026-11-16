@@ -579,6 +579,54 @@ mod tests {
     }
 
     #[test]
+    fn extract_and_substring_canonical_names_keep_public_and_derived_field_contracts() {
+        let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
+        for expression in [
+            "EXTRACT(YEAR FROM CAST('2024-02-29' AS DATE))",
+            "substring('abc' from 2)",
+            "substring('abc', 2)",
+            "substr('abc', 2)",
+        ] {
+            let sql = format!("SELECT {expression}, {expression} AS KeptName");
+            let statements = novarocks_parser::parse(&sql).unwrap();
+            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
+                panic!("query");
+            };
+            let (resolved, ctes, mut factory) =
+                crate::analyzer::analyze(query, &catalog, "default").unwrap();
+            let fields = resolved.output_columns.clone();
+            assert_eq!(fields[0].field_name, None, "{sql}");
+            assert_eq!(fields[1].field_name.as_deref(), Some("KeptName"), "{sql}");
+            let plan = crate::planner::plan_query(
+                resolved,
+                ctes,
+                &mut factory,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let columns = crate::planner::plan_output_columns(&plan).unwrap();
+            let semantics =
+                RootOutputSemantics::bind_analyzed(&fields, &columns, &factory).unwrap();
+            assert_eq!(
+                semantics.field_names(&columns).unwrap(),
+                &[None, Some("KeptName".to_string())],
+                "{sql}"
+            );
+            let derived = format!("SELECT q.KeptName FROM (SELECT {expression} AS KeptName) q");
+            let statements = novarocks_parser::parse(&derived).unwrap();
+            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
+                panic!("query");
+            };
+            let (resolved, _, _) = crate::analyzer::analyze(query, &catalog, "default").unwrap();
+            assert_eq!(
+                resolved.output_columns[0].field_name.as_deref(),
+                Some("KeptName"),
+                "{derived}"
+            );
+        }
+    }
+
+    #[test]
     fn planned_bare_grouping_and_arithmetic_roots_keep_anonymous_fields() {
         let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
         for sql in [

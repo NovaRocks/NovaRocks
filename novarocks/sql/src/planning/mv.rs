@@ -3381,6 +3381,7 @@ fn case_contains_aggregate_function(clauses: &[ast::WhenClause], default: Option
 
 fn expr_contains_aggregate_function(expr: &Expr) -> bool {
     match expr {
+        Expr::Extract(node) => expr_contains_aggregate_function(&node.expression),
         Expr::If(node) => {
             expr_contains_aggregate_function(&node.condition)
                 || expr_contains_aggregate_function(&node.true_value)
@@ -3573,6 +3574,7 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
         Expr::Coalesce(node) => reject_unsupported_exprs(&node.operands)?,
         Expr::Try(node) => reject_unsupported_expr(&node.inner)?,
         Expr::Format(node) => reject_unsupported_exprs(&node.arguments)?,
+        Expr::Extract(node) => reject_unsupported_expr(&node.expression)?,
         Expr::FunctionCall(function) => reject_unsupported_function(function)?,
         Expr::Access(access) => reject_unsupported_access_expr(access)?,
         Expr::Dereference(node) => {

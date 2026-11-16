@@ -505,6 +505,7 @@ impl SyntaxEq for Expr {
             (Self::Identifier(left), Self::Identifier(right)) => left.syntax_eq(right),
             (Self::Literal(left), Self::Literal(right)) => left.syntax_eq(right),
             (Self::FunctionCall(left), Self::FunctionCall(right)) => left.syntax_eq(right),
+            (Self::Extract(left), Self::Extract(right)) => left.syntax_eq(right),
             (Self::If(left), Self::If(right)) => left.syntax_eq(right),
             (Self::NullIf(left), Self::NullIf(right)) => left.syntax_eq(right),
             (Self::Coalesce(left), Self::Coalesce(right)) => left.syntax_eq(right),
@@ -552,7 +553,6 @@ impl SyntaxEq for FunctionCall {
             && syntax_eq_option(&self.filter, &other.filter)
             && self.null_treatment == other.null_treatment
             && syntax_eq_option(&self.window, &other.window)
-            && self.substring_from_syntax == other.substring_from_syntax
     }
 }
 
@@ -814,7 +814,6 @@ mod tests {
                 }),
                 span: span(start + 21),
             }))),
-            substring_from_syntax: false,
             span: span(start + 22),
         }))
     }

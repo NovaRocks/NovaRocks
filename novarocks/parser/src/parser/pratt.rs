@@ -1152,7 +1152,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.advance();
         self.skip_trivia();
         let field_span = self.current_span();
-        let Some(field_token) = self.current().cloned() else {
+        let Some(field_token) = self.current() else {
             return Err(self.unexpected("EXTRACT field"));
         };
         if !matches!(
@@ -1161,7 +1161,29 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         ) {
             return Err(self.unexpected("EXTRACT field"));
         }
-        let field = Expr::Identifier(self.parse_identifier(field_span));
+        // The pinned builder uppercases identifier.getText(), including raw
+        // quoting. Do not decode a quoted field into an admitted enum value.
+        let field = match self.token_text(field_span).to_uppercase().as_str() {
+            "YEAR" => crate::ast::ExtractField::Year,
+            "QUARTER" => crate::ast::ExtractField::Quarter,
+            "MONTH" => crate::ast::ExtractField::Month,
+            "WEEK" => crate::ast::ExtractField::Week,
+            "DAY" => crate::ast::ExtractField::Day,
+            "DAY_OF_MONTH" => crate::ast::ExtractField::DayOfMonth,
+            "DAY_OF_WEEK" => crate::ast::ExtractField::DayOfWeek,
+            "DOW" => crate::ast::ExtractField::Dow,
+            "DAY_OF_YEAR" => crate::ast::ExtractField::DayOfYear,
+            "DOY" => crate::ast::ExtractField::Doy,
+            "YEAR_OF_WEEK" => crate::ast::ExtractField::YearOfWeek,
+            "YOW" => crate::ast::ExtractField::Yow,
+            "HOUR" => crate::ast::ExtractField::Hour,
+            "MINUTE" => crate::ast::ExtractField::Minute,
+            "SECOND" => crate::ast::ExtractField::Second,
+            "TIMEZONE_MINUTE" => crate::ast::ExtractField::TimezoneMinute,
+            "TIMEZONE_HOUR" => crate::ast::ExtractField::TimezoneHour,
+            _ => return Err(self.unexpected("a supported EXTRACT field")),
+        };
+        self.advance();
         self.skip_trivia();
         if !self.current_is_keyword(Keyword::From) {
             return Err(self.unexpected("FROM in EXTRACT"));
@@ -1175,34 +1197,15 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
         let end = self.current_span().end();
         self.advance();
-        Ok(Expr::FunctionCall(AstBox::new(FunctionCall {
-            name: ObjectName {
-                parts: vec![Ident {
-                    value: "EXTRACT".to_owned(),
-                    quoted: false,
-                    span: Span::new(start, start + "EXTRACT".len()),
-                }],
-                span: Span::new(start, start + "EXTRACT".len()),
-            },
-            arguments: vec![field, expression]
-                .into_iter()
-                .map(|value| crate::build::call_argument(value, None))
-                .collect(),
-            processing_mode: None,
-            quantifier: FunctionQuantifier::None,
-            order_by: None,
-            separator: None,
-            filter: None,
-            null_treatment: None,
-            window: None,
-            substring_from_syntax: false,
+        Ok(Expr::Extract(AstBox::new(crate::ast::ExtractExpr {
+            expression,
+            field,
             span: Span::new(start, end),
         })))
     }
 
     fn parse_substring_expression(&mut self) -> Result<Expr, ParseError> {
         let start = self.current_span().start();
-        let name_span = self.current_span();
         self.advance();
         self.skip_trivia();
         if !self.current_is_symbol(Symbol::LParen) {
@@ -1240,11 +1243,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         Ok(Expr::FunctionCall(AstBox::new(FunctionCall {
             name: ObjectName {
                 parts: vec![Ident {
-                    value: self.token_text(name_span).to_owned(),
+                    value: "substr".to_owned(),
                     quoted: false,
-                    span: name_span,
+                    span: crate::SYNTHETIC,
                 }],
-                span: name_span,
+                span: crate::SYNTHETIC,
             },
             arguments: arguments
                 .into_iter()
@@ -1257,7 +1260,6 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             filter: None,
             null_treatment: None,
             window: None,
-            substring_from_syntax: true,
             span: Span::new(start, end),
         })))
     }
@@ -1718,7 +1720,6 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             filter,
             null_treatment,
             window,
-            substring_from_syntax: false,
             span: Span::new(span.start(), span_end),
         })))
     }
@@ -2335,16 +2336,13 @@ mod tests {
     }
 
     #[test]
-    fn substring_from_for_form_preserves_its_syntax_and_reparses() {
+    fn substring_from_for_form_normalizes_to_substr_and_reparses() {
         for (source, canonical) in [
             (
                 "SUBSTRING('STARROCKS' FROM 2 FOR 3)",
-                "SUBSTRING('STARROCKS' FROM 2 FOR 3)",
+                "substr('STARROCKS', 2, 3)",
             ),
-            (
-                "SUBSTRING('STARROCKS' FROM 5)",
-                "SUBSTRING('STARROCKS' FROM 5)",
-            ),
+            ("SUBSTRING('STARROCKS' FROM 5)", "substr('STARROCKS', 5)"),
             (
                 "SUBSTRING('STARROCKS', 2, 3)",
                 "SUBSTRING('STARROCKS', 2, 3)",

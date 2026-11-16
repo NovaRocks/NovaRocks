@@ -47,7 +47,6 @@ fn call(name: &str, argument: &str, span: Span) -> ast::Expr {
         filter: None,
         null_treatment: None,
         window: None,
-        substring_from_syntax: false,
         span,
     }))
 }

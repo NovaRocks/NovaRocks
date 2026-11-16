@@ -924,6 +924,7 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
                 expr_display_name_preserve_path(&lambda.body)
             )
         }
+        ast::Expr::Extract(_) => printer::print_expr(expr),
         ast::Expr::If(node) => {
             let mut arguments = vec![&node.condition, &node.true_value];
             arguments.extend(node.false_value.iter());

@@ -43,6 +43,7 @@ pub enum SqlConstantExpressionStep {
     InValueList,
     InListValue(usize),
     CastExpression,
+    ExtractInput,
     DereferenceBase,
     SubscriptBase,
     SubscriptIndex,
@@ -300,6 +301,7 @@ pub(crate) fn resolve_expression_site<'a>(
                     })?
                     .sort_key
             }
+            (SqlConstantExpressionStep::ExtractInput, ast::Expr::Extract(node)) => &node.expression,
             (SqlConstantExpressionStep::IfCondition, ast::Expr::If(node)) => &node.condition,
             (SqlConstantExpressionStep::IfTrue, ast::Expr::If(node)) => &node.true_value,
             (SqlConstantExpressionStep::IfFalse, ast::Expr::If(node)) => {

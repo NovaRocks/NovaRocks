@@ -587,6 +587,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 node.span,
             )),
 
+            ast::Expr::Extract(node) => self.analyze_extract(node, scope),
+
             // Function call
             ast::Expr::FunctionCall(func) => self.analyze_function(func, scope),
 
@@ -2142,6 +2144,62 @@ impl<'a> super::AnalyzerContext<'a> {
         self.analyze_function_with_original_arguments(func, &original_arguments, scope)
     }
 
+    fn analyze_extract(
+        &self,
+        node: &ast::ExtractExpr,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let function_name = match node.field {
+            ast::ExtractField::Year => "year",
+            ast::ExtractField::Month => "month",
+            ast::ExtractField::Day => "day",
+            ast::ExtractField::Hour => "hour",
+            ast::ExtractField::Minute => "minute",
+            ast::ExtractField::Second => "second",
+            field => {
+                let name = match field {
+                    ast::ExtractField::Quarter => "quarter",
+                    ast::ExtractField::Week => "week",
+                    ast::ExtractField::DayOfMonth => "day_of_month",
+                    ast::ExtractField::DayOfWeek => "day_of_week",
+                    ast::ExtractField::Dow => "dow",
+                    ast::ExtractField::DayOfYear => "day_of_year",
+                    ast::ExtractField::Doy => "doy",
+                    ast::ExtractField::YearOfWeek => "year_of_week",
+                    ast::ExtractField::Yow => "yow",
+                    ast::ExtractField::TimezoneMinute => "timezone_minute",
+                    ast::ExtractField::TimezoneHour => "timezone_hour",
+                    _ => unreachable!("the six supported EXTRACT fields returned above"),
+                };
+                return Err(AnalyzeError::unsupported_expression(
+                    format!("unsupported EXTRACT field: {name}"),
+                    node.span,
+                ));
+            }
+        };
+        let argument = self.analyze_expr(&node.expression, scope)?;
+        let bound = bind_scalar_function_call_with_catalog(
+            self.function_catalog,
+            function_name,
+            vec![argument],
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
+            self.control,
+        )
+        .map_err(|error| error.at_type_mismatch(node.span))?;
+        let value_type = bound.value_type().clone();
+        Ok(TypedExpr {
+            kind: ExprKind::FunctionCall {
+                volatility: self.function_catalog.volatility(function_name),
+                name: function_name.to_string(),
+                binding: bound.binding,
+                args: bound.args,
+                distinct: false,
+            },
+            value_type,
+        })
+    }
+
     /// Use the existing function owner with the actual dedicated-node children.
     /// The plain metadata carries no source occurrence or selected binding.
     fn analyze_control_call(
@@ -2273,53 +2331,6 @@ impl<'a> super::AnalyzerContext<'a> {
         } else {
             original_arguments.to_vec()
         };
-
-        // The native parser represents EXTRACT as a function call whose first
-        // argument is the field identifier. Preserve the historical lowering
-        // to the unit-specific scalar function without reconstructing SQL.
-        if original_name == "extract" && arg_exprs.len() == 2 {
-            let ast::Expr::Identifier(field) = arg_exprs[0] else {
-                return Err(AnalyzeError::unsupported_expression(
-                    "unsupported EXTRACT field",
-                    func.span,
-                ));
-            };
-            let function_name = match field.value.to_ascii_lowercase().as_str() {
-                "year" => "year",
-                "month" => "month",
-                "day" => "day",
-                "hour" => "hour",
-                "minute" => "minute",
-                "second" => "second",
-                other => {
-                    return Err(AnalyzeError::unsupported_expression(
-                        format!("unsupported EXTRACT field: {other}"),
-                        field.span,
-                    ));
-                }
-            };
-            let argument = self.analyze_expr(arg_exprs[1], scope)?;
-            let bound = bind_scalar_function_call_with_catalog(
-                self.function_catalog,
-                function_name,
-                vec![argument],
-                self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                self.constant_policy,
-                self.control,
-            )
-            .map_err(|error| error.at_type_mismatch(func.span))?;
-            let value_type = bound.value_type().clone();
-            return Ok(TypedExpr {
-                kind: ExprKind::FunctionCall {
-                    volatility: self.function_catalog.volatility(function_name),
-                    name: function_name.to_string(),
-                    binding: bound.binding,
-                    args: bound.args,
-                    distinct: false,
-                },
-                value_type,
-            });
-        }
 
         // typeof(CAST(x AS T)) preserves the SQL-level type spelling (CHAR vs
         // VARCHAR, DECIMAL128(p, s), etc.) which is lost once the cast lowers
@@ -4437,6 +4448,7 @@ impl<'a> super::AnalyzerContext<'a> {
     /// Window functions (with OVER) are NOT counted as aggregates.
     pub(super) fn expr_contains_aggregate(&self, expr: &ast::Expr) -> bool {
         match expr {
+            ast::Expr::Extract(node) => self.expr_contains_aggregate(&node.expression),
             ast::Expr::If(node) => {
                 self.expr_contains_aggregate(&node.condition)
                     || self.expr_contains_aggregate(&node.true_value)
@@ -9928,12 +9940,12 @@ mod tests {
             .ok_or_else(|| "expected projection".to_string())
     }
 
-    fn assert_substring_int32_arguments(sql: &str, expected_arity: usize) {
+    fn assert_substring_int32_arguments(sql: &str, expected_name: &str, expected_arity: usize) {
         let expr = analyze_projection_expr(sql).expect("substring should analyze");
         let crate::analysis::ExprKind::FunctionCall { name, args, .. } = expr.kind else {
             panic!("expected FunctionCall, got {:?}", expr.kind);
         };
-        assert_eq!(name, "substring");
+        assert_eq!(name, expected_name);
         assert_eq!(args.len(), expected_arity);
         assert_eq!(args[0].value_type.data_type().clone(), DataType::Utf8);
         for arg in &args[1..] {
@@ -10008,7 +10020,7 @@ mod tests {
             panic!("expected special FunctionCall, got {:?}", special.kind);
         };
 
-        assert_eq!(special_name, "substring");
+        assert_eq!(special_name, "substr");
         assert_eq!(normal.return_type(), &DataType::Utf8);
         assert_eq!(normal.args.len(), special_args.len());
         for (normal, special) in normal.args.iter().zip(special_args.iter()) {
@@ -10041,8 +10053,8 @@ mod tests {
 
     #[test]
     fn substring_special_syntax_uses_the_same_binding() {
-        assert_substring_int32_arguments("select substring('STARROCKS' from 2 for 3)", 3);
-        assert_substring_int32_arguments("select substring('STARROCKS' from 2)", 2);
+        assert_substring_int32_arguments("select substring('STARROCKS' from 2 for 3)", "substr", 3);
+        assert_substring_int32_arguments("select substring('STARROCKS' from 2)", "substr", 2);
     }
 
     #[test]
@@ -10451,13 +10463,18 @@ mod tests {
 
     #[test]
     fn substring_null_offset_binds_to_nullable_int32() {
-        let expr = analyze_projection_expr("select substring('x', NULL)")
-            .expect("NULL should bind to the signature target");
-        let crate::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
-            panic!("expected FunctionCall, got {:?}", expr.kind);
-        };
-        assert_eq!(args[1].value_type.data_type().clone(), DataType::Int32);
-        assert!(args[1].value_type.nullable());
+        for sql in [
+            "select substring('x', NULL)",
+            "select substring('x' FROM NULL)",
+        ] {
+            let expr =
+                analyze_projection_expr(sql).expect("NULL should bind to the signature target");
+            let crate::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
+                panic!("expected FunctionCall, got {:?}", expr.kind);
+            };
+            assert_eq!(args[1].value_type.data_type().clone(), DataType::Int32);
+            assert!(args[1].value_type.nullable());
+        }
     }
 
     #[test]

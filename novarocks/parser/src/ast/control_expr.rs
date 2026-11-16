@@ -530,3 +530,75 @@ impl SyntaxEq for FormatExpr {
         eq_slice(&self.arguments, &other.arguments)
     }
 }
+
+/// The exact EXTRACT operand and pinned field, without an invented field node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtractExpr {
+    pub expression: Expr,
+    pub field: ExtractField,
+    pub span: Span,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtractField {
+    Year,
+    Quarter,
+    Month,
+    Week,
+    Day,
+    DayOfMonth,
+    DayOfWeek,
+    Dow,
+    DayOfYear,
+    Doy,
+    YearOfWeek,
+    Yow,
+    Hour,
+    Minute,
+    Second,
+    TimezoneMinute,
+    TimezoneHour,
+}
+impl ExtractField {
+    /// The canonical syntax label. This is not an execution capability table.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Year => "YEAR",
+            Self::Quarter => "QUARTER",
+            Self::Month => "MONTH",
+            Self::Week => "WEEK",
+            Self::Day => "DAY",
+            Self::DayOfMonth => "DAY_OF_MONTH",
+            Self::DayOfWeek => "DAY_OF_WEEK",
+            Self::Dow => "DOW",
+            Self::DayOfYear => "DAY_OF_YEAR",
+            Self::Doy => "DOY",
+            Self::YearOfWeek => "YEAR_OF_WEEK",
+            Self::Yow => "YOW",
+            Self::Hour => "HOUR",
+            Self::Minute => "MINUTE",
+            Self::Second => "SECOND",
+            Self::TimezoneMinute => "TIMEZONE_MINUTE",
+            Self::TimezoneHour => "TIMEZONE_HOUR",
+        }
+    }
+}
+impl ExtractExpr {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+#[recursive::recursive]
+pub fn walk_extract_expr<V: Visit + ?Sized>(visitor: &mut V, node: &ExtractExpr) {
+    visitor.visit_expr(&node.expression);
+}
+#[recursive::recursive]
+pub fn fold_extract_expr<F: Fold + ?Sized>(folder: &mut F, mut node: ExtractExpr) -> ExtractExpr {
+    node.expression = folder.fold_expr(node.expression);
+    node
+}
+impl SyntaxEq for ExtractExpr {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.field == other.field && self.expression.syntax_eq(&other.expression)
+    }
+}

@@ -2240,3 +2240,114 @@ fn actual_control_call_cycles_keep_all_alternative_child_slots_and_order() {
     assert_eq!(number(root.false_value.as_ref().unwrap()), DEPTH * 10 + 3);
     drop(root.condition);
 }
+
+#[test]
+fn actual_extract_owning_and_semantic_cycle_keeps_deep_fields_and_original_leaf() {
+    use crate::ast::{
+        Expr, ExtractExpr, ExtractField, Fold, GroupBy, Literal, LiteralKind, SetExpr, Statement,
+        SyntaxEq, Visit, walk_extract_expr,
+    };
+    use crate::build;
+    const DEPTH: usize = 20_000;
+    let fields = [
+        ExtractField::Year,
+        ExtractField::Quarter,
+        ExtractField::Month,
+        ExtractField::Week,
+        ExtractField::Day,
+        ExtractField::DayOfMonth,
+        ExtractField::DayOfWeek,
+        ExtractField::Dow,
+        ExtractField::DayOfYear,
+        ExtractField::Doy,
+        ExtractField::YearOfWeek,
+        ExtractField::Yow,
+        ExtractField::Hour,
+        ExtractField::Minute,
+        ExtractField::Second,
+        ExtractField::TimezoneMinute,
+        ExtractField::TimezoneHour,
+    ];
+    let mut tree = build::integer(7);
+    for index in 0..DEPTH {
+        tree = build::extract(tree, fields[index % fields.len()]);
+    }
+    let copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH);
+    struct Seen {
+        fields: Vec<ExtractField>,
+        leaves: Vec<i64>,
+    }
+    impl Visit for Seen {
+        fn visit_extract_expr(&mut self, node: &ExtractExpr) {
+            self.fields.push(node.field);
+            walk_extract_expr(self, node);
+        }
+        fn visit_literal(&mut self, node: &Literal) {
+            if let LiteralKind::Long { parsed_value, .. } = &node.kind {
+                self.leaves.push(*parsed_value);
+            }
+        }
+    }
+    let mut original = Seen {
+        fields: Vec::new(),
+        leaves: Vec::new(),
+    };
+    original.visit_expr(&tree);
+    assert_eq!(
+        original.fields,
+        (0..DEPTH)
+            .rev()
+            .map(|index| fields[index % fields.len()])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(original.leaves, [7]);
+    struct ChangeLeaf;
+    impl Fold for ChangeLeaf {
+        fn fold_literal(&mut self, mut node: Literal) -> Literal {
+            if let LiteralKind::Long {
+                spelling,
+                parsed_value,
+            } = &mut node.kind
+            {
+                assert_eq!(*parsed_value, 7);
+                *parsed_value = 8;
+                *spelling = "8".into();
+            }
+            node
+        }
+    }
+    let changed = ChangeLeaf.fold_expr(copy);
+    let mut observed = Seen {
+        fields: Vec::new(),
+        leaves: Vec::new(),
+    };
+    observed.visit_expr(&changed);
+    assert_eq!(observed.fields, original.fields);
+    assert_eq!(observed.leaves, [8]);
+    assert!(!tree.syntax_eq(&changed));
+    let printed = crate::printer::print_expr(&tree);
+    assert_eq!(printed.matches("EXTRACT(").count(), DEPTH);
+    assert_eq!(printed.matches('7').count(), 1);
+    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
+        build::select(
+            vec![build::item(changed, None, false)],
+            Vec::new(),
+            None,
+            GroupBy::None,
+        )
+        .unwrap(),
+    ))));
+    crate::ast::validate_statement(&statement).unwrap();
+    drop(statement);
+    let Expr::Extract(node) = tree else {
+        unreachable!()
+    };
+    let payload = node.into_inner();
+    assert_eq!(payload.field, fields[(DEPTH - 1) % fields.len()]);
+    drop(payload.expression);
+}

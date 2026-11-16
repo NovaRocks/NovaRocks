@@ -946,6 +946,7 @@ impl Printer {
             Expr::Identifier(ident) => self.write_ident(ident),
             Expr::Literal(literal) => self.write_literal(literal),
             Expr::FunctionCall(call) => self.write_function_call(call),
+            Expr::Extract(node) => self.write_extract_expr(node),
             Expr::If(node) => self.write_if_expr(node),
             Expr::NullIf(node) => self.write_null_if_expr(node),
             Expr::Coalesce(node) => self.write_coalesce_expr(node),
@@ -1254,59 +1255,20 @@ impl Printer {
     }
 
     #[recursive::recursive]
+    fn write_extract_expr(&mut self, node: &ExtractExpr) {
+        self.output.push_str("EXTRACT(");
+        self.output.push_str(node.field.as_str());
+        self.output.push_str(" FROM ");
+        self.write_expr(&node.expression);
+        self.output.push(')');
+    }
+
+    #[recursive::recursive]
     fn write_function_call(&mut self, call: &FunctionCall) {
         if let Some(mode) = &call.processing_mode {
             self.write_processing_mode(mode);
         }
-        if call.name.parts.len() == 1
-            && call.name.parts[0].value.eq_ignore_ascii_case("EXTRACT")
-            && call.arguments.len() == 2
-            && matches!(call.quantifier, FunctionQuantifier::None)
-            && call.order_by.is_none()
-            && call.separator.is_none()
-            && call.filter.is_none()
-            && call.null_treatment.is_none()
-            && call.window.is_none()
-            && call.processing_mode.is_none()
-            && call
-                .arguments
-                .iter()
-                .all(|argument| argument.name.is_none())
-        {
-            self.output.push_str("EXTRACT(");
-            self.write_expr(&call.arguments[0].value);
-            self.output.push_str(" FROM ");
-            self.write_expr(&call.arguments[1].value);
-            self.output.push(')');
-            return;
-        }
-        if call.substring_from_syntax
-            && call.name.parts.len() == 1
-            && call.name.parts[0].value.eq_ignore_ascii_case("SUBSTRING")
-            && matches!(call.arguments.len(), 2 | 3)
-            && matches!(call.quantifier, FunctionQuantifier::None)
-            && call.order_by.is_none()
-            && call.separator.is_none()
-            && call.filter.is_none()
-            && call.null_treatment.is_none()
-            && call.window.is_none()
-            && call.processing_mode.is_none()
-            && call
-                .arguments
-                .iter()
-                .all(|argument| argument.name.is_none())
-        {
-            self.output.push_str("SUBSTRING(");
-            self.write_expr(&call.arguments[0].value);
-            self.output.push_str(" FROM ");
-            self.write_expr(&call.arguments[1].value);
-            if let Some(length) = call.arguments.get(2) {
-                self.output.push_str(" FOR ");
-                self.write_expr(&length.value);
-            }
-            self.output.push(')');
-            return;
-        }
+
         self.write_object_name(&call.name);
         self.output.push('(');
         match call.quantifier {
@@ -2614,7 +2576,6 @@ mod tests {
                 window_frame: None,
                 span: span(),
             }))),
-            substring_from_syntax: false,
             span: span(),
         }));
         assert_eq!(

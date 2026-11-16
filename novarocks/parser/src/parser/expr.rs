@@ -459,7 +459,7 @@ mod tests {
         ));
         assert!(matches!(
             parse("EXTRACT(YEAR FROM created_at)"),
-            Expr::FunctionCall(_)
+            Expr::Extract(_)
         ));
         assert!(matches!(parse("payload->>'$.name'"), Expr::Access(_)));
         let Expr::FunctionCall(call) = parse("array_map((x, y) -> x + y, input)") else {
