@@ -751,3 +751,41 @@ fn sort_carrier_merge_keeps_map_union_and_dictionary_parameters() {
     );
     assert!(merge(&occurrence(7, false), &occurrence(8, true)).is_err());
 }
+
+#[test]
+fn shared_sort_window_encoding_preserves_float_bits_and_null_peers() {
+    use crate::exec::operators::{aggregate_fixture, family_fixture};
+    use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
+    let chunks = family_fixture::run(&list_program(false, false, false, false, false));
+    let output = chunks[0].chunk_schema_ref();
+    let factory = aggregate_fixture::runtime_construction_factory(
+        MemTracker::new_root("shared normalized key encoder"),
+        Arc::new(RuntimeErrorState::default()),
+    );
+    let creation = SortCreation::new(factory.as_ref(), &output);
+    let nan = f64::from_bits(0x7ff8_0000_0000_0001);
+    let other_nan = f64::from_bits(0x7ff8_0000_0000_0002);
+    let keys: Vec<arrow::array::ArrayRef> = vec![Arc::new(arrow::array::Float64Array::from(vec![
+        Some(-0.0),
+        Some(0.0),
+        Some(nan),
+        Some(nan),
+        Some(other_nan),
+        None,
+        None,
+    ]))];
+    let mut converter = None;
+    let encoded = creation
+        .encode_keys(
+            &mut converter,
+            &keys,
+            ValueTypeStorageLifetime::pure(),
+            encoding_failure,
+        )
+        .unwrap();
+    assert_ne!(encoded.row(0), encoded.row(1));
+    assert_eq!(encoded.row(2), encoded.row(3));
+    assert_ne!(encoded.row(2), encoded.row(4));
+    assert_eq!(encoded.row(5), encoded.row(6));
+    assert_ne!(encoded.row(4), encoded.row(5));
+}
