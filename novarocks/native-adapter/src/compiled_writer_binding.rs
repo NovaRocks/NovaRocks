@@ -132,6 +132,7 @@ enum WriterBindingContractFailure {
     MissingRecipe,
     SummaryBinding(&'static str),
     PositionShardBinding(&'static str),
+    LayoutBinding(&'static str),
     DisplayRange {
         index: usize,
         source: std::num::TryFromIntError,
@@ -146,6 +147,9 @@ impl fmt::Display for WriterBindingContractFailure {
             Self::SummaryBinding(detail) => write!(f, "compiled summary binding refused: {detail}"),
             Self::PositionShardBinding(detail) => {
                 write!(f, "compiled position shard binding refused: {detail}")
+            }
+            Self::LayoutBinding(detail) => {
+                write!(f, "compiled write layout binding refused: {detail}")
             }
             Self::DisplayRange { index, .. } => {
                 write!(f, "local node index {index} exceeds the display identity")
@@ -173,6 +177,7 @@ impl novarocks_execution_contract::failure::FailureProjection for WriterBindingC
             Self::SummaryBinding(_) | Self::PositionShardBinding(_) => {
                 (FailureClass::Invariant, 9724)
             }
+            Self::LayoutBinding(_) => (FailureClass::Invariant, 9725),
             Self::DisplayRange { .. } => (FailureClass::Invariant, 9721),
             Self::WrongBinding => (FailureClass::Invariant, 9722),
             Self::Observation(_) => (FailureClass::Unexpected, 9723),
@@ -211,6 +216,47 @@ pub(crate) fn bind_compiled_writers(
     for (index, node) in program.graph().nodes().iter().enumerate() {
         let id = ProgramNodeId::new(index);
         match node.kind() {
+            ProgramNodeKind::WriteLayoutKey {
+                input,
+                key_inputs,
+                recipe,
+                ..
+            } => {
+                let input = program.graph().nodes()[input.index()].output_layout();
+                let invalid = |detail| {
+                    CompiledWriterBindingError::at_domain(
+                        id,
+                        WriterBindingContractFailure::LayoutBinding(detail),
+                    )
+                };
+                let ordinals = key_inputs
+                    .iter()
+                    .map(|slot| {
+                        input
+                            .slots()
+                            .iter()
+                            .position(|candidate| candidate == slot)
+                            .ok_or_else(|| invalid("partition input slot is absent"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let schema = input
+                    .schema()
+                    .project(&ordinals)
+                    .map_err(|_| invalid("partition input schema cannot be projected"))?;
+                let binding = task
+                    .runtime
+                    .catalog_write_execution(recipe.draft().binding().catalog_handle())
+                    .map_err(|source| CompiledWriterBindingError::at_domain(id, source))?;
+                let execution = binding
+                    .write_layout()
+                    .ok_or_else(|| invalid("catalog has no write layout capability"))?;
+                let evaluator = execution
+                    .open(recipe, &schema)
+                    .map_err(|source| CompiledWriterBindingError::at_domain(id, source))?;
+                bindings
+                    .bind_write_layout(id, evaluator)
+                    .map_err(|source| CompiledWriterBindingError::at_failure(id, source))?;
+            }
             ProgramNodeKind::TableWriter { input, .. } => {
                 let recipe = program.write_recipes().get(&id).ok_or_else(|| {
                     CompiledWriterBindingError::at_domain(

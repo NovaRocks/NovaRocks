@@ -80,6 +80,8 @@ mod table_finish_failure;
 pub(crate) mod table_writer;
 mod unpivot_processor;
 mod values_source;
+pub(crate) mod write_layout_key;
+mod write_spread;
 
 pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
 pub(crate) use data_stream_sink::CompiledPartitionKeys;

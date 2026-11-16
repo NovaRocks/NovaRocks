@@ -144,10 +144,30 @@ fn lower_core_with_creation<H>(
         | Distribution::RoundRobin
         | Distribution::Broadcast => &[],
     };
+    let routing = match cut.partitioning.routing_only.as_ref() {
+        [] => None,
+        [(_, destination)] => {
+            let next = slots
+                .iter()
+                .map(|slot| slot.0)
+                .max()
+                .unwrap_or_default()
+                .checked_add(1)
+                .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+            Some((*destination, SlotId::new(next)))
+        }
+        _ => {
+            return Err(
+                FragmentCompileError::Invalid("exchange has multiple routing-only values").into(),
+            );
+        }
+    };
     let mut hash_partition_slots = Vec::new();
     reserve_vec(&mut hash_partition_slots, keys.len(), work)?;
     for key in keys {
-        let mut found = None;
+        let mut found = routing
+            .filter(|(destination, _)| destination == key)
+            .map(|(_, slot)| slot);
         for (ordinal, value) in node.output.columns.iter().enumerate() {
             work.step()?;
             if value == key && found.is_none() {
@@ -163,8 +183,21 @@ fn lower_core_with_creation<H>(
         .filter(|result| result.output.columns == node.output.columns);
     let mut typed_layout =
         crate::typed_layout::TypedLayoutBuilder::new_with_creation(slots.len(), work, creation)?;
-    let mut wire_layout =
-        crate::typed_layout::TypedLayoutBuilder::new_with_creation(slots.len(), work, creation)?;
+    let transport_width = slots.len() + usize::from(routing.is_some());
+    let mut wire_layout = crate::typed_layout::TypedLayoutBuilder::new_with_creation(
+        transport_width,
+        work,
+        creation,
+    )?;
+    let mut routed_layout = if routing.is_some() {
+        Some(crate::typed_layout::TypedLayoutBuilder::new_with_creation(
+            transport_width,
+            work,
+            creation,
+        )?)
+    } else {
+        None
+    };
     for (ordinal, value) in node.output.columns.iter().enumerate() {
         let ty = &package
             .fragment()
@@ -262,6 +295,10 @@ fn lower_core_with_creation<H>(
             )?,
         };
         work.flush()?;
+        if let Some(routed_layout) = routed_layout.as_mut() {
+            let label = crate::typed_layout::copy_name_with_creation(&name, work, creation)?;
+            routed_layout.push_with_creation(ty, label, work, creation)?;
+        }
         typed_layout.push_with_creation(ty, name, work, creation)?;
         // The cut's source owns the wire declaration. Its ordinal maps to
         // this receiver's slot, independently of source-fragment slot IDs
@@ -276,7 +313,27 @@ fn lower_core_with_creation<H>(
     }
     work.flush()?;
     let layout = typed_layout.finish_with_creation(slots, work, creation)?;
-    let wire_layout = wire_layout.finish_with_creation(slots, work, creation)?;
+    let (wire_layout, routing_layout) = if let Some((destination, slot)) = routing {
+        let ty = &package.fragment().values()[&destination].ty;
+        let mut transport_slots = Vec::new();
+        reserve_vec(&mut transport_slots, transport_width, work)?;
+        transport_slots.extend_from_slice(slots);
+        transport_slots.push(slot);
+        wire_layout.push_with_creation(ty, String::new(), work, creation)?;
+        let mut routed_layout = routed_layout.expect("routing layout builder created");
+        let label =
+            crate::typed_layout::copy_name_with_creation("write_layout_key", work, creation)?;
+        routed_layout.push_with_creation(ty, label, work, creation)?;
+        (
+            wire_layout.finish_with_creation(&transport_slots, work, creation)?,
+            Some(routed_layout.finish_with_creation(&transport_slots, work, creation)?),
+        )
+    } else {
+        (
+            wire_layout.finish_with_creation(slots, work, creation)?,
+            None,
+        )
+    };
     work.flush()?;
     Ok(LoweredExchangeSource {
         kind: ProgramNodeKind::ExchangeSource {
@@ -286,6 +343,7 @@ fn lower_core_with_creation<H>(
         layout,
         input: CompiledExchangeInput {
             wire_layout,
+            routing_layout,
             role: crate::stream_sink::cut_role(&cut.payload),
             delivery: crate::stream_sink::cut_delivery(cut.delivery),
             routing: match &cut.partitioning.destination {

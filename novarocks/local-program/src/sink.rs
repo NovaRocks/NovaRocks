@@ -331,6 +331,7 @@ impl StaticStreamBranch {
 pub enum ProgramWriteLayoutPreference {
     None,
     ClusterBy(Arc<[SlotId]>),
+    PartitionAffinity(Arc<[SlotId]>),
 }
 
 #[derive(Clone, Debug)]
@@ -537,7 +538,9 @@ fn validate_router_core<E: From<StaticSinkError>>(
         if !valid {
             return Err(StaticSinkError::InvalidRouter.into());
         }
-        if let ProgramWriteLayoutPreference::ClusterBy(keys) = &route.layout {
+        if let ProgramWriteLayoutPreference::ClusterBy(keys)
+        | ProgramWriteLayoutPreference::PartitionAffinity(keys) = &route.layout
+        {
             if keys.is_empty() {
                 return Err(StaticSinkError::InvalidRouter.into());
             }

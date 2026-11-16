@@ -140,8 +140,12 @@ pub(crate) fn materialize_compiled_exchange_receivers(
         registrations.push({
             let creation = creation.ok_or(ConstructionFailure::MissingOwner)?;
             let wire_chunk_schema = creation.create_compiled_chunk_schema(&input.wire_layout)?;
-            let expected_chunk_schema =
-                creation.create_compiled_chunk_schema(node.output_layout())?;
+            let expected_chunk_schema = creation.create_compiled_chunk_schema(
+                input
+                    .routing_layout
+                    .as_ref()
+                    .unwrap_or(node.output_layout()),
+            )?;
             ExchangeReceiverRegistration {
                 key,
                 expected_senders,

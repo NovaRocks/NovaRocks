@@ -99,13 +99,13 @@ pub use program::{
     MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH, MAX_PROGRAM_NODES,
     NestedLoopJoinType, ProgramAssertionApplicability, ProgramCompileError, ProgramJoinCondition,
     ProgramJoinKey, ProgramNode, ProgramNodeKind, ProgramPositionShardInput, ProgramScanSource,
-    ProjectExpressionSlot, ProjectExpressionSlots, RowAssertion, SetOpKind, SortExpression,
-    SortTopNType, StaticAggregateCall, StaticAggregateOrder, StaticAggregateTypeSignature,
-    StaticWindowFunction, StaticWriterProjection, StreamingPreaggregationMode,
-    TableFunctionOutputSlot, UnpivotConstant, UnpivotMapping, UnpivotPassthrough, WindowBoundary,
-    WindowFrame, WindowFunctionKind, WindowType, WriterFinalAggregateCall,
-    WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
-    WriterPartialAggregateCall,
+    ProgramWriteLayoutEffects, ProjectExpressionSlot, ProjectExpressionSlots, RowAssertion,
+    SetOpKind, SortExpression, SortTopNType, StaticAggregateCall, StaticAggregateOrder,
+    StaticAggregateTypeSignature, StaticWindowFunction, StaticWriterProjection,
+    StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant, UnpivotMapping,
+    UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind, WindowType,
+    WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
+    WriterGroupedUnpivotPlan, WriterPartialAggregateCall,
 };
 pub use provenance::*;
 pub use provider_links::ProviderLinkError;

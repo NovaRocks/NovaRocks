@@ -663,6 +663,19 @@ fn resolve_core_with_creation<H>(
                 work.flush()?;
                 (slots, port)
             }
+            NodeKind::WriteLayoutKey { output_key, .. } => {
+                let child = single_child(&node.inputs)?;
+                let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
+                    "missing lowered write layout input",
+                ))?;
+                let mut slots = Vec::new();
+                reserve_vec(&mut slots, node.output.columns.len(), work)?;
+                slots.extend(child_channels.slots.iter().copied());
+                let mut port = ports[&child].clone();
+                port.insert(*output_key, slots.len());
+                slots.extend(fresh_slots(1, &mut next_slot, work)?.iter().copied());
+                (Arc::from(slots), port)
+            }
             NodeKind::PositionShard(_) => fresh_relation(fragment, node, &mut next_slot, work)?,
             NodeKind::ChangeEventExpand { .. } => {
                 single_child(&node.inputs)?;

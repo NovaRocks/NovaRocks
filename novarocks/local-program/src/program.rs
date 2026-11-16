@@ -509,6 +509,12 @@ pub enum TableFunctionOutputSlot {
 /// Every execution node has a closed static representation. Task-owned inputs,
 /// exchange receivers, writer handles, and filter sessions are requirements.
 #[derive(Clone, Debug)]
+pub struct ProgramWriteLayoutEffects {
+    pub slot: SlotId,
+    pub accepted: Arc<[novarocks_connector_contract::ConnectorRowMutationEffect]>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ProgramPositionShardInput {
     pub input: ProgramNodeId,
     pub file: SlotId,
@@ -569,6 +575,14 @@ pub enum ProgramNodeKind {
         events: Vec<ChangeEventSpec>,
         output_slot_ids: Vec<SlotId>,
         effect_slot_id: SlotId,
+    },
+    WriteLayoutKey {
+        input: ProgramNodeId,
+        key_inputs: Box<[SlotId]>,
+        output_key: SlotId,
+        recipe: novarocks_connector_contract::ConnectorWriteLayoutRecipe,
+        branch: usize,
+        effects: Option<ProgramWriteLayoutEffects>,
     },
     PositionShard {
         group: ConnectorMutationContributionGroupId,
@@ -714,6 +728,7 @@ impl ProgramNodeKind {
             | Self::Filter { input, .. }
             | Self::Repeat { input, .. }
             | Self::ChangeEventExpand { input, .. }
+            | Self::WriteLayoutKey { input, .. }
             | Self::Limit { input, .. }
             | Self::Sort { input, .. }
             | Self::TableFunction { input, .. }
@@ -918,7 +933,7 @@ impl ProgramNodeKind {
                     }
                 }
             }
-            Self::PositionShard { .. } => {}
+            Self::PositionShard { .. } | Self::WriteLayoutKey { .. } => {}
             Self::Sort {
                 order_by,
                 partition_exprs,

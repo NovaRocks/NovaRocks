@@ -1233,6 +1233,63 @@ fn build_node(
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
+        ProgramNodeKind::WriteLayoutKey {
+            input,
+            key_inputs,
+            output_key,
+            branch,
+            effects,
+            ..
+        } => {
+            let invalid =
+                |detail| program_failure(FragmentBindingErrorKind::InvalidAssignment, detail);
+            let (evaluator, destinations) = ctx
+                .compiled_writers
+                .layout(id, *branch)
+                .ok_or_else(|| invalid("missing write layout binding or sink destinations"))?;
+            let mut build = build_node(program, *input, ctx, error, ordered)?;
+            let writers = destinations
+                .checked_mul(build.pipeline.dop as usize)
+                .and_then(|count| u32::try_from(count).ok())
+                .and_then(std::num::NonZeroU32::new)
+                .ok_or_else(|| invalid("write layout destination writer count is invalid"))?;
+            let input_layout = program.graph().nodes()[input.index()].output_layout();
+            let output_layout = program.graph().nodes()[id.index()].output_layout();
+            if output_layout.slots().last() != Some(output_key)
+                || output_layout.slots().len() != input_layout.slots().len() + 1
+                || !output_layout.slots().starts_with(input_layout.slots())
+            {
+                return Err(invalid("write layout does not append one key"));
+            }
+            let ordinal = |slot| {
+                input_layout
+                    .slots()
+                    .iter()
+                    .position(|candidate| *candidate == slot)
+                    .ok_or_else(|| invalid("write layout input slot is absent"))
+            };
+            let inputs = key_inputs
+                .iter()
+                .copied()
+                .map(ordinal)
+                .collect::<ExecutionResult<Vec<_>>>()?;
+            let effects = effects
+                .as_ref()
+                .map(|effects| {
+                    ordinal(effects.slot).map(|index| (index, Arc::clone(&effects.accepted)))
+                })
+                .transpose()?;
+            build.pipeline.factories.push(Box::new(
+                crate::exec::operators::write_layout_key::WriteLayoutProjectionFactory::attach(
+                    output_layout.clone(),
+                    evaluator,
+                    inputs,
+                    effects,
+                    writers,
+                ),
+            ));
+            Ok(build)
+        }
         ProgramNodeKind::PositionShard {
             inputs,
             output_slots,

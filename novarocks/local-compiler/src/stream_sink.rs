@@ -376,13 +376,20 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             )?);
         }
         let (columns, layout) = {
-            let columns = match &selection {
+            let mut columns = match &selection {
                 OutputSelection::Router { aliases, .. } => aliases
                     .get(&cut.edge)
                     .ok_or(FragmentCompileError::Invalid("missing exact route aliases"))?
                     .to_vec(),
                 OutputSelection::Stream(_) => projected_slots(cut, root_values, root_layout, work)?,
             };
+            for (source, _) in &cut.partitioning.routing_only {
+                let ordinal = first_ordinal(root_values, *source, work)?.ok_or(
+                    FragmentCompileError::Invalid("routing-only value is outside root"),
+                )?;
+                columns.push(root_layout.slots()[ordinal]);
+                work.step()?;
+            }
             let storage = creation.storage_lifetime();
             let layout = root_layout.project_by_slots_typed_with_creator(
                 &columns,
@@ -423,7 +430,8 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                 novarocks_physical_plan::WriteLayoutPreference::None => {
                     ProgramWriteLayoutPreference::None
                 }
-                novarocks_physical_plan::WriteLayoutPreference::ClusterBy(values) => {
+                novarocks_physical_plan::WriteLayoutPreference::ClusterBy(values)
+                | novarocks_physical_plan::WriteLayoutPreference::PartitionAffinity(values) => {
                     let mut slots = Vec::new();
                     reserve_vec(&mut slots, values.len(), work)?;
                     for value in values.iter() {
@@ -441,7 +449,14 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                         slots.push(branch.output_columns()[ordinal]);
                         work.step()?;
                     }
-                    ProgramWriteLayoutPreference::ClusterBy(Arc::from(slots))
+                    if matches!(
+                        &route.requirements.layout,
+                        novarocks_physical_plan::WriteLayoutPreference::PartitionAffinity(_)
+                    ) {
+                        ProgramWriteLayoutPreference::PartitionAffinity(Arc::from(slots))
+                    } else {
+                        ProgramWriteLayoutPreference::ClusterBy(Arc::from(slots))
+                    }
                 }
             };
             router_routes.push(StaticRouterRoute {
@@ -672,13 +687,17 @@ fn projected_slots(
     layout: &StaticLayout,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<SlotId>, FragmentCompileError> {
-    let mut positional = cut.projection.len() == values.len();
+    let mut positional = cut.projection.len() + cut.partitioning.routing_only.len() == values.len();
     for (projected, value) in cut.projection.iter().zip(values) {
         positional &= projected.value == *value;
         work.step()?;
     }
     let mut slots = Vec::new();
-    reserve_vec(&mut slots, cut.projection.len(), work)?;
+    reserve_vec(
+        &mut slots,
+        cut.projection.len() + cut.partitioning.routing_only.len(),
+        work,
+    )?;
     let mut seen = BTreeSet::new();
     for (index, projected) in cut.projection.iter().enumerate() {
         let ordinal = if positional {
