@@ -403,6 +403,7 @@ enum CastBody {
     ArrayNull,
     ArrayLeaf(trino_array_leaf::Leaf),
     ArrayText,
+    ArrayDateText,
     ArrayJson(array_json::Operation),
     ExtendedScalar(f3_scalar::Body),
     SelectedArray(f3_array::Body),
@@ -1185,7 +1186,7 @@ impl PreparedCastRecipe {
             }
             CastBody::ArrayNull => false,
             CastBody::ArrayLeaf(leaf) => leaf.may_fail(),
-            CastBody::ArrayText | CastBody::ArrayJson(_) => true,
+            CastBody::ArrayText | CastBody::ArrayDateText | CastBody::ArrayJson(_) => true,
             CastBody::SelectedArray(f3_array::Body::ArrowScalar) => true,
             CastBody::SelectedArray(f3_array::Body::Structure) => false,
             CastBody::ExtendedScalar(body) => body.may_raise(
@@ -1922,6 +1923,26 @@ impl PreparedCastRecipe {
                     }
                     _ => return Err(internal("temporal cast has a foreign frozen result")),
                 });
+            }
+            if self.body == CastBody::ArrayDateText {
+                let row =
+                    self.checked_row(Source::Utf8, argument, ordinal, logical_row, &mut work)?;
+                if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
+                    return if self.source.nullable() {
+                        Ok(CastRowResult::Null)
+                    } else {
+                        Err(invalid(
+                            "non-null DATE text argument contains a selected NULL",
+                        ))
+                    };
+                }
+                let text = argument
+                    .array()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| internal("DATE text cast has a foreign String carrier"))?
+                    .value(row);
+                return calendar::evaluate_trino_array_date(text, ordinal, &mut work);
             }
             if let CastBody::Text { source } = self.body {
                 let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;

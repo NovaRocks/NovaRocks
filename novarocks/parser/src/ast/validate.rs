@@ -513,7 +513,7 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             }
         }
         Expr::Array(array) => {
-            for expression in &array.elements {
+            for expression in &array.values {
                 validate_expr(expression)?;
             }
         }

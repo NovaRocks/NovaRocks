@@ -590,12 +590,9 @@ impl SyntaxEq for TupleExpr {
 }
 
 impl SyntaxEq for ArrayExpr {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
-        match (&self.element_type, &other.element_type) {
-            (Some(left), Some(right)) if !left.syntax_eq(right) => false,
-            (None, None) | (Some(_), Some(_)) => syntax_eq_slice(&self.elements, &other.elements),
-            _ => false,
-        }
+        syntax_eq_slice(&self.values, &other.values)
     }
 }
 

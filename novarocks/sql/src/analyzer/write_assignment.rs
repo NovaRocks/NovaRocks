@@ -167,13 +167,12 @@ fn register_literal_assignments<'a>(
         };
         match expression {
             ast::Expr::Array(array)
-                if array.element_type.is_none()
-                    && matches!(
-                        assignment.input().data_type(),
-                        DataType::List(_) | DataType::LargeList(_)
-                    ) =>
+                if matches!(
+                    assignment.input().data_type(),
+                    DataType::List(_) | DataType::LargeList(_)
+                ) =>
             {
-                for value in &array.elements {
+                for value in &array.values {
                     visit(value, 0)?;
                 }
             }
@@ -408,7 +407,7 @@ fn context_hole(
     match expression {
         ast::Expr::Nested(nested) => context_hole(&nested.expression, source, control),
         ast::Expr::Literal(literal) => Ok(matches!(literal.kind, ast::LiteralKind::Null)),
-        ast::Expr::Array(array) => Ok(array.element_type.is_none() && array.elements.is_empty()),
+        ast::Expr::Array(array) => Ok(array.values.is_empty()),
         ast::Expr::Map(map) => Ok(map.entries.is_empty()),
         ast::Expr::SearchedCase(_) | ast::Expr::SimpleCase(_) => {
             for value in case_results(expression) {
@@ -476,20 +475,20 @@ fn context_literal<'a>(
             }
             None
         }
-        ast::Expr::Array(array) if array.element_type.is_none() => {
+        ast::Expr::Array(array) => {
             if !matches!(
                 expected.data_type(),
                 arrow::datatypes::DataType::List(_) | arrow::datatypes::DataType::LargeList(_)
             ) {
                 return Ok(());
             }
-            if array.elements.is_empty() {
+            if array.values.is_empty() {
                 Some(empty_literal(expected, policy, control)?)
             } else {
                 let child: FunctionValueType = expected
                     .child_at(0)
                     .ok_or_else(|| AnalyzeError::internal("array literal context lost its item"))?;
-                for element in &array.elements {
+                for element in &array.values {
                     context_literal(element, &child, source, policy, control)?;
                 }
                 None

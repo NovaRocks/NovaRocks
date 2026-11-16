@@ -888,7 +888,7 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
         ast::Expr::Array(array) => format!(
             "[{}]",
             array
-                .elements
+                .values
                 .iter()
                 .map(expr_display_name)
                 .collect::<Vec<_>>()

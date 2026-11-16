@@ -103,6 +103,8 @@ impl StaticPlanInterpreter {
 /// cannot prepare these new shapes; absence keeps the original interpretation.
 /// Revision 29 adds ARRAY common-type coercion profiles and binds their real
 /// ordered conversion overload. The original scalar policy remains separate.
+/// Revision 30 adds explicit signed-to-text and Trino text-to-date array
+/// profiles; full Date32 presentation shares the original calendar author.
 ///
 /// RWM-7 retires COW vocabulary and freezes explicit writer W/T declarations,
 /// projected writer values and selected-assignment construction in the package

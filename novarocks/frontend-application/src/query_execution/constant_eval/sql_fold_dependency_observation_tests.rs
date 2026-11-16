@@ -745,9 +745,7 @@ fn assert_real_null_list_cast(
 ) {
     use arrow::datatypes::{DataType, Field};
     use novarocks_failure_contract::FailureProjection;
-    use novarocks_type_contract::{
-        ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
-    };
+    use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
     let expected = columns
         .iter()
         .map(|(name, domain, len)| {

@@ -2174,10 +2174,6 @@ fn dynamic_scalar_data_type_with_construction<E>(
     creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,
 ) -> Result<Option<DataType>, super::scalar_construction::Failure<E>> {
     Ok(Some(match name {
-        "__array_literal" => list_type_with_construction(
-            widen_dynamic_carriers(argument_types.iter().cloned(), creation)?,
-            creation,
-        )?,
         "__array_struct_subfield" => DataType::Null,
         "__iceberg_transform_void" => DataType::Null,
         "__struct_subfield" => DataType::Null,
@@ -2493,19 +2489,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             borrow_creator(&mut creation),
         );
     }
-    if function_id.as_str() == "builtin.scalar/__array_literal/v1"
-        && request.arguments.is_empty()
-        && let Some(expected) = request.expected_result_type
-    {
-        if expected.logical_type() != ValueLogicalType::Physical
-            || expected.nullable()
-            || !matches!(expected.data_type(), DataType::List(_))
-        {
-            return Err(FunctionBindingError::NoMatchingOverload.into());
-        }
-        binding_control::value_type(expected, work)?;
-        return Ok(expected.clone());
-    }
     if function_id.as_str() == "builtin.scalar/__array_literal/v1" {
         let arguments = dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
         return with_binding_creation(borrow_creator(&mut creation), work, |cx| {
@@ -2685,7 +2668,7 @@ fn bind_dynamic_scalar_result_with_creation<H>(
         }
     }
     let nullable = match name {
-        "__array_literal" | "map" | "named_struct" | "row" | "struct" => false,
+        "map" | "named_struct" | "row" | "struct" => false,
         "__struct_subfield" | "__array_struct_subfield" => true,
         _ => scalar_result_nullable(name, request, work)?,
     };
@@ -3236,28 +3219,6 @@ impl BuiltinDynamicScalarResolver {
                     FunctionBindingError::UnknownOverload(selected.overload.clone()).into(),
                 );
             }
-            let request = if self.function_id.as_str() == "builtin.scalar/__array_literal/v1"
-                && request.arguments.is_empty()
-            {
-                let FunctionResultType::Scalar(result) = &selected.result_type else {
-                    return Err(FunctionBindingError::NoMatchingOverload.into());
-                };
-                if let Some(expected) = request.expected_result_type
-                    && !binding_control::exact_type(expected, result, work)?
-                {
-                    return Err(FunctionBindingError::InvalidBinding(
-                        "selected empty array differs from its explicit result constraint".into(),
-                    )
-                    .into());
-                }
-                // This is the existing explicit empty-array declaration rule.
-                FunctionBindingRequest {
-                    expected_result_type: Some(result),
-                    ..request
-                }
-            } else {
-                request
-            };
             work.flush()?;
             let expected =
                 self.resolve_with_creation(request, borrow_creator(&mut creation), work.control())?;

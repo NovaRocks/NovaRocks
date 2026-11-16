@@ -733,6 +733,13 @@ pub fn walk_window_frame_bound<V: Visit + ?Sized>(visitor: &mut V, bound: &Windo
     }
 }
 
+#[recursive::recursive]
+fn walk_array_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &ArrayExpr) {
+    for value in &expression.values {
+        visitor.visit_expr(value);
+    }
+}
+
 pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
     match expression {
         Expr::JsonConstructor(node) => visitor.visit_json_constructor(node),
@@ -779,14 +786,7 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
                 visitor.visit_expr(expr);
             }
         }
-        Expr::Array(expression) => {
-            if let Some(element_type) = &expression.element_type {
-                visitor.visit_type_name(element_type);
-            }
-            for expr in &expression.elements {
-                visitor.visit_expr(expr);
-            }
-        }
+        Expr::Array(expression) => walk_array_expr(visitor, expression),
         Expr::Map(expression) => {
             for entry in &expression.entries {
                 visitor.visit_expr(&entry.key);
@@ -1808,6 +1808,16 @@ pub fn fold_window_frame_bound<F: Fold + ?Sized>(
     }
 }
 
+#[recursive::recursive]
+fn fold_array_expr<F: Fold + ?Sized>(folder: &mut F, mut expression: ArrayExpr) -> ArrayExpr {
+    expression.values = expression
+        .values
+        .into_iter()
+        .map(|value| folder.fold_expr(value))
+        .collect();
+    expression
+}
+
 pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
     match expression {
         Expr::JsonConstructor(node) => {
@@ -1876,17 +1886,7 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
                 .collect();
             Expr::Tuple(expression)
         }
-        Expr::Array(mut expression) => {
-            expression.element_type = expression
-                .element_type
-                .map(|element_type| folder.fold_type_name(element_type));
-            expression.elements = expression
-                .elements
-                .into_iter()
-                .map(|expr| folder.fold_expr(expr))
-                .collect();
-            Expr::Array(expression)
-        }
+        Expr::Array(expression) => Expr::Array(fold_array_expr(folder, expression)),
         Expr::Map(mut expression) => {
             expression.entries = expression
                 .entries

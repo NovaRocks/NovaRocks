@@ -94,14 +94,14 @@ async fn finish_residual(
         .unwrap();
 }
 
-async fn wait_for_adapter_replay(round: &TaskRound) {
+pub(super) async fn wait_for_adapter_abort(round: &TaskRound) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while round.queued_abort_effects() != 1 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the original actor authorizes a bounded replay");
+    .expect("the original actor queues its pending Abort");
 }
 
 async fn wait_for_owner_failure(
@@ -226,7 +226,7 @@ async fn owner_failed_late_abort_cancels_the_actual_dispatcher_queued_replay() {
     round
         .turn()
         .expect("the original transport exits with an unknown outcome");
-    wait_for_adapter_replay(&round).await;
+    wait_for_adapter_abort(&round).await;
     for intent in sink
         .take()
         .into_iter()

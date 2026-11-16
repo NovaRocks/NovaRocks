@@ -219,30 +219,59 @@ fn explicit_largeint_and_typed_null_are_authored_by_syntax_not_carrier() {
 }
 
 #[test]
-fn empty_array_declares_expected_result_only_to_its_exact_owner() {
-    let resolved = analyze("SELECT ARRAY<JSON>[]");
-    let QueryBody::Select(select) = resolved.body else {
-        panic!("expected select");
-    };
-    let expression = &select.projection[0].expr;
-    assert!(!expression.value_type.nullable());
-    let ExprKind::FunctionCall { args, binding, .. } = &expression.kind else {
-        panic!("expected direct bound literal owner");
-    };
-    assert!(args.is_empty());
-    let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
-    else {
-        panic!("expected scalar");
-    };
-    assert_eq!(&expression.value_type, result);
-    let DataType::List(item) = &result.data_type() else {
-        panic!("expected list");
-    };
-    let expected =
-        crate::test_value_types::string_list(item.is_nullable(), true, result.nullable());
-    assert_eq!(result, &expected);
-    assert!(item.metadata().as_arc().is_none());
-    assert_eq!(item.data_type(), &DataType::Utf8);
+fn typed_empty_array_uses_the_original_unknown_constructor_and_complete_json_cast() {
+    for sql in ["SELECT ARRAY<JSON>[]", "SELECT CAST([] AS ARRAY<JSON>)"] {
+        let resolved = analyze(sql);
+        let QueryBody::Select(select) = resolved.body else {
+            panic!("expected select");
+        };
+        let expression = &select.projection[0].expr;
+        let ExprKind::Cast {
+            expr,
+            target,
+            array_failure_mode,
+            ..
+        } = &expression.kind
+        else {
+            panic!("expected ordinary outer CAST");
+        };
+        assert_eq!(
+            *array_failure_mode,
+            Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+        );
+        let expected = crate::test_value_types::string_list(true, true, true);
+        assert_eq!(expression.value_type, expected);
+        assert_eq!(target, expected.data_type());
+        assert_eq!(
+            expression.value_type.try_to_field("result").unwrap(),
+            expected.try_to_field("result").unwrap()
+        );
+        let ExprKind::FunctionCall { args, binding, .. } = &expr.kind else {
+            panic!("original independent ARRAY constructor");
+        };
+        assert!(args.is_empty());
+        assert!(binding.result_constraint().is_none());
+        assert!(!expr.value_type.nullable());
+        assert_eq!(
+            expr.value_type.child_at(0).unwrap().data_type(),
+            &DataType::Null
+        );
+        assert_eq!(
+            expr.value_type.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Physical
+        );
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("array scalar result");
+        };
+        assert_eq!(result, &expr.value_type);
+        let DataType::List(item) = expression.value_type.data_type() else {
+            panic!("JSON list");
+        };
+        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert!(item.is_nullable());
+        assert!(item.metadata().as_arc().is_none());
+    }
 }
 
 struct StopAt {
@@ -754,11 +783,48 @@ fn mixed_case_and_typed_array_convert_actual_json_sources() {
         panic!("expected CASE");
     };
     assert_selected_conversion(&when_then[0].1, "json_text_same_structure/v1");
-    let expression = projection("SELECT ARRAY<VARCHAR>[j] FROM source");
-    let ExprKind::FunctionCall { args, .. } = expression.kind else {
-        panic!("expected array literal owner");
-    };
-    assert_selected_conversion(&args[0], "json_text_same_structure/v1");
+    for sql in [
+        "SELECT ARRAY<VARCHAR>[j] FROM source",
+        "SELECT CAST([j] AS ARRAY<VARCHAR>) FROM source",
+    ] {
+        let expression = projection(sql);
+        assert_eq!(
+            expression.value_type.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Physical
+        );
+        let ExprKind::Cast {
+            expr,
+            array_failure_mode,
+            ..
+        } = &expression.kind
+        else {
+            panic!("ordinary outer array CAST");
+        };
+        assert_eq!(
+            *array_failure_mode,
+            Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+        );
+        let ExprKind::FunctionCall { args, binding, .. } = &expr.kind else {
+            panic!("original independent ARRAY source");
+        };
+        assert_eq!(
+            binding.function_id.as_str(),
+            "builtin.scalar/__array_literal/v1"
+        );
+        assert_eq!(
+            expr.value_type.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Json
+        );
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0].kind, ExprKind::ColumnRef { .. }));
+        assert_eq!(args[0].value_type.logical_type(), ValueLogicalType::Json);
+        assert_eq!(args[0].value_type.data_type(), &DataType::Utf8);
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("ARRAY scalar")
+        };
+        assert_eq!(result, &expr.value_type);
+    }
 }
 
 #[test]

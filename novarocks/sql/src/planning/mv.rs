@@ -3400,7 +3400,7 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
             .expressions
             .iter()
             .any(expr_contains_aggregate_function),
-        Expr::Array(array) => array.elements.iter().any(expr_contains_aggregate_function),
+        Expr::Array(array) => array.values.iter().any(expr_contains_aggregate_function),
         Expr::Struct(record) => record
             .fields
             .iter()
@@ -3538,7 +3538,7 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
             reject_unsupported_case(&case.when_clauses, case.default_value.as_ref())?;
         }
         Expr::Tuple(tuple) => reject_unsupported_exprs(&tuple.expressions)?,
-        Expr::Array(array) => reject_unsupported_exprs(&array.elements)?,
+        Expr::Array(array) => reject_unsupported_exprs(&array.values)?,
         Expr::Struct(record) => {
             for field in &record.fields {
                 reject_unsupported_expr(&field.value)?;

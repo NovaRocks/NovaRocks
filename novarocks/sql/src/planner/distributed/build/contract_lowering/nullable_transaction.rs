@@ -80,12 +80,6 @@ impl ContractLoweringVisitor<'_> {
                 }
                 Ok(None)
             }
-            SqlResultConstraintOrigin::EmptyArrayLiteral => {
-                if !arguments.is_empty() {
-                    return Err(invalid("empty-array result constraint acquired arguments"));
-                }
-                Ok(binding.result_constraint().cloned())
-            }
             SqlResultConstraintOrigin::ArrayCommonCoercion => {
                 let [novarocks_functions::FunctionArgument::Value { value_type, .. }] = arguments
                 else {

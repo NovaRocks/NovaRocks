@@ -200,48 +200,53 @@ fn null_list_cast_retains_selected_constant_field_and_write_assignment_source() 
     )
     .unwrap();
     let value = pool.value(1).unwrap();
-    let query = query("SELECT CAST(original_null_list AS ARRAY<JSON>)");
-    let ast::Expr::Cast(cast) = projection(&query) else {
-        panic!("ordinary CAST");
-    };
-    let mut source = MaterializedSourceBorrow::empty(&query);
-    source
-        .insert_context_constant(&cast.expression, value.clone(), &control)
-        .unwrap();
-    source
-        .insert_write_assignment(
-            &cast.expression,
-            Cow::Owned(
-                SqlWriteAssignmentSite::try_new(0, source_type.clone(), None, &control)
-                    .unwrap()
-                    .with_source_span(cast.expression.span()),
-            ),
-            &control,
-        )
-        .unwrap();
-    assert!(
+    for sql in [
+        "SELECT CAST(original_null_list AS ARRAY<JSON>)",
+        "SELECT ARRAY<JSON>[NULL,NULL]",
+    ] {
+        let query = query(sql);
+        let ast::Expr::Cast(cast) = projection(&query) else {
+            panic!("ordinary CAST");
+        };
+        let mut source = MaterializedSourceBorrow::empty(&query);
         source
-            .view()
-            .constant_at(&cast.expression.clone())
-            .is_none()
-    );
-    let mut ctx = context(&control);
-    ctx.materialized_values = Some(source.view());
-    let scope = ctx.new_scope();
-    let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
-    assert_eq!(actual.value_type, json_list_target());
-    let ExprKind::Cast { expr, .. } = &actual.kind else {
-        panic!("intrinsic outer cast");
-    };
-    assert_eq!(expr.value_type, source_type);
-    let ExprKind::Constant(retained) = &expr.kind else {
-        panic!("original materialized source");
-    };
-    assert_eq!(retained.ordinal(), 1);
-    assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
-    assert!(Arc::ptr_eq(retained.pool().field_ref(), &field));
-    assert_eq!(retained.field(), field.as_ref());
-    assert_eq!(retained.value_type(), value.value_type());
+            .insert_context_constant(&cast.expression, value.clone(), &control)
+            .unwrap();
+        source
+            .insert_write_assignment(
+                &cast.expression,
+                Cow::Owned(
+                    SqlWriteAssignmentSite::try_new(0, source_type.clone(), None, &control)
+                        .unwrap()
+                        .with_source_span(cast.expression.span()),
+                ),
+                &control,
+            )
+            .unwrap();
+        assert!(
+            source
+                .view()
+                .constant_at(&cast.expression.clone())
+                .is_none()
+        );
+        let mut ctx = context(&control);
+        ctx.materialized_values = Some(source.view());
+        let scope = ctx.new_scope();
+        let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
+        assert_eq!(actual.value_type, json_list_target());
+        let ExprKind::Cast { expr, .. } = &actual.kind else {
+            panic!("intrinsic outer cast");
+        };
+        assert_eq!(expr.value_type, source_type);
+        let ExprKind::Constant(retained) = &expr.kind else {
+            panic!("original materialized source");
+        };
+        assert_eq!(retained.ordinal(), 1);
+        assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
+        assert!(Arc::ptr_eq(retained.pool().field_ref(), &field));
+        assert_eq!(retained.field(), field.as_ref());
+        assert_eq!(retained.value_type(), value.value_type());
+    }
 }
 
 #[test]
@@ -583,7 +588,7 @@ fn ordinary_array_common_targets_preserve_original_operands_and_use_trino_rules(
             panic!("original array")
         };
         let originals = source_array
-            .elements
+            .values
             .iter()
             .map(|item| ctx.analyze_expr(item, &scope).unwrap())
             .collect::<Vec<_>>();

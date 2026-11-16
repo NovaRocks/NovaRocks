@@ -102,7 +102,6 @@ impl GroupConcatSourceFacts {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum SqlResultConstraintOrigin {
     Unconstrained,
-    EmptyArrayLiteral,
     /// A common target authored from the original ARRAY element declarations.
     ArrayCommonCoercion,
     ValueDomainConversion {
@@ -135,23 +134,6 @@ impl SqlFunctionBinding {
             decimal_overflow_policy,
             result_constraint: None,
             result_constraint_origin: SqlResultConstraintOrigin::Unconstrained,
-            group_concat: None,
-            aggregate_state_source: None,
-        }))
-    }
-
-    /// Preserve the exact target supplied to the original binding owner.
-    /// An inferred selected result must never be passed as this constraint.
-    pub(crate) fn new_with_empty_array_constraint(
-        resolved: novarocks_functions::ResolvedFunctionBinding,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-        result_constraint: novarocks_functions::FunctionValueType,
-    ) -> Self {
-        Self(Arc::new(SqlFunctionCallFacts {
-            resolved,
-            decimal_overflow_policy,
-            result_constraint: Some(result_constraint),
-            result_constraint_origin: SqlResultConstraintOrigin::EmptyArrayLiteral,
             group_concat: None,
             aggregate_state_source: None,
         }))

@@ -227,10 +227,10 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         panic!("expected direct ARRAY");
     };
     assert_eq!(
-        number_text(cast_input(&array.elements[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(&array.values[0], "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
-    let exponent = cast_input(&array.elements[1], "DECIMAL(18, 9)");
+    let exponent = cast_input(&array.values[1], "DECIMAL(18, 9)");
     let ast::Expr::Literal(ast::Literal {
         kind: ast::LiteralKind::Double(value),
         ..
@@ -242,10 +242,10 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
     let ast::Expr::Array(source_array) = &rows(&source)[0][0] else {
         panic!("source ARRAY");
     };
-    assert_eq!(exponent, &source_array.elements[1]);
-    assert_eq!(exponent.span(), source_array.elements[1].span());
+    assert_eq!(exponent, &source_array.values[1]);
+    assert_eq!(exponent.span(), source_array.values[1].span());
     assert!(matches!(
-        cast_input(&array.elements[2], "DECIMAL(18, 9)"),
+        cast_input(&array.values[2], "DECIMAL(18, 9)"),
         ast::Expr::Literal(ast::Literal {
             kind: ast::LiteralKind::Null,
             ..
@@ -265,7 +265,7 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         panic!("expected MAP array value");
     };
     assert_eq!(
-        number_text(cast_input(&map_array.elements[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(&map_array.values[0], "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
 
@@ -285,7 +285,7 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         panic!("expected STRUCT array field");
     };
     assert_eq!(
-        number_text(cast_input(&struct_array.elements[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(&struct_array.values[0], "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
 }
@@ -300,6 +300,11 @@ fn explicit_casts_keep_their_original_expression_and_declared_type() {
         ),
         (
             "VALUES (CAST([123456789.123456789, 1.25e2] AS ARRAY<DOUBLE>))",
+            array_type(decimal_type()),
+            "ARRAY<DECIMAL(18, 9)>",
+        ),
+        (
+            "VALUES (ARRAY<DOUBLE>[123456789.123456789, 1.25e2])",
             array_type(decimal_type()),
             "ARRAY<DECIMAL(18, 9)>",
         ),
@@ -592,9 +597,9 @@ fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
     let ast::Expr::Array(array) = &structure.expressions[0] else {
         panic!("expected nonempty ARRAY default");
     };
-    assert_eq!(number_text(&array.elements[0]), "-123456789.123456789");
+    assert_eq!(number_text(&array.values[0]), "-123456789.123456789");
     assert!(matches!(
-        &array.elements[1],
+        &array.values[1],
         ast::Expr::Literal(ast::Literal {
             kind: ast::LiteralKind::Null,
             ..
@@ -626,7 +631,7 @@ fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
         panic!("expected target-shaped ARRAY default");
     };
     assert_eq!(
-        number_text(cast_input(&array.elements[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(&array.values[0], "DECIMAL(18, 9)")),
         "-123456789.123456789"
     );
 }

@@ -497,10 +497,10 @@ fn constrain_literal_in(
                     ast::LiteralKind::Binary(novarocks_sql::literal::latin1_string_to_bytes(text)?);
             }
         }
-        ast::Expr::Array(array) if array.element_type.is_none() => {
+        ast::Expr::Array(array) => {
             if matches!(target.data_type(), DataType::List(_)) {
                 let item = target_child(target, 0)?;
-                for element in &mut array.elements {
+                for element in &mut array.values {
                     *element = constrain_literal(element.clone(), &item)?;
                 }
             }

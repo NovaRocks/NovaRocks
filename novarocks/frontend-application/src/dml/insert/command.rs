@@ -95,7 +95,7 @@ pub(crate) fn is_literal_expr(expr: &ast::Expr) -> bool {
             ) && is_literal_expr(&binary.left)
                 && is_literal_expr(&binary.right)
         }
-        ast::Expr::Array(array) => array.elements.iter().all(is_literal_expr),
+        ast::Expr::Array(array) => array.values.iter().all(is_literal_expr),
         ast::Expr::Map(map) => map
             .entries
             .iter()
@@ -212,7 +212,7 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
             _ => None,
         },
         ast::Expr::Array(array) => array
-            .elements
+            .values
             .iter()
             .all(|value| legacy_literal_shape(value).is_some())
             .then_some(Other),

@@ -3100,7 +3100,7 @@ impl Visit for CompletionRetainedBytes {
                 self.add_vec_capacity::<Expr>(expression.expressions.capacity());
             }
             Expr::Array(expression) => {
-                self.add_vec_capacity::<Expr>(expression.elements.capacity());
+                self.add_vec_capacity::<Expr>(expression.values.capacity());
             }
             Expr::Map(expression) => {
                 self.add_vec_capacity::<novarocks_parser::ast::MapEntry>(

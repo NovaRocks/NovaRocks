@@ -250,7 +250,7 @@ mod scalar_domain_tests {
             output_domains("select array<varchar>[json_object('k',1)],array<json>['plain']"),
             vec![
                 Some(SqlType::Array(Box::new(SqlType::String))),
-                Some(SqlType::Array(Box::new(SqlType::String)))
+                Some(SqlType::Array(Box::new(SqlType::Json)))
             ],
         );
         assert_eq!(
@@ -302,34 +302,48 @@ mod scalar_domain_tests {
             };
             assert_eq!(result, &expr.value_type);
         }
-        // Legacy typed ARRAY still has its separate element-type producer.
+        // Both declarations belong to the ordinary outer CAST. Their source
+        // constructors retain the original text and JSON domains separately.
         let sql = "select array<json>['{}'],array<json>[parse_json('{}')]";
         assert_eq!(
             output_domains(sql),
-            vec![
-                Some(SqlType::Array(Box::new(SqlType::String))),
-                Some(SqlType::Array(Box::new(SqlType::Json)))
-            ]
+            vec![Some(SqlType::Array(Box::new(SqlType::Json))); 2]
         );
         let expressions = output_expressions(sql);
-        assert_eq!(domain_at(&expressions[0], &[0]), None);
-        assert_eq!(
-            domain_at(&expressions[1], &[0]),
-            Some(novarocks_type_contract::ValueLogicalType::Json)
-        );
-        for expression in expressions {
-            let ExprKind::FunctionCall { binding, .. } = &expression.kind else {
-                panic!("literal owner");
+        for (expression, source_domain) in expressions
+            .into_iter()
+            .zip([None, Some(novarocks_type_contract::ValueLogicalType::Json)])
+        {
+            assert_eq!(
+                domain_at(&expression, &[0]),
+                Some(novarocks_type_contract::ValueLogicalType::Json)
+            );
+            let ExprKind::Cast {
+                expr,
+                array_failure_mode,
+                ..
+            } = &expression.kind
+            else {
+                panic!("ordinary outer array CAST");
+            };
+            assert_eq!(
+                *array_failure_mode,
+                Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+            );
+            assert_eq!(domain_at(expr, &[0]), source_domain);
+            let ExprKind::FunctionCall { binding, .. } = &expr.kind else {
+                panic!("original independent constructor");
             };
             let novarocks_functions::FunctionResultType::Scalar(result) =
                 &binding.selected.result_type
             else {
-                panic!("scalar");
+                panic!("scalar")
             };
-            assert_eq!(result, &expression.value_type);
+            assert_eq!(result, &expr.value_type);
             let DataType::List(item) = expression.value_type.data_type() else {
-                panic!("list");
+                panic!("list")
             };
+            assert_eq!(item.data_type(), &DataType::Utf8);
             assert!(item.metadata().as_arc().is_none());
         }
     }

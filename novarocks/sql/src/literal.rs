@@ -210,7 +210,7 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
         // Handle array literal [1, 2, 3]
         ast::Expr::Array(array) => Ok(Literal::Array(
             array
-                .elements
+                .values
                 .iter()
                 .map(expr_to_literal)
                 .collect::<Result<Vec<_>, _>>()?,

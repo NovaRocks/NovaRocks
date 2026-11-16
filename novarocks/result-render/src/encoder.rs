@@ -1078,20 +1078,10 @@ fn year_atom(year: i32) -> Result<Atom, RenderError> {
     })
 }
 fn date_atom(days: i32) -> Result<Atom, RenderError> {
-    let ce = 719163i64
-        .checked_add(i64::from(days))
-        .ok_or_else(invalid_value)?;
-    let date = chrono::NaiveDate::from_num_days_from_ce_opt(
-        i32::try_from(ce).map_err(|_| invalid_value())?,
-    )
-    .ok_or_else(invalid_value)?;
-    Ok(atom!(
-        "{}-{:02}-{:02}",
-        year_atom(date.year())?,
-        date.month(),
-        date.day()
-    ))
+    let (year, month, day) = novarocks_functions::datetime_value::date32_to_gregorian(days);
+    Ok(atom!("{}-{:02}-{:02}", year_atom(year)?, month, day))
 }
+
 fn decimal128(value: i128, scale: usize, precision: Option<u8>) -> Result<Atom, RenderError> {
     let negative = value < 0;
     let abs = value.unsigned_abs();

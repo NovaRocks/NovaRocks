@@ -450,6 +450,7 @@ fn intrinsic_scoped_refs_and_false_true_parameters_survive_one_package_carrier()
                 target_carrier_type_id: Some(u32::MAX),
                 decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
                 allow_throw_exception: Some(reference(u32::MAX)),
+                array_failure_mode: None,
             })),
             ..Default::default()
         },

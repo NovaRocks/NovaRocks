@@ -385,25 +385,27 @@ mod tests {
         );
         assert!(matches!(parse("(SELECT 1) + 2"), Expr::Binary(_)));
         assert!(matches!(parse("[1, 2, 3]"), Expr::Array(_)));
-        let Expr::Array(typed_array) = parse("ARRAY<double>[0.25, 0.5]") else {
-            panic!("expected typed array literal");
+        let typed_array = parse("ARRAY<double>[0.25, 0.5]");
+        let Expr::Cast(cast) = &typed_array else {
+            panic!("expected ordinary outer CAST");
         };
-        assert_eq!(typed_array.elements.len(), 2);
-        assert_eq!(
-            typed_array
-                .element_type
-                .as_ref()
-                .and_then(|element_type| match &element_type.kind {
-                    crate::ast::TypeKind::Generic(value) => Some(&value.name),
-                    _ => None,
-                })
-                .map(|part| part.value.as_str()),
-            Some("double")
+        assert!(!cast.safe);
+        let Expr::Array(array) = &cast.expression else {
+            panic!("expected untyped ARRAY input");
+        };
+        assert_eq!(array.values.len(), 2);
+        assert!(
+            array
+                .values
+                .iter()
+                .all(|value| matches!(value, Expr::Literal(_)))
         );
         assert_eq!(
-            crate::printer::print_expr(&Expr::Array(typed_array.clone())),
-            "ARRAY<double>[0.25, 0.5]"
+            crate::printer::print_expr(&typed_array),
+            "CAST([0.25, 0.5] AS ARRAY<double>)"
         );
+        let ordinary = parse("CAST([0.25, 0.5] AS ARRAY<double>)");
+        assert!(crate::ast::SyntaxEq::syntax_eq(&typed_array, &ordinary));
         let hex = parse("X'AB01'");
         let Expr::Literal(hex_literal) = &hex else {
             panic!("expected hex literal");
@@ -465,5 +467,72 @@ mod tests {
             call.null_treatment,
             Some(crate::ast::NullTreatment::IgnoreNulls)
         );
+    }
+
+    #[test]
+    fn typed_array_normalization_keeps_raw_literals_and_full_type_source() {
+        let source = "ARRAY<DECIMAL(20,0)>[9007199254740993,1e0]";
+        let expression = parse(source);
+        let ordinary = parse("CAST([9007199254740993,1e0] AS ARRAY<DECIMAL(20,0)>)");
+        assert!(crate::ast::SyntaxEq::syntax_eq(&expression, &ordinary));
+        let Expr::Cast(cast) = &expression else {
+            panic!("outer CAST");
+        };
+        let Expr::Array(array) = &cast.expression else {
+            panic!("independent ARRAY");
+        };
+        assert!(!cast.safe);
+        assert_eq!(cast.span, Span::new(0, source.len()));
+        assert_eq!(
+            &source[cast.data_type.span.start()..cast.data_type.span.end()],
+            "ARRAY<DECIMAL(20,0)>"
+        );
+        assert_eq!(
+            &source[array.span.start()..array.span.end()],
+            "[9007199254740993,1e0]"
+        );
+        let [Expr::Literal(first), Expr::Literal(second)] = array.values.as_slice() else {
+            panic!("original literal children");
+        };
+        assert!(
+            matches!(&first.kind, LiteralKind::Long { spelling, parsed_value } if spelling == "9007199254740993" && *parsed_value == 9_007_199_254_740_993)
+        );
+        assert!(
+            matches!(&second.kind, LiteralKind::Double(value) if value.get().to_bits() == 1_f64.to_bits())
+        );
+        assert_eq!(
+            &source[first.span.start()..first.span.end()],
+            "9007199254740993"
+        );
+        assert_eq!(&source[second.span.start()..second.span.end()], "1e0");
+    }
+
+    #[test]
+    fn typed_array_full_declarations_match_independent_casts() {
+        for (source, ordinary) in [
+            ("ARRAY<JSON>[]", "CAST([] AS ARRAY<JSON>)"),
+            (
+                "ARRAY<ARRAY<DECIMAL(20,0)>>[[9007199254740993,1e0]]",
+                "CAST([[9007199254740993,1e0]] AS ARRAY<ARRAY<DECIMAL(20,0)>>)",
+            ),
+            (
+                "ARRAY<STRUCT<`a b` INT, k ARRAY<JSON>>>[]",
+                "CAST([] AS ARRAY<STRUCT<`a b` INT, k ARRAY<JSON>>>)",
+            ),
+        ] {
+            assert!(crate::ast::SyntaxEq::syntax_eq(
+                &parse(source),
+                &parse(ordinary)
+            ));
+        }
+        for source in [
+            "ARRAY< >[]",
+            "ARRAY<3>[1]",
+            "ARRAY<INT,INT>[1]",
+            "ARRAY<INT>1",
+        ] {
+            let tokens = lex(source).unwrap();
+            assert!(parse_expression(source, &tokens).is_err(), "{source}");
+        }
     }
 }

@@ -256,6 +256,33 @@ fn prepare_element(
     {
         return Err(CastPrepareError::Unsupported);
     }
+    // Reuse the original signed decimal text author, including BIGINT MIN.
+    if result.data_type() == &DataType::Utf8
+        && let Some(width) = SignedWidth::from_type(source.data_type())
+    {
+        return Ok(recipe(
+            source,
+            result,
+            CastBody::Text {
+                source: Source::Signed(width),
+            },
+            None,
+            policy,
+            allow,
+            None,
+        ));
+    }
+    if source.data_type() == &DataType::Utf8 && result.data_type() == &DataType::Date32 {
+        return Ok(recipe(
+            source,
+            result,
+            CastBody::ArrayDateText,
+            None,
+            policy,
+            allow,
+            None,
+        ));
+    }
     if source.data_type() == &DataType::Utf8 && result.data_type() == &DataType::Int32 {
         return Ok(recipe(
             source,

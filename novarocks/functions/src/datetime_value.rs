@@ -497,3 +497,155 @@ mod tests {
         }
     }
 }
+
+/// Explicit Trino ARRAY date-cast text profile of this original date author.
+/// Unlike the legacy NaiveDate entry it preserves the complete Date32 range.
+/// No SQL input limit, new parser module, fallback or global policy is installed.
+pub(crate) fn parse_trino_date32_observed<E>(
+    text: &str,
+    mut observe: impl FnMut(DateParseObservation) -> Result<(), E>,
+) -> Result<Option<i32>, E> {
+    fn step_char<E>(
+        ch: char,
+        observe: &mut impl FnMut(DateParseObservation) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for _ in 0..ch.len_utf8() {
+            observe(DateParseObservation::Step)?;
+        }
+        Ok(())
+    }
+    // SliceUtf8.trim delegates Character.isWhitespace. This is its Unicode
+    // whitespace set, including Java's four information separators and
+    // excluding NBSP/FIGURE SPACE/NARROW NBSP and NEL (Rust trim differs).
+    fn whitespace(ch: char) -> bool {
+        matches!(ch, '\u{0009}'..='\u{000d}' | '\u{001c}'..='\u{0020}' | '\u{1680}'
+            | '\u{2000}'..='\u{2006}' | '\u{2008}'..='\u{200a}' | '\u{2028}' | '\u{2029}'
+            | '\u{205f}' | '\u{3000}')
+    }
+    let mut start = 0;
+    for ch in text.chars() {
+        step_char(ch, &mut observe)?;
+        if !whitespace(ch) {
+            break;
+        }
+        start += ch.len_utf8();
+    }
+    let mut end = text.len();
+    for ch in text[start..].chars().rev() {
+        step_char(ch, &mut observe)?;
+        if !whitespace(ch) {
+            break;
+        }
+        end -= ch.len_utf8();
+    }
+    let bytes = text[start..end].as_bytes();
+    // ISODateTimeFormat.date is yearMonthDay. Its NumberFormatter accepts
+    // 1..9 ASCII year digits plus optional sign, then unsigned 1..2 month/day
+    // digits with the two required '-' literals and no trailing characters.
+    fn component<E>(
+        bytes: &[u8],
+        at: &mut usize,
+        max: usize,
+        observe: &mut impl FnMut(DateParseObservation) -> Result<(), E>,
+    ) -> Result<Option<i64>, E> {
+        let begin = *at;
+        let mut value = 0_i64;
+        while *at < bytes.len() && *at - begin < max && bytes[*at].is_ascii_digit() {
+            observe(DateParseObservation::Step)?;
+            value = value * 10 + i64::from(bytes[*at] - b'0');
+            *at += 1;
+        }
+        Ok((*at != begin).then_some(value))
+    }
+    let mut at = 0;
+    let negative = bytes.first() == Some(&b'-');
+    if matches!(bytes.first(), Some(b'-' | b'+')) {
+        observe(DateParseObservation::Step)?;
+        at += 1;
+    }
+    let Some(year) = component(bytes, &mut at, 9, &mut observe)? else {
+        return Ok(None);
+    };
+    if bytes.get(at) != Some(&b'-') {
+        return Ok(None);
+    }
+    observe(DateParseObservation::Step)?;
+    at += 1;
+    let Some(month) = component(bytes, &mut at, 2, &mut observe)? else {
+        return Ok(None);
+    };
+    if bytes.get(at) != Some(&b'-') {
+        return Ok(None);
+    }
+    observe(DateParseObservation::Step)?;
+    at += 1;
+    let Some(day) = component(bytes, &mut at, 2, &mut observe)? else {
+        return Ok(None);
+    };
+    if at != bytes.len() {
+        return Ok(None);
+    }
+    let year = if negative { -year } else { year };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return Ok(None),
+    };
+    if !(1..=days).contains(&day) {
+        return Ok(None);
+    }
+    // ISOChronology is proleptic Gregorian, including year zero. A March-based
+    // 400-year era keeps negative-year division exact and avoids Chrono's
+    // smaller calendar range. Nine input digits bound every i64 operation.
+    observe(DateParseObservation::Step)?;
+    // Every accepted i32 day fits Joda's i64 millisecond domain. Values beyond
+    // Date32 also fail Trino's final toIntExact and remain conversion Data9.
+    Ok(i32::try_from(gregorian_epoch_day_from_valid_parts(year, month, day)).ok())
+}
+
+#[cfg(test)]
+#[path = "datetime_value_trino_date_tests.rs"]
+mod trino_date_profile_tests;
+
+const GREGORIAN_EPOCH_DAY_OFFSET: i64 = 719468;
+const DAYS_PER_GREGORIAN_ERA: i64 = 146097;
+
+/// The forward half of the same calendar geometry. Its sole parser caller
+/// has already validated month/day and bounds year to nine decimal digits.
+fn gregorian_epoch_day_from_valid_parts(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * DAYS_PER_GREGORIAN_ERA + day_of_era - GREGORIAN_EPOCH_DAY_OFFSET
+}
+
+/// Exact proleptic-Gregorian components for every Arrow Date32 value.
+/// This is the original date author's inverse geometry, shared with result
+/// presentation. Fixed scalar arithmetic needs no source clone or allocation.
+/// The complete input range bounds year to -5877641..=5881580, month to 1..=12
+/// and day to 1..=31; none of these narrowing casts truncates a valid value.
+pub fn date32_to_gregorian(days: i32) -> (i32, u32, u32) {
+    let day = i64::from(days) + GREGORIAN_EPOCH_DAY_OFFSET;
+    let era = day.div_euclid(DAYS_PER_GREGORIAN_ERA);
+    let day_of_era = day - era * DAYS_PER_GREGORIAN_ERA;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = month_from_march + if month_from_march < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    (year as i32, month as u32, day as u32)
+}

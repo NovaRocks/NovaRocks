@@ -1446,13 +1446,8 @@ impl Printer {
         self.output.push(')');
     }
     fn write_array_expr(&mut self, expression: &ArrayExpr) {
-        if let Some(element_type) = &expression.element_type {
-            self.output.push_str("ARRAY<");
-            self.write_type_name(element_type);
-            self.output.push('>');
-        }
         self.output.push('[');
-        self.write_expr_list(&expression.elements);
+        self.write_expr_list(&expression.values);
         self.output.push(']');
     }
 

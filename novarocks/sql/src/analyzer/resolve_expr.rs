@@ -1033,124 +1033,9 @@ impl<'a> super::AnalyzerContext<'a> {
         array: &ast::ArrayExpr,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        let mut args = Vec::with_capacity(array.elements.len());
-        let explicit_item_type = array
-            .element_type
-            .as_ref()
-            .map(|target| super::helpers::sql_type_to_value_type(target, true, self.control))
-            .transpose()?;
-        for item in &array.elements {
-            let mut typed = self.analyze_expr(item, scope)?;
-            if let Some(target) = &explicit_item_type
-                && !typed.value_type.same_value_domain(target)
-            {
-                let value_type =
-                    super::helpers::declared_cast_value_type(&typed, target.clone(), self.control)?;
-                typed = self.cast_to_value_type(typed, value_type, item.span())?;
-            }
-            args.push(typed);
-        }
-        if args.is_empty()
-            && let Some(item) = explicit_item_type
-        {
-            // Syntax supplied the complete item declaration. Wrap that same
-            // semantic child; Arrow attributes cannot author the target domain.
-            self.check_control()?;
-            let carrier = DataType::List(Arc::new(arrow::datatypes::Field::new(
-                "item",
-                item.data_type().clone(),
-                item.nullable(),
-            )));
-            let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
-            enum AuthorError {
-                Type(novarocks_type_contract::ExecutionValueTypeError),
-                Wrapper(novarocks_type_contract::ValueTypeError),
-                Control(novarocks_type_contract::CompileControlError),
-            }
-            impl From<novarocks_type_contract::ExecutionValueTypeError> for AuthorError {
-                fn from(error: novarocks_type_contract::ExecutionValueTypeError) -> Self {
-                    Self::Type(error)
-                }
-            }
-            let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
-                self.control,
-                novarocks_type_contract::CompilePhase::Validate,
-            )
-            .map_err(AnalyzeError::control)?;
-            let result = (|| {
-                let mut observe = |units| {
-                    for _ in 0..units {
-                        work.step().map_err(AuthorError::Control)?;
-                    }
-                    work.flush().map_err(AuthorError::Control)
-                };
-                let value = novarocks_type_contract::ValueTypeRef::try_new_observed(
-                    novarocks_type_contract::ValueKind::List(item.value_type().clone()),
-                    false,
-                    storage.clone(),
-                    &mut observe,
-                )?;
-                let layout =
-                    novarocks_type_contract::ValueLayout::try_from_normalized_arrow_observed(
-                        carrier,
-                        storage,
-                        &mut observe,
-                    )?;
-                let binding = novarocks_type_contract::TypedValueBinding::try_new_observed(
-                    value,
-                    layout,
-                    &mut observe,
-                )?;
-                novarocks_type_contract::FunctionValueType::try_from_typed_binding(binding)
-                    .map_err(AuthorError::Wrapper)
-            })();
-            if let Err(AuthorError::Control(error)) = &result {
-                return Err(AnalyzeError::control(error.clone()));
-            }
-            work.finish().map_err(AnalyzeError::control)?;
-            let expected = result.map_err(|error| match error {
-                AuthorError::Type(error) => {
-                    AnalyzeError::type_mismatch(error.to_string(), array.span)
-                }
-                AuthorError::Wrapper(error) => {
-                    AnalyzeError::type_mismatch(error.to_string(), array.span)
-                }
-                AuthorError::Control(error) => AnalyzeError::control(error),
-            })?;
-            super::helpers::validate_value_type(&expected, self.control)?;
-            let binding = self
-                .function_catalog
-                .resolve_scalar_binding_with_expected_result(
-                    "__array_literal",
-                    &[],
-                    &expected,
-                    self.control,
-                )
-                .map_err(|error| {
-                    AnalyzeError::function_binding(error).at_type_mismatch(array.span)
-                })?;
-            let novarocks_functions::FunctionResultType::Scalar(value_type) =
-                &binding.selected.result_type
-            else {
-                return Err(AnalyzeError::internal(
-                    "array literal owner must produce a scalar result",
-                ));
-            };
-            let value_type = value_type.clone();
-            return Ok(TypedExpr {
-                value_type,
-                kind: ExprKind::FunctionCall {
-                    volatility: binding.semantics.volatility,
-                    name: "__array_literal".to_string(),
-                    binding: crate::binding::SqlFunctionBinding::new_with_empty_array_constraint(
-                        binding,
-                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                        expected,
-                    ),
-                    args,
-                    distinct: false,
-                },
-            });
+        let mut args = Vec::with_capacity(array.values.len());
+        for item in &array.values {
+            args.push(self.analyze_expr(item, scope)?);
         }
         resolved_scalar_call_at(
             self.function_catalog,
@@ -4413,7 +4298,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 .iter()
                 .any(|item| self.expr_contains_aggregate(item)),
             ast::Expr::Array(array) => array
-                .elements
+                .values
                 .iter()
                 .any(|item| self.expr_contains_aggregate(item)),
             ast::Expr::Struct(structure) => structure
@@ -6874,7 +6759,7 @@ fn signed_integer_literal_expr(expr: &ast::Expr) -> Option<ast::Expr> {
 
 fn syntactic_array_literal_len(expr: &ast::Expr) -> Option<usize> {
     match expr {
-        ast::Expr::Array(array) => Some(array.elements.len()),
+        ast::Expr::Array(array) => Some(array.values.len()),
         ast::Expr::Nested(inner) => syntactic_array_literal_len(&inner.expression),
         ast::Expr::Cast(cast) => syntactic_array_literal_len(&cast.expression),
         _ => None,
@@ -8024,21 +7909,7 @@ mod tests {
         assert_eq!(observation.polls.load(Ordering::SeqCst), 1);
     }
 
-    fn assert_json_list_scalar_owner(expression: &crate::analysis::TypedExpr, expected_id: &str) {
-        let DataType::List(item) = &expression.value_type.data_type() else {
-            panic!("expected List");
-        };
-        assert_eq!(item.data_type(), &DataType::Utf8);
-        assert_eq!(
-            expression
-                .value_type
-                .value_type()
-                .child_type_at(0)
-                .unwrap()
-                .domain(),
-            Some(novarocks_type_contract::ValueLogicalType::Json)
-        );
-        assert!(item.metadata().as_arc().is_none());
+    fn assert_exact_list_scalar_owner(expression: &crate::analysis::TypedExpr, expected_id: &str) {
         let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
             panic!("expected direct exact scalar owner");
         };
@@ -8063,17 +7934,69 @@ mod tests {
             );
         }
     }
+    fn assert_json_list_declaration(expression: &crate::analysis::TypedExpr) {
+        let DataType::List(item) = expression.value_type.data_type() else {
+            panic!("expected List");
+        };
+        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(
+            expression
+                .value_type
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .domain(),
+            Some(novarocks_type_contract::ValueLogicalType::Json)
+        );
+        assert!(item.metadata().as_arc().is_none());
+    }
+    fn assert_json_list_scalar_owner(expression: &crate::analysis::TypedExpr, expected_id: &str) {
+        assert_json_list_declaration(expression);
+        assert_exact_list_scalar_owner(expression, expected_id);
+    }
 
     #[test]
     fn json_array_literal_and_sortby_keep_complete_exact_owner_bindings() {
-        for sql in [
-            "select [json_object('k',1), json_object('k',2), null]",
-            "select array<json>[json_object('k',1), null]",
-            "select array<json>[]",
-            "select array<json>[null]",
+        let expression =
+            analyze_projection_expr("select [json_object('k',1), json_object('k',2), null]")
+                .unwrap();
+        assert_json_list_scalar_owner(&expression, "builtin.scalar/__array_literal/v1");
+        for (sql, source_carrier, source_domain) in [
+            (
+                "select array<json>[json_object('k',1), null]",
+                DataType::Utf8,
+                novarocks_type_contract::ValueLogicalType::Json,
+            ),
+            (
+                "select array<json>[]",
+                DataType::Null,
+                novarocks_type_contract::ValueLogicalType::Physical,
+            ),
+            (
+                "select array<json>[null]",
+                DataType::Null,
+                novarocks_type_contract::ValueLogicalType::Physical,
+            ),
         ] {
             let expression = analyze_projection_expr(sql).unwrap();
-            assert_json_list_scalar_owner(&expression, "builtin.scalar/__array_literal/v1");
+            assert_json_list_declaration(&expression);
+            let ExprKind::Cast {
+                expr,
+                array_failure_mode,
+                ..
+            } = &expression.kind
+            else {
+                panic!("ordinary outer CAST")
+            };
+            assert_eq!(
+                *array_failure_mode,
+                Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+            );
+            assert_exact_list_scalar_owner(expr, "builtin.scalar/__array_literal/v1");
+            let child = expr.value_type.child_at(0).unwrap();
+            assert_eq!(child.data_type(), &source_carrier);
+            assert_eq!(child.logical_type(), source_domain);
+            assert!(!expr.value_type.nullable());
         }
         for sql in [
             "select array_sortby([json_object('k',1), json_object('k',2)], [2,1])",
@@ -8092,18 +8015,54 @@ mod tests {
                 analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
             assert_json_list_scalar_owner(&expression, "builtin.scalar/array_sortby/v1");
         }
-        for sql in [
-            "select ['{\"k\":1}', '{\"k\":2}']",
-            "select array<varchar>[json_object('k',1), json_object('k',2)]",
-            "select array_sortby(['{\"k\":1}', '{\"k\":2}'], [2,1])",
-            "select array_sortby(cast([json_object('k',1), json_object('k',2)] as array<varchar>), [2,1])",
+        for (sql, cast_boundary, owner_id) in [
+            (
+                r#"select ['{"k":1}', '{"k":2}']"#,
+                false,
+                "builtin.scalar/__array_literal/v1",
+            ),
+            (
+                "select array<varchar>[json_object('k',1), json_object('k',2)]",
+                true,
+                "builtin.scalar/__array_literal/v1",
+            ),
+            (
+                r#"select array_sortby(['{"k":1}', '{"k":2}'], [2,1])"#,
+                false,
+                "builtin.scalar/array_sortby/v1",
+            ),
+            (
+                "select array_sortby(cast([json_object('k',1), json_object('k',2)] as array<varchar>), [2,1])",
+                false,
+                "builtin.scalar/array_sortby/v1",
+            ),
         ] {
             let expression = analyze_projection_expr(sql).unwrap();
-            let DataType::List(item) = &expression.value_type.data_type() else {
-                panic!("expected List");
+            let DataType::List(item) = expression.value_type.data_type() else {
+                panic!("expected List")
             };
             assert_eq!(novarocks_types::logical::logical_type_of_field(item), None);
-            assert!(matches!(expression.kind, ExprKind::FunctionCall { .. }));
+            assert_eq!(
+                expression.value_type.child_at(0).unwrap().logical_type(),
+                novarocks_type_contract::ValueLogicalType::Physical
+            );
+            if cast_boundary {
+                let ExprKind::Cast {
+                    expr,
+                    array_failure_mode,
+                    ..
+                } = &expression.kind
+                else {
+                    panic!("ordinary outer CAST")
+                };
+                assert_eq!(
+                    *array_failure_mode,
+                    Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+                );
+                assert_json_list_scalar_owner(expr, owner_id);
+            } else {
+                assert_exact_list_scalar_owner(&expression, owner_id);
+            }
         }
     }
 

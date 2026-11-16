@@ -229,3 +229,149 @@ fn unwind_during_one_element_drop_releases_siblings_exactly_once() {
     assert!(result.is_err());
     assert_eq!(live.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn actual_array_owning_carrier_guards_deep_traits_move_and_drop() {
+    use crate::ast::{Expr, GroupBy, LiteralKind, SetExpr, Statement};
+    use crate::build;
+    const DEPTH: usize = 20_000;
+    let mut tree = build::integer(7);
+    for _ in 0..DEPTH {
+        tree = build::array(vec![tree]);
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH);
+    let mut cursor = &mut copy;
+    for _ in 0..DEPTH {
+        let Expr::Array(array) = cursor else {
+            panic!("actual nested Array");
+        };
+        assert_eq!(array.values.len(), 1);
+        cursor = &mut array.values[0];
+    }
+    let Expr::Literal(literal) = cursor else {
+        panic!("original leaf");
+    };
+    assert!(matches!(
+        literal.kind,
+        LiteralKind::Long {
+            parsed_value: 7,
+            ..
+        }
+    ));
+    literal.kind = LiteralKind::Long {
+        spelling: "8".into(),
+        parsed_value: 8,
+    };
+    assert_ne!(tree, copy);
+    drop(copy);
+    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
+        build::select(
+            vec![build::item(tree.clone(), None, false)],
+            Vec::new(),
+            None,
+            GroupBy::None,
+        )
+        .unwrap(),
+    ))));
+    crate::ast::validate_statement(&statement).unwrap();
+    drop(statement);
+    let Expr::Array(array) = tree else {
+        unreachable!()
+    };
+    let values = array.values.into_inner();
+    assert_eq!(values.len(), 1);
+    drop(values);
+}
+
+#[test]
+fn actual_array_semantic_walk_fold_and_equivalence_preserve_deep_values_and_order() {
+    use crate::ast::{
+        Expr, Fold, GroupBy, Literal, LiteralKind, SetExpr, Statement, SyntaxEq, Visit,
+    };
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    const LEAF: i64 = 1_000_000;
+    let mut tree = build::integer(LEAF);
+    for marker in 1..=DEPTH {
+        tree = build::array(vec![build::integer(marker), tree, build::integer(-marker)]);
+    }
+    #[derive(Default)]
+    struct Values(Vec<i64>);
+    impl Visit for Values {
+        fn visit_literal(&mut self, node: &Literal) {
+            let LiteralKind::Long {
+                spelling,
+                parsed_value,
+            } = &node.kind
+            else {
+                panic!("fixture Long literal");
+            };
+            assert_eq!(spelling, &parsed_value.to_string());
+            self.0.push(*parsed_value);
+        }
+    }
+    let expected = (1..=DEPTH)
+        .rev()
+        .chain(std::iter::once(LEAF))
+        .chain((1..=DEPTH).map(|value| -value))
+        .collect::<Vec<_>>();
+    let mut source_values = Values::default();
+    source_values.visit_expr(&tree);
+    assert_eq!(source_values.0, expected);
+    struct Relocate;
+    impl Fold for Relocate {
+        fn fold_expr(&mut self, node: Expr) -> Expr {
+            let mut node = crate::ast::fold_expr(self, node);
+            match &mut node {
+                Expr::Array(array) => array.span = Span::new(17, 23),
+                Expr::Literal(literal) => literal.span = Span::new(17, 23),
+                _ => unreachable!("Array/Long fixture"),
+            }
+            node
+        }
+    }
+    let relocated = Relocate.fold_expr(tree.clone());
+    assert!(tree.syntax_eq(&relocated));
+    assert_ne!(tree, relocated);
+    let mut relocated_values = Values::default();
+    relocated_values.visit_expr(&relocated);
+    assert_eq!(relocated_values.0, expected);
+    struct Offset;
+    impl Fold for Offset {
+        fn fold_literal(&mut self, mut node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = &node.kind else {
+                unreachable!()
+            };
+            let next = *parsed_value + 1;
+            node.kind = LiteralKind::Long {
+                spelling: next.to_string(),
+                parsed_value: next,
+            };
+            node
+        }
+    }
+    let shifted = Offset.fold_expr(relocated);
+    let mut shifted_values = Values::default();
+    shifted_values.visit_expr(&shifted);
+    assert_eq!(
+        shifted_values.0,
+        expected.iter().map(|value| value + 1).collect::<Vec<_>>()
+    );
+    assert!(!tree.syntax_eq(&shifted));
+    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
+        build::select(
+            vec![build::item(shifted, None, false)],
+            Vec::new(),
+            None,
+            GroupBy::None,
+        )
+        .unwrap(),
+    ))));
+    crate::ast::validate_statement(&statement).unwrap();
+    drop(statement);
+    drop(tree);
+}

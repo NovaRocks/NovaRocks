@@ -7967,12 +7967,8 @@ async fn actor_abort_round_at_first_dispatch() -> (
         )
         .await
         .expect("settle actor admission");
-    for _ in 0..100 {
-        if round.queued_abort_effects() == 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    owner_failed_actor_abort::wait_for_adapter_abort(&round).await;
+    assert_eq!(round.queued_abort_effects(), 1);
     ack_handle.publish(admission_ack(&admission));
     round
         .turn()

@@ -70,3 +70,24 @@ signed_bounds
 -- types	array(decimal(18, 18))
 whole_array
 NULL
+
+-- query 22
+-- types	array(varchar)	array(varchar)	array(varchar)	array(varchar)
+tiny_text	small_text	integer_text	big_text
+["-128","127",null]	["-32768","32767",null]	["-2147483648","2147483647",null]	["-9223372036854775808","9223372036854775807",null]
+
+-- query 23
+-- types	array(date)
+dates
+["1970-01-01","1969-12-31","2000-02-29","0000-01-01","-0001-01-01",null]
+
+-- query 25
+-- types	array(date)	array(date)
+whole_array	original_null_element
+NULL	[null]
+
+-- query 26
+-- types	integer	array(date)
+ordinal	dates
+1	["-5877641-06-23"]
+2	["+5881580-07-11"]

@@ -1082,3 +1082,272 @@ fn explicit_json_text_guards_distinguish_json_null_from_required_string_encoding
         );
     }
 }
+
+#[test]
+fn trino_array_date_uses_original_selected_date32_author_and_whole_array_try() {
+    let source = ty(DataType::Utf8, true, true, "date-text-source");
+    let target = ty(DataType::Date32, true, true, "date-text-target");
+    let input = list(
+        &source,
+        Arc::new(StringArray::from(vec![
+            Some("1970-01-01"),
+            Some("bad"),
+            Some("2000-02-29"),
+            None,
+            Some("-5877641-06-23"),
+            Some("+5881580-07-11"),
+        ])),
+        &[0, 2, 4, 6],
+        None,
+    );
+    let strict = prepare(&source, &target, ArrayCastFailureMode::ReportError);
+    let output = evaluate(&strict, &input, Selection::all(3));
+    assert_eq!(output.errors().len(), 1);
+    assert_eq!(output.errors()[0].selected_ordinal(), 0);
+    assert_eq!(
+        output.errors()[0].reason(),
+        DataFailureReason::Domain(INVALID_CAST_ARGUMENT)
+    );
+    assert!(std::error::Error::source(&output.errors()[0]).is_some());
+    let expected = list(
+        &target,
+        Arc::new(Date32Array::from(vec![
+            Some(11016),
+            None,
+            Some(i32::MIN),
+            Some(i32::MAX),
+        ])),
+        &[0, 0, 2, 4],
+        Some(&[false, true, true]),
+    );
+    same(&output, &expected, &target);
+    let safe = prepare(&source, &target, ArrayCastFailureMode::OutputNull);
+    let output = evaluate(&safe, &input, Selection::all(3));
+    assert!(output.errors().is_empty());
+    same(&output, &expected, &target);
+}
+#[test]
+fn trino_date_array_preserves_selected_control_refusals_and_original_source_errors() {
+    let source = ty(DataType::Utf8, true, true, "date-control-source");
+    let target = ty(DataType::Date32, true, true, "date-control-target");
+    let input = list(
+        &source,
+        Arc::new(StringArray::from(vec![format!(
+            "{}2000-02-29",
+            " ".repeat(1024)
+        )])),
+        &[0, 1],
+        None,
+    );
+    let recipe = prepare(&source, &target, ArrayCastFailureMode::ReportError);
+    let observed = Control::default();
+    recipe
+        .evaluate_selected(
+            EvaluatedArgument::Column(&input),
+            Selection::all(1),
+            &[],
+            &observed,
+        )
+        .unwrap();
+    let count = observed.calls.lock().unwrap().len();
+    for cause in [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+        KernelFailure::InvalidProgram(KernelDiagnostic::new("original date source refusal")),
+    ] {
+        for at in 0..count {
+            let control = Control {
+                calls: Mutex::new(vec![]),
+                refusal: Some((at, cause.clone())),
+            };
+            assert_eq!(
+                recipe
+                    .evaluate_selected(
+                        EvaluatedArgument::Column(&input),
+                        Selection::all(1),
+                        &[],
+                        &control
+                    )
+                    .unwrap_err(),
+                cause
+            );
+            assert_eq!(control.calls.lock().unwrap().len(), at + 1);
+        }
+    }
+    let failed = list(
+        &source,
+        Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+        &[0, 0],
+        Some(&[false]),
+    );
+    let original = RowDataError::with_reason(
+        0,
+        DataFailureReason::DivisionByZero,
+        "original DATE source failed",
+    );
+    let source = SelectedValues::try_new(
+        Selection::all(1),
+        source.data_type(),
+        failed,
+        vec![original.clone()].into_boxed_slice(),
+    )
+    .unwrap();
+    let safe = prepare(
+        recipe.source_type(),
+        &target,
+        ArrayCastFailureMode::OutputNull,
+    );
+    let output = safe
+        .evaluate_selected(
+            EvaluatedArgument::SelectedColumn(&source),
+            Selection::all(1),
+            source.errors(),
+            &Control::default(),
+        )
+        .unwrap();
+    assert_eq!(output.errors(), &[original]);
+    assert!(output.values().is_null(0));
+}
+
+#[test]
+fn signed_array_to_varchar_reuses_original_text_author_at_all_exact_widths() {
+    let cases: Vec<(DataType, ArrayRef, Vec<Option<&str>>)> = vec![
+        (
+            DataType::Int8,
+            Arc::new(Int8Array::from(vec![Some(i8::MIN), None, Some(i8::MAX)])),
+            vec![Some("-128"), None, Some("127")],
+        ),
+        (
+            DataType::Int16,
+            Arc::new(Int16Array::from(vec![Some(i16::MIN), None, Some(i16::MAX)])),
+            vec![Some("-32768"), None, Some("32767")],
+        ),
+        (
+            DataType::Int32,
+            Arc::new(Int32Array::from(vec![Some(i32::MIN), None, Some(i32::MAX)])),
+            vec![Some("-2147483648"), None, Some("2147483647")],
+        ),
+        (
+            DataType::Int64,
+            Arc::new(Int64Array::from(vec![Some(i64::MIN), None, Some(i64::MAX)])),
+            vec![
+                Some("-9223372036854775808"),
+                None,
+                Some("9223372036854775807"),
+            ],
+        ),
+    ];
+    for (carrier, values, expected) in cases {
+        let source = ty(carrier, true, true, "source-signed-text");
+        let target = ty(DataType::Utf8, true, true, "target-signed-text");
+        let input = list(&source, values, &[0, 3], None);
+        for mode in [
+            ArrayCastFailureMode::ReportError,
+            ArrayCastFailureMode::OutputNull,
+        ] {
+            let recipe = prepare(&source, &target, mode);
+            let actual = evaluate(&recipe, &input, Selection::all(1));
+            assert!(actual.errors().is_empty());
+            assert!(!actual.values().is_null(0));
+            let values = actual
+                .values()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap()
+                .value(0);
+            assert_eq!(
+                values
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+}
+#[test]
+fn signed_array_text_preserves_sparse_parent_null_and_inherited_source_journal() {
+    let source = ty(DataType::Int64, true, true, "signed-text-sparse-source");
+    let target = ty(DataType::Utf8, true, true, "signed-text-sparse-target");
+    let input = list(
+        &source,
+        Arc::new(Int64Array::from(vec![
+            Some(7),
+            None,
+            Some(i64::MIN),
+            Some(i64::MAX),
+        ])),
+        &[0, 1, 2, 4],
+        Some(&[true, false, true]),
+    );
+    let rows = [1, 2];
+    let selection = Selection::try_sparse(3, &rows).unwrap();
+    let recipe = prepare(&source, &target, ArrayCastFailureMode::ReportError);
+    let output = evaluate(&recipe, &input, selection);
+    let expected = list(
+        &target,
+        Arc::new(StringArray::from(vec![
+            Some("-9223372036854775808"),
+            Some("9223372036854775807"),
+        ])),
+        &[0, 0, 2],
+        Some(&[false, true]),
+    );
+    same(&output, &expected, &target);
+    let failed = list(
+        &source,
+        Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+        &[0, 0],
+        Some(&[false]),
+    );
+    let original = RowDataError::with_reason(
+        0,
+        DataFailureReason::DivisionByZero,
+        "original producer failed",
+    );
+    let selected = SelectedValues::try_new(
+        Selection::all(1),
+        source.data_type(),
+        failed,
+        vec![original.clone()].into_boxed_slice(),
+    )
+    .unwrap();
+    let recipe = prepare(&source, &target, ArrayCastFailureMode::OutputNull);
+    let actual = recipe
+        .evaluate_selected(
+            EvaluatedArgument::SelectedColumn(&selected),
+            Selection::all(1),
+            selected.errors(),
+            &Control::default(),
+        )
+        .unwrap();
+    assert_eq!(actual.errors(), &[original]);
+    assert!(actual.values().is_null(0));
+}
+#[test]
+fn signed_text_profile_does_not_enable_other_scalar_text_families() {
+    for carrier in [
+        DataType::UInt32,
+        DataType::Boolean,
+        DataType::Float64,
+        DataType::Decimal128(20, 1),
+    ] {
+        let source = ty(carrier, true, true, "unadmitted-other-text");
+        let target = ty(DataType::Utf8, true, true, "signed-text-only");
+        assert!(matches!(
+            PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &source,
+                &target,
+                DecimalOverflowPolicy::ReportError,
+                false,
+                Some(ArrayCastFailureMode::ReportError),
+                crate::binding_test_control()
+            ),
+            Err(CastPrepareError::Unsupported)
+        ));
+    }
+}

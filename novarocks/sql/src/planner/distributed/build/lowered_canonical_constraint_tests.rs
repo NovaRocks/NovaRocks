@@ -287,43 +287,66 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
 }
 
 #[test]
-fn canonical_constraint_actual_typed_empty_array_retains_full_json_item_target() {
-    // ARRAY<JSON>[] is the parser's explicit typed-array vocabulary, not a
-    // CAST([]) shortcut or a manually synthesized checked journal token.
-    let owner = crate::compiler::compile_authored_aggregate_for_test(
+fn typed_empty_array_retains_independent_unknown_owner_and_outer_json_cast() {
+    for sql in [
         "SELECT ARRAY<JSON>[] AS a FROM orders",
-    );
-    let arrays = calls(&owner, ARRAY_LITERAL);
-    assert_eq!(arrays.len(), 1);
-    let (fragment, source) = arrays[0];
-    let receipt = assert_constraint(&owner, fragment, source);
-    assert!(receipt.arguments().is_empty());
-    assert!(receipt.captured().request().arguments.is_empty());
-    assert_eq!(receipt.captured().request().logical_argument_count, 0);
-    let target = receipt.captured().binding().result_constraint().unwrap();
-    assert!(!target.nullable());
-    assert_eq!(target.logical_type(), ValueLogicalType::Physical);
-    let DataType::List(item) = &target.data_type() else {
-        panic!("typed ARRAY target");
-    };
-    assert_eq!(item.name(), "item");
-    assert_eq!(item.data_type(), &DataType::Utf8);
-    assert_eq!(
-        target.child_at(0).unwrap().logical_type(),
-        ValueLogicalType::Json
-    );
-    assert!(item.metadata().is_empty());
-    let FunctionResultType::Scalar(selected) = &receipt.canonical_selection().unwrap().result_type
-    else {
-        panic!("array scalar selection");
-    };
-    let DataType::List(selected_item) = &selected.data_type() else {
-        unreachable!();
-    };
-    assert!(Arc::ptr_eq(item, selected_item));
-    assert_public_result_fields(&owner);
-    let result = owner.plan().result_port().unwrap();
-    assert_eq!(result.fields.len(), 1);
-    assert_eq!(&result.fields[0].ty, target);
-    assert_loan_prefixes(&owner, fragment, source);
+        "SELECT CAST([] AS ARRAY<JSON>) AS a FROM orders",
+    ] {
+        let owner = crate::compiler::compile_authored_aggregate_for_test(sql);
+        let arrays = calls(&owner, ARRAY_LITERAL);
+        assert_eq!(arrays.len(), 1);
+        let (fragment, source) = arrays[0];
+        let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+        assert!(receipt.arguments().is_empty());
+        assert!(receipt.captured().request().arguments.is_empty());
+        assert_eq!(receipt.captured().request().logical_argument_count, 0);
+        assert!(receipt.captured().binding().result_constraint().is_none());
+        let selected = receipt.canonical_selection().unwrap();
+        assert_eq!(
+            selected.result_type,
+            FunctionResultType::Scalar(source.ty.clone())
+        );
+        assert_eq!(source.ty.child_at(0).unwrap().data_type(), &DataType::Null);
+        assert_eq!(
+            source.ty.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Physical
+        );
+        let mut json_casts = 0;
+        for (_, expression) in fragment.expressions().iter() {
+            if let ContractExprKind::Cast {
+                expr,
+                target,
+                array_failure_mode: Some(mode),
+                ..
+            } = &expression.kind
+            {
+                if fragment.expressions().get(*expr).unwrap().id != source.id {
+                    continue;
+                }
+                json_casts += 1;
+                assert_eq!(
+                    *mode,
+                    novarocks_type_contract::ArrayCastFailureMode::ReportError
+                );
+                assert_eq!(target, expression.ty.data_type());
+                let DataType::List(item) = expression.ty.data_type() else {
+                    panic!("outer JSON list target");
+                };
+                assert_eq!(item.name(), "item");
+                assert_eq!(item.data_type(), &DataType::Utf8);
+                assert!(item.is_nullable());
+                assert!(item.metadata().is_empty());
+                assert_eq!(
+                    expression.ty.child_at(0).unwrap().logical_type(),
+                    ValueLogicalType::Json
+                );
+                assert_public_result_fields(&owner);
+                let result = owner.plan().result_port().unwrap();
+                assert_eq!(result.fields.len(), 1);
+                assert_eq!(&result.fields[0].ty, &expression.ty);
+            }
+        }
+        assert_eq!(json_casts, 1);
+        assert_loan_prefixes(&owner, fragment, source);
+    }
 }

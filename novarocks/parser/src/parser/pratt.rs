@@ -731,22 +731,29 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     fn parse_primary_expression(&mut self) -> Result<Expr, ParseError> {
         self.skip_trivia();
         if self.current_is_word("ARRAY") && self.peek_nontrivia_is_symbol(1, Symbol::Lt) {
-            let start = self.current_span();
+            let start = self.current_span().start();
             let array_type = self.parse_type_name()?;
-            let TypeKind::Generic(mut array_type) = array_type.kind else {
+            let TypeKind::Generic(generic) = &array_type.kind else {
                 return Err(self.unexpected("ARRAY element type"));
             };
-            if array_type.arguments.len() != 1 || !self.current_is_symbol(Symbol::LBracket) {
+            if generic.arguments.len() != 1
+                || !matches!(generic.arguments.first(), Some(DataTypeParameter::Type(_)))
+            {
+                return Err(self.unexpected("ARRAY element type"));
+            }
+            if !self.current_is_symbol(Symbol::LBracket) {
                 return Err(self.unexpected("'[' after ARRAY element type"));
             }
-            let DataTypeParameter::Type(element_type) = array_type
-                .arguments
-                .pop()
-                .expect("ARRAY type checked to have one argument")
-            else {
-                return Err(self.unexpected("ARRAY element type"));
-            };
-            return self.parse_array_expression(start, Some(element_type.data_type.into_inner()));
+            let expression = self.parse_array_expression(self.current_span())?;
+            let span = Span::new(start, expression.span().end());
+            // The source type belongs to the outer CAST. ARRAY inference sees
+            // the original children without a target context.
+            return Ok(Expr::Cast(AstBox::new(CastExpr {
+                expression,
+                data_type: array_type,
+                safe: false,
+                span,
+            })));
         }
         if self.current_is_word("MAP") && self.peek_nontrivia_is_symbol(1, Symbol::LBrace) {
             let start = self.current_span().start();
@@ -880,7 +887,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             Some(Token {
                 kind: TokenKind::Symbol(Symbol::LBracket),
                 span,
-            }) => self.parse_array_expression(span, None),
+            }) => self.parse_array_expression(span),
             _ => Err(self.unexpected("expression")),
         }
     }
@@ -1852,11 +1859,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }))
     }
 
-    fn parse_array_expression(
-        &mut self,
-        opening_span: Span,
-        element_type: Option<TypeName>,
-    ) -> Result<Expr, ParseError> {
+    fn parse_array_expression(&mut self, opening_span: Span) -> Result<Expr, ParseError> {
         self.advance();
         self.skip_trivia();
         let mut elements = Vec::new();
@@ -1877,8 +1880,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let end = self.current_span().end();
         self.advance();
         Ok(Expr::Array(ArrayExpr {
-            element_type,
-            elements,
+            values: elements.into(),
             span: Span::new(opening_span.start(), end),
         }))
     }

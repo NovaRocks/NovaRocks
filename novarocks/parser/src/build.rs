@@ -626,10 +626,9 @@ pub fn group_by(expressions: Vec<Expr>) -> GroupBy {
     }
 }
 
-pub fn array(elements: Vec<Expr>) -> Expr {
+pub fn array(values: Vec<Expr>) -> Expr {
     Expr::Array(ArrayExpr {
-        element_type: None,
-        elements,
+        values: values.into(),
         span: SYNTHETIC,
     })
 }
