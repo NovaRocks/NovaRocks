@@ -274,7 +274,11 @@ fn void_of_a_nested_source_does_not_add_a_partition_distinction() {
                 Arc::new(NestedField::optional(
                     2,
                     "retired",
-                    Type::Struct(StructType::new(vec![Arc::new(NestedField::required(
+                    // The SDK splitter currently rejects Void over a struct
+                    // with required children when converting its all-NULL
+                    // result to literals. Keep this supported nested case in
+                    // the evaluator/splitter consistency matrix.
+                    Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
                         3,
                         "v",
                         Type::Primitive(PrimitiveType::Long),
