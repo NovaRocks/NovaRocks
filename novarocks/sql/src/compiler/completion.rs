@@ -3754,7 +3754,10 @@ fn catalog_selection_bytes(
     };
     let source_bytes = match &selection.version.value {
         Expr::Literal(literal) => match &literal.kind {
-            LiteralKind::Number(value) | LiteralKind::String(value) => value.len(),
+            LiteralKind::Long {
+                spelling: value, ..
+            }
+            | LiteralKind::String(value) => value.len(),
             _ => unreachable!("closed time travel selection has a numeric or string literal"),
         },
         _ => unreachable!("closed time travel selection has a literal expression"),

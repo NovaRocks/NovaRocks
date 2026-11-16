@@ -54,7 +54,6 @@ pub enum Expr {
     Struct(StructExpr),
     Lambda(LambdaExpr),
     Access(AccessExpr),
-    TypedString(TypedStringExpr),
 }
 
 impl Expr {
@@ -91,7 +90,6 @@ impl Expr {
             Self::Struct(expression) => expression.span,
             Self::Lambda(expression) => expression.span,
             Self::Access(expression) => expression.span,
-            Self::TypedString(expression) => expression.span,
         }
     }
 }
@@ -358,13 +356,6 @@ pub enum AccessKind {
 pub enum JsonOperator {
     Arrow,
     ArrowText,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TypedStringExpr {
-    pub data_type: TypeName,
-    pub value: Literal,
-    pub span: Span,
 }
 
 /// Prefix operators initially recognized by the Pratt parser.

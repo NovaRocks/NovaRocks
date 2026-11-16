@@ -102,7 +102,10 @@ fn query_suffixes_keep_specification_and_parenthesized_owners_distinct() {
     struct Numbers(Vec<String>);
     impl Visit for Numbers {
         fn visit_literal(&mut self, literal: &Literal) {
-            if let LiteralKind::Number(value) = &literal.kind {
+            if let LiteralKind::Long {
+                spelling: value, ..
+            } = &literal.kind
+            {
                 self.0.push(value.clone());
             }
         }
@@ -152,7 +155,10 @@ fn query_session_assignments_preserve_names_values_and_traversal() {
             self.names.push(ident.value.clone());
         }
         fn visit_literal(&mut self, literal: &Literal) {
-            if let LiteralKind::Number(value) = &literal.kind {
+            if let LiteralKind::Long {
+                spelling: value, ..
+            } = &literal.kind
+            {
                 self.numbers.push(value.clone());
             }
         }
@@ -175,8 +181,13 @@ fn query_session_assignments_preserve_names_values_and_traversal() {
     struct Increment;
     impl Fold for Increment {
         fn fold_literal(&mut self, mut literal: Literal) -> Literal {
-            if let LiteralKind::Number(value) = &mut literal.kind {
-                *value = (value.parse::<i64>().unwrap() + 1).to_string();
+            if let LiteralKind::Long {
+                spelling: value,
+                parsed_value,
+            } = &mut literal.kind
+            {
+                *parsed_value += 1;
+                *value = parsed_value.to_string();
             }
             literal
         }
@@ -217,7 +228,7 @@ fn identifiers_literals_and_unary_nodes_match_parser_shapes() {
     assert_expression(build::integer(i64::MIN), "-9223372036854775808");
     assert_expression(build::integer(i64::MAX), "9223372036854775807");
     assert_expression(build::string("a\\b'c"), "'a\\\\b''c'");
-    assert_expression(build::hex_string("aB01"), "X'aB01'");
+    assert_expression(build::binary_literal(vec![0xAB, 1]), "X'AB01'");
     assert_expression(build::boolean(true), "TRUE");
     assert_expression(build::boolean(false), "FALSE");
     assert_expression(build::null(), "NULL");
@@ -247,7 +258,7 @@ fn domain_authored_decimal_literals_keep_their_value_beyond_source_integer_width
     // Literal construction preserves that value; source-number admission keeps
     // its existing width check and cannot serve as the oracle for this input.
     let digits = "12345678901234567890123456789012345678";
-    let kind = ast::LiteralKind::Number(digits.into());
+    let kind = ast::LiteralKind::Decimal(digits.into());
     let value = build::literal(kind.clone());
     let Expr::Literal(literal) = value else {
         panic!("authored decimal literal");
@@ -259,7 +270,7 @@ fn domain_authored_decimal_literals_keep_their_value_beyond_source_integer_width
 
 #[test]
 fn one_field_value_tuples_remain_distinct_from_source_parentheses() {
-    let field = build::literal(ast::LiteralKind::Number(
+    let field = build::literal(ast::LiteralKind::Decimal(
         "12345678901234567890123456789012345678".into(),
     ));
     let value = build::tuple_value(vec![field.clone()]).expect("one-field value tuple");
@@ -277,52 +288,32 @@ fn one_field_value_tuples_remain_distinct_from_source_parentheses() {
 }
 
 #[test]
-fn type_nodes_preserve_nested_arguments_and_comma_trivia() {
-    let parameter = |value: i64| {
-        ast::TypeNameArgument::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(value.to_string()),
-            span: SYNTHETIC,
-        })
-    };
-    for spaced in [false, true] {
-        let decimal = build::type_name(
-            name("DECIMAL"),
-            vec![parameter(12), parameter(2)],
-            vec![spaced],
-        )
-        .expect("valid type arguments");
-        let separator = if spaced { ", " } else { "," };
-        assert_expression(
-            build::cast(build::null(), decimal),
-            &format!("CAST(NULL AS DECIMAL(12{separator}2))"),
-        );
-    }
-    let field = ast::StructField {
-        name: build::ident("a b", Some('`')),
+fn type_nodes_preserve_nested_arguments_without_comma_trivia() {
+    let decimal = build::type_name(
+        build::ident("DECIMAL", None),
+        vec![build::numeric_parameter(12), build::numeric_parameter(2)],
+    );
+    assert_expression(
+        build::cast(build::null(), decimal),
+        "CAST(NULL AS DECIMAL(12, 2))",
+    );
+    let field = ast::RowDataTypeField {
+        name: Some(build::ident("a b", Some('`'))),
         data_type: build::simple_type("INT"),
         span: SYNTHETIC,
     };
-    let structure = build::type_name(
-        name("STRUCT"),
-        vec![ast::TypeNameArgument::Field(field)],
-        Vec::new(),
-    )
-    .expect("struct field");
+    let structure = build::row_type(vec![field]);
     let array = build::type_name(
-        name("ARRAY"),
-        vec![ast::TypeNameArgument::Type(structure)],
-        Vec::new(),
-    )
-    .expect("array element");
+        build::ident("ARRAY", None),
+        vec![build::type_parameter(structure)],
+    );
     let map = build::type_name(
-        name("MAP"),
+        build::ident("MAP", None),
         vec![
-            ast::TypeNameArgument::Type(build::simple_type("STRING")),
-            ast::TypeNameArgument::Type(array),
+            build::type_parameter(build::simple_type("STRING")),
+            build::type_parameter(array),
         ],
-        vec![true],
-    )
-    .expect("map arguments");
+    );
     assert_expression(
         build::cast(build::null(), map),
         "CAST(NULL AS MAP<STRING, ARRAY<STRUCT<`a b` INT>>>)",
@@ -514,7 +505,10 @@ fn union_all_preserves_input_order_and_set_boundaries() {
         .collect::<Vec<_>>();
     assert_eq!(
         values,
-        [1, 2, 3].map(|n| ast::LiteralKind::Number(n.to_string()))
+        [1, 2, 3].map(|n| ast::LiteralKind::Long {
+            spelling: n.to_string(),
+            parsed_value: (n.to_string()).parse::<i64>().unwrap()
+        })
     );
     assert!(query("SELECT 1 UNION SELECT 2").syntax_eq(&query("SELECT 1 UNION DISTINCT SELECT 2")));
     for source in [
@@ -605,11 +599,53 @@ fn builders_reject_missing_required_structure() {
         build::qualified_wildcard(Vec::new()),
         Err(BuildError::EmptyWildcardPrefix)
     );
-    assert_eq!(
-        build::type_name(name("INT"), Vec::new(), vec![false]),
-        Err(BuildError::TypeArgumentSeparators {
-            arguments: 0,
-            separators: 1
-        }),
+}
+
+#[test]
+fn public_literals_retain_categories_decoded_bytes_and_numeric_facts() {
+    let parsed = query(
+        "SELECT 0001, 1.20, 1e0, X'ab01', DECIMAL '12345678901234567890123456789012345678', DECIMAL '-123.45', 1e999",
     );
+    let SetExpr::Select(select) = parsed.body.as_ref() else {
+        panic!("SELECT")
+    };
+    let kinds: Vec<_> = select
+        .projection
+        .iter()
+        .map(|item| {
+            let ast::SelectItem::UnnamedExpr(Expr::Literal(value)) = item else {
+                panic!("literal")
+            };
+            &value.kind
+        })
+        .collect();
+    assert!(
+        matches!(kinds[0], ast::LiteralKind::Long { spelling, parsed_value: 1 } if spelling == "0001")
+    );
+    assert!(matches!(kinds[1], ast::LiteralKind::Decimal(value) if value == "1.20"));
+    assert!(matches!(kinds[2], ast::LiteralKind::Double(value) if value.get() == 1.0));
+    assert!(matches!(kinds[3], ast::LiteralKind::Binary(value) if value == &[0xAB, 1]));
+    assert!(
+        matches!(kinds[4], ast::LiteralKind::Decimal(value) if value == "12345678901234567890123456789012345678")
+    );
+    assert!(matches!(kinds[5], ast::LiteralKind::Decimal(value) if value == "-123.45"));
+    assert!(matches!(kinds[6], ast::LiteralKind::Double(value) if value.get() == f64::INFINITY));
+    let rendered = novarocks_parser::printer::print_query(&parsed);
+    assert!(rendered.contains("DECIMAL '12345678901234567890123456789012345678'"));
+    assert!(parsed.syntax_eq(&query(&rendered)));
+    let compact = query("SELECT CAST(NULL AS DECIMAL(12,2))");
+    let spaced = query("SELECT CAST(NULL AS DECIMAL(12, 2))");
+    assert!(compact.syntax_eq(&spaced));
+}
+
+#[test]
+fn decimal_constructor_text_is_not_reinterpreted_as_an_unrelated_number_expression() {
+    // Trino's DecimalLiteral retains decoded constructor text even when the
+    // later numeric analyzer will reject its value. Printing is syntax-only.
+    for value in ["", ".", "1..2", "1-2.3", "1+2.3", "-0.0", "+2.3", "1e0"] {
+        assert_expression(
+            build::literal(ast::LiteralKind::Decimal(value.into())),
+            &format!("DECIMAL '{value}'"),
+        );
+    }
 }

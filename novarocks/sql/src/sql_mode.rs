@@ -92,7 +92,9 @@ impl SqlMode {
     pub fn from_expression(value: &ast::Expr) -> Self {
         let value = match value {
             ast::Expr::Literal(literal) => match &literal.kind {
-                ast::LiteralKind::String(value) | ast::LiteralKind::Number(value) => value.clone(),
+                ast::LiteralKind::String(value) | ast::LiteralKind::Decimal(value) => value.clone(),
+                ast::LiteralKind::Long { parsed_value, .. } => parsed_value.to_string(),
+                ast::LiteralKind::Double(value) => value.get().to_string(),
                 _ => novarocks_parser::printer::print_expr(value),
             },
             ast::Expr::Identifier(name) => name.value.clone(),
@@ -156,7 +158,13 @@ fn decimal_flag(value: &ast::Expr) -> Result<bool, crate::analyze_error::Analyze
     let text = match value {
         ast::Expr::Literal(literal) => match &literal.kind {
             ast::LiteralKind::Boolean(value) => return Ok(*value),
-            ast::LiteralKind::String(value) | ast::LiteralKind::Number(value) => value.as_str(),
+            ast::LiteralKind::String(value) => value.as_str(),
+            ast::LiteralKind::Long {
+                parsed_value: 1, ..
+            } => "1",
+            ast::LiteralKind::Long {
+                parsed_value: 0, ..
+            } => "0",
             _ => "",
         },
         ast::Expr::Identifier(name) => name.value.as_str(),

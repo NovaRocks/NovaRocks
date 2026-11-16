@@ -65,12 +65,12 @@ fn roundtrip_seed_ast_printer_contracts_cover_vertical_slice_and_expressions() {
         BinaryOperator::Multiply,
         binary(
             Expr::Literal(Literal {
-                kind: LiteralKind::Number("01.5e+2".to_owned()),
+                kind: LiteralKind::Double(novarocks_parser::ast::DoubleValue::from_f64(150.0)),
                 span: span(),
             }),
             BinaryOperator::Add,
             ident("c"),
         ),
     );
-    assert_eq!(print_expr(&expression), "a * (01.5e+2 + c)");
+    assert_eq!(print_expr(&expression), "a * (1.5e2 + c)");
 }

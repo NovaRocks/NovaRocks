@@ -1276,11 +1276,14 @@ impl<'a> AnalyzerContext<'a> {
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
         for gb_expr in &group_by_exprs {
             if let ast::Expr::Literal(ast::Literal {
-                kind: ast::LiteralKind::Number(n),
+                kind:
+                    ast::LiteralKind::Long {
+                        parsed_value: n, ..
+                    },
                 ..
             }) = gb_expr
             {
-                let pos = n.parse::<usize>().map_err(|e| {
+                let pos = usize::try_from(*n).map_err(|e| {
                     AnalyzeError::invalid_literal(
                         format!("invalid GROUP BY position: {e}"),
                         gb_expr.span(),
@@ -2577,11 +2580,14 @@ impl<'a> AnalyzerContext<'a> {
             // to a numeric literal reference (ORDER BY 1, 2, ...)
             let typed = match &ob.expr {
                 ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::Number(n),
+                    kind:
+                        ast::LiteralKind::Long {
+                            parsed_value: n, ..
+                        },
                     ..
                 }) => {
                     // Positional reference: ORDER BY 1
-                    let pos: usize = n.parse::<usize>().map_err(|e| {
+                    let pos: usize = usize::try_from(*n).map_err(|e| {
                         AnalyzeError::invalid_literal(
                             format!("invalid ORDER BY position: {e}"),
                             ob.expr.span(),
@@ -3128,7 +3134,10 @@ impl ast::Fold for GroupingDisplayFolder<'_> {
             && let Some(index) = self.calls.iter().position(|call| call.syntax == *function)
         {
             return ast::Expr::Literal(ast::Literal {
-                kind: ast::LiteralKind::Number((-9000 - index as i64).to_string()),
+                kind: ast::LiteralKind::Long {
+                    spelling: (-9000 - index as i64).to_string(),
+                    parsed_value: -9000 - index as i64,
+                },
                 span: function.span,
             });
         }

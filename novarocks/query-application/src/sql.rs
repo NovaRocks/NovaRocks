@@ -638,12 +638,14 @@ fn lower_iceberg_partition_field(
         Ok(parts.into_iter().next().expect("checked one path segment"))
     };
     let positive_u32 = |literal: &novarocks_parser::ast::Literal, label: &str| {
-        let LiteralKind::Number(value) = &literal.kind else {
+        let LiteralKind::Long {
+            parsed_value: value,
+            ..
+        } = &literal.kind
+        else {
             return Err(format!("Iceberg {label} requires a numeric literal"));
         };
-        value
-            .parse::<u32>()
-            .map_err(|_| format!("Iceberg {label} must fit u32"))
+        u32::try_from(*value).map_err(|_| format!("Iceberg {label} must fit u32"))
     };
     Ok(match field {
         IcebergPartitionField::Identity { column: value, .. } => {
@@ -686,60 +688,68 @@ fn lower_iceberg_partition_field(
 }
 
 fn lower_sql_type(type_name: &novarocks_parser::ast::TypeName) -> Result<SqlType, String> {
-    use novarocks_parser::ast::TypeNameArgument;
+    use novarocks_parser::ast::{DataTypeParameter, DateTimeType, TypeKind};
 
-    let name = type_name
-        .name
-        .parts
-        .last()
-        .ok_or_else(|| "type name is empty".to_string())?
-        .value
-        .to_ascii_lowercase();
-    if type_name.name.parts.len() != 1 {
-        return Err(format!("qualified type name `{name}` is not supported"));
-    }
+    let generic = match &type_name.kind {
+        TypeKind::Generic(generic) => generic,
+        TypeKind::Row(row) => {
+            return Ok(SqlType::Struct(
+                row.fields
+                    .iter()
+                    .map(|field| {
+                        let name = field
+                            .name
+                            .as_ref()
+                            .ok_or("ROW schema type requires named fields")?;
+                        Ok((name.value.clone(), lower_sql_type(&field.data_type)?))
+                    })
+                    .collect::<Result<_, String>>()?,
+            ));
+        }
+        TypeKind::DateTime(value) => {
+            let supported_precision = value.precision.as_ref().is_none_or(|parameter| {
+                matches!(parameter.as_ref(), DataTypeParameter::Numeric(number) if number.parsed_value == 6)
+            });
+            if value.with_time_zone || !supported_precision {
+                return Err("Iceberg schema supports only TIME/TIMESTAMP without time zone at microsecond precision".into());
+            }
+            return Ok(match value.kind {
+                DateTimeType::Time => SqlType::Time,
+                DateTimeType::Timestamp => SqlType::DateTime,
+            });
+        }
+        TypeKind::Interval(_) => return Err("INTERVAL schema types are not supported".into()),
+        TypeKind::ExplicitArray(_) => {
+            return Err("explicit ARRAY schema lengths are not supported".into());
+        }
+    };
+    let name = generic.name.value.to_ascii_lowercase();
     match name.as_str() {
         "array" => {
-            let [TypeNameArgument::Type(element)] = type_name.arguments.as_slice() else {
+            let [DataTypeParameter::Type(element)] = generic.arguments.as_slice() else {
                 return Err("ARRAY type requires one element type".to_string());
             };
-            Ok(SqlType::Array(Box::new(lower_sql_type(element)?)))
+            Ok(SqlType::Array(Box::new(lower_sql_type(
+                &element.data_type,
+            )?)))
         }
         "map" => {
-            let [TypeNameArgument::Type(key), TypeNameArgument::Type(value)] =
-                type_name.arguments.as_slice()
+            let [DataTypeParameter::Type(key), DataTypeParameter::Type(value)] =
+                generic.arguments.as_slice()
             else {
                 return Err("MAP type requires key and value types".to_string());
             };
             Ok(SqlType::Map(
-                Box::new(lower_sql_type(key)?),
-                Box::new(lower_sql_type(value)?),
+                Box::new(lower_sql_type(&key.data_type)?),
+                Box::new(lower_sql_type(&value.data_type)?),
             ))
         }
-        "struct" => Ok(SqlType::Struct(
-            type_name
-                .arguments
-                .iter()
-                .map(|argument| match argument {
-                    TypeNameArgument::Field(field) => {
-                        Ok((field.name.value.clone(), lower_sql_type(&field.data_type)?))
-                    }
-                    _ => Err("STRUCT type requires named fields".to_string()),
-                })
-                .collect::<Result<_, String>>()?,
-        )),
         "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
-            let values = type_name
+            let values = generic
                 .arguments
                 .iter()
                 .map(|argument| match argument {
-                    TypeNameArgument::Literal(literal) => {
-                        if let novarocks_parser::ast::LiteralKind::Number(value) = &literal.kind {
-                            Ok(value.as_str())
-                        } else {
-                            Err("DECIMAL precision and scale must be numeric literals".to_string())
-                        }
-                    }
+                    DataTypeParameter::Numeric(value) => Ok(value.parsed_value),
                     _ => Err("DECIMAL precision and scale must be numeric literals".to_string()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -749,18 +759,14 @@ fn lower_sql_type(type_name: &novarocks_parser::ast::TypeName) -> Result<SqlType
             let precision = values
                 .first()
                 .map(|value| {
-                    value
-                        .parse::<u8>()
-                        .map_err(|_| "DECIMAL precision must fit u8".to_string())
+                    u8::try_from(*value).map_err(|_| "DECIMAL precision must fit u8".to_string())
                 })
                 .transpose()?
                 .unwrap_or(38);
             let scale = values
                 .get(1)
                 .map(|value| {
-                    value
-                        .parse::<i8>()
-                        .map_err(|_| "DECIMAL scale must fit i8".to_string())
+                    i8::try_from(*value).map_err(|_| "DECIMAL scale must fit i8".to_string())
                 })
                 .transpose()?
                 .unwrap_or(0);
@@ -901,39 +907,17 @@ fn lower_command_literal(
     match &literal.kind {
         LiteralKind::Null => Ok(CommandLiteral::Null),
         LiteralKind::Boolean(value) => Ok(CommandLiteral::Bool(*value)),
-        LiteralKind::Number(value) => Ok(CommandLiteral::Number(value.clone())),
+        LiteralKind::Long { parsed_value, .. } => {
+            Ok(CommandLiteral::Number(parsed_value.to_string()))
+        }
+        LiteralKind::Double(value) => Ok(CommandLiteral::Number(format!("{:?}", value.get()))),
+        LiteralKind::Decimal(value) => Ok(CommandLiteral::Number(value.clone())),
         LiteralKind::String(value) => Ok(CommandLiteral::String(value.clone())),
-        LiteralKind::HexString(value) => {
-            let digits = value
-                .strip_prefix("0x")
-                .or_else(|| value.strip_prefix("0X"))
-                .unwrap_or(value);
-            decode_hex_literal(digits)
-                .map(CommandLiteral::Binary)
-                .map_err(|error| format!("invalid hex literal X'{value}': {error}"))
+        LiteralKind::Binary(value) => Ok(CommandLiteral::Binary(value.clone())),
+        LiteralKind::Generic(_) | LiteralKind::Interval(_) => {
+            Err("typed literals are not supported in command arguments".into())
         }
     }
-}
-
-fn decode_hex_literal(value: &str) -> Result<Vec<u8>, &'static str> {
-    if !value.len().is_multiple_of(2) {
-        return Err("hex literal has an odd number of digits");
-    }
-    value
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let digit = |value: u8| match value {
-                b'0'..=b'9' => Ok(value - b'0'),
-                b'a'..=b'f' => Ok(value - b'a' + 10),
-                b'A'..=b'F' => Ok(value - b'A' + 10),
-                _ => Err("hex literal contains a non-hex digit"),
-            };
-            Ok((digit(pair[0])? << 4) | digit(pair[1])?)
-        })
-        .collect()
 }
 
 fn lower_object_name(name: &novarocks_parser::ast::ObjectName) -> ObjectName {
@@ -1135,6 +1119,139 @@ mod tests {
         CommandLiteral, ExpireSnapshotsOptionSql, MaintenanceValueSql,
     };
     use novarocks_sql::semantic::{CatalogSqlCommand, MaintenanceSqlCommand, StatisticsSqlCommand};
+
+    #[test]
+    fn schema_type_lowering_uses_structured_children_and_named_rows() {
+        use novarocks_parser::{SYNTHETIC, ast, build};
+        use novarocks_types::schema::SqlType;
+        let row = build::row_type(vec![ast::RowDataTypeField {
+            name: Some(build::ident("payload", None)),
+            data_type: build::type_name(
+                build::ident("ARRAY", None),
+                vec![build::type_parameter(build::simple_type("INT"))],
+            ),
+            span: SYNTHETIC,
+        }]);
+        assert_eq!(
+            super::lower_sql_type(&row).unwrap(),
+            SqlType::Struct(vec![(
+                "payload".into(),
+                SqlType::Array(Box::new(SqlType::Int))
+            )])
+        );
+        let anonymous = build::row_type(vec![ast::RowDataTypeField {
+            name: None,
+            data_type: build::simple_type("INT"),
+            span: SYNTHETIC,
+        }]);
+        assert!(
+            super::lower_sql_type(&anonymous)
+                .unwrap_err()
+                .contains("named fields")
+        );
+        let decimal = build::type_name(
+            build::ident("DECIMAL", None),
+            vec![build::numeric_parameter(38), build::numeric_parameter(9)],
+        );
+        assert_eq!(
+            super::lower_sql_type(&decimal).unwrap(),
+            SqlType::Decimal {
+                precision: 38,
+                scale: 9
+            }
+        );
+        let overflow = build::type_name(
+            build::ident("DECIMAL", None),
+            vec![build::numeric_parameter(256)],
+        );
+        assert!(
+            super::lower_sql_type(&overflow)
+                .unwrap_err()
+                .contains("fit u8")
+        );
+    }
+
+    #[test]
+    fn schema_types_refuse_unrepresentable_temporal_and_explicit_array_facts() {
+        use novarocks_parser::{SYNTHETIC, ast, build};
+        for kind in [ast::DateTimeType::Time, ast::DateTimeType::Timestamp] {
+            for precision in [None, Some(6), Some(3)] {
+                for with_time_zone in [false, true] {
+                    let ty = ast::TypeName {
+                        kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
+                            kind,
+                            with_time_zone,
+                            precision: precision
+                                .map(|value| build::numeric_parameter(value).into()),
+                        }),
+                        span: SYNTHETIC,
+                    };
+                    assert_eq!(
+                        super::lower_sql_type(&ty).is_ok(),
+                        !with_time_zone && precision.is_none_or(|value| value == 6)
+                    );
+                }
+            }
+        }
+        let ty = ast::TypeName {
+            kind: ast::TypeKind::ExplicitArray(ast::ExplicitArrayDataType {
+                element: build::simple_type("INT").into(),
+                length: ast::ArrayLength {
+                    spelling: "99999999999999999999999999999".into(),
+                    span: SYNTHETIC,
+                },
+            }),
+            span: SYNTHETIC,
+        };
+        assert!(
+            super::lower_sql_type(&ty)
+                .unwrap_err()
+                .contains("explicit ARRAY")
+        );
+    }
+
+    #[test]
+    fn command_literals_preserve_numeric_category_and_binary_payload() {
+        use novarocks_parser::{SYNTHETIC, ast};
+        let lower = |kind| {
+            super::lower_command_literal(&ast::Literal {
+                kind,
+                span: SYNTHETIC,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            lower(ast::LiteralKind::Long {
+                spelling: "0x10".into(),
+                parsed_value: 16
+            }),
+            CommandLiteral::Number("16".into())
+        );
+        assert_eq!(
+            lower(ast::LiteralKind::Double(ast::DoubleValue::from_f64(1.0))),
+            CommandLiteral::Number("1.0".into())
+        );
+        assert_eq!(
+            lower(ast::LiteralKind::Decimal(
+                "12345678901234567890.00100".into()
+            )),
+            CommandLiteral::Number("12345678901234567890.00100".into())
+        );
+        assert_eq!(
+            lower(ast::LiteralKind::Binary(vec![0, 255, 39, 92])),
+            CommandLiteral::Binary(vec![0, 255, 39, 92])
+        );
+        assert!(
+            super::lower_command_literal(&ast::Literal {
+                kind: ast::LiteralKind::Generic(ast::GenericLiteral {
+                    type_name: "DATE".into(),
+                    value: "2020-01-01".into()
+                }),
+                span: SYNTHETIC
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn accepts_one_parser_statement() {

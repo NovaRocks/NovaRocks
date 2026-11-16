@@ -208,7 +208,10 @@ fn named_window(
 
 fn number(value: &str) -> novarocks_parser::ast::Expr {
     novarocks_parser::ast::Expr::Literal(novarocks_parser::ast::Literal {
-        kind: novarocks_parser::ast::LiteralKind::Number(value.to_owned()),
+        kind: novarocks_parser::ast::LiteralKind::Long {
+            spelling: value.to_owned(),
+            parsed_value: (value.to_owned()).parse::<i64>().unwrap(),
+        },
         span: SPAN,
     })
 }

@@ -296,7 +296,9 @@ fn serialize_literal(
     use arrow::datatypes::{DataType, TimeUnit};
     let (raw, was_negated): (String, bool) = match lit_expr {
         Expr::Literal(literal) => match &literal.kind {
-            LiteralKind::Number(s) => (s.clone(), false),
+            LiteralKind::Long { parsed_value, .. } => (parsed_value.to_string(), false),
+            LiteralKind::Double(value) => (format!("{:?}", value.get()), false),
+            LiteralKind::Decimal(s) => (s.clone(), false),
             LiteralKind::String(s) => (s.clone(), false),
             LiteralKind::Boolean(b) => return Ok(if *b { "1".into() } else { "0".into() }),
             LiteralKind::Null => {
@@ -313,12 +315,16 @@ fn serialize_literal(
         },
         Expr::Unary(expression) if expression.operator == UnaryOperator::Minus => {
             match expression.expression.as_ref() {
-                Expr::Literal(literal) if matches!(&literal.kind, LiteralKind::Number(_)) => {
-                    let LiteralKind::Number(s) = &literal.kind else {
-                        unreachable!()
-                    };
-                    (s.clone(), true)
-                }
+                Expr::Literal(literal) => match &literal.kind {
+                    LiteralKind::Long { parsed_value, .. } => (parsed_value.to_string(), true),
+                    LiteralKind::Double(value) => (format!("{:?}", value.get()), true),
+                    LiteralKind::Decimal(s) => (s.clone(), true),
+                    _ => {
+                        return Err(format!(
+                            "unsupported negated literal for column '{column_name}'"
+                        ));
+                    }
+                },
                 _ => {
                     return Err(format!(
                         "unsupported negated literal for column '{column_name}'"

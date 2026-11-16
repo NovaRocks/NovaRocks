@@ -809,7 +809,6 @@ impl Printer {
             Expr::Struct(expression) => self.write_struct_expr(expression),
             Expr::Lambda(expression) => self.write_lambda_expr(expression),
             Expr::Access(expression) => self.write_access_expr(expression),
-            Expr::TypedString(expression) => self.write_typed_string_expr(expression),
         }
     }
 
@@ -836,41 +835,124 @@ impl Printer {
         }
     }
 
-    fn write_type_name(&mut self, type_name: &TypeName) {
-        self.write_object_name(&type_name.name);
-        if type_name.arguments.is_empty() {
-            return;
-        }
-        let generic = matches!(
-            type_name
-                .name
-                .parts
-                .last()
-                .map(|part| part.value.to_ascii_uppercase())
-                .as_deref(),
-            Some("ARRAY" | "MAP" | "STRUCT")
-        );
-        self.output.push(if generic { '<' } else { '(' });
-        for (index, argument) in type_name.arguments.iter().enumerate() {
-            if index != 0 {
-                self.output
-                    .push_str(if type_name.argument_separator_spaces[index - 1] {
-                        ", "
-                    } else {
-                        ","
-                    });
-            }
-            match argument {
-                TypeNameArgument::Type(data_type) => self.write_type_name(data_type),
-                TypeNameArgument::Literal(literal) => self.write_literal(literal),
-                TypeNameArgument::Field(field) => {
-                    self.write_ident(&field.name);
-                    self.output.push(' ');
-                    self.write_type_name(&field.data_type);
+    #[recursive::recursive]
+    fn write_type_name(&mut self, node: &TypeName) {
+        match &node.kind {
+            TypeKind::Generic(value) => {
+                self.write_ident(&value.name);
+                if !value.arguments.is_empty() {
+                    let angle = matches!(
+                        value.name.value.to_ascii_uppercase().as_str(),
+                        "ARRAY" | "MAP"
+                    );
+                    self.output.push(if angle { '<' } else { '(' });
+                    for (i, arg) in value.arguments.iter().enumerate() {
+                        if i > 0 {
+                            self.output.push_str(", ");
+                        }
+                        self.write_data_type_parameter(arg);
+                    }
+                    self.output.push(if angle { '>' } else { ')' });
                 }
             }
+            TypeKind::Row(value) => {
+                self.output.push_str("STRUCT<");
+                for (i, field) in value.fields.iter().enumerate() {
+                    if i > 0 {
+                        self.output.push_str(", ");
+                    }
+                    if let Some(name) = &field.name {
+                        self.write_ident(name);
+                        self.output.push(' ');
+                    }
+                    self.write_type_name(&field.data_type);
+                }
+                self.output.push('>');
+            }
+            TypeKind::DateTime(value) => {
+                self.output.push_str(match value.kind {
+                    DateTimeType::Time => "TIME",
+                    DateTimeType::Timestamp => "TIMESTAMP",
+                });
+                if let Some(precision) = &value.precision {
+                    self.output.push('(');
+                    self.write_data_type_parameter(precision);
+                    self.output.push(')');
+                }
+                if value.with_time_zone {
+                    self.output.push_str(" WITH TIME ZONE");
+                }
+            }
+            TypeKind::Interval(value) => {
+                self.output.push_str("INTERVAL ");
+                self.write_interval_qualifier(&value.qualifier);
+            }
+            TypeKind::ExplicitArray(value) => {
+                self.write_type_name(&value.element);
+                self.output.push_str(" ARRAY[");
+                self.output.push_str(&value.length.spelling);
+                self.output.push(']');
+            }
         }
-        self.output.push(if generic { '>' } else { ')' });
+    }
+
+    fn write_data_type_parameter(&mut self, value: &DataTypeParameter) {
+        match value {
+            DataTypeParameter::Numeric(value) => self.output.push_str(&value.spelling),
+            DataTypeParameter::Type(value) => self.write_type_name(&value.data_type),
+        }
+    }
+
+    fn write_interval_qualifier_field(&mut self, field: &IntervalQualifierField) {
+        self.output.push_str(match field {
+            IntervalQualifierField::Year => "YEAR",
+            IntervalQualifierField::Month => "MONTH",
+            IntervalQualifierField::Day => "DAY",
+            IntervalQualifierField::Hour => "HOUR",
+            IntervalQualifierField::Minute => "MINUTE",
+            IntervalQualifierField::Second { .. } => "SECOND",
+        });
+        if let IntervalQualifierField::Second {
+            fractional_precision: Some(p),
+        } = field
+        {
+            self.output.push('(');
+            self.write_data_type_parameter(p);
+            self.output.push(')');
+        }
+    }
+
+    fn write_interval_qualifier(&mut self, value: &IntervalQualifier) {
+        let (first, precision, last) = match value {
+            IntervalQualifier::Simple(v) => (&v.field, &v.precision, None),
+            IntervalQualifier::Composite(v) => (&v.from, &v.precision, Some(&v.to)),
+        };
+        if let IntervalQualifierField::Second {
+            fractional_precision,
+        } = first
+        {
+            self.output.push_str("SECOND");
+            if let Some(leading) = precision {
+                self.output.push('(');
+                self.write_data_type_parameter(leading);
+                if let Some(fractional) = fractional_precision {
+                    self.output.push_str(", ");
+                    self.write_data_type_parameter(fractional);
+                }
+                self.output.push(')');
+            }
+        } else {
+            self.write_interval_qualifier_field(first);
+            if let Some(p) = precision {
+                self.output.push('(');
+                self.write_data_type_parameter(p);
+                self.output.push(')');
+            }
+        }
+        if let Some(last) = last {
+            self.output.push_str(" TO ");
+            self.write_interval_qualifier_field(last);
+        }
     }
 
     fn write_literal(&mut self, literal: &Literal) {
@@ -879,13 +961,59 @@ impl Printer {
             LiteralKind::Boolean(value) => {
                 self.output.push_str(if *value { "TRUE" } else { "FALSE" })
             }
-            LiteralKind::Number(value) => self.output.push_str(value),
-            LiteralKind::HexString(value) => {
+            LiteralKind::Long { spelling, .. } => self.output.push_str(spelling),
+            LiteralKind::Decimal(value) => {
+                // Integer text in a DECIMAL string constructor must remain a
+                // decimal node after printing, independent of integer width.
+                if value.bytes().filter(|byte| *byte == b'.').count() == 1
+                    && value.bytes().any(|byte| byte.is_ascii_digit())
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+                {
+                    self.output.push_str(value);
+                } else {
+                    self.output.push_str("DECIMAL ");
+                    self.write_quoted_string(value);
+                }
+            }
+            LiteralKind::Double(value) => {
+                if value.get().is_finite() {
+                    self.output.push_str(&format!("{:e}", value.get()));
+                } else if value.get().is_infinite() {
+                    self.output.push_str(if value.get().is_sign_negative() {
+                        "-1e999"
+                    } else {
+                        "1e999"
+                    });
+                } else {
+                    self.output.push_str("DOUBLE ");
+                    self.write_quoted_string("NaN");
+                }
+            }
+            LiteralKind::Binary(value) => {
+                use std::fmt::Write;
                 self.output.push_str("X'");
-                self.output.push_str(value);
+                for byte in value {
+                    write!(self.output, "{byte:02X}").expect("writing to a String");
+                }
                 self.output.push('\'');
             }
             LiteralKind::String(value) => self.write_quoted_string(value),
+            LiteralKind::Generic(value) => {
+                self.output.push_str(&value.type_name);
+                self.output.push(' ');
+                self.write_quoted_string(&value.value);
+            }
+            LiteralKind::Interval(value) => {
+                self.output.push_str("INTERVAL ");
+                if value.sign == IntervalSign::Negative {
+                    self.output.push('-');
+                }
+                self.write_quoted_string(&value.value);
+                self.output.push(' ');
+                self.write_interval_qualifier(&value.qualifier);
+            }
         }
     }
 
@@ -1015,7 +1143,7 @@ impl Printer {
             && !matches!(expression.operator, UnaryOperator::Not))
             || (expression.operator == UnaryOperator::Minus
                 && matches!(expression.expression.as_ref(), Expr::Literal(Literal {
-                    kind: LiteralKind::Number(value), ..
+                    kind: LiteralKind::Long { spelling: value, .. }, ..
                 }) if value.starts_with('-')));
         if requires_separator {
             self.output.push(' ');
@@ -1319,12 +1447,6 @@ impl Printer {
             }
         }
     }
-    fn write_typed_string_expr(&mut self, expression: &TypedStringExpr) {
-        self.write_type_name(&expression.data_type);
-        self.output.push(' ');
-        self.write_literal(&expression.value);
-    }
-
     fn write_expr_list(&mut self, expressions: &[Expr]) {
         for (index, expression) in expressions.iter().enumerate() {
             if index != 0 {
@@ -2143,7 +2265,10 @@ mod tests {
 
     fn number(value: &str) -> Expr {
         Expr::Literal(Literal {
-            kind: LiteralKind::Number(value.to_owned()),
+            kind: LiteralKind::Long {
+                spelling: value.to_owned(),
+                parsed_value: (value.to_owned()).parse::<i64>().unwrap(),
+            },
             span: span(),
         })
     }

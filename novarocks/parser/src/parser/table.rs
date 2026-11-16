@@ -3,14 +3,16 @@
 
 //! Table DDL grammar owned by SQLP-5.
 
+use crate::ast::{AstBox, TypeParameter};
+
 use super::{StatementParser, query};
 use crate::{
     ParseError, Span,
     ast::{
-        ColumnDefinition, CreateTable, CreateTableAsSelect, DmlStatement, LegacyRangePartition,
-        LegacyRangePartitionDefinition, Literal, LiteralKind, PartitionTransform, Statement,
-        TableDistribution, TableKey, TableKeyKind, TablePartition, TablePartitionTransform,
-        TableProperty, TableStatement, TypeName, TypeNameArgument,
+        ColumnDefinition, CreateTable, CreateTableAsSelect, DataTypeParameter, DmlStatement,
+        LegacyRangePartition, LegacyRangePartitionDefinition, Literal, LiteralKind,
+        PartitionTransform, Statement, TableDistribution, TableKey, TableKeyKind, TablePartition,
+        TablePartitionTransform, TableProperty, TableStatement, TypeName,
     },
     token::Symbol,
 };
@@ -284,60 +286,53 @@ fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, Par
         end = part.span.end();
         parts.push(part);
     }
-    let name = crate::ast::ObjectName {
-        parts,
-        span: Span::new(start, end),
-    };
+    if parts.len() != 1 {
+        return Err(parser.unexpected("unqualified type name"));
+    }
+    let name = parts.pop().expect("first type identifier");
     let mut arguments = vec![];
-    let mut argument_separator_spaces = vec![];
+    let mut fields = None;
     if parser.consume_if_symbol(Symbol::LParen) {
         loop {
             let literal = parser.parse_literal()?;
-            if !matches!(literal.kind, LiteralKind::Number(_)) {
+            if !matches!(literal.kind, LiteralKind::Long { .. }) {
                 return Err(parser.unexpected("numeric type parameter"));
             }
-            end = literal.span.end();
-            arguments.push(TypeNameArgument::Literal(literal));
-            if parser.consume_if_symbol(Symbol::RParen) {
+            arguments.push(super::numeric_type_parameter(literal)?);
+            if parser.current_is_symbol(Symbol::RParen) {
+                end = parser.consume_symbol(Symbol::RParen)?.end();
                 break;
             }
             parser.consume_symbol(Symbol::Comma)?;
-            argument_separator_spaces.push(true);
         }
     } else if parser.consume_if_symbol(Symbol::Lt) {
-        let struct_type = name
-            .parts
-            .last()
-            .is_some_and(|v| v.value.eq_ignore_ascii_case("STRUCT"));
+        let struct_type = name.value.eq_ignore_ascii_case("STRUCT");
         loop {
             if struct_type {
                 let field_start = parser.current_span().start();
                 let field_name = parser.parse_contextual_ident()?;
                 let data_type = parse_type_name(parser)?;
                 let field_end = data_type.span.end();
-                arguments.push(TypeNameArgument::Field(crate::ast::StructField {
-                    name: field_name,
-                    data_type,
-                    span: Span::new(field_start, field_end),
-                }));
+                fields
+                    .get_or_insert_with(Vec::new)
+                    .push(crate::ast::RowDataTypeField {
+                        name: Some(field_name),
+                        data_type,
+                        span: Span::new(field_start, field_end),
+                    });
             } else {
                 let data_type = parse_type_name(parser)?;
-                arguments.push(TypeNameArgument::Type(data_type));
+                arguments.push(DataTypeParameter::Type(TypeParameter {
+                    data_type: AstBox::new(data_type),
+                }));
             }
-            if !parser.has_pending_type_gt() && parser.consume_if_symbol(Symbol::Comma) {
-                argument_separator_spaces.push(true);
-            } else {
+            if parser.has_pending_type_gt() || !parser.consume_if_symbol(Symbol::Comma) {
                 end = parser.consume_type_gt()?.end();
                 break;
             }
         }
     }
-    Ok(TypeName {
-        name,
-        arguments,
-        argument_separator_spaces,
-        span: Span::new(start, end),
-    })
+    super::finish_type_name(name, arguments, fields, Span::new(start, end))
 }
 
 fn aggregation_word(parser: &StatementParser<'_, '_>) -> bool {
@@ -389,7 +384,10 @@ fn parse_distribution(
     let mut end = columns.last().map_or(start, |v| v.span.end());
     let buckets = if parser.consume_if_word("BUCKETS") {
         let literal = parser.parse_literal()?;
-        let LiteralKind::Number(value) = &literal.kind else {
+        let LiteralKind::Long {
+            spelling: value, ..
+        } = &literal.kind
+        else {
             return Err(parser.unexpected("BUCKETS number"));
         };
         let value = value
@@ -519,7 +517,10 @@ fn transform(parser: &mut StatementParser<'_, '_>) -> Result<PartitionTransform,
     if word == "BUCKET" || word == "TRUNCATE" {
         parser.consume_symbol(Symbol::Comma)?;
         let literal = parser.parse_literal()?;
-        let LiteralKind::Number(value) = literal.kind else {
+        let LiteralKind::Long {
+            spelling: value, ..
+        } = literal.kind
+        else {
             return Err(parser.unexpected("positive transform width"));
         };
         let value = value

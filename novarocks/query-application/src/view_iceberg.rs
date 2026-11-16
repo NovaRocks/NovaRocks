@@ -112,7 +112,11 @@ pub(crate) fn create_external_view(
             target,
             columns,
             definition,
-            comment: statement.comment.as_ref().map(literal_to_string),
+            comment: statement
+                .comment
+                .as_ref()
+                .map(literal_to_string)
+                .transpose()?,
             or_replace: statement.or_replace,
             if_not_exists: statement.if_not_exists,
             properties: Vec::new(),
@@ -122,14 +126,19 @@ pub(crate) fn create_external_view(
     Ok(ViewStatementResult::Ok)
 }
 
-fn literal_to_string(literal: &novarocks_parser::ast::Literal) -> String {
-    match &literal.kind {
-        novarocks_parser::ast::LiteralKind::String(value)
-        | novarocks_parser::ast::LiteralKind::HexString(value)
-        | novarocks_parser::ast::LiteralKind::Number(value) => value.clone(),
-        novarocks_parser::ast::LiteralKind::Null => "NULL".to_string(),
-        novarocks_parser::ast::LiteralKind::Boolean(value) => value.to_string(),
-    }
+fn literal_to_string(literal: &novarocks_parser::ast::Literal) -> Result<String, String> {
+    use novarocks_parser::ast::LiteralKind;
+    Ok(match &literal.kind {
+        LiteralKind::String(value) | LiteralKind::Decimal(value) => value.clone(),
+        LiteralKind::Long { parsed_value, .. } => parsed_value.to_string(),
+        LiteralKind::Double(value) => format!("{:?}", value.get()),
+        LiteralKind::Binary(value) => value.iter().map(|byte| format!("{byte:02X}")).collect(),
+        LiteralKind::Null => "NULL".to_string(),
+        LiteralKind::Boolean(value) => value.to_string(),
+        LiteralKind::Generic(_) | LiteralKind::Interval(_) => {
+            return Err("typed view comments are not supported".into());
+        }
+    })
 }
 
 pub(crate) fn drop_external_view(

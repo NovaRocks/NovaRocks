@@ -163,11 +163,14 @@ fn partition_u32_argument(arguments: &[MaterializedViewPartitionArgument], trans
     let Some(MaterializedViewPartitionArgument::Literal(value)) = arguments.get(1) else {
         unreachable!("MV {transform} partition transform was validated during SQL admission");
     };
-    let LiteralKind::Number(value) = &value.kind else {
+    let LiteralKind::Long {
+        parsed_value: value,
+        ..
+    } = &value.kind
+    else {
         unreachable!("MV {transform} partition transform was validated during SQL admission");
     };
-    let value = value
-        .parse::<u32>()
+    let value = u32::try_from(*value)
         .expect("MV partition numeric argument was validated during SQL admission");
     assert!(
         value > 0,

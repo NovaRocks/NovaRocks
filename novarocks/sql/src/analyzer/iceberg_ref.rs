@@ -196,14 +196,8 @@ pub fn parse_time_travel_selection(
     match version.kind {
         TableVersionKind::ForVersionAsOf => match &version.value {
             Expr::Literal(literal) => match &literal.kind {
-                LiteralKind::Number(n) => {
-                    let snapshot_id: i64 = n.parse().map_err(|_| {
-                        AnalyzeError::invalid_literal(
-                            format!("iceberg time travel: invalid snapshot id '{n}' for {fully_qualified_name}"),
-                            literal.span,
-                        )
-                    })?;
-                    Ok(SqlTimeTravelSelection::SnapshotId(snapshot_id))
+                LiteralKind::Long { parsed_value, .. } => {
+                    Ok(SqlTimeTravelSelection::SnapshotId(*parsed_value))
                 }
                 LiteralKind::String(s) => Ok(SqlTimeTravelSelection::NamedReference(s.clone())),
                 other => Err(AnalyzeError::invalid_literal(
@@ -275,14 +269,7 @@ pub fn resolve_read_binding(
 fn resolve_timestamp_expr(expr: &Expr, fully_qualified_name: &str) -> Result<i64, AnalyzeError> {
     match expr {
         Expr::Literal(literal) => match &literal.kind {
-            LiteralKind::Number(n) => n.parse::<i64>().map_err(|_| {
-                AnalyzeError::invalid_literal(
-                    format!(
-                        "iceberg time travel: invalid epoch-ms value '{n}' for {fully_qualified_name}"
-                    ),
-                    literal.span,
-                )
-            }),
+            LiteralKind::Long { parsed_value, .. } => Ok(*parsed_value),
             LiteralKind::String(s) => parse_timestamp_string(s, fully_qualified_name, literal.span),
             other => Err(AnalyzeError::invalid_literal(
                 format!(
@@ -438,7 +425,10 @@ mod tests {
 
     fn val_num(n: &str) -> Expr {
         Expr::Literal(Literal {
-            kind: LiteralKind::Number(n.to_string()),
+            kind: LiteralKind::Long {
+                spelling: n.to_string(),
+                parsed_value: n.parse().expect("snapshot fixture is a signed integer"),
+            },
             span: span(),
         })
     }

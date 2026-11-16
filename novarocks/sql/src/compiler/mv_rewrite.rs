@@ -3111,8 +3111,7 @@ impl Visit for CompletionRetainedBytes {
             | Expr::Cast(_)
             | Expr::Interval(_)
             | Expr::Subquery(_)
-            | Expr::Access(_)
-            | Expr::TypedString(_) => {}
+            | Expr::Access(_) => {}
         }
         walk_expr(self, expression);
     }
@@ -3130,21 +3129,81 @@ impl Visit for CompletionRetainedBytes {
 
     fn visit_type_name(&mut self, type_name: &TypeName) {
         self.add(std::mem::size_of::<TypeName>());
-        self.add_vec_capacity::<novarocks_parser::ast::TypeNameArgument>(
-            type_name.arguments.capacity(),
-        );
-        self.add_vec_capacity::<bool>(type_name.argument_separator_spaces.capacity());
         walk_type_name(self, type_name);
+    }
+
+    fn visit_generic_data_type(&mut self, node: &novarocks_parser::ast::GenericDataType) {
+        self.add_vec_capacity::<novarocks_parser::ast::DataTypeParameter>(
+            node.arguments.capacity(),
+        );
+        novarocks_parser::ast::walk_generic_data_type(self, node);
+    }
+    fn visit_row_data_type(&mut self, node: &novarocks_parser::ast::RowDataType) {
+        self.add_vec_capacity::<novarocks_parser::ast::RowDataTypeField>(node.fields.capacity());
+        novarocks_parser::ast::walk_row_data_type(self, node);
+    }
+    fn visit_date_time_data_type(&mut self, node: &novarocks_parser::ast::DateTimeDataType) {
+        if node.precision.is_some() {
+            self.add(std::mem::size_of::<novarocks_parser::ast::DataTypeParameter>());
+        }
+        novarocks_parser::ast::walk_date_time_data_type(self, node);
+    }
+    fn visit_numeric_parameter(&mut self, node: &novarocks_parser::ast::NumericParameter) {
+        self.add(node.spelling.capacity());
+    }
+    fn visit_array_length(&mut self, node: &novarocks_parser::ast::ArrayLength) {
+        self.add(node.spelling.capacity());
+    }
+    fn visit_simple_interval_qualifier(
+        &mut self,
+        node: &novarocks_parser::ast::SimpleIntervalQualifier,
+    ) {
+        if node.precision.is_some() {
+            self.add(std::mem::size_of::<novarocks_parser::ast::DataTypeParameter>());
+        }
+        novarocks_parser::ast::walk_simple_interval_qualifier(self, node);
+    }
+    fn visit_composite_interval_qualifier(
+        &mut self,
+        node: &novarocks_parser::ast::CompositeIntervalQualifier,
+    ) {
+        if node.precision.is_some() {
+            self.add(std::mem::size_of::<novarocks_parser::ast::DataTypeParameter>());
+        }
+        novarocks_parser::ast::walk_composite_interval_qualifier(self, node);
+    }
+    fn visit_interval_qualifier_field(
+        &mut self,
+        node: &novarocks_parser::ast::IntervalQualifierField,
+    ) {
+        if matches!(
+            node,
+            novarocks_parser::ast::IntervalQualifierField::Second {
+                fractional_precision: Some(_)
+            }
+        ) {
+            self.add(std::mem::size_of::<novarocks_parser::ast::DataTypeParameter>());
+        }
+        novarocks_parser::ast::walk_interval_qualifier_field(self, node);
     }
 
     fn visit_literal(&mut self, literal: &Literal) {
         self.add(std::mem::size_of::<Literal>());
         match &literal.kind {
-            LiteralKind::Number(value)
-            | LiteralKind::String(value)
-            | LiteralKind::HexString(value) => self.add(value.capacity()),
-            LiteralKind::Null | LiteralKind::Boolean(_) => {}
+            LiteralKind::Long {
+                spelling: value, ..
+            }
+            | LiteralKind::Decimal(value)
+            | LiteralKind::String(value) => self.add(value.capacity()),
+            LiteralKind::Binary(value) => self.add(value.capacity()),
+            LiteralKind::Generic(value) => {
+                self.add(value.type_name.capacity());
+                self.add(value.value.capacity());
+            }
+            LiteralKind::Interval(value) => self.add(value.value.capacity()),
+            LiteralKind::Null | LiteralKind::Boolean(_) | LiteralKind::Double(_) => {}
         }
+        novarocks_parser::ast::walk_literal(self, literal);
     }
 
     fn visit_function_call(&mut self, call: &FunctionCall) {

@@ -747,7 +747,9 @@ fn validate_literal_for_column(
         Expr::Unary(unary) if unary.operator == UnaryOperator::Minus
     );
     let lit_str = match &lit_value.kind {
-        LiteralKind::Number(s) | LiteralKind::String(s) => s.clone(),
+        LiteralKind::Decimal(s) | LiteralKind::String(s) => s.clone(),
+        LiteralKind::Long { parsed_value, .. } => parsed_value.to_string(),
+        LiteralKind::Double(value) => format!("{:?}", value.get()),
         LiteralKind::Boolean(b) => b.to_string(),
         LiteralKind::Null => {
             return Err(format!(

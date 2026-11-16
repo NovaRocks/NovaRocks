@@ -41,10 +41,14 @@ pub fn query_mem_limit_hint(query: &novarocks_parser::ast::Query) -> Option<i64>
         let Expr::Literal(literal) = &property.value else {
             return None;
         };
-        let LiteralKind::Number(value) = &literal.kind else {
+        let LiteralKind::Long {
+            parsed_value: value,
+            ..
+        } = &literal.kind
+        else {
             return None;
         };
-        value.parse::<i64>().ok().filter(|value| *value > 0)
+        Some(*value).filter(|value| *value > 0)
     })
 }
 

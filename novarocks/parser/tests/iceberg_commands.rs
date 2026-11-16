@@ -85,7 +85,13 @@ fn schema_default_checks_the_complete_signed_i64_literal() {
         let mut defaults = Defaults(Vec::new());
         defaults.visit_statement(&parsed);
         assert_eq!(defaults.0.len(), 1);
-        assert_eq!(defaults.0[0].kind, LiteralKind::Number(expected.to_owned()));
+        assert_eq!(
+            defaults.0[0].kind,
+            LiteralKind::Long {
+                spelling: expected.to_owned(),
+                parsed_value: (expected.to_owned()).parse::<i64>().unwrap()
+            }
+        );
         let start = source.find(spelling).unwrap();
         assert_eq!(defaults.0[0].span, Span::new(start, source.len()));
         let canonical = format!("ALTER TABLE t ADD COLUMN value BIGINT DEFAULT {expected}");

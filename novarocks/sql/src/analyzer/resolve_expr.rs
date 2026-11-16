@@ -786,67 +786,6 @@ impl<'a> super::AnalyzerContext<'a> {
             }
 
             // Typed literals: DATE '2024-01-01', TIMESTAMP '...', etc.
-            ast::Expr::TypedString(typed_str) => {
-                let target = sql_type_to_arrow(&typed_str.data_type)?;
-                let ast::LiteralKind::String(value) = &typed_str.value.kind else {
-                    return Err(AnalyzeError::invalid_literal(
-                        "typed string requires a string literal",
-                        typed_str.span,
-                    ));
-                };
-                let value = value.clone();
-                let declared = super::helpers::sql_type_to_value_type(
-                    &typed_str.data_type,
-                    false,
-                    self.control,
-                )?;
-                if declared.logical_type() == novarocks_type_contract::ValueLogicalType::Json {
-                    // The explicit literal owns this nominal domain. Preserve
-                    // its bytes; canonical JSON semantics belong to the one
-                    // Functions normalization owner at the consuming call.
-                    return Ok(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::String(value)),
-                        value_type: declared,
-                    });
-                }
-                // For DATE literals, constant-fold to Date32 integer value
-                if target == DataType::Date32 {
-                    let date_str = value.trim_matches(|c| c == '\'' || c == '"');
-                    let days = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                        .map_err(|e| {
-                            AnalyzeError::invalid_literal(
-                                format!("invalid date literal '{date_str}': {e}"),
-                                typed_str.span,
-                            )
-                        })?
-                        .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-                        .num_days();
-                    return Ok(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Int(days)),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Date32,
-                            false,
-                        ),
-                    });
-                }
-                Ok(TypedExpr {
-                    kind: ExprKind::Cast {
-                        expr: Box::new(TypedExpr {
-                            kind: ExprKind::Literal(LiteralValue::String(value)),
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                DataType::Utf8,
-                                false,
-                            ),
-                        }),
-                        target: target.clone(),
-                        decimal_overflow_policy: self
-                            .sql_semantics
-                            .sql_mode()
-                            .decimal_overflow_policy(),
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(target, false),
-                })
-            }
 
             // INTERVAL `value unit` remains a syntax-level string literal for
             // the existing function rewrites; source rendering is native.
@@ -1166,55 +1105,122 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok(result)
     }
 
+    fn analyze_typed_string_content(
+        &self,
+        data_type: &ast::TypeName,
+        value: &str,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let target = sql_type_to_arrow(data_type)?;
+        let value = value.to_owned();
+        let declared = super::helpers::sql_type_to_value_type(data_type, false, self.control)?;
+        if declared.logical_type() == novarocks_type_contract::ValueLogicalType::Json {
+            // The explicit literal owns this nominal domain. Preserve
+            // its bytes; canonical JSON semantics belong to the one
+            // Functions normalization owner at the consuming call.
+            return Ok(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::String(value)),
+                value_type: declared,
+            });
+        }
+        // For DATE literals, constant-fold to Date32 integer value
+        if target == DataType::Date32 {
+            let date_str = value.trim_matches(|c| c == '\'' || c == '"');
+            let days = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                .map_err(|e| {
+                    AnalyzeError::invalid_literal(
+                        format!("invalid date literal '{date_str}': {e}"),
+                        span,
+                    )
+                })?
+                .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+                .num_days();
+            return Ok(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(days)),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Date32,
+                    false,
+                ),
+            });
+        }
+        Ok(TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::String(value)),
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Utf8,
+                        false,
+                    ),
+                }),
+                target: target.clone(),
+                decimal_overflow_policy: self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            },
+            value_type: novarocks_type_contract::FunctionValueType::new(target, false),
+        })
+    }
+
     /// Analyze a literal value.
     fn analyze_literal(&self, value: &ast::Literal) -> Result<TypedExpr, AnalyzeError> {
         match value {
             ast::Literal {
-                kind: ast::LiteralKind::Number(n),
+                kind: ast::LiteralKind::Long { parsed_value, .. },
+                ..
+            } => Ok(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(*parsed_value)),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    if i32::try_from(*parsed_value).is_ok() {
+                        DataType::Int32
+                    } else {
+                        DataType::Int64
+                    },
+                    false,
+                ),
+            }),
+            ast::Literal {
+                kind: ast::LiteralKind::Decimal(text),
                 ..
             } => {
-                if let Ok(v) = n.parse::<i64>() {
-                    // Ordinary signed integer syntax has the Trino INTEGER/BIGINT domain.
-                    Ok(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Int(v)),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            if i32::try_from(v).is_ok() {
-                                DataType::Int32
-                            } else {
-                                DataType::Int64
-                            },
-                            false,
-                        ),
-                    })
-                } else if !n.contains('.') && !n.contains('e') && !n.contains('E') {
-                    Err(AnalyzeError::invalid_literal(
-                        format!("invalid integer literal: {n}"),
-                        value.span,
-                    ))
-                } else if n.contains('.') && !n.contains('e') && !n.contains('E') {
-                    let data_type = infer_decimal_literal_type(n)
-                        .map_err(|message| AnalyzeError::invalid_literal(message, value.span))?;
-                    Ok(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Decimal(n.clone())),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            data_type, false,
-                        ),
-                    })
-                } else if let Ok(v) = n.parse::<f64>() {
-                    Ok(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Float(v)),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Float64,
-                            false,
-                        ),
-                    })
-                } else {
-                    Err(AnalyzeError::invalid_literal(
-                        format!("invalid numeric literal: {n}"),
-                        value.span,
-                    ))
-                }
+                let data_type = infer_decimal_literal_type(text)
+                    .map_err(|message| AnalyzeError::invalid_literal(message, value.span))?;
+                Ok(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Decimal(text.clone())),
+                    value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
+                })
             }
+            ast::Literal {
+                kind: ast::LiteralKind::Double(number),
+                ..
+            } => Ok(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Float(number.get())),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Float64,
+                    false,
+                ),
+            }),
+            ast::Literal {
+                kind: ast::LiteralKind::Generic(generic),
+                ..
+            } => {
+                if !crate::literal::is_supported_generic_literal(generic) {
+                    return Err(AnalyzeError::unsupported_expression(
+                        format!(
+                            "generic literal type {} is not supported",
+                            generic.type_name
+                        ),
+                        value.span,
+                    ));
+                }
+                let mut data_type = novarocks_parser::build::simple_type(&generic.type_name);
+                data_type.span = value.span;
+                self.analyze_typed_string_content(&data_type, &generic.value, value.span)
+            }
+            ast::Literal {
+                kind: ast::LiteralKind::Interval(_),
+                ..
+            } => Err(AnalyzeError::unsupported_expression(
+                "INTERVAL literals are not supported",
+                value.span,
+            )),
             ast::Literal {
                 kind: ast::LiteralKind::String(s),
                 ..
@@ -1235,23 +1241,15 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
             ast::Literal {
-                kind: ast::LiteralKind::HexString(s),
+                kind: ast::LiteralKind::Binary(bytes),
                 ..
-            } => {
-                let bytes = hex::decode(s).map_err(|err| {
-                    AnalyzeError::invalid_literal(
-                        format!("invalid hex literal X'{s}': {err}"),
-                        value.span,
-                    )
-                })?;
-                Ok(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Binary(bytes)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Binary,
-                        false,
-                    ),
-                })
-            }
+            } => Ok(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Binary(bytes.clone())),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Binary,
+                    false,
+                ),
+            }),
             ast::Literal {
                 kind: ast::LiteralKind::Boolean(b),
                 ..
@@ -4358,9 +4356,9 @@ fn normalize_slice_arguments(
     fn integer_source(expr: &ast::Expr) -> bool {
         match expr {
             ast::Expr::Literal(ast::Literal {
-                kind: ast::LiteralKind::Number(value),
+                kind: ast::LiteralKind::Long { .. },
                 ..
-            }) => value.parse::<i128>().is_ok(),
+            }) => true,
             ast::Expr::Unary(unary)
                 if matches!(
                     unary.operator,
@@ -4527,17 +4525,11 @@ fn normalize_slice_arguments(
 fn function_order_by_position(expr: &ast::Expr) -> Option<i64> {
     match expr {
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(n),
+            kind: ast::LiteralKind::Long { parsed_value, .. },
             ..
-        }) => n.parse::<i64>().ok(),
-        ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
-            match unary.expression.as_ref() {
-                ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::Number(n),
-                    ..
-                }) => n.parse::<i64>().ok().map(|pos| -pos),
-                _ => None,
-            }
+        }) => Some(*parsed_value),
+        ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
+            function_order_by_position(&unary.expression)?.checked_neg()
         }
         _ => None,
     }
@@ -6675,13 +6667,13 @@ fn is_map_higher_order_function_with_lambda(name: &str, arg_exprs: &[&ast::Expr]
 fn is_integer_const_literal(expr: &ast::Expr) -> bool {
     match expr {
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(s),
+            kind: ast::LiteralKind::Long { .. },
             ..
-        }) => s.parse::<i64>().is_ok(),
+        }) => true,
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::String(s),
+            kind: ast::LiteralKind::String(value),
             ..
-        }) => s.parse::<i64>().is_ok(),
+        }) => value.parse::<i64>().is_ok(),
         ast::Expr::Unary(unary)
             if matches!(
                 unary.operator,
@@ -6698,32 +6690,43 @@ fn is_integer_const_literal(expr: &ast::Expr) -> bool {
 fn signed_integer_literal_expr(expr: &ast::Expr) -> Option<ast::Expr> {
     match expr {
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(s),
-            span,
-        }) if s.parse::<i64>().is_ok() => Some(ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(s.clone()),
-            span: *span,
-        })),
+            kind: ast::LiteralKind::Long { .. },
+            ..
+        }) => Some(expr.clone()),
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::String(s),
+            kind: ast::LiteralKind::String(value),
             span,
-        }) if s.parse::<i64>().is_ok() => Some(ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(s.clone()),
+        }) => Some(ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Long {
+                spelling: value.clone(),
+                parsed_value: value.parse().ok()?,
+            },
             span: *span,
         })),
-        ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
-            signed_integer_literal_expr(&unary.expression).and_then(|inner| match inner {
-                ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::Number(s),
-                    span,
-                }) if !s.starts_with('-') => Some(ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::Number(format!("-{s}")),
-                    span,
-                })),
-                _ => None,
-            })
+        ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
+            let ast::Expr::Literal(ast::Literal {
+                kind:
+                    ast::LiteralKind::Long {
+                        spelling,
+                        parsed_value,
+                    },
+                span,
+            }) = signed_integer_literal_expr(&unary.expression)?
+            else {
+                return None;
+            };
+            if spelling.starts_with('-') {
+                return None;
+            }
+            Some(ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Long {
+                    spelling: format!("-{spelling}"),
+                    parsed_value: parsed_value.checked_neg()?,
+                },
+                span,
+            }))
         }
-        ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Plus) => {
+        ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Plus => {
             signed_integer_literal_expr(&unary.expression)
         }
         ast::Expr::Nested(inner) => signed_integer_literal_expr(&inner.expression),
@@ -6854,7 +6857,11 @@ fn sql_expr_logical_type_name(expr: &ast::Expr) -> Option<String> {
 /// width (CHAR vs VARCHAR, DECIMAL128(p, s), etc.) that is otherwise lost
 /// once the cast target lowers to Arrow.
 fn sql_type_starrocks_name(sql_type: &ast::TypeName) -> Option<String> {
-    let name = sql_type.name.parts.last()?.value.to_ascii_lowercase();
+    let name = match &sql_type.kind {
+        ast::TypeKind::Generic(value) => value.name.value.to_ascii_lowercase(),
+        ast::TypeKind::DateTime(value) if !value.with_time_zone && value.precision.as_deref().is_none_or(|parameter| matches!(parameter, ast::DataTypeParameter::Numeric(number) if number.parsed_value == 6)) => return Some(match value.kind { ast::DateTimeType::Time => "time", ast::DateTimeType::Timestamp => "datetime" }.into()),
+        _ => return None,
+    };
     let canonical = match name.as_str() {
         "tinyint" | "smallint" | "int" | "integer" | "bigint" | "float" | "double" | "boolean"
         | "char" | "date" | "time" | "largeint" | "bitmap" | "hll" => name,
@@ -7245,6 +7252,44 @@ mod tests {
             sql,
             crate::functions::builtin_sql_function_catalog(),
         )
+    }
+
+    #[test]
+    fn final_literal_nodes_keep_minimal_numeric_types_and_original_typed_string_results() {
+        for (sql, expected) in [
+            ("SELECT 1", DataType::Int32),
+            ("SELECT 2147483648", DataType::Int64),
+            ("SELECT 1.20", DataType::Decimal128(3, 2)),
+            ("SELECT DECIMAL '001.200'", DataType::Decimal128(4, 3)),
+            ("SELECT 1e0", DataType::Float64),
+            ("SELECT X'00ff'", DataType::Binary),
+            ("SELECT DATE '2024-01-02'", DataType::Date32),
+            (
+                "SELECT TIMESTAMP '2024-01-02 03:04:05.123456'",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            ),
+        ] {
+            let result =
+                analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_eq!(result.value_type.data_type(), &expected, "{sql}");
+            assert!(!result.value_type.nullable(), "{sql}");
+        }
+        let decimal = analyze_projection_expr("SELECT DECIMAL '001.200'").unwrap();
+        assert!(
+            matches!(decimal.kind, ExprKind::Literal(LiteralValue::Decimal(value)) if value == "001.200")
+        );
+        let binary = analyze_projection_expr("SELECT X'00ff'").unwrap();
+        assert!(
+            matches!(binary.kind, ExprKind::Literal(LiteralValue::Binary(value)) if value == vec![0, 255])
+        );
+        let json = analyze_projection_expr("SELECT JSON '{\"a\": 1}'").unwrap();
+        assert_eq!(
+            json.value_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Json
+        );
+        assert!(
+            matches!(json.kind, ExprKind::Literal(LiteralValue::String(value)) if value == "{\"a\": 1}")
+        );
     }
 
     #[test]

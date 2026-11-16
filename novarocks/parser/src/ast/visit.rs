@@ -21,6 +21,54 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_type_name(&mut self, node: &TypeName) {
+        walk_type_name(self, node);
+    }
+    fn visit_generic_data_type(&mut self, node: &GenericDataType) {
+        walk_generic_data_type(self, node);
+    }
+    fn visit_row_data_type(&mut self, node: &RowDataType) {
+        walk_row_data_type(self, node);
+    }
+    fn visit_row_data_type_field(&mut self, node: &RowDataTypeField) {
+        walk_row_data_type_field(self, node);
+    }
+    fn visit_date_time_data_type(&mut self, node: &DateTimeDataType) {
+        walk_date_time_data_type(self, node);
+    }
+    fn visit_interval_data_type(&mut self, node: &IntervalDataType) {
+        walk_interval_data_type(self, node);
+    }
+    fn visit_explicit_array_data_type(&mut self, node: &ExplicitArrayDataType) {
+        walk_explicit_array_data_type(self, node);
+    }
+    fn visit_array_length(&mut self, node: &ArrayLength) {
+        walk_array_length(self, node);
+    }
+    fn visit_data_type_parameter(&mut self, node: &DataTypeParameter) {
+        walk_data_type_parameter(self, node);
+    }
+    fn visit_numeric_parameter(&mut self, node: &NumericParameter) {
+        walk_numeric_parameter(self, node);
+    }
+    fn visit_type_parameter(&mut self, node: &TypeParameter) {
+        walk_type_parameter(self, node);
+    }
+    fn visit_interval_qualifier(&mut self, node: &IntervalQualifier) {
+        walk_interval_qualifier(self, node);
+    }
+    fn visit_simple_interval_qualifier(&mut self, node: &SimpleIntervalQualifier) {
+        walk_simple_interval_qualifier(self, node);
+    }
+    fn visit_composite_interval_qualifier(&mut self, node: &CompositeIntervalQualifier) {
+        walk_composite_interval_qualifier(self, node);
+    }
+    fn visit_interval_qualifier_field(&mut self, node: &IntervalQualifierField) {
+        walk_interval_qualifier_field(self, node);
+    }
+    fn visit_literal(&mut self, node: &Literal) {
+        walk_literal(self, node);
+    }
     fn visit_json_path_string(&mut self, node: &JsonPathString) {
         super::json::walk_json_path_string(self, node);
     }
@@ -266,14 +314,6 @@ pub trait Visit {
         walk_object_name(self, name);
     }
 
-    fn visit_type_name(&mut self, type_name: &TypeName) {
-        walk_type_name(self, type_name);
-    }
-
-    fn visit_literal(&mut self, literal: &Literal) {
-        walk_literal(self, literal);
-    }
-
     fn visit_expr(&mut self, expression: &Expr) {
         walk_expr(self, expression);
     }
@@ -368,22 +408,6 @@ pub fn walk_object_name<V: Visit + ?Sized>(visitor: &mut V, name: &ObjectName) {
         visitor.visit_ident(part);
     }
 }
-
-pub fn walk_type_name<V: Visit + ?Sized>(visitor: &mut V, type_name: &TypeName) {
-    visitor.visit_object_name(&type_name.name);
-    for argument in &type_name.arguments {
-        match argument {
-            TypeNameArgument::Type(data_type) => visitor.visit_type_name(data_type),
-            TypeNameArgument::Literal(literal) => visitor.visit_literal(literal),
-            TypeNameArgument::Field(field) => {
-                visitor.visit_ident(&field.name);
-                visitor.visit_type_name(&field.data_type);
-            }
-        }
-    }
-}
-
-pub fn walk_literal<V: Visit + ?Sized>(_: &mut V, _: &Literal) {}
 
 pub fn walk_explain_query<V: Visit + ?Sized>(visitor: &mut V, query: &ExplainQuery) {
     visitor.visit_query(&query.query);
@@ -754,10 +778,6 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
                 AccessKind::Json { path, .. } => visitor.visit_expr(path),
             }
         }
-        Expr::TypedString(expression) => {
-            visitor.visit_type_name(&expression.data_type);
-            visitor.visit_literal(&expression.value);
-        }
     }
 }
 
@@ -795,6 +815,66 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_type_name(&mut self, node: TypeName) -> TypeName {
+        fold_type_name(self, node)
+    }
+    fn fold_generic_data_type(&mut self, node: GenericDataType) -> GenericDataType {
+        fold_generic_data_type(self, node)
+    }
+    fn fold_row_data_type(&mut self, node: RowDataType) -> RowDataType {
+        fold_row_data_type(self, node)
+    }
+    fn fold_row_data_type_field(&mut self, node: RowDataTypeField) -> RowDataTypeField {
+        fold_row_data_type_field(self, node)
+    }
+    fn fold_date_time_data_type(&mut self, node: DateTimeDataType) -> DateTimeDataType {
+        fold_date_time_data_type(self, node)
+    }
+    fn fold_interval_data_type(&mut self, node: IntervalDataType) -> IntervalDataType {
+        fold_interval_data_type(self, node)
+    }
+    fn fold_explicit_array_data_type(
+        &mut self,
+        node: ExplicitArrayDataType,
+    ) -> ExplicitArrayDataType {
+        fold_explicit_array_data_type(self, node)
+    }
+    fn fold_array_length(&mut self, node: ArrayLength) -> ArrayLength {
+        fold_array_length(self, node)
+    }
+    fn fold_data_type_parameter(&mut self, node: DataTypeParameter) -> DataTypeParameter {
+        fold_data_type_parameter(self, node)
+    }
+    fn fold_numeric_parameter(&mut self, node: NumericParameter) -> NumericParameter {
+        fold_numeric_parameter(self, node)
+    }
+    fn fold_type_parameter(&mut self, node: TypeParameter) -> TypeParameter {
+        fold_type_parameter(self, node)
+    }
+    fn fold_interval_qualifier(&mut self, node: IntervalQualifier) -> IntervalQualifier {
+        fold_interval_qualifier(self, node)
+    }
+    fn fold_simple_interval_qualifier(
+        &mut self,
+        node: SimpleIntervalQualifier,
+    ) -> SimpleIntervalQualifier {
+        fold_simple_interval_qualifier(self, node)
+    }
+    fn fold_composite_interval_qualifier(
+        &mut self,
+        node: CompositeIntervalQualifier,
+    ) -> CompositeIntervalQualifier {
+        fold_composite_interval_qualifier(self, node)
+    }
+    fn fold_interval_qualifier_field(
+        &mut self,
+        node: IntervalQualifierField,
+    ) -> IntervalQualifierField {
+        fold_interval_qualifier_field(self, node)
+    }
+    fn fold_literal(&mut self, node: Literal) -> Literal {
+        fold_literal(self, node)
+    }
     fn fold_json_path_string(&mut self, node: JsonPathString) -> JsonPathString {
         super::json::fold_json_path_string(self, node)
     }
@@ -1071,14 +1151,6 @@ pub trait Fold {
         fold_object_name(self, name)
     }
 
-    fn fold_type_name(&mut self, type_name: TypeName) -> TypeName {
-        fold_type_name(self, type_name)
-    }
-
-    fn fold_literal(&mut self, literal: Literal) -> Literal {
-        fold_literal(self, literal)
-    }
-
     fn fold_expr(&mut self, expression: Expr) -> Expr {
         fold_expr(self, expression)
     }
@@ -1249,32 +1321,6 @@ pub fn fold_object_name<F: Fold + ?Sized>(folder: &mut F, mut name: ObjectName) 
         .map(|part| folder.fold_ident(part))
         .collect();
     name
-}
-
-pub fn fold_type_name<F: Fold + ?Sized>(folder: &mut F, mut type_name: TypeName) -> TypeName {
-    type_name.name = folder.fold_object_name(type_name.name);
-    type_name.arguments = type_name
-        .arguments
-        .into_iter()
-        .map(|argument| match argument {
-            TypeNameArgument::Type(data_type) => {
-                TypeNameArgument::Type(folder.fold_type_name(data_type))
-            }
-            TypeNameArgument::Literal(literal) => {
-                TypeNameArgument::Literal(folder.fold_literal(literal))
-            }
-            TypeNameArgument::Field(field) => TypeNameArgument::Field(StructField {
-                name: folder.fold_ident(field.name),
-                data_type: folder.fold_type_name(field.data_type),
-                span: field.span,
-            }),
-        })
-        .collect();
-    type_name
-}
-
-pub fn fold_literal<F: Fold + ?Sized>(_: &mut F, literal: Literal) -> Literal {
-    literal
 }
 
 pub fn fold_explain_query<F: Fold + ?Sized>(
@@ -1819,11 +1865,6 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
                 },
             };
             Expr::Access(expression)
-        }
-        Expr::TypedString(mut expression) => {
-            expression.data_type = folder.fold_type_name(expression.data_type);
-            expression.value = folder.fold_literal(expression.value);
-            Expr::TypedString(expression)
         }
     }
 }

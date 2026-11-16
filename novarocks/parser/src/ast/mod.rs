@@ -39,6 +39,8 @@ pub use routine::{
 pub(crate) mod session;
 pub(crate) mod statistics;
 mod storage;
+mod type_literal;
+pub use type_literal::*;
 pub(crate) mod table;
 mod validate;
 pub(crate) mod view;
@@ -62,8 +64,8 @@ pub use expr::{
     CastKind, CompoundIdentifier, ExistsExpr, Expr, FunctionCall, FunctionOrderBy,
     FunctionQuantifier, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField, IsPredicate,
     IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, MapEntry, MapExpr,
-    NestedExpr, NullTreatment, StructExpr, StructExprField, SubqueryExpr, TupleExpr,
-    TypedStringExpr, UnaryExpr, UnaryOperator,
+    NestedExpr, NullTreatment, StructExpr, StructExprField, SubqueryExpr, TupleExpr, UnaryExpr,
+    UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -107,12 +109,11 @@ pub use table::{
 pub use validate::{validate_statement, validate_statements};
 pub use view::{CreateView, DropView, ShowCreateView, ViewStatement};
 pub use visit::{
-    Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_literal,
-    fold_nested_expr, fold_object_name, fold_query, fold_select, fold_statement, fold_table_factor,
-    fold_type_name, fold_unary_expr, fold_view_statement, walk_binary_expr, walk_expr,
-    walk_function_call, walk_ident, walk_literal, walk_nested_expr, walk_object_name, walk_query,
-    walk_select, walk_statement, walk_table_factor, walk_type_name, walk_unary_expr,
-    walk_view_statement,
+    Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_nested_expr,
+    fold_object_name, fold_query, fold_select, fold_statement, fold_table_factor, fold_unary_expr,
+    fold_view_statement, walk_binary_expr, walk_expr, walk_function_call, walk_ident,
+    walk_nested_expr, walk_object_name, walk_query, walk_select, walk_statement, walk_table_factor,
+    walk_unary_expr, walk_view_statement,
 };
 pub use window::{
     NamedWindow, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
@@ -173,49 +174,6 @@ pub struct ObjectName {
     pub span: Span,
 }
 
-/// A syntax-level type name, deliberately independent of execution data types.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TypeName {
-    pub name: ObjectName,
-    pub arguments: Vec<TypeNameArgument>,
-    /// Trivia after each argument comma, retained for canonical reparse compatibility.
-    pub argument_separator_spaces: Vec<bool>,
-    pub span: Span,
-}
-
-/// A type parameter retained without lowering it into an execution type.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TypeNameArgument {
-    Type(TypeName),
-    Literal(Literal),
-    Field(StructField),
-}
-
-/// One named field in a `STRUCT<...>` type.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StructField {
-    pub name: Ident,
-    pub data_type: TypeName,
-    pub span: Span,
-}
-
-/// A source literal and its syntactic category.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Literal {
-    pub kind: LiteralKind,
-    pub span: Span,
-}
-
-/// Literal categories initially required by the parser foundation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LiteralKind {
-    Null,
-    Boolean(bool),
-    Number(String),
-    String(String),
-    HexString(String),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,13 +195,17 @@ mod tests {
             span: span(0, 7),
         };
         let type_name = TypeName {
-            name: name.clone(),
-            arguments: Vec::new(),
-            argument_separator_spaces: Vec::new(),
+            kind: TypeKind::Generic(GenericDataType {
+                name: name.parts[0].clone(),
+                arguments: AstVec::new(),
+            }),
             span: span(0, 7),
         };
         let literal = Literal {
-            kind: LiteralKind::Number("42".to_owned()),
+            kind: LiteralKind::Long {
+                spelling: "42".to_owned(),
+                parsed_value: ("42".to_owned()).parse::<i64>().unwrap(),
+            },
             span: span(8, 10),
         };
         let expression = Expr::Literal(literal.clone());
@@ -292,7 +254,10 @@ mod tests {
                     span: span(4, 7),
                 },
                 arguments: vec![Expr::Literal(Literal {
-                    kind: LiteralKind::Number("1".to_owned()),
+                    kind: LiteralKind::Long {
+                        spelling: "1".to_owned(),
+                        parsed_value: ("1".to_owned()).parse::<i64>().unwrap(),
+                    },
                     span: span(8, 9),
                 })],
                 quantifier: FunctionQuantifier::None,

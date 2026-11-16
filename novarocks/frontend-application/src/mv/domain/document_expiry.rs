@@ -104,11 +104,15 @@ fn decode_call(call: &CallStatement) -> Result<Option<ExpiryCall>, String> {
     let Some(MaintenanceValue::Literal(literal)) = arguments.get("keep_last").copied() else {
         return Err("MV document expiry keep_last must be a positive integer literal".into());
     };
-    let LiteralKind::Number(number) = &literal.kind else {
+    let LiteralKind::Long {
+        spelling: number,
+        parsed_value,
+        ..
+    } = &literal.kind
+    else {
         return Err("MV document expiry keep_last must be a positive integer literal".into());
     };
-    let keep_last = number
-        .parse::<usize>()
+    let keep_last = usize::try_from(*parsed_value)
         .ok()
         .filter(|value| *value > 0)
         .filter(|_| number.bytes().all(|b| b.is_ascii_digit()))

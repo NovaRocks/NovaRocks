@@ -313,16 +313,18 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             TokenKind::Keyword(Keyword::True) => LiteralKind::Boolean(true),
             TokenKind::Keyword(Keyword::False) => LiteralKind::Boolean(false),
             TokenKind::Number => number_literal_kind(source.to_owned(), span)?,
-            TokenKind::HexNumber => LiteralKind::HexString(
+            TokenKind::HexNumber => binary_literal_kind(
                 source
                     .strip_prefix("0x")
                     .or_else(|| source.strip_prefix("0X"))
                     .expect("hex token must have 0x prefix")
                     .to_owned(),
-            ),
-            TokenKind::String => hex_string_literal(source)
-                .map(LiteralKind::HexString)
-                .unwrap_or_else(|| LiteralKind::String(unquote_string(source))),
+                span,
+            )?,
+            TokenKind::String => match hex_string_literal(source) {
+                Some(value) => binary_literal_kind(value, span)?,
+                None => LiteralKind::String(unquote_string(source)),
+            },
             _ => return Err(self.unexpected("literal")),
         };
         self.advance();
@@ -400,14 +402,120 @@ pub(crate) fn is_integer_number(value: &str) -> bool {
 
 /// Check the complete signed spelling before rejecting its positive magnitude.
 pub(crate) fn number_literal_kind(value: String, span: Span) -> Result<LiteralKind, ParseError> {
-    if is_integer_number(&value) && value.parse::<i64>().is_err() {
+    let invalid = || ParseError::UnexpectedToken {
+        expected: "signed 64-bit integer literal",
+        found: format!("`{value}`"),
+        span,
+    };
+    if is_integer_number(&value) {
+        let parsed_value = value.parse::<i64>().map_err(|_| invalid())?;
+        Ok(LiteralKind::Long {
+            spelling: value,
+            parsed_value,
+        })
+    } else if value.contains(['e', 'E']) {
+        let parsed = value.parse::<f64>().map_err(|_| invalid())?;
+        Ok(LiteralKind::Double(crate::ast::DoubleValue::from_f64(
+            parsed,
+        )))
+    } else {
+        Ok(LiteralKind::Decimal(value))
+    }
+}
+
+pub(crate) fn binary_literal_kind(value: String, span: Span) -> Result<LiteralKind, ParseError> {
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let mut high = None;
+    for character in value.chars() {
+        if character.is_whitespace() {
+            continue;
+        }
+        let digit = character
+            .to_digit(16)
+            .ok_or_else(|| ParseError::UnexpectedToken {
+                expected: "hexadecimal binary literal",
+                found: value.clone(),
+                span,
+            })? as u8;
+        if let Some(prefix) = high.take() {
+            bytes.push(prefix * 16 + digit);
+        } else {
+            high = Some(digit);
+        }
+    }
+    if high.is_some() {
         return Err(ParseError::UnexpectedToken {
-            expected: "signed 64-bit integer literal",
-            found: format!("`{value}`"),
+            expected: "even number of hexadecimal digits",
+            found: value,
             span,
         });
     }
-    Ok(LiteralKind::Number(value))
+    Ok(LiteralKind::Binary(bytes))
+}
+
+pub(crate) fn numeric_type_parameter(
+    literal: Literal,
+) -> Result<crate::ast::DataTypeParameter, ParseError> {
+    match literal.kind {
+        LiteralKind::Long {
+            spelling,
+            parsed_value,
+        } => Ok(crate::ast::DataTypeParameter::Numeric(
+            crate::ast::NumericParameter {
+                spelling,
+                parsed_value,
+                span: literal.span,
+            },
+        )),
+        _ => Err(ParseError::UnexpectedToken {
+            expected: "integer type parameter",
+            found: "non-integer literal".into(),
+            span: literal.span,
+        }),
+    }
+}
+
+/// The retiring grammar produces the final type vocabulary directly.
+pub(crate) fn finish_type_name(
+    name: crate::ast::Ident,
+    arguments: Vec<crate::ast::DataTypeParameter>,
+    fields: Option<Vec<crate::ast::RowDataTypeField>>,
+    span: Span,
+) -> Result<crate::ast::TypeName, ParseError> {
+    use crate::ast::*;
+    let kind = if let Some(fields) = fields {
+        TypeKind::Row(RowDataType {
+            fields: fields.into(),
+        })
+    } else if !name.quoted
+        && matches!(
+            name.value.to_ascii_uppercase().as_str(),
+            "TIME" | "TIMESTAMP" | "DATETIME"
+        )
+    {
+        if arguments.len() > 1 {
+            return Err(ParseError::UnexpectedToken {
+                expected: "single date/time precision",
+                found: format!("{} arguments", arguments.len()),
+                span,
+            });
+        }
+        TypeKind::DateTime(DateTimeDataType {
+            kind: if name.value.eq_ignore_ascii_case("TIME") {
+                DateTimeType::Time
+            } else {
+                DateTimeType::Timestamp
+            },
+            with_time_zone: false,
+            precision: arguments.into_iter().next().map(AstBox::new),
+        })
+    } else {
+        TypeKind::Generic(GenericDataType {
+            name,
+            arguments: arguments.into(),
+        })
+    };
+    Ok(TypeName { kind, span })
 }
 
 fn unquote_string(source: &str) -> String {

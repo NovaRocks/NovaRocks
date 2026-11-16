@@ -119,15 +119,15 @@ fn declaration_syntax(declaration: &SqlType) -> Result<ast::TypeName, TypeSyntax
         SqlType::Array(item) => {
             return parameterized_type(
                 "ARRAY",
-                vec![ast::TypeNameArgument::Type(declaration_syntax(item)?)],
+                vec![build::type_parameter(declaration_syntax(item)?)],
             );
         }
         SqlType::Map(key, value) => {
             return parameterized_type(
                 "MAP",
                 vec![
-                    ast::TypeNameArgument::Type(declaration_syntax(key)?),
-                    ast::TypeNameArgument::Type(declaration_syntax(value)?),
+                    build::type_parameter(declaration_syntax(key)?),
+                    build::type_parameter(declaration_syntax(value)?),
                 ],
             );
         }
@@ -135,36 +135,31 @@ fn declaration_syntax(declaration: &SqlType) -> Result<ast::TypeName, TypeSyntax
             if fields.is_empty() {
                 return Err(TypeSyntaxError::EmptyStruct);
             }
-            let arguments = fields
+            let fields = fields
                 .iter()
                 .map(|(name, declaration)| {
-                    Ok(ast::TypeNameArgument::Field(ast::StructField {
-                        name: build::ident(name, Some('`')),
+                    Ok(ast::RowDataTypeField {
+                        name: Some(build::ident(name, Some('`'))),
                         data_type: declaration_syntax(declaration)?,
                         span: SYNTHETIC,
-                    }))
+                    })
                 })
                 .collect::<Result<Vec<_>, TypeSyntaxError>>()?;
-            return parameterized_type("STRUCT", arguments);
+            return Ok(build::row_type(fields));
         }
     };
     Ok(build::simple_type(scalar))
 }
 
-fn number_argument(value: u8) -> ast::TypeNameArgument {
-    ast::TypeNameArgument::Literal(ast::Literal {
-        kind: ast::LiteralKind::Number(value.to_string()),
-        span: SYNTHETIC,
-    })
+fn number_argument(value: u8) -> ast::DataTypeParameter {
+    build::numeric_parameter(i64::from(value))
 }
 
 fn parameterized_type(
     name: &str,
-    arguments: Vec<ast::TypeNameArgument>,
+    arguments: Vec<ast::DataTypeParameter>,
 ) -> Result<ast::TypeName, TypeSyntaxError> {
-    let separators = vec![true; arguments.len().saturating_sub(1)];
-    build::type_name(build::simple_type(name).name, arguments, separators)
-        .map_err(TypeSyntaxError::Construction)
+    Ok(build::type_name(build::ident(name, None), arguments))
 }
 
 #[cfg(test)]

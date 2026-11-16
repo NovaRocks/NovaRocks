@@ -476,19 +476,27 @@ fn cast_semantics(
 
 fn declared_root(sql_type: &ast::TypeName) -> novarocks_type_contract::ValueLogicalType {
     use novarocks_type_contract::ValueLogicalType as V;
-    match sql_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("json" | "jsonb") => V::Json,
-        Some("variant") => V::Variant,
-        Some("largeint") => V::LargeInt,
-        Some("hll") => V::Hll,
-        Some("bitmap") => V::Bitmap,
+    let ast::TypeKind::Generic(generic) = &sql_type.kind else {
+        return V::Physical;
+    };
+    match generic.name.value.to_ascii_lowercase().as_str() {
+        "json" | "jsonb" => V::Json,
+        "variant" => V::Variant,
+        "largeint" => V::LargeInt,
+        "hll" => V::Hll,
+        "bitmap" => V::Bitmap,
         _ => V::Physical,
+    }
+}
+
+fn generic_type_arguments(
+    sql_type: &ast::TypeName,
+) -> Result<&[ast::DataTypeParameter], AnalyzeError> {
+    match &sql_type.kind {
+        ast::TypeKind::Generic(generic) => Ok(&generic.arguments),
+        _ => Err(AnalyzeError::internal(
+            "container layout lost its generic SQL type author",
+        )),
     }
 }
 
@@ -530,15 +538,36 @@ fn validate_ast_type(
             sql_type.span,
         ));
     }
-    for argument in &sql_type.arguments {
-        match argument {
-            ast::TypeNameArgument::Type(child) => validate_ast_type(child, depth + 1, nodes, work)?,
-            ast::TypeNameArgument::Field(field) => {
-                validate_ast_type(&field.data_type, depth + 1, nodes, work)?
+    match &sql_type.kind {
+        ast::TypeKind::Generic(generic) => {
+            for parameter in &generic.arguments {
+                match parameter {
+                    ast::DataTypeParameter::Type(child) => {
+                        validate_ast_type(&child.data_type, depth + 1, nodes, work)?
+                    }
+                    ast::DataTypeParameter::Numeric(_) => {
+                        work.step().map_err(AnalyzeError::control)?
+                    }
+                }
             }
-            ast::TypeNameArgument::Literal(_) => {
-                work.step().map_err(AnalyzeError::control)?;
+        }
+        ast::TypeKind::Row(row) => {
+            for field in &row.fields {
+                validate_ast_type(&field.data_type, depth + 1, nodes, work)?;
             }
+        }
+        ast::TypeKind::DateTime(_) => {}
+        ast::TypeKind::Interval(_) => {
+            return Err(AnalyzeError::unsupported_expression(
+                "INTERVAL data types are not supported",
+                sql_type.span,
+            ));
+        }
+        ast::TypeKind::ExplicitArray(_) => {
+            return Err(AnalyzeError::unsupported_expression(
+                "explicit ARRAY lengths are not supported",
+                sql_type.span,
+            ));
         }
     }
     Ok(())
@@ -560,7 +589,7 @@ fn author_ast_type(
     } else {
         match layout {
             DataType::List(item) => ValueKind::List(author_ast_type(
-                type_type_argument(&sql_type.arguments, 0, "ARRAY", sql_type.span)?,
+                type_type_argument(generic_type_arguments(sql_type)?, 0, "ARRAY", sql_type.span)?,
                 item.data_type(),
                 item.is_nullable(),
                 work,
@@ -573,13 +602,23 @@ fn author_ast_type(
                 };
                 ValueKind::Map {
                     key: author_ast_type(
-                        type_type_argument(&sql_type.arguments, 0, "MAP", sql_type.span)?,
+                        type_type_argument(
+                            generic_type_arguments(sql_type)?,
+                            0,
+                            "MAP",
+                            sql_type.span,
+                        )?,
                         fields[0].data_type(),
                         false,
                         work,
                     )?,
                     value: author_ast_type(
-                        type_type_argument(&sql_type.arguments, 1, "MAP", sql_type.span)?,
+                        type_type_argument(
+                            generic_type_arguments(sql_type)?,
+                            1,
+                            "MAP",
+                            sql_type.span,
+                        )?,
                         fields[1].data_type(),
                         fields[1].is_nullable(),
                         work,
@@ -588,17 +627,13 @@ fn author_ast_type(
             }
             DataType::Struct(fields) => {
                 let mut values = Vec::with_capacity(fields.len());
-                for (field, argument) in fields.iter().zip(&sql_type.arguments) {
-                    let child = match argument {
-                        ast::TypeNameArgument::Field(field) => &field.data_type,
-                        ast::TypeNameArgument::Type(child) => child,
-                        ast::TypeNameArgument::Literal(_) => {
-                            return Err(AnalyzeError::invalid_argument(
-                                "STRUCT field must have an explicit type",
-                                sql_type.span,
-                            ));
-                        }
-                    };
+                let ast::TypeKind::Row(row) = &sql_type.kind else {
+                    return Err(AnalyzeError::internal(
+                        "Struct layout lost its ROW syntax author",
+                    ));
+                };
+                for (field, argument) in fields.iter().zip(&row.fields) {
+                    let child = &argument.data_type;
                     let value =
                         author_ast_type(child, field.data_type(), field.is_nullable(), work)?;
                     for _ in field.name().bytes() {
@@ -634,15 +669,52 @@ fn nested_field_with_logical_type(
 pub(super) fn sql_type_to_arrow(
     sql_type: &novarocks_parser::ast::TypeName,
 ) -> Result<DataType, AnalyzeError> {
-    let type_name = sql_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .ok_or_else(|| {
-            AnalyzeError::invalid_query_shape("CAST target type has no name", sql_type.span)
-        })?;
-    let type_args = &sql_type.arguments;
+    let generic = match &sql_type.kind {
+        ast::TypeKind::Generic(generic) => generic,
+        ast::TypeKind::Row(row) => {
+            let fields = row
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let name = field
+                        .name
+                        .as_ref()
+                        .map(|name| name.value.clone())
+                        .unwrap_or_else(|| format!("f{}", index + 1));
+                    nested_field_with_logical_type(&name, &field.data_type, true).map(Arc::new)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(DataType::Struct(Fields::from(fields)));
+        }
+        ast::TypeKind::DateTime(datetime) => {
+            if datetime.with_time_zone || datetime.precision.as_deref().is_some_and(|parameter| !matches!(parameter, ast::DataTypeParameter::Numeric(value) if value.parsed_value == 6)) {
+                return Err(AnalyzeError::unsupported_expression("TIME/TIMESTAMP only support microsecond precision without time zone", sql_type.span));
+            }
+            return Ok(match datetime.kind {
+                ast::DateTimeType::Time => {
+                    DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
+                }
+                ast::DateTimeType::Timestamp => {
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+                }
+            });
+        }
+        ast::TypeKind::Interval(_) => {
+            return Err(AnalyzeError::unsupported_expression(
+                "INTERVAL data types are not supported",
+                sql_type.span,
+            ));
+        }
+        ast::TypeKind::ExplicitArray(_) => {
+            return Err(AnalyzeError::unsupported_expression(
+                "explicit ARRAY lengths are not supported",
+                sql_type.span,
+            ));
+        }
+    };
+    let type_name = generic.name.value.to_ascii_lowercase();
+    let type_args = &generic.arguments;
     match type_name.as_str() {
         "tinyint" => Ok(DataType::Int8),
         "smallint" => Ok(DataType::Int16),
@@ -740,31 +812,6 @@ pub(super) fn sql_type_to_arrow(
                 false,
             ))
         }
-        "struct" => {
-            let fields = type_args
-                .iter()
-                .enumerate()
-                .map(|(index, argument)| match argument {
-                    novarocks_parser::ast::TypeNameArgument::Field(field) => Ok(Arc::new(
-                        nested_field_with_logical_type(&field.name.value, &field.data_type, true)?,
-                    )),
-                    novarocks_parser::ast::TypeNameArgument::Type(data_type) => {
-                        Ok(Arc::new(nested_field_with_logical_type(
-                            &format!("f{}", index + 1),
-                            data_type,
-                            true,
-                        )?))
-                    }
-                    novarocks_parser::ast::TypeNameArgument::Literal(_) => {
-                        Err(AnalyzeError::invalid_argument(
-                            "STRUCT type field must include a type name",
-                            type_name_argument_span(argument),
-                        ))
-                    }
-                })
-                .collect::<Result<Vec<_>, AnalyzeError>>()?;
-            Ok(DataType::Struct(Fields::from(fields)))
-        }
         _ => Err(AnalyzeError::unsupported_query_shape(
             format!("unsupported SQL type: {type_name}"),
             sql_type.span,
@@ -773,40 +820,36 @@ pub(super) fn sql_type_to_arrow(
 }
 
 fn type_numeric_argument(
-    arguments: &[novarocks_parser::ast::TypeNameArgument],
+    arguments: &[ast::DataTypeParameter],
     index: usize,
 ) -> Result<Option<u64>, AnalyzeError> {
     let Some(argument) = arguments.get(index) else {
         return Ok(None);
     };
-    let novarocks_parser::ast::TypeNameArgument::Literal(literal) = argument else {
+    let ast::DataTypeParameter::Numeric(value) = argument else {
         return Err(AnalyzeError::invalid_literal(
-            "numeric type parameter must be a literal",
+            "numeric type parameter must be an integer",
             type_name_argument_span(argument),
         ));
     };
-    let novarocks_parser::ast::LiteralKind::Number(value) = &literal.kind else {
-        return Err(AnalyzeError::invalid_literal(
-            "numeric type parameter must be an integer literal",
-            literal.span,
-        ));
-    };
-    value.parse::<u64>().map(Some).map_err(|error| {
+    u64::try_from(value.parsed_value).map(Some).map_err(|_| {
         AnalyzeError::invalid_literal(
-            format!("invalid numeric type parameter `{value}`: {error}"),
-            literal.span,
+            format!(
+                "numeric type parameter must be nonnegative: {}",
+                value.spelling
+            ),
+            value.span,
         )
     })
 }
 
 fn type_type_argument<'a>(
-    arguments: &'a [novarocks_parser::ast::TypeNameArgument],
+    arguments: &'a [ast::DataTypeParameter],
     index: usize,
     kind: &str,
     type_span: novarocks_parser::Span,
-) -> Result<&'a novarocks_parser::ast::TypeName, AnalyzeError> {
-    let Some(novarocks_parser::ast::TypeNameArgument::Type(data_type)) = arguments.get(index)
-    else {
+) -> Result<&'a ast::TypeName, AnalyzeError> {
+    let Some(ast::DataTypeParameter::Type(value)) = arguments.get(index) else {
         return Err(AnalyzeError::invalid_argument(
             format!("{kind} type requires a type parameter"),
             arguments
@@ -815,16 +858,13 @@ fn type_type_argument<'a>(
                 .unwrap_or(type_span),
         ));
     };
-    Ok(data_type)
+    Ok(&value.data_type)
 }
 
-fn type_name_argument_span(
-    argument: &novarocks_parser::ast::TypeNameArgument,
-) -> novarocks_parser::Span {
+fn type_name_argument_span(argument: &ast::DataTypeParameter) -> novarocks_parser::Span {
     match argument {
-        novarocks_parser::ast::TypeNameArgument::Type(type_name) => type_name.span,
-        novarocks_parser::ast::TypeNameArgument::Literal(literal) => literal.span,
-        novarocks_parser::ast::TypeNameArgument::Field(field) => field.span,
+        ast::DataTypeParameter::Type(value) => value.data_type.span,
+        ast::DataTypeParameter::Numeric(value) => value.span,
     }
 }
 
@@ -1064,8 +1104,14 @@ fn format_literal_display_name(literal: &ast::Literal) -> String {
         ast::LiteralKind::Boolean(true) => "TRUE".to_string(),
         ast::LiteralKind::Boolean(false) => "FALSE".to_string(),
         ast::LiteralKind::Null => "NULL".to_string(),
-        ast::LiteralKind::Number(value) => value.clone(),
-        ast::LiteralKind::HexString(value) => format!("X'{value}'"),
+        ast::LiteralKind::Long { spelling, .. } | ast::LiteralKind::Decimal(spelling) => {
+            spelling.clone()
+        }
+        ast::LiteralKind::Double(value) => value.get().to_string(),
+        ast::LiteralKind::Binary(bytes) => format!("X'{}'", hex::encode(bytes)),
+        ast::LiteralKind::Generic(_) | ast::LiteralKind::Interval(_) => {
+            printer::print_expr(&ast::Expr::Literal(literal.clone()))
+        }
     }
 }
 
@@ -1131,63 +1177,11 @@ fn binary_operator_display(operator: ast::BinaryOperator) -> &'static str {
 }
 
 fn type_name_is(data_type: &ast::TypeName, expected: &str) -> bool {
-    data_type
-        .name
-        .parts
-        .last()
-        .is_some_and(|part| part.value.eq_ignore_ascii_case(expected))
+    matches!(&data_type.kind, ast::TypeKind::Generic(value) if value.name.value.eq_ignore_ascii_case(expected))
 }
 
 fn format_cast_type(data_type: &ast::TypeName) -> String {
-    let name = data_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .unwrap_or_default();
-    match name.as_str() {
-        "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
-            let precision = numeric_type_argument(data_type, 0).unwrap_or(38);
-            let scale = numeric_type_argument(data_type, 1).unwrap_or(0);
-            format!("{}({precision},{scale})", decimal_kind(precision))
-        }
-        "tinyint" => "TINYINT".to_string(),
-        "smallint" => "SMALLINT".to_string(),
-        "bigint" => "BIGINT".to_string(),
-        "largeint" => "LARGEINT".to_string(),
-        "string" => "VARCHAR(65533)".to_string(),
-        "binary" | "varbinary" => "VARBINARY".to_string(),
-        "int" | "integer" => "INT".to_string(),
-        "array" => format!(
-            "ARRAY<{}>",
-            data_type
-                .arguments
-                .first()
-                .and_then(type_name_argument_as_type)
-                .map(format_cast_type)
-                .unwrap_or_default()
-        ),
-        "map" => format!(
-            "MAP<{}>",
-            data_type
-                .arguments
-                .iter()
-                .filter_map(type_name_argument_as_type)
-                .map(format_cast_type)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        "struct" => format!(
-            "struct<{}>",
-            data_type
-                .arguments
-                .iter()
-                .map(format_struct_type_argument)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        _ => printer::print_type_name(data_type),
-    }
+    format_type_display(data_type, 0)
 }
 
 fn format_cast_type_for_expression(data_type: &ast::TypeName, expression: &ast::Expr) -> String {
@@ -1210,131 +1204,90 @@ fn is_parse_json_call(expression: &ast::Expr) -> bool {
 }
 
 fn format_json_cast_type(data_type: &ast::TypeName) -> String {
-    let name = data_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .unwrap_or_default();
-    match name.as_str() {
-        "array" => format!(
-            "ARRAY<{}>",
-            data_type
-                .arguments
-                .first()
-                .and_then(type_name_argument_as_type)
-                .map(format_json_cast_type)
-                .unwrap_or_default()
-        ),
-        "map" => format!(
-            "MAP<{}>",
-            data_type
-                .arguments
-                .iter()
-                .filter_map(type_name_argument_as_type)
-                .map(format_json_cast_type)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        "struct" => format!(
-            "struct<{}>",
-            data_type
-                .arguments
-                .iter()
-                .map(format_json_struct_type_argument)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        _ => format_cast_type(data_type),
-    }
+    format_type_display(data_type, 1)
 }
 
 fn numeric_type_argument(data_type: &ast::TypeName, index: usize) -> Option<u64> {
-    match data_type.arguments.get(index) {
-        Some(ast::TypeNameArgument::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(value),
-            ..
-        })) => value.parse().ok(),
+    let ast::TypeKind::Generic(value) = &data_type.kind else {
+        return None;
+    };
+    match value.arguments.get(index) {
+        Some(ast::DataTypeParameter::Numeric(value)) => u64::try_from(value.parsed_value).ok(),
         _ => None,
     }
 }
 
-fn type_name_argument_as_type(argument: &ast::TypeNameArgument) -> Option<&ast::TypeName> {
+fn type_name_argument_as_type(argument: &ast::DataTypeParameter) -> Option<&ast::TypeName> {
     match argument {
-        ast::TypeNameArgument::Type(data_type) => Some(data_type),
-        _ => None,
+        ast::DataTypeParameter::Type(value) => Some(&value.data_type),
+        ast::DataTypeParameter::Numeric(_) => None,
     }
 }
 
-fn format_struct_type_argument(argument: &ast::TypeNameArgument) -> String {
-    match argument {
-        ast::TypeNameArgument::Field(field) => {
-            format!(
-                "{} {}",
-                field.name.value,
-                format_cast_type(&field.data_type)
-            )
+// These are the established output-column display spellings, not SQL syntax.
+// The parser printer remains the owner of reparsable Trino type text.
+fn format_type_display(data_type: &ast::TypeName, style: u8) -> String {
+    match &data_type.kind {
+        ast::TypeKind::Row(row) => {
+            let fields = row
+                .fields
+                .iter()
+                .map(|field| {
+                    let child =
+                        format_type_display(&field.data_type, if style == 0 { 0 } else { 2 });
+                    field
+                        .name
+                        .as_ref()
+                        .map(|name| format!("{} {child}", name.value))
+                        .unwrap_or(child)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("struct<{fields}>")
         }
-        ast::TypeNameArgument::Type(data_type) => format_cast_type(data_type),
-        ast::TypeNameArgument::Literal(literal) => format_literal_display_name(literal),
-    }
-}
-
-fn format_json_struct_type_argument(argument: &ast::TypeNameArgument) -> String {
-    match argument {
-        ast::TypeNameArgument::Field(field) => format!(
-            "{} {}",
-            field.name.value,
-            format_json_struct_field_cast_type(&field.data_type)
-        ),
-        ast::TypeNameArgument::Type(data_type) => format_json_struct_field_cast_type(data_type),
-        ast::TypeNameArgument::Literal(literal) => format_literal_display_name(literal),
-    }
-}
-
-fn format_json_struct_field_cast_type(data_type: &ast::TypeName) -> String {
-    let name = data_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .unwrap_or_default();
-    match name.as_str() {
-        "tinyint" => "tinyint(4)".to_string(),
-        "smallint" => "smallint(6)".to_string(),
-        "int" | "integer" => "int(11)".to_string(),
-        "bigint" => "bigint(20)".to_string(),
-        "string" => "varchar(65533)".to_string(),
-        "binary" | "varbinary" => "varbinary".to_string(),
-        "array" => format!(
-            "array<{}>",
-            data_type
-                .arguments
-                .first()
-                .and_then(type_name_argument_as_type)
-                .map(format_json_struct_field_cast_type)
-                .unwrap_or_default()
-        ),
-        "map" => format!(
-            "map<{}>",
-            data_type
-                .arguments
-                .iter()
-                .filter_map(type_name_argument_as_type)
-                .map(format_json_struct_field_cast_type)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        "struct" => format!(
-            "struct<{}>",
-            data_type
-                .arguments
-                .iter()
-                .map(format_json_struct_type_argument)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        _ => format_cast_type(data_type),
+        ast::TypeKind::Generic(generic) => {
+            let name = generic.name.value.to_ascii_lowercase();
+            let arguments = &generic.arguments;
+            match name.as_str() {
+                "array" => {
+                    let child = arguments
+                        .first()
+                        .and_then(type_name_argument_as_type)
+                        .map(|child| format_type_display(child, style))
+                        .unwrap_or_default();
+                    format!("{}<{child}>", if style == 2 { "array" } else { "ARRAY" })
+                }
+                "map" => {
+                    let children = arguments
+                        .iter()
+                        .filter_map(type_name_argument_as_type)
+                        .map(|child| format_type_display(child, style))
+                        .collect::<Vec<_>>()
+                        .join(if style == 2 { ", " } else { "," });
+                    format!("{}<{children}>", if style == 2 { "map" } else { "MAP" })
+                }
+                "tinyint" if style == 2 => "tinyint(4)".into(),
+                "smallint" if style == 2 => "smallint(6)".into(),
+                "int" | "integer" if style == 2 => "int(11)".into(),
+                "bigint" if style == 2 => "bigint(20)".into(),
+                "string" if style == 2 => "varchar(65533)".into(),
+                "binary" | "varbinary" if style == 2 => "varbinary".into(),
+                "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
+                    let precision = numeric_type_argument(data_type, 0).unwrap_or(38);
+                    let scale = numeric_type_argument(data_type, 1).unwrap_or(0);
+                    format!("{}({precision},{scale})", decimal_kind(precision))
+                }
+                "tinyint" => "TINYINT".into(),
+                "smallint" => "SMALLINT".into(),
+                "bigint" => "BIGINT".into(),
+                "largeint" => "LARGEINT".into(),
+                "int" | "integer" => "INT".into(),
+                "string" => "VARCHAR(65533)".into(),
+                "binary" | "varbinary" => "VARBINARY".into(),
+                _ => printer::print_type_name(data_type),
+            }
+        }
+        _ => printer::print_type_name(data_type),
     }
 }
 
@@ -1476,13 +1429,10 @@ fn restore_typeof_cast_spelling(display: String, function: &ast::FunctionCall) -
     impl ast::Visit for Collector {
         fn visit_expr(&mut self, expression: &ast::Expr) {
             if let ast::Expr::Cast(cast) = expression {
-                let source = cast
-                    .data_type
-                    .name
-                    .parts
-                    .last()
-                    .map(|part| part.value.as_str())
-                    .unwrap_or_default();
+                let source = match &cast.data_type.kind {
+                    ast::TypeKind::Generic(value) => value.name.value.as_str(),
+                    _ => "",
+                };
                 let canonical = format_cast_type(&cast.data_type);
                 let display = match source {
                     // `typeof` has legacy result-header spellings for these
@@ -1571,14 +1521,16 @@ fn ordinal_function_argument<'a>(
     arguments: &'a [ast::Expr],
 ) -> Option<&'a ast::Expr> {
     let ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::Number(position),
+        kind: ast::LiteralKind::Long {
+            parsed_value: position,
+            ..
+        },
         ..
     }) = expr
     else {
         return None;
     };
-    position
-        .parse::<usize>()
+    usize::try_from(*position)
         .ok()
         .and_then(|position| arguments.get(position.saturating_sub(1)))
 }
@@ -1744,11 +1696,13 @@ pub(super) fn extract_offset(modifiers: &ast::QueryModifiers) -> Result<Option<i
 fn eval_limit_or_offset(expr: &ast::Expr, keyword: &str) -> Result<i64, AnalyzeError> {
     match expr {
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(value),
+            kind:
+                ast::LiteralKind::Long {
+                    parsed_value: value,
+                    ..
+                },
             ..
-        }) => value.parse::<i64>().map_err(|error| {
-            AnalyzeError::invalid_literal(format!("invalid {keyword} value: {error}"), expr.span())
-        }),
+        }) => Ok(*value),
         _ => Err(AnalyzeError::invalid_argument(
             format!("only constant {keyword} is supported"),
             expr.span(),
@@ -1760,14 +1714,13 @@ fn eval_limit_or_offset(expr: &ast::Expr, keyword: &str) -> Result<i64, AnalyzeE
 pub(super) fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
     match expr {
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(value),
+            kind:
+                ast::LiteralKind::Long {
+                    parsed_value: value,
+                    ..
+                },
             ..
-        }) => value.parse::<i64>().map_err(|error| {
-            AnalyzeError::invalid_literal(
-                format!("cannot parse integer literal '{value}': {error}"),
-                expr.span(),
-            )
-        }),
+        }) => Ok(*value),
         ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
             Ok(-eval_const_i64(&unary.expression)?)
         }
@@ -1907,8 +1860,21 @@ mod tests {
                 .expect_err("invalid decimal type must fail before binding");
             assert_eq!(error.span(), Some(target.span), "{type_name}: {error}");
         }
-        let fractional = parse_native_cast_type("SELECT CAST(NULL AS DECIMAL(1.5,0))");
-        assert!(sql_type_to_arrow(&fractional).is_err());
+        // Numeric type parameters accept integer tokens. Fractions are syntax
+        // errors whose rejected span must identify source within this CAST.
+        const FRACTIONAL_SOURCE: &str = "SELECT CAST(NULL AS DECIMAL(1.5,0))";
+        let error = novarocks_parser::parse(FRACTIONAL_SOURCE)
+            .expect_err("fractional type parameters have no final AST representation");
+        let novarocks_parser::ParserError::Parse(novarocks_parser::ParseError::UnexpectedToken {
+            span,
+            ..
+        }) = error
+        else {
+            panic!("fractional parameter must be a syntax rejection, got {error:?}");
+        };
+        let cast_start = FRACTIONAL_SOURCE.find("CAST").unwrap();
+        assert!(!span.is_empty());
+        assert!(span.start() >= cast_start && span.end() <= FRACTIONAL_SOURCE.len());
         // Signed parameters are already rejected by the native parser.
         for type_name in ["DECIMAL(-1,0)", "DECIMAL(10,-1)"] {
             assert!(
@@ -2084,5 +2050,152 @@ mod tests {
             "CAST((row(1, 2, 3)) AS struct<col1 INT, col2 ARRAY<INT>, \
              col3 struct<nested TINYINT>>)"
         );
+    }
+    #[test]
+    fn final_row_and_datetime_nodes_preserve_names_domains_and_microsecond_contract() {
+        use novarocks_parser::{Span, ast, build};
+        use novarocks_type_contract::{ValueKind, ValueLogicalType};
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let row = build::row_type(vec![ast::RowDataTypeField {
+            name: None,
+            data_type: build::simple_type("JSON"),
+            span: Span::new(4, 8),
+        }]);
+        let value = super::sql_type_to_value_type(&row, true, &control).unwrap();
+        let ValueKind::Struct(fields) = value.value_type().kind() else {
+            panic!("row")
+        };
+        assert_eq!(fields[0].name(), "f1");
+        assert!(matches!(
+            fields[0].value_type().kind(),
+            ValueKind::Nominal(ValueLogicalType::Json)
+        ));
+        for kind in [ast::DateTimeType::Time, ast::DateTimeType::Timestamp] {
+            for precision in [None, Some(ast::AstBox::new(build::numeric_parameter(6)))] {
+                let ty = ast::TypeName {
+                    kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
+                        kind,
+                        with_time_zone: false,
+                        precision,
+                    }),
+                    span: Span::new(0, 12),
+                };
+                let expected = match kind {
+                    ast::DateTimeType::Time => DataType::Time64(TimeUnit::Microsecond),
+                    ast::DateTimeType::Timestamp => {
+                        DataType::Timestamp(TimeUnit::Microsecond, None)
+                    }
+                };
+                assert_eq!(sql_type_to_arrow(&ty).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn final_unsupported_type_and_literal_facts_reject_before_catalog_discovery() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_parser::{Span, ast, build};
+        struct NoLookup;
+        impl crate::catalog::PlannerTableProvider for NoLookup {
+            fn resolve_table_for_analysis(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+                panic!("unsupported typed syntax must precede catalog lookup");
+            }
+        }
+        let span = Span::new(20, 80);
+        let qualifier = ast::IntervalQualifier::Simple(ast::SimpleIntervalQualifier {
+            precision: None,
+            field: ast::IntervalQualifierField::Year,
+            span,
+        });
+        let explicit = ast::TypeName {
+            kind: ast::TypeKind::ExplicitArray(ast::ExplicitArrayDataType {
+                element: ast::AstBox::new(build::simple_type("INTEGER")),
+                length: ast::ArrayLength {
+                    spelling: "9999999999999999999999999999999999999999999999999".into(),
+                    span,
+                },
+            }),
+            span,
+        };
+        let unsupported_types = vec![
+            explicit.clone(),
+            build::type_name(
+                build::ident("ARRAY", None),
+                vec![build::type_parameter(explicit)],
+            ),
+            ast::TypeName {
+                kind: ast::TypeKind::Interval(ast::IntervalDataType {
+                    qualifier: qualifier.clone(),
+                    span,
+                }),
+                span,
+            },
+            ast::TypeName {
+                kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
+                    kind: ast::DateTimeType::Timestamp,
+                    with_time_zone: true,
+                    precision: None,
+                }),
+                span,
+            },
+            ast::TypeName {
+                kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
+                    kind: ast::DateTimeType::Time,
+                    with_time_zone: false,
+                    precision: Some(ast::AstBox::new(build::numeric_parameter(3))),
+                }),
+                span,
+            },
+            ast::TypeName {
+                kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
+                    kind: ast::DateTimeType::Timestamp,
+                    with_time_zone: false,
+                    precision: Some(ast::AstBox::new(build::type_parameter(build::simple_type(
+                        "BIGINT",
+                    )))),
+                }),
+                span,
+            },
+        ];
+        let mut expressions = unsupported_types
+            .into_iter()
+            .map(|ty| build::cast(build::null(), ty))
+            .collect::<Vec<_>>();
+        for type_name in ["INTEGER", "\"DATE\""] {
+            expressions.push(ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Generic(ast::GenericLiteral {
+                    type_name: type_name.into(),
+                    value: "1".into(),
+                }),
+                span,
+            }));
+        }
+        expressions.push(ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Interval(ast::IntervalLiteral {
+                value: "1".into(),
+                sign: ast::IntervalSign::Positive,
+                qualifier,
+            }),
+            span,
+        }));
+        for expression in expressions {
+            let mut statements =
+                novarocks_parser::parse("SELECT NULL FROM missing_type_input").unwrap();
+            let ast::Statement::Query(query) = &mut statements[0] else {
+                panic!("query")
+            };
+            let ast::SetExpr::Select(select) = query.body.as_mut() else {
+                panic!("select")
+            };
+            select.projection[0] = ast::SelectItem::UnnamedExpr(expression);
+            let error = crate::analyzer::analyze(query, &NoLookup, "default").unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+            assert_eq!(error.span(), Some(span));
+        }
     }
 }

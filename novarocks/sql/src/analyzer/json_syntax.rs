@@ -1007,7 +1007,10 @@ mod tests {
             Span::new(40, 49),
         ));
         let assigned = ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number("1".into()),
+            kind: ast::LiteralKind::Long {
+                spelling: "1".into(),
+                parsed_value: 1,
+            },
             span: Span::new(65, 66),
         });
         let node = object(vec![

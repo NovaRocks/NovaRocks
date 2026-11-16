@@ -19,9 +19,10 @@
 //! Requires the real JSON Visit/Fold hooks to be integrated by the root owner.
 //! Does not fabricate Expr/TableFactor variants or prove parser/runtime support.
 
-use super::super::visit::{fold_expr, walk_expr, walk_type_name};
+use super::super::visit::{fold_expr, walk_expr};
 use super::super::{
-    BinaryExpr, BinaryOperator, Literal, LiteralKind, ObjectName, StructField, TypeNameArgument,
+    AstBox, AstVec, BinaryExpr, BinaryOperator, DataTypeParameter, GenericDataType,
+    NumericParameter, TypeKind, TypeParameter, walk_type_name,
 };
 use super::*;
 use std::collections::BTreeSet;
@@ -48,28 +49,39 @@ fn path(prefix: &str, value: &str, span: Span) -> JsonPathString {
 }
 fn simple_type(prefix: &str, name: &str, span: Span) -> TypeName {
     TypeName {
-        name: ObjectName {
-            parts: vec![id(prefix, name, span)],
-            span,
-        },
-        arguments: vec![],
-        argument_separator_spaces: vec![],
+        kind: TypeKind::Generic(GenericDataType {
+            name: id(prefix, name, span),
+            arguments: AstVec::new(),
+        }),
         span,
     }
 }
 fn nested_type(prefix: &str, stem: &str, span: Span) -> TypeName {
     let mut leaf = simple_type(prefix, &format!("{stem}_leaf"), span);
-    leaf.arguments.push(TypeNameArgument::Literal(Literal {
-        kind: LiteralKind::Number("17".into()),
-        span,
-    }));
+    let TypeKind::Generic(inner) = &mut leaf.kind else {
+        unreachable!()
+    };
+    inner
+        .arguments
+        .push(DataTypeParameter::Numeric(NumericParameter {
+            spelling: "17".into(),
+            parsed_value: 17,
+            span,
+        }));
     let mut outer = simple_type(prefix, stem, span);
-    outer.arguments.push(TypeNameArgument::Field(StructField {
-        name: id(prefix, &format!("{stem}_field"), span),
-        data_type: leaf,
-        span,
+    let TypeKind::Generic(inner) = &mut outer.kind else {
+        unreachable!()
+    };
+    inner.arguments.push(DataTypeParameter::Type(TypeParameter {
+        data_type: AstBox::new(leaf),
     }));
     outer
+}
+fn clear_type_arguments(node: &mut TypeName) {
+    let TypeKind::Generic(value) = &mut node.kind else {
+        unreachable!()
+    };
+    value.arguments.clear();
 }
 fn invocation(prefix: &str, stem: &str, span: Span) -> JsonPathInvocation {
     JsonPathInvocation {
@@ -339,17 +351,20 @@ impl Visit for Trace {
         self.events.push(format!("id:{}", node.value));
     }
     fn visit_type_name(&mut self, node: &TypeName) {
-        self.events
-            .push(format!("type:{}", node.name.parts[0].value));
+        self.events.push(format!(
+            "type:{}",
+            match &node.kind {
+                TypeKind::Generic(value) => value.name.value.as_str(),
+                _ => panic!("generic fixture"),
+            }
+        ));
         walk_type_name(self, node);
     }
     fn visit_expr(&mut self, node: &Expr) {
         walk_expr(self, node);
     }
-    fn visit_literal(&mut self, node: &Literal) {
-        if let LiteralKind::Number(value) = &node.kind {
-            self.events.push(format!("number:{value}"));
-        }
+    fn visit_numeric_parameter(&mut self, node: &NumericParameter) {
+        self.events.push(format!("number:{}", node.spelling));
     }
     fn visit_json_path_string(&mut self, node: &JsonPathString) {
         self.hooks.insert("json_path_string");
@@ -683,7 +698,6 @@ fn table_visit_preserves_parameter_column_nested_and_plan_order() {
             "id:v_name",
             "type:v_type",
             "id:v_type",
-            "id:v_type_field",
             "type:v_type_leaf",
             "id:v_type_leaf",
             "number:17",
@@ -693,7 +707,6 @@ fn table_visit_preserves_parameter_column_nested_and_plan_order() {
             "id:q_name",
             "type:q_type",
             "id:q_type",
-            "id:q_type_field",
             "type:q_type_leaf",
             "id:q_type_leaf",
             "number:17",
@@ -725,7 +738,6 @@ fn object_keys_are_expressions_and_return_types_are_traversed() {
             "id:object_b",
             "type:object_return",
             "id:object_return",
-            "id:object_return_field",
             "type:object_return_leaf",
             "id:object_return_leaf",
             "number:17"
@@ -895,11 +907,11 @@ fn typed_table_columns_paths_plans_and_order_remain_observable() {
     });
     let v = value_column("", s());
     assert_distinct(&v, |n| n.name.value = "other".into());
-    assert_distinct(&v, |n| n.data_type.arguments.clear());
+    assert_distinct(&v, |n| clear_type_arguments(&mut n.data_type));
     assert_distinct(&v, |n| n.json_path = None);
     let q = query_column("", s());
     assert_distinct(&q, |n| n.name.value = "other_query_column".into());
-    assert_distinct(&q, |n| n.data_type.arguments.clear());
+    assert_distinct(&q, |n| clear_type_arguments(&mut n.data_type));
     assert_distinct(&q, |n| n.format = JsonFormat::Json);
     assert_distinct(&q, |n| n.json_path = None);
     assert_distinct(&q, |n| {

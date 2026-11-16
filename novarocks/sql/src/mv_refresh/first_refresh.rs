@@ -2998,20 +2998,12 @@ fn aggregate_visible_type_witness(data_type: &DataType) -> Result<ast::Expr, Str
         DataType::Date32 => build::simple_type("DATE"),
         DataType::Timestamp(_, _) => build::simple_type("DATETIME"),
         DataType::Decimal128(precision, scale) if *scale >= 0 => build::type_name(
-            build::object_name(vec![build::ident("DECIMAL", None)])
-                .map_err(|error| error.to_string())?,
+            build::ident("DECIMAL", None),
             [i64::from(*precision), i64::from(*scale)]
                 .into_iter()
-                .map(|value| {
-                    ast::TypeNameArgument::Literal(ast::Literal {
-                        kind: ast::LiteralKind::Number(value.to_string()),
-                        span: novarocks_parser::SYNTHETIC,
-                    })
-                })
+                .map(build::numeric_parameter)
                 .collect(),
-            vec![false],
-        )
-        .map_err(|error| error.to_string())?,
+        ),
         other => {
             return Err(format!(
                 "unsupported MV aggregate visible target type {other:?}"
@@ -3925,7 +3917,10 @@ mod tests {
                 {
                     assert_eq!(version.kind, ast::TableVersionKind::ForVersionAsOf);
                     let ast::Expr::Literal(ast::Literal {
-                        kind: ast::LiteralKind::Number(value),
+                        kind:
+                            ast::LiteralKind::Long {
+                                spelling: value, ..
+                            },
                         ..
                     }) = &version.value
                     else {
@@ -4349,7 +4344,10 @@ mod tests {
                         panic!("branch id CAST");
                     };
                     let ast::Expr::Literal(ast::Literal {
-                        kind: ast::LiteralKind::Number(value),
+                        kind:
+                            ast::LiteralKind::Long {
+                                spelling: value, ..
+                            },
                         ..
                     }) = cast.expr.as_ref()
                     else {

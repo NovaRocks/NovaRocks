@@ -533,10 +533,7 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
                 super::AccessKind::Json { path, .. } => validate_expr(path)?,
             }
         }
-        Expr::Identifier(_)
-        | Expr::CompoundIdentifier(_)
-        | Expr::Literal(_)
-        | Expr::TypedString(_) => {}
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Literal(_) => {}
     }
     Ok(())
 }

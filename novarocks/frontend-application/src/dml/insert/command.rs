@@ -79,7 +79,7 @@ pub fn convert_insert_command(insert: &Insert) -> Result<InsertCommand, String> 
 /// Classify literal projections by syntax, without evaluating values or CASTs.
 pub(crate) fn is_literal_expr(expr: &ast::Expr) -> bool {
     match expr {
-        ast::Expr::Literal(_) | ast::Expr::TypedString(_) => true,
+        ast::Expr::Literal(_) => true,
         ast::Expr::Nested(nested) => is_literal_expr(&nested.expression),
         ast::Expr::Unary(unary) => {
             matches!(unary.operator, ast::UnaryOperator::Minus)
@@ -169,20 +169,22 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
     use LiteralShape::{Float, Integer, Other, String};
     match expr {
         ast::Expr::Literal(literal) => Some(match &literal.kind {
-            ast::LiteralKind::Number(text) if text.contains(['.', 'e', 'E']) => Float,
-            ast::LiteralKind::Number(text) if text.parse::<i64>().is_ok() => Integer,
-            ast::LiteralKind::Number(_)
-            | ast::LiteralKind::String(_)
-            | ast::LiteralKind::HexString(_) => String,
+            ast::LiteralKind::Long { .. } => Integer,
+            ast::LiteralKind::Double(_) | ast::LiteralKind::Decimal(_) => Float,
+            ast::LiteralKind::String(_)
+            | ast::LiteralKind::Binary(_)
+            | ast::LiteralKind::Generic(_) => String,
             _ => Other,
         }),
-        ast::Expr::TypedString(_) | ast::Expr::Identifier(_) => Some(String),
+        ast::Expr::Identifier(_) => Some(String),
         ast::Expr::Nested(nested) => legacy_literal_shape(&nested.expression),
         ast::Expr::Cast(cast) => {
             if matches!(
-                printer::print_object_name(&cast.data_type.name)
-                    .to_ascii_lowercase()
-                    .as_str(),
+                match &cast.data_type.kind {
+                    ast::TypeKind::Generic(value) => value.name.value.to_ascii_lowercase(),
+                    _ => std::string::String::new(),
+                }
+                .as_str(),
                 "decimal" | "decimal32" | "decimal64" | "decimal128" | "dec" | "numeric"
             ) {
                 None
@@ -340,7 +342,7 @@ mod tests {
         };
         assert_eq!(
             value.kind,
-            ast::LiteralKind::Number("123456789.123456789".into())
+            ast::LiteralKind::Decimal("123456789.123456789".into())
         );
         assert!(matches!(&values.rows[1][0], ast::Expr::Cast(_)));
     }

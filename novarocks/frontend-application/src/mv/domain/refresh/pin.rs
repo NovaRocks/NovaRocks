@@ -451,7 +451,10 @@ fn walk_factor(
             *version = Some(TableVersion {
                 kind: TableVersionKind::ForVersionAsOf,
                 value: Expr::Literal(Literal {
-                    kind: LiteralKind::Number(pinned.snapshot_id().to_string()),
+                    kind: LiteralKind::Long {
+                        spelling: pinned.snapshot_id().to_string(),
+                        parsed_value: pinned.snapshot_id(),
+                    },
                     span: name.span,
                 }),
                 span: name.span,

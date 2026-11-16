@@ -19,10 +19,7 @@
 
 use crate::Span;
 
-use super::{
-    Fold, Ident, Literal, LiteralKind, ObjectName, Property, PropertyKeyValue, TypeName,
-    TypeNameArgument, Visit,
-};
+use super::{Fold, Ident, Literal, ObjectName, Property, PropertyKeyValue, TypeName, Visit};
 
 /// Iceberg table commands owned by SQLP-3.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -472,36 +469,8 @@ fn write_column_path(path: &ColumnPath, output: &mut String) {
         write_ident(part, output);
     }
 }
-fn write_type_name(type_name: &TypeName, output: &mut String) {
-    write_object_name(&type_name.name, output);
-    if type_name.arguments.is_empty() {
-        return;
-    }
-    let generic = matches!(
-        type_name
-            .name
-            .parts
-            .last()
-            .map(|part| part.value.to_ascii_uppercase())
-            .as_deref(),
-        Some("ARRAY" | "MAP" | "STRUCT")
-    );
-    output.push(if generic { '<' } else { '(' });
-    for (index, argument) in type_name.arguments.iter().enumerate() {
-        if index != 0 {
-            output.push_str(", ");
-        }
-        match argument {
-            TypeNameArgument::Type(data_type) => write_type_name(data_type, output),
-            TypeNameArgument::Literal(literal) => write_literal(literal, output),
-            TypeNameArgument::Field(field) => {
-                write_ident(&field.name, output);
-                output.push(' ');
-                write_type_name(&field.data_type, output);
-            }
-        }
-    }
-    output.push(if generic { '>' } else { ')' });
+fn write_type_name(value: &TypeName, output: &mut String) {
+    output.push_str(&crate::printer::print_type_name(value));
 }
 fn write_ident(ident: &Ident, output: &mut String) {
     if ident.quoted {
@@ -512,18 +481,8 @@ fn write_ident(ident: &Ident, output: &mut String) {
         output.push_str(&ident.value);
     }
 }
-fn write_literal(literal: &Literal, output: &mut String) {
-    match &literal.kind {
-        LiteralKind::Null => output.push_str("NULL"),
-        LiteralKind::Boolean(value) => output.push_str(if *value { "TRUE" } else { "FALSE" }),
-        LiteralKind::Number(value) => output.push_str(value),
-        LiteralKind::HexString(value) => {
-            output.push_str("X'");
-            output.push_str(value);
-            output.push('\'');
-        }
-        LiteralKind::String(value) => write_quoted_string(value, output),
-    }
+fn write_literal(value: &Literal, output: &mut String) {
+    output.push_str(&crate::printer::print_literal(value));
 }
 fn write_quoted_string(value: &str, output: &mut String) {
     output.push('\'');

@@ -673,12 +673,14 @@ fn lower_typed_u32(value: &Literal, context: &str) -> Result<u32, String> {
 }
 
 fn lower_typed_u64(value: &Literal, context: &str) -> Result<u64, String> {
-    let LiteralKind::Number(value) = &value.kind else {
+    let LiteralKind::Long {
+        parsed_value: value,
+        ..
+    } = &value.kind
+    else {
         return Err(format!("{context} expects a number"));
     };
-    value
-        .parse::<u64>()
-        .map_err(|error| format!("invalid {context} `{value}`: {error}"))
+    u64::try_from(*value).map_err(|error| format!("invalid {context} `{value}`: {error}"))
 }
 
 fn lower_typed_string(value: &Literal, context: &str) -> Result<String, String> {

@@ -40,7 +40,6 @@ pub enum BuildError {
     EmptyTuple,
     EmptyUnion,
     EmptyWildcardPrefix,
-    TypeArgumentSeparators { arguments: usize, separators: usize },
     Number(ParserError),
 }
 
@@ -57,13 +56,6 @@ impl fmt::Display for BuildError {
             Self::EmptyWildcardPrefix => {
                 formatter.write_str("qualified wildcard must contain a name prefix")
             }
-            Self::TypeArgumentSeparators {
-                arguments,
-                separators,
-            } => write!(
-                formatter,
-                "type with {arguments} arguments has {separators} separator markers"
-            ),
             Self::Number(error) => fmt::Display::fmt(error, formatter),
         }
     }
@@ -151,16 +143,19 @@ pub fn number(text: impl Into<String>) -> Result<Expr, BuildError> {
 
 /// Builds an exactly representable integer without a fallible text conversion.
 pub fn integer(value: i64) -> Expr {
-    literal(LiteralKind::Number(value.to_string()))
+    literal(LiteralKind::Long {
+        spelling: value.to_string(),
+        parsed_value: value,
+    })
 }
 
 pub fn string(value: impl Into<String>) -> Expr {
     literal(LiteralKind::String(value.into()))
 }
 
-/// The input is the admitted hexadecimal body, without a SQL delimiter.
-pub fn hex_string(value: impl Into<String>) -> Expr {
-    literal(LiteralKind::HexString(value.into()))
+/// Builds a binary literal from its decoded bytes.
+pub fn binary_literal(value: Vec<u8>) -> Expr {
+    literal(LiteralKind::Binary(value))
 }
 
 pub fn boolean(value: bool) -> Expr {
@@ -180,35 +175,58 @@ pub fn literal(kind: LiteralKind) -> Expr {
     })
 }
 
-pub fn type_name(
-    name: ObjectName,
-    arguments: Vec<TypeNameArgument>,
-    argument_separator_spaces: Vec<bool>,
-) -> Result<TypeName, BuildError> {
-    if argument_separator_spaces.len() != arguments.len().saturating_sub(1) {
-        return Err(BuildError::TypeArgumentSeparators {
-            arguments: arguments.len(),
-            separators: argument_separator_spaces.len(),
-        });
-    }
-    Ok(TypeName {
-        name,
-        arguments,
-        argument_separator_spaces,
+pub fn type_name(name: Ident, arguments: Vec<DataTypeParameter>) -> TypeName {
+    TypeName {
+        kind: TypeKind::Generic(GenericDataType {
+            name,
+            arguments: arguments.into(),
+        }),
         span: SYNTHETIC,
-    })
+    }
 }
 
 pub fn simple_type(name: impl Into<String>) -> TypeName {
-    TypeName {
-        name: ObjectName {
-            parts: vec![ident(name, None)],
+    let name = name.into();
+    let kind = match name.to_ascii_uppercase().as_str() {
+        "TIME" => Some(DateTimeType::Time),
+        "TIMESTAMP" | "DATETIME" => Some(DateTimeType::Timestamp),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        TypeName {
+            kind: TypeKind::DateTime(DateTimeDataType {
+                kind,
+                with_time_zone: false,
+                precision: None,
+            }),
             span: SYNTHETIC,
-        },
-        arguments: Vec::new(),
-        argument_separator_spaces: Vec::new(),
+        }
+    } else {
+        type_name(ident(name, None), Vec::new())
+    }
+}
+
+pub fn row_type(fields: Vec<RowDataTypeField>) -> TypeName {
+    TypeName {
+        kind: TypeKind::Row(RowDataType {
+            fields: fields.into(),
+        }),
         span: SYNTHETIC,
     }
+}
+
+pub fn type_parameter(data_type: TypeName) -> DataTypeParameter {
+    DataTypeParameter::Type(TypeParameter {
+        data_type: AstBox::new(data_type),
+    })
+}
+
+pub fn numeric_parameter(value: i64) -> DataTypeParameter {
+    DataTypeParameter::Numeric(NumericParameter {
+        spelling: value.to_string(),
+        parsed_value: value,
+        span: SYNTHETIC,
+    })
 }
 
 pub fn cast(expr: Expr, data_type: TypeName) -> Expr {
@@ -234,7 +252,9 @@ pub fn unary(operator: UnaryOperator, expr: Expr) -> Result<Expr, BuildError> {
     let span = expr.span();
     if operator == UnaryOperator::Minus
         && let Expr::Literal(Literal {
-            kind: LiteralKind::Number(value),
+            kind: LiteralKind::Long {
+                spelling: value, ..
+            },
             ..
         }) = &expr
         && !value.starts_with(['-', '+'])

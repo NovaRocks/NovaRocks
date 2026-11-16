@@ -117,6 +117,34 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                 _ => novarocks_parser::ast::walk_expr(self, expression),
             }
         }
+        fn visit_type_name(&mut self, data_type: &novarocks_parser::ast::TypeName) {
+            if self.0.is_some() {
+                return;
+            }
+            use novarocks_parser::ast::{DataTypeParameter, TypeKind};
+            match &data_type.kind {
+                TypeKind::ExplicitArray(_) => self.0 = Some(("explicit ARRAY lengths are not supported", data_type.span)),
+                TypeKind::Interval(_) => self.0 = Some(("INTERVAL data types are not supported", data_type.span)),
+                TypeKind::DateTime(value) if value.with_time_zone || value.precision.as_deref().is_some_and(|parameter| !matches!(parameter, DataTypeParameter::Numeric(number) if number.parsed_value == 6)) => self.0 = Some(("TIME/TIMESTAMP only support microsecond precision without time zone", data_type.span)),
+                _ => novarocks_parser::ast::walk_type_name(self, data_type),
+            }
+        }
+        fn visit_literal(&mut self, literal: &novarocks_parser::ast::Literal) {
+            if self.0.is_some() {
+                return;
+            }
+            match &literal.kind {
+                LiteralKind::Interval(_) => {
+                    self.0 = Some(("INTERVAL literals are not supported", literal.span))
+                }
+                LiteralKind::Generic(value)
+                    if !crate::literal::is_supported_generic_literal(value) =>
+                {
+                    self.0 = Some(("generic literal type is not supported", literal.span))
+                }
+                _ => novarocks_parser::ast::walk_literal(self, literal),
+            }
+        }
         fn visit_table_factor(&mut self, factor: &TableFactor) {
             if self.0.is_some() {
                 return;
@@ -148,10 +176,14 @@ fn recursive_cte_max_depth(query: &Query) -> Option<usize> {
         let Expr::Literal(value) = &property.value else {
             return None;
         };
-        let LiteralKind::Number(value) = &value.kind else {
+        let LiteralKind::Long {
+            parsed_value: value,
+            ..
+        } = &value.kind
+        else {
             return None;
         };
-        value.parse::<usize>().ok().map(|depth| depth.max(1))
+        usize::try_from(*value).ok().map(|depth| depth.max(1))
     })
 }
 

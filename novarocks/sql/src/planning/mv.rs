@@ -3520,7 +3520,7 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
                 );
             }
         }
-        Expr::CompoundIdentifier(_) | Expr::Literal(_) | Expr::TypedString(_) => {}
+        Expr::CompoundIdentifier(_) | Expr::Literal(_) => {}
     }
     Ok(())
 }

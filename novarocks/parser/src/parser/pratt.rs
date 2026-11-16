@@ -17,16 +17,18 @@
 
 //! Data-driven Pratt parsing machinery for the initial expression grammar.
 
+use crate::ast::{AstBox, TypeKind, TypeParameter};
+
 use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
         AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr,
-        CastExpr, CastKind, ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier,
-        Ident, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField, IsPredicate,
-        IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, Literal, LiteralKind,
-        MapEntry, MapExpr, NestedExpr, NullTreatment, ObjectName, StructField, SubqueryExpr,
-        TupleExpr, TypeName, TypeNameArgument, TypedStringExpr, UnaryExpr, UnaryOperator,
-        WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+        CastExpr, CastKind, DataTypeParameter, ExistsExpr, Expr, FunctionCall, FunctionOrderBy,
+        FunctionQuantifier, Ident, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField,
+        IsPredicate, IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, Literal,
+        LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment, ObjectName, RowDataTypeField,
+        SubqueryExpr, TupleExpr, TypeName, UnaryExpr, UnaryOperator, WindowFrame, WindowFrameBound,
+        WindowFrameExclusion, WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -722,18 +724,21 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.skip_trivia();
         if self.current_is_word("ARRAY") && self.peek_nontrivia_is_symbol(1, Symbol::Lt) {
             let start = self.current_span();
-            let mut array_type = self.parse_type_name()?;
+            let array_type = self.parse_type_name()?;
+            let TypeKind::Generic(mut array_type) = array_type.kind else {
+                return Err(self.unexpected("ARRAY element type"));
+            };
             if array_type.arguments.len() != 1 || !self.current_is_symbol(Symbol::LBracket) {
                 return Err(self.unexpected("'[' after ARRAY element type"));
             }
-            let TypeNameArgument::Type(element_type) = array_type
+            let DataTypeParameter::Type(element_type) = array_type
                 .arguments
                 .pop()
                 .expect("ARRAY type checked to have one argument")
             else {
                 return Err(self.unexpected("ARRAY element type"));
             };
-            return self.parse_array_expression(start, Some(element_type));
+            return self.parse_array_expression(start, Some(element_type.data_type.into_inner()));
         }
         if self.current_is_word("MAP") && self.peek_nontrivia_is_symbol(1, Symbol::LBrace) {
             let start = self.current_span().start();
@@ -747,7 +752,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         if self.current_is_word("EXTRACT") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
             return self.parse_extract_expression();
         }
-        if (self.current_is_word("DATETIME") || self.current_is_word("JSON"))
+        if (self.current_is_word("DATETIME")
+            || self.current_is_word("JSON")
+            || self.current_is_word("DECIMAL"))
             && self.peek_nontrivia_is_string(1)
         {
             return self.parse_typed_string_expression();
@@ -770,7 +777,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }) => {
                 self.advance();
                 Ok(Expr::Literal(Literal {
-                    kind: LiteralKind::HexString(self.hex_string_value(span).expect("hex token")),
+                    kind: super::binary_literal_kind(
+                        self.hex_string_value(span).expect("hex token"),
+                        span,
+                    )?,
                     span,
                 }))
             }
@@ -780,10 +790,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }) => {
                 self.advance();
                 Ok(Expr::Literal(Literal {
-                    kind: self
-                        .hex_string_value(span)
-                        .map(LiteralKind::HexString)
-                        .unwrap_or_else(|| LiteralKind::String(self.string_value(span))),
+                    kind: match self.hex_string_value(span) {
+                        Some(value) => super::binary_literal_kind(value, span)?,
+                        None => LiteralKind::String(self.string_value(span)),
+                    },
                     span,
                 }))
             }
@@ -1060,7 +1070,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
 
     fn parse_typed_string_expression(&mut self) -> Result<Expr, ParseError> {
         let start = self.current_span().start();
-        let data_type = self.parse_type_name()?;
+        let raw_tag = self.token_text(self.current_span()).to_owned();
+        self.advance();
         self.skip_trivia();
         let Some(token) = self.current().cloned() else {
             return Err(self.unexpected("string literal after type name"));
@@ -1069,12 +1080,21 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             return Err(self.unexpected("string literal after type name"));
         }
         self.advance();
-        Ok(Expr::TypedString(TypedStringExpr {
-            data_type,
-            value: Literal {
-                kind: LiteralKind::String(self.string_value(token.span)),
-                span: token.span,
-            },
+        let value = self.string_value(token.span);
+        let kind = if raw_tag.eq_ignore_ascii_case("DECIMAL") {
+            LiteralKind::Decimal(value)
+        } else {
+            LiteralKind::Generic(crate::ast::GenericLiteral {
+                type_name: if raw_tag.eq_ignore_ascii_case("DATETIME") {
+                    "TIMESTAMP".into()
+                } else {
+                    raw_tag
+                },
+                value,
+            })
+        };
+        Ok(Expr::Literal(Literal {
+            kind,
             span: Span::new(start, token.span.end()),
         }))
     }
@@ -1219,13 +1239,13 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
             parts.push(self.parse_identifier(token.span));
         }
-        let name_end = parts.last().map_or(start, |part| part.span.end());
-        let name = ObjectName {
-            parts,
-            span: Span::new(start, name_end),
-        };
+        if parts.len() != 1 {
+            return Err(self.unexpected("unqualified type name"));
+        }
+        let name = parts.pop().expect("first type identifier");
+        let name_end = name.span.end();
         let mut arguments = Vec::new();
-        let mut argument_separator_spaces = Vec::new();
+        let mut fields = None;
         let mut end = name_end;
         if self.current_is_symbol(Symbol::LParen) {
             self.advance();
@@ -1244,15 +1264,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     }
                     _ => return Err(self.unexpected("type parameter")),
                 };
-                arguments.push(TypeNameArgument::Literal(literal));
+                arguments.push(super::numeric_type_parameter(literal)?);
                 if self.pending_type_gt.is_some() || !self.current_is_symbol(Symbol::Comma) {
                     break;
                 }
                 self.advance();
-                argument_separator_spaces.push(matches!(
-                    self.current().map(|token| &token.kind),
-                    Some(TokenKind::Trivia(crate::TriviaKind::Whitespace))
-                ));
                 self.skip_trivia();
             }
             if !self.current_is_symbol(Symbol::RParen) {
@@ -1264,10 +1280,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         } else if self.current_is_symbol(Symbol::Lt) {
             self.advance();
             self.skip_trivia();
-            let is_struct = name
-                .parts
-                .last()
-                .is_some_and(|part| part.value.eq_ignore_ascii_case("STRUCT"));
+            let is_struct = name.value.eq_ignore_ascii_case("STRUCT");
             loop {
                 if is_struct {
                     let field_start = self.current_span().start();
@@ -1284,33 +1297,26 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     self.skip_trivia();
                     let data_type = self.parse_type_name()?;
                     let field_end = data_type.span.end();
-                    arguments.push(TypeNameArgument::Field(StructField {
-                        name: field_name,
+                    fields.get_or_insert_with(Vec::new).push(RowDataTypeField {
+                        name: Some(field_name),
                         data_type,
                         span: Span::new(field_start, field_end),
-                    }));
+                    });
                 } else {
-                    arguments.push(TypeNameArgument::Type(self.parse_type_name()?));
+                    arguments.push(DataTypeParameter::Type(TypeParameter {
+                        data_type: AstBox::new(self.parse_type_name()?),
+                    }));
                 }
                 self.skip_trivia();
                 if self.pending_type_gt.is_some() || !self.current_is_symbol(Symbol::Comma) {
                     break;
                 }
                 self.advance();
-                argument_separator_spaces.push(matches!(
-                    self.current().map(|token| &token.kind),
-                    Some(TokenKind::Trivia(crate::TriviaKind::Whitespace))
-                ));
                 self.skip_trivia();
             }
             end = self.consume_type_gt()?;
         }
-        Ok(TypeName {
-            name,
-            arguments,
-            argument_separator_spaces,
-            span: Span::new(start, end),
-        })
+        super::finish_type_name(name, arguments, fields, Span::new(start, end))
     }
 
     /// `identifier ::= IDENT | QUOTED_IDENT`
@@ -2224,7 +2230,7 @@ mod tests {
         let canonical = Printer::new().statements(&statements);
         assert_eq!(
             canonical,
-            "SELECT array_generate(DATETIME '2025-10-01', DATETIME '2025-10-05', INTERVAL 1 DAY), '\\n\\t\\v\\f\\r'"
+            "SELECT array_generate(TIMESTAMP '2025-10-01', TIMESTAMP '2025-10-05', INTERVAL 1 DAY), '\\n\\t\\v\\f\\r'"
         );
         let reparsed = crate::parse(&canonical).expect("canonical SQL should reparse");
         assert_eq!(Printer::new().statements(&reparsed), canonical);

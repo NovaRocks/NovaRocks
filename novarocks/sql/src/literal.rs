@@ -36,18 +36,38 @@ use novarocks_types::schema::{ColumnDefault, SqlType, validate_column_default};
 mod failure;
 pub use failure::LiteralFailure;
 
+/// Tags accepted by the original typed-string parser and its value consumers.
+/// GenericLiteral retains raw tag text, so quoted tags are not guessed aliases.
+pub(crate) fn is_supported_generic_literal(value: &ast::GenericLiteral) -> bool {
+    matches!(
+        value.type_name.to_ascii_lowercase().as_str(),
+        "date" | "datetime" | "timestamp" | "time" | "json"
+    )
+}
+
 fn native_literal_to_literal(literal: &ast::Literal) -> Result<Literal, LiteralFailure> {
     match &literal.kind {
         ast::LiteralKind::Null => Ok(Literal::Null),
         ast::LiteralKind::Boolean(value) => Ok(Literal::Bool(*value)),
-        ast::LiteralKind::Number(value) => Ok(sql_number_literal(value)),
+        ast::LiteralKind::Long { parsed_value, .. } => Ok(Literal::Int(*parsed_value)),
+        ast::LiteralKind::Decimal(value) => Ok(sql_number_literal(value)),
+        ast::LiteralKind::Double(value) => Ok(Literal::Float(value.get())),
         ast::LiteralKind::String(value) => Ok(Literal::String(value.clone())),
-        ast::LiteralKind::HexString(value) => {
-            let bytes = hex::decode(value).map_err(|source| {
-                LiteralFailure::hex(format_args!("invalid hex literal X'{value}'"), source)
-            })?;
-            Ok(Literal::String(bytes_to_latin1_string(&bytes)))
+        ast::LiteralKind::Binary(value) => Ok(Literal::String(bytes_to_latin1_string(value))),
+        ast::LiteralKind::Generic(value) => {
+            if !is_supported_generic_literal(value) {
+                return Err(LiteralFailure::rejected(format_args!(
+                    "generic literal type {} is not supported",
+                    value.type_name
+                )));
+            }
+            // The original typed-string INSERT fast path delegates its decoded
+            // value to the sink's existing declaration conversion.
+            Ok(Literal::String(value.value.clone()))
         }
+        ast::LiteralKind::Interval(_) => Err(LiteralFailure::rejected(
+            "INTERVAL literals are not supported",
+        )),
     }
 }
 
@@ -156,8 +176,6 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
                 expr_to_literal(&cast.expr)
             }
         }
-        // Handle DATE '2024-01-01' typed strings
-        ast::Expr::TypedString(typed) => native_literal_to_literal(&typed.value),
         // In MySQL mode, "value" is parsed as an identifier — treat as string literal
         ast::Expr::Identifier(ident) => Ok(Literal::String(ident.value.clone())),
         // Handle binary operations like 10000 - 1
@@ -230,21 +248,51 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
 /// whether a CAST-to-DECIMAL expression should be routed through the full query
 /// pipeline rather than being folded into a bare literal.
 fn cast_type_is_decimal(data_type: &ast::TypeName) -> bool {
-    data_type.name.parts.last().is_some_and(|part| {
-        matches!(
-            part.value.to_ascii_lowercase().as_str(),
-            "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128"
-        )
-    })
+    matches!(&data_type.kind, ast::TypeKind::Generic(value) if matches!(value.name.value.to_ascii_lowercase().as_str(), "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128"))
 }
 
 fn type_name_to_sql_type(data_type: &ast::TypeName) -> Result<SqlType, LiteralFailure> {
-    let name = data_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .ok_or_else(|| LiteralFailure::rejected("CAST target type has no name"))?;
+    let generic = match &data_type.kind {
+        ast::TypeKind::Generic(generic) => generic,
+        ast::TypeKind::Row(row) => {
+            return row
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    Ok((
+                        field
+                            .name
+                            .as_ref()
+                            .map(|name| name.value.clone())
+                            .unwrap_or_else(|| format!("f{}", index + 1)),
+                        type_name_to_sql_type(&field.data_type)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, LiteralFailure>>()
+                .map(SqlType::Struct);
+        }
+        ast::TypeKind::DateTime(value) => {
+            if value.with_time_zone || value.precision.as_deref().is_some_and(|parameter| !matches!(parameter, ast::DataTypeParameter::Numeric(number) if number.parsed_value == 6)) {
+                return Err(LiteralFailure::rejected("TIME/TIMESTAMP only support microsecond precision without time zone"));
+            }
+            return Ok(match value.kind {
+                ast::DateTimeType::Time => SqlType::Time,
+                ast::DateTimeType::Timestamp => SqlType::DateTime,
+            });
+        }
+        ast::TypeKind::Interval(_) => {
+            return Err(LiteralFailure::rejected(
+                "INTERVAL data types are not supported",
+            ));
+        }
+        ast::TypeKind::ExplicitArray(_) => {
+            return Err(LiteralFailure::rejected(
+                "explicit ARRAY lengths are not supported",
+            ));
+        }
+    };
+    let name = generic.name.value.to_ascii_lowercase();
     match name.as_str() {
         "tinyint" => Ok(SqlType::TinyInt),
         "smallint" => Ok(SqlType::SmallInt),
@@ -265,8 +313,8 @@ fn type_name_to_sql_type(data_type: &ast::TypeName) -> Result<SqlType, LiteralFa
         "time" => Ok(SqlType::Time),
         "variant" => Ok(SqlType::Variant),
         "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
-            let precision = type_numeric_argument(&data_type.arguments, 0)?.unwrap_or(38);
-            let scale = type_numeric_argument(&data_type.arguments, 1)?.unwrap_or(0);
+            let precision = type_numeric_argument(&generic.arguments, 0)?.unwrap_or(38);
+            let scale = type_numeric_argument(&generic.arguments, 1)?.unwrap_or(0);
             let precision = u8::try_from(precision).map_err(|_| {
                 LiteralFailure::rejected(
                     "literal DECIMAL precision exceeds its supported parameter domain",
@@ -284,32 +332,14 @@ fn type_name_to_sql_type(data_type: &ast::TypeName) -> Result<SqlType, LiteralFa
             Ok(SqlType::Decimal { precision, scale })
         }
         "array" => Ok(SqlType::Array(Box::new(type_type_argument(
-            &data_type.arguments,
+            &generic.arguments,
             0,
             "ARRAY",
         )?))),
         "map" => Ok(SqlType::Map(
-            Box::new(type_type_argument(&data_type.arguments, 0, "MAP")?),
-            Box::new(type_type_argument(&data_type.arguments, 1, "MAP")?),
+            Box::new(type_type_argument(&generic.arguments, 0, "MAP")?),
+            Box::new(type_type_argument(&generic.arguments, 1, "MAP")?),
         )),
-        "struct" => data_type
-            .arguments
-            .iter()
-            .enumerate()
-            .map(|(index, argument)| match argument {
-                ast::TypeNameArgument::Field(field) => Ok((
-                    field.name.value.clone(),
-                    type_name_to_sql_type(&field.data_type)?,
-                )),
-                ast::TypeNameArgument::Type(data_type) => {
-                    Ok((format!("f{}", index + 1), type_name_to_sql_type(data_type)?))
-                }
-                ast::TypeNameArgument::Literal(_) => Err(LiteralFailure::rejected(
-                    "STRUCT type field must include a type name",
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(SqlType::Struct),
         _ => Err(LiteralFailure::rejected(format_args!(
             "unsupported SQL type: {name}"
         ))),
@@ -317,36 +347,33 @@ fn type_name_to_sql_type(data_type: &ast::TypeName) -> Result<SqlType, LiteralFa
 }
 
 fn type_numeric_argument(
-    arguments: &[ast::TypeNameArgument],
+    arguments: &[ast::DataTypeParameter],
     index: usize,
 ) -> Result<Option<u64>, LiteralFailure> {
-    let Some(ast::TypeNameArgument::Literal(literal)) = arguments.get(index) else {
+    let Some(argument) = arguments.get(index) else {
         return Ok(None);
     };
-    let ast::LiteralKind::Number(value) = &literal.kind else {
+    let ast::DataTypeParameter::Numeric(value) = argument else {
         return Err(LiteralFailure::rejected(
-            "numeric type parameter must be an integer literal",
+            "numeric type parameter must be an integer",
         ));
     };
-    value.parse::<u64>().map(Some).map_err(|source| {
-        LiteralFailure::parameter(
-            format_args!("invalid numeric type parameter `{value}`"),
-            source,
-        )
-    })
+    u64::try_from(value.parsed_value)
+        .map(Some)
+        .map_err(|_| LiteralFailure::rejected("numeric type parameter must be nonnegative"))
 }
 
 fn type_type_argument(
-    arguments: &[ast::TypeNameArgument],
+    arguments: &[ast::DataTypeParameter],
     index: usize,
     kind: &str,
 ) -> Result<SqlType, LiteralFailure> {
-    let Some(ast::TypeNameArgument::Type(data_type)) = arguments.get(index) else {
+    let Some(ast::DataTypeParameter::Type(value)) = arguments.get(index) else {
         return Err(LiteralFailure::rejected(format_args!(
             "{kind} type requires a type parameter"
         )));
     };
-    type_name_to_sql_type(data_type)
+    type_name_to_sql_type(&value.data_type)
 }
 
 pub(crate) fn sql_number_literal(input: &str) -> Literal {
@@ -538,7 +565,11 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, L
             // the cast's native (narrower) width. Allowing the unwrap would
             // produce values that disagree with `eval_hll_hash` at runtime.
             if let ast::Expr::Cast(cast) = args[0] {
-                let narrowing = cast.data_type.name.parts.last().is_some_and(|part| {
+                let narrowing = match &cast.data_type.kind {
+                    ast::TypeKind::Generic(generic) => Some(&generic.name),
+                    _ => None,
+                }
+                .is_some_and(|part| {
                     matches!(
                         part.value.to_ascii_lowercase().as_str(),
                         "tinyint"
@@ -2126,5 +2157,32 @@ mod source_failure_tests {
             };
             assert!(type_name_to_sql_type(&expr.data_type).is_err());
         }
+    }
+    #[test]
+    fn generic_date_json_and_decoded_binary_keep_original_literal_producer_values() {
+        for (source, expected) in [
+            ("DATE '2024-01-02'", Literal::String("2024-01-02".into())),
+            ("JSON '{\"a\":1}'", Literal::String("{\"a\":1}".into())),
+            (
+                "TIMESTAMP '2024-01-02 03:04:05.123456'",
+                Literal::String("2024-01-02 03:04:05.123456".into()),
+            ),
+            (
+                "X'00ff'",
+                Literal::String(bytes_to_latin1_string(&[0, 255])),
+            ),
+        ] {
+            let tokens = novarocks_parser::lex(source).unwrap();
+            let expression = novarocks_parser::parser::parse_expression(source, &tokens).unwrap();
+            assert_eq!(expr_to_literal(&expression).unwrap(), expected, "{source}");
+        }
+        let unknown = ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Generic(ast::GenericLiteral {
+                type_name: "INTEGER".into(),
+                value: "1".into(),
+            }),
+            span: novarocks_parser::Span::new(0, 11),
+        });
+        assert!(expr_to_literal(&unknown).is_err());
     }
 }

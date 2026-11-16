@@ -171,18 +171,17 @@ fn resolve_anchor(
 ) -> Result<i64, AnalyzeError> {
     match anchor {
         ReferenceAnchor::Version(literal) => {
-            let LiteralKind::Number(value) = &literal.kind else {
+            let LiteralKind::Long {
+                parsed_value: value,
+                ..
+            } = &literal.kind
+            else {
                 return Err(AnalyzeError::invalid_literal(
                     "iceberg ref: snapshot version must be a numeric literal",
                     literal.span,
                 ));
             };
-            let n = value.parse::<i64>().map_err(|_| {
-                AnalyzeError::invalid_literal(
-                    "iceberg ref: snapshot version must fit i64",
-                    literal.span,
-                )
-            })?;
+            let n = *value;
             if !metadata.has_snapshot(n) {
                 return Err(AnalyzeError::invalid_argument(
                     format!(
@@ -306,7 +305,10 @@ mod tests {
             kind: IcebergReferenceKind::Branch,
             name: ident("dev"),
             anchor: ReferenceAnchor::Version(Literal {
-                kind: LiteralKind::Number("99999".to_string()),
+                kind: LiteralKind::Long {
+                    spelling: "99999".to_string(),
+                    parsed_value: 99999,
+                },
                 span: Span::new(0, 0),
             }),
             if_not_exists: false,

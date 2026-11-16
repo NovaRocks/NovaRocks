@@ -49,7 +49,12 @@ fn call(name: &str, argument: &str, span: Span) -> ast::Expr {
 }
 fn number(value: &str, span: Span) -> ast::Expr {
     ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::Number(value.into()),
+        kind: ast::LiteralKind::Long {
+            spelling: value.into(),
+            parsed_value: value
+                .parse::<i64>()
+                .expect("partition integer constructor receives a signed integer"),
+        },
         span,
     })
 }

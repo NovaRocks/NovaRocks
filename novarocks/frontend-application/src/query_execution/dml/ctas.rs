@@ -178,9 +178,14 @@ fn literal_text(literal: &Literal) -> Result<String, CtasAdmissionFailure> {
             "CTAS properties do not support NULL literals",
         )),
         LiteralKind::Boolean(value) => Ok(value.to_string()),
-        LiteralKind::Number(value) | LiteralKind::String(value) | LiteralKind::HexString(value) => {
-            Ok(value.clone())
-        }
+        LiteralKind::Long { parsed_value, .. } => Ok(parsed_value.to_string()),
+        LiteralKind::Double(value) => Ok(format!("{:?}", value.get())),
+        LiteralKind::Binary(value) => Ok(hex::encode_upper(value)),
+        LiteralKind::Generic(_) | LiteralKind::Interval(_) => Err(unsupported(
+            literal.span,
+            "CTAS properties do not support typed literals",
+        )),
+        LiteralKind::Decimal(value) | LiteralKind::String(value) => Ok(value.clone()),
     }
 }
 

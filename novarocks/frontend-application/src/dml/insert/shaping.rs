@@ -454,7 +454,7 @@ pub(crate) fn omitted_insert_expr(column: &ColumnDef) -> Result<ast::Expr, Strin
 }
 
 fn is_variant_cast(cast: &ast::CastExpr) -> bool {
-    printer::print_object_name(&cast.data_type.name).eq_ignore_ascii_case("variant")
+    matches!(&cast.data_type.kind, ast::TypeKind::Generic(generic) if generic.name.value.eq_ignore_ascii_case("variant"))
 }
 fn explicit_variant_source_path(
     mut expr: &ast::Expr,
@@ -493,9 +493,8 @@ fn constrain_literal_in(
             if matches!(target.data_type(), DataType::Binary | DataType::LargeBinary)
                 && let ast::LiteralKind::String(text) = &value.kind
             {
-                value.kind = ast::LiteralKind::HexString(hex::encode_upper(
-                    novarocks_sql::literal::latin1_string_to_bytes(text)?,
-                ));
+                value.kind =
+                    ast::LiteralKind::Binary(novarocks_sql::literal::latin1_string_to_bytes(text)?);
             }
         }
         ast::Expr::Array(array) if array.element_type.is_none() => {
@@ -620,7 +619,7 @@ fn constant_variant_in(
 }
 fn variant_bytes_expr(bytes: &[u8], span: Span) -> ast::Expr {
     ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::HexString(hex::encode_upper(bytes)),
+        kind: ast::LiteralKind::Binary(bytes.to_vec()),
         span,
     })
 }
@@ -646,9 +645,11 @@ fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
             ast::Expr::Nested(nested) => string_literal(&nested.expression),
             ast::Expr::Cast(cast)
                 if matches!(
-                    printer::print_object_name(&cast.data_type.name)
-                        .to_ascii_lowercase()
-                        .as_str(),
+                    match &cast.data_type.kind {
+                        ast::TypeKind::Generic(value) => value.name.value.to_ascii_lowercase(),
+                        _ => String::new(),
+                    }
+                    .as_str(),
                     "varchar" | "string" | "text"
                 ) && cast.format.is_none() =>
             {
@@ -676,16 +677,11 @@ fn literal(kind: ast::LiteralKind) -> ast::Expr {
 fn null_expr() -> ast::Expr {
     build::null()
 }
-fn number(value: String) -> ast::Expr {
-    // Typed defaults retain their exact coefficient, including values that are
-    // not source-language i64 literals. This is not a parser rejection fallback.
-    build::literal(ast::LiteralKind::Number(value))
-}
 fn string(value: String) -> ast::Expr {
     build::string(value)
 }
 fn binary(value: &[u8]) -> ast::Expr {
-    build::hex_string(hex::encode_upper(value))
+    build::binary_literal(value.to_vec())
 }
 fn array(elements: Vec<ast::Expr>) -> ast::Expr {
     build::array(elements)
@@ -713,30 +709,6 @@ pub(crate) fn canonical_insert_wrapper_expression(expr: ast::Expr) -> Result<ast
                 return expression;
             }
             match expression {
-                ast::Expr::Literal(original) => {
-                    let ast::LiteralKind::Number(value) = &original.kind else {
-                        return ast::Expr::Literal(original);
-                    };
-                    match build::number(value.clone()) {
-                        Ok(mut canonical) => {
-                            match &mut canonical {
-                                ast::Expr::Literal(literal) => literal.span = original.span,
-                                ast::Expr::Unary(unary) => {
-                                    unary.span = original.span;
-                                    if let ast::Expr::Literal(literal) = unary.expression.as_mut() {
-                                        literal.span = original.span;
-                                    }
-                                }
-                                _ => unreachable!("numeric constructor returns literal or unary"),
-                            }
-                            canonical
-                        }
-                        Err(error) => {
-                            self.error = Some(error.to_string());
-                            ast::Expr::Literal(original)
-                        }
-                    }
-                }
                 ast::Expr::Tuple(tuple) => {
                     let expressions = tuple
                         .expressions
@@ -778,14 +750,14 @@ fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast:
         (
             ColumnDefault::Int32(value),
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
-        ) => number(value.to_string()),
-        (ColumnDefault::Int64(value), DataType::Int64) => number(value.to_string()),
-        (ColumnDefault::Float32 { bits }, DataType::Float32) => {
-            number(f32::from_bits(*bits).to_string())
-        }
-        (ColumnDefault::Float64 { bits }, DataType::Float64) => {
-            number(f64::from_bits(*bits).to_string())
-        }
+        ) => build::integer(i64::from(*value)),
+        (ColumnDefault::Int64(value), DataType::Int64) => build::integer(*value),
+        (ColumnDefault::Float32 { bits }, DataType::Float32) => literal(ast::LiteralKind::Double(
+            ast::DoubleValue::from_f64(f64::from(f32::from_bits(*bits))),
+        )),
+        (ColumnDefault::Float64 { bits }, DataType::Float64) => literal(ast::LiteralKind::Double(
+            ast::DoubleValue::from_f64(f64::from_bits(*bits)),
+        )),
         (
             ColumnDefault::Decimal {
                 unscaled,
@@ -793,9 +765,9 @@ fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast:
                 scale,
             },
             DataType::Decimal128(target_precision, target_scale),
-        ) if precision == target_precision && scale == target_scale => {
-            number(format_decimal(*unscaled, *scale)?)
-        }
+        ) if precision == target_precision && scale == target_scale => literal(
+            ast::LiteralKind::Decimal(format_decimal(*unscaled, *scale)?),
+        ),
         (ColumnDefault::String(value), DataType::Utf8 | DataType::LargeUtf8) => {
             string(value.clone())
         }
@@ -1425,9 +1397,16 @@ mod typed_write_source_tests {
         assert!(
             matches!(&values.rows[0][0], ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::String(bytes), .. }) if bytes == "abc")
         );
-        assert!(
-            matches!(&values.rows[0][1], ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::Number(coefficient), .. }) if coefficient == "9007199254740993")
-        );
+        assert!(matches!(
+            &values.rows[0][1],
+            ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Long {
+                    parsed_value: 9007199254740993,
+                    ..
+                },
+                ..
+            })
+        ));
     }
     #[test]
     fn write_source_general_distinct_union_limit_keeps_its_complete_semantics() {
@@ -1512,7 +1491,7 @@ mod typed_write_source_tests {
         assert!(matches!(
             cast.expr.as_ref(),
             ast::Expr::Literal(ast::Literal {
-                kind: ast::LiteralKind::HexString(_),
+                kind: ast::LiteralKind::Binary(_),
                 ..
             })
         ));

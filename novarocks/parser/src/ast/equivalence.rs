@@ -57,37 +57,6 @@ impl SyntaxEq for ObjectName {
     }
 }
 
-impl SyntaxEq for Literal {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.kind == other.kind
-    }
-}
-
-impl SyntaxEq for TypeName {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.name.syntax_eq(&other.name)
-            && syntax_eq_slice(&self.arguments, &other.arguments)
-            && self.argument_separator_spaces == other.argument_separator_spaces
-    }
-}
-
-impl SyntaxEq for TypeNameArgument {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Type(left), Self::Type(right)) => left.syntax_eq(right),
-            (Self::Literal(left), Self::Literal(right)) => left.syntax_eq(right),
-            (Self::Field(left), Self::Field(right)) => left.syntax_eq(right),
-            _ => false,
-        }
-    }
-}
-
-impl SyntaxEq for StructField {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.name.syntax_eq(&other.name) && self.data_type.syntax_eq(&other.data_type)
-    }
-}
-
 impl SyntaxEq for ExplainQuery {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.format == other.format
@@ -543,7 +512,6 @@ impl SyntaxEq for Expr {
             (Self::Struct(left), Self::Struct(right)) => left.syntax_eq(right),
             (Self::Lambda(left), Self::Lambda(right)) => left.syntax_eq(right),
             (Self::Access(left), Self::Access(right)) => left.syntax_eq(right),
-            (Self::TypedString(left), Self::TypedString(right)) => left.syntax_eq(right),
             _ => false,
         }
     }
@@ -749,12 +717,6 @@ impl SyntaxEq for AccessKind {
     }
 }
 
-impl SyntaxEq for TypedStringExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.data_type.syntax_eq(&other.data_type) && self.value.syntax_eq(&other.value)
-    }
-}
-
 impl<T: SyntaxEq> SyntaxEq for Box<T> {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.as_ref().syntax_eq(other.as_ref())
@@ -805,7 +767,10 @@ mod tests {
 
     fn number(value: &str, start: usize) -> Expr {
         Expr::Literal(Literal {
-            kind: LiteralKind::Number(value.to_owned()),
+            kind: LiteralKind::Long {
+                spelling: value.to_owned(),
+                parsed_value: (value.to_owned()).parse::<i64>().unwrap(),
+            },
             span: span(start),
         })
     }

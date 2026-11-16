@@ -3,7 +3,7 @@
 
 //! Table DDL syntax nodes owned by SQLP-5.
 
-use super::{Fold, Ident, Literal, LiteralKind, ObjectName, TypeName, TypeNameArgument, Visit};
+use super::{Fold, Ident, Literal, ObjectName, TypeName, Visit};
 use crate::Span;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -437,47 +437,10 @@ fn ident(value: &Ident, output: &mut String) {
     }
 }
 fn type_name(value: &TypeName, output: &mut String) {
-    name(&value.name, output);
-    if value.arguments.is_empty() {
-        return;
-    }
-    let generic = value
-        .arguments
-        .iter()
-        .any(|v| matches!(v, TypeNameArgument::Type(_) | TypeNameArgument::Field(_)));
-    output.push(if generic { '<' } else { '(' });
-    for (index, argument) in value.arguments.iter().enumerate() {
-        if index > 0 {
-            output.push_str(", ");
-        }
-        match argument {
-            TypeNameArgument::Type(v) => type_name(v, output),
-            TypeNameArgument::Literal(v) => literal(v, output),
-            TypeNameArgument::Field(v) => {
-                ident(&v.name, output);
-                output.push(' ');
-                type_name(&v.data_type, output);
-            }
-        }
-    }
-    output.push(if generic { '>' } else { ')' });
+    output.push_str(&crate::printer::print_type_name(value));
 }
 fn literal(value: &Literal, output: &mut String) {
-    match &value.kind {
-        LiteralKind::Null => output.push_str("NULL"),
-        LiteralKind::Boolean(v) => output.push_str(if *v { "TRUE" } else { "FALSE" }),
-        LiteralKind::Number(v) => output.push_str(v),
-        LiteralKind::HexString(v) => {
-            output.push_str("X'");
-            output.push_str(v);
-            output.push('\'');
-        }
-        LiteralKind::String(v) => {
-            output.push('\'');
-            output.push_str(&v.replace('\'', "''"));
-            output.push('\'');
-        }
-    }
+    output.push_str(&crate::printer::print_literal(value));
 }
 fn walk_partition<V: Visit + ?Sized>(visitor: &mut V, value: &TablePartition) {
     match value {

@@ -154,19 +154,17 @@ fn lower_literal(expression: &novarocks_parser::ast::Expr) -> Result<Literal, St
         novarocks_parser::ast::Expr::Unary(unary)
             if unary.operator == novarocks_parser::ast::UnaryOperator::Minus =>
         {
-            let novarocks_parser::ast::Expr::Literal(literal) = unary.expression.as_ref() else {
+            let novarocks_parser::ast::Expr::Literal(_) = unary.expression.as_ref() else {
                 return Err("ADD EQUALITY DELETE accepts literal values only".to_string());
             };
-            let LiteralKind::Number(value) = &literal.kind else {
-                return Err("ADD EQUALITY DELETE accepts numeric negation only".to_string());
+            return match lower_literal(&unary.expression)? {
+                Literal::Int(value) => value
+                    .checked_neg()
+                    .map(Literal::Int)
+                    .ok_or_else(|| "ADD EQUALITY DELETE numeric negation overflows i64".into()),
+                Literal::Float(value) => Ok(Literal::Float(-value)),
+                _ => Err("ADD EQUALITY DELETE accepts numeric negation only".into()),
             };
-            return value
-                .parse::<i64>()
-                .map(|value| Literal::Int(-value))
-                .or_else(|_| value.parse::<f64>().map(|value| Literal::Float(-value)))
-                .map_err(|_| {
-                    format!("unsupported ADD EQUALITY DELETE numeric literal `-{value}`")
-                });
         }
         _ => return Err("ADD EQUALITY DELETE accepts literal values only".to_string()),
     };
@@ -174,14 +172,17 @@ fn lower_literal(expression: &novarocks_parser::ast::Expr) -> Result<Literal, St
         LiteralKind::Null => Ok(Literal::Null),
         LiteralKind::Boolean(value) => Ok(Literal::Bool(*value)),
         LiteralKind::String(value) => Ok(Literal::String(value.clone())),
-        LiteralKind::Number(value) => value
+        LiteralKind::Long { parsed_value, .. } => Ok(Literal::Int(*parsed_value)),
+        LiteralKind::Double(value) => Ok(Literal::Float(value.get())),
+        LiteralKind::Decimal(value) => value
             .parse::<i64>()
             .map(Literal::Int)
             .or_else(|_| value.parse::<f64>().map(Literal::Float))
             .map_err(|_| format!("unsupported ADD EQUALITY DELETE numeric literal `{value}`")),
-        LiteralKind::HexString(value) => Err(format!(
-            "unsupported ADD EQUALITY DELETE hexadecimal literal `{value}`"
-        )),
+        LiteralKind::Binary(_) => Err("unsupported ADD EQUALITY DELETE binary literal".into()),
+        LiteralKind::Generic(_) | LiteralKind::Interval(_) => {
+            Err("unsupported ADD EQUALITY DELETE typed literal".into())
+        }
     }
 }
 
@@ -310,7 +311,7 @@ fn equality_delete_literal_ast(value: &Expr, data_type: &DataType) -> Result<Exp
     {
         let bytes = novarocks_sql::literal::latin1_string_to_bytes(text)?;
         return Ok(Expr::Literal(ast::Literal {
-            kind: LiteralKind::HexString(hex::encode_upper(bytes)),
+            kind: LiteralKind::Binary(bytes),
             span: literal.span,
         }));
     }
@@ -1194,7 +1195,9 @@ mod tests {
             };
             assert_eq!(alias.value, name);
             assert!(*explicit_as);
-            assert_eq!(cast.data_type.name.parts[0].value, ty);
+            assert!(
+                matches!(&cast.data_type.kind, novarocks_parser::ast::TypeKind::Generic(generic) if generic.name.value == ty)
+            );
         }
     }
     #[test]
@@ -1246,7 +1249,7 @@ mod tests {
         };
         assert_eq!(
             literal.kind,
-            novarocks_parser::ast::LiteralKind::HexString("00FF5C27".into())
+            novarocks_parser::ast::LiteralKind::Binary(vec![0x00, 0xFF, 0x5C, 0x27])
         );
         assert_eq!(literal.span, span);
         let unsupported = novarocks_parser::build::string("雪");

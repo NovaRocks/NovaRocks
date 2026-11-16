@@ -17,6 +17,8 @@
 
 //! Iceberg table DDL grammar.
 
+use crate::ast::{AstBox, TypeParameter};
+
 use crate::{
     ParseError, Span, TokenKind,
     ast::iceberg::{
@@ -26,8 +28,8 @@ use crate::{
         IcebergTableAction, RawReferenceOptions, ReferenceAnchor,
     },
     ast::{
-        Ident, Literal, LiteralKind, Property, PropertyKeyValue, Statement, StructField, TypeName,
-        TypeNameArgument,
+        DataTypeParameter, Ident, Literal, LiteralKind, Property, PropertyKeyValue,
+        RowDataTypeField, Statement, TypeName,
     },
     token::Symbol,
 };
@@ -496,14 +498,10 @@ fn parse_column_path(parser: &mut StatementParser<'_, '_>) -> Result<ColumnPath,
 }
 
 fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, ParseError> {
-    let name = parser.parse_object_name()?;
-    let type_word = name
-        .parts
-        .last()
-        .expect("object names always contain one part")
-        .value
-        .to_ascii_uppercase();
+    let name = parser.parse_ident()?;
+    let type_word = name.value.to_ascii_uppercase();
     let mut arguments = Vec::new();
+    let mut fields = None;
     let end = if matches!(type_word.as_str(), "ARRAY" | "MAP" | "STRUCT")
         && parser.consume_if_symbol(Symbol::Lt)
     {
@@ -512,11 +510,11 @@ fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, Par
                 let field_name = parser.parse_ident()?;
                 let data_type = parse_type_name(parser)?;
                 let field_span = Span::new(field_name.span.start(), data_type.span.end());
-                arguments.push(TypeNameArgument::Field(StructField {
-                    name: field_name,
+                fields.get_or_insert_with(Vec::new).push(RowDataTypeField {
+                    name: Some(field_name),
                     data_type,
                     span: field_span,
-                }));
+                });
                 if parser.consume_if_symbol(Symbol::Comma) {
                     continue;
                 }
@@ -524,7 +522,9 @@ fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, Par
             }
         } else {
             loop {
-                arguments.push(TypeNameArgument::Type(parse_type_name(parser)?));
+                arguments.push(DataTypeParameter::Type(TypeParameter {
+                    data_type: AstBox::new(parse_type_name(parser)?),
+                }));
                 if parser.consume_if_symbol(Symbol::Comma) {
                     continue;
                 }
@@ -533,7 +533,7 @@ fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, Par
         }
     } else if parser.consume_if_symbol(Symbol::LParen) {
         loop {
-            arguments.push(TypeNameArgument::Literal(parser.parse_literal()?));
+            arguments.push(super::numeric_type_parameter(parser.parse_literal()?)?);
             if parser.consume_if_symbol(Symbol::Comma) {
                 continue;
             }
@@ -542,12 +542,8 @@ fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, Par
     } else {
         name.span
     };
-    Ok(TypeName {
-        span: Span::new(name.span.start(), end.end()),
-        name,
-        arguments,
-        argument_separator_spaces: Vec::new(),
-    })
+    let span = Span::new(name.span.start(), end.end());
+    super::finish_type_name(name, arguments, fields, span)
 }
 
 /// Partition-transform names are grammar words, so a keyword such as

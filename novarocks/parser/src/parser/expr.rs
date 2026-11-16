@@ -33,7 +33,7 @@ pub fn parse_expression(source: &str, tokens: &[Token]) -> Result<Expr, ParseErr
 mod tests {
     use crate::{
         ParseError, ParserError, Span,
-        ast::{BinaryOperator, Expr, FunctionQuantifier, LiteralKind, UnaryOperator},
+        ast::{BinaryOperator, Expr, FunctionQuantifier, Literal, LiteralKind, UnaryOperator},
         lex,
     };
 
@@ -124,7 +124,13 @@ mod tests {
             let Expr::Literal(literal) = parse(source) else {
                 panic!("expected signed integer literal: {source}");
             };
-            assert_eq!(literal.kind, LiteralKind::Number(source.to_owned()));
+            assert_eq!(
+                literal.kind,
+                LiteralKind::Long {
+                    spelling: source.to_owned(),
+                    parsed_value: (source.to_owned()).parse::<i64>().unwrap()
+                }
+            );
             assert_eq!(literal.span, Span::new(0, source.len()));
         }
     }
@@ -134,7 +140,13 @@ mod tests {
         let Expr::Literal(direct) = parse("-2147483648") else {
             panic!("expected direct signed literal");
         };
-        assert_eq!(direct.kind, LiteralKind::Number("-2147483648".to_owned()));
+        assert_eq!(
+            direct.kind,
+            LiteralKind::Long {
+                spelling: "-2147483648".to_owned(),
+                parsed_value: ("-2147483648".to_owned()).parse::<i64>().unwrap()
+            }
+        );
 
         let source = "-(2147483648)";
         let Expr::Unary(unary) = parse(source) else {
@@ -149,7 +161,13 @@ mod tests {
         let Expr::Literal(positive) = *nested.expression else {
             panic!("expected positive inner literal");
         };
-        assert_eq!(positive.kind, LiteralKind::Number("2147483648".to_owned()));
+        assert_eq!(
+            positive.kind,
+            LiteralKind::Long {
+                spelling: "2147483648".to_owned(),
+                parsed_value: ("2147483648".to_owned()).parse::<i64>().unwrap()
+            }
+        );
 
         let Expr::Unary(outer) = parse("-(-9223372036854775808)") else {
             panic!("expected outer unary, without parser evaluation");
@@ -162,7 +180,10 @@ mod tests {
         };
         assert_eq!(
             minimum.kind,
-            LiteralKind::Number("-9223372036854775808".to_owned())
+            LiteralKind::Long {
+                spelling: "-9223372036854775808".to_owned(),
+                parsed_value: ("-9223372036854775808".to_owned()).parse::<i64>().unwrap()
+            }
         );
     }
 
@@ -224,7 +245,10 @@ mod tests {
         };
         assert_eq!(
             literal.kind,
-            LiteralKind::Number("-9223372036854775808".to_owned())
+            LiteralKind::Long {
+                spelling: "-9223372036854775808".to_owned(),
+                parsed_value: ("-9223372036854775808".to_owned()).parse::<i64>().unwrap()
+            }
         );
         assert_eq!(literal.span, Span::new(0, source.len()));
 
@@ -264,7 +288,13 @@ mod tests {
         let Expr::Literal(negative) = *multiply.left else {
             panic!("expected direct negative multiplicand");
         };
-        assert_eq!(negative.kind, LiteralKind::Number("-2".to_owned()));
+        assert_eq!(
+            negative.kind,
+            LiteralKind::Long {
+                spelling: "-2".to_owned(),
+                parsed_value: ("-2".to_owned()).parse::<i64>().unwrap()
+            }
+        );
     }
 
     #[test]
@@ -339,7 +369,10 @@ mod tests {
             typed_array
                 .element_type
                 .as_ref()
-                .and_then(|element_type| element_type.name.parts.last())
+                .and_then(|element_type| match &element_type.kind {
+                    crate::ast::TypeKind::Generic(value) => Some(&value.name),
+                    _ => None,
+                })
                 .map(|part| part.value.as_str()),
             Some("double")
         );
@@ -351,7 +384,7 @@ mod tests {
         let Expr::Literal(hex_literal) = &hex else {
             panic!("expected hex literal");
         };
-        assert_eq!(hex_literal.kind, LiteralKind::HexString("AB01".to_owned()));
+        assert_eq!(hex_literal.kind, LiteralKind::Binary(vec![0xAB, 0x01]));
         assert_eq!(crate::printer::print_expr(&hex), "X'AB01'");
         assert!(matches!(parse("map{1: [2, 3], NULL: 4}"), Expr::Map(_)));
         assert!(matches!(parse("(a, b)"), Expr::Tuple(_)));
@@ -369,8 +402,20 @@ mod tests {
         assert!(matches!(parse("items[1].field"), Expr::Access(_)));
         assert!(matches!(parse("left('value', 2)"), Expr::FunctionCall(_)));
         assert!(matches!(parse("right('value', 2)"), Expr::FunctionCall(_)));
-        assert!(matches!(parse("DATE '2024-01-10'"), Expr::TypedString(_)));
-        assert!(matches!(parse("JSON '1.00'"), Expr::TypedString(_)));
+        assert!(matches!(
+            parse("DATE '2024-01-10'"),
+            Expr::Literal(Literal {
+                kind: LiteralKind::Generic(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("JSON '1.00'"),
+            Expr::Literal(Literal {
+                kind: LiteralKind::Generic(_),
+                ..
+            })
+        ));
         assert!(matches!(
             parse("EXTRACT(YEAR FROM created_at)"),
             Expr::FunctionCall(_)

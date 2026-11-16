@@ -1298,14 +1298,13 @@ fn generate_series_named_arg(expr: &ast::Expr) -> Option<(&ast::Ident, &ast::Exp
 fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
     match expr {
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(number),
+            kind:
+                ast::LiteralKind::Long {
+                    parsed_value: number,
+                    ..
+                },
             ..
-        }) => number.parse::<i64>().map_err(|error| {
-            AnalyzeError::invalid_literal(
-                format!("cannot parse integer literal `{number}`: {error}"),
-                expr.span(),
-            )
-        }),
+        }) => Ok(*number),
         ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
             Ok(-eval_const_i64(&unary.expression)?)
         }

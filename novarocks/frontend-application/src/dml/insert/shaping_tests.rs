@@ -158,26 +158,28 @@ fn cast_input<'a>(expr: &'a ast::Expr, target: &str) -> &'a ast::Expr {
     &cast.expr
 }
 
-fn number_text(expr: &ast::Expr) -> &str {
-    let ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::Number(text),
-        ..
-    }) = expr
-    else {
+fn number_text(expr: &ast::Expr) -> String {
+    let ast::Expr::Literal(literal) = expr else {
         panic!("expected exact numeric literal, got {expr:?}");
     };
-    text
+    match &literal.kind {
+        ast::LiteralKind::Long { spelling, .. } | ast::LiteralKind::Decimal(spelling) => {
+            spelling.clone()
+        }
+        ast::LiteralKind::Double(value) => format!("{:?}", value.get()),
+        _ => panic!("expected exact numeric literal, got {expr:?}"),
+    }
 }
 
 fn literal_bytes(expr: &ast::Expr) -> Vec<u8> {
     let ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::HexString(text),
+        kind: ast::LiteralKind::Binary(bytes),
         ..
     }) = expr
     else {
         panic!("expected binary literal, got {expr:?}");
     };
-    hex::decode(text).expect("binary literal must have valid hex")
+    bytes.clone()
 }
 
 fn decimal_type() -> DataType {
@@ -214,10 +216,12 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         column("m", map_type(decimal_type(), decimal_array)),
         column("s", structure),
     ];
-    let query = shape(
+    let source = parse_query(
         "VALUES ([123456789.123456789, 1.25e2, NULL], map(123456789.123456789, [123456789.123456789, NULL]), row(123456789.123456789, [123456789.123456789]))",
-        &columns,
     );
+    let query = shape_insert_source(&source, &[], &columns, &columns)
+        .expect("literal source should shape")
+        .expect("literal source should use target shaping");
     let row = &rows(&query)[0];
     let ast::Expr::Array(array) = cast_input(&row[0], "ARRAY<DECIMAL(18, 9)>") else {
         panic!("expected direct ARRAY");
@@ -226,10 +230,20 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         number_text(cast_input(&array.elements[0], "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
-    assert_eq!(
-        number_text(cast_input(&array.elements[1], "DECIMAL(18, 9)")),
-        "1.25e2"
-    );
+    let exponent = cast_input(&array.elements[1], "DECIMAL(18, 9)");
+    let ast::Expr::Literal(ast::Literal {
+        kind: ast::LiteralKind::Double(value),
+        ..
+    }) = exponent
+    else {
+        panic!("source exponent must retain its Double category");
+    };
+    assert_eq!(value.get().to_bits(), 125.0_f64.to_bits());
+    let ast::Expr::Array(source_array) = &rows(&source)[0][0] else {
+        panic!("source ARRAY");
+    };
+    assert_eq!(exponent, &source_array.elements[1]);
+    assert_eq!(exponent.span(), source_array.elements[1].span());
     assert!(matches!(
         cast_input(&array.elements[2], "DECIMAL(18, 9)"),
         ast::Expr::Literal(ast::Literal {
@@ -411,21 +425,18 @@ fn typed_decimal_defaults_keep_coefficients_beyond_source_integer_width() {
         number_text(cast_input(&rows(&shaped)[0][1], "DECIMAL(38, 0)")),
         coefficient.to_string()
     );
-    // The original number author retained this coefficient as a raw Number;
-    // the analyzer still rejects an integer literal wider than i64 before CAST.
+    // Typed decimal defaults use their declared numeric category, even when
+    // their exact coefficient exceeds the source integer literal width.
     let baseline = baseline_default_values(
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(coefficient.to_string()),
+            kind: ast::LiteralKind::Decimal(coefficient.to_string()),
             span: SYNTHETIC,
         }),
         "DECIMAL(38, 0)",
     );
-    assert_existing_default_rejection(
-        shaped,
-        baseline,
-        AnalyzeErrorKind::InvalidLiteral,
-        &format!("invalid integer literal: {coefficient}"),
-    );
+    assert!(shaped.syntax_eq(&baseline));
+    analyze_shaped_query(baseline).expect("typed decimal coefficient should analyze");
+    analyze_shaped_query(shaped).expect("shaped typed decimal coefficient should analyze");
 }
 
 #[test]
@@ -467,7 +478,10 @@ fn typed_single_field_struct_defaults_keep_their_values_tuple() {
         ast::Expr::Tuple(ast::TupleExpr {
             expressions: vec![baseline_target_cast(
                 ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::Number("7".into()),
+                    kind: ast::LiteralKind::Long {
+                        spelling: "7".into(),
+                        parsed_value: 7,
+                    },
                     span: SYNTHETIC,
                 }),
                 "BIGINT",
@@ -504,7 +518,7 @@ fn select_wrapper_normalizes_generated_defaults_and_retains_user_positions() {
         .unwrap()
         .unwrap();
     let expected = parse_query(
-        "SELECT CAST(1 AS INT), CAST(-123.45 AS DECIMAL(5, 2)) FROM (SELECT 1 AS original) AS __nr_insert_literal_src",
+        "SELECT CAST(1 AS INT), CAST(DECIMAL '-123.45' AS DECIMAL(5, 2)) FROM (SELECT 1 AS original) AS __nr_insert_literal_src",
     );
     let ast::SetExpr::Query(wrapper) = shaped.body.as_ref() else {
         panic!("target wrapper");
@@ -801,6 +815,45 @@ fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
         assert!(
             error.to_string().contains("no matching declared overload"),
             "{error}"
+        );
+    }
+}
+
+#[test]
+fn typed_float_defaults_keep_double_category_and_signed_zero() {
+    for value in [-0.0_f64, 1.0, f64::MAX] {
+        let mut column = column("f", DataType::Float64);
+        column.write_default = Some(ColumnDefault::Float64 {
+            bits: value.to_bits(),
+        });
+        let ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Double(actual),
+            ..
+        }) = omitted_insert_expr(&column).unwrap()
+        else {
+            panic!("typed floating default must remain a double");
+        };
+        assert_eq!(actual.get().to_bits(), value.to_bits());
+    }
+}
+
+#[test]
+fn wrapper_keeps_admitted_numeric_category_spelling_and_span() {
+    for kind in [
+        ast::LiteralKind::Long {
+            spelling: "0x01".into(),
+            parsed_value: 1,
+        },
+        ast::LiteralKind::Decimal("-12345678901234567890123456789.00100".into()),
+        ast::LiteralKind::Double(ast::DoubleValue::from_f64(-0.0)),
+    ] {
+        let original = ast::Expr::Literal(ast::Literal {
+            kind,
+            span: Span::new(7, 29),
+        });
+        assert_eq!(
+            super::canonical_insert_wrapper_expression(original.clone()).unwrap(),
+            original
         );
     }
 }
