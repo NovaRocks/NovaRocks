@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(loom)]
-
 //! These models run the real standing-input and handoff synchronization. The
 //! bounds cover the named competitions, not arbitrary executor scheduling.
 

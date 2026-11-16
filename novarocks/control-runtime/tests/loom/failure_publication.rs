@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(loom)]
-
 //! A two-preemption model of the actual cleanup-body/publication gate.
 use loom::{sync::Arc, thread};
 use novarocks_control_runtime::{

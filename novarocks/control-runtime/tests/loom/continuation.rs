@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(loom)]
-
 //! Bounded production-algorithm models, not a proof of arbitrary host I/O.
 use loom::thread;
 use novarocks_control_runtime::{

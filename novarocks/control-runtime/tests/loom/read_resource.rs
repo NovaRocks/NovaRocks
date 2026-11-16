@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(loom)]
-
 //! Models the actual row pins and store/seal locks with two preemptions.
 //! Store/View standard Arc/Weak lifetime is deliberately kept alive here;
 //! its internal Weak algorithm is not modeled. No Worker R admission, RF,

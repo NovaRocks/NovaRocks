@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(loom)]
-
 //! These models run the production mutex/claim/report algorithms with at most
 //! two preemptions. They target the named boundaries; they are not a proof of
 //! arbitrary scheduling or host I/O behavior.

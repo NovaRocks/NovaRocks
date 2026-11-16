@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(loom)]
-
 //! Models the production custody locks with two preemptions. Host capture
 //! disposal is supplied by the original authority, not simulated by a timeout.
 use loom::thread;
