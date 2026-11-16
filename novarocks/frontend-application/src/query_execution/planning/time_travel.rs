@@ -24,6 +24,7 @@ use crate::query_execution::kernels::{DmlExecutionKernel, QueryPreparationKernel
 use novarocks_parser::ast::{
     Ident, ObjectName as ParserObjectName, Query, SetExpr, TableAlias, TableFactor, TableWithJoins,
 };
+use novarocks_parser::recursion::GuardedFuture;
 use novarocks_spi::connector::{ConnectorReadReferenceFacts, ConnectorReadReferenceKind};
 use novarocks_sql::analyze_error::AnalyzeError;
 #[cfg(test)]
@@ -34,6 +35,9 @@ use novarocks_sql::planning::catalog::{
     resolve_time_travel_snapshot_binding,
 };
 use novarocks_sql::semantic::ObjectName;
+
+type TimeTravelRewriteFuture<'a> =
+    GuardedFuture<dyn std::future::Future<Output = Result<(), TimeTravelRewriteError>> + Send + 'a>;
 
 /// Keeps SQL analysis facts distinct from catalog and connector failures until
 /// the frontend still has the original statement source for user rendering.
@@ -259,10 +263,8 @@ pub(crate) fn rewrite_time_travel_refs_async<'a>(
     current_database: &'a str,
     query: &'a mut Query,
     connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(), TimeTravelRewriteError>> + Send + 'a>,
-> {
-    Box::pin(async move {
+) -> TimeTravelRewriteFuture<'a> {
+    GuardedFuture::from_pin(Box::pin(async move {
         // Walk CTEs
         if let Some(with) = &mut query.with {
             for cte in &mut with.ctes {
@@ -284,7 +286,7 @@ pub(crate) fn rewrite_time_travel_refs_async<'a>(
             connector_context,
         )
         .await
-    })
+    }))
 }
 
 fn rewrite_time_travel_in_query_async<'a>(
@@ -293,10 +295,8 @@ fn rewrite_time_travel_in_query_async<'a>(
     current_database: &'a str,
     query: &'a mut Query,
     connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(), TimeTravelRewriteError>> + Send + 'a>,
-> {
-    Box::pin(async move {
+) -> TimeTravelRewriteFuture<'a> {
+    GuardedFuture::from_pin(Box::pin(async move {
         if let Some(with) = &mut query.with {
             for cte in &mut with.ctes {
                 rewrite_time_travel_in_query_async(
@@ -317,7 +317,7 @@ fn rewrite_time_travel_in_query_async<'a>(
             connector_context,
         )
         .await
-    })
+    }))
 }
 
 fn rewrite_time_travel_in_set_expr_async<'a>(
@@ -326,10 +326,8 @@ fn rewrite_time_travel_in_set_expr_async<'a>(
     current_database: &'a str,
     expr: &'a mut SetExpr,
     connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(), TimeTravelRewriteError>> + Send + 'a>,
-> {
-    Box::pin(async move {
+) -> TimeTravelRewriteFuture<'a> {
+    GuardedFuture::from_pin(Box::pin(async move {
         match expr {
             SetExpr::Select(select) => {
                 for tw in &mut select.from {
@@ -379,7 +377,7 @@ fn rewrite_time_travel_in_set_expr_async<'a>(
             }
             _ => Ok(()),
         }
-    })
+    }))
 }
 
 fn rewrite_time_travel_in_factor_async<'a>(
@@ -388,10 +386,8 @@ fn rewrite_time_travel_in_factor_async<'a>(
     current_database: &'a str,
     factor: &'a mut TableFactor,
     connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(), TimeTravelRewriteError>> + Send + 'a>,
-> {
-    Box::pin(async move {
+) -> TimeTravelRewriteFuture<'a> {
+    GuardedFuture::from_pin(Box::pin(async move {
         match factor {
             TableFactor::Table {
                 name,
@@ -541,7 +537,7 @@ fn rewrite_time_travel_in_factor_async<'a>(
             }
             _ => Ok(()),
         }
-    })
+    }))
 }
 
 fn rewrite_time_travel_in_table_with_joins_async<'a>(
@@ -550,10 +546,8 @@ fn rewrite_time_travel_in_table_with_joins_async<'a>(
     current_database: &'a str,
     table: &'a mut TableWithJoins,
     connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(), TimeTravelRewriteError>> + Send + 'a>,
-> {
-    Box::pin(async move {
+) -> TimeTravelRewriteFuture<'a> {
+    GuardedFuture::from_pin(Box::pin(async move {
         rewrite_time_travel_in_factor_async(
             resolver,
             current_catalog,
@@ -573,7 +567,7 @@ fn rewrite_time_travel_in_table_with_joins_async<'a>(
             .await?;
         }
         Ok(())
-    })
+    }))
 }
 
 #[cfg(test)]

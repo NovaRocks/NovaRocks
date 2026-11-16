@@ -21,6 +21,7 @@ pub mod ast;
 pub mod build;
 pub mod parser;
 pub mod printer;
+pub mod recursion;
 pub mod trino_keyword;
 pub mod trino_lexer;
 pub mod trino_token;
