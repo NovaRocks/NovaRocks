@@ -50,11 +50,9 @@ struct WindowSignatureKey {
     window_frame: String,
 }
 
-/// Returns the number of distinct (partition_by, order_by, frame) groups.
-fn count_unique_signatures(window_exprs: &[ScalarWindowSpec]) -> usize {
-    window_exprs
-        .iter()
-        .map(|expr| WindowSignatureKey {
+impl From<&ScalarWindowSpec> for WindowSignatureKey {
+    fn from(expr: &ScalarWindowSpec) -> Self {
+        Self {
             partition_by: expr.partition_by.clone(),
             order_by: expr
                 .order_by
@@ -62,9 +60,31 @@ fn count_unique_signatures(window_exprs: &[ScalarWindowSpec]) -> usize {
                 .map(|item| (item.expr, item.asc, item.nulls_first))
                 .collect(),
             window_frame: format!("{:?}", expr.window_frame),
-        })
+        }
+    }
+}
+
+/// Returns the number of distinct (partition_by, order_by, frame) groups.
+fn count_unique_signatures(window_exprs: &[ScalarWindowSpec]) -> usize {
+    window_exprs
+        .iter()
+        .map(WindowSignatureKey::from)
         .collect::<HashSet<_>>()
         .len()
+}
+
+fn sort_matches_window_signature(sort: &SortOp, signature: &WindowSignatureKey) -> bool {
+    let partition_len = signature.partition_by.len();
+    sort.analytic_partition_exprs == signature.partition_by
+        && sort.items.len() == partition_len + signature.order_by.len()
+        && sort.items[..partition_len]
+            .iter()
+            .zip(&signature.partition_by)
+            .all(|(item, partition)| item.expr == *partition && item.asc && item.nulls_first)
+        && sort.items[partition_len..]
+            .iter()
+            .map(|item| (item.expr, item.asc, item.nulls_first))
+            .eq(signature.order_by.iter().copied())
 }
 
 impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
@@ -206,6 +226,13 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
 
         // --- Step 4: Non-empty partition guard ---
         if sort_op.analytic_partition_exprs.is_empty() {
+            return Ok(RewriteResult::Unchanged);
+        }
+
+        // A finer ordering would split peers before the retained Window ranks
+        // them. Only prune with the exact partition and peer signature.
+        let signature = WindowSignatureKey::from(&window_op.window_exprs[0]);
+        if !sort_matches_window_signature(sort_op, &signature) {
             return Ok(RewriteResult::Unchanged);
         }
 
@@ -540,7 +567,7 @@ mod tests {
         let sort_key = make_sort_key(arena, p_id);
         OptExpr::new(
             Operator::LogicalSort(SortOp {
-                items: vec![sort_key],
+                items: vec![sort_key.clone(), sort_key],
                 analytic_partition_exprs: vec![partition_expr],
                 partition_limit: None,
                 topn_type: None,
@@ -560,7 +587,7 @@ mod tests {
         let sort_key = make_sort_key(arena, p_id);
         OptExpr::new(
             Operator::LogicalSort(SortOp {
-                items: vec![sort_key],
+                items: vec![sort_key.clone(), sort_key],
                 analytic_partition_exprs: vec![partition_expr],
                 partition_limit: Some(limit),
                 topn_type: Some(SqlTopNType::Rank),
@@ -862,7 +889,11 @@ mod tests {
         let rank_id = ColumnId::new_for_test(12);
 
         let mut arena = ScalarArena::new();
-        let sort = make_sort_opt(&mut arena, region_id);
+        let mut sort = make_sort_opt(&mut arena, region_id);
+        let Operator::LogicalSort(sort_op) = &mut sort.op else {
+            unreachable!()
+        };
+        sort_op.items[1] = make_sort_key(&mut arena, amount_id);
         let window_spec =
             make_window_spec_opt_with_order(&mut arena, "rank", rank_id, region_id, amount_id);
         let window = window_opt(
@@ -1281,6 +1312,45 @@ mod tests {
         let sort_node = extract_sort_from_changed(result);
         assert_eq!(sort_node.partition_limit, Some(3));
         assert_eq!(sort_node.topn_type, Some(SqlTopNType::Rank));
+    }
+
+    #[test]
+    fn rejects_sort_keys_that_differ_from_the_ranking_window_signature() {
+        for mismatch in 0..8 {
+            let rank = ColumnId::new_for_test(1);
+            let partition = ColumnId::new_for_test(2);
+            let other = ColumnId::new_for_test(3);
+            let mut arena = ScalarArena::new();
+            let mut sort = make_sort_opt(&mut arena, partition);
+            let other_key = make_sort_key(&mut arena, other);
+            let Operator::LogicalSort(sort_op) = &mut sort.op else {
+                unreachable!()
+            };
+            match mismatch {
+                0 => sort_op.items.push(other_key),
+                1 => sort_op.items[1].asc = false,
+                2 => sort_op.items[1].nulls_first = false,
+                3 => sort_op.analytic_partition_exprs[0] = other_key.expr,
+                4 => sort_op.items[0].asc = false,
+                5 => sort_op.items[0].nulls_first = false,
+                6 => sort_op.items[1] = other_key,
+                7 => sort_op.items[0] = other_key,
+                _ => unreachable!(),
+            }
+            let spec = make_window_spec_opt(&mut arena, "rank", rank, partition);
+            let window = window_opt(sort, vec![spec], vec![output_col(rank, "rk")]);
+            let plan = filter_opt(&mut arena, window, le_typed(col_typed(rank), 2));
+            let mut ctx = make_ctx(arena);
+            assert!(
+                matches!(
+                    RankingWindowPredicatePushdownRule
+                        .apply(plan, &mut ctx)
+                        .unwrap(),
+                    RewriteResult::Unchanged
+                ),
+                "mismatch {mismatch}"
+            );
+        }
     }
 
     fn decimal_cast_typed(
