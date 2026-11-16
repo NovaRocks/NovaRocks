@@ -31,10 +31,19 @@ use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::{
-    CatalogVersion, ConnectorInstanceId, ConnectorProviderId, ConnectorStopOwner,
+    CatalogVersion, ConnectorInstanceId, ConnectorProviderId, ConnectorReservationBackend,
+    ConnectorResourceCheckpoint, ConnectorResourceLedger, ConnectorStopOwner,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+#[derive(Default)]
+struct WriterOptions {
+    partitioned: bool,
+    output: Option<IcebergWriterOutput>,
+    resources: Option<ConnectorExecutionResources>,
+}
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -88,6 +97,19 @@ impl Fixture {
         RecordBatch,
         ConnectorStopOwner,
     ) {
+        self.writer_with_options(branch, data_input, WriterOptions::default())
+            .await
+    }
+    async fn writer_with_options(
+        &self,
+        branch: IcebergWriteBranch,
+        data_input: Option<(String, RecordBatch)>,
+        options: WriterOptions,
+    ) -> (
+        Box<dyn ConnectorBatchWriter>,
+        RecordBatch,
+        ConnectorStopOwner,
+    ) {
         let root = format!("file://{}", self.directory.path().display());
         let table = IcebergWriteTableFacts::try_new(
             "6f7c3a0e-0000-4000-8000-000000000001".into(),
@@ -112,9 +134,9 @@ impl Fixture {
         } else {
             IcebergFileFormat::Parquet
         };
-        let output =
-            IcebergWriterOutput::try_new(format, parquet::basic::Compression::SNAPPY, None)
-                .unwrap();
+        let output = options.output.unwrap_or_else(|| {
+            IcebergWriterOutput::for_test(format, parquet::basic::Compression::SNAPPY)
+        });
         let mut data = data_branch_plan();
         let mut equality = equality_delete_recipe();
         let data_batch = if let Some((schema, batch)) = data_input {
@@ -147,6 +169,16 @@ impl Fixture {
         } else {
             None
         };
+        if options.partitioned {
+            data.recipe = IcebergDataBranchRecipe::try_new(
+                data.recipe.target_schema_json().map(str::to_owned),
+                vec!["k1".into()],
+                vec!["k1".into()],
+                vec!["identity".into()],
+                false,
+            )
+            .unwrap();
+        }
         let (handle, batch) = match branch {
             IcebergWriteBranch::Data | IcebergWriteBranch::EqualityDelete => {
                 let handle = if branch == IcebergWriteBranch::Data {
@@ -235,7 +267,13 @@ impl Fixture {
         let writer = self
             .execution
             .open_writer(ConnectorOpenWriterRequest {
-                resources: (branch == IcebergWriteBranch::DeletionVector).then(writer_resources),
+                resources: options.resources.or_else(|| {
+                    matches!(
+                        branch,
+                        IcebergWriteBranch::Data | IcebergWriteBranch::DeletionVector
+                    )
+                    .then(writer_resources)
+                }),
                 handle: self.adapter.wrap_writer_handle(handle),
                 target: WriteTargetOrdinal::try_new(0).unwrap(),
                 expected_schema: batch.schema(),
@@ -364,6 +402,164 @@ async fn rejected_append_keeps_the_open_data_stream_abortable() {
     assert!(fixture.files().is_empty());
     writer.abort().await.unwrap();
     assert!(writer.finish().await.is_err());
+}
+
+#[tokio::test]
+async fn open_partition_limit_keeps_typed_counts_and_abort_cleans_unsealed_files() {
+    use novarocks_failure_contract::connector_reason::ICEBERG_TOO_MANY_OPEN_PARTITIONS;
+
+    let fixture = Fixture::new();
+    let output = IcebergWriterOutput::try_new(
+        IcebergFileFormat::Parquet,
+        parquet::basic::Compression::SNAPPY,
+        128 << 20,
+        1 << 30,
+        1,
+    )
+    .unwrap();
+    let (mut writer, batch, _) = fixture
+        .writer_with_options(
+            IcebergWriteBranch::Data,
+            None,
+            WriterOptions {
+                partitioned: true,
+                output: Some(output),
+                resources: None,
+            },
+        )
+        .await;
+    writer.append(batch.slice(0, 1)).await.unwrap();
+    assert_eq!(fixture.files().len(), 1);
+    let error = writer.append(batch.slice(1, 1)).await.unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+    assert_eq!(
+        error.message(),
+        "Exceeded limit of 1 open writers for partitions: 2"
+    );
+    let fact = error.failure_fact();
+    assert_eq!(fact.reason(), ICEBERG_TOO_MANY_OPEN_PARTITIONS);
+    let resource = fact.resource().unwrap();
+    assert_eq!(
+        (resource.limit, resource.requested, resource.live),
+        (Some(1), Some(2), Some(1))
+    );
+    assert_eq!(fixture.files().len(), 1);
+
+    writer.abort().await.unwrap();
+    assert!(fixture.files().is_empty());
+}
+
+#[derive(Clone)]
+struct BufferLedger {
+    live: Arc<AtomicU64>,
+    limit: Arc<AtomicU64>,
+}
+
+impl BufferLedger {
+    fn check_limit(&self, size: u64) -> Result<(), ConnectorError> {
+        if size > self.limit.load(Ordering::Relaxed) {
+            return Err(error(
+                ConnectorErrorKind::ResourceExhausted,
+                "writer memory denied",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ConnectorResourceLedger for BufferLedger {
+    fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+        Ok(ConnectorResourceCheckpoint::new(0))
+    }
+
+    fn try_reserve(
+        &self,
+        class: ConnectorResourceClass,
+        bytes: u64,
+    ) -> Result<Box<dyn ConnectorReservationBackend>, ConnectorError> {
+        assert_eq!(class, ConnectorResourceClass::WriterState);
+        self.check_limit(bytes)?;
+        assert_eq!(self.live.swap(bytes, Ordering::Relaxed), 0);
+        Ok(Box::new(BufferReservation {
+            ledger: self.clone(),
+            bytes,
+        }))
+    }
+}
+
+struct BufferReservation {
+    ledger: BufferLedger,
+    bytes: u64,
+}
+
+impl ConnectorReservationBackend for BufferReservation {
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
+        let next = self.bytes + additional;
+        self.ledger.check_limit(next)?;
+        self.bytes = next;
+        self.ledger.live.store(next, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+        assert!(bytes <= self.bytes);
+        self.bytes = bytes;
+        self.ledger.live.store(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl Drop for BufferReservation {
+    fn drop(&mut self) {
+        assert_eq!(self.ledger.live.swap(0, Ordering::Relaxed), self.bytes);
+    }
+}
+
+#[tokio::test]
+async fn data_writer_holds_only_live_parquet_buffer_charge_and_preserves_refusal() {
+    let fixture = Fixture::new();
+    let ledger = BufferLedger {
+        live: Arc::new(AtomicU64::new(0)),
+        limit: Arc::new(AtomicU64::new(u64::MAX)),
+    };
+    let options = || WriterOptions {
+        resources: Some(ConnectorExecutionResources::from_admitted_ledger(Arc::new(
+            ledger.clone(),
+        ))),
+        ..WriterOptions::default()
+    };
+    let (mut writer, batch, _) = fixture
+        .writer_with_options(IcebergWriteBranch::Data, None, options())
+        .await;
+    assert_eq!(ledger.live.load(Ordering::Relaxed), 0);
+    writer.append(batch.clone()).await.unwrap();
+    let held = ledger.live.load(Ordering::Relaxed);
+    assert!(held > 0);
+    ledger.limit.store(held, Ordering::Relaxed);
+    let growth = RecordBatch::try_new(
+        batch.schema(),
+        vec![Arc::new(Int64Array::from_iter_values(100..300))],
+    )
+    .unwrap();
+    let refusal = writer.append(growth).await.unwrap_err();
+    assert_eq!(refusal.kind(), ConnectorErrorKind::ResourceExhausted);
+    assert_eq!(refusal.message(), "writer memory denied");
+    assert_eq!(ledger.live.load(Ordering::Relaxed), held);
+    writer.abort().await.unwrap();
+    assert!(fixture.files().is_empty());
+    assert_eq!(ledger.live.load(Ordering::Relaxed), 0);
+
+    let (mut writer, batch, _) = fixture
+        .writer_with_options(IcebergWriteBranch::Data, None, options())
+        .await;
+    writer.append(batch).await.unwrap();
+    assert_eq!(ledger.live.load(Ordering::Relaxed), held);
+    assert_eq!(writer.finish().await.unwrap().len(), 1);
+    assert_eq!(ledger.live.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]

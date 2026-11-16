@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 #[path = "data_writer/staged_paths.rs"]
 mod staged_paths;
-pub(crate) use staged_paths::{CreateClaim, ObjectContent, ObjectOwner, StagedPathJournal};
+pub(crate) use staged_paths::{
+    CreateClaim, ObjectContent, ObjectOwner, StagedPathJournal, StagedWriteProgress,
+};
 
 #[path = "data_writer/streaming.rs"]
 mod streaming;
@@ -81,6 +83,8 @@ impl LocationGenerator for JournaledLocationGenerator {
 }
 
 pub(crate) const PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY: &str = "write.parquet.row-group-size-bytes";
+pub(crate) const TARGET_FILE_SIZE_BYTES_PROPERTY: &str = "write.target-file-size-bytes";
+pub(crate) const DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES: u64 = 128 << 20;
 const MAX_WRITE_BATCH_ROWS: usize = 1024;
 const ROW_GROUP_WRITE_BATCH_DIVISOR: usize = 64;
 
@@ -88,40 +92,38 @@ fn row_group_write_batch_rows(max_row_group_bytes: usize) -> usize {
     (max_row_group_bytes / ROW_GROUP_WRITE_BATCH_DIVISOR).clamp(1, MAX_WRITE_BATCH_ROWS)
 }
 
-pub(crate) fn parquet_row_group_size_bytes(
+pub(crate) fn positive_table_bytes(
     table_properties: &HashMap<String, String>,
-) -> Result<Option<usize>, String> {
+    property: &str,
+) -> Result<Option<u64>, String> {
     table_properties
-        .get(PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY)
+        .get(property)
         .map(|value| {
-            let max_row_group_bytes = value.parse::<usize>().map_err(|error| {
-            format!(
-                "Iceberg table property {PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY} must be a positive byte count: {error}"
-            )
-        })?;
-            if max_row_group_bytes == 0 {
-                return Err(format!(
-                    "Iceberg table property {PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY} must be a positive byte count"
-                ));
-            }
-            Ok(max_row_group_bytes)
+            value
+                .parse::<std::num::NonZeroU64>()
+                .map(std::num::NonZeroU64::get)
+                .map_err(|error| {
+                    format!(
+                        "Iceberg table property {property} must be a positive byte count: {error}"
+                    )
+                })
         })
         .transpose()
 }
 
-fn parquet_writer_properties(
+pub(crate) fn parquet_row_group_size_bytes(
     table_properties: &HashMap<String, String>,
-) -> Result<WriterProperties, String> {
-    let mut properties = WriterProperties::builder();
-    if let Some(max_row_group_bytes) = parquet_row_group_size_bytes(table_properties)? {
-        // Parquet only evaluates the byte threshold between write batches.
-        // Keep an explicitly small Iceberg row-group limit meaningful instead
-        // of allowing the default 1024-row batch to overshoot it wholesale.
-        properties = properties
-            .set_max_row_group_bytes(Some(max_row_group_bytes))
-            .set_write_batch_size(row_group_write_batch_rows(max_row_group_bytes));
-    }
-    Ok(properties.build())
+) -> Result<Option<u64>, String> {
+    positive_table_bytes(table_properties, PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY)
+}
+
+fn parquet_writer_properties(max_row_group_bytes: usize) -> WriterProperties {
+    // Parquet evaluates the byte threshold between write batches. Keep a
+    // small limit meaningful instead of writing the entire default batch.
+    WriterProperties::builder()
+        .set_max_row_group_bytes(Some(max_row_group_bytes))
+        .set_write_batch_size(row_group_write_batch_rows(max_row_group_bytes))
+        .build()
 }
 
 pub struct StagedDataFile {
@@ -167,6 +169,8 @@ pub struct StagedWriteContext {
     /// staged writer may use synthetic metadata for schema/partition binding,
     /// but the coordinator must commit files under the real target spec id.
     partition_spec_id: i32,
+    target_file_size_bytes: usize,
+    max_partitions_per_writer: u32,
 }
 
 impl StagedWriteContext {
@@ -224,7 +228,31 @@ impl StagedWriteContext {
             writer_schema,
             annotated_schema,
             partition_spec_id,
+            target_file_size_bytes:
+                crate::iceberg::spec::TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT,
+            max_partitions_per_writer: crate::catalog_config::DEFAULT_MAX_PARTITIONS_PER_WRITER,
         })
+    }
+
+    pub(super) fn with_frozen_file_shaping(
+        mut self,
+        target_file_size_bytes: u64,
+        max_partitions_per_writer: u32,
+    ) -> Result<Self, String> {
+        self.target_file_size_bytes = usize::try_from(target_file_size_bytes)
+            .map_err(|_| "Iceberg target file size does not fit this platform".to_string())?;
+        if self.target_file_size_bytes == 0 || max_partitions_per_writer == 0 {
+            return Err("Iceberg frozen file shaping settings must be positive".into());
+        }
+        self.max_partitions_per_writer = max_partitions_per_writer;
+        Ok(self)
+    }
+
+    fn max_row_group_bytes(&self) -> Result<usize, String> {
+        let bytes = parquet_row_group_size_bytes(self.metadata.properties())?
+            .unwrap_or(DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES);
+        usize::try_from(bytes)
+            .map_err(|_| "Iceberg Parquet row group size does not fit this platform".into())
     }
 
     pub fn schema(&self) -> &SchemaRef {
@@ -263,11 +291,12 @@ impl StagedWriteContext {
             DataFileFormat::Parquet,
         );
         let parquet_builder = ParquetWriterBuilder::new(
-            parquet_writer_properties(self.metadata.properties())?,
+            parquet_writer_properties(self.max_row_group_bytes()?),
             self.writer_schema.clone(),
         );
-        let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        let rolling_builder = RollingFileWriterBuilder::new(
             parquet_builder,
+            self.target_file_size_bytes,
             self.file_io.clone(),
             location_generator,
             file_name_generator,
@@ -340,9 +369,7 @@ async fn write_record_batches_with_journal(
     // Parquet checks its row-group byte threshold between RecordBatch writes.
     // The SQL sink can hand us a much larger batch, so preserve the configured
     // limit's usefulness by making the same bounded write granularity explicit.
-    let write_batch_rows = parquet_row_group_size_bytes(ctx.metadata.properties())?
-        .map(row_group_write_batch_rows)
-        .unwrap_or(usize::MAX);
+    let write_batch_rows = row_group_write_batch_rows(ctx.max_row_group_bytes()?);
 
     if ctx.partition_spec().fields().is_empty() {
         let mut writer = data_file_builder
@@ -921,7 +948,8 @@ mod tests {
 
     use super::*;
 
-    fn local_test_binding() -> novarocks_connector_iceberg::access_binding::IcebergReadBinding {
+    pub(super) fn local_test_binding()
+    -> novarocks_connector_iceberg::access_binding::IcebergReadBinding {
         let runtime = tokio::runtime::Handle::current();
         novarocks_connector_iceberg::access_binding::IcebergReadBinding::new(
             None,
@@ -934,11 +962,13 @@ mod tests {
 
     #[test]
     fn parquet_writer_properties_honor_iceberg_row_group_byte_limit() {
-        let properties = parquet_writer_properties(&HashMap::from([(
+        let row_group = parquet_row_group_size_bytes(&HashMap::from([(
             PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY.to_string(),
             "1024".to_string(),
         )]))
-        .expect("valid row-group byte limit");
+        .expect("valid row-group byte limit")
+        .expect("explicit row-group byte limit");
+        let properties = parquet_writer_properties(row_group.try_into().unwrap());
 
         assert_eq!(properties.max_row_group_bytes(), Some(1024));
         assert_eq!(properties.write_batch_size(), 16);
@@ -948,7 +978,7 @@ mod tests {
     #[test]
     fn parquet_writer_properties_reject_zero_or_malformed_row_group_limit() {
         for value in ["0", "not-a-number"] {
-            let error = parquet_writer_properties(&HashMap::from([(
+            let error = parquet_row_group_size_bytes(&HashMap::from([(
                 PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY.to_string(),
                 value.to_string(),
             )]))

@@ -102,7 +102,9 @@ message IcebergWriteTableFacts {
 message IcebergWriterOutput {
   IcebergWriteFileFormat file_format = 1;
   IcebergCompression compression = 2;
-  optional uint64 parquet_row_group_size_bytes = 3;
+  uint64 parquet_row_group_size_bytes = 3;
+  uint64 target_file_size_bytes = 4;
+  uint32 max_partitions_per_writer = 5;
 }
 
 message IcebergDataBranchRecipe {

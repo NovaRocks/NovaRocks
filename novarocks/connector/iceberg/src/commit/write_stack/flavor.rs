@@ -133,7 +133,9 @@ impl IcebergSessionMaterial {
             output: IcebergWriterOutput::try_new(
                 delete_branch_format(branch)?,
                 parquet::basic::Compression::SNAPPY,
-                None,
+                self.data_output.parquet_row_group_size_bytes(),
+                self.data_output.target_file_size_bytes(),
+                self.data_output.max_partitions_per_writer(),
             )?,
             position_rewrite,
             input,
@@ -221,7 +223,9 @@ fn plan_equality_delete_branches(
                 output: IcebergWriterOutput::try_new(
                     IcebergFileFormat::Parquet,
                     parquet::basic::Compression::SNAPPY,
-                    None,
+                    material.data_output.parquet_row_group_size_bytes(),
+                    material.data_output.target_file_size_bytes(),
+                    material.data_output.max_partitions_per_writer(),
                 )?,
                 recipe,
                 input: material.input.clone(),

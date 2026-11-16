@@ -229,6 +229,29 @@ pub struct IcebergWriteSessionControl {
     runtime: Arc<IcebergMetadataContext>,
 }
 
+pub(crate) fn freeze_writer_output(
+    properties: &std::collections::HashMap<String, String>,
+    config: crate::catalog_config::IcebergCatalogWriteConfig,
+) -> Result<IcebergWriterOutput, ConnectorError> {
+    use crate::commit::data_writer::{
+        DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES, TARGET_FILE_SIZE_BYTES_PROPERTY, positive_table_bytes,
+    };
+
+    let row_group_size = crate::commit::data_writer::parquet_row_group_size_bytes(properties)
+        .map_err(corrupt)?
+        .unwrap_or(DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES);
+    let target_file_size = positive_table_bytes(properties, TARGET_FILE_SIZE_BYTES_PROPERTY)
+        .map_err(corrupt)?
+        .unwrap_or(config.target_file_size_bytes);
+    IcebergWriterOutput::try_new(
+        crate::delete_file::IcebergFileFormat::Parquet,
+        parquet::basic::Compression::SNAPPY,
+        row_group_size,
+        target_file_size,
+        config.max_partitions_per_writer,
+    )
+}
+
 impl IcebergWriteSessionControl {
     #[cfg(novarocks_dev_controls)]
     pub fn with_test_observation(
@@ -2877,14 +2900,9 @@ impl IcebergWriteSessionControl {
             None
         };
         let material = IcebergSessionMaterial {
-            data_output: IcebergWriterOutput::try_new(
-                crate::delete_file::IcebergFileFormat::Parquet,
-                parquet::basic::Compression::SNAPPY,
-                crate::commit::data_writer::parquet_row_group_size_bytes(
-                    writer_metadata.properties(),
-                )
-                .map_err(invalid)?
-                .map(|size| size as u64),
+            data_output: freeze_writer_output(
+                writer_metadata.properties(),
+                self.runtime.control_state().configuration().write,
             )?,
             data_recipe: if let Some(scope) = rewrite_scope.as_ref() {
                 rewrite_source::data_recipe(

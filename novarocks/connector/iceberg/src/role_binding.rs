@@ -457,12 +457,10 @@ mod tests {
     fn writer_handle() -> IcebergWriterHandle {
         IcebergWriterHandle::try_new_data(
             table_facts(),
-            IcebergWriterOutput::try_new(
+            IcebergWriterOutput::for_test(
                 IcebergFileFormat::Parquet,
                 parquet::basic::Compression::SNAPPY,
-                None,
-            )
-            .expect("output"),
+            ),
             IcebergDataBranchRecipe::try_new(None, Vec::new(), Vec::new(), Vec::new(), false)
                 .expect("recipe")
                 .with_write_input_identity(

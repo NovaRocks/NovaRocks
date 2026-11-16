@@ -166,6 +166,7 @@ enum MessageKind {
 #[derive(Clone, Copy)]
 enum FieldKind {
     Varint,
+    U32,
     Text,
     Bytes,
     Message(MessageKind),
@@ -208,7 +209,7 @@ impl FieldRule {
 
     const fn wire(self) -> u8 {
         match self.kind {
-            FieldKind::Varint => 0,
+            FieldKind::Varint | FieldKind::U32 => 0,
             FieldKind::Text
             | FieldKind::Bytes
             | FieldKind::Message(_)
@@ -245,7 +246,8 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
 
         (M::WriteTable, 1..=6) => Some(singular(F::Text)),
         (M::WriteTable, 7..=11) => Some(singular(F::Varint)),
-        (M::WriterOutput, 1..=3) => Some(singular(F::Varint)),
+        (M::WriterOutput, 1..=4) => Some(singular(F::Varint)),
+        (M::WriterOutput, 5) => Some(singular(F::U32)),
         (M::DataRecipe, 1) => Some(singular(F::Text)),
         (M::DataRecipe, 2..=4) => Some(repeated(F::Text)),
         (M::DataRecipe, 5) => Some(singular(F::Varint)),
@@ -369,6 +371,11 @@ fn scan_message(
         match rule.kind {
             FieldKind::Varint => {
                 read_varint(&mut input, &field_path, context)?;
+            }
+            FieldKind::U32 => {
+                let value = read_varint(&mut input, &field_path, context)?;
+                u32::try_from(value)
+                    .map_err(|_| invalid(field_path, "protobuf unsigned integer exceeds u32"))?;
             }
             FieldKind::Text | FieldKind::Bytes | FieldKind::PackedVarint => {
                 let value = read_length_delimited(&mut input, &field_path, context)?;
@@ -756,10 +763,22 @@ fn validate_output(
             }
             _ => {}
         }
-        if output.parquet_row_group_size_bytes == Some(0) {
+        if output.parquet_row_group_size_bytes == 0 {
             return Err(invalid(
                 path.field("parquet_row_group_size_bytes"),
                 "Parquet row group size must be positive",
+            ));
+        }
+        if output.target_file_size_bytes == 0 {
+            return Err(invalid(
+                path.field("target_file_size_bytes"),
+                "target file size must be positive",
+            ));
+        }
+        if output.max_partitions_per_writer == 0 {
+            return Err(invalid(
+                path.field("max_partitions_per_writer"),
+                "maximum open partitions must be positive",
             ));
         }
         Ok(())
@@ -1617,7 +1636,7 @@ mod compile_control_tests {
         )
     }
     fn output(format: IcebergFileFormat) -> IcebergWriterOutput {
-        IcebergWriterOutput::try_new(format, Compression::SNAPPY, None).unwrap()
+        IcebergWriterOutput::for_test(format, Compression::SNAPPY)
     }
     fn handles() -> Vec<dto::IcebergWriterHandle> {
         let data = IcebergWriterHandle::try_new_data(

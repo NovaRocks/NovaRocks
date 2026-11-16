@@ -586,6 +586,8 @@ impl IcebergWriteValueCodec {
             compression: self
                 .encode_compression(output.compression(), path.field("compression"))?,
             parquet_row_group_size_bytes: output.parquet_row_group_size_bytes(),
+            target_file_size_bytes: output.target_file_size_bytes(),
+            max_partitions_per_writer: output.max_partitions_per_writer(),
         })
     }
 
@@ -607,19 +609,15 @@ impl IcebergWriteValueCodec {
                 self.decode_file_format(output.file_format, path.field("file_format"), context)?;
             let compression =
                 self.decode_compression(output.compression, path.field("compression"), context)?;
-            // `try_new` owns the rule that a Parquet row-group size belongs only to
-            // a Parquet writer: the carrier can state both, and only Iceberg knows
-            // the pairing is a contradiction.
-            {
-                let arguments = (
+            observe_value_opaque(context, || {
+                IcebergWriterOutput::try_new(
                     file_format,
                     compression,
                     output.parquet_row_group_size_bytes,
-                );
-                observe_value_opaque(context, || {
-                    IcebergWriterOutput::try_new(arguments.0, arguments.1, arguments.2)
-                })?
-            }
+                    output.target_file_size_bytes,
+                    output.max_partitions_per_writer,
+                )
+            })?
             .map_err(|error| spi_codec_error(self.rejected(path, &error)))
         })();
         finish_value_decode(result, context)
@@ -2005,7 +2003,7 @@ mod tests {
     }
 
     fn output(format: IcebergFileFormat) -> IcebergWriterOutput {
-        IcebergWriterOutput::try_new(format, Compression::SNAPPY, None).expect("output")
+        IcebergWriterOutput::for_test(format, Compression::SNAPPY)
     }
 
     fn schema() -> String {
@@ -2018,7 +2016,9 @@ mod tests {
             IcebergWriterOutput::try_new(
                 IcebergFileFormat::Parquet,
                 Compression::SNAPPY,
-                Some(4096),
+                4096,
+                64 << 20,
+                7,
             )
             .expect("output"),
             IcebergDataBranchRecipe::try_new(
@@ -2177,6 +2177,14 @@ mod tests {
         assert_eq!(
             left.output().parquet_row_group_size_bytes(),
             right.output().parquet_row_group_size_bytes()
+        );
+        assert_eq!(
+            left.output().target_file_size_bytes(),
+            right.output().target_file_size_bytes()
+        );
+        assert_eq!(
+            left.output().max_partitions_per_writer(),
+            right.output().max_partitions_per_writer()
         );
         match (left.data(), right.data()) {
             (None, None) => {}
@@ -2456,10 +2464,10 @@ mod tests {
             .output
             .as_mut()
             .unwrap()
-            .parquet_row_group_size_bytes = Some(4096);
+            .parquet_row_group_size_bytes = 0;
         let error = codec
             .decode_writer_handle_value(&private, &mut context)
-            .expect_err("Puffin cannot carry a Parquet row group size");
+            .expect_err("writer output requires a positive row group size");
         assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
         assert_eq!(error.path().to_string(), "writer_handle.iceberg.output");
         assert!(error.detail().contains("Iceberg Parquet row group size"));
@@ -2623,13 +2631,11 @@ mod tests {
         for cause in projection_control_causes() {
             for invalid in [false, true] {
                 let output = dto::IcebergWriterOutput {
-                    file_format: if invalid {
-                        dto::IcebergWriteFileFormat::Puffin as i32
-                    } else {
-                        dto::IcebergWriteFileFormat::Parquet as i32
-                    },
+                    file_format: dto::IcebergWriteFileFormat::Parquet as i32,
                     compression: dto::IcebergCompression::Snappy as i32,
-                    parquet_row_group_size_bytes: Some(4096),
+                    parquet_row_group_size_bytes: if invalid { 0 } else { 4096 },
+                    target_file_size_bytes: 1 << 20,
+                    max_partitions_per_writer: 3,
                 };
                 let control = ProjectionControl::new(cause.clone(), 1);
                 let mut ledger = ConnectorDecodeLedger::new(private_limits());
@@ -2683,8 +2689,7 @@ mod tests {
             delete_handle(IcebergWriteBranch::DeletionVector),
             IcebergWriterHandle::try_new_equality_delete(
                 table_facts(),
-                IcebergWriterOutput::try_new(IcebergFileFormat::Parquet, Compression::SNAPPY, None)
-                    .expect("output"),
+                IcebergWriterOutput::for_test(IcebergFileFormat::Parquet, Compression::SNAPPY),
                 equality_delete_recipe(),
             )
             .expect("equality-delete handle"),
@@ -2755,7 +2760,7 @@ mod tests {
             );
             assert_eq!(ledger.raw_bytes(), 0);
         }
-        for revision in [3, 4, 5, 6, 7, 9] {
+        for revision in [3, 4, 5, 6, 7, 9, 10] {
             for category in [
                 ConnectorCodecCategory::WriteHandle,
                 ConnectorCodecCategory::CommitFragment,
@@ -2938,10 +2943,9 @@ mod tests {
         let recipe = recovered.data().expect("a data branch keeps its recipe");
         assert_eq!(recipe.target_schema_json(), Some(schema().as_str()));
         assert!(recipe.row_lineage());
-        assert_eq!(
-            recovered.output().parquet_row_group_size_bytes(),
-            Some(4096)
-        );
+        assert_eq!(recovered.output().parquet_row_group_size_bytes(), 4096);
+        assert_eq!(recovered.output().target_file_size_bytes(), 64 << 20);
+        assert_eq!(recovered.output().max_partitions_per_writer(), 7);
     }
 
     #[test]
@@ -3274,9 +3278,7 @@ mod tests {
     fn a_structurally_valid_carrier_still_faces_the_domain_constructors() {
         let facets = generation();
 
-        // A Puffin writer carrying a Parquet row-group size: the carrier can
-        // state both, and only `IcebergWriterOutput::try_new` knows the pairing
-        // is a contradiction.
+        // All branches carry exact positive writer settings.
         let raw = facets
             .handle_encoder
             .encode_writer_handle(
@@ -3290,20 +3292,18 @@ mod tests {
                 .output
                 .as_mut()
                 .expect("output")
-                .parquet_row_group_size_bytes = Some(4096);
+                .parquet_row_group_size_bytes = 0;
         });
         let error = facets
             .handle_decoder
             .decode_writer_handle(&parse_handle(raw))
-            .expect_err("a Puffin writer with a Parquet row group size");
+            .expect_err("a writer without a positive row group size");
         assert_eq!(error.protocol().kind(), &ProtocolErrorKind::InvalidValue);
-        assert_public_provider_error_path(&error, "writer_handle.iceberg.output");
-        assert!(
-            error
-                .protocol()
-                .detail()
-                .contains("Iceberg Parquet row group size")
+        assert_public_provider_error_path(
+            &error,
+            "writer_handle.iceberg.output.parquet_row_group_size_bytes",
         );
+        assert!(error.protocol().detail().contains("Parquet row group size"));
 
         // A deletion vector whose cardinality disagrees with its record count.
         let raw = facets
@@ -3344,12 +3344,10 @@ mod tests {
         let facets = generation();
         let handle = IcebergWriterHandle::try_new_data(
             table_facts(),
-            IcebergWriterOutput::try_new(
+            IcebergWriterOutput::for_test(
                 IcebergFileFormat::Parquet,
                 Compression::GZIP(GzipLevel::try_new(9).expect("level")),
-                None,
-            )
-            .expect("output"),
+            ),
             IcebergDataBranchRecipe::try_new(None, Vec::new(), Vec::new(), Vec::new(), false)
                 .expect("recipe")
                 .with_write_input_identity(
@@ -3477,8 +3475,7 @@ mod tests {
         let facets = generation();
         let handle = IcebergWriterHandle::try_new_equality_delete(
             table_facts(),
-            IcebergWriterOutput::try_new(IcebergFileFormat::Parquet, Compression::SNAPPY, None)
-                .expect("output"),
+            IcebergWriterOutput::for_test(IcebergFileFormat::Parquet, Compression::SNAPPY),
             equality_delete_recipe(),
         )
         .expect("equality delete handle");
@@ -3621,7 +3618,9 @@ mod tests {
             IcebergWriterOutput::try_new(
                 IcebergFileFormat::Parquet,
                 Compression::SNAPPY,
-                Some(4096),
+                4096,
+                64 << 20,
+                7,
             )
             .unwrap(),
             old_recipe.with_write_input_identity(
@@ -3637,7 +3636,9 @@ mod tests {
             IcebergWriterOutput::try_new(
                 IcebergFileFormat::Parquet,
                 Compression::SNAPPY,
-                Some(4096),
+                4096,
+                64 << 20,
+                7,
             )
             .unwrap(),
             shared_recipe.with_write_input_identity(

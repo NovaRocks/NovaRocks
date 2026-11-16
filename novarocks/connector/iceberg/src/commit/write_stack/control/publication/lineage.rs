@@ -220,12 +220,10 @@ mod tests {
             crate::commit::write_stack::domain::data_write_input_identity(&public_input).unwrap();
         let handle = IcebergWriterHandle::try_new_data(
             table,
-            IcebergWriterOutput::try_new(
+            IcebergWriterOutput::for_test(
                 crate::delete_file::IcebergFileFormat::Parquet,
                 parquet::basic::Compression::SNAPPY,
-                None,
-            )
-            .unwrap(),
+            ),
             IcebergDataBranchRecipe::try_new(
                 Some(serde_json::to_string(metadata.current_schema().as_ref()).unwrap()),
                 Vec::new(),
@@ -250,7 +248,7 @@ mod tests {
         let execution = IcebergWriteStackExecution::new(catalog, adapter.clone(), binding);
         let mut writer = execution
             .open_writer(ConnectorOpenWriterRequest {
-                resources: None,
+                resources: Some(crate::commit::write_stack::test_support::writer_resources()),
                 handle: adapter.wrap_writer_handle(handle),
                 target: WriteTargetOrdinal::try_new(0).unwrap(),
                 expected_schema: schema,

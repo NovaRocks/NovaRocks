@@ -430,12 +430,10 @@ pub(crate) fn equality_delete_recipe() -> IcebergEqualityDeleteRecipe {
 
 pub(crate) fn data_branch_plan() -> IcebergDataBranchPlan {
     IcebergDataBranchPlan {
-        output: IcebergWriterOutput::try_new(
+        output: IcebergWriterOutput::for_test(
             IcebergFileFormat::Parquet,
             parquet::basic::Compression::SNAPPY,
-            None,
-        )
-        .expect("output"),
+            ),
         recipe: IcebergDataBranchRecipe::try_new(Some(serde_json::json!({"type":"struct","schema-id":1,"fields":[{"id":1,"name":"k1","required":false,"type":"long"}]}).to_string()), Vec::new(), Vec::new(), Vec::new(), false)
             .expect("recipe"),
         input: data_input_shape(),
@@ -452,12 +450,7 @@ pub(crate) fn delete_branch_plan(
     };
     IcebergDeleteBranchPlan {
         branch,
-        output: IcebergWriterOutput::try_new(
-            file_format,
-            parquet::basic::Compression::SNAPPY,
-            None,
-        )
-        .expect("output"),
+        output: IcebergWriterOutput::for_test(file_format, parquet::basic::Compression::SNAPPY),
         position_rewrite,
         input: delete_input_shape(branch),
     }

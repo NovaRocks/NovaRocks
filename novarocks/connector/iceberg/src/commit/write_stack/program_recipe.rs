@@ -350,6 +350,8 @@ fn validate_data(
         transform_exprs: copy_texts(recipe.transform_exprs(), work)?,
         target_schema_json: copy_text(source, work)?,
         parquet_row_group_size_bytes: handle.output().parquet_row_group_size_bytes(),
+        target_file_size_bytes: handle.output().target_file_size_bytes(),
+        max_partitions_per_writer: handle.output().max_partitions_per_writer(),
     };
     work.step()?;
     work.flush()?;

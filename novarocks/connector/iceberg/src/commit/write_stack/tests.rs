@@ -3373,7 +3373,7 @@ impl FrozenRewriteLake {
         let fragments = self.executor.block_on(async {
             let mut writer = execution
                 .open_writer(ConnectorOpenWriterRequest {
-                    resources: source.map(|_| super::test_support::writer_resources()),
+                    resources: Some(super::test_support::writer_resources()),
                     handle: target.handle().clone(),
                     target: target.ordinal(),
                     expected_schema: batch.schema(),
@@ -4729,7 +4729,7 @@ fn seal_test_data_output(
     let physical = ConnectorWriterPhysicalContext::new([1; 16], 1, [2; 16], 0, 0);
     let mut writer = executor
         .block_on(execution.open_writer(ConnectorOpenWriterRequest {
-            resources: None,
+            resources: Some(super::test_support::writer_resources()),
             handle: target.handle().clone(),
             target: target.ordinal(),
             expected_schema: schema.clone(),
@@ -5666,7 +5666,7 @@ fn open_streaming_data_writer(
     let writer = lake
         .executor
         .block_on(execution.open_writer(ConnectorOpenWriterRequest {
-            resources: None,
+            resources: Some(super::test_support::writer_resources()),
             handle: target.handle().clone(),
             target: target.ordinal(),
             expected_schema: schema.clone(),

@@ -249,16 +249,14 @@ fn facts(base: Option<i64>, version: u8) -> IcebergWriteTableFacts {
     .unwrap()
 }
 fn output(branch: IcebergWriteBranch) -> IcebergWriterOutput {
-    IcebergWriterOutput::try_new(
+    IcebergWriterOutput::for_test(
         if branch == IcebergWriteBranch::DeletionVector {
             IcebergFileFormat::Puffin
         } else {
             IcebergFileFormat::Parquet
         },
         parquet::basic::Compression::SNAPPY,
-        None,
     )
-    .unwrap()
 }
 
 #[test]
