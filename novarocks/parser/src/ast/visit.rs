@@ -21,6 +21,102 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_json_path_string(&mut self, node: &JsonPathString) {
+        super::json::walk_json_path_string(self, node);
+    }
+
+    fn visit_json_path_invocation(&mut self, node: &JsonPathInvocation) {
+        super::json::walk_json_path_invocation(self, node);
+    }
+
+    fn visit_json_path_parameter(&mut self, node: &JsonPathParameter) {
+        super::json::walk_json_path_parameter(self, node);
+    }
+
+    fn visit_json_constructor(&mut self, node: &JsonConstructor) {
+        super::json::walk_json_constructor(self, node);
+    }
+
+    fn visit_json_exists(&mut self, node: &JsonExists) {
+        super::json::walk_json_exists(self, node);
+    }
+
+    fn visit_json_value(&mut self, node: &JsonValue) {
+        super::json::walk_json_value(self, node);
+    }
+
+    fn visit_json_query(&mut self, node: &JsonQuery) {
+        super::json::walk_json_query(self, node);
+    }
+
+    fn visit_json_serialize(&mut self, node: &JsonSerialize) {
+        super::json::walk_json_serialize(self, node);
+    }
+
+    fn visit_json_object(&mut self, node: &JsonObject) {
+        super::json::walk_json_object(self, node);
+    }
+
+    fn visit_json_object_member(&mut self, node: &JsonObjectMember) {
+        super::json::walk_json_object_member(self, node);
+    }
+
+    fn visit_json_array(&mut self, node: &JsonArray) {
+        super::json::walk_json_array(self, node);
+    }
+
+    fn visit_json_array_element(&mut self, node: &JsonArrayElement) {
+        super::json::walk_json_array_element(self, node);
+    }
+
+    fn visit_json_table(&mut self, node: &JsonTable) {
+        super::json::walk_json_table(self, node);
+    }
+
+    fn visit_json_table_ordinality_column(&mut self, node: &JsonTableOrdinalityColumn) {
+        super::json::walk_json_table_ordinality_column(self, node);
+    }
+
+    fn visit_json_table_value_column(&mut self, node: &JsonTableValueColumn) {
+        super::json::walk_json_table_value_column(self, node);
+    }
+
+    fn visit_json_table_query_column(&mut self, node: &JsonTableQueryColumn) {
+        super::json::walk_json_table_query_column(self, node);
+    }
+
+    fn visit_json_table_nested_columns(&mut self, node: &JsonTableNestedColumns) {
+        super::json::walk_json_table_nested_columns(self, node);
+    }
+
+    fn visit_json_table_default_plan(&mut self, node: &JsonTableDefaultPlan) {
+        super::json::walk_json_table_default_plan(self, node);
+    }
+
+    fn visit_json_table_plan_leaf(&mut self, node: &JsonTablePlanLeaf) {
+        super::json::walk_json_table_plan_leaf(self, node);
+    }
+
+    fn visit_json_table_plan_parent_child(&mut self, node: &JsonTablePlanParentChild) {
+        super::json::walk_json_table_plan_parent_child(self, node);
+    }
+
+    fn visit_json_table_plan_siblings(&mut self, node: &JsonTablePlanSiblings) {
+        super::json::walk_json_table_plan_siblings(self, node);
+    }
+
+    fn visit_json_table_column(&mut self, node: &JsonTableColumn) {
+        super::json::walk_json_table_column(self, node);
+    }
+
+    fn visit_json_table_plan(&mut self, node: &JsonTablePlan) {
+        super::json::walk_json_table_plan(self, node);
+    }
+
+    fn visit_json_table_specific_plan(&mut self, node: &JsonTableSpecificPlan) {
+        super::json::walk_json_table_specific_plan(self, node);
+    }
+
     fn visit_function_specification(&mut self, node: &FunctionSpecification) {
         super::routine::walk_function_specification(self, node);
     }
@@ -684,6 +780,117 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_json_path_string(&mut self, node: JsonPathString) -> JsonPathString {
+        super::json::fold_json_path_string(self, node)
+    }
+
+    fn fold_json_path_invocation(&mut self, node: JsonPathInvocation) -> JsonPathInvocation {
+        super::json::fold_json_path_invocation(self, node)
+    }
+
+    fn fold_json_path_parameter(&mut self, node: JsonPathParameter) -> JsonPathParameter {
+        super::json::fold_json_path_parameter(self, node)
+    }
+
+    fn fold_json_constructor(&mut self, node: JsonConstructor) -> JsonConstructor {
+        super::json::fold_json_constructor(self, node)
+    }
+
+    fn fold_json_exists(&mut self, node: JsonExists) -> JsonExists {
+        super::json::fold_json_exists(self, node)
+    }
+
+    fn fold_json_value(&mut self, node: JsonValue) -> JsonValue {
+        super::json::fold_json_value(self, node)
+    }
+
+    fn fold_json_query(&mut self, node: JsonQuery) -> JsonQuery {
+        super::json::fold_json_query(self, node)
+    }
+
+    fn fold_json_serialize(&mut self, node: JsonSerialize) -> JsonSerialize {
+        super::json::fold_json_serialize(self, node)
+    }
+
+    fn fold_json_object(&mut self, node: JsonObject) -> JsonObject {
+        super::json::fold_json_object(self, node)
+    }
+
+    fn fold_json_object_member(&mut self, node: JsonObjectMember) -> JsonObjectMember {
+        super::json::fold_json_object_member(self, node)
+    }
+
+    fn fold_json_array(&mut self, node: JsonArray) -> JsonArray {
+        super::json::fold_json_array(self, node)
+    }
+
+    fn fold_json_array_element(&mut self, node: JsonArrayElement) -> JsonArrayElement {
+        super::json::fold_json_array_element(self, node)
+    }
+
+    fn fold_json_table(&mut self, node: JsonTable) -> JsonTable {
+        super::json::fold_json_table(self, node)
+    }
+
+    fn fold_json_table_ordinality_column(
+        &mut self,
+        node: JsonTableOrdinalityColumn,
+    ) -> JsonTableOrdinalityColumn {
+        super::json::fold_json_table_ordinality_column(self, node)
+    }
+
+    fn fold_json_table_value_column(&mut self, node: JsonTableValueColumn) -> JsonTableValueColumn {
+        super::json::fold_json_table_value_column(self, node)
+    }
+
+    fn fold_json_table_query_column(&mut self, node: JsonTableQueryColumn) -> JsonTableQueryColumn {
+        super::json::fold_json_table_query_column(self, node)
+    }
+
+    fn fold_json_table_nested_columns(
+        &mut self,
+        node: JsonTableNestedColumns,
+    ) -> JsonTableNestedColumns {
+        super::json::fold_json_table_nested_columns(self, node)
+    }
+
+    fn fold_json_table_default_plan(&mut self, node: JsonTableDefaultPlan) -> JsonTableDefaultPlan {
+        super::json::fold_json_table_default_plan(self, node)
+    }
+
+    fn fold_json_table_plan_leaf(&mut self, node: JsonTablePlanLeaf) -> JsonTablePlanLeaf {
+        super::json::fold_json_table_plan_leaf(self, node)
+    }
+
+    fn fold_json_table_plan_parent_child(
+        &mut self,
+        node: JsonTablePlanParentChild,
+    ) -> JsonTablePlanParentChild {
+        super::json::fold_json_table_plan_parent_child(self, node)
+    }
+
+    fn fold_json_table_plan_siblings(
+        &mut self,
+        node: JsonTablePlanSiblings,
+    ) -> JsonTablePlanSiblings {
+        super::json::fold_json_table_plan_siblings(self, node)
+    }
+
+    fn fold_json_table_column(&mut self, node: JsonTableColumn) -> JsonTableColumn {
+        super::json::fold_json_table_column(self, node)
+    }
+
+    fn fold_json_table_plan(&mut self, node: JsonTablePlan) -> JsonTablePlan {
+        super::json::fold_json_table_plan(self, node)
+    }
+
+    fn fold_json_table_specific_plan(
+        &mut self,
+        node: JsonTableSpecificPlan,
+    ) -> JsonTableSpecificPlan {
+        super::json::fold_json_table_specific_plan(self, node)
+    }
+
     fn fold_function_specification(
         &mut self,
         node: FunctionSpecification,

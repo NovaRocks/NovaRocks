@@ -46,6 +46,7 @@ unimplemented = "deny"
 result_large_err = "allow"
 
 [workspace.dependencies]
+recursive = "=0.1.1"
 novarocks-test-compile-to-execute = { path = "tests/compile-to-execute", version = "0.1.0" }
 novarocks-sql-testkit = { path = "novarocks/sql/testkit", version = "0.1.0" }
 novarocks-attempt-protocol = { path = "novarocks/attempt-protocol", version = "0.1.0" }

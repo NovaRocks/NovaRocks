@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+recursive.workspace = true
 novarocks-user-error.workspace = true
 
 [lib]

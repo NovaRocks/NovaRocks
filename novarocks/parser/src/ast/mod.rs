@@ -38,11 +38,13 @@ pub use routine::{
 };
 pub(crate) mod session;
 pub(crate) mod statistics;
+mod storage;
 pub(crate) mod table;
 mod validate;
 pub(crate) mod view;
 mod visit;
 mod window;
+pub use storage::{AstBox, AstVec};
 
 pub use catalog::{
     CatalogProperty, CatalogStatement, CreateCatalog, CreateDatabase, DropCatalog, DropDatabase,
@@ -365,3 +367,35 @@ pub use routine::{
 };
 
 pub use visit::{fold_query_modifiers, walk_query_modifiers};
+
+mod json;
+
+pub use json::{
+    JsonArray, JsonArrayElement, JsonAstInvariantError, JsonConstructor, JsonExists,
+    JsonExistsErrorBehavior, JsonFormat, JsonObject, JsonObjectMember, JsonPathInvocation,
+    JsonPathParameter, JsonPathString, JsonQuery, JsonQueryBehavior, JsonQueryQuotesBehavior,
+    JsonQueryWrapperBehavior, JsonSerialize, JsonSerializeErrorBehavior, JsonTable,
+    JsonTableColumn, JsonTableDefaultPlan, JsonTableErrorBehavior, JsonTableNestedColumns,
+    JsonTableOrdinalityColumn, JsonTableParentChildPlanType, JsonTablePlan, JsonTablePlanLeaf,
+    JsonTablePlanParentChild, JsonTablePlanSiblings, JsonTableQueryColumn,
+    JsonTableSiblingsPlanType, JsonTableSpecificPlan, JsonTableValueColumn, JsonValue,
+    JsonValueBehavior,
+};
+
+// Re-export helpers if following the existing ast module API.
+pub use json::{
+    fold_json_array, fold_json_array_element, fold_json_constructor, fold_json_exists,
+    fold_json_object, fold_json_object_member, fold_json_path_invocation, fold_json_path_parameter,
+    fold_json_path_string, fold_json_query, fold_json_serialize, fold_json_table,
+    fold_json_table_column, fold_json_table_default_plan, fold_json_table_nested_columns,
+    fold_json_table_ordinality_column, fold_json_table_plan, fold_json_table_plan_leaf,
+    fold_json_table_plan_parent_child, fold_json_table_plan_siblings, fold_json_table_query_column,
+    fold_json_table_specific_plan, fold_json_table_value_column, fold_json_value, walk_json_array,
+    walk_json_array_element, walk_json_constructor, walk_json_exists, walk_json_object,
+    walk_json_object_member, walk_json_path_invocation, walk_json_path_parameter,
+    walk_json_path_string, walk_json_query, walk_json_serialize, walk_json_table,
+    walk_json_table_column, walk_json_table_default_plan, walk_json_table_nested_columns,
+    walk_json_table_ordinality_column, walk_json_table_plan, walk_json_table_plan_leaf,
+    walk_json_table_plan_parent_child, walk_json_table_plan_siblings, walk_json_table_query_column,
+    walk_json_table_specific_plan, walk_json_table_value_column, walk_json_value,
+};
