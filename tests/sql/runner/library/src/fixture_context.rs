@@ -775,7 +775,13 @@ fn rewrite_delta_namespace_refs(
                 && call.name.parts[0]
                     .value
                     .eq_ignore_ascii_case("__nr_ivm_delta")
-                && let Some(Expr::Literal(literal)) = call.arguments.first()
+                && call.processing_mode.is_none()
+                && call
+                    .arguments
+                    .iter()
+                    .all(|argument| argument.name.is_none())
+                && let Some(Expr::Literal(literal)) =
+                    call.arguments.first().map(|argument| &argument.value)
                 && let LiteralKind::String(value) = &literal.kind
             {
                 let parts: Vec<_> = value.split('.').collect();

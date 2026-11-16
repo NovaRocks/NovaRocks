@@ -924,6 +924,15 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
                 expr_display_name_preserve_path(&lambda.body)
             )
         }
+        ast::Expr::FunctionCall(function)
+            if function.processing_mode.is_some()
+                || function
+                    .arguments
+                    .iter()
+                    .any(|argument| argument.name.is_some()) =>
+        {
+            printer::print_expr(expr)
+        }
         ast::Expr::FunctionCall(function) => format_function_display_name(function),
         ast::Expr::Predicated(node) => format_predicated_display_name(expr, node),
         ast::Expr::Cast(cast) => {
@@ -1402,21 +1411,26 @@ fn format_function_display_name(function: &ast::FunctionCall) -> String {
     if canonical_name == "element_at" && function.arguments.len() == 2 {
         return format!(
             "{}[{}]",
-            expr_display_name_preserve_path(&function.arguments[0]),
-            expr_display_name(&function.arguments[1])
+            expr_display_name_preserve_path(&function.arguments[0].value),
+            expr_display_name(&function.arguments[1].value)
         );
     }
 
     let distinct = matches!(function.quantifier, ast::FunctionQuantifier::Distinct)
         || original_name == "array_agg_distinct";
+    let argument_values = function
+        .arguments
+        .iter()
+        .map(|argument| &argument.value)
+        .collect::<Vec<_>>();
     let (arguments, order_arguments, implicit_separator) = if canonical_name == "group_concat" {
         // Prepared syntax owns values and separator in distinct fields.
-        let values = function.arguments.as_slice();
+        let values = argument_values.as_slice();
         let separator = function.separator.as_deref();
         (
             values
                 .iter()
-                .map(expr_display_name_preserve_path)
+                .map(|value| expr_display_name_preserve_path(value))
                 .collect::<Vec<_>>()
                 .join(","),
             values,
@@ -1425,7 +1439,7 @@ fn format_function_display_name(function: &ast::FunctionCall) -> String {
     } else {
         (
             format_function_arguments(function, &canonical_name),
-            function.arguments.as_slice(),
+            argument_values.as_slice(),
             None,
         )
     };
@@ -1524,7 +1538,7 @@ fn restore_typeof_cast_spelling(display: String, function: &ast::FunctionCall) -
 
     let mut collector = Collector { casts: Vec::new() };
     for argument in &function.arguments {
-        ast::Visit::visit_expr(&mut collector, argument);
+        ast::Visit::visit_expr(&mut collector, &argument.value);
     }
     if collector.casts.is_empty() {
         return display;
@@ -1551,7 +1565,7 @@ fn format_function_arguments(function: &ast::FunctionCall, canonical_name: &str)
     let mut arguments = function
         .arguments
         .iter()
-        .map(expr_display_name_preserve_path)
+        .map(|argument| expr_display_name_preserve_path(&argument.value))
         .collect::<Vec<_>>();
     if function_null_treatment_is_argument(canonical_name, arguments.len())
         && let Some(null_treatment) = function.null_treatment
@@ -1573,7 +1587,7 @@ fn function_null_treatment_is_argument(canonical_name: &str, argument_count: usi
 
 fn format_map_display_name(function: &ast::FunctionCall) -> String {
     let mut pairs = Vec::new();
-    let mut arguments = function.arguments.iter();
+    let mut arguments = function.arguments.iter().map(|argument| &argument.value);
     while let Some(key) = arguments.next() {
         let key = expr_display_name_preserve_path(key);
         if let Some(value) = arguments.next() {
@@ -1585,7 +1599,7 @@ fn format_map_display_name(function: &ast::FunctionCall) -> String {
     format!("map{{{}}}", pairs.join(","))
 }
 
-fn is_constant_function_order_by(order_by: &ast::SortItem, arguments: &[ast::Expr]) -> bool {
+fn is_constant_function_order_by(order_by: &ast::SortItem, arguments: &[&ast::Expr]) -> bool {
     ordinal_function_argument(&order_by.sort_key, arguments)
         .map(is_constant_expr)
         .unwrap_or_else(|| is_constant_expr(&order_by.sort_key))
@@ -1593,7 +1607,7 @@ fn is_constant_function_order_by(order_by: &ast::SortItem, arguments: &[ast::Exp
 
 fn ordinal_function_argument<'a>(
     expr: &ast::Expr,
-    arguments: &'a [ast::Expr],
+    arguments: &'a [&'a ast::Expr],
 ) -> Option<&'a ast::Expr> {
     let ast::Expr::Literal(ast::Literal {
         kind: ast::LiteralKind::Long {
@@ -1608,6 +1622,7 @@ fn ordinal_function_argument<'a>(
     usize::try_from(*position)
         .ok()
         .and_then(|position| arguments.get(position.saturating_sub(1)))
+        .copied()
 }
 
 fn is_constant_expr(expr: &ast::Expr) -> bool {
@@ -1618,9 +1633,9 @@ fn is_constant_expr(expr: &ast::Expr) -> bool {
     }
 }
 
-fn format_function_order_by(order_by: &ast::SortItem, arguments: &[ast::Expr]) -> String {
+fn format_function_order_by(order_by: &ast::SortItem, arguments: &[&ast::Expr]) -> String {
     let expression = ordinal_function_argument(&order_by.sort_key, arguments)
-        .map(expr_display_name_preserve_path)
+        .map(|value| expr_display_name_preserve_path(value))
         .unwrap_or_else(|| expr_display_name(&order_by.sort_key));
     format_order_by_display_name(
         expression,

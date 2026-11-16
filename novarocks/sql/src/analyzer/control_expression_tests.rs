@@ -310,7 +310,7 @@ fn lambda_body_borrow_retains_original_constant_ordinal_and_write_conversion() {
     let ast::Expr::FunctionCall(call) = projection(&query) else {
         panic!("array_map")
     };
-    let ast::Expr::Lambda(lambda) = &call.arguments[0] else {
+    let ast::Expr::Lambda(lambda) = &call.arguments[0].value else {
         panic!("lambda")
     };
     assert_eq!(lambda.arguments[0].name.value, "x");
@@ -466,4 +466,77 @@ fn case_result_cast_path_preserves_original_constant_and_write_conversion() {
             .constant_at(&cast.expression.clone())
             .is_none()
     );
+}
+
+#[test]
+fn named_arguments_and_processing_modes_refuse_before_ordinary_or_table_lookup() {
+    use novarocks_parser::{ast::*, build};
+    let source = crate::planning::catalog::PlannerMemoryCatalog::default();
+    let functions = crate::compiler::build_builtin_engine_function_catalog().unwrap();
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    for table_call in [false, true] {
+        for named in [false, true] {
+            let sql = if table_call {
+                "SELECT * FROM missing_function(missing_value)"
+            } else {
+                "SELECT missing_function(missing_value) FROM missing_table"
+            };
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let [Statement::Query(query)] = statements.as_slice() else {
+                panic!("query");
+            };
+            let mut query = query.clone();
+            let SetExpr::Select(select) = query.body.as_mut() else {
+                panic!("select");
+            };
+            let expression: &mut Expr = if table_call {
+                let TableFactor::TableFunction { expr, .. } = &mut select.from[0].relation else {
+                    panic!("table call");
+                };
+                expr
+            } else {
+                let SelectItem::UnnamedExpr(expr) = &mut select.projection[0] else {
+                    panic!("projection");
+                };
+                expr
+            };
+            let Expr::FunctionCall(call) = expression else {
+                panic!("call");
+            };
+            if named {
+                let argument_span = call.arguments[0].span;
+                call.arguments[0].name = Some(build::ident_at("named", false, argument_span));
+            } else {
+                let call_span = call.span;
+                call.processing_mode = Some(ProcessingMode {
+                    mode: ProcessingModeKind::Running,
+                    span: call_span,
+                });
+            }
+            let error = super::analyze_with_function_catalog_and_sql_semantics(
+                &query,
+                &source,
+                "default",
+                &functions,
+                &crate::sql_mode::SqlSemanticSettings::default(),
+                crate::constant::test_constant_policy(),
+                &control,
+            )
+            .map(|result| result.0)
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains(if named {
+                    "named function arguments"
+                } else {
+                    "processing modes"
+                }),
+                "{message}"
+            );
+        }
+    }
 }

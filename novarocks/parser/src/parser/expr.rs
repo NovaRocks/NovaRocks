@@ -103,8 +103,8 @@ mod tests {
         };
         assert_eq!(call.span, Span::new(16, source.len()));
         assert_eq!(call.arguments.len(), 2);
-        assert!(matches!(call.arguments[0], Expr::Unary(_)));
-        let Expr::Literal(literal) = &call.arguments[1] else {
+        assert!(matches!(call.arguments[0].value, Expr::Unary(_)));
+        let Expr::Literal(literal) = &call.arguments[1].value else {
             panic!("expected string literal");
         };
         assert_eq!(literal.kind, LiteralKind::String("it's".to_owned()));
@@ -465,7 +465,7 @@ mod tests {
         let Expr::FunctionCall(call) = parse("array_map((x, y) -> x + y, input)") else {
             panic!("expected lambda function argument");
         };
-        assert!(matches!(call.arguments[0], Expr::Lambda(_)));
+        assert!(matches!(call.arguments[0].value, Expr::Lambda(_)));
         let Expr::FunctionCall(call) = parse(
             "group_concat(DISTINCT a ORDER BY b DESC SEPARATOR ',') FILTER (WHERE a IS NOT NULL)",
         ) else {

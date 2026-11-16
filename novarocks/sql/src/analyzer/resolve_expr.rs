@@ -115,6 +115,20 @@ pub(crate) fn unsupported_predicate_reason(node: &ast::PredicatedExpr) -> Option
     }
 }
 
+pub(crate) fn unsupported_call_facts(call: &ast::FunctionCall) -> Option<&'static str> {
+    if call.processing_mode.is_some() {
+        return Some("function processing modes are not supported");
+    }
+    if call
+        .arguments
+        .iter()
+        .any(|argument| argument.name.is_some())
+    {
+        return Some("named function arguments are not supported");
+    }
+    None
+}
+
 pub(crate) fn unsupported_window_frame_reason(frame: &ast::WindowFrame) -> Option<&'static str> {
     if frame.exclusion != ast::WindowFrameExclusion::NoOthers {
         return Some("window frame EXCLUDE is not supported");
@@ -156,6 +170,9 @@ pub(crate) fn unsupported_control_expression_reason(
         ast::Expr::Unique(_) => return Some("UNIQUE subquery predicates are not supported"),
         ast::Expr::WindowOperation(_) => return Some("window operations are not supported"),
         ast::Expr::FunctionCall(call) => {
+            if let Some(reason) = unsupported_call_facts(call) {
+                return Some(reason);
+            }
             if let Some(reason) = call.window.as_ref().and_then(|window| match window {
                 ast::Window::Specification(specification) => specification
                     .window_frame
@@ -2087,7 +2104,11 @@ impl<'a> super::AnalyzerContext<'a> {
         func: &ast::FunctionCall,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        let original_arguments = func.arguments.iter().collect::<Vec<_>>();
+        let original_arguments = func
+            .arguments
+            .iter()
+            .map(|argument| &argument.value)
+            .collect::<Vec<_>>();
         self.analyze_function_with_original_arguments(func, &original_arguments, scope)
     }
 
@@ -2101,6 +2122,9 @@ impl<'a> super::AnalyzerContext<'a> {
         original_arguments: &[&ast::Expr],
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        if let Some(reason) = unsupported_call_facts(func) {
+            return Err(AnalyzeError::unsupported_expression(reason, func.span));
+        }
         let original_name = print_object_name(&func.name).to_ascii_lowercase();
         if matches!(original_name.as_str(), "grouping" | "grouping_id") {
             return self.analyze_grouping_function(func, scope);
@@ -4373,7 +4397,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 f.arguments
                     .iter()
-                    .any(|expr| self.expr_contains_aggregate(expr))
+                    .any(|argument| self.expr_contains_aggregate(&argument.value))
                     || f.order_by
                         .iter()
                         .flat_map(|order| &order.items)

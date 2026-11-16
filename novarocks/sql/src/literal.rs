@@ -480,6 +480,11 @@ fn json_object_literal(args: &[&ast::Expr]) -> Result<Literal, LiteralFailure> {
 }
 
 pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, LiteralFailure> {
+    if func.processing_mode.is_some() {
+        return Err(LiteralFailure::rejected(
+            "function processing modes are not supported in literals",
+        ));
+    }
     let args = function_expr_args(&func.arguments)?;
     let name = object_name_lower(&func.name)?;
     if let Some(value) = try_array_map_cast_string_literal(&name, &args)? {
@@ -773,7 +778,7 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, L
         }
         _ => Err(LiteralFailure::rejected(format_args!(
             "unsupported expression in INSERT VALUES: {}",
-            printer::print_expr(&ast::Expr::FunctionCall(func.clone()))
+            printer::print_expr(&ast::Expr::FunctionCall(ast::AstBox::new(func.clone())))
         ))),
     }
 }
@@ -861,8 +866,15 @@ fn lambda_expr_is_param(expr: &ast::Expr, param_name: &str) -> bool {
     }
 }
 
-pub(crate) fn function_expr_args(args: &[ast::Expr]) -> Result<Vec<&ast::Expr>, LiteralFailure> {
-    Ok(args.iter().collect())
+pub(crate) fn function_expr_args(
+    args: &[ast::CallArgument],
+) -> Result<Vec<&ast::Expr>, LiteralFailure> {
+    if args.iter().any(|argument| argument.name.is_some()) {
+        return Err(LiteralFailure::rejected(
+            "named function arguments are not supported in literals",
+        ));
+    }
+    Ok(args.iter().map(|argument| &argument.value).collect())
 }
 
 /// Cast a `Literal` to the given SQL type without `ManualValue`.

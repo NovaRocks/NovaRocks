@@ -235,13 +235,23 @@ fn classify_aggregate_call(
     if function.name.parts.len() != 1
         || function.null_treatment.is_some()
         || function.window.is_some()
+        || function.processing_mode.is_some()
+        || function
+            .arguments
+            .iter()
+            .any(|argument| argument.name.is_some())
         || function.filter.is_some()
         || function.order_by.is_some()
     {
         return Err(aggregate_error());
     }
     let name = function.name.parts[0].value.to_ascii_lowercase();
-    let args = &function.arguments;
+    let argument_values = function
+        .arguments
+        .iter()
+        .map(|argument| &argument.value)
+        .collect::<Vec<_>>();
+    let args = argument_values.as_slice();
     let (function, input) = match name.as_str() {
         "count" if matches!(function.quantifier, ast::FunctionQuantifier::Distinct) => (
             AggregateFunctionKind::CountDistinct,
@@ -307,7 +317,7 @@ fn classify_aggregate_call(
     })
 }
 
-fn count_input(args: &[ast::Expr]) -> Result<(AggregateFunctionKind, SqlAggregateInput), String> {
+fn count_input(args: &[&ast::Expr]) -> Result<(AggregateFunctionKind, SqlAggregateInput), String> {
     let [arg] = args else {
         return Err(aggregate_error());
     };
@@ -317,19 +327,19 @@ fn count_input(args: &[ast::Expr]) -> Result<(AggregateFunctionKind, SqlAggregat
         }
         expr => Ok((
             AggregateFunctionKind::Count,
-            SqlAggregateInput::Expr(Box::new(expr.clone())),
+            SqlAggregateInput::Expr(Box::new((**expr).clone())),
         )),
     }
 }
 
-fn single_expression_input(args: &[ast::Expr], label: &str) -> Result<SqlAggregateInput, String> {
+fn single_expression_input(args: &[&ast::Expr], label: &str) -> Result<SqlAggregateInput, String> {
     let [arg] = args else {
         return Err(format!("{label} requires exactly one column expression"));
     };
     if matches!(arg, ast::Expr::Identifier(ident) if ident.value == "*") {
         return Err(format!("{label}(*) is not supported"));
     }
-    Ok(SqlAggregateInput::Expr(Box::new(arg.clone())))
+    Ok(SqlAggregateInput::Expr(Box::new((**arg).clone())))
 }
 
 fn aggregate_error() -> String {

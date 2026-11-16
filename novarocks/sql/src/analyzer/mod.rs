@@ -67,7 +67,7 @@ mod predicate_tests;
 pub(crate) mod query_prepass;
 mod resolve_expr;
 pub(crate) use resolve_expr::{
-    unsupported_control_expression_reason, unsupported_predicate_reason,
+    unsupported_call_facts, unsupported_control_expression_reason, unsupported_predicate_reason,
 };
 #[cfg(test)]
 mod scalar_rebind_contract_tests;
@@ -592,7 +592,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut typed_arguments = Vec::with_capacity(count);
         for argument in &function.arguments {
             self.check_control()?;
-            typed_arguments.push(self.analyze_expr(argument, argument_scope)?);
+            typed_arguments.push(self.analyze_expr(&argument.value, argument_scope)?);
         }
         let public_type = if grouping && count <= 31 {
             DataType::Int32
@@ -722,7 +722,7 @@ impl<'a> AnalyzerContext<'a> {
                 let Some(index) = matched else {
                     return Err(AnalyzeError::invalid_argument(
                         "GROUPING arguments must be grouping columns",
-                        syntax.span(),
+                        syntax.value.span(),
                     ));
                 };
                 let canonical = state.keys.get(index).map(expr_syntax_key).ok_or_else(|| {
@@ -3158,7 +3158,7 @@ impl ast::Fold for GroupingDisplayFolder<'_> {
     }
     fn fold_expr(&mut self, expression: ast::Expr) -> ast::Expr {
         if let ast::Expr::FunctionCall(function) = &expression
-            && let Some(index) = self.calls.iter().position(|call| call.syntax == *function)
+            && let Some(index) = self.calls.iter().position(|call| call.syntax == **function)
         {
             return ast::Expr::Literal(ast::Literal {
                 kind: ast::LiteralKind::Long {

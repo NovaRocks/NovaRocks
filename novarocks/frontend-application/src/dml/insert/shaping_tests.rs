@@ -258,10 +258,11 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         panic!("expected MAP constructor");
     };
     assert_eq!(
-        number_text(cast_input(&map.arguments[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(&map.arguments[0].value, "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
-    let ast::Expr::Array(map_array) = cast_input(&map.arguments[1], "ARRAY<DECIMAL(18, 9)>") else {
+    let ast::Expr::Array(map_array) = cast_input(&map.arguments[1].value, "ARRAY<DECIMAL(18, 9)>")
+    else {
         panic!("expected MAP array value");
     };
     assert_eq!(
@@ -276,11 +277,11 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         panic!("expected ROW constructor");
     };
     assert_eq!(
-        number_text(cast_input(&structure.arguments[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(&structure.arguments[0].value, "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
     let ast::Expr::Array(struct_array) =
-        cast_input(&structure.arguments[1], "ARRAY<DECIMAL(18, 9)>")
+        cast_input(&structure.arguments[1].value, "ARRAY<DECIMAL(18, 9)>")
     else {
         panic!("expected STRUCT array field");
     };

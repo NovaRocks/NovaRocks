@@ -46,6 +46,7 @@ pub enum SqlConstantExpressionStep {
     DereferenceBase,
     SubscriptBase,
     SubscriptIndex,
+    FunctionArgumentValue(usize),
     FunctionOrderByKey(usize),
     WindowOrderByKey(usize),
     CaseOperand,
@@ -246,6 +247,20 @@ pub(crate) fn resolve_expression_site<'a>(
             }
             (SqlConstantExpressionStep::SubscriptBase, ast::Expr::Subscript(node)) => &node.base,
             (SqlConstantExpressionStep::SubscriptIndex, ast::Expr::Subscript(node)) => &node.index,
+            (
+                SqlConstantExpressionStep::FunctionArgumentValue(index),
+                ast::Expr::FunctionCall(call),
+            ) => {
+                &call
+                    .arguments
+                    .get(*index)
+                    .ok_or_else(|| {
+                        invalid(
+                            "constant source function argument index differs from its owned syntax",
+                        )
+                    })?
+                    .value
+            }
             (
                 SqlConstantExpressionStep::FunctionOrderByKey(index),
                 ast::Expr::FunctionCall(call),

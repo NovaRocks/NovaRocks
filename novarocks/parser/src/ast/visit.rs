@@ -21,6 +21,12 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_call_argument(&mut self, node: &CallArgument) {
+        walk_call_argument(self, node);
+    }
+    fn visit_processing_mode(&mut self, node: &ProcessingMode) {
+        walk_processing_mode(self, node);
+    }
     fn visit_window(&mut self, node: &Window) {
         walk_window(self, node);
     }
@@ -862,10 +868,14 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
     }
 }
 
+#[recursive::recursive]
 pub fn walk_function_call<V: Visit + ?Sized>(visitor: &mut V, call: &FunctionCall) {
     visitor.visit_object_name(&call.name);
+    if let Some(mode) = &call.processing_mode {
+        visitor.visit_processing_mode(mode);
+    }
     for argument in &call.arguments {
-        visitor.visit_expr(argument);
+        visitor.visit_call_argument(argument);
     }
     if let Some(order) = &call.order_by {
         visitor.visit_order_by(order);
@@ -896,6 +906,12 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_call_argument(&mut self, node: CallArgument) -> CallArgument {
+        fold_call_argument(self, node)
+    }
+    fn fold_processing_mode(&mut self, node: ProcessingMode) -> ProcessingMode {
+        fold_processing_mode(self, node)
+    }
     fn fold_window(&mut self, node: Window) -> Window {
         fold_window(self, node)
     }
@@ -1942,7 +1958,9 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::Identifier(ident) => Expr::Identifier(folder.fold_ident(ident)),
 
         Expr::Literal(literal) => Expr::Literal(folder.fold_literal(literal)),
-        Expr::FunctionCall(call) => Expr::FunctionCall(folder.fold_function_call(call)),
+        Expr::FunctionCall(call) => {
+            Expr::FunctionCall(AstBox::new(folder.fold_function_call(call.into_inner())))
+        }
         Expr::WindowOperation(node) => {
             Expr::WindowOperation(AstBox::new(folder.fold_window_operation(node.into_inner())))
         }
@@ -2018,23 +2036,25 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
     }
 }
 
+#[recursive::recursive]
 pub fn fold_function_call<F: Fold + ?Sized>(
     folder: &mut F,
     mut call: FunctionCall,
 ) -> FunctionCall {
     call.name = folder.fold_object_name(call.name);
+    call.processing_mode = call
+        .processing_mode
+        .map(|mode| folder.fold_processing_mode(mode));
     call.arguments = call
         .arguments
         .into_iter()
-        .map(|argument| folder.fold_expr(argument))
+        .map(|argument| folder.fold_call_argument(argument))
         .collect();
     call.order_by = call.order_by.map(|order| folder.fold_order_by(order));
     call.separator = call
         .separator
         .map(|separator| Box::new(folder.fold_expr(*separator)));
-    call.filter = call
-        .filter
-        .map(|filter| Box::new(folder.fold_expr(*filter)));
+    call.filter = call.filter.map(|filter| folder.fold_expr(filter));
     call.window = call.window.map(|window| folder.fold_window(window));
     call
 }
@@ -2284,5 +2304,32 @@ pub fn fold_window_operation<F: Fold + ?Sized>(
 ) -> WindowOperation {
     node.name = folder.fold_ident(node.name);
     node.window = folder.fold_window(node.window);
+    node
+}
+
+#[recursive::recursive]
+pub fn walk_call_argument<V: Visit + ?Sized>(visitor: &mut V, node: &CallArgument) {
+    if let Some(name) = &node.name {
+        visitor.visit_ident(name);
+    }
+    visitor.visit_expr(&node.value);
+}
+pub fn walk_processing_mode<V: Visit + ?Sized>(visitor: &mut V, node: &ProcessingMode) {
+    let _ = (visitor, node);
+}
+#[recursive::recursive]
+pub fn fold_call_argument<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut node: CallArgument,
+) -> CallArgument {
+    node.name = node.name.map(|name| folder.fold_ident(name));
+    node.value = folder.fold_expr(node.value);
+    node
+}
+pub fn fold_processing_mode<F: Fold + ?Sized>(
+    folder: &mut F,
+    node: ProcessingMode,
+) -> ProcessingMode {
+    let _ = folder;
     node
 }

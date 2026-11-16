@@ -242,7 +242,14 @@ pub(crate) fn normalize_concat_query(
                 .parts
                 .last()
                 .map(|name| name.value.to_ascii_lowercase());
-            if call.separator.is_some() || call.arguments.is_empty() {
+            if call.separator.is_some()
+                || call.arguments.is_empty()
+                || call.processing_mode.is_some()
+                || call
+                    .arguments
+                    .iter()
+                    .any(|argument| argument.name.is_some())
+            {
                 return call;
             }
             let positional_separator = match name.as_deref() {
@@ -254,6 +261,7 @@ pub(crate) fn normalize_concat_query(
                 call.arguments
                     .pop()
                     .expect("at least two positional arguments")
+                    .value
             } else {
                 ast::Expr::Literal(ast::Literal {
                     kind: ast::LiteralKind::String(
@@ -433,7 +441,9 @@ mod tests {
     fn display(sql: &str, mode: &str) -> String {
         let query = normalize_concat_query(query(sql), &semantics(mode)).unwrap();
         let calls = calls(&query);
-        crate::analyzer::display_expr_for_test(&ast::Expr::FunctionCall(calls[0].clone()))
+        crate::analyzer::display_expr_for_test(&ast::Expr::FunctionCall(ast::AstBox::new(
+            calls[0].clone(),
+        )))
     }
 
     #[test]

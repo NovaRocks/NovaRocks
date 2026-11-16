@@ -410,18 +410,22 @@ pub fn case_when(
 
 pub fn function(name: ObjectName, arguments: Vec<Expr>) -> Expr {
     let span = name.span.cover(cover(arguments.iter().map(Expr::span)));
-    Expr::FunctionCall(FunctionCall {
+    Expr::FunctionCall(AstBox::new(FunctionCall {
         name,
-        arguments,
+        arguments: arguments
+            .into_iter()
+            .map(|value| call_argument(value, None))
+            .collect(),
         quantifier: FunctionQuantifier::None,
         order_by: None,
         separator: None,
         filter: None,
         null_treatment: None,
         window: None,
+        processing_mode: None,
         substring_from_syntax: false,
         span,
-    })
+    }))
 }
 
 pub fn count_star() -> Expr {
@@ -705,4 +709,12 @@ pub fn order_by(items: Vec<SortItem>) -> Result<OrderBy, BuildError> {
         items: items.into(),
         span: SYNTHETIC,
     })
+}
+
+/// Retains the original argument value and optional source-authored name.
+pub fn call_argument(value: Expr, name: Option<Ident>) -> CallArgument {
+    let span = name
+        .as_ref()
+        .map_or_else(|| value.span(), |name| name.span.cover(value.span()));
+    CallArgument { name, value, span }
 }

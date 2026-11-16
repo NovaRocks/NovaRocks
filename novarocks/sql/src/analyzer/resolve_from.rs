@@ -948,6 +948,9 @@ impl<'a> super::AnalyzerContext<'a> {
         expr: &ast::Expr,
         alias: Option<&ast::TableAlias>,
     ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
+        if let Some(reason) = super::resolve_expr::unsupported_control_expression_reason(expr) {
+            return Err(AnalyzeError::unsupported_expression(reason, expr.span()));
+        }
         let ast::Expr::FunctionCall(function) = expr else {
             return Err(AnalyzeError::invalid_query_shape(
                 format!("TABLE() requires a function call, got: {expr:?}"),
@@ -976,11 +979,18 @@ impl<'a> super::AnalyzerContext<'a> {
         // The typed parser represents both `=>` and StarRocks's accepted
         // `=` spelling as a binary syntax node; their semantic distinction is
         // local to this function's argument grammar.
-        let arguments = &function.arguments;
+        let argument_values = function
+            .arguments
+            .iter()
+            .map(|argument| &argument.value)
+            .collect::<Vec<_>>();
+        let arguments = argument_values.as_slice();
         // Mixing named and positional is disallowed; StarRocks's FE rejects
         // the first positional token after a named one as `Unexpected input
         // '<token>'`, which the SQL test suite asserts against verbatim.
-        let any_named = arguments.iter().any(generate_series_named_arg_is_some);
+        let any_named = arguments
+            .iter()
+            .any(|argument| generate_series_named_arg_is_some(argument));
         let any_positional = arguments
             .iter()
             .any(|arg| !generate_series_named_arg_is_some(arg));
@@ -1079,7 +1089,7 @@ impl<'a> super::AnalyzerContext<'a> {
         } else {
             let values: Vec<i64> = arguments
                 .iter()
-                .map(eval_const_i64)
+                .map(|argument| eval_const_i64(argument))
                 .collect::<Result<_, _>>()?;
             match values.as_slice() {
                 [s, e] => (*s, *e, 1i64),
@@ -1148,7 +1158,7 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         // Argument 0: three-part identifier as a string literal.
-        let three_part = &function.arguments[0];
+        let three_part = &function.arguments[0].value;
         let three_part = match three_part {
             ast::Expr::Literal(ast::Literal {
                 kind: ast::LiteralKind::String(s),
@@ -1171,7 +1181,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     "__nr_ivm_delta argument 0 must be a three-part identifier \
                      'catalog.namespace.table', got '{three_part}'"
                 ),
-                function.arguments[0].span(),
+                function.arguments[0].value.span(),
             ));
         }
         let catalog = parts[0].to_string();
@@ -1179,8 +1189,8 @@ impl<'a> super::AnalyzerContext<'a> {
         let table_name = parts[2].to_string();
 
         // Argument 1 / 2: from_snapshot_id, to_snapshot_id (non-negative i64).
-        let from_expr = &function.arguments[1];
-        let to_expr = &function.arguments[2];
+        let from_expr = &function.arguments[1].value;
+        let to_expr = &function.arguments[2].value;
         let from_snapshot_id = eval_const_i64(from_expr).map_err(|error| {
             AnalyzeError::invalid_literal(
                 format!("__nr_ivm_delta from_snapshot_id: {error}"),
@@ -1209,7 +1219,9 @@ impl<'a> super::AnalyzerContext<'a> {
         let resolved_table = self
             .catalog
             .resolve_table_for_analysis(Some(&catalog), &namespace, &table_name)
-            .map_err(|error| AnalyzeError::unknown_table(error, function.arguments[0].span()))?;
+            .map_err(|error| {
+                AnalyzeError::unknown_table(error, function.arguments[0].value.span())
+            })?;
         let table_def = resolved_table.planner;
         if resolved_table.catalog.hidden_columns.is_empty() {
             return Err(AnalyzeError::invalid_argument(
@@ -1217,7 +1229,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     "__nr_ivm_delta requires base table '{three_part}' to expose Iceberg v3 \
                      row-lineage metadata columns; the table is not Iceberg v3"
                 ),
-                function.arguments[0].span(),
+                function.arguments[0].value.span(),
             ));
         }
 

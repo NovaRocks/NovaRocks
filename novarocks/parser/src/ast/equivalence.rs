@@ -535,9 +535,11 @@ impl SyntaxEq for Expr {
 }
 
 impl SyntaxEq for FunctionCall {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         self.name.syntax_eq(&other.name)
             && syntax_eq_slice(&self.arguments, &other.arguments)
+            && syntax_eq_option(&self.processing_mode, &other.processing_mode)
             && self.quantifier == other.quantifier
             && syntax_eq_option(&self.order_by, &other.order_by)
             && syntax_eq_option(&self.separator, &other.separator)
@@ -727,7 +729,7 @@ mod tests {
     }
 
     fn sample_expr(start: usize) -> Expr {
-        Expr::FunctionCall(FunctionCall {
+        Expr::FunctionCall(AstBox::new(FunctionCall {
             name: ObjectName {
                 parts: vec![ident("catalog", start), ident("f", start + 1)],
                 span: span(start + 2),
@@ -746,7 +748,11 @@ mod tests {
                     })),
                 },
                 span: span(start + 7),
-            })],
+            })]
+            .into_iter()
+            .map(|value| crate::build::call_argument(value, None))
+            .collect(),
+            processing_mode: None,
             quantifier: FunctionQuantifier::Distinct,
             order_by: Some(OrderBy {
                 items: vec![SortItem {
@@ -762,14 +768,14 @@ mod tests {
                 kind: LiteralKind::String(",".to_owned()),
                 span: span(start + 10),
             }))),
-            filter: Some(Box::new(Expr::Predicated(AstBox::new(PredicatedExpr {
+            filter: Some(Expr::Predicated(AstBox::new(PredicatedExpr {
                 value: Expr::Identifier(ident("present", start + 11)),
                 predicate: Predicate::IsNull(IsNullPredicate {
                     negated: true,
                     span: span(start + 12),
                 }),
                 span: span(start + 12),
-            })))),
+            }))),
             null_treatment: Some(NullTreatment::IgnoreNulls),
             window: Some(Window::Specification(AstBox::new(WindowSpecification {
                 existing_window_name: Some(ident("base", start + 13)),
@@ -804,7 +810,7 @@ mod tests {
             }))),
             substring_from_syntax: false,
             span: span(start + 22),
-        })
+        }))
     }
 
     fn sample_query(start: usize) -> Query {
@@ -943,5 +949,17 @@ impl SyntaxEq for WindowOperation {
     #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         self.name.syntax_eq(&other.name) && self.window.syntax_eq(&other.window)
+    }
+}
+
+impl SyntaxEq for CallArgument {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        syntax_eq_option(&self.name, &other.name) && self.value.syntax_eq(&other.value)
+    }
+}
+impl SyntaxEq for ProcessingMode {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
     }
 }

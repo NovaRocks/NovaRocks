@@ -33,7 +33,7 @@ pub enum Expr {
 
     Identifier(Ident),
     Literal(Literal),
-    FunctionCall(FunctionCall),
+    FunctionCall(AstBox<FunctionCall>),
     WindowOperation(AstBox<super::WindowOperation>),
     Unary(UnaryExpr),
     Binary(BinaryExpr),
@@ -102,13 +102,14 @@ impl Expr {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FunctionCall {
     pub name: ObjectName,
-    pub arguments: Vec<Expr>,
+    pub arguments: AstVec<CallArgument>,
     pub quantifier: FunctionQuantifier,
     pub order_by: Option<OrderBy>,
     pub separator: Option<Box<Expr>>,
-    pub filter: Option<Box<Expr>>,
+    pub filter: Option<Expr>,
     pub null_treatment: Option<NullTreatment>,
     pub window: Option<super::Window>,
+    pub processing_mode: Option<ProcessingMode>,
     /// Whether SUBSTRING used its `value FROM start [FOR length]` spelling.
     pub substring_from_syntax: bool,
     pub span: Span,
@@ -292,4 +293,25 @@ pub enum BinaryOperator {
     ShiftLeft,
     ShiftRight,
     StringConcat,
+}
+
+/// One positional or named function argument with its original expression.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallArgument {
+    pub name: Option<Ident>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// An explicit RUNNING or FINAL function processing qualifier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessingMode {
+    pub mode: ProcessingModeKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessingModeKind {
+    Running,
+    Final,
 }

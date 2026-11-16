@@ -985,7 +985,7 @@ fn actual_function_order_by_owning_cycle_keeps_deep_traits_move_and_drop() {
     let Expr::FunctionCall(call) = tree else {
         unreachable!()
     };
-    let order_by = call.order_by.unwrap();
+    let order_by = call.into_inner().order_by.unwrap();
     assert_eq!(order_by.span, Span::new(15, 95));
     let items = order_by.items.into_inner();
     assert_eq!(items.len(), 1);
@@ -1719,4 +1719,239 @@ fn actual_row_pattern_box_vec_cycle_keeps_quantifier_facts_and_real_children() {
     let children = patterns.into_inner();
     assert_eq!(children.len(), 2);
     drop(children.into_iter().nth(1).unwrap());
+}
+
+// Exercise the two actual recursive owners independently on the normal test thread.
+fn assert_actual_call_argument_or_filter_cycle(filter_child: bool) {
+    use crate::ast::{
+        CallArgument, Expr, Fold, FunctionCall, Ident, Literal, LiteralKind, ProcessingMode,
+        ProcessingModeKind, SyntaxEq, Visit,
+    };
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    let mut tree = build::integer(-1);
+    for marker in 1..=DEPTH {
+        let name = build::object_name(vec![build::ident("deep_call", false)]).unwrap();
+        let (arguments, filter) = if filter_child {
+            (vec![build::integer(marker)], Some(tree))
+        } else {
+            (vec![build::integer(marker), tree], None)
+        };
+        tree = build::function(name, arguments);
+        let Expr::FunctionCall(call) = &mut tree else {
+            unreachable!()
+        };
+        call.span = Span::new(10, 100);
+        call.arguments[0].span = Span::new(20, 40);
+        if !filter_child {
+            call.arguments[0].name = Some(build::ident(format!("named{marker}"), true));
+            call.arguments[1].span = Span::new(40, 90);
+        }
+        call.filter = filter;
+        call.processing_mode = Some(ProcessingMode {
+            mode: if marker % 2 == 0 {
+                ProcessingModeKind::Running
+            } else {
+                ProcessingModeKind::Final
+            },
+            span: Span::new(10, 18),
+        });
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    let mut cursor = &mut copy;
+    for marker in (1..=DEPTH).rev() {
+        let Expr::FunctionCall(call) = cursor else {
+            panic!("actual whole-call AstBox recursive edge")
+        };
+        assert_eq!(call.name.parts[0].value, "deep_call");
+        assert_eq!(call.span, Span::new(10, 100));
+        assert_eq!(call.arguments[0].span, Span::new(20, 40));
+        assert!(matches!(&call.arguments[0].value, Expr::Literal(Literal {
+            kind: LiteralKind::Long { parsed_value, .. }, ..
+        }) if *parsed_value == marker));
+        assert_eq!(
+            call.processing_mode.as_ref().unwrap().mode,
+            if marker % 2 == 0 {
+                ProcessingModeKind::Running
+            } else {
+                ProcessingModeKind::Final
+            }
+        );
+        if filter_child {
+            assert_eq!(call.arguments.len(), 1);
+            assert!(call.arguments[0].name.is_none());
+            cursor = call.filter.as_mut().unwrap();
+        } else {
+            assert!(call.filter.is_none());
+            assert_eq!(call.arguments.len(), 2);
+            let name = call.arguments[0].name.as_ref().unwrap();
+            assert_eq!(name.value, format!("named{marker}"));
+            assert!(name.quoted);
+            assert!(call.arguments[1].name.is_none());
+            assert_eq!(call.arguments[1].span, Span::new(40, 90));
+            cursor = &mut call.arguments[1].value;
+        }
+    }
+    assert!(matches!(cursor, Expr::Literal(Literal {
+        kind: LiteralKind::Long { parsed_value, .. }, ..
+    }) if *parsed_value == -1));
+    *cursor = build::integer(-2);
+    assert_ne!(tree, copy);
+    assert!(!tree.syntax_eq(&copy));
+    drop(copy);
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum Event {
+        Mode(ProcessingModeKind),
+        Argument(Option<(String, bool)>),
+        Integer(i64),
+    }
+    #[derive(Default)]
+    struct Events(Vec<Event>);
+    impl Visit for Events {
+        fn visit_processing_mode(&mut self, node: &ProcessingMode) {
+            self.0.push(Event::Mode(node.mode));
+        }
+        fn visit_call_argument(&mut self, node: &CallArgument) {
+            self.0.push(Event::Argument(
+                node.name
+                    .as_ref()
+                    .map(|name| (name.value.clone(), name.quoted)),
+            ));
+            crate::ast::walk_call_argument(self, node);
+        }
+        fn visit_literal(&mut self, node: &Literal) {
+            let LiteralKind::Long { parsed_value, .. } = &node.kind else {
+                panic!("actual integer marker or terminal")
+            };
+            self.0.push(Event::Integer(*parsed_value));
+        }
+    }
+    let mut expected = Vec::new();
+    for marker in (1..=DEPTH).rev() {
+        expected.push(Event::Mode(if marker % 2 == 0 {
+            ProcessingModeKind::Running
+        } else {
+            ProcessingModeKind::Final
+        }));
+        expected.push(Event::Argument(if filter_child {
+            None
+        } else {
+            Some((format!("named{marker}"), true))
+        }));
+        expected.push(Event::Integer(marker));
+        if !filter_child {
+            expected.push(Event::Argument(None));
+        }
+    }
+    expected.push(Event::Integer(-1));
+    let mut events = Events::default();
+    events.visit_expr(&tree);
+    assert_eq!(events.0, expected);
+
+    struct Relocate;
+    impl Fold for Relocate {
+        fn fold_function_call(&mut self, node: FunctionCall) -> FunctionCall {
+            let mut node = crate::ast::fold_function_call(self, node);
+            node.span = Span::new(101, 201);
+            node
+        }
+        fn fold_call_argument(&mut self, node: CallArgument) -> CallArgument {
+            let mut node = crate::ast::fold_call_argument(self, node);
+            node.span = Span::new(111, 191);
+            node
+        }
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.span = Span::new(121, 181);
+            node
+        }
+        fn fold_literal(&mut self, mut node: Literal) -> Literal {
+            node.span = Span::new(131, 171);
+            node
+        }
+        fn fold_processing_mode(&mut self, mut node: ProcessingMode) -> ProcessingMode {
+            node.span = Span::new(141, 161);
+            node
+        }
+    }
+    let relocated = Relocate.fold_expr(tree.clone());
+    assert!(tree.syntax_eq(&relocated));
+    assert_ne!(tree, relocated);
+    let mut events = Events::default();
+    events.visit_expr(&relocated);
+    assert_eq!(events.0, expected);
+    struct Change;
+    impl Fold for Change {
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                panic!("actual integer children")
+            };
+            let Expr::Literal(changed) = build::integer(parsed_value + 1) else {
+                unreachable!()
+            };
+            changed
+        }
+    }
+    let changed = Change.fold_expr(relocated);
+    assert!(!tree.syntax_eq(&changed));
+    let mut events = Events::default();
+    events.visit_expr(&changed);
+    let changed_expected = expected
+        .into_iter()
+        .map(|event| match event {
+            Event::Integer(value) => Event::Integer(value + 1),
+            other => other,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.0, changed_expected);
+    drop(changed);
+    let printed = crate::printer::print_expr(&tree);
+    assert_eq!(printed.matches("deep_call(").count(), DEPTH as usize);
+    assert_eq!(printed.matches("RUNNING ").count(), (DEPTH / 2) as usize);
+    assert_eq!(printed.matches("FINAL ").count(), (DEPTH / 2) as usize);
+    assert_eq!(
+        printed.matches(" FILTER (WHERE ").count(),
+        if filter_child { DEPTH as usize } else { 0 }
+    );
+    assert_eq!(
+        printed.matches(" => ").count(),
+        if filter_child { 0 } else { DEPTH as usize }
+    );
+    let statement =
+        crate::ast::Statement::Query(build::query(crate::ast::SetExpr::Select(Box::new(
+            build::select(
+                vec![build::item(tree.clone(), None, false)],
+                Vec::new(),
+                None,
+                crate::ast::GroupBy::None,
+            )
+            .unwrap(),
+        ))));
+    crate::ast::validate_statement(&statement).unwrap();
+    drop(statement);
+    let Expr::FunctionCall(call) = tree else {
+        unreachable!()
+    };
+    // Move the real payload out of its protected owner before moving child fields.
+    let call = call.into_inner();
+    if filter_child {
+        drop(call.filter.unwrap());
+    } else {
+        let mut arguments = call.arguments.into_inner();
+        drop(arguments.pop().unwrap().value);
+    }
+}
+
+#[test]
+fn actual_call_argument_value_cycle_keeps_ordered_children_and_named_metadata() {
+    assert_actual_call_argument_or_filter_cycle(false);
+}
+
+#[test]
+fn actual_function_filter_cycle_keeps_original_argument_and_filter_children() {
+    assert_actual_call_argument_or_filter_cycle(true);
 }

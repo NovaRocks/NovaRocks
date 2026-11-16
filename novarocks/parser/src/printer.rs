@@ -1208,7 +1208,11 @@ impl Printer {
         self.output.push('\'');
     }
 
+    #[recursive::recursive]
     fn write_function_call(&mut self, call: &FunctionCall) {
+        if let Some(mode) = &call.processing_mode {
+            self.write_processing_mode(mode);
+        }
         if call.name.parts.len() == 1
             && call.name.parts[0].value.eq_ignore_ascii_case("EXTRACT")
             && call.arguments.len() == 2
@@ -1218,11 +1222,16 @@ impl Printer {
             && call.filter.is_none()
             && call.null_treatment.is_none()
             && call.window.is_none()
+            && call.processing_mode.is_none()
+            && call
+                .arguments
+                .iter()
+                .all(|argument| argument.name.is_none())
         {
             self.output.push_str("EXTRACT(");
-            self.write_expr(&call.arguments[0]);
+            self.write_expr(&call.arguments[0].value);
             self.output.push_str(" FROM ");
-            self.write_expr(&call.arguments[1]);
+            self.write_expr(&call.arguments[1].value);
             self.output.push(')');
             return;
         }
@@ -1236,14 +1245,19 @@ impl Printer {
             && call.filter.is_none()
             && call.null_treatment.is_none()
             && call.window.is_none()
+            && call.processing_mode.is_none()
+            && call
+                .arguments
+                .iter()
+                .all(|argument| argument.name.is_none())
         {
             self.output.push_str("SUBSTRING(");
-            self.write_expr(&call.arguments[0]);
+            self.write_expr(&call.arguments[0].value);
             self.output.push_str(" FROM ");
-            self.write_expr(&call.arguments[1]);
+            self.write_expr(&call.arguments[1].value);
             if let Some(length) = call.arguments.get(2) {
                 self.output.push_str(" FOR ");
-                self.write_expr(length);
+                self.write_expr(&length.value);
             }
             self.output.push(')');
             return;
@@ -1255,7 +1269,12 @@ impl Printer {
             FunctionQuantifier::Distinct => self.output.push_str("DISTINCT "),
             FunctionQuantifier::All => self.output.push_str("ALL "),
         }
-        self.write_expr_list(&call.arguments);
+        for (index, argument) in call.arguments.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_call_argument(argument);
+        }
         if let Some(null_treatment) = call.null_treatment {
             if !call.arguments.is_empty() {
                 self.output.push(' ');
@@ -1286,6 +1305,21 @@ impl Printer {
             self.output.push_str(" OVER ");
             self.write_window(over);
         }
+    }
+
+    #[recursive::recursive]
+    fn write_call_argument(&mut self, argument: &CallArgument) {
+        if let Some(name) = &argument.name {
+            self.write_ident(name);
+            self.output.push_str(" => ");
+        }
+        self.write_expr(&argument.value);
+    }
+    fn write_processing_mode(&mut self, mode: &ProcessingMode) {
+        self.output.push_str(match mode.mode {
+            ProcessingModeKind::Running => "RUNNING ",
+            ProcessingModeKind::Final => "FINAL ",
+        });
     }
 
     fn write_unary_expr(&mut self, expression: &UnaryExpr) {
@@ -2516,13 +2550,17 @@ mod tests {
 
     #[test]
     fn renders_extended_expression_forms() {
-        let function = Expr::FunctionCall(FunctionCall {
+        let function = Expr::FunctionCall(AstBox::new(FunctionCall {
             name: object_name("Coalesce"),
-            arguments: vec![identifier("a"), number("1")],
+            arguments: vec![identifier("a"), number("1")]
+                .into_iter()
+                .map(|value| crate::build::call_argument(value, None))
+                .collect(),
+            processing_mode: None,
             quantifier: FunctionQuantifier::Distinct,
             order_by: None,
             separator: None,
-            filter: Some(Box::new(crate::build::is_null(identifier("b"), true))),
+            filter: Some(crate::build::is_null(identifier("b"), true)),
             null_treatment: Some(NullTreatment::IgnoreNulls),
             window: Some(Window::Specification(AstBox::new(WindowSpecification {
                 existing_window_name: None,
@@ -2533,7 +2571,7 @@ mod tests {
             }))),
             substring_from_syntax: false,
             span: span(),
-        });
+        }));
         assert_eq!(
             print_expr(&function),
             "Coalesce(DISTINCT a, 1 IGNORE NULLS) FILTER (WHERE b IS NOT NULL) OVER (PARTITION BY partition_key)"

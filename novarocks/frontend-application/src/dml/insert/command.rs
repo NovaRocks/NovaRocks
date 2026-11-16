@@ -112,7 +112,10 @@ pub(crate) fn is_literal_expr(expr: &ast::Expr) -> bool {
                         .as_str(),
                     "array" | "map" | "row" | "named_struct" | "parse_json"
                 )
-                && function.arguments.iter().all(is_literal_expr)
+                && function
+                    .arguments
+                    .iter()
+                    .all(|argument| is_literal_expr(&argument.value))
         }
         _ => false,
     }
@@ -125,6 +128,11 @@ pub(crate) fn plain_function(function: &ast::FunctionCall) -> bool {
         && function.filter.is_none()
         && function.null_treatment.is_none()
         && function.window.is_none()
+        && function.processing_mode.is_none()
+        && function
+            .arguments
+            .iter()
+            .all(|argument| argument.name.is_none())
 }
 
 pub(crate) fn literal_query(query: &ast::Query) -> bool {
@@ -232,7 +240,7 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
             let name = printer::print_object_name(&function.name).to_ascii_lowercase();
             if name == "parse_json" {
                 return (function.arguments.len() == 1
-                    && legacy_literal_shape(&function.arguments[0]) == Some(String))
+                    && legacy_literal_shape(&function.arguments[0].value) == Some(String))
                 .then_some(String);
             }
             if !matches!(name.as_str(), "array" | "row" | "map" | "named_struct")
@@ -244,7 +252,7 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
             function
                 .arguments
                 .iter()
-                .all(|value| legacy_literal_shape(value).is_some())
+                .all(|argument| legacy_literal_shape(&argument.value).is_some())
                 .then_some(Other)
         }
         _ => None,

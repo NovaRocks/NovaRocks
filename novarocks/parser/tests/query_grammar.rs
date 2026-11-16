@@ -108,7 +108,7 @@ fn table_function_named_arguments_are_typed_locally() {
     };
     assert!(call.arguments.iter().all(|argument| {
         matches!(
-            argument,
+            &argument.value,
             Expr::Binary(binary) if binary.operator == BinaryOperator::NamedArgument
         )
     }));

@@ -30,13 +30,18 @@ fn column(value: &str, span: Span) -> ast::Expr {
     ast::Expr::Identifier(ident(value, span))
 }
 fn call(name: &str, argument: &str, span: Span) -> ast::Expr {
-    ast::Expr::FunctionCall(ast::FunctionCall {
+    ast::Expr::FunctionCall(ast::AstBox::new(ast::FunctionCall {
         name: ast::ObjectName {
             parts: vec![ident(name, span)],
             span,
         },
-        arguments: vec![column(argument, span)],
+        arguments: vec![novarocks_parser::build::call_argument(
+            column(argument, span),
+            None,
+        )]
+        .into(),
         quantifier: ast::FunctionQuantifier::None,
+        processing_mode: None,
         order_by: None,
         separator: None,
         filter: None,
@@ -44,7 +49,7 @@ fn call(name: &str, argument: &str, span: Span) -> ast::Expr {
         window: None,
         substring_from_syntax: false,
         span,
-    })
+    }))
 }
 fn number(value: &str, span: Span) -> ast::Expr {
     ast::Expr::Literal(ast::Literal {

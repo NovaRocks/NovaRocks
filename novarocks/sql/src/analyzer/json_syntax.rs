@@ -1068,11 +1068,11 @@ mod tests {
             .unwrap();
         let mut expected_source = MaterializedSourceBorrow::empty(&expected_query);
         expected_source
-            .insert_context_constant(&expected_node.arguments[1], value.clone(), &control)
+            .insert_context_constant(&expected_node.arguments[1].value, value.clone(), &control)
             .unwrap();
         expected_source
             .insert_write_assignment(
-                &expected_node.arguments[3],
+                &expected_node.arguments[3].value,
                 Cow::Owned(assignment),
                 &control,
             )
@@ -1145,7 +1145,7 @@ mod tests {
             .unwrap();
         let mut ordinary_source = MaterializedSourceBorrow::empty(&ordinary_query);
         ordinary_source
-            .insert_context_constant(&ordinary.arguments[0], value, &control)
+            .insert_context_constant(&ordinary.arguments[0].value, value, &control)
             .unwrap();
         let mut array_context = context(&control);
         array_context.materialized_values = Some(array_source.view());

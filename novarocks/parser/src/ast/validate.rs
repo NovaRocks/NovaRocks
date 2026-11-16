@@ -446,7 +446,7 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
         Expr::WindowOperation(node) => validate_window(&node.window)?,
         Expr::FunctionCall(function) => {
             for argument in &function.arguments {
-                validate_expr(argument)?;
+                validate_call_argument(argument)?;
             }
             if let Some(order_by) = &function.order_by {
                 validate_order_by(order_by)?;
@@ -734,4 +734,9 @@ fn validate_row_pattern(pattern: &super::RowPattern) -> Result<(), ValidateError
         RowPattern::Variable { .. } | RowPattern::Empty { .. } | RowPattern::Anchor { .. } => {}
     }
     Ok(())
+}
+
+#[recursive::recursive]
+fn validate_call_argument(argument: &super::CallArgument) -> Result<(), ValidateError> {
+    validate_expr(&argument.value)
 }

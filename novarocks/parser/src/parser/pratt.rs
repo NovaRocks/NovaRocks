@@ -1175,7 +1175,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
         let end = self.current_span().end();
         self.advance();
-        Ok(Expr::FunctionCall(FunctionCall {
+        Ok(Expr::FunctionCall(AstBox::new(FunctionCall {
             name: ObjectName {
                 parts: vec![Ident {
                     value: "EXTRACT".to_owned(),
@@ -1184,7 +1184,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 }],
                 span: Span::new(start, start + "EXTRACT".len()),
             },
-            arguments: vec![field, expression],
+            arguments: vec![field, expression]
+                .into_iter()
+                .map(|value| crate::build::call_argument(value, None))
+                .collect(),
+            processing_mode: None,
             quantifier: FunctionQuantifier::None,
             order_by: None,
             separator: None,
@@ -1193,7 +1197,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             window: None,
             substring_from_syntax: false,
             span: Span::new(start, end),
-        }))
+        })))
     }
 
     fn parse_substring_expression(&mut self) -> Result<Expr, ParseError> {
@@ -1233,7 +1237,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         if let Some(length) = length {
             arguments.push(length);
         }
-        Ok(Expr::FunctionCall(FunctionCall {
+        Ok(Expr::FunctionCall(AstBox::new(FunctionCall {
             name: ObjectName {
                 parts: vec![Ident {
                     value: self.token_text(name_span).to_owned(),
@@ -1242,7 +1246,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 }],
                 span: name_span,
             },
-            arguments,
+            arguments: arguments
+                .into_iter()
+                .map(|value| crate::build::call_argument(value, None))
+                .collect(),
+            processing_mode: None,
             quantifier: FunctionQuantifier::None,
             order_by: None,
             separator: None,
@@ -1251,7 +1259,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             window: None,
             substring_from_syntax: true,
             span: Span::new(start, end),
-        }))
+        })))
     }
 
     fn parse_type_name(&mut self) -> Result<TypeName, ParseError> {
@@ -1583,7 +1591,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
             self.advance();
             self.skip_trivia();
-            Some(Box::new(filter))
+            Some(filter)
         } else {
             None
         };
@@ -1618,9 +1626,13 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             |window| window.span().end(),
         );
         self.function_call_depth -= 1;
-        Ok(Expr::FunctionCall(FunctionCall {
+        Ok(Expr::FunctionCall(AstBox::new(FunctionCall {
             name,
-            arguments,
+            arguments: arguments
+                .into_iter()
+                .map(|value| crate::build::call_argument(value, None))
+                .collect(),
+            processing_mode: None,
             quantifier,
             order_by,
             separator,
@@ -1629,7 +1641,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             window,
             substring_from_syntax: false,
             span: Span::new(span.start(), span_end),
-        }))
+        })))
     }
 
     fn table_function_named_argument_ahead(&self) -> bool {

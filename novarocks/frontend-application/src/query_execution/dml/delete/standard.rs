@@ -621,8 +621,18 @@ fn function_expr_args(func: &FunctionCall) -> Option<Vec<&Expr>> {
         && func.order_by.is_none()
         && func.separator.is_none()
         && func.filter.is_none()
-        && func.window.is_none())
-    .then(|| func.arguments.iter().collect())
+        && func.window.is_none()
+        && func.processing_mode.is_none()
+        && func
+            .arguments
+            .iter()
+            .all(|argument| argument.name.is_none()))
+    .then(|| {
+        func.arguments
+            .iter()
+            .map(|argument| &argument.value)
+            .collect()
+    })
 }
 
 /// The set of deterministic, single-argument scalar functions that the phase-1

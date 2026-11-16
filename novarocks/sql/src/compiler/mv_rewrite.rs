@@ -3275,7 +3275,7 @@ impl Visit for CompletionRetainedBytes {
 
     fn visit_function_call(&mut self, call: &FunctionCall) {
         self.add(std::mem::size_of::<FunctionCall>());
-        self.add_vec_capacity::<Expr>(call.arguments.capacity());
+        self.add_vec_capacity::<novarocks_parser::ast::CallArgument>(call.arguments.capacity());
         self.add_order_by_containers(&call.order_by);
         if let Some(window) = &call.window {
             self.add_window_containers(window);

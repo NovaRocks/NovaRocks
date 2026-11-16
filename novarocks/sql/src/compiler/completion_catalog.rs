@@ -868,13 +868,19 @@ impl<'a> CatalogNeedCollector<'a> {
         let Some(name) = function.name.parts.last() else {
             return Ok(());
         };
-        if !name.value.eq_ignore_ascii_case("__nr_ivm_delta") {
+        if !name.value.eq_ignore_ascii_case("__nr_ivm_delta")
+            || function.processing_mode.is_some()
+            || function
+                .arguments
+                .iter()
+                .any(|argument| argument.name.is_some())
+        {
             return Ok(());
         }
         let Some(ast::Expr::Literal(ast::Literal {
             kind: ast::LiteralKind::String(identity),
             ..
-        })) = function.arguments.first()
+        })) = function.arguments.first().map(|argument| &argument.value)
         else {
             return Ok(());
         };

@@ -531,12 +531,13 @@ fn constrain_literal_in(
                 ("array", DataType::List(_)) => {
                     let item = target_child(target, 0)?;
                     for value in &mut function.arguments {
-                        *value = constrain_literal(value.clone(), &item)?;
+                        value.value = constrain_literal(value.value.clone(), &item)?;
                     }
                 }
                 ("row", DataType::Struct(fields)) if fields.len() == function.arguments.len() => {
                     for (index, value) in function.arguments.iter_mut().enumerate() {
-                        *value = constrain_literal(value.clone(), &target_child(target, index)?)?;
+                        value.value =
+                            constrain_literal(value.value.clone(), &target_child(target, index)?)?;
                     }
                 }
                 ("named_struct", DataType::Struct(fields))
@@ -549,8 +550,10 @@ fn constrain_literal_in(
                         .iter_mut()
                         .enumerate()
                     {
-                        pair[1] =
-                            constrain_literal(pair[1].clone(), &target_child(target, index)?)?;
+                        pair[1].value = constrain_literal(
+                            pair[1].value.clone(),
+                            &target_child(target, index)?,
+                        )?;
                     }
                 }
                 ("map", DataType::Map(..)) => {
@@ -558,8 +561,8 @@ fn constrain_literal_in(
                         let key = target_child(target, 0)?;
                         let value = target_child(target, 1)?;
                         for pair in function.arguments.as_chunks_mut::<2>().0 {
-                            pair[0] = constrain_literal(pair[0].clone(), &key)?;
-                            pair[1] = constrain_literal(pair[1].clone(), &value)?;
+                            pair[0].value = constrain_literal(pair[0].value.clone(), &key)?;
+                            pair[1].value = constrain_literal(pair[1].value.clone(), &value)?;
                         }
                     }
                 }
@@ -649,7 +652,7 @@ fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
             _ => None,
         }
     }
-    let Some(text) = string_literal(&function.arguments[0]) else {
+    let Some(text) = string_literal(&function.arguments[0].value) else {
         return Ok(None);
     };
     let bytes = novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(text)

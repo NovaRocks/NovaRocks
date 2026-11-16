@@ -145,7 +145,7 @@ fn original_over_branches_preserve_reference_vs_specification_and_quoted_spans()
     let Expr::FunctionCall(call) = plain else {
         panic!("call");
     };
-    let Window::Specification(spec) = call.window.unwrap() else {
+    let Window::Specification(spec) = call.into_inner().window.unwrap() else {
         panic!("spec");
     };
     let frame = spec.window_frame.as_ref().unwrap();

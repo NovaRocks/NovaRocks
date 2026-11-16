@@ -576,7 +576,13 @@ impl Visit for CatalogEdits<'_> {
             && call.name.parts[0]
                 .value
                 .eq_ignore_ascii_case("__nr_ivm_delta")
-            && let Some(Expr::Literal(literal)) = call.arguments.first()
+            && call.processing_mode.is_none()
+            && call
+                .arguments
+                .iter()
+                .all(|argument| argument.name.is_none())
+            && let Some(Expr::Literal(literal)) =
+                call.arguments.first().map(|argument| &argument.value)
             && let LiteralKind::String(value) = &literal.kind
         {
             match self.symbols.display(value, Display::MvIdentity) {
@@ -785,7 +791,7 @@ fn catalog_output_plan(sql: &str) -> Vec<OutputColumn> {
                             }
                         };
                         let current = select.from.is_empty()
-                            && matches!(expr,Expr::FunctionCall(call) if call.name.parts.len()==1 && call.name.parts[0].value.eq_ignore_ascii_case("current_catalog") && call.arguments.is_empty());
+                            && matches!(expr,Expr::FunctionCall(call) if call.name.parts.len()==1 && call.name.parts[0].value.eq_ignore_ascii_case("current_catalog") && call.arguments.is_empty() && call.processing_mode.is_none());
                         let catalog = (metadata && catalog_column(expr).is_some()) || current;
                         let header = alias.unwrap_or_else(|| {
                             syntax_identifier_chain(expr)

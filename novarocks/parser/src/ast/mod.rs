@@ -67,9 +67,10 @@ pub use dml::{
 pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
     AccessExpr, AccessKind, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr, BinaryOperator,
-    DereferenceExpr, Expr, FunctionCall, FunctionQuantifier, IntervalExpr, IntervalField,
-    JsonOperator, LogicalExpr, LogicalOperator, MapEntry, MapExpr, NestedExpr, NullTreatment,
-    RowExpr, RowField, SubqueryExpr, SubscriptExpr, UnaryExpr, UnaryOperator,
+    CallArgument, DereferenceExpr, Expr, FunctionCall, FunctionQuantifier, IntervalExpr,
+    IntervalField, JsonOperator, LogicalExpr, LogicalOperator, MapEntry, MapExpr, NestedExpr,
+    NullTreatment, ProcessingMode, ProcessingModeKind, RowExpr, RowField, SubqueryExpr,
+    SubscriptExpr, UnaryExpr, UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -248,7 +249,7 @@ mod tests {
                 span: span(0, 1),
             })),
             operator: BinaryOperator::Add,
-            right: Box::new(Expr::FunctionCall(FunctionCall {
+            right: Box::new(Expr::FunctionCall(AstBox::new(FunctionCall {
                 name: ObjectName {
                     parts: vec![Ident {
                         value: "abs".to_owned(),
@@ -263,7 +264,11 @@ mod tests {
                         parsed_value: ("1".to_owned()).parse::<i64>().unwrap(),
                     },
                     span: span(8, 9),
-                })],
+                })]
+                .into_iter()
+                .map(|value| crate::build::call_argument(value, None))
+                .collect(),
+                processing_mode: None,
                 quantifier: FunctionQuantifier::None,
                 order_by: None,
                 separator: None,
@@ -272,7 +277,7 @@ mod tests {
                 window: None,
                 substring_from_syntax: false,
                 span: span(4, 10),
-            })),
+            }))),
             span: span(0, 10),
         });
 
@@ -391,4 +396,8 @@ pub use visit::{
     fold_window, fold_window_definition, fold_window_frame, fold_window_operation,
     fold_window_reference, fold_window_specification, walk_window, walk_window_definition,
     walk_window_frame, walk_window_operation, walk_window_reference, walk_window_specification,
+};
+
+pub use visit::{
+    fold_call_argument, fold_processing_mode, walk_call_argument, walk_processing_mode,
 };

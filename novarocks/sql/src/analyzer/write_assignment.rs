@@ -193,7 +193,12 @@ fn register_literal_assignments<'a>(
                     && function.separator.is_none()
                     && function.filter.is_none()
                     && function.null_treatment.is_none()
-                    && function.window.is_none() =>
+                    && function.window.is_none()
+                    && function.processing_mode.is_none()
+                    && function
+                        .arguments
+                        .iter()
+                        .all(|argument| argument.name.is_none()) =>
             {
                 // These are only the original INSERT literal syntax forms.
                 // Normal analysis still resolves or rejects the actual call.
@@ -205,14 +210,14 @@ fn register_literal_assignments<'a>(
                 ) {
                     ("array", DataType::List(_) | DataType::LargeList(_)) => {
                         for value in &function.arguments {
-                            visit(value, 0)?;
+                            visit(&value.value, 0)?;
                         }
                     }
                     ("row", DataType::Struct(fields))
                         if fields.len() == function.arguments.len() =>
                     {
                         for (ordinal, value) in function.arguments.iter().enumerate() {
-                            visit(value, ordinal)?;
+                            visit(&value.value, ordinal)?;
                         }
                     }
                     ("named_struct", DataType::Struct(fields))
@@ -221,13 +226,13 @@ fn register_literal_assignments<'a>(
                         for (ordinal, pair) in
                             function.arguments.as_chunks::<2>().0.iter().enumerate()
                         {
-                            visit(&pair[1], ordinal)?;
+                            visit(&pair[1].value, ordinal)?;
                         }
                     }
                     ("map", DataType::Map(..)) if function.arguments.len() % 2 == 0 => {
                         for pair in function.arguments.as_chunks::<2>().0 {
-                            visit(&pair[0], 0)?;
-                            visit(&pair[1], 1)?;
+                            visit(&pair[0].value, 0)?;
+                            visit(&pair[1].value, 1)?;
                         }
                     }
                     _ => {}

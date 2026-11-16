@@ -137,7 +137,15 @@ fn validate_imv_aggregate_star_expr(expr: &Expr) -> Result<(), AnalyzeError> {
     let Expr::FunctionCall(function) = expr else {
         return Ok(());
     };
-    let [Expr::Identifier(argument)] = function.arguments.as_slice() else {
+    if let Some(reason) = crate::analyzer::unsupported_call_facts(function) {
+        return Err(AnalyzeError::unsupported_expression(reason, function.span));
+    }
+    let argument_values = function
+        .arguments
+        .iter()
+        .map(|argument| &argument.value)
+        .collect::<Vec<_>>();
+    let [Expr::Identifier(argument)] = argument_values.as_slice() else {
         return Ok(());
     };
     if argument.value != "*"
@@ -3154,13 +3162,23 @@ fn classify_aggregate_call(expr: &Expr, output_name: String) -> Result<Aggregate
     if function.name.parts.len() != 1
         || function.null_treatment.is_some()
         || function.window.is_some()
+        || function.processing_mode.is_some()
+        || function
+            .arguments
+            .iter()
+            .any(|argument| argument.name.is_some())
         || function.filter.is_some()
         || function.order_by.is_some()
     {
         return Err(aggregate_error());
     }
 
-    let args = &function.arguments;
+    let argument_values = function
+        .arguments
+        .iter()
+        .map(|argument| &argument.value)
+        .collect::<Vec<_>>();
+    let args = argument_values.as_slice();
     let function_name = function.name.parts[0].value.to_ascii_lowercase();
     if function_name == "count" && matches!(function.quantifier, ast::FunctionQuantifier::Distinct)
     {
@@ -3205,7 +3223,7 @@ fn classify_aggregate_call(expr: &Expr, output_name: String) -> Result<Aggregate
 }
 
 fn classify_count_distinct_from_distinct_syntax(
-    args: &[Expr],
+    args: &[&Expr],
     output_name: String,
 ) -> Result<AggregateCallShape, String> {
     Ok(AggregateCallShape {
@@ -3215,7 +3233,7 @@ fn classify_count_distinct_from_distinct_syntax(
     })
 }
 
-fn classify_count_input(args: &[Expr]) -> Result<(AggregateFunctionKind, AggregateInput), String> {
+fn classify_count_input(args: &[&Expr]) -> Result<(AggregateFunctionKind, AggregateInput), String> {
     let [arg] = args else {
         return Err(aggregate_error());
     };
@@ -3227,13 +3245,13 @@ fn classify_count_input(args: &[Expr]) -> Result<(AggregateFunctionKind, Aggrega
             reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
             Ok((
                 AggregateFunctionKind::Count,
-                AggregateInput::Expr(Box::new(expr.clone())),
+                AggregateInput::Expr(Box::new((**expr).clone())),
             ))
         }
     }
 }
 
-fn classify_count_distinct_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_count_distinct_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     if args.len() > 1 {
         return Err(format!(
             "COUNT(DISTINCT) with {} arguments is not supported in incremental materialized views; multi-column DISTINCT cannot be incrementally maintained",
@@ -3247,10 +3265,10 @@ fn classify_count_distinct_input(args: &[Expr]) -> Result<AggregateInput, String
         return Err("COUNT(DISTINCT *) is not supported".to_string());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
-fn classify_approx_count_distinct_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_approx_count_distinct_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     if args.len() > 1 {
         return Err(format!(
             "APPROX_COUNT_DISTINCT with {} arguments is not supported in incremental materialized views; the precision hint argument is not supported in IVM. Please use the single-argument form: APPROX_COUNT_DISTINCT(col)",
@@ -3264,10 +3282,10 @@ fn classify_approx_count_distinct_input(args: &[Expr]) -> Result<AggregateInput,
         return Err("APPROX_COUNT_DISTINCT(*) is not supported".to_string());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
-fn classify_sum_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_sum_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     let [arg] = args else {
         return Err(aggregate_error());
     };
@@ -3275,10 +3293,10 @@ fn classify_sum_input(args: &[Expr]) -> Result<AggregateInput, String> {
         return Err(aggregate_error());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
-fn classify_avg_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_avg_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     let [arg] = args else {
         return Err("AVG aggregate requires a column expression argument".to_string());
     };
@@ -3286,10 +3304,10 @@ fn classify_avg_input(args: &[Expr]) -> Result<AggregateInput, String> {
         return Err("AVG aggregate requires a column expression argument".to_string());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
-fn classify_min_max_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_min_max_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     let [arg] = args else {
         return Err("MIN/MAX aggregate requires a column expression argument".to_string());
     };
@@ -3297,10 +3315,10 @@ fn classify_min_max_input(args: &[Expr]) -> Result<AggregateInput, String> {
         return Err("MIN/MAX aggregate requires a column expression argument".to_string());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
-fn classify_bool_or_and_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_bool_or_and_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     // BOOL_OR / BOOL_AND require a single scalar Boolean-typed expression.
     // The input type is enforced later when state column physical types are
     // validated (`validate_state_column_type`); shape classification only
@@ -3312,7 +3330,7 @@ fn classify_bool_or_and_input(args: &[Expr]) -> Result<AggregateInput, String> {
         return Err("BOOL_OR/BOOL_AND aggregate requires a column expression argument".to_string());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
 pub fn query_has_aggregate_surface(query: &Query) -> bool {
@@ -3369,7 +3387,7 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
                 || function
                     .arguments
                     .iter()
-                    .any(expr_contains_aggregate_function)
+                    .any(|argument| expr_contains_aggregate_function(&argument.value))
                 || function
                     .filter
                     .as_ref()
@@ -3605,7 +3623,15 @@ fn reject_unsupported_access_expr(access: &ast::AccessExpr) -> Result<(), String
 
 fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), String> {
     let function_name = printer::print_object_name(&function.name).to_ascii_lowercase();
-    if is_non_deterministic_function(&function_name, &function.arguments) {
+    if let Some(reason) = crate::analyzer::unsupported_call_facts(function) {
+        return Err(reason.to_string());
+    }
+    let argument_values = function
+        .arguments
+        .iter()
+        .map(|argument| &argument.value)
+        .collect::<Vec<_>>();
+    if is_non_deterministic_function(&function_name, &argument_values) {
         return Err(
             "incremental MV projection/filter query contains non-deterministic function"
                 .to_string(),
@@ -3618,6 +3644,11 @@ fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), Strin
         || function_name == "match"
         || function.null_treatment.is_some()
         || function.window.is_some()
+        || function.processing_mode.is_some()
+        || function
+            .arguments
+            .iter()
+            .any(|argument| argument.name.is_some())
         || function.order_by.is_some()
         || function.separator.is_some()
         || function.filter.is_some()
@@ -3625,17 +3656,17 @@ fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), Strin
     {
         return Err(projection_filter_error());
     }
-    reject_unsupported_function_arguments(&function.arguments)
+    reject_unsupported_function_arguments(&argument_values)
 }
 
-fn reject_unsupported_function_arguments(args: &[Expr]) -> Result<(), String> {
+fn reject_unsupported_function_arguments(args: &[&Expr]) -> Result<(), String> {
     for arg in args {
         reject_unsupported_expr(arg)?;
     }
     Ok(())
 }
 
-fn is_non_deterministic_function(name: &str, args: &[Expr]) -> bool {
+fn is_non_deterministic_function(name: &str, args: &[&Expr]) -> bool {
     matches!(
         name,
         "now"
@@ -3668,7 +3699,7 @@ fn is_non_deterministic_bare_identifier(name: &str) -> bool {
     )
 }
 
-fn function_argument_count(args: &[Expr]) -> Option<usize> {
+fn function_argument_count(args: &[&Expr]) -> Option<usize> {
     Some(args.len())
 }
 

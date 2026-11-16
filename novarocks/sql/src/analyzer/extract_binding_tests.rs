@@ -277,7 +277,7 @@ fn extract_binding_rejects_carrier_only_largeint_and_unsupported_field_at_origin
     else {
         panic!("extract");
     };
-    let ast::Expr::Identifier(field) = &function.arguments[0] else {
+    let ast::Expr::Identifier(field) = &function.arguments[0].value else {
         panic!("field");
     };
     let error = analyze(sql, &catalog, crate::constant::test_constant_policy()).unwrap_err();

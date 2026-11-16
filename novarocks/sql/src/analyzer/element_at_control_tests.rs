@@ -218,7 +218,9 @@ fn element_at_type_probe_keeps_original_ordinary_binding_error_without_rebinding
         else {
             panic!("element_at call");
         };
-        let Some(ast::Expr::Array(array)) = function.arguments.first() else {
+        let Some(ast::Expr::Array(array)) =
+            function.arguments.first().map(|argument| &argument.value)
+        else {
             panic!("original array argument");
         };
         let array_span = array.span;
