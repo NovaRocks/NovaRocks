@@ -416,7 +416,13 @@ mod tests {
         let journal = StagedPathJournal::default();
         let context = tracked_context(&table, &journal, Some(1));
         let mut writer = StreamingStagedDataFileWriter::new(context, &journal).unwrap();
-        writer.append(test_batch(&[1, 2])).await.unwrap();
+        // A flushed row group can still be in Parquet's buffered output.
+        // Each burst contains enough one-row groups to reach FileIO.
+        const ROWS_PER_BURST: usize = 1024;
+        let mut initial = vec![1; ROWS_PER_BURST];
+        initial.resize(2 * ROWS_PER_BURST, 2);
+        let active = test_batch(&[2; ROWS_PER_BURST]);
+        writer.append(test_batch(&initial)).await.unwrap();
         let written = writer.written_since_idle_check;
         assert!(written > 0);
 
@@ -433,7 +439,7 @@ mod tests {
         );
         assert!(writer.pending_idle_closes.is_empty());
 
-        writer.append(test_batch(&[2])).await.unwrap();
+        writer.append(active.clone()).await.unwrap();
         let idle = writer
             .writers
             .values()
@@ -444,13 +450,21 @@ mod tests {
         writer.consider_idle_close(0, 0, idle_bytes);
         assert!(writer.pending_idle_closes.is_empty());
 
-        writer.append(test_batch(&[2])).await.unwrap();
+        writer.append(active).await.unwrap();
         writer.consider_idle_close(0, 0, idle_bytes - 1);
         assert_eq!(writer.pending_idle_closes.len(), 1);
         writer.finish_idle_closes().await.unwrap();
         assert_eq!(writer.writers.len(), 1);
         assert_eq!(writer.completed.len(), 1);
-        assert_eq!(writer.completed[0].data_file.record_count(), 1);
+        let idle_file = &writer.completed[0].data_file;
+        assert_eq!(idle_file.record_count(), ROWS_PER_BURST as u64);
+        assert_eq!(
+            journal
+                .write_progress(idle_file.file_path())
+                .unwrap()
+                .accepted_bytes(),
+            idle_file.file_size_in_bytes()
+        );
 
         writer.append(test_batch(&[1])).await.unwrap();
         assert_eq!(writer.writers.len(), 2);
@@ -462,7 +476,7 @@ mod tests {
             .map(|file| file.data_file.record_count())
             .collect::<Vec<_>>();
         rows.sort_unstable();
-        assert_eq!(rows, [1, 1, 3]);
+        assert_eq!(rows, [1, ROWS_PER_BURST as u64, 3 * ROWS_PER_BURST as u64]);
         assert_eq!(writer.buffered_bytes(), 0);
     }
 
@@ -477,7 +491,9 @@ mod tests {
         assert_eq!(journal.total_accepted_bytes(), 0);
         assert!(writer.buffered_bytes() > 0);
         let mut buffered = writer.buffered_bytes();
-        for value in 1..1024 {
+        // Span multiple row groups so a flush also drains the SDK's
+        // buffered output into the original FileIO writer.
+        for value in 1..4096 {
             writer.append(test_batch(&[value])).await.unwrap();
             let slot = writer.writers.values().next().unwrap();
             let written = slot.accepted_file_bytes();
@@ -494,7 +510,14 @@ mod tests {
             journal.total_accepted_bytes() > 0,
             "a row group has flushed"
         );
-        writer.finish().await.unwrap();
+        let files = writer.finish().await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0]
+                .data_file
+                .split_offsets()
+                .is_some_and(|groups| groups.len() > 1)
+        );
         assert_eq!(writer.buffered_bytes(), 0);
     }
 
