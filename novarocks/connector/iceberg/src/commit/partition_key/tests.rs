@@ -17,7 +17,7 @@
 
 use super::*;
 use crate::iceberg::arrow::RecordBatchPartitionSplitter;
-use crate::iceberg::spec::{NestedField, PrimitiveType};
+use crate::iceberg::spec::{NestedField, PrimitiveType, StructType, Type};
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
@@ -259,4 +259,61 @@ fn provider_partition_keys_match_the_sdk_data_splitter_across_supported_sources(
             }
         }
     }
+}
+
+#[test]
+fn void_of_a_nested_source_does_not_add_a_partition_distinction() {
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields([
+                Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "retired",
+                    Type::Struct(StructType::new(vec![Arc::new(NestedField::required(
+                        3,
+                        "v",
+                        Type::Primitive(PrimitiveType::Long),
+                    ))])),
+                )),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let spec = Arc::new(
+        PartitionSpec::builder(schema.clone())
+            .add_partition_field("id", "partition_id", Transform::Identity)
+            .unwrap()
+            .add_partition_field("retired", "retired_key", Transform::Void)
+            .unwrap()
+            .build()
+            .unwrap(),
+    );
+    let target = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+    let arrow::datatypes::DataType::Struct(fields) = target.field(1).data_type() else {
+        panic!("nested retired field");
+    };
+    let values = arrow::array::StructArray::new(
+        fields.clone(),
+        vec![Arc::new(Int64Array::from(vec![7, 8, 9]))],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        target.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 1, 2])), Arc::new(values)],
+    )
+    .unwrap();
+    let evaluator = IcebergPartitionKeyEvaluator::new(&schema, &spec, &target).unwrap();
+    let splitter =
+        RecordBatchPartitionSplitter::try_new_with_computed_values(schema, spec).unwrap();
+    let keys = evaluator.partition_keys(&batch).unwrap();
+    assert_eq!(keys.value(0), keys.value(1));
+    assert_ne!(keys.value(0), keys.value(2));
+    let split = splitter.split(&batch).unwrap();
+    assert_eq!(split.len(), 2);
+    assert!(split.iter().all(|(key, _)| key.data().is_null_at_index(1)));
 }

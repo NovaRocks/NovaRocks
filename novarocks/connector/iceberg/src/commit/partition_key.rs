@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{Int64Array, new_null_array};
 use arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_connector_contract::{
@@ -42,7 +42,7 @@ use super::write_stack::domain::{IcebergDataBranchRecipe, IcebergWriteTableFacts
 use crate::iceberg::arrow::{
     PartitionValueCalculator, arrow_struct_to_literal, schema_to_arrow_schema,
 };
-use crate::iceberg::spec::{Literal, PartitionSpec, Schema, Transform, Type};
+use crate::iceberg::spec::{Literal, PartitionSpec, Schema, Transform};
 
 pub(crate) fn partition_layout(
     binding: &ConnectorWriteBinding,
@@ -171,10 +171,9 @@ pub(crate) fn layout_facts(
         .collect::<BTreeSet<_>>();
     if fields.len() != draft.inputs().len()
         || fields.len() != partition_sources.len()
-        || fields.iter().any(|field| {
-            !matches!(field.field_type.as_ref(), Type::Primitive(_))
-                || !partition_sources.contains(&field.id)
-        })
+        || fields
+            .iter()
+            .any(|field| !partition_sources.contains(&field.id))
         || spec.is_unpartitioned()
         || partition_fields.iter().any(|field| {
             matches!(
@@ -184,7 +183,7 @@ pub(crate) fn layout_facts(
         })
     {
         return Err(bad_recipe(
-            "Iceberg layout recipe must carry its exact primitive partition source fields and transforms",
+            "Iceberg layout recipe must carry its exact partition source fields and transforms",
         ));
     }
     // Rebind the original spec's identities against the SDK's own schema laws.
@@ -231,6 +230,7 @@ struct IcebergPartitionKeyEvaluator {
     calculator: PartitionValueCalculator,
     input: ArrowSchemaRef,
     target: ArrowSchemaRef,
+    transformed_inputs: Box<[bool]>,
 }
 
 impl IcebergPartitionKeyEvaluator {
@@ -255,14 +255,34 @@ impl IcebergPartitionKeyEvaluator {
                 "Iceberg partition layout input width differs from its recipe".to_owned(),
             ));
         }
-        // The engine's slot fields need not carry SQL names. This positional
-        // binding uses the token order frozen by the Provider's route.
+        let actual_sources = spec
+            .fields()
+            .iter()
+            .filter(|field| field.transform != Transform::Void)
+            .map(|field| field.source_id)
+            .collect::<BTreeSet<_>>();
+        let transformed_inputs = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| actual_sources.contains(&field.id))
+            .collect::<Box<_>>();
+        // Slot names are engine-local. The recipe binds their occurrences
+        // positionally. Void-only sources can be typed NULL without reading
+        // their original values, including nested retired source columns.
         let input = Arc::new(ArrowSchema::new(
             input
                 .fields()
                 .iter()
                 .zip(target.fields())
-                .map(|(source, to)| source.as_ref().clone().with_name(to.name()))
+                .zip(&transformed_inputs)
+                .map(|((source, to), &transformed)| {
+                    if transformed {
+                        Arc::new(source.as_ref().clone().with_name(to.name()))
+                    } else {
+                        to.clone()
+                    }
+                })
                 .collect::<Vec<_>>(),
         ));
         validate_batch_schema(&input, &target).map_err(invalid)?;
@@ -272,6 +292,7 @@ impl IcebergPartitionKeyEvaluator {
             calculator,
             input,
             target,
+            transformed_inputs,
         })
     }
 }
@@ -281,9 +302,22 @@ impl ConnectorPartitionKeyEvaluator for IcebergPartitionKeyEvaluator {
         if input.num_rows() == 0 {
             return Ok(Int64Array::new_null(0));
         }
-        let input = RecordBatch::try_new(self.input.clone(), input.columns().to_vec()).map_err(
-            |error| ConnectorError::new(ConnectorErrorKind::Internal, error.to_string()),
-        )?;
+        let sources = input
+            .columns()
+            .iter()
+            .zip(self.input.fields())
+            .zip(&self.transformed_inputs)
+            .map(|((array, field), &transformed)| {
+                if transformed {
+                    array.clone()
+                } else {
+                    new_null_array(field.data_type(), input.num_rows())
+                }
+            })
+            .collect();
+        let input = RecordBatch::try_new(self.input.clone(), sources).map_err(|error| {
+            ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
+        })?;
         let adapted = adapt_batch(&input, &self.target)
             .map_err(super::write_adaptation::WriteAdaptationError::into_connector_error)?;
         let partition_values = self

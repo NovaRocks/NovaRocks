@@ -881,18 +881,20 @@ pub(crate) fn validate_edge(
                 Some(NodeKind::TableWriter { target }),
             ) => {
                 let header = target.handle.header();
+                let fields = target
+                    .target_fields
+                    .iter()
+                    .map(|field| (field.token, field.input))
+                    .collect::<BTreeMap<_, _>>();
+                let imports = ValueMappingIndex::from_pairs(&edge.destination.receive_mapping);
                 header.provider_id() == &recipe.binding().descriptor().provider_id
                     && header.catalog() == recipe.binding().catalog_handle()
                     && header.codec_revision() == recipe.payload().header().codec_revision()
                     && recipe.inputs().len() == key_inputs.len()
                     && recipe.inputs().iter().zip(key_inputs).all(|(token, key)| {
-                        target.target_fields.iter().any(|field| {
-                            field.token == *token
-                                && edge
-                                    .destination
-                                    .receive_mapping
-                                    .contains(&(*key, field.input))
-                        })
+                        fields
+                            .get(token)
+                            .is_some_and(|input| imports.contains(*key, *input))
                     })
             }
             _ => false,
@@ -1680,12 +1682,17 @@ pub(crate) fn validate_write_layout_recipes<'a>(
                 )
             });
             affinity.next().is_some_and(|route| {
+                let inputs_by_token = route
+                    .input_mapping
+                    .iter()
+                    .copied()
+                    .collect::<BTreeMap<_, _>>();
                 route.requirements.layout_keys() == inputs
                     && recipe
                         .inputs()
                         .iter()
                         .zip(inputs)
-                        .all(|(token, value)| route.input_mapping.contains(&(*token, *value)))
+                        .all(|(token, value)| inputs_by_token.get(token) == Some(value))
             }) && affinity.next().is_none()
         });
         if found || !matches {
