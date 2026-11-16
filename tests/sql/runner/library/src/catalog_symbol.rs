@@ -549,6 +549,15 @@ impl Visit for CatalogEdits<'_> {
                     self.ident(c);
                 }
             }
+            Statement::Session(SessionStatement::Set(s)) => {
+                for catalog in s
+                    .assignments
+                    .iter()
+                    .filter_map(|assignment| assignment.catalog.as_ref())
+                {
+                    self.ident(catalog);
+                }
+            }
             Statement::Maintenance(MaintenanceStatement::Call(call)) => {
                 if call.procedure.parts.last().is_some_and(|n| {
                     n.value
@@ -972,6 +981,18 @@ mod tests {
         assert!(out.contains(&format!("DROP CATALOG {name}")));
         assert_eq!(out, s.rewrite_source(&out).unwrap());
     }
+    #[test]
+    fn set_session_rewrites_only_the_catalog_qualifier() {
+        let symbols = symbols();
+        let catalog = symbols.lookup("owned").unwrap();
+        let source =
+            r#"SET SESSION "owned".owned = 'owned', owned = 'owned', external.owned = 'owned';"#;
+        let expected = format!(
+            r#"SET SESSION "{catalog}".owned = 'owned', owned = 'owned', external.owned = 'owned';"#
+        );
+        assert_eq!(symbols.rewrite_source(source).unwrap(), expected);
+    }
+
     #[test]
     fn optimize_and_metadata_bind_the_same_catalog_without_rewriting_data() {
         let symbols = symbols();
