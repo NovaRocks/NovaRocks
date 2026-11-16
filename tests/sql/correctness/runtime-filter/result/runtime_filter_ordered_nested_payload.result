@@ -1,0 +1,11 @@
+-- query 6
+-- types	integer	bigint
+k	array_count
+1	2
+2	1
+
+-- query 8
+-- types	integer	bigint
+k	array_count
+1	2
+2	1
