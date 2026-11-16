@@ -532,6 +532,13 @@ pub fn walk_table_with_joins<V: Visit + ?Sized>(visitor: &mut V, table: &TableWi
 
 pub fn walk_table_factor<V: Visit + ?Sized>(visitor: &mut V, factor: &TableFactor) {
     match factor {
+        TableFactor::JsonTable { table, alias, .. } => {
+            visitor.visit_json_table(table);
+            if let Some(alias) = alias {
+                walk_table_alias(visitor, alias);
+            }
+        }
+
         TableFactor::Table {
             name,
             metadata,
@@ -632,6 +639,14 @@ pub fn walk_window_frame_bound<V: Visit + ?Sized>(visitor: &mut V, bound: &Windo
 
 pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
     match expression {
+        Expr::JsonConstructor(node) => visitor.visit_json_constructor(node),
+        Expr::JsonExists(node) => visitor.visit_json_exists(node),
+        Expr::JsonValue(node) => visitor.visit_json_value(node),
+        Expr::JsonQuery(node) => visitor.visit_json_query(node),
+        Expr::JsonSerialize(node) => visitor.visit_json_serialize(node),
+        Expr::JsonObject(node) => visitor.visit_json_object(node),
+        Expr::JsonArray(node) => visitor.visit_json_array(node),
+
         Expr::Identifier(ident) => visitor.visit_ident(ident),
         Expr::CompoundIdentifier(ident) => {
             for part in &ident.parts {
@@ -1500,6 +1515,12 @@ pub fn fold_table_with_joins<F: Fold + ?Sized>(
 
 pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) -> TableFactor {
     match factor {
+        TableFactor::JsonTable { table, alias, span } => TableFactor::JsonTable {
+            table: Box::new(folder.fold_json_table(*table)),
+            alias: alias.map(|alias| fold_table_alias(folder, alias)),
+            span,
+        },
+
         TableFactor::Table {
             name,
             metadata,
@@ -1630,6 +1651,18 @@ pub fn fold_window_frame_bound<F: Fold + ?Sized>(
 
 pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
     match expression {
+        Expr::JsonConstructor(node) => {
+            Expr::JsonConstructor(Box::new(folder.fold_json_constructor(*node)))
+        }
+        Expr::JsonExists(node) => Expr::JsonExists(Box::new(folder.fold_json_exists(*node))),
+        Expr::JsonValue(node) => Expr::JsonValue(Box::new(folder.fold_json_value(*node))),
+        Expr::JsonQuery(node) => Expr::JsonQuery(Box::new(folder.fold_json_query(*node))),
+        Expr::JsonSerialize(node) => {
+            Expr::JsonSerialize(Box::new(folder.fold_json_serialize(*node)))
+        }
+        Expr::JsonObject(node) => Expr::JsonObject(Box::new(folder.fold_json_object(*node))),
+        Expr::JsonArray(node) => Expr::JsonArray(Box::new(folder.fold_json_array(*node))),
+
         Expr::Identifier(ident) => Expr::Identifier(folder.fold_ident(ident)),
         Expr::CompoundIdentifier(mut ident) => {
             ident.parts = ident

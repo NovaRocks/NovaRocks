@@ -278,6 +278,10 @@ fn validate_table_with_joins(table_with_joins: &TableWithJoins) -> Result<(), Va
 
 fn validate_table_factor(table_factor: &TableFactor) -> Result<(), ValidateError> {
     match table_factor {
+        TableFactor::JsonTable { table, .. } => {
+            validate_json_root(|visitor| super::Visit::visit_json_table(visitor, table))
+        }
+
         TableFactor::Table { version, .. } => {
             if let Some(version) = version {
                 validate_expr(&version.value)?;
@@ -394,6 +398,28 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
     // contain a Query or WindowSpec. Other expression-local invariants are
     // enforced by their parser production and remain valid after construction.
     match expression {
+        Expr::JsonConstructor(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_constructor(visitor, node))?
+        }
+        Expr::JsonExists(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_exists(visitor, node))?
+        }
+        Expr::JsonValue(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_value(visitor, node))?
+        }
+        Expr::JsonQuery(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_query(visitor, node))?
+        }
+        Expr::JsonSerialize(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_serialize(visitor, node))?
+        }
+        Expr::JsonObject(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_object(visitor, node))?
+        }
+        Expr::JsonArray(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_array(visitor, node))?
+        }
+
         Expr::FunctionCall(function) => {
             for argument in &function.arguments {
                 validate_expr(argument)?;
@@ -521,4 +547,88 @@ fn identifier_key(value: &str, quoted: bool) -> String {
     } else {
         format!("unquoted:{}", value.to_ascii_lowercase())
     }
+}
+
+struct JsonValidation(Result<(), ValidateError>);
+impl super::Visit for JsonValidation {
+    fn visit_expr(&mut self, expression: &Expr) {
+        if self.0.is_ok() {
+            self.0 = validate_expr(expression);
+        }
+    }
+    fn visit_json_value(&mut self, node: &super::JsonValue) {
+        if self.0.is_err() {
+            return;
+        }
+        self.0 = node.validate_constructor_invariants().map_err(|error| {
+            ValidateError::invalid_structure(
+                StructuralViolation::JsonConstructorInvariant(error),
+                node.span,
+            )
+        });
+        if self.0.is_ok() {
+            super::walk_json_value(self, node);
+        }
+    }
+    fn visit_json_table_value_column(&mut self, node: &super::JsonTableValueColumn) {
+        if self.0.is_err() {
+            return;
+        }
+        self.0 = node.validate_constructor_invariants().map_err(|error| {
+            ValidateError::invalid_structure(
+                StructuralViolation::JsonConstructorInvariant(error),
+                node.span,
+            )
+        });
+        if self.0.is_ok() {
+            super::walk_json_table_value_column(self, node);
+        }
+    }
+    fn visit_json_table(&mut self, node: &super::JsonTable) {
+        if self.0.is_err() {
+            return;
+        }
+        self.0 = node.validate_constructor_invariants().map_err(|error| {
+            ValidateError::invalid_structure(
+                StructuralViolation::JsonConstructorInvariant(error),
+                node.span,
+            )
+        });
+        if self.0.is_ok() {
+            super::walk_json_table(self, node);
+        }
+    }
+    fn visit_json_table_nested_columns(&mut self, node: &super::JsonTableNestedColumns) {
+        if self.0.is_err() {
+            return;
+        }
+        self.0 = node.validate_constructor_invariants().map_err(|error| {
+            ValidateError::invalid_structure(
+                StructuralViolation::JsonConstructorInvariant(error),
+                node.span,
+            )
+        });
+        if self.0.is_ok() {
+            super::walk_json_table_nested_columns(self, node);
+        }
+    }
+    fn visit_json_table_plan_siblings(&mut self, node: &super::JsonTablePlanSiblings) {
+        if self.0.is_err() {
+            return;
+        }
+        self.0 = node.validate_constructor_invariants().map_err(|error| {
+            ValidateError::invalid_structure(
+                StructuralViolation::JsonConstructorInvariant(error),
+                node.span,
+            )
+        });
+        if self.0.is_ok() {
+            super::walk_json_table_plan_siblings(self, node);
+        }
+    }
+}
+fn validate_json_root(walk: impl FnOnce(&mut JsonValidation)) -> Result<(), ValidateError> {
+    let mut visitor = JsonValidation(Ok(()));
+    walk(&mut visitor);
+    visitor.0
 }

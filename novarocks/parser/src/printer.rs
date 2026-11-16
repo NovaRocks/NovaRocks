@@ -540,6 +540,14 @@ impl Printer {
 
     fn write_table_factor(&mut self, factor: &TableFactor) {
         match factor {
+            TableFactor::JsonTable { table, alias, .. } => {
+                self.write_json_table(table);
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
+
             TableFactor::Table {
                 name,
                 metadata,
@@ -768,6 +776,14 @@ impl Printer {
 
     fn write_expr(&mut self, expression: &Expr) {
         match expression {
+            Expr::JsonConstructor(node) => self.write_json_constructor(node),
+            Expr::JsonExists(node) => self.write_json_exists(node),
+            Expr::JsonValue(node) => self.write_json_value(node),
+            Expr::JsonQuery(node) => self.write_json_query(node),
+            Expr::JsonSerialize(node) => self.write_json_serialize(node),
+            Expr::JsonObject(node) => self.write_json_object(node),
+            Expr::JsonArray(node) => self.write_json_array(node),
+
             Expr::Identifier(ident) => self.write_ident(ident),
             Expr::CompoundIdentifier(ident) => {
                 self.write_ident_list_with_separator(&ident.parts, ".")
@@ -1703,6 +1719,395 @@ impl Printer {
     fn write_routine_indent(&mut self, indent: usize) {
         for _ in 0..indent {
             self.output.push_str("  ");
+        }
+    }
+}
+
+impl Printer {
+    fn write_json_constructor(&mut self, node: &JsonConstructor) {
+        self.output.push_str("JSON(");
+        self.write_json_expression(&node.expression, Some(node.format));
+        self.output.push(')');
+    }
+
+    fn write_json_exists(&mut self, node: &JsonExists) {
+        self.output.push_str("JSON_EXISTS(");
+        self.write_json_path_invocation(&node.path_invocation);
+        self.output.push_str(match node.error_behavior {
+            JsonExistsErrorBehavior::False => " FALSE ON ERROR",
+            JsonExistsErrorBehavior::True => " TRUE ON ERROR",
+            JsonExistsErrorBehavior::Unknown => " UNKNOWN ON ERROR",
+            JsonExistsErrorBehavior::Error => " ERROR ON ERROR",
+        });
+        self.output.push(')');
+    }
+
+    fn write_json_value(&mut self, node: &JsonValue) {
+        node.validate_constructor_invariants()
+            .expect("invalid JSON_VALUE constructor facts");
+        self.output.push_str("JSON_VALUE(");
+        self.write_json_path_invocation(&node.path_invocation);
+        self.write_json_returning(node.returned_type.as_ref(), None);
+        self.write_json_value_behavior(node.empty_behavior, node.empty_default.as_ref());
+        self.output.push_str(" ON EMPTY");
+        self.write_json_value_behavior(node.error_behavior, node.error_default.as_ref());
+        self.output.push_str(" ON ERROR)");
+    }
+
+    fn write_json_query(&mut self, node: &JsonQuery) {
+        self.output.push_str("JSON_QUERY(");
+        self.write_json_path_invocation(&node.path_invocation);
+        self.write_json_returning(node.returned_type.as_ref(), node.output_format);
+        self.write_json_query_wrapper(node.wrapper_behavior);
+        self.write_json_query_quotes(node.quotes_behavior);
+        self.write_json_query_behavior(node.empty_behavior);
+        self.output.push_str(" ON EMPTY");
+        self.write_json_query_behavior(node.error_behavior);
+        self.output.push_str(" ON ERROR)");
+    }
+
+    fn write_json_serialize(&mut self, node: &JsonSerialize) {
+        self.output.push_str("JSON_SERIALIZE(");
+        self.write_json_expression(&node.expression, Some(node.input_format));
+        self.write_json_returning(node.returned_type.as_ref(), node.output_format);
+        // ERROR is the enum's effective default, with no optional-presence bit.
+        match node.error_behavior {
+            JsonSerializeErrorBehavior::Error => {}
+            JsonSerializeErrorBehavior::Null => self.output.push_str(" NULL ON ERROR"),
+        }
+        self.output.push(')');
+    }
+
+    fn write_json_object(&mut self, node: &JsonObject) {
+        // The grammar allows NULL/UNIQUE clauses only after a nonempty member
+        // list. An empty list can only carry AstBuilder's true/false defaults.
+        assert!(
+            !node.members.is_empty() || (node.null_on_null && !node.unique_keys),
+            "empty JSON_OBJECT has unprintable NULL/UNIQUE facts"
+        );
+        self.output.push_str("JSON_OBJECT(");
+        for (index, member) in node.members.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_json_object_member(member);
+        }
+        if !node.members.is_empty() {
+            self.output.push_str(if node.null_on_null {
+                " NULL ON NULL"
+            } else {
+                " ABSENT ON NULL"
+            });
+            self.output.push_str(if node.unique_keys {
+                " WITH UNIQUE KEYS"
+            } else {
+                " WITHOUT UNIQUE KEYS"
+            });
+        }
+        self.write_json_returning(node.returned_type.as_ref(), node.output_format);
+        self.output.push(')');
+    }
+
+    fn write_json_object_member(&mut self, member: &JsonObjectMember) {
+        self.output.push_str("KEY ");
+        self.write_expr(&member.key);
+        self.output.push_str(" VALUE ");
+        self.write_json_expression(&member.value, member.format);
+    }
+
+    fn write_json_array(&mut self, node: &JsonArray) {
+        assert!(
+            !node.elements.is_empty() || !node.null_on_null,
+            "empty JSON_ARRAY has unprintable NULL facts"
+        );
+        self.output.push_str("JSON_ARRAY(");
+        for (index, element) in node.elements.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_json_array_element(element);
+        }
+        if !node.elements.is_empty() {
+            self.output.push_str(if node.null_on_null {
+                " NULL ON NULL"
+            } else {
+                " ABSENT ON NULL"
+            });
+        }
+        self.write_json_returning(node.returned_type.as_ref(), node.output_format);
+        self.output.push(')');
+    }
+
+    fn write_json_array_element(&mut self, element: &JsonArrayElement) {
+        self.write_json_expression(&element.value, element.format);
+    }
+
+    fn write_json_path_invocation(&mut self, node: &JsonPathInvocation) {
+        self.write_json_expression(&node.input_expression, Some(node.input_format));
+        self.output.push_str(", ");
+        self.write_json_path_string(&node.json_path);
+        if let Some(name) = &node.path_name {
+            self.output.push_str(" AS ");
+            self.write_ident(name);
+        }
+        if !node.path_parameters.is_empty() {
+            self.output.push_str(" PASSING ");
+            for (index, parameter) in node.path_parameters.iter().enumerate() {
+                if index != 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_json_path_parameter(parameter);
+            }
+        }
+    }
+
+    fn write_json_path_parameter(&mut self, parameter: &JsonPathParameter) {
+        self.write_json_expression(&parameter.parameter, parameter.format);
+        self.output.push_str(" AS ");
+        self.write_ident(&parameter.name);
+    }
+
+    fn write_json_path_string(&mut self, path: &JsonPathString) {
+        // Payload is already decoded by the original StringLiteral author.
+        self.write_quoted_string(&path.value);
+    }
+
+    fn write_json_expression(&mut self, expression: &Expr, format: Option<JsonFormat>) {
+        self.write_expr(expression);
+        if let Some(format) = format {
+            self.output.push_str(" FORMAT ");
+            self.write_json_format(format);
+        }
+    }
+
+    fn write_json_format(&mut self, format: JsonFormat) {
+        self.output.push_str(match format {
+            JsonFormat::Json => "JSON",
+            JsonFormat::Utf8 => "JSON ENCODING UTF8",
+            JsonFormat::Utf16 => "JSON ENCODING UTF16",
+            JsonFormat::Utf32 => "JSON ENCODING UTF32",
+        });
+    }
+
+    fn write_json_returning(
+        &mut self,
+        returned_type: Option<&TypeName>,
+        output_format: Option<JsonFormat>,
+    ) {
+        // FORMAT output syntax belongs inside RETURNING in the pinned grammar.
+        assert!(
+            returned_type.is_some() || output_format.is_none(),
+            "JSON output format has no RETURNING type"
+        );
+        if let Some(data_type) = returned_type {
+            self.output.push_str(" RETURNING ");
+            self.write_type_name(data_type);
+            if let Some(format) = output_format {
+                self.output.push_str(" FORMAT ");
+                self.write_json_format(format);
+            }
+        }
+    }
+
+    fn write_json_value_behavior(&mut self, behavior: JsonValueBehavior, default: Option<&Expr>) {
+        self.output.push(' ');
+        match behavior {
+            JsonValueBehavior::Null => {
+                assert!(default.is_none(), "NULL behavior has a default expression");
+                self.output.push_str("NULL");
+            }
+            JsonValueBehavior::Error => {
+                assert!(default.is_none(), "ERROR behavior has a default expression");
+                self.output.push_str("ERROR");
+            }
+            JsonValueBehavior::Default => {
+                self.output.push_str("DEFAULT ");
+                self.write_expr(default.expect("DEFAULT behavior has no expression"));
+            }
+        }
+    }
+
+    fn write_json_query_wrapper(&mut self, behavior: JsonQueryWrapperBehavior) {
+        self.output.push_str(match behavior {
+            JsonQueryWrapperBehavior::Without => " WITHOUT ARRAY WRAPPER",
+            JsonQueryWrapperBehavior::Conditional => " WITH CONDITIONAL ARRAY WRAPPER",
+            JsonQueryWrapperBehavior::Unconditional => " WITH UNCONDITIONAL ARRAY WRAPPER",
+        });
+    }
+
+    fn write_json_query_quotes(&mut self, behavior: Option<JsonQueryQuotesBehavior>) {
+        if let Some(behavior) = behavior {
+            self.output.push_str(match behavior {
+                JsonQueryQuotesBehavior::Keep => " KEEP QUOTES ON SCALAR STRING",
+                JsonQueryQuotesBehavior::Omit => " OMIT QUOTES ON SCALAR STRING",
+            });
+        }
+    }
+
+    fn write_json_query_behavior(&mut self, behavior: JsonQueryBehavior) {
+        self.output.push_str(match behavior {
+            JsonQueryBehavior::Null => " NULL",
+            JsonQueryBehavior::Error => " ERROR",
+            JsonQueryBehavior::EmptyArray => " EMPTY ARRAY",
+            JsonQueryBehavior::EmptyObject => " EMPTY OBJECT",
+        });
+    }
+
+    fn write_json_table(&mut self, node: &JsonTable) {
+        node.validate_constructor_invariants()
+            .expect("invalid JSON_TABLE constructor facts");
+        self.output.push_str("JSON_TABLE(");
+        self.write_json_path_invocation(&node.path_invocation);
+        self.write_json_table_columns(&node.columns);
+        if let Some(plan) = &node.plan {
+            match plan {
+                JsonTablePlan::Default(plan) => {
+                    self.output.push_str(" PLAN DEFAULT (");
+                    self.write_json_table_default_plan(plan);
+                }
+                JsonTablePlan::Specific(plan) => {
+                    self.output.push_str(" PLAN (");
+                    self.write_json_table_specific_plan(plan);
+                }
+            }
+            self.output.push(')');
+        }
+        if let Some(behavior) = node.error_behavior {
+            self.output.push_str(match behavior {
+                JsonTableErrorBehavior::Error => " ERROR ON ERROR",
+                JsonTableErrorBehavior::Empty => " EMPTY ON ERROR",
+            });
+        }
+        self.output.push(')');
+        // The outer TableFactor alias and its column list are root-owned.
+    }
+
+    fn write_json_table_columns(&mut self, columns: &[JsonTableColumn]) {
+        assert!(!columns.is_empty(), "JSON_TABLE column list is empty");
+        self.output.push_str(" COLUMNS (");
+        for (index, column) in columns.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_json_table_column(column);
+        }
+        self.output.push(')');
+    }
+
+    fn write_json_table_column(&mut self, column: &JsonTableColumn) {
+        match column {
+            JsonTableColumn::Ordinality(node) => self.write_json_table_ordinality_column(node),
+            JsonTableColumn::Value(node) => self.write_json_table_value_column(node),
+            JsonTableColumn::Query(node) => self.write_json_table_query_column(node),
+            JsonTableColumn::Nested(node) => self.write_json_table_nested_columns(node),
+        }
+    }
+
+    fn write_json_table_ordinality_column(&mut self, node: &JsonTableOrdinalityColumn) {
+        self.write_ident(&node.name);
+        self.output.push_str(" FOR ORDINALITY");
+    }
+
+    fn write_json_table_value_column(&mut self, node: &JsonTableValueColumn) {
+        node.validate_constructor_invariants()
+            .expect("invalid JSON_TABLE value column constructor facts");
+        self.write_ident(&node.name);
+        self.output.push(' ');
+        self.write_type_name(&node.data_type);
+        if let Some(path) = &node.json_path {
+            self.output.push_str(" PATH ");
+            self.write_json_path_string(path);
+        }
+        self.write_json_value_behavior(node.empty_behavior, node.empty_default.as_ref());
+        self.output.push_str(" ON EMPTY");
+        if let Some(behavior) = node.error_behavior {
+            self.write_json_value_behavior(behavior, node.error_default.as_ref());
+            self.output.push_str(" ON ERROR");
+        }
+    }
+
+    fn write_json_table_query_column(&mut self, node: &JsonTableQueryColumn) {
+        self.write_ident(&node.name);
+        self.output.push(' ');
+        self.write_type_name(&node.data_type);
+        self.output.push_str(" FORMAT ");
+        self.write_json_format(node.format);
+        if let Some(path) = &node.json_path {
+            self.output.push_str(" PATH ");
+            self.write_json_path_string(path);
+        }
+        self.write_json_query_wrapper(node.wrapper_behavior);
+        self.write_json_query_quotes(node.quotes_behavior);
+        self.write_json_query_behavior(node.empty_behavior);
+        self.output.push_str(" ON EMPTY");
+        if let Some(behavior) = node.error_behavior {
+            self.write_json_query_behavior(behavior);
+            self.output.push_str(" ON ERROR");
+        }
+    }
+
+    fn write_json_table_nested_columns(&mut self, node: &JsonTableNestedColumns) {
+        node.validate_constructor_invariants()
+            .expect("invalid JSON_TABLE nested column constructor facts");
+        self.output.push_str("NESTED PATH ");
+        self.write_json_path_string(&node.json_path);
+        if let Some(name) = &node.path_name {
+            self.output.push_str(" AS ");
+            self.write_ident(name);
+        }
+        self.write_json_table_columns(&node.columns);
+    }
+
+    fn write_json_table_default_plan(&mut self, plan: &JsonTableDefaultPlan) {
+        self.output.push_str(match plan.parent_child {
+            JsonTableParentChildPlanType::Outer => "OUTER",
+            JsonTableParentChildPlanType::Inner => "INNER",
+        });
+        self.output.push_str(", ");
+        self.output.push_str(match plan.siblings {
+            JsonTableSiblingsPlanType::Union => "UNION",
+            JsonTableSiblingsPlanType::Cross => "CROSS",
+        });
+    }
+
+    fn write_json_table_specific_plan(&mut self, plan: &JsonTableSpecificPlan) {
+        match plan {
+            JsonTableSpecificPlan::Leaf(node) => self.write_json_table_plan_leaf(node),
+            JsonTableSpecificPlan::ParentChild(node) => {
+                self.write_json_table_plan_parent_child(node)
+            }
+            JsonTableSpecificPlan::Siblings(node) => self.write_json_table_plan_siblings(node),
+        }
+    }
+
+    fn write_json_table_plan_leaf(&mut self, node: &JsonTablePlanLeaf) {
+        self.write_ident(&node.name);
+    }
+
+    fn write_json_table_plan_parent_child(&mut self, node: &JsonTablePlanParentChild) {
+        self.write_json_table_plan_leaf(&node.parent);
+        self.output.push_str(match node.plan_type {
+            JsonTableParentChildPlanType::Outer => " OUTER (",
+            JsonTableParentChildPlanType::Inner => " INNER (",
+        });
+        self.write_json_table_specific_plan(&node.child);
+        self.output.push(')');
+    }
+
+    fn write_json_table_plan_siblings(&mut self, node: &JsonTablePlanSiblings) {
+        node.validate_constructor_invariants()
+            .expect("invalid JSON_TABLE sibling plan constructor facts");
+        for (index, sibling) in node.siblings.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(match node.plan_type {
+                    JsonTableSiblingsPlanType::Union => " UNION ",
+                    JsonTableSiblingsPlanType::Cross => " CROSS ",
+                });
+            }
+            // Preserve nested specific-plan hierarchy, even for the same type.
+            self.output.push('(');
+            self.write_json_table_specific_plan(sibling);
+            self.output.push(')');
         }
     }
 }

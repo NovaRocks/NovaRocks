@@ -43,8 +43,12 @@ mod extract_binding_tests;
 mod full_value_type_tests;
 pub(crate) mod functions;
 mod helpers;
+mod json_syntax;
 #[cfg(test)]
 pub(crate) use helpers::sql_logical_projection;
+pub(crate) use json_syntax::{
+    is_plain_json_query, is_supported_json_array_profile, is_supported_json_object_profile,
+};
 pub(crate) mod declaration_widening;
 mod literal_coercion;
 #[cfg(test)]

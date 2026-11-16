@@ -2994,6 +2994,55 @@ impl Visit for CompletionRetainedBytes {
         novarocks_parser::ast::walk_control_statement(self, statement);
     }
 
+    fn visit_json_path_string(&mut self, path: &novarocks_parser::ast::JsonPathString) {
+        self.add(path.value.capacity());
+    }
+    fn visit_json_path_invocation(&mut self, node: &novarocks_parser::ast::JsonPathInvocation) {
+        self.add_vec_capacity::<novarocks_parser::ast::JsonPathParameter>(
+            node.path_parameters.capacity(),
+        );
+        novarocks_parser::ast::walk_json_path_invocation(self, node);
+    }
+    fn visit_json_object(&mut self, node: &novarocks_parser::ast::JsonObject) {
+        self.add_vec_capacity::<novarocks_parser::ast::JsonObjectMember>(node.members.capacity());
+        novarocks_parser::ast::walk_json_object(self, node);
+    }
+    fn visit_json_array(&mut self, node: &novarocks_parser::ast::JsonArray) {
+        self.add_vec_capacity::<novarocks_parser::ast::JsonArrayElement>(node.elements.capacity());
+        novarocks_parser::ast::walk_json_array(self, node);
+    }
+    fn visit_json_table(&mut self, node: &novarocks_parser::ast::JsonTable) {
+        self.add(std::mem::size_of::<novarocks_parser::ast::JsonTable>());
+        self.add_vec_capacity::<novarocks_parser::ast::JsonTableColumn>(node.columns.capacity());
+        novarocks_parser::ast::walk_json_table(self, node);
+    }
+    fn visit_json_table_nested_columns(
+        &mut self,
+        node: &novarocks_parser::ast::JsonTableNestedColumns,
+    ) {
+        self.add_vec_capacity::<novarocks_parser::ast::JsonTableColumn>(node.columns.capacity());
+        novarocks_parser::ast::walk_json_table_nested_columns(self, node);
+    }
+    fn visit_json_table_plan_siblings(
+        &mut self,
+        node: &novarocks_parser::ast::JsonTablePlanSiblings,
+    ) {
+        self.add_vec_capacity::<novarocks_parser::ast::JsonTableSpecificPlan>(
+            node.siblings.capacity(),
+        );
+        novarocks_parser::ast::walk_json_table_plan_siblings(self, node);
+    }
+
+    fn visit_json_table_plan_parent_child(
+        &mut self,
+        node: &novarocks_parser::ast::JsonTablePlanParentChild,
+    ) {
+        self.add(std::mem::size_of::<
+            novarocks_parser::ast::JsonTableSpecificPlan,
+        >());
+        novarocks_parser::ast::walk_json_table_plan_parent_child(self, node);
+    }
+
     fn visit_query(&mut self, query: &Query) {
         self.add(std::mem::size_of::<Query>());
         self.add_query_containers(query);
@@ -3003,6 +3052,22 @@ impl Visit for CompletionRetainedBytes {
     fn visit_expr(&mut self, expression: &Expr) {
         self.add(std::mem::size_of::<Expr>());
         match expression {
+            Expr::JsonConstructor(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::JsonConstructor>())
+            }
+            Expr::JsonExists(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::JsonExists>())
+            }
+            Expr::JsonValue(_) => self.add(std::mem::size_of::<novarocks_parser::ast::JsonValue>()),
+            Expr::JsonQuery(_) => self.add(std::mem::size_of::<novarocks_parser::ast::JsonQuery>()),
+            Expr::JsonSerialize(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::JsonSerialize>())
+            }
+            Expr::JsonObject(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::JsonObject>())
+            }
+            Expr::JsonArray(_) => self.add(std::mem::size_of::<novarocks_parser::ast::JsonArray>()),
+
             Expr::CompoundIdentifier(identifier) => {
                 self.add_vec_capacity::<Ident>(identifier.parts.capacity());
             }
@@ -3095,7 +3160,8 @@ impl Visit for CompletionRetainedBytes {
     fn visit_table_factor(&mut self, factor: &TableFactor) {
         self.add(std::mem::size_of::<TableFactor>());
         match factor {
-            TableFactor::Table { alias, .. }
+            TableFactor::JsonTable { alias, .. }
+            | TableFactor::Table { alias, .. }
             | TableFactor::Derived { alias, .. }
             | TableFactor::TableFunction { alias, .. } => {
                 self.add_alias_containers(alias);
@@ -3775,6 +3841,41 @@ mod tests {
         .unwrap();
 
         assert!(definition.completion_retained_bytes().unwrap() > COMPLETION_LIMIT as u64);
+    }
+
+    #[test]
+    fn completion_accounting_charges_json_member_capacity() {
+        const LIMIT: usize = 32 * 1024 * 1024;
+        let mut query = test_query("SELECT 1");
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT")
+        };
+        let capacity = LIMIT / std::mem::size_of::<novarocks_parser::ast::JsonObjectMember>() + 1;
+        select.projection[0] = novarocks_parser::build::item(
+            Expr::JsonObject(Box::new(novarocks_parser::ast::JsonObject {
+                members: Vec::with_capacity(capacity),
+                null_on_null: true,
+                unique_keys: false,
+                returned_type: None,
+                output_format: None,
+                span: novarocks_parser::SYNTHETIC,
+            })),
+            None,
+            false,
+        );
+        let definition = SqlMvRewriteDefinitionFacts::try_new(
+            1,
+            [11; 32],
+            query,
+            test_resolution(),
+            "iceberg".to_string(),
+            None,
+            vec![test_source(SqlMvRewriteBaseTableFacts::unavailable(
+                "not published".to_string(),
+            ))],
+        )
+        .unwrap();
+        assert!(definition.completion_retained_bytes().unwrap() > LIMIT as u64);
     }
 
     struct CandidateCatalog {

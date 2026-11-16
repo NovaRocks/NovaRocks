@@ -19,6 +19,11 @@ pub struct TableWithJoins {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TableFactor {
+    JsonTable {
+        table: Box<super::JsonTable>,
+        alias: Option<TableAlias>,
+        span: Span,
+    },
     Table {
         name: ObjectName,
         /// A parser-owned `$metadata` suffix on the final unquoted table-name
@@ -67,7 +72,8 @@ pub enum TableFunctionSyntax {
 impl TableFactor {
     pub const fn span(&self) -> Span {
         match self {
-            Self::Table { span, .. }
+            Self::JsonTable { span, .. }
+            | Self::Table { span, .. }
             | Self::Derived { span, .. }
             | Self::TableFunction { span, .. }
             | Self::Unnest { span, .. }

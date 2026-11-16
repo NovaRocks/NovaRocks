@@ -51,6 +51,9 @@ pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
         StructuralViolation::InvalidQueryModifierOwner => {
             "direct SELECT modifiers must belong to the query specification".to_string()
         }
+        StructuralViolation::JsonConstructorInvariant(error) => {
+            format!("invalid SQL structure: {error}")
+        }
         StructuralViolation::EmptyUnnestExpressionList => {
             "invalid SQL structure: empty UNNEST expression list".to_owned()
         }

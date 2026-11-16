@@ -353,6 +353,11 @@ impl<'a> super::AnalyzerContext<'a> {
         outer_scope: Option<&AnalyzerScope>,
     ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
         match factor {
+            ast::TableFactor::JsonTable { span, .. } => Err(AnalyzeError::unsupported_expression(
+                "JSON_TABLE is not supported",
+                *span,
+            )),
+
             ast::TableFactor::Table {
                 name,
                 metadata,

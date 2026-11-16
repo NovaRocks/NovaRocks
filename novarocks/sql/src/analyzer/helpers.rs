@@ -971,7 +971,8 @@ fn mark_table_with_joins_aliases_explicit(table_with_joins: &mut ast::TableWithJ
 
 fn mark_table_factor_aliases_explicit(factor: &mut ast::TableFactor) {
     match factor {
-        ast::TableFactor::Table { alias, .. }
+        ast::TableFactor::JsonTable { alias, .. }
+        | ast::TableFactor::Table { alias, .. }
         | ast::TableFactor::TableFunction { alias, .. }
         | ast::TableFactor::Unnest { alias, .. } => {
             if let Some(alias) = alias {

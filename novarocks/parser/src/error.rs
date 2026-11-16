@@ -123,6 +123,7 @@ pub enum StructuralViolation {
     EmptySelectProjection,
     InvalidSetOperationOperandCount,
     InvalidQueryModifierOwner,
+    JsonConstructorInvariant(crate::ast::JsonAstInvariantError),
     EmptyUnnestExpressionList,
     MismatchedCaseArms,
     DuplicateTableColumnName,

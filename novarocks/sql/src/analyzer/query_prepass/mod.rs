@@ -54,7 +54,7 @@ pub(crate) fn preanalyze_with_semantics(
     mut query: Query,
     semantics: &crate::sql_mode::SqlSemanticSettings,
 ) -> Result<Query, AnalyzeError> {
-    reject_inline_functions(&query)?;
+    reject_unimplemented_query_syntax(&query)?;
     let max_depth = recursive_cte_max_depth(&query)
         .or_else(|| {
             semantics
@@ -69,32 +69,70 @@ pub(crate) fn preanalyze_with_semantics(
     Ok(query)
 }
 
-/// Inline definitions must fail before catalog discovery or global function
-/// lookup; ignoring a declaration could bind its call to an unrelated routine.
-fn reject_inline_functions(query: &Query) -> Result<(), AnalyzeError> {
+/// Capability rejection precedes catalog discovery and global function lookup.
+/// Inline definitions cannot be ignored and rebound as unrelated global calls.
+fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> {
     #[derive(Default)]
-    struct UnsupportedFunction(Option<Span>);
-
-    impl Visit for UnsupportedFunction {
+    struct UnsupportedSyntax(Option<(&'static str, Span)>);
+    impl Visit for UnsupportedSyntax {
         fn visit_query(&mut self, query: &Query) {
             if self.0.is_some() {
                 return;
             }
             if let Some(function) = query.functions.first() {
-                self.0 = Some(function.span);
+                self.0 = Some(("Inline functions are not supported", function.span));
             } else {
                 novarocks_parser::ast::walk_query(self, query);
             }
         }
+        fn visit_expr(&mut self, expression: &Expr) {
+            if self.0.is_some() {
+                return;
+            }
+            match expression {
+                Expr::JsonConstructor(_)
+                | Expr::JsonExists(_)
+                | Expr::JsonValue(_)
+                | Expr::JsonSerialize(_) => {
+                    self.0 = Some(("SQL/JSON constructor is not supported", expression.span()));
+                }
+                Expr::JsonObject(node) if !super::is_supported_json_object_profile(node) => {
+                    self.0 = Some((
+                        "JSON_OBJECT clauses are not supported by the existing function",
+                        node.span,
+                    ));
+                }
+                Expr::JsonArray(node) if !super::is_supported_json_array_profile(node) => {
+                    self.0 = Some((
+                        "JSON_ARRAY clauses are not supported by the existing function",
+                        node.span,
+                    ));
+                }
+                Expr::JsonQuery(node) if !super::is_plain_json_query(node) => {
+                    self.0 = Some((
+                        "JSON_QUERY only supports its plain two-argument profile",
+                        node.span,
+                    ));
+                }
+                _ => novarocks_parser::ast::walk_expr(self, expression),
+            }
+        }
+        fn visit_table_factor(&mut self, factor: &TableFactor) {
+            if self.0.is_some() {
+                return;
+            }
+            match factor {
+                TableFactor::JsonTable { span, .. } => {
+                    self.0 = Some(("JSON_TABLE is not supported", *span))
+                }
+                _ => novarocks_parser::ast::walk_table_factor(self, factor),
+            }
+        }
     }
-
-    let mut visitor = UnsupportedFunction::default();
+    let mut visitor = UnsupportedSyntax::default();
     visitor.visit_query(query);
     match visitor.0 {
-        Some(span) => Err(AnalyzeError::unsupported_expression(
-            "Inline functions are not supported",
-            span,
-        )),
+        Some((message, span)) => Err(AnalyzeError::unsupported_expression(message, span)),
         None => Ok(()),
     }
 }
@@ -708,7 +746,8 @@ fn normalize_cross_factor(factor: &mut TableFactor) {
             }
             normalize_cross_factor(&mut table_with_joins.relation);
         }
-        TableFactor::Table { .. }
+        TableFactor::JsonTable { .. }
+        | TableFactor::Table { .. }
         | TableFactor::TableFunction { .. }
         | TableFactor::Unnest { .. } => {}
     }

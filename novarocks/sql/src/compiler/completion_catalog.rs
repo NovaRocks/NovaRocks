@@ -702,6 +702,14 @@ impl<'a> CatalogNeedCollector<'a> {
     ) -> Result<(), SqlCompileError> {
         self.step()?;
         match factor {
+            ast::TableFactor::JsonTable { span, .. } => {
+                Err(crate::analyze_error::AnalyzeError::unsupported_expression(
+                    "JSON_TABLE is not supported",
+                    *span,
+                )
+                .into())
+            }
+
             ast::TableFactor::Table {
                 name,
                 metadata,

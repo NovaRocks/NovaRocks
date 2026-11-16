@@ -3429,6 +3429,36 @@ fn contains_match_against(expr: &Expr) -> bool {
 
 fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
     match expr {
+        Expr::JsonObject(node) => {
+            if !crate::analyzer::is_supported_json_object_profile(node) {
+                return Err(projection_filter_error());
+            }
+            for member in &node.members {
+                reject_unsupported_expr(&member.key)?;
+                reject_unsupported_expr(&member.value)?;
+            }
+        }
+        Expr::JsonArray(node) => {
+            if !crate::analyzer::is_supported_json_array_profile(node) {
+                return Err(projection_filter_error());
+            }
+            for element in &node.elements {
+                reject_unsupported_expr(&element.value)?;
+            }
+        }
+
+        Expr::JsonQuery(node) => {
+            if !crate::analyzer::is_plain_json_query(node) {
+                return Err(projection_filter_error());
+            }
+            reject_unsupported_expr(&node.path_invocation.input_expression)?;
+        }
+
+        Expr::JsonConstructor(_)
+        | Expr::JsonExists(_)
+        | Expr::JsonValue(_)
+        | Expr::JsonSerialize(_) => return Err(projection_filter_error()),
+
         Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => {
             return Err(projection_filter_error());
         }
@@ -3886,6 +3916,69 @@ mod tests {
             err.contains(needle) || err.starts_with(NATIVE_PARSE_REJECTION),
             "expected error to contain `{needle}` or a native parser rejection for `{sql}`, got `{err}`"
         );
+    }
+
+    #[test]
+    fn typed_json_keeps_existing_mv_profiles_and_rejects_volatile_children() {
+        let mut query = parse_query("SELECT k1 AS value FROM ice.ns.orders");
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT")
+        };
+        select.projection[0] = novarocks_parser::build::item(
+            Expr::JsonObject(Box::new(ast::JsonObject {
+                members: vec![ast::JsonObjectMember {
+                    key: novarocks_parser::build::string("k"),
+                    value: novarocks_parser::build::identifier(novarocks_parser::build::ident(
+                        "k1", None,
+                    )),
+                    format: None,
+                    span: novarocks_parser::SYNTHETIC,
+                }],
+                null_on_null: true,
+                unique_keys: false,
+                returned_type: None,
+                output_format: None,
+                span: novarocks_parser::SYNTHETIC,
+            })),
+            Some(novarocks_parser::build::ident("value", None)),
+            true,
+        );
+        assert!(classify_incremental_mv_query(&query).is_ok());
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT")
+        };
+        let ast::SelectItem::ExprWithAlias {
+            expr: Expr::JsonObject(node),
+            ..
+        } = &mut select.projection[0]
+        else {
+            panic!("JSON_OBJECT")
+        };
+        node.members[0].value = novarocks_parser::build::function(
+            novarocks_parser::build::object_name(vec![novarocks_parser::build::ident(
+                "rand", None,
+            )])
+            .unwrap(),
+            vec![],
+        );
+        let error = classify_incremental_mv_query(&query).unwrap_err();
+        assert!(error.contains("non-deterministic"), "{error}");
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT")
+        };
+        select.projection[0] = novarocks_parser::build::item(
+            Expr::JsonQuery(Box::new(ast::JsonQuery::plain(
+                ast::JsonPathInvocation::plain(
+                    novarocks_parser::build::identifier(novarocks_parser::build::ident("k1", None)),
+                    ast::JsonPathString::new("$.a".to_string(), novarocks_parser::SYNTHETIC),
+                    novarocks_parser::SYNTHETIC,
+                ),
+                novarocks_parser::SYNTHETIC,
+            ))),
+            Some(novarocks_parser::build::ident("value", None)),
+            true,
+        );
+        assert!(classify_incremental_mv_query(&query).is_ok());
     }
 
     #[test]

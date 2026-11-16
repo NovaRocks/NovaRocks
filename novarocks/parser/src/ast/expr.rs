@@ -23,6 +23,14 @@ use crate::{
 /// A SQL expression with source spans retained at every syntax node.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Expr {
+    JsonConstructor(Box<super::JsonConstructor>),
+    JsonExists(Box<super::JsonExists>),
+    JsonValue(Box<super::JsonValue>),
+    JsonQuery(Box<super::JsonQuery>),
+    JsonSerialize(Box<super::JsonSerialize>),
+    JsonObject(Box<super::JsonObject>),
+    JsonArray(Box<super::JsonArray>),
+
     Identifier(Ident),
     CompoundIdentifier(CompoundIdentifier),
     Literal(Literal),
@@ -52,6 +60,14 @@ pub enum Expr {
 impl Expr {
     pub const fn span(&self) -> Span {
         match self {
+            Self::JsonConstructor(node) => node.span,
+            Self::JsonExists(node) => node.span,
+            Self::JsonValue(node) => node.span,
+            Self::JsonQuery(node) => node.span,
+            Self::JsonSerialize(node) => node.span,
+            Self::JsonObject(node) => node.span,
+            Self::JsonArray(node) => node.span,
+
             Self::Identifier(ident) => ident.span,
             Self::CompoundIdentifier(ident) => ident.span,
             Self::Literal(literal) => literal.span,

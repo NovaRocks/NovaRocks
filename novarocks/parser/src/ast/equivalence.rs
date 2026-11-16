@@ -320,6 +320,19 @@ impl SyntaxEq for TableFactor {
     fn syntax_eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
+                Self::JsonTable {
+                    table: left,
+                    alias: la,
+                    ..
+                },
+                Self::JsonTable {
+                    table: right,
+                    alias: ra,
+                    ..
+                },
+            ) => left.syntax_eq(right) && syntax_eq_option(la, ra),
+
+            (
                 Self::Table {
                     name: left_name,
                     metadata: left_metadata,
@@ -497,6 +510,14 @@ impl SyntaxEq for WindowFrameBound {
 impl SyntaxEq for Expr {
     fn syntax_eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::JsonConstructor(left), Self::JsonConstructor(right)) => left.syntax_eq(right),
+            (Self::JsonExists(left), Self::JsonExists(right)) => left.syntax_eq(right),
+            (Self::JsonValue(left), Self::JsonValue(right)) => left.syntax_eq(right),
+            (Self::JsonQuery(left), Self::JsonQuery(right)) => left.syntax_eq(right),
+            (Self::JsonSerialize(left), Self::JsonSerialize(right)) => left.syntax_eq(right),
+            (Self::JsonObject(left), Self::JsonObject(right)) => left.syntax_eq(right),
+            (Self::JsonArray(left), Self::JsonArray(right)) => left.syntax_eq(right),
+
             (Self::Identifier(left), Self::Identifier(right)) => left.syntax_eq(right),
             (Self::CompoundIdentifier(left), Self::CompoundIdentifier(right)) => {
                 syntax_eq_slice(&left.parts, &right.parts)

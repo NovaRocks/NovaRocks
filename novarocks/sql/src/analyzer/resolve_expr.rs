@@ -245,6 +245,17 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         match expr {
+            ast::Expr::JsonQuery(node) => self.analyze_json_query_syntax(node, scope),
+            ast::Expr::JsonObject(node) => self.analyze_json_object_syntax(node, scope),
+            ast::Expr::JsonArray(node) => self.analyze_json_array_syntax(node, scope),
+            ast::Expr::JsonConstructor(_)
+            | ast::Expr::JsonExists(_)
+            | ast::Expr::JsonValue(_)
+            | ast::Expr::JsonSerialize(_) => Err(AnalyzeError::unsupported_expression(
+                "SQL/JSON constructor is not supported",
+                expr.span(),
+            )),
+
             // Simple column reference
             ast::Expr::Identifier(ident) => {
                 if let Some(param) = scope.resolve_lambda_param(&ident.value) {
@@ -1989,6 +2000,20 @@ impl<'a> super::AnalyzerContext<'a> {
         func: &ast::FunctionCall,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        let original_arguments = func.arguments.iter().collect::<Vec<_>>();
+        self.analyze_function_with_original_arguments(func, &original_arguments, scope)
+    }
+
+    /// Share the original function admission/binding path while preserving
+    /// actual child-expression addresses for materialized constants and writes.
+    /// Reserved JSON constructors supply plain call metadata and their original
+    /// ordered child references; ordinary calls supply their own argument list.
+    pub(super) fn analyze_function_with_original_arguments(
+        &self,
+        func: &ast::FunctionCall,
+        original_arguments: &[&ast::Expr],
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
         let original_name = print_object_name(&func.name).to_ascii_lowercase();
         if matches!(original_name.as_str(), "grouping" | "grouping_id") {
             return self.analyze_grouping_function(func, scope);
@@ -2011,8 +2036,7 @@ impl<'a> super::AnalyzerContext<'a> {
         if name == "element_at" {
             // Analyze the first argument to learn its type. Preserve any
             // authored failure before analyzing another argument or retrying.
-            let first_arg_ty = func
-                .arguments
+            let first_arg_ty = original_arguments
                 .first()
                 .map(|argument| {
                     self.analyze_expr(argument, scope)
@@ -2036,7 +2060,7 @@ impl<'a> super::AnalyzerContext<'a> {
         // value argument, and SEPARATOR belongs exclusively to GROUP_CONCAT.
         // Reject these shapes before aggregate ORDER BY validation so the
         // StarRocks-compatible parse error remains stable.
-        if func.arguments.is_empty() && !func.order_by.is_empty() {
+        if original_arguments.is_empty() && !func.order_by.is_empty() {
             return Err(AnalyzeError::invalid_query_shape(
                 if matches!(func.quantifier, ast::FunctionQuantifier::Distinct) {
                     "Unexpected input 'order', the most similar input is {a legal identifier}."
@@ -2047,7 +2071,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 func.span,
             ));
         }
-        if func.arguments.is_empty() && func.separator.is_some() {
+        if original_arguments.is_empty() && func.separator.is_some() {
             return Err(AnalyzeError::invalid_query_shape(
                 format!("No viable statement for input '{}(separator NULL'.", name),
                 func.span,
@@ -2067,14 +2091,14 @@ impl<'a> super::AnalyzerContext<'a> {
         // Keep it out of ordinary argument resolution: the empty aggregate
         // argument list is the analyzer representation of COUNT(*).
         let is_count_star = name == "count"
-            && matches!(func.arguments.as_slice(), [ast::Expr::Identifier(ident)] if ident.value == "*");
+            && matches!(original_arguments, [ast::Expr::Identifier(ident)] if ident.value == "*");
 
         // SQL preparation makes separator ownership explicit. Analysis and
         // output naming consume the same idempotently normalized syntax.
         let group_concat_args = if matches!(name.as_str(), "group_concat" | "string_agg") {
-            func.arguments
+            original_arguments
                 .iter()
-                .cloned()
+                .map(|argument| ast::Expr::clone(argument))
                 .chain(func.separator.as_deref().cloned())
                 .collect::<Vec<_>>()
         } else {
@@ -2083,7 +2107,7 @@ impl<'a> super::AnalyzerContext<'a> {
         let arg_exprs: Vec<&ast::Expr> = if matches!(name.as_str(), "group_concat" | "string_agg") {
             group_concat_args.iter().collect()
         } else {
-            func.arguments.iter().collect()
+            original_arguments.to_vec()
         };
 
         // The native parser represents EXTRACT as a function call whose first
@@ -6791,6 +6815,13 @@ fn starrocks_error_type_name(dt: &DataType) -> String {
 /// producing function in the AST. Also handles the bare `NULL` literal.
 fn sql_expr_logical_type_name(expr: &ast::Expr) -> Option<String> {
     match expr {
+        ast::Expr::JsonObject(node) if super::is_supported_json_object_profile(node) => {
+            Some("json".to_string())
+        }
+        ast::Expr::JsonArray(node) if super::is_supported_json_array_profile(node) => {
+            Some("json".to_string())
+        }
+
         ast::Expr::Literal(ast::Literal {
             kind: ast::LiteralKind::Null,
             ..

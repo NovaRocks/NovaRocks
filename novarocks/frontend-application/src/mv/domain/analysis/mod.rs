@@ -220,6 +220,7 @@ fn validate_mv_select_raw_clauses_in_table_with_joins(
 
 fn validate_mv_select_raw_clauses_in_factor(factor: &TableFactor) -> Result<(), String> {
     match factor {
+        TableFactor::JsonTable { .. } => Err(unsupported_mv_from_clause("JSON_TABLE")),
         TableFactor::Table { version, .. } => {
             if version.is_some() {
                 return Err(unsupported_mv_from_clause("table version qualifiers"));
