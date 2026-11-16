@@ -480,9 +480,9 @@ fn constrain_literal_in(
         // authorizes the existing constant JSON representation conversion.
         ast::Expr::Cast(cast) => {
             if is_variant_cast(cast)
-                && let Some(syntax) = constant_variant_in(&cast.expr, encoded.as_deref_mut())?
+                && let Some(syntax) = constant_variant_in(&cast.expression, encoded.as_deref_mut())?
             {
-                *cast.expr = syntax;
+                cast.expression = syntax;
             }
         }
         ast::Expr::Nested(nested) => {
@@ -651,9 +651,9 @@ fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
                     }
                     .as_str(),
                     "varchar" | "string" | "text"
-                ) && cast.format.is_none() =>
+                ) =>
             {
-                string_literal(&cast.expr)
+                string_literal(&cast.expression)
             }
             _ => None,
         }
@@ -939,8 +939,8 @@ fn typed_write_literal_source(
             if is_variant_cast(cast)
                 && target.logical_type() == novarocks_type_contract::ValueLogicalType::Variant =>
         {
-            if let Some(syntax) = constant_variant_in(&cast.expr, encoded)? {
-                *cast.expr = syntax;
+            if let Some(syntax) = constant_variant_in(&cast.expression, encoded)? {
+                cast.expression = syntax;
             }
         }
         _ => {}
@@ -1489,7 +1489,7 @@ mod typed_write_source_tests {
         };
         assert!(is_variant_cast(cast));
         assert!(matches!(
-            cast.expr.as_ref(),
+            &cast.expression,
             ast::Expr::Literal(ast::Literal {
                 kind: ast::LiteralKind::Binary(_),
                 ..

@@ -127,7 +127,7 @@ pub enum StructuralViolation {
     InvalidQueryModifierOwner,
     JsonConstructorInvariant(crate::ast::JsonAstInvariantError),
     EmptyUnnestExpressionList,
-    MismatchedCaseArms,
+    EmptyCaseBranches,
     DuplicateTableColumnName,
 }
 

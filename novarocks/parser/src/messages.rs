@@ -61,8 +61,8 @@ pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
         StructuralViolation::EmptyUnnestExpressionList => {
             "invalid SQL structure: empty UNNEST expression list".to_owned()
         }
-        StructuralViolation::MismatchedCaseArms => {
-            "invalid SQL structure: mismatched CASE condition and result arms".to_owned()
+        StructuralViolation::EmptyCaseBranches => {
+            "invalid SQL structure: empty CASE branch list".to_owned()
         }
         StructuralViolation::DuplicateTableColumnName => {
             "invalid SQL structure: duplicate CREATE TABLE column name".to_owned()

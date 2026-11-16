@@ -496,19 +496,21 @@ impl SyntaxEq for Expr {
             (Self::Unary(left), Self::Unary(right)) => left.syntax_eq(right),
             (Self::Binary(left), Self::Binary(right)) => left.syntax_eq(right),
             (Self::Logical(left), Self::Logical(right)) => left.syntax_eq(right),
+            (Self::Exists(left), Self::Exists(right)) => left.syntax_eq(right),
+            (Self::Unique(left), Self::Unique(right)) => left.syntax_eq(right),
+            (Self::Cast(left), Self::Cast(right)) => left.syntax_eq(right),
+            (Self::Lambda(left), Self::Lambda(right)) => left.syntax_eq(right),
+            (Self::SearchedCase(left), Self::SearchedCase(right)) => left.syntax_eq(right),
+            (Self::SimpleCase(left), Self::SimpleCase(right)) => left.syntax_eq(right),
             (Self::Predicated(left), Self::Predicated(right)) => left.syntax_eq(right),
             (Self::InList(left), Self::InList(right)) => left.syntax_eq(right),
             (Self::Nested(left), Self::Nested(right)) => left.syntax_eq(right),
-            (Self::Exists(left), Self::Exists(right)) => left.syntax_eq(right),
-            (Self::Case(left), Self::Case(right)) => left.syntax_eq(right),
-            (Self::Cast(left), Self::Cast(right)) => left.syntax_eq(right),
             (Self::Interval(left), Self::Interval(right)) => left.syntax_eq(right),
             (Self::Subquery(left), Self::Subquery(right)) => left.syntax_eq(right),
             (Self::Tuple(left), Self::Tuple(right)) => left.syntax_eq(right),
             (Self::Array(left), Self::Array(right)) => left.syntax_eq(right),
             (Self::Map(left), Self::Map(right)) => left.syntax_eq(right),
             (Self::Struct(left), Self::Struct(right)) => left.syntax_eq(right),
-            (Self::Lambda(left), Self::Lambda(right)) => left.syntax_eq(right),
             (Self::Access(left), Self::Access(right)) => left.syntax_eq(right),
             _ => false,
         }
@@ -561,30 +563,6 @@ impl SyntaxEq for BinaryExpr {
 impl SyntaxEq for NestedExpr {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.expression.syntax_eq(&other.expression)
-    }
-}
-
-impl SyntaxEq for ExistsExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.negated == other.negated && self.query.syntax_eq(&other.query)
-    }
-}
-
-impl SyntaxEq for CaseExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_option(&self.operand, &other.operand)
-            && syntax_eq_slice(&self.conditions, &other.conditions)
-            && syntax_eq_slice(&self.results, &other.results)
-            && syntax_eq_option(&self.else_result, &other.else_result)
-    }
-}
-
-impl SyntaxEq for CastExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.expr.syntax_eq(&other.expr)
-            && self.data_type.syntax_eq(&other.data_type)
-            && self.kind == other.kind
-            && syntax_eq_option(&self.format, &other.format)
     }
 }
 
@@ -644,14 +622,6 @@ impl SyntaxEq for StructExpr {
 impl SyntaxEq for StructExprField {
     fn syntax_eq(&self, other: &Self) -> bool {
         syntax_eq_option(&self.name, &other.name) && self.value.syntax_eq(&other.value)
-    }
-}
-
-impl SyntaxEq for LambdaExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_slice(&self.parameters, &other.parameters)
-            && self.parenthesized_single_parameter == other.parenthesized_single_parameter
-            && self.body.syntax_eq(&other.body)
     }
 }
 

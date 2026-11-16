@@ -26,12 +26,13 @@ use crate::ast::{
 use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
-        AccessExpr, AccessKind, ArrayExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr,
-        CastKind, DataTypeParameter, ExistsExpr, Expr, FunctionCall, FunctionOrderBy,
-        FunctionQuantifier, Ident, InListExpr, IntervalExpr, IntervalField, JsonOperator,
-        LambdaExpr, Literal, LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment, ObjectName,
-        RowDataTypeField, SubqueryExpr, TupleExpr, TypeName, UnaryExpr, UnaryOperator, WindowFrame,
-        WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+        AccessExpr, AccessKind, ArrayExpr, BinaryExpr, BinaryOperator, CastExpr, DataTypeParameter,
+        ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier, Ident, InListExpr,
+        IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration, LambdaExpr, Literal,
+        LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment, ObjectName, RowDataTypeField,
+        SearchedCaseExpr, SimpleCaseExpr, SubqueryExpr, TupleExpr, TypeName, UnaryExpr,
+        UnaryOperator, WhenClause, WhenMatch, WindowFrame, WindowFrameBound, WindowFrameExclusion,
+        WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -275,19 +276,22 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             if self.current_is_symbol(Symbol::Arrow) && self.arrow_starts_lambda(&left) {
                 let parameters = Self::lambda_parameters(&left)
                     .expect("arrow_starts_lambda only accepts identifier parameters");
-                let parenthesized_single_parameter =
-                    parameters.len() == 1 && matches!(left, Expr::Nested(_));
                 let start = left.span().start();
                 self.advance();
                 self.skip_trivia();
                 let body = self.parse_binding_power(0)?;
                 let span = Span::new(start, body.span().end());
-                left = Expr::Lambda(LambdaExpr {
-                    parameters,
-                    parenthesized_single_parameter,
-                    body: Box::new(body),
+                left = Expr::Lambda(AstBox::new(LambdaExpr {
+                    arguments: parameters
+                        .into_iter()
+                        .map(|name| LambdaArgumentDeclaration {
+                            span: name.span,
+                            name,
+                        })
+                        .collect(),
+                    body,
                     span,
-                });
+                }));
                 continue;
             }
             if self.current_is_symbol(Symbol::LBracket)
@@ -838,11 +842,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             Some(Token {
                 kind: TokenKind::Keyword(Keyword::Cast),
                 ..
-            }) => self.parse_cast_expression(CastKind::Cast),
+            }) => self.parse_cast_expression(false),
             Some(Token {
                 kind: TokenKind::Keyword(Keyword::TryCast),
                 ..
-            }) => self.parse_cast_expression(CastKind::TryCast),
+            }) => self.parse_cast_expression(true),
             Some(Token {
                 kind: TokenKind::Keyword(Keyword::Interval),
                 ..
@@ -931,22 +935,36 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         if !self.current_is_keyword(Keyword::Exists) {
             return Err(self.unexpected("EXISTS"));
         }
+        let exists_start = self.current_span().start();
         self.advance();
         self.skip_trivia();
         if !self.current_is_symbol(Symbol::LParen) {
             return Err(self.unexpected("'(' after EXISTS"));
         }
+        let opening = self.current_span().start();
         self.advance();
         self.skip_trivia();
         if !self.query_follows() {
             return Err(self.unexpected("query after EXISTS ("));
         }
-        let (query, span) = self.parse_subquery_body(start)?;
-        Ok(Expr::Exists(ExistsExpr {
-            negated,
-            query,
+        let (query, subquery_span) = self.parse_subquery_body(opening)?;
+        let span = Span::new(exists_start, subquery_span.end());
+        let exists = Expr::Exists(AstBox::new(ExistsExpr {
+            subquery: Expr::Subquery(SubqueryExpr {
+                query,
+                span: subquery_span,
+            }),
             span,
-        }))
+        }));
+        Ok(if negated {
+            Expr::Unary(UnaryExpr {
+                operator: UnaryOperator::Not,
+                expression: Box::new(exists),
+                span: Span::new(start, span.end()),
+            })
+        } else {
+            exists
+        })
     }
 
     fn parse_scalar_subquery(&mut self, opening_span: Span) -> Result<Expr, ParseError> {
@@ -1001,11 +1019,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let operand = if self.current_is_keyword(Keyword::When) {
             None
         } else {
-            Some(Box::new(self.parse_binding_power(0)?))
+            Some(self.parse_binding_power(0)?)
         };
-        let mut conditions = Vec::new();
-        let mut results = Vec::new();
+        let mut when_clauses = Vec::new();
         while self.current_is_keyword(Keyword::When) {
+            let when_start = self.current_span().start();
             self.advance();
             self.skip_trivia();
             let condition = self.parse_binding_power(0)?;
@@ -1015,16 +1033,20 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             self.advance();
             self.skip_trivia();
             let result = self.parse_binding_power(0)?;
-            conditions.push(condition);
-            results.push(result);
+            let span = Span::new(when_start, result.span().end());
+            when_clauses.push(WhenClause {
+                match_value: WhenMatch::Operand(condition),
+                result,
+                span,
+            });
         }
-        if conditions.is_empty() {
+        if when_clauses.is_empty() {
             return Err(self.unexpected("WHEN in CASE expression"));
         }
-        let else_result = if self.current_is_keyword(Keyword::Else) {
+        let default_value = if self.current_is_keyword(Keyword::Else) {
             self.advance();
             self.skip_trivia();
-            Some(Box::new(self.parse_binding_power(0)?))
+            Some(self.parse_binding_power(0)?)
         } else {
             None
         };
@@ -1033,16 +1055,24 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
         let end = self.current_span().end();
         self.advance();
-        Ok(Expr::Case(CaseExpr {
-            operand,
-            conditions,
-            results,
-            else_result,
-            span: Span::new(start, end),
-        }))
+        let span = Span::new(start, end);
+        Ok(if let Some(operand) = operand {
+            Expr::SimpleCase(AstBox::new(SimpleCaseExpr {
+                operand,
+                when_clauses: when_clauses.into(),
+                default_value,
+                span,
+            }))
+        } else {
+            Expr::SearchedCase(AstBox::new(SearchedCaseExpr {
+                when_clauses: when_clauses.into(),
+                default_value,
+                span,
+            }))
+        })
     }
 
-    fn parse_cast_expression(&mut self, kind: CastKind) -> Result<Expr, ParseError> {
+    fn parse_cast_expression(&mut self, safe: bool) -> Result<Expr, ParseError> {
         let start = self.current_span().start();
         self.advance();
         self.skip_trivia();
@@ -1063,13 +1093,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
         let end = self.current_span().end();
         self.advance();
-        Ok(Expr::Cast(CastExpr {
-            expr: Box::new(expr),
+        Ok(Expr::Cast(AstBox::new(CastExpr {
+            expression: expr,
             data_type,
-            kind,
-            format: None,
+            safe,
             span: Span::new(start, end),
-        }))
+        })))
     }
 
     fn parse_typed_string_expression(&mut self) -> Result<Expr, ParseError> {

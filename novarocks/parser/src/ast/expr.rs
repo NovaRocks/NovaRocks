@@ -41,16 +41,18 @@ pub enum Expr {
     Nested(NestedExpr),
     Predicated(AstBox<super::PredicatedExpr>),
     InList(AstBox<super::InListExpr>),
-    Exists(ExistsExpr),
-    Case(CaseExpr),
-    Cast(CastExpr),
+    Exists(AstBox<super::ExistsExpr>),
+    SearchedCase(AstBox<super::SearchedCaseExpr>),
+    SimpleCase(AstBox<super::SimpleCaseExpr>),
+    Unique(AstBox<super::UniqueExpr>),
+    Cast(AstBox<super::CastExpr>),
     Interval(IntervalExpr),
     Subquery(SubqueryExpr),
     Tuple(TupleExpr),
     Array(ArrayExpr),
     Map(MapExpr),
     Struct(StructExpr),
-    Lambda(LambdaExpr),
+    Lambda(AstBox<super::LambdaExpr>),
     Access(AccessExpr),
 }
 
@@ -76,7 +78,9 @@ impl Expr {
             Self::InList(expression) => expression.span,
             Self::Predicated(expression) => expression.span,
             Self::Exists(expression) => expression.span,
-            Self::Case(expression) => expression.span,
+            Self::SearchedCase(node) => node.span,
+            Self::SimpleCase(node) => node.span,
+            Self::Unique(node) => node.span,
             Self::Cast(expression) => expression.span,
             Self::Interval(expression) => expression.span,
             Self::Subquery(expression) => expression.span,
@@ -158,38 +162,6 @@ pub struct NestedExpr {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExistsExpr {
-    pub negated: bool,
-    pub query: Box<Query>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CaseExpr {
-    pub operand: Option<Box<Expr>>,
-    pub conditions: Vec<Expr>,
-    pub results: Vec<Expr>,
-    pub else_result: Option<Box<Expr>>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CastExpr {
-    pub expr: Box<Expr>,
-    pub data_type: TypeName,
-    pub kind: CastKind,
-    pub format: Option<Box<Expr>>,
-    pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CastKind {
-    Cast,
-    TryCast,
-    Convert,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IntervalExpr {
     pub value: Box<Expr>,
     pub leading_field: IntervalField,
@@ -257,15 +229,6 @@ pub struct StructExpr {
 pub struct StructExprField {
     pub name: Option<Ident>,
     pub value: Expr,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LambdaExpr {
-    pub parameters: Vec<Ident>,
-    /// Whether a single parameter appeared in parentheses in the source.
-    pub parenthesized_single_parameter: bool,
-    pub body: Box<Expr>,
     pub span: Span,
 }
 

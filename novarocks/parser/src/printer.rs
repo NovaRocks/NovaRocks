@@ -797,7 +797,18 @@ impl Printer {
             Expr::InList(expression) => self.write_in_list_expr(expression),
             Expr::Predicated(expression) => self.write_predicated_expr(expression),
             Expr::Exists(expression) => self.write_exists_expr(expression),
-            Expr::Case(expression) => self.write_case_expr(expression),
+            Expr::SearchedCase(node) => {
+                self.write_case_expr(None, &node.when_clauses, node.default_value.as_ref())
+            }
+            Expr::SimpleCase(node) => self.write_case_expr(
+                Some(&node.operand),
+                &node.when_clauses,
+                node.default_value.as_ref(),
+            ),
+            Expr::Unique(node) => {
+                self.output.push_str("UNIQUE ");
+                self.write_expr(&node.subquery);
+            }
             Expr::Cast(expression) => self.write_cast_expr(expression),
             Expr::Interval(expression) => self.write_interval_expr(expression),
             Expr::Subquery(expression) => self.write_subquery_expr(expression),
@@ -1224,7 +1235,12 @@ impl Printer {
     #[recursive::recursive]
     fn write_predicated_expr(&mut self, expression: &PredicatedExpr) {
         self.write_predicate_operand(&expression.value, false);
-        match &expression.predicate {
+        self.write_predicate(&expression.predicate);
+    }
+
+    #[recursive::recursive]
+    fn write_predicate(&mut self, predicate: &Predicate) {
+        match predicate {
             Predicate::Comparison(node) => {
                 self.output.push(' ');
                 self.output.push_str(node.operator.sql());
@@ -1339,59 +1355,49 @@ impl Printer {
     }
 
     fn write_exists_expr(&mut self, expression: &ExistsExpr) {
-        if expression.negated {
-            self.output.push_str("NOT ");
-        }
-        self.output.push_str("EXISTS (");
-        self.write_query(&expression.query);
-        self.output.push(')');
+        self.output.push_str("EXISTS ");
+        self.write_expr(&expression.subquery);
     }
 
-    fn write_case_expr(&mut self, expression: &CaseExpr) {
+    fn write_case_expr(
+        &mut self,
+        operand: Option<&Expr>,
+        clauses: &[WhenClause],
+        default: Option<&Expr>,
+    ) {
         self.output.push_str("CASE");
-        if let Some(operand) = &expression.operand {
+        if let Some(operand) = operand {
             self.output.push(' ');
             self.write_expr(operand);
         }
-        let common = expression.conditions.len().min(expression.results.len());
-        for index in 0..common {
-            self.output.push_str(" WHEN ");
-            self.write_expr(&expression.conditions[index]);
+        for clause in clauses {
+            self.output.push_str(" WHEN");
+            match &clause.match_value {
+                WhenMatch::Operand(expression) => {
+                    self.output.push(' ');
+                    self.write_expr(expression);
+                }
+                WhenMatch::Partial(predicate) => self.write_predicate(predicate),
+            }
             self.output.push_str(" THEN ");
-            self.write_expr(&expression.results[index]);
+            self.write_expr(&clause.result);
         }
-        for condition in &expression.conditions[common..] {
-            self.output.push_str(" WHEN ");
-            self.write_expr(condition);
-            self.output.push_str(" THEN NULL");
-        }
-        for result in &expression.results[common..] {
-            self.output.push_str(" WHEN TRUE THEN ");
-            self.write_expr(result);
-        }
-        if let Some(else_result) = &expression.else_result {
+        if let Some(default) = default {
             self.output.push_str(" ELSE ");
-            self.write_expr(else_result);
+            self.write_expr(default);
         }
         self.output.push_str(" END");
     }
 
     fn write_cast_expr(&mut self, expression: &CastExpr) {
-        match expression.kind {
-            CastKind::Cast => self.output.push_str("CAST("),
-            CastKind::TryCast => self.output.push_str("TRY_CAST("),
-            CastKind::Convert => self.output.push_str("CONVERT("),
-        }
-        self.write_expr(&expression.expr);
-        self.output.push_str(match expression.kind {
-            CastKind::Cast | CastKind::TryCast => " AS ",
-            CastKind::Convert => ", ",
+        self.output.push_str(if expression.safe {
+            "TRY_CAST("
+        } else {
+            "CAST("
         });
+        self.write_expr(&expression.expression);
+        self.output.push_str(" AS ");
         self.write_type_name(&expression.data_type);
-        if let Some(format) = &expression.format {
-            self.output.push_str(" FORMAT ");
-            self.write_expr(format);
-        }
         self.output.push(')');
     }
 
@@ -1480,11 +1486,17 @@ impl Printer {
     }
 
     fn write_lambda_expr(&mut self, expression: &LambdaExpr) {
-        if expression.parameters.len() == 1 && !expression.parenthesized_single_parameter {
-            self.write_ident(&expression.parameters[0]);
-        } else {
+        let parenthesized = expression.arguments.len() != 1;
+        if parenthesized {
             self.output.push('(');
-            self.write_ident_list(&expression.parameters);
+        }
+        for (index, argument) in expression.arguments.iter().enumerate() {
+            if index > 0 {
+                self.output.push_str(", ");
+            }
+            self.write_ident(&argument.name);
+        }
+        if parenthesized {
             self.output.push(')');
         }
         self.output.push_str(" -> ");
@@ -2404,12 +2416,15 @@ mod tests {
             "payload ->> 'name'"
         );
         assert_eq!(
-            print_expr(&Expr::Lambda(LambdaExpr {
-                parameters: vec![ident("value")],
-                parenthesized_single_parameter: false,
-                body: Box::new(identifier("value")),
+            print_expr(&Expr::Lambda(AstBox::new(LambdaExpr {
+                arguments: vec![LambdaArgumentDeclaration {
+                    name: ident("value"),
+                    span: span()
+                }]
+                .into(),
+                body: identifier("value"),
                 span: span(),
-            })),
+            }))),
             "value -> value"
         );
     }

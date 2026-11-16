@@ -439,7 +439,8 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             }
         }
         Expr::Subquery(subquery) => validate_query(&subquery.query)?,
-        Expr::Exists(exists) => validate_query(&exists.query)?,
+        Expr::Exists(exists) => validate_expr(&exists.subquery)?,
+        Expr::Unique(unique) => validate_expr(&unique.subquery)?,
 
         Expr::Unary(unary) => validate_expr(&unary.expression)?,
         Expr::Predicated(node) => {
@@ -484,32 +485,19 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
         }
         Expr::Nested(nested) => validate_expr(&nested.expression)?,
 
-        Expr::Case(case) => {
-            if case.conditions.len() != case.results.len() {
-                return Err(ValidateError::invalid_structure(
-                    StructuralViolation::MismatchedCaseArms,
-                    case.span,
-                ));
-            }
-            if let Some(operand) = &case.operand {
-                validate_expr(operand)?;
-            }
-            for condition in &case.conditions {
-                validate_expr(condition)?;
-            }
-            for result in &case.results {
-                validate_expr(result)?;
-            }
-            if let Some(else_result) = &case.else_result {
-                validate_expr(else_result)?;
-            }
-        }
-        Expr::Cast(cast) => {
-            validate_expr(&cast.expr)?;
-            if let Some(format) = &cast.format {
-                validate_expr(format)?;
-            }
-        }
+        Expr::SearchedCase(case) => validate_case(
+            None,
+            &case.when_clauses,
+            case.default_value.as_ref(),
+            case.span,
+        )?,
+        Expr::SimpleCase(case) => validate_case(
+            Some(&case.operand),
+            &case.when_clauses,
+            case.default_value.as_ref(),
+            case.span,
+        )?,
+        Expr::Cast(cast) => validate_expr(&cast.expression)?,
         Expr::Interval(interval) => {
             validate_expr(&interval.value)?;
             if let Some(precision) = &interval.leading_precision {
@@ -644,4 +632,38 @@ fn validate_json_root(walk: impl FnOnce(&mut JsonValidation)) -> Result<(), Vali
     let mut visitor = JsonValidation(Ok(()));
     walk(&mut visitor);
     visitor.0
+}
+
+fn validate_case(
+    operand: Option<&Expr>,
+    clauses: &[super::WhenClause],
+    default: Option<&Expr>,
+    span: crate::Span,
+) -> Result<(), ValidateError> {
+    if clauses.is_empty() {
+        return Err(ValidateError::invalid_structure(
+            StructuralViolation::EmptyCaseBranches,
+            span,
+        ));
+    }
+    if let Some(operand) = operand {
+        validate_expr(operand)?;
+    }
+    struct Children(Result<(), ValidateError>);
+    impl super::Visit for Children {
+        fn visit_expr(&mut self, expression: &Expr) {
+            if self.0.is_ok() {
+                self.0 = validate_expr(expression);
+            }
+        }
+    }
+    for clause in clauses {
+        let mut children = Children(Ok(()));
+        super::Visit::visit_when_clause(&mut children, clause);
+        children.0?;
+    }
+    if let Some(default) = default {
+        validate_expr(default)?;
+    }
+    Ok(())
 }

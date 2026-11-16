@@ -19,6 +19,7 @@
 
 pub(crate) mod catalog;
 pub(crate) mod command;
+mod control_expr;
 pub(crate) mod dml;
 mod equivalence;
 mod expr;
@@ -26,6 +27,7 @@ pub(crate) mod iceberg;
 pub(crate) mod maintenance;
 pub(crate) mod materialized_view;
 mod predicate;
+pub use control_expr::*;
 mod query;
 pub use predicate::*;
 mod relation;
@@ -62,11 +64,10 @@ pub use dml::{
 };
 pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
-    AccessExpr, AccessKind, ArrayExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr, CastKind,
-    CompoundIdentifier, ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier,
-    IntervalExpr, IntervalField, JsonOperator, LambdaExpr, LogicalExpr, LogicalOperator, MapEntry,
-    MapExpr, NestedExpr, NullTreatment, StructExpr, StructExprField, SubqueryExpr, TupleExpr,
-    UnaryExpr, UnaryOperator,
+    AccessExpr, AccessKind, ArrayExpr, BinaryExpr, BinaryOperator, CompoundIdentifier, Expr,
+    FunctionCall, FunctionOrderBy, FunctionQuantifier, IntervalExpr, IntervalField, JsonOperator,
+    LogicalExpr, LogicalOperator, MapEntry, MapExpr, NestedExpr, NullTreatment, StructExpr,
+    StructExprField, SubqueryExpr, TupleExpr, UnaryExpr, UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -365,3 +366,6 @@ pub use json::{
     walk_json_table_plan_parent_child, walk_json_table_plan_siblings, walk_json_table_query_column,
     walk_json_table_specific_plan, walk_json_table_value_column, walk_json_value,
 };
+
+#[cfg(test)]
+mod control_expr_tests;

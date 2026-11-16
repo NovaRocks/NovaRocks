@@ -3081,10 +3081,21 @@ impl Visit for CompletionRetainedBytes {
                 self.add(std::mem::size_of::<novarocks_parser::ast::InListExpr>());
                 self.add_vec_capacity::<Expr>(expression.values.capacity());
             }
-            Expr::Case(expression) => {
-                self.add_vec_capacity::<Expr>(expression.conditions.capacity());
-                self.add_vec_capacity::<Expr>(expression.results.capacity());
+            Expr::SearchedCase(expression) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::SearchedCaseExpr>());
+                self.add_vec_capacity::<novarocks_parser::ast::WhenClause>(
+                    expression.when_clauses.capacity(),
+                );
             }
+            Expr::SimpleCase(expression) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::SimpleCaseExpr>());
+                self.add_vec_capacity::<novarocks_parser::ast::WhenClause>(
+                    expression.when_clauses.capacity(),
+                );
+            }
+            Expr::Cast(_) => self.add(std::mem::size_of::<novarocks_parser::ast::CastExpr>()),
+            Expr::Exists(_) => self.add(std::mem::size_of::<novarocks_parser::ast::ExistsExpr>()),
+            Expr::Unique(_) => self.add(std::mem::size_of::<novarocks_parser::ast::UniqueExpr>()),
             Expr::Tuple(expression) => {
                 self.add_vec_capacity::<Expr>(expression.expressions.capacity());
             }
@@ -3102,7 +3113,10 @@ impl Visit for CompletionRetainedBytes {
                 );
             }
             Expr::Lambda(expression) => {
-                self.add_vec_capacity::<Ident>(expression.parameters.capacity());
+                self.add(std::mem::size_of::<novarocks_parser::ast::LambdaExpr>());
+                self.add_vec_capacity::<novarocks_parser::ast::LambdaArgumentDeclaration>(
+                    expression.arguments.capacity(),
+                );
             }
             Expr::Identifier(_)
             | Expr::Literal(_)
@@ -3110,8 +3124,6 @@ impl Visit for CompletionRetainedBytes {
             | Expr::Unary(_)
             | Expr::Binary(_)
             | Expr::Nested(_)
-            | Expr::Exists(_)
-            | Expr::Cast(_)
             | Expr::Interval(_)
             | Expr::Subquery(_)
             | Expr::Access(_) => {}

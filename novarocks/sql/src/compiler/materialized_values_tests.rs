@@ -501,3 +501,174 @@ fn actual_in_predicate_preserves_nonzero_constant_sources_on_both_sides() {
         assert_eq!(value.value_type(), &ty);
     }
 }
+
+#[test]
+fn control_expression_edges_resolve_only_real_fields_and_reject_partial_or_absent_fields() {
+    use SqlConstantExpressionStep as Edge;
+    let control = SqlCompileControl::unbounded();
+    let retained = value(crate::constant::test_constant_policy(), &control);
+    type Case = (&'static str, Vec<Edge>, fn(&ast::Expr) -> &ast::Expr);
+    let cases: Vec<Case> = vec![
+        (
+            "SELECT CAST(source AS INT)",
+            vec![Edge::CastExpression],
+            |e| {
+                let ast::Expr::Cast(c) = e else {
+                    panic!("CAST")
+                };
+                &c.expression
+            },
+        ),
+        (
+            "SELECT CASE source WHEN 1 THEN 2 END",
+            vec![Edge::CaseOperand],
+            |e| {
+                let ast::Expr::SimpleCase(c) = e else {
+                    panic!("simple CASE")
+                };
+                &c.operand
+            },
+        ),
+        (
+            "SELECT CASE WHEN source THEN 2 END",
+            vec![Edge::CaseWhenOperand(0)],
+            |e| {
+                let ast::Expr::SearchedCase(c) = e else {
+                    panic!("searched CASE")
+                };
+                let ast::WhenMatch::Operand(v) = &c.when_clauses[0].match_value else {
+                    panic!("WHEN expression")
+                };
+                v
+            },
+        ),
+        (
+            "SELECT CASE 1 WHEN 2 THEN source END",
+            vec![Edge::CaseResult(0)],
+            |e| {
+                let ast::Expr::SimpleCase(c) = e else {
+                    panic!("simple CASE")
+                };
+                &c.when_clauses[0].result
+            },
+        ),
+        (
+            "SELECT CASE WHEN TRUE THEN 2 ELSE source END",
+            vec![Edge::CaseDefault],
+            |e| {
+                let ast::Expr::SearchedCase(c) = e else {
+                    panic!("searched CASE")
+                };
+                c.default_value.as_ref().unwrap()
+            },
+        ),
+        ("SELECT x -> source", vec![Edge::LambdaBody], |e| {
+            let ast::Expr::Lambda(c) = e else {
+                panic!("lambda")
+            };
+            &c.body
+        }),
+        (
+            "SELECT EXISTS (SELECT 1)",
+            vec![Edge::ExistsSubquery],
+            |e| {
+                let ast::Expr::Exists(c) = e else {
+                    panic!("EXISTS")
+                };
+                &c.subquery
+            },
+        ),
+    ];
+    for (sql, path, selected) in cases {
+        let query = query(sql);
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("select")
+        };
+        let ast::SelectItem::UnnamedExpr(expression) = &select.projection[0] else {
+            panic!("projection")
+        };
+        let source = MaterializedValues::try_new_expressions(
+            &query,
+            vec![
+                SqlExpressionConstant::new(
+                    vec![],
+                    SqlConstantExpressionSite::SelectProjection { column: 0 },
+                    retained.clone(),
+                )
+                .with_expression_path(path),
+            ]
+            .into(),
+            &control,
+        )
+        .unwrap();
+        let owned = source.loan(&query, &control).unwrap();
+        assert!(
+            owned.view().constant_at(selected(expression)).is_some(),
+            "{sql}"
+        );
+        assert!(
+            owned
+                .view()
+                .constant_at(&selected(expression).clone())
+                .is_none(),
+            "{sql}"
+        );
+    }
+    let query = query("SELECT CASE WHEN TRUE THEN 2 END");
+    for path in [
+        vec![Edge::CaseOperand],
+        vec![Edge::CastExpression],
+        vec![Edge::LambdaBody],
+        vec![Edge::ExistsSubquery],
+        vec![Edge::CaseWhenOperand(1)],
+        vec![Edge::CaseResult(1)],
+        vec![Edge::CaseDefault],
+        vec![Edge::ComparisonRight],
+    ] {
+        assert!(
+            MaterializedValues::try_new_expressions(
+                &query,
+                vec![
+                    SqlExpressionConstant::new(
+                        vec![],
+                        SqlConstantExpressionSite::SelectProjection { column: 0 },
+                        retained.clone()
+                    )
+                    .with_expression_path(path)
+                ]
+                .into(),
+                &control
+            )
+            .is_err()
+        );
+    }
+    let mut partial = query.clone();
+    let ast::SetExpr::Select(select) = partial.body.as_mut() else {
+        panic!("select")
+    };
+    let ast::SelectItem::UnnamedExpr(ast::Expr::SearchedCase(case)) = &mut select.projection[0]
+    else {
+        panic!("CASE")
+    };
+    case.when_clauses[0].match_value =
+        ast::WhenMatch::Partial(ast::Predicate::IsNull(ast::IsNullPredicate {
+            negated: false,
+            span: novarocks_parser::Span::new(0, 1),
+        }));
+    assert!(
+        MaterializedValues::try_new_expressions(
+            &partial,
+            vec![
+                SqlExpressionConstant::new(
+                    vec![],
+                    SqlConstantExpressionSite::SelectProjection { column: 0 },
+                    retained
+                )
+                .with_expression_path(vec![Edge::CaseWhenOperand(0)])
+            ]
+            .into(),
+            &control
+        )
+        .is_err()
+    );
+}

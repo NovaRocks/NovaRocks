@@ -376,6 +376,23 @@ fn context_body<'a>(
     Ok(())
 }
 
+/// Borrow result/default occurrences only. Predicate/operand syntax is never
+/// assigned the sink's literal-hole context.
+fn case_results(
+    expression: &novarocks_parser::ast::Expr,
+) -> impl Iterator<Item = &novarocks_parser::ast::Expr> {
+    use novarocks_parser::ast::Expr;
+    let (clauses, default) = match expression {
+        Expr::SearchedCase(case) => (&case.when_clauses, &case.default_value),
+        Expr::SimpleCase(case) => (&case.when_clauses, &case.default_value),
+        _ => unreachable!("only CASE variants have branch results"),
+    };
+    clauses
+        .iter()
+        .map(|clause| &clause.result)
+        .chain(default.iter())
+}
+
 fn context_hole(
     expression: &novarocks_parser::ast::Expr,
     source: &crate::compiler::materialized_values::MaterializedSourceBorrow<'_>,
@@ -393,12 +410,8 @@ fn context_hole(
         ast::Expr::Literal(literal) => Ok(matches!(literal.kind, ast::LiteralKind::Null)),
         ast::Expr::Array(array) => Ok(array.element_type.is_none() && array.elements.is_empty()),
         ast::Expr::Map(map) => Ok(map.entries.is_empty()),
-        ast::Expr::Case(case) => {
-            for value in case
-                .results
-                .iter()
-                .chain(case.else_result.iter().map(|value| value.as_ref()))
-            {
+        ast::Expr::SearchedCase(_) | ast::Expr::SimpleCase(_) => {
+            for value in case_results(expression) {
                 if !context_hole(value, source, control)? {
                     return Ok(false);
                 }
@@ -448,23 +461,15 @@ fn context_literal<'a>(
                 .map_err(|error| original_analysis_error(error.into()))?,
             )
         }
-        ast::Expr::Case(case) => {
+        ast::Expr::SearchedCase(_) | ast::Expr::SimpleCase(_) => {
             // A real branch, such as a Fixed read column, authors common-type
             // inference. Giving its NULL peer W would normalize that branch
             // before selection. Context only an otherwise untyped whole CASE.
             let mut only_holes = true;
-            for result in case
-                .results
-                .iter()
-                .chain(case.else_result.iter().map(|value| value.as_ref()))
-            {
+            for result in case_results(expression) {
                 only_holes &= context_hole(result, source, control)?;
             }
-            for result in case
-                .results
-                .iter()
-                .chain(case.else_result.iter().map(|value| value.as_ref()))
-            {
+            for result in case_results(expression) {
                 if only_holes || !context_hole(result, source, control)? {
                     context_literal(result, expected, source, policy, control)?;
                 }
@@ -704,4 +709,80 @@ fn assignment_allocation(cause: std::collections::TryReserveError) -> AnalyzeErr
             cause,
         ),
     )
+}
+
+#[cfg(test)]
+mod case_context_tests {
+    use super::*;
+    use crate::compiler::materialized_values::MaterializedSourceBorrow;
+    use novarocks_parser::ast;
+    use novarocks_type_contract::FunctionValueType;
+
+    #[test]
+    fn case_holes_borrow_only_results_and_preserve_mixed_real_source_branches() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let policy = crate::constant::test_constant_policy();
+        let expected = FunctionValueType::new(arrow::datatypes::DataType::Int64, false);
+        for (sql, only_holes) in [
+            ("SELECT CASE WHEN TRUE THEN NULL ELSE NULL END", true),
+            ("SELECT CASE 1 WHEN 2 THEN NULL ELSE NULL END", true),
+            (
+                "SELECT CASE WHEN TRUE THEN original_read ELSE NULL END",
+                false,
+            ),
+            (
+                "SELECT CASE 1 WHEN 2 THEN original_read ELSE NULL END",
+                false,
+            ),
+        ] {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query")
+            };
+            let ast::SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("select")
+            };
+            let ast::SelectItem::UnnamedExpr(expression) = &select.projection[0] else {
+                panic!("CASE projection")
+            };
+            let mut source = MaterializedSourceBorrow::empty(query);
+            assert_eq!(
+                context_hole(expression, &source, &control).unwrap(),
+                only_holes
+            );
+            context_literal(expression, &expected, &mut source, policy, &control).unwrap();
+            for result in case_results(expression) {
+                if only_holes {
+                    let value = source
+                        .view()
+                        .constant_at(result)
+                        .expect("an actual NULL result receives context");
+                    assert_eq!(
+                        value.value_type(),
+                        &FunctionValueType::new(arrow::datatypes::DataType::Int64, true)
+                    );
+                    assert!(source.view().constant_at(&result.clone()).is_none());
+                } else {
+                    assert!(
+                        source.view().constant_at(result).is_none(),
+                        "a real read branch keeps common-type authority over its NULL peer"
+                    );
+                }
+            }
+            let (operand, clauses) = match expression {
+                ast::Expr::SimpleCase(case) => (Some(&case.operand), &case.when_clauses),
+                ast::Expr::SearchedCase(case) => (None, &case.when_clauses),
+                _ => panic!("CASE"),
+            };
+            if let Some(operand) = operand {
+                assert!(source.view().constant_at(operand).is_none());
+            }
+            for clause in clauses {
+                let ast::WhenMatch::Operand(condition) = &clause.match_value else {
+                    panic!("WHEN expression")
+                };
+                assert!(source.view().constant_at(condition).is_none());
+            }
+        }
+    }
 }

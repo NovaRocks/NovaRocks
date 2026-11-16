@@ -116,6 +116,29 @@ pub(crate) fn unsupported_predicate_reason(node: &ast::PredicatedExpr) -> Option
     }
 }
 
+pub(crate) fn unsupported_control_expression_reason(
+    expression: &ast::Expr,
+) -> Option<&'static str> {
+    let clauses = match expression {
+        ast::Expr::SearchedCase(case) => Some(case.when_clauses.as_slice()),
+        ast::Expr::SimpleCase(case) => Some(case.when_clauses.as_slice()),
+        ast::Expr::Unique(_) => return Some("UNIQUE subquery predicates are not supported"),
+        ast::Expr::Exists(exists) if !matches!(exists.subquery, ast::Expr::Subquery(_)) => {
+            return Some("EXISTS requires a subquery expression");
+        }
+        _ => None,
+    };
+    if clauses.is_some_and(|clauses| {
+        clauses
+            .iter()
+            .any(|clause| matches!(clause.match_value, ast::WhenMatch::Partial(_)))
+    }) {
+        Some("partial CASE predicates are not supported")
+    } else {
+        None
+    }
+}
+
 fn string_literal_expr(value: String, span: Span) -> ast::Expr {
     ast::Expr::Literal(ast::Literal {
         kind: ast::LiteralKind::String(value),
@@ -217,6 +240,9 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         self.check_control()?;
+        if let Some(reason) = unsupported_control_expression_reason(expr) {
+            return Err(AnalyzeError::unsupported_expression(reason, expr.span()));
+        }
         let resolved = match self
             .materialized_values
             .and_then(|source| source.constant_at(expr))
@@ -341,6 +367,9 @@ impl<'a> super::AnalyzerContext<'a> {
             // Unary NOT. `NOT NULL` is NULL, so the result admits null
             // exactly when its operand does.
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Not) => {
+                if let ast::Expr::Exists(exists) = unary.expression.as_ref() {
+                    return self.analyze_exists(exists, true);
+                }
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
                 let nullable = inner_typed.value_type.nullable();
                 Ok(TypedExpr {
@@ -423,7 +452,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // CAST
             ast::Expr::Cast(cast) => {
-                let inner_typed = self.analyze_expr(&cast.expr, scope)?;
+                let inner_typed = self.analyze_expr(&cast.expression, scope)?;
                 let declared =
                     super::helpers::sql_type_to_value_type(&cast.data_type, true, self.control)?;
                 let value_type =
@@ -432,11 +461,17 @@ impl<'a> super::AnalyzerContext<'a> {
             }
 
             // CASE WHEN
-            ast::Expr::Case(case) => self.analyze_case(
-                case.operand.as_deref(),
-                &case.conditions,
-                &case.results,
-                case.else_result.as_deref(),
+            ast::Expr::SearchedCase(case) => self.analyze_case(
+                None,
+                &case.when_clauses,
+                case.default_value.as_ref(),
+                scope,
+                case.span,
+            ),
+            ast::Expr::SimpleCase(case) => self.analyze_case(
+                Some(&case.operand),
+                &case.when_clauses,
+                case.default_value.as_ref(),
                 scope,
                 case.span,
             ),
@@ -459,31 +494,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
 
-            // Subquery expression: EXISTS / NOT EXISTS
-            ast::Expr::Exists(exists) => {
-                let id = self.alloc_subquery_id();
-                let kind = SubqueryKind::Exists {
-                    negated: exists.negated,
-                };
-                self.collected_subqueries.borrow_mut().push(SubqueryInfo {
-                    id,
-                    kind: kind.clone(),
-                    subquery: exists.query.clone(),
-                    data_type: DataType::Boolean,
-                    in_expr: None,
-                });
-                Ok(TypedExpr {
-                    kind: ExprKind::SubqueryPlaceholder {
-                        id,
-                        kind,
-                        data_type: DataType::Boolean,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                })
-            }
+            ast::Expr::Exists(exists) => self.analyze_exists(exists, false),
+            ast::Expr::Unique(node) => Err(AnalyzeError::unsupported_expression(
+                "UNIQUE subquery predicates are not supported",
+                node.span,
+            )),
 
             // Scalar subquery: (SELECT ...)
             ast::Expr::Subquery(subquery) => {
@@ -1918,12 +1933,42 @@ impl<'a> super::AnalyzerContext<'a> {
         })
     }
 
+    fn analyze_exists(
+        &self,
+        exists: &ast::ExistsExpr,
+        negated: bool,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        self.check_control()?;
+        let ast::Expr::Subquery(subquery) = &exists.subquery else {
+            return Err(AnalyzeError::unsupported_expression(
+                "EXISTS requires a subquery expression",
+                exists.span,
+            ));
+        };
+        let id = self.alloc_subquery_id();
+        let kind = SubqueryKind::Exists { negated };
+        self.collected_subqueries.borrow_mut().push(SubqueryInfo {
+            id,
+            kind: kind.clone(),
+            subquery: subquery.query.clone(),
+            data_type: DataType::Boolean,
+            in_expr: None,
+        });
+        Ok(TypedExpr {
+            kind: ExprKind::SubqueryPlaceholder {
+                id,
+                kind,
+                data_type: DataType::Boolean,
+            },
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        })
+    }
+
     /// Analyze a CASE expression.
     fn analyze_case(
         &self,
         operand: Option<&ast::Expr>,
-        conditions: &[ast::Expr],
-        results: &[ast::Expr],
+        clauses: &[ast::WhenClause],
         else_result: Option<&ast::Expr>,
         scope: &AnalyzerScope,
         span: Span,
@@ -1933,11 +1978,17 @@ impl<'a> super::AnalyzerContext<'a> {
             None => None,
         };
 
-        let mut when_then = Vec::with_capacity(conditions.len());
+        let mut when_then = Vec::with_capacity(clauses.len());
         let mut result_type = novarocks_type_contract::FunctionValueType::new(DataType::Null, true);
-        for (condition, result) in conditions.iter().zip(results) {
+        for clause in clauses {
+            let ast::WhenMatch::Operand(condition) = &clause.match_value else {
+                return Err(AnalyzeError::unsupported_expression(
+                    "partial CASE predicates are not supported",
+                    clause.span,
+                ));
+            };
             let when_typed = self.analyze_expr(condition, scope)?;
-            let then_typed = self.analyze_expr(result, scope)?;
+            let then_typed = self.analyze_expr(&clause.result, scope)?;
             result_type = super::helpers::assignment_common_value_type(
                 &result_type,
                 &then_typed.value_type,
@@ -3484,7 +3535,7 @@ impl<'a> super::AnalyzerContext<'a> {
             for param in &lambda_params {
                 lambda_scope.add_lambda_param(param.clone());
             }
-            let body = self.analyze_expr(&lambda_body, &lambda_scope)?;
+            let body = self.analyze_expr(lambda_body, &lambda_scope)?;
             if typed_expr_contains_column_ref(&body)
                 || typed_expr_contains_nondeterministic_call(self.function_catalog, &body)
                 || !typed_expr_references_all_lambda_params(&body, &lambda_params)
@@ -3565,7 +3616,7 @@ impl<'a> super::AnalyzerContext<'a> {
         for param in &lambda_params {
             lambda_scope.add_lambda_param(param.clone());
         }
-        let body = self.analyze_expr(&lambda_body, &lambda_scope)?;
+        let body = self.analyze_expr(lambda_body, &lambda_scope)?;
         let lambda = TypedExpr {
             value_type: body.value_type.clone(),
 
@@ -4261,6 +4312,16 @@ impl<'a> super::AnalyzerContext<'a> {
         false
     }
 
+    fn case_contains_aggregate(
+        &self,
+        clauses: &[ast::WhenClause],
+        default: Option<&ast::Expr>,
+    ) -> bool {
+        clauses.iter().any(|clause| {
+            matches!(&clause.match_value, ast::WhenMatch::Operand(value) if self.expr_contains_aggregate(value)) || self.expr_contains_aggregate(&clause.result)
+        }) || default.is_some_and(|value| self.expr_contains_aggregate(value))
+    }
+
     /// Recursively check if an expression contains an aggregate function call.
     /// Window functions (with OVER) are NOT counted as aggregates.
     pub(super) fn expr_contains_aggregate(&self, expr: &ast::Expr) -> bool {
@@ -4318,7 +4379,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             ast::Expr::InList(list) => list.values.iter().any(|e| self.expr_contains_aggregate(e)),
             ast::Expr::Nested(nested) => self.expr_contains_aggregate(&nested.expression),
-            ast::Expr::Cast(cast) => self.expr_contains_aggregate(&cast.expr),
+            ast::Expr::Cast(cast) => self.expr_contains_aggregate(&cast.expression),
             ast::Expr::Tuple(tuple) => tuple
                 .expressions
                 .iter()
@@ -4343,18 +4404,12 @@ impl<'a> super::AnalyzerContext<'a> {
                         ast::AccessKind::Field(_) => false,
                     }
             }
-            ast::Expr::Case(case) => {
-                case.conditions
-                    .iter()
-                    .any(|expr| self.expr_contains_aggregate(expr))
-                    || case
-                        .results
-                        .iter()
-                        .any(|expr| self.expr_contains_aggregate(expr))
-                    || case
-                        .else_result
-                        .as_ref()
-                        .is_some_and(|e| self.expr_contains_aggregate(e))
+            ast::Expr::SearchedCase(case) => {
+                self.case_contains_aggregate(&case.when_clauses, case.default_value.as_ref())
+            }
+            ast::Expr::SimpleCase(case) => {
+                self.expr_contains_aggregate(&case.operand)
+                    || self.case_contains_aggregate(&case.when_clauses, case.default_value.as_ref())
             }
             _ => false,
         }
@@ -6610,15 +6665,17 @@ fn extract_lambda_field_chain(expr: &ast::Expr, param_name: &str) -> Result<Vec<
 fn parse_array_sortby_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)> {
     match expr {
         ast::Expr::Lambda(lambda) => lambda
-            .parameters
+            .arguments
             .first()
-            .map(|ident| (ident.value.to_lowercase(), lambda.body.as_ref())),
+            .map(|argument| (argument.name.value.to_lowercase(), &lambda.body)),
         ast::Expr::Nested(inner) => parse_array_sortby_lambda(&inner.expression),
         _ => None,
     }
 }
 
-fn find_lambda_argument(arg_exprs: &[&ast::Expr]) -> Option<(usize, Vec<String>, ast::Expr)> {
+fn find_lambda_argument<'a>(
+    arg_exprs: &[&'a ast::Expr],
+) -> Option<(usize, Vec<String>, &'a ast::Expr)> {
     if let Some((idx, params, body)) = arg_exprs
         .first()
         .and_then(|expr| parse_lambda_expr(expr))
@@ -6632,15 +6689,15 @@ fn find_lambda_argument(arg_exprs: &[&ast::Expr]) -> Option<(usize, Vec<String>,
         .map(|(params, body)| (arg_exprs.len() - 1, params, body))
 }
 
-fn parse_lambda_expr(expr: &ast::Expr) -> Option<(Vec<String>, ast::Expr)> {
+fn parse_lambda_expr(expr: &ast::Expr) -> Option<(Vec<String>, &ast::Expr)> {
     match expr {
         ast::Expr::Lambda(lambda) => Some((
             lambda
-                .parameters
+                .arguments
                 .iter()
-                .map(|ident| ident.value.to_lowercase())
+                .map(|argument| argument.name.value.to_lowercase())
                 .collect(),
-            (*lambda.body).clone(),
+            &lambda.body,
         )),
         ast::Expr::Nested(inner) => parse_lambda_expr(&inner.expression),
         _ => None,
@@ -6650,7 +6707,7 @@ fn parse_lambda_expr(expr: &ast::Expr) -> Option<(Vec<String>, ast::Expr)> {
 fn lambda_body_casts_param_to_utf8(expr: &ast::Expr, param_name: &str) -> bool {
     match expr {
         ast::Expr::Nested(inner) => lambda_body_casts_param_to_utf8(&inner.expression, param_name),
-        ast::Expr::Cast(cast) if lambda_expr_is_param(&cast.expr, param_name) => {
+        ast::Expr::Cast(cast) if lambda_expr_is_param(&cast.expression, param_name) => {
             matches!(
                 sql_type_to_arrow(&cast.data_type),
                 Ok(DataType::Utf8 | DataType::LargeUtf8)
@@ -6672,11 +6729,11 @@ fn parse_multi_param_lambda(expr: &ast::Expr) -> Option<(Vec<String>, &ast::Expr
     match expr {
         ast::Expr::Lambda(lambda) => Some((
             lambda
-                .parameters
+                .arguments
                 .iter()
-                .map(|p| p.value.to_lowercase())
+                .map(|argument| argument.name.value.to_lowercase())
                 .collect(),
-            lambda.body.as_ref(),
+            &lambda.body,
         )),
         ast::Expr::Nested(inner) => parse_multi_param_lambda(&inner.expression),
         _ => None,
@@ -6772,7 +6829,7 @@ fn syntactic_array_literal_len(expr: &ast::Expr) -> Option<usize> {
     match expr {
         ast::Expr::Array(array) => Some(array.elements.len()),
         ast::Expr::Nested(inner) => syntactic_array_literal_len(&inner.expression),
-        ast::Expr::Cast(cast) => syntactic_array_literal_len(&cast.expr),
+        ast::Expr::Cast(cast) => syntactic_array_literal_len(&cast.expression),
         _ => None,
     }
 }

@@ -85,7 +85,7 @@ pub(crate) fn is_literal_expr(expr: &ast::Expr) -> bool {
             matches!(unary.operator, ast::UnaryOperator::Minus)
                 && is_literal_expr(&unary.expression)
         }
-        ast::Expr::Cast(cast) => is_literal_expr(&cast.expr),
+        ast::Expr::Cast(cast) => is_literal_expr(&cast.expression),
         ast::Expr::Binary(binary) => {
             matches!(
                 binary.operator,
@@ -189,7 +189,7 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
             ) {
                 None
             } else {
-                legacy_literal_shape(&cast.expr)
+                legacy_literal_shape(&cast.expression)
             }
         }
         ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {

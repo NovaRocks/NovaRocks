@@ -173,7 +173,7 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
                     printer::print_expr(expr)
                 )))
             } else {
-                expr_to_literal(&cast.expr)
+                expr_to_literal(&cast.expression)
             }
         }
         // In MySQL mode, "value" is parsed as an identifier — treat as string literal
@@ -836,9 +836,9 @@ fn array_map_cast_string_lambda_matches(args: &[&ast::Expr]) -> Result<bool, Lit
 fn parse_single_arrow_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)> {
     match expr {
         ast::Expr::Lambda(lambda) => lambda
-            .parameters
+            .arguments
             .first()
-            .map(|ident| (ident.value.to_lowercase(), lambda.body.as_ref())),
+            .map(|argument| (argument.name.value.to_lowercase(), &lambda.body)),
         ast::Expr::Nested(nested) => parse_single_arrow_lambda(&nested.expression),
         _ => None,
     }
@@ -852,7 +852,7 @@ fn lambda_body_casts_param_to_string(
         ast::Expr::Nested(nested) => {
             lambda_body_casts_param_to_string(&nested.expression, param_name)
         }
-        ast::Expr::Cast(cast) if lambda_expr_is_param(&cast.expr, param_name) => {
+        ast::Expr::Cast(cast) if lambda_expr_is_param(&cast.expression, param_name) => {
             let sql_type = type_name_to_sql_type(&cast.data_type)?;
             Ok(matches!(sql_type, SqlType::String))
         }

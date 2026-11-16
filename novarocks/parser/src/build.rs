@@ -235,13 +235,12 @@ pub fn numeric_parameter(value: i64) -> DataTypeParameter {
 
 pub fn cast(expr: Expr, data_type: TypeName) -> Expr {
     let span = expr.span();
-    Expr::Cast(CastExpr {
-        expr: Box::new(expr),
+    Expr::Cast(AstBox::new(CastExpr {
+        expression: expr,
         data_type,
-        kind: CastKind::Cast,
-        format: None,
+        safe: false,
         span,
-    })
+    }))
 }
 
 pub fn nested(expr: Expr) -> Expr {
@@ -389,14 +388,19 @@ pub fn case_when(
             .flat_map(|(condition, result)| [condition.span(), result.span()])
             .chain(else_result.iter().map(Expr::span)),
     );
-    let (conditions, results) = branches.into_iter().unzip();
-    Ok(Expr::Case(CaseExpr {
-        operand: None,
-        conditions,
-        results,
-        else_result: else_result.map(Box::new),
+    let when_clauses = branches
+        .into_iter()
+        .map(|(condition, result)| WhenClause {
+            span: condition.span().cover(result.span()),
+            match_value: WhenMatch::Operand(condition),
+            result,
+        })
+        .collect();
+    Ok(Expr::SearchedCase(AstBox::new(SearchedCaseExpr {
+        when_clauses,
+        default_value: else_result,
         span,
-    }))
+    })))
 }
 
 pub fn function(name: ObjectName, arguments: Vec<Expr>) -> Expr {

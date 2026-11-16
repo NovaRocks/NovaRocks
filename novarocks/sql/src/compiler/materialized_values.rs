@@ -42,6 +42,13 @@ pub enum SqlConstantExpressionStep {
     LikePattern,
     InValueList,
     InListValue(usize),
+    CastExpression,
+    CaseOperand,
+    CaseWhenOperand(usize),
+    CaseResult(usize),
+    CaseDefault,
+    LambdaBody,
+    ExistsSubquery,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlConstantExpressionSite {
@@ -208,6 +215,46 @@ pub(crate) fn resolve_expression_site<'a>(
                     invalid("constant source IN value index differs from its owned syntax")
                 })?
             }
+            (SqlConstantExpressionStep::CastExpression, ast::Expr::Cast(cast)) => &cast.expression,
+            (SqlConstantExpressionStep::CaseOperand, ast::Expr::SimpleCase(case)) => &case.operand,
+            (SqlConstantExpressionStep::CaseWhenOperand(index), ast::Expr::SearchedCase(case)) => {
+                case_when_operand(&case.when_clauses, *index)?
+            }
+            (SqlConstantExpressionStep::CaseWhenOperand(index), ast::Expr::SimpleCase(case)) => {
+                case_when_operand(&case.when_clauses, *index)?
+            }
+            (SqlConstantExpressionStep::CaseResult(index), ast::Expr::SearchedCase(case)) => {
+                &case
+                    .when_clauses
+                    .get(*index)
+                    .ok_or_else(|| {
+                        invalid("constant source CASE branch index differs from its owned syntax")
+                    })?
+                    .result
+            }
+            (SqlConstantExpressionStep::CaseResult(index), ast::Expr::SimpleCase(case)) => {
+                &case
+                    .when_clauses
+                    .get(*index)
+                    .ok_or_else(|| {
+                        invalid("constant source CASE branch index differs from its owned syntax")
+                    })?
+                    .result
+            }
+            (SqlConstantExpressionStep::CaseDefault, ast::Expr::SearchedCase(case)) => {
+                case.default_value.as_ref().ok_or_else(|| {
+                    invalid("constant source CASE default is absent from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::CaseDefault, ast::Expr::SimpleCase(case)) => {
+                case.default_value.as_ref().ok_or_else(|| {
+                    invalid("constant source CASE default is absent from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::LambdaBody, ast::Expr::Lambda(lambda)) => &lambda.body,
+            (SqlConstantExpressionStep::ExistsSubquery, ast::Expr::Exists(exists)) => {
+                &exists.subquery
+            }
             _ => {
                 return Err(invalid(
                     "constant source expression path differs from its owned syntax",
@@ -216,6 +263,19 @@ pub(crate) fn resolve_expression_site<'a>(
         };
     }
     Ok(expression)
+}
+
+fn case_when_operand(
+    clauses: &[ast::WhenClause],
+    index: usize,
+) -> Result<&ast::Expr, SqlCompileError> {
+    let clause = clauses.get(index).ok_or_else(|| {
+        invalid("constant source CASE branch index differs from its owned syntax")
+    })?;
+    let ast::WhenMatch::Operand(value) = &clause.match_value else {
+        return Err(invalid("constant source CASE match is a partial predicate"));
+    };
+    Ok(value)
 }
 
 pub type SqlExpressionConstants = std::sync::Arc<[SqlExpressionConstant]>;

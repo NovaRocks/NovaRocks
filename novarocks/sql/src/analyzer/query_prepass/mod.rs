@@ -89,6 +89,10 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
             if self.0.is_some() {
                 return;
             }
+            if let Some(reason) = super::unsupported_control_expression_reason(expression) {
+                self.0 = Some((reason, expression.span()));
+                return;
+            }
             match expression {
                 Expr::Predicated(node) => {
                     if let Some(reason) = super::unsupported_predicate_reason(node) {
@@ -1044,7 +1048,14 @@ mod tests {
         let SelectItem::UnnamedExpr(Expr::Exists(exists)) = &select.projection[0] else {
             panic!("expected EXISTS predicate");
         };
-        let with = exists.query.with.as_ref().expect("nested WITH must remain");
+        let Expr::Subquery(subquery) = &exists.subquery else {
+            panic!("EXISTS query wrapper")
+        };
+        let with = subquery
+            .query
+            .with
+            .as_ref()
+            .expect("nested WITH must remain");
         assert!(!set_expr_references_table(
             with.ctes[0].query.body.as_ref(),
             "n"

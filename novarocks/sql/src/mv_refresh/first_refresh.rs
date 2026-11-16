@@ -4349,7 +4349,7 @@ mod tests {
                                 spelling: value, ..
                             },
                         ..
-                    }) = cast.expr.as_ref()
+                    }) = &cast.expression
                     else {
                         panic!("branch id integer");
                     };

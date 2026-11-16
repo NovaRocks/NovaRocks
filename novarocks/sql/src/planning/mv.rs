@@ -3350,6 +3350,11 @@ fn predicate_exprs(predicate: &ast::Predicate) -> Vec<&Expr> {
     }
 }
 
+fn case_contains_aggregate_function(clauses: &[ast::WhenClause], default: Option<&Expr>) -> bool {
+    clauses.iter().any(|clause| matches!(&clause.match_value, ast::WhenMatch::Operand(value) if expr_contains_aggregate_function(value)) || expr_contains_aggregate_function(&clause.result))
+        || default.is_some_and(expr_contains_aggregate_function)
+}
+
 fn expr_contains_aggregate_function(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall(function) => {
@@ -3376,7 +3381,7 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
         Expr::Logical(logical) => logical.terms.iter().any(expr_contains_aggregate_function),
         Expr::Unary(unary) => expr_contains_aggregate_function(&unary.expression),
         Expr::Nested(nested) => expr_contains_aggregate_function(&nested.expression),
-        Expr::Cast(cast) => expr_contains_aggregate_function(&cast.expr),
+        Expr::Cast(cast) => expr_contains_aggregate_function(&cast.expression),
         Expr::Predicated(node) => {
             expr_contains_aggregate_function(&node.value)
                 || predicate_exprs(&node.predicate)
@@ -3384,22 +3389,12 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
                     .any(expr_contains_aggregate_function)
         }
         Expr::InList(list) => list.values.iter().any(expr_contains_aggregate_function),
-        Expr::Case(case) => {
-            case.operand
-                .as_ref()
-                .is_some_and(|operand| expr_contains_aggregate_function(operand))
-                || case
-                    .conditions
-                    .iter()
-                    .zip(&case.results)
-                    .any(|(when, then)| {
-                        expr_contains_aggregate_function(when)
-                            || expr_contains_aggregate_function(then)
-                    })
-                || case
-                    .else_result
-                    .as_ref()
-                    .is_some_and(|else_result| expr_contains_aggregate_function(else_result))
+        Expr::SearchedCase(case) => {
+            case_contains_aggregate_function(&case.when_clauses, case.default_value.as_ref())
+        }
+        Expr::SimpleCase(case) => {
+            expr_contains_aggregate_function(&case.operand)
+                || case_contains_aggregate_function(&case.when_clauses, case.default_value.as_ref())
         }
         Expr::Tuple(tuple) => tuple
             .expressions
@@ -3460,7 +3455,27 @@ fn contains_match_against(expr: &Expr) -> bool {
     matches!(expr, Expr::FunctionCall(function) if printer::print_object_name(&function.name).eq_ignore_ascii_case("match"))
 }
 
+fn reject_unsupported_case(
+    clauses: &[ast::WhenClause],
+    default: Option<&Expr>,
+) -> Result<(), String> {
+    for clause in clauses {
+        let ast::WhenMatch::Operand(value) = &clause.match_value else {
+            return Err(projection_filter_error());
+        };
+        reject_unsupported_expr(value)?;
+        reject_unsupported_expr(&clause.result)?;
+    }
+    if let Some(default) = default {
+        reject_unsupported_expr(default)?;
+    }
+    Ok(())
+}
+
 fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
+    if crate::analyzer::unsupported_control_expression_reason(expr).is_some() {
+        return Err(projection_filter_error());
+    }
     match expr {
         Expr::JsonObject(node) => {
             if !crate::analyzer::is_supported_json_object_profile(node) {
@@ -3492,7 +3507,7 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
         | Expr::JsonValue(_)
         | Expr::JsonSerialize(_) => return Err(projection_filter_error()),
 
-        Expr::Subquery(_) | Expr::Exists(_) => {
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::Unique(_) => {
             return Err(projection_filter_error());
         }
         Expr::FunctionCall(function) => reject_unsupported_function(function)?,
@@ -3514,18 +3529,13 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
             reject_unsupported_expr(&binary.right)?;
         }
         Expr::Logical(logical) => reject_unsupported_exprs(&logical.terms)?,
-        Expr::Cast(cast) => reject_unsupported_expr(&cast.expr)?,
-        Expr::Case(case) => {
-            if let Some(operand) = &case.operand {
-                reject_unsupported_expr(operand)?;
-            }
-            for (when, then) in case.conditions.iter().zip(&case.results) {
-                reject_unsupported_expr(when)?;
-                reject_unsupported_expr(then)?;
-            }
-            if let Some(else_result) = &case.else_result {
-                reject_unsupported_expr(else_result)?;
-            }
+        Expr::Cast(cast) => reject_unsupported_expr(&cast.expression)?,
+        Expr::SearchedCase(case) => {
+            reject_unsupported_case(&case.when_clauses, case.default_value.as_ref())?
+        }
+        Expr::SimpleCase(case) => {
+            reject_unsupported_expr(&case.operand)?;
+            reject_unsupported_case(&case.when_clauses, case.default_value.as_ref())?;
         }
         Expr::Tuple(tuple) => reject_unsupported_exprs(&tuple.expressions)?,
         Expr::Array(array) => reject_unsupported_exprs(&array.elements)?,

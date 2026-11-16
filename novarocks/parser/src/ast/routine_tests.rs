@@ -803,10 +803,10 @@ fn query_function_slot_participates_in_real_walk_fold_and_syntax_equality() {
 
 fn malformed_case_expression() -> Expr {
     let mut expression = build::case_when(vec![(expr("condition"), expr("result"))], None).unwrap();
-    let Expr::Case(case) = &mut expression else {
+    let Expr::SearchedCase(case) = &mut expression else {
         panic!("CASE");
     };
-    case.results.clear();
+    case.when_clauses.clear();
     case.span = Span::new(700, 711);
     expression
 }
@@ -815,7 +815,7 @@ fn malformed_case_expression() -> Expr {
 fn statement_validation_reaches_nested_routine_body_and_property_expressions() {
     use crate::{StructuralViolation, ValidateError};
     let expected = ValidateError::InvalidStructure {
-        violation: StructuralViolation::MismatchedCaseArms,
+        violation: StructuralViolation::EmptyCaseBranches,
         span: Span::new(700, 711),
     };
     let valid = query_with_functions(vec![function(RoutineBody::Sql(ret("valid")))]);

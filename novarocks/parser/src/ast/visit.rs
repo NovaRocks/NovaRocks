@@ -21,6 +21,34 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_exists_expr(&mut self, node: &ExistsExpr) {
+        walk_exists_expr(self, node);
+    }
+    fn visit_unique_expr(&mut self, node: &UniqueExpr) {
+        walk_unique_expr(self, node);
+    }
+    fn visit_cast_expr(&mut self, node: &CastExpr) {
+        walk_cast_expr(self, node);
+    }
+    fn visit_lambda_expr(&mut self, node: &LambdaExpr) {
+        walk_lambda_expr(self, node);
+    }
+    fn visit_lambda_argument_declaration(&mut self, node: &LambdaArgumentDeclaration) {
+        walk_lambda_argument_declaration(self, node);
+    }
+    fn visit_searched_case_expr(&mut self, node: &SearchedCaseExpr) {
+        walk_searched_case_expr(self, node);
+    }
+    fn visit_simple_case_expr(&mut self, node: &SimpleCaseExpr) {
+        walk_simple_case_expr(self, node);
+    }
+    fn visit_when_clause(&mut self, node: &WhenClause) {
+        walk_when_clause(self, node);
+    }
+    fn visit_when_match(&mut self, node: &WhenMatch) {
+        walk_when_match(self, node);
+    }
+
     fn visit_predicated_expr(&mut self, node: &PredicatedExpr) {
         walk_predicated_expr(self, node);
     }
@@ -726,33 +754,16 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::Unary(expression) => visitor.visit_unary_expr(expression),
         Expr::Binary(expression) => visitor.visit_binary_expr(expression),
         Expr::Logical(expression) => visitor.visit_logical_expr(expression),
+        Expr::Exists(node) => visitor.visit_exists_expr(node),
+        Expr::Unique(node) => visitor.visit_unique_expr(node),
+        Expr::Cast(node) => visitor.visit_cast_expr(node),
+        Expr::Lambda(node) => visitor.visit_lambda_expr(node),
+        Expr::SearchedCase(node) => visitor.visit_searched_case_expr(node),
+        Expr::SimpleCase(node) => visitor.visit_simple_case_expr(node),
         Expr::Predicated(node) => visitor.visit_predicated_expr(node),
         Expr::InList(node) => visitor.visit_in_list_expr(node),
         Expr::Nested(expression) => visitor.visit_nested_expr(expression),
 
-        Expr::Exists(expression) => visitor.visit_query(&expression.query),
-
-        Expr::Case(expression) => {
-            if let Some(operand) = &expression.operand {
-                visitor.visit_expr(operand);
-            }
-            for condition in &expression.conditions {
-                visitor.visit_expr(condition);
-            }
-            for result in &expression.results {
-                visitor.visit_expr(result);
-            }
-            if let Some(result) = &expression.else_result {
-                visitor.visit_expr(result);
-            }
-        }
-        Expr::Cast(expression) => {
-            visitor.visit_expr(&expression.expr);
-            visitor.visit_type_name(&expression.data_type);
-            if let Some(format) = &expression.format {
-                visitor.visit_expr(format);
-            }
-        }
         Expr::Interval(expression) => {
             visitor.visit_expr(&expression.value);
             if let Some(precision) = &expression.leading_precision {
@@ -790,12 +801,7 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
                 visitor.visit_expr(&field.value);
             }
         }
-        Expr::Lambda(expression) => {
-            for parameter in &expression.parameters {
-                visitor.visit_ident(parameter);
-            }
-            visitor.visit_expr(&expression.body);
-        }
+
         Expr::Access(expression) => {
             visitor.visit_expr(&expression.expr);
             match &expression.kind {
@@ -841,6 +847,37 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_exists_expr(&mut self, node: ExistsExpr) -> ExistsExpr {
+        fold_exists_expr(self, node)
+    }
+    fn fold_unique_expr(&mut self, node: UniqueExpr) -> UniqueExpr {
+        fold_unique_expr(self, node)
+    }
+    fn fold_cast_expr(&mut self, node: CastExpr) -> CastExpr {
+        fold_cast_expr(self, node)
+    }
+    fn fold_lambda_expr(&mut self, node: LambdaExpr) -> LambdaExpr {
+        fold_lambda_expr(self, node)
+    }
+    fn fold_lambda_argument_declaration(
+        &mut self,
+        node: LambdaArgumentDeclaration,
+    ) -> LambdaArgumentDeclaration {
+        fold_lambda_argument_declaration(self, node)
+    }
+    fn fold_searched_case_expr(&mut self, node: SearchedCaseExpr) -> SearchedCaseExpr {
+        fold_searched_case_expr(self, node)
+    }
+    fn fold_simple_case_expr(&mut self, node: SimpleCaseExpr) -> SimpleCaseExpr {
+        fold_simple_case_expr(self, node)
+    }
+    fn fold_when_clause(&mut self, node: WhenClause) -> WhenClause {
+        fold_when_clause(self, node)
+    }
+    fn fold_when_match(&mut self, node: WhenMatch) -> WhenMatch {
+        fold_when_match(self, node)
+    }
+
     fn fold_predicated_expr(&mut self, node: PredicatedExpr) -> PredicatedExpr {
         fold_predicated_expr(self, node)
     }
@@ -1799,6 +1836,16 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::Unary(expression) => Expr::Unary(folder.fold_unary_expr(expression)),
         Expr::Binary(expression) => Expr::Binary(folder.fold_binary_expr(expression)),
         Expr::Logical(expression) => Expr::Logical(folder.fold_logical_expr(expression)),
+        Expr::Exists(node) => Expr::Exists(AstBox::new(folder.fold_exists_expr(node.into_inner()))),
+        Expr::Unique(node) => Expr::Unique(AstBox::new(folder.fold_unique_expr(node.into_inner()))),
+        Expr::Cast(node) => Expr::Cast(AstBox::new(folder.fold_cast_expr(node.into_inner()))),
+        Expr::Lambda(node) => Expr::Lambda(AstBox::new(folder.fold_lambda_expr(node.into_inner()))),
+        Expr::SearchedCase(node) => Expr::SearchedCase(AstBox::new(
+            folder.fold_searched_case_expr(node.into_inner()),
+        )),
+        Expr::SimpleCase(node) => {
+            Expr::SimpleCase(AstBox::new(folder.fold_simple_case_expr(node.into_inner())))
+        }
         Expr::Predicated(node) => {
             Expr::Predicated(AstBox::new(folder.fold_predicated_expr(node.into_inner())))
         }
@@ -1807,38 +1854,6 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         }
         Expr::Nested(expression) => Expr::Nested(folder.fold_nested_expr(expression)),
 
-        Expr::Exists(mut expression) => {
-            expression.query = Box::new(folder.fold_query(*expression.query));
-            Expr::Exists(expression)
-        }
-
-        Expr::Case(mut expression) => {
-            expression.operand = expression
-                .operand
-                .map(|expr| Box::new(folder.fold_expr(*expr)));
-            expression.conditions = expression
-                .conditions
-                .into_iter()
-                .map(|expr| folder.fold_expr(expr))
-                .collect();
-            expression.results = expression
-                .results
-                .into_iter()
-                .map(|expr| folder.fold_expr(expr))
-                .collect();
-            expression.else_result = expression
-                .else_result
-                .map(|expr| Box::new(folder.fold_expr(*expr)));
-            Expr::Case(expression)
-        }
-        Expr::Cast(mut expression) => {
-            expression.expr = Box::new(folder.fold_expr(*expression.expr));
-            expression.data_type = folder.fold_type_name(expression.data_type);
-            expression.format = expression
-                .format
-                .map(|format| Box::new(folder.fold_expr(*format)));
-            Expr::Cast(expression)
-        }
         Expr::Interval(mut expression) => {
             expression.value = Box::new(folder.fold_expr(*expression.value));
             expression.leading_precision = expression
@@ -1896,15 +1911,7 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
                 .collect();
             Expr::Struct(expression)
         }
-        Expr::Lambda(mut expression) => {
-            expression.parameters = expression
-                .parameters
-                .into_iter()
-                .map(|parameter| folder.fold_ident(parameter))
-                .collect();
-            expression.body = Box::new(folder.fold_expr(*expression.body));
-            Expr::Lambda(expression)
-        }
+
         Expr::Access(mut expression) => {
             expression.expr = Box::new(folder.fold_expr(*expression.expr));
             expression.kind = match expression.kind {

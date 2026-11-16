@@ -80,7 +80,7 @@ fn baseline_target_cast(expr: ast::Expr, type_sql: &str) -> ast::Expr {
     };
     let mut cast = cast.clone();
     cast.span = expr.span();
-    cast.expr = Box::new(expr);
+    cast.expression = expr;
     ast::Expr::Cast(cast)
 }
 
@@ -155,7 +155,7 @@ fn cast_input<'a>(expr: &'a ast::Expr, target: &str) -> &'a ast::Expr {
         panic!("expected target CAST, got {expr:?}");
     };
     assert_eq!(printer::print_type_name(&cast.data_type), target);
-    &cast.expr
+    &cast.expression
 }
 
 fn number_text(expr: &ast::Expr) -> String {
@@ -317,6 +317,30 @@ fn explicit_casts_keep_their_original_expression_and_declared_type() {
 }
 
 #[test]
+fn explicit_safe_cast_keeps_original_child_type_and_source_positions() {
+    let mut source = parse_query("VALUES (CAST(123456789.123456789 AS DOUBLE))");
+    let ast::SetExpr::Values(values) = source.body.as_mut() else {
+        panic!("VALUES");
+    };
+    let ast::Expr::Cast(cast) = &mut values.rows[0][0] else {
+        panic!("explicit CAST");
+    };
+    cast.safe = true;
+    let original = values.rows[0][0].clone();
+    let columns = [column("d", decimal_type())];
+    let shaped = shape_insert_source(&source, &[], &columns, &columns)
+        .unwrap()
+        .unwrap();
+    let preserved = cast_input(&rows(&shaped)[0][0], "DECIMAL(18, 9)");
+    assert_eq!(preserved, &original);
+    let ast::Expr::Cast(cast) = preserved else {
+        panic!("original safe CAST");
+    };
+    assert!(cast.safe);
+    assert_eq!(preserved.span(), original.span());
+}
+
+#[test]
 fn variant_direct_and_explicit_cast_inputs_use_canonical_payloads() {
     // Published VARIANT layout: u32 little-endian total size, sorted empty
     // metadata dictionary (11 00 00), then primitive INT8 (0C) and value 42.
@@ -471,7 +495,7 @@ fn typed_single_field_struct_defaults_keep_their_values_tuple() {
     let ast::Expr::Cast(cast) = &rows(&shaped)[0][1] else {
         panic!("Struct target cast");
     };
-    assert!(matches!(cast.expr.as_ref(), ast::Expr::Tuple(tuple) if tuple.expressions.len() == 1));
+    assert!(matches!(&cast.expression, ast::Expr::Tuple(tuple) if tuple.expressions.len() == 1));
     // The original tuple author kept even one field as Tuple, and recursive
     // target shaping cast its child. The analyzer rejects that Tuple unchanged.
     let baseline = baseline_default_values(
@@ -532,7 +556,7 @@ fn select_wrapper_normalizes_generated_defaults_and_retains_user_positions() {
         panic!("target cast");
     };
     assert_eq!(cast.span, projection_expr(inner, 0).span());
-    assert_eq!(cast.expr.span(), projection_expr(inner, 0).span());
+    assert_eq!(cast.expression.span(), projection_expr(inner, 0).span());
     analyze_shaped_query(shaped).expect("the original generated default keeps its typed value");
 }
 

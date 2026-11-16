@@ -1937,10 +1937,20 @@ mod tests {
         let ast::Expr::Nested(action) = action else {
             panic!("action expression boundary");
         };
-        let ast::Expr::Case(case) = action.expression.as_ref() else {
+        let ast::Expr::SearchedCase(case) = action.expression.as_ref() else {
             panic!("ordered action CASE");
         };
-        assert_eq!(case.conditions.len(), 2);
+        assert_eq!(case.when_clauses.len(), 2);
+        assert!(matches!(
+            &case.default_value,
+            Some(ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Long {
+                    parsed_value: 0,
+                    ..
+                },
+                ..
+            }))
+        ));
         for (index, (original, guard, result)) in [
             (&matched, true, MERGE_ACTION_MATCHED_UPDATE),
             (&inserted, false, MERGE_ACTION_NOT_MATCHED_INSERT),
@@ -1948,7 +1958,11 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let ast::Expr::Logical(condition) = &case.conditions[index] else {
+            let branch = &case.when_clauses[index];
+            let ast::WhenMatch::Operand(condition) = &branch.match_value else {
+                panic!("searched CASE condition must be an operand");
+            };
+            let ast::Expr::Logical(condition) = condition else {
                 panic!("action AND");
             };
             assert_eq!(condition.operator, ast::LogicalOperator::And);
@@ -1968,7 +1982,7 @@ mod tests {
             assert_eq!(clause.expression.as_ref(), original);
             assert_eq!(clause.expression.span(), original.span());
             assert!(
-                matches!(&case.results[index], ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::Long { parsed_value, .. }, .. }) if *parsed_value == i64::from(result))
+                matches!(&branch.result, ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::Long { parsed_value, .. }, .. }) if *parsed_value == i64::from(result))
             );
         }
     }

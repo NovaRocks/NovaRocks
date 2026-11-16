@@ -230,7 +230,7 @@ mod tests {
         let Expr::Cast(cast) = parse("CAST('9223372036854775808' AS LARGEINT)") else {
             panic!("expected original explicit string cast");
         };
-        let Expr::Literal(text) = *cast.expr else {
+        let Expr::Literal(text) = cast.into_inner().expression else {
             panic!("expected original text literal");
         };
         assert_eq!(
@@ -366,7 +366,7 @@ mod tests {
 
         assert!(matches!(
             parse("CASE WHEN a THEN CAST(b AS DECIMAL(10, 2)) ELSE TRY_CAST(c AS INT) END"),
-            Expr::Case(_)
+            Expr::SearchedCase(_)
         ));
 
         let Expr::FunctionCall(call) = parse(

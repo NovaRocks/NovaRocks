@@ -873,3 +873,55 @@ fn distinct_from_in_projection_keeps_the_later_relation_boundary() {
         assert!(left.syntax_eq(right), "{source} -> {rendered}");
     }
 }
+
+#[test]
+fn control_producers_keep_branch_wrappers_safe_flags_and_declaration_spans() {
+    for source in [
+        "SELECT CASE WHEN a THEN b WHEN c THEN d END",
+        "SELECT CASE a WHEN 1 THEN b WHEN 2 THEN c ELSE NULL END",
+        "SELECT CASE WHEN a THEN CASE b WHEN 1 THEN c END ELSE d END",
+        "SELECT CAST(a AS integer), TRY_CAST(b AS varchar)",
+        "SELECT array_map(x -> x + 1, [1,2])",
+        "SELECT array_map((x, y) -> x + y, [1], [2])",
+        "SELECT EXISTS (SELECT 1), NOT EXISTS (SELECT 2)",
+    ] {
+        let parsed = novarocks_parser::parse(source).unwrap();
+        let rendered = novarocks_parser::printer::print_statement(&parsed[0]);
+        let reparsed = novarocks_parser::parse(&rendered).unwrap();
+        let (ast::Statement::Query(left), ast::Statement::Query(right)) =
+            (&parsed[0], &reparsed[0])
+        else {
+            panic!("query")
+        };
+        assert!(left.syntax_eq(right), "{source} -> {rendered}");
+    }
+    let Expr::Cast(ordinary) = expression("CAST(a AS integer)") else {
+        panic!("cast")
+    };
+    let Expr::Cast(safe) = expression("TRY_CAST(a AS integer)") else {
+        panic!("try cast")
+    };
+    assert!(!ordinary.safe);
+    assert!(safe.safe);
+    assert!(!ordinary.syntax_eq(&safe));
+    let source = "NOT EXISTS (SELECT 1)";
+    let Expr::Unary(negation) = expression(source) else {
+        panic!("NOT")
+    };
+    assert_eq!(negation.operator, ast::UnaryOperator::Not);
+    assert_eq!(negation.span, novarocks_parser::Span::new(0, source.len()));
+    let Expr::Exists(exists) = negation.expression.as_ref() else {
+        panic!("exists")
+    };
+    assert_eq!(exists.span.start(), 4);
+    let Expr::Subquery(subquery) = &exists.subquery else {
+        panic!("subquery wrapper")
+    };
+    assert_eq!(subquery.span, novarocks_parser::Span::new(11, source.len()));
+    let Expr::Lambda(lambda) = expression("(x, y) -> x + y") else {
+        panic!("lambda")
+    };
+    assert_eq!(lambda.arguments[0].span, novarocks_parser::Span::new(1, 2));
+    assert_eq!(lambda.arguments[1].span, novarocks_parser::Span::new(4, 5));
+    assert!(expression("x -> x").syntax_eq(&expression("(x) -> x")));
+}

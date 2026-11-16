@@ -908,12 +908,12 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
         ),
         ast::Expr::Lambda(lambda) => {
             let parameters = lambda
-                .parameters
+                .arguments
                 .iter()
-                .map(|parameter| parameter.value.as_str())
+                .map(|argument| argument.name.value.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let parameters = if lambda.parameters.len() == 1 {
+            let parameters = if lambda.arguments.len() == 1 {
                 parameters
             } else {
                 format!("({parameters})")
@@ -927,14 +927,14 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
         ast::Expr::Predicated(node) => format_predicated_display_name(expr, node),
         ast::Expr::Cast(cast) => {
             if type_name_is(&cast.data_type, "array")
-                && matches!(cast.expr.as_ref(), ast::Expr::Array(_))
+                && matches!(&cast.expression, ast::Expr::Array(_))
             {
-                return expr_display_name(&cast.expr);
+                return expr_display_name(&cast.expression);
             }
             format!(
                 "CAST({} AS {})",
-                expr_display_name_with_parens(&cast.expr),
-                format_cast_type_for_expression(&cast.data_type, &cast.expr)
+                expr_display_name_with_parens(&cast.expression),
+                format_cast_type_for_expression(&cast.data_type, &cast.expression)
             )
         }
         ast::Expr::Binary(binary) => format!(
