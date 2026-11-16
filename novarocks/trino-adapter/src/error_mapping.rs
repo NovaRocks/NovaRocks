@@ -438,7 +438,7 @@ fn row_match_message_for_code(code: &str) -> Option<&'static str> {
 }
 
 fn open_partition_limit(input: &ExecutionFailureInput) -> Option<(u64, u64)> {
-    use novarocks_failure_contract::{
+    use novarocks_execution_contract::failure::{
         ResourceDimension, connector_reason::ICEBERG_TOO_MANY_OPEN_PARTITIONS,
     };
     let fact = input.fact();
