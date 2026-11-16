@@ -10,6 +10,7 @@ query.execution.dependency	Execution
 query.execution.division_by_zero	Execution
 query.execution.invalid_cast_argument	Execution
 query.execution.invalid_data	Execution
+query.execution.invalid_function_argument	Execution
 query.execution.invariant	Execution
 query.execution.merge_target_row_multiple_matches	Execution
 query.execution.numeric_out_of_range	Execution

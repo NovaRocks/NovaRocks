@@ -418,6 +418,7 @@ fn cast(
             owner,
             ty(DataType::Timestamp(target, None), nullable),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: child,
                 target: DataType::Timestamp(target, None),
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

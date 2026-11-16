@@ -431,6 +431,7 @@ fn in_predicate_children_retain_actual_source_and_write_conversion_loans() {
         FunctionValueType::new(DataType::Int64, true)
     );
     let ExprKind::Cast {
+        array_failure_mode: None,
         expr: input,
         target,
         decimal_overflow_policy,

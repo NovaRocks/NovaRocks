@@ -947,10 +947,12 @@ pub(crate) fn substitute_scalar(
             resolved,
         },
         ScalarNode::Cast {
+            array_failure_mode,
             child,
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
+            array_failure_mode,
             child: substitute_scalar(arena, child, defs, control)?,
             target,
             decimal_overflow_policy,

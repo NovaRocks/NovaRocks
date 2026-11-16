@@ -1622,6 +1622,7 @@ impl<'a> AnalyzerContext<'a> {
                                 .expect("valid value root nullability transform"),
 
                             kind: ExprKind::Cast {
+                                array_failure_mode: None,
                                 expr: Box::new(outer_expr),
                                 target: pred.inner_col.value_type.data_type().clone(),
                                 decimal_overflow_policy:
@@ -3548,6 +3549,7 @@ pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
             ),
 
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(expr),
                 target: DataType::Boolean,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -3685,6 +3687,7 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::Cast {
+            array_failure_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
@@ -3692,6 +3695,7 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::Cast {
+                array_failure_mode,
                 expr: Box::new(qualify_inner_shadowing_column_refs(
                     *inner,
                     inner_scope,
@@ -5342,6 +5346,7 @@ fn cast_case_branch_if_needed(expr: TypedExpr, target: &DataType) -> TypedExpr {
     if expr.value_type.data_type() != target && *expr.value_type.data_type() != DataType::Null {
         TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(expr),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -5448,6 +5453,7 @@ fn replace_placeholder_in_expr(
             },
         },
         ExprKind::Cast {
+            array_failure_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
@@ -5455,6 +5461,7 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::Cast {
+                array_failure_mode: *array_failure_mode,
                 expr: Box::new(replace_placeholder_in_expr(
                     inner,
                     placeholder_id,
@@ -5932,6 +5939,94 @@ fn conjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shadowing_qualification_preserves_explicit_array_cast_modes_and_complete_sources() {
+        use crate::column_id::ColumnId;
+        use novarocks_type_contract::{
+            ArrayCastFailureMode, DecimalOverflowPolicy, FunctionValueType,
+        };
+        use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+        let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
+        let mut inner = AnalyzerScope::new(Rc::clone(&factory));
+        let mut outer = AnalyzerScope::new(factory);
+        let source = FunctionValueType::new(
+            DataType::List(Arc::new(
+                arrow::datatypes::Field::new("source_child", DataType::Int32, true)
+                    .with_metadata(HashMap::from([("owner".into(), "original-source".into())])),
+            )),
+            true,
+        );
+        let target = FunctionValueType::new(
+            DataType::List(Arc::new(
+                arrow::datatypes::Field::new("target_child", DataType::Int64, true)
+                    .with_metadata(HashMap::from([("owner".into(), "declared-target".into())])),
+            )),
+            true,
+        );
+        let inner_id = ColumnId(801);
+        let outer_id = ColumnId(802);
+        inner.add_column_with_id(Some("inner_source"), "values", inner_id, source.clone());
+        outer.add_column_with_id(Some("outer_source"), "values", outer_id, source.clone());
+        assert_eq!(inner.resolve(None, "values").unwrap().0, inner_id);
+        assert_eq!(outer.resolve(None, "values").unwrap().0, outer_id);
+        for mode in [
+            ArrayCastFailureMode::ReportError,
+            ArrayCastFailureMode::OutputNull,
+        ] {
+            let original = TypedExpr {
+                kind: ExprKind::Cast {
+                    expr: Box::new(TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: inner_id,
+                            qualifier: None,
+                            column: "values".into(),
+                        },
+                        value_type: source.clone(),
+                    }),
+                    target: target.data_type().clone(),
+                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                    array_failure_mode: Some(mode),
+                },
+                value_type: target.clone(),
+            };
+            let actual = qualify_inner_shadowing_column_refs(original, &inner, &outer);
+            assert_eq!(actual.value_type, target);
+            assert_eq!(
+                actual.value_type.try_to_field("result").unwrap(),
+                target.try_to_field("result").unwrap()
+            );
+            let ExprKind::Cast {
+                expr,
+                target: actual_target,
+                decimal_overflow_policy,
+                array_failure_mode,
+            } = actual.kind
+            else {
+                panic!("original CAST boundary")
+            };
+            assert_eq!(array_failure_mode, Some(mode));
+            assert_eq!(decimal_overflow_policy, DecimalOverflowPolicy::ReportError);
+            assert_eq!(&actual_target, target.data_type());
+            assert_eq!(expr.value_type, source);
+            assert_eq!(
+                expr.value_type.try_to_field("source").unwrap(),
+                source.try_to_field("source").unwrap()
+            );
+            let ExprKind::ColumnRef {
+                column_id,
+                qualifier,
+                column,
+            } = expr.kind
+            else {
+                panic!("original bound child")
+            };
+            assert_eq!(column_id, inner_id);
+            assert_ne!(column_id, outer_id);
+            assert_eq!(qualifier.as_deref(), Some("inner_source"));
+            assert_eq!(column, "values");
+        }
+    }
 
     #[test]
     fn composite_in_evaluates_volatile_probe_outside_candidate_lambda() {

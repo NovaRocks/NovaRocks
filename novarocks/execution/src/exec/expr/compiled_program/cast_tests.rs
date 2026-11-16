@@ -199,6 +199,7 @@ fn result_literal(
             NodeId::new(0),
             result.clone(),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: value,
                 target: result.data_type().clone(),
                 decimal_overflow_policy: policy,
@@ -247,6 +248,7 @@ fn fixture(
                     input_node,
                     ty.clone(),
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: exact,
                         target: DataType::Float32,
                         decimal_overflow_policy: policy,
@@ -320,6 +322,7 @@ fn fixture(
                     output_node,
                     source_type.clone(),
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: exact,
                         target: DataType::Float32,
                         decimal_overflow_policy: policy,
@@ -384,6 +387,7 @@ fn fixture(
             output_node,
             result_type.clone(),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: child,
                 target: result_type.data_type().clone(),
                 decimal_overflow_policy: policy,

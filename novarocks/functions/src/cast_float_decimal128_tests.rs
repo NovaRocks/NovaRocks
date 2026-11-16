@@ -67,6 +67,7 @@ fn recipe(p: u8, s: i8, nullable: bool) -> PreparedCastRecipe {
         &FunctionValueType::new(DataType::Decimal128(p, s), true),
         DecimalOverflowPolicy::OutputNull,
         false,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -96,6 +97,7 @@ fn float_decimal128_complete_metadata_effect_nullable_and_policy() {
                                 &target,
                                 policy,
                                 allow,
+                                None,
                                 &Control::default(),
                             );
                             if !target_nullable {
@@ -147,6 +149,7 @@ fn float_decimal128_complete_metadata_effect_nullable_and_policy() {
                 &FunctionValueType::new(DataType::Decimal128(18, 4), true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &Control::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -218,6 +221,7 @@ fn float_decimal128_original_value_static_error_and_hidden_null() {
                 &FunctionValueType::new(DataType::Decimal128(1, 0), true),
                 policy,
                 allow,
+                None,
                 &Control::default(),
             )
             .unwrap();
@@ -296,6 +300,7 @@ fn float_decimal128_original_value_static_error_and_hidden_null() {
             &FunctionValueType::new(DataType::Decimal128(38, 0), true),
             policy,
             false,
+            None,
             &Control::default(),
         )
         .unwrap();
@@ -419,6 +424,7 @@ fn float_decimal128_compile_callbacks_preserve_three_causes_no_tail() {
             &result,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &baseline,
         );
         // Both floating carriers are admitted; malformed result nullability
@@ -450,6 +456,7 @@ fn float_decimal128_compile_callbacks_preserve_three_causes_no_tail() {
                     &result,
                     DecimalOverflowPolicy::ReportError,
                     true,
+                    None,
                     &control,
                 )
                 .unwrap_err();

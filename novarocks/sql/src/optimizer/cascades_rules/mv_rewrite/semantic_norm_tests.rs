@@ -81,6 +81,7 @@ fn call(args: Vec<NormExpr>) -> NormExpr {
         args,
         binding: None,
         decimal_overflow_policy: None,
+        array_failure_mode: None,
         order_by: vec![],
         argument_order: NormArgumentOrder::Ordered,
     }
@@ -589,6 +590,7 @@ fn typed_map64_mv_normalization_fingerprint_and_cast_keep_complete_identity() {
     let cast = intern(
         &mut arena,
         ScalarNode::Cast {
+            array_failure_mode: None,
             child: value,
             target: ty.data_type().clone(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
@@ -608,4 +610,46 @@ fn typed_map64_mv_normalization_fingerprint_and_cast_keep_complete_identity() {
         key(&normalized) != key(&expression),
         "a retained cast keeps its own normalized expression identity"
     );
+}
+
+#[test]
+fn array_cast_mode_is_part_of_mv_normalized_fingerprint_and_exact_equality() {
+    use novarocks_type_contract::ArrayCastFailureMode;
+    let ty = FunctionValueType::new(
+        DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int32,
+            true,
+        ))),
+        true,
+    );
+    let mut arena = ScalarArena::new();
+    let child = intern(&mut arena, ScalarNode::ColumnRef(ColumnId(81)), ty.clone());
+    let names = HashMap::from([(ColumnId(81), "source".into())]);
+    let mut expressions = Vec::new();
+    for mode in [
+        None,
+        Some(ArrayCastFailureMode::ReportError),
+        Some(ArrayCastFailureMode::OutputNull),
+    ] {
+        let id = intern(
+            &mut arena,
+            ScalarNode::Cast {
+                child,
+                target: ty.data_type().clone(),
+                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                array_failure_mode: mode,
+            },
+            ty.clone(),
+        );
+        let expression = normalized(&arena, id, &names);
+        assert!(same(&expression, &expression.clone()));
+        expressions.push(expression);
+    }
+    for left in 0..expressions.len() {
+        for right in left + 1..expressions.len() {
+            assert!(!same(&expressions[left], &expressions[right]));
+            assert_ne!(key(&expressions[left]), key(&expressions[right]));
+        }
+    }
 }

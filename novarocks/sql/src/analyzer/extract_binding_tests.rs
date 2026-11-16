@@ -217,6 +217,7 @@ fn extract_binding_all_six_units_preserve_canonical_targets_and_original_catalog
                     let argument = &call(expression).2[0];
                     if original.data_type() != target.data_type() {
                         let ExprKind::Cast {
+                            array_failure_mode: None,
                             expr,
                             target: cast_target,
                             decimal_overflow_policy,

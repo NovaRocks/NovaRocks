@@ -255,8 +255,54 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains("select cast(['plain'] as array<json>)"),
-            vec![Some(SqlType::Array(Box::new(SqlType::String)))],
+            vec![Some(SqlType::Array(Box::new(SqlType::Json)))],
         );
+        for (sql, mode) in [
+            (
+                "select cast(['plain'] as array<json>)",
+                novarocks_type_contract::ArrayCastFailureMode::ReportError,
+            ),
+            (
+                "select try_cast(['plain'] as array<json>)",
+                novarocks_type_contract::ArrayCastFailureMode::OutputNull,
+            ),
+        ] {
+            let expressions = output_expressions(sql);
+            let expression = &expressions[0];
+            assert_eq!(
+                expression.value_type,
+                crate::test_value_types::string_list(true, true, true)
+            );
+            let ExprKind::Cast {
+                expr,
+                array_failure_mode,
+                ..
+            } = &expression.kind
+            else {
+                panic!("explicit array CAST");
+            };
+            assert_eq!(*array_failure_mode, Some(mode));
+            assert_eq!(domain_at(expr, &[0]), None);
+            let ExprKind::FunctionCall { binding, args, .. } = &expr.kind else {
+                panic!("original array literal owner");
+            };
+            assert_eq!(
+                binding.function_id.as_str(),
+                "builtin.scalar/__array_literal/v1"
+            );
+            assert_eq!(args.len(), 1);
+            assert_eq!(
+                args[0].value_type.logical_type(),
+                novarocks_type_contract::ValueLogicalType::Physical
+            );
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &binding.selected.result_type
+            else {
+                panic!("scalar");
+            };
+            assert_eq!(result, &expr.value_type);
+        }
+        // Legacy typed ARRAY still has its separate element-type producer.
         let sql = "select array<json>['{}'],array<json>[parse_json('{}')]";
         assert_eq!(
             output_domains(sql),
@@ -1253,6 +1299,7 @@ mod scalar_domain_tests {
         let target = crate::test_value_types::string_list(false, false, false);
         let coerced = TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(original),
                 target: target.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1340,6 +1387,7 @@ mod scalar_domain_tests {
         assert_eq!(result, &original.value_type);
         let value = TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(original.clone()),
                 target: original.value_type.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

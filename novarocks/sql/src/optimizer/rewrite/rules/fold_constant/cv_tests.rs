@@ -48,6 +48,7 @@ fn fold_identity(value: ConstantValue) -> (ScalarArena, ScalarId, ConstantValue,
     let root = arena
         .intern_observed(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child,
                 target: ty.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -168,6 +169,7 @@ fn evaluator_source_result_mismatch_is_fatal_without_publishing_a_constant() {
     let root = arena
         .intern_observed(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

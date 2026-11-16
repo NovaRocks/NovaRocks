@@ -25,6 +25,10 @@ mod failure_projection;
 mod between;
 pub use between::*;
 mod arithmetic;
+mod array_cast;
+pub use array_cast::{
+    ArrayCastFailureMode, array_cast_mode_types_valid, array_cast_mode_types_valid_observed,
+};
 mod array_generate;
 mod carrier_parameters;
 mod coercion;

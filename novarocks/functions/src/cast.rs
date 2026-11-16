@@ -51,8 +51,12 @@ mod f3_scalar;
 #[path = "cast/f3_array.rs"]
 mod f3_array;
 
+mod array_json;
+mod array_mode;
+mod array_text;
 #[path = "cast/selected.rs"]
 mod selected;
+mod trino_array_leaf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CastOperation {
@@ -395,6 +399,11 @@ impl DecimalTextSource {
 /// What a prepared cast does to a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
+    ExplicitArray,
+    ArrayNull,
+    ArrayLeaf(trino_array_leaf::Leaf),
+    ArrayText,
+    ArrayJson(array_json::Operation),
     ExtendedScalar(f3_scalar::Body),
     SelectedArray(f3_array::Body),
     /// Original List retag/null-child computation on an exact selected domain.
@@ -456,9 +465,11 @@ enum CastBody {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedCastRecipe {
     operation: CastOperation,
+    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     source: FunctionValueType,
     result: FunctionValueType,
     body: CastBody,
+    array_child: Option<Box<PreparedCastRecipe>>,
     decimal_overflow_policy: DecimalOverflowPolicy,
     allow_throw_exception: bool,
 }
@@ -469,12 +480,28 @@ impl PreparedCastRecipe {
         result: &FunctionValueType,
         policy: DecimalOverflowPolicy,
         allow_throw_exception: bool,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, CastPrepareError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         let outcome = (|| {
             for ty in [source, result] {
                 validate_type_observed(ty, &mut work).map_err(CastPrepareError::Kernel)?;
+            }
+            if let Some(mode) = array_failure_mode {
+                if operation != CastOperation::Carrier
+                    || !novarocks_type_contract::array_cast_mode_types_valid(source, result, mode)
+                {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                return array_mode::prepare(
+                    source,
+                    result,
+                    policy,
+                    allow_throw_exception,
+                    mode,
+                    &mut work,
+                );
             }
             if operation == CastOperation::Carrier
                 && source.logical_type() == ValueLogicalType::Physical
@@ -497,9 +524,11 @@ impl PreparedCastRecipe {
                     work.step()?;
                     return Ok(Self {
                         operation,
+                        array_failure_mode,
                         source: source.clone(),
                         result: result.clone(),
                         body: CastBody::ExtendedScalar(body),
+                        array_child: None,
                         decimal_overflow_policy: policy,
                         allow_throw_exception,
                     });
@@ -519,12 +548,14 @@ impl PreparedCastRecipe {
                 work.step()?;
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::FloatDecimal {
                         precision: *precision,
                         scale: *scale,
                     },
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -557,12 +588,14 @@ impl PreparedCastRecipe {
                 work.step()?;
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::IntegralDecimal {
                         precision: *precision,
                         scale: *scale,
                     },
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -584,12 +617,14 @@ impl PreparedCastRecipe {
                 work.step()?;
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::DecimalRescale {
                         precision: *precision,
                         scale: *scale,
                     },
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -620,9 +655,11 @@ impl PreparedCastRecipe {
                 }
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::Identity,
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -638,9 +675,11 @@ impl PreparedCastRecipe {
                 }
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::Collection,
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -660,9 +699,11 @@ impl PreparedCastRecipe {
                 }
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::TimeCalendar,
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -687,9 +728,11 @@ impl PreparedCastRecipe {
                 };
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::TimeText { mode },
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -704,9 +747,11 @@ impl PreparedCastRecipe {
                 }
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::BinaryText,
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -729,12 +774,14 @@ impl PreparedCastRecipe {
                     }
                     return Ok(Self {
                         operation,
+                        array_failure_mode,
                         source: source.clone(),
                         result: result.clone(),
                         body: CastBody::DecimalText {
                             source: decimal,
                             scale: *scale,
                         },
+                        array_child: None,
                         decimal_overflow_policy: policy,
                         allow_throw_exception,
                     });
@@ -765,6 +812,7 @@ impl PreparedCastRecipe {
                     }
                     return Ok(Self {
                         operation,
+                        array_failure_mode,
                         source: source.clone(),
                         result: result.clone(),
                         body: CastBody::DecimalFloat {
@@ -776,6 +824,7 @@ impl PreparedCastRecipe {
                                 Target::F64
                             },
                         },
+                        array_child: None,
                         decimal_overflow_policy: policy,
                         allow_throw_exception,
                     });
@@ -790,9 +839,11 @@ impl PreparedCastRecipe {
                 }
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::LargeIntText,
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -800,9 +851,11 @@ impl PreparedCastRecipe {
             if let Some(body) = f3_array::prepare(source, result, &mut work)? {
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::SelectedArray(body),
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -822,9 +875,11 @@ impl PreparedCastRecipe {
                 };
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::DateFloat { target },
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -835,11 +890,13 @@ impl PreparedCastRecipe {
                 }
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::TemporalCarrier {
                         source: source_kind,
                     },
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -850,11 +907,13 @@ impl PreparedCastRecipe {
                 }
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::Text {
                         source: source_kind,
                     },
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -865,11 +924,13 @@ impl PreparedCastRecipe {
                 }
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::FloatDate {
                         source: source_kind,
                     },
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -889,12 +950,14 @@ impl PreparedCastRecipe {
                 };
                 return Ok(Self {
                     operation,
+                    array_failure_mode,
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::Calendar {
                         source: source_kind,
                         unit: unit.copied(),
                     },
+                    array_child: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -924,12 +987,14 @@ impl PreparedCastRecipe {
             // Admitted timestamp zones are None; scalar types retain no owned graph.
             let recipe = Self {
                 operation,
+                array_failure_mode,
                 source: source.clone(),
                 result: result.clone(),
                 body: CastBody::Carrier {
                     source: source_kind,
                     target,
                 },
+                array_child: None,
                 decimal_overflow_policy: policy,
                 allow_throw_exception,
             };
@@ -945,6 +1010,9 @@ impl PreparedCastRecipe {
         }
         work.finish()?;
         outcome
+    }
+    pub fn array_failure_mode(&self) -> Option<novarocks_type_contract::ArrayCastFailureMode> {
+        self.array_failure_mode
     }
     pub fn operation(&self) -> CastOperation {
         self.operation
@@ -996,7 +1064,13 @@ impl PreparedCastRecipe {
     /// Exact array-valued cast bodies use the selected invocation port instead
     /// of forcing nested/byte/wide-decimal values through a scalar result enum.
     pub fn uses_selected_array(&self) -> bool {
-        matches!(self.body, CastBody::Collection | CastBody::SelectedArray(_))
+        matches!(
+            self.body,
+            CastBody::Collection
+                | CastBody::SelectedArray(_)
+                | CastBody::ExplicitArray
+                | CastBody::ArrayNull
+        )
     }
     pub fn evaluate_selected_array<'a>(
         &self,
@@ -1006,6 +1080,9 @@ impl PreparedCastRecipe {
         control: &dyn KernelEvaluationControl,
     ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
         match self.body {
+            CastBody::ExplicitArray | CastBody::ArrayNull => {
+                array_mode::evaluate(self, argument, selection, inherited, control)
+            }
             CastBody::Collection => {
                 self.evaluate_collection(argument, selection, inherited, control)
             }
@@ -1027,7 +1104,9 @@ impl PreparedCastRecipe {
         inherited: &[RowDataError],
         control: &dyn KernelEvaluationControl,
     ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
-        if self.uses_selected_array() {
+        if self.is_identity() {
+            array_mode::evaluate(self, argument, selection, inherited, control)
+        } else if self.uses_selected_array() {
             self.evaluate_selected_array(argument, selection, inherited, control)
         } else {
             selected::evaluate(self, argument, selection, inherited, control)
@@ -1035,6 +1114,20 @@ impl PreparedCastRecipe {
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
         let may_raise_row_error = match self.body {
+            CastBody::ExplicitArray => {
+                self.array_failure_mode
+                    == Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+                    && self.array_child.as_ref().is_some_and(|child| {
+                        child
+                            .own_effects(context)
+                            .for_use(context)
+                            .expect("same effect context")
+                            .may_raise_row_error
+                    })
+            }
+            CastBody::ArrayNull => false,
+            CastBody::ArrayLeaf(leaf) => leaf.may_fail(),
+            CastBody::ArrayText | CastBody::ArrayJson(_) => true,
             CastBody::SelectedArray(f3_array::Body::ArrowScalar) => true,
             CastBody::SelectedArray(f3_array::Body::Structure) => false,
             CastBody::ExtendedScalar(body) => body.may_raise(
@@ -1131,6 +1224,29 @@ impl PreparedCastRecipe {
                 return Err(invalid(
                     "array CAST requires its actual selected invocation",
                 ));
+            }
+            if let CastBody::ArrayJson(operation) = self.body {
+                return array_mode::evaluate_json(
+                    self,
+                    operation,
+                    argument,
+                    ordinal,
+                    logical_row,
+                    &mut work,
+                );
+            }
+            if self.body == CastBody::ArrayText {
+                return array_text::evaluate_row(self, argument, ordinal, logical_row, &mut work);
+            }
+            if let CastBody::ArrayLeaf(leaf) = self.body {
+                return array_mode::evaluate_leaf(
+                    self,
+                    leaf,
+                    argument,
+                    ordinal,
+                    logical_row,
+                    &mut work,
+                );
             }
             if let CastBody::ExtendedScalar(body) = self.body {
                 return body.evaluate(self, argument, ordinal, logical_row, &mut work);
@@ -2276,3 +2392,6 @@ fn temporal_row_failure(
 #[cfg(test)]
 #[path = "cast/selected_tests.rs"]
 mod selected_tests;
+
+#[cfg(test)]
+mod array_mode_tests;

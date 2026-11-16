@@ -82,6 +82,7 @@ fn prepare(
         &result,
         policy,
         allow,
+        None,
         &CompileControl::default(),
     )
     .unwrap()
@@ -339,6 +340,7 @@ fn nullable_proof_depends_on_actual_allow_and_source_not_decimal_policy_or_value
                                 &ty(target.clone(), result_nullable),
                                 policy,
                                 allow,
+                                None,
                                 &CompileControl::default(),
                             );
                             if result_nullable || (!source_nullable && allow) {
@@ -375,6 +377,7 @@ fn nullable_proof_depends_on_actual_allow_and_source_not_decimal_policy_or_value
                     &ty(target, true),
                     DecimalOverflowPolicy::OutputNull,
                     false,
+                    None,
                     &CompileControl::default()
                 ),
                 Err(CastPrepareError::Unsupported)
@@ -389,6 +392,7 @@ fn nullable_proof_depends_on_actual_allow_and_source_not_decimal_policy_or_value
                     &ty(DataType::Int64, true),
                     DecimalOverflowPolicy::OutputNull,
                     false,
+                    None,
                     &CompileControl::default()
                 ),
                 Err(CastPrepareError::Unsupported)
@@ -601,6 +605,7 @@ fn float_compile_original_three_causes_keep_all_refusal_prefixes_and_metadata_qu
             &target,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &baseline,
         );
         let trace = baseline.trace.lock().unwrap().clone();
@@ -625,6 +630,7 @@ fn float_compile_original_three_causes_keep_all_refusal_prefixes_and_metadata_qu
                     &target,
                     DecimalOverflowPolicy::ReportError,
                     true,
+                    None,
                     &control,
                 )
                 .unwrap_err();

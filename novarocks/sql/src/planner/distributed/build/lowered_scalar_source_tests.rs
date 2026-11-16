@@ -341,6 +341,7 @@ fn scalar_journal_original_cast_and_nested_none_survive_constant_emission() {
     for argument in [
         TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(text("ABC")),
                 target: DataType::Utf8,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
@@ -526,6 +527,7 @@ fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources
     ));
     let cast = TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(null),
             target: DataType::Utf8,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

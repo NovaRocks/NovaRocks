@@ -50,6 +50,32 @@ pub use read::{
     decode_expression_definitions_in,
 };
 
+fn encode_array_cast_failure_mode(
+    mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+) -> Option<i32> {
+    use novarocks_proto_models::physical_package_v2::ArrayCastFailureMode as Wire;
+    use novarocks_type_contract::ArrayCastFailureMode as Mode;
+    mode.map(|mode| match mode {
+        Mode::ReportError => Wire::ReportError as i32,
+        Mode::OutputNull => Wire::OutputNull as i32,
+    })
+}
+
+fn decode_array_cast_failure_mode(
+    mode: Option<i32>,
+) -> Result<Option<novarocks_type_contract::ArrayCastFailureMode>, ExpressionCodecError> {
+    use novarocks_proto_models::physical_package_v2::ArrayCastFailureMode as Wire;
+    use novarocks_type_contract::ArrayCastFailureMode as Mode;
+    match mode {
+        None => Ok(None),
+        Some(value) if value == Wire::ReportError as i32 => Ok(Some(Mode::ReportError)),
+        Some(value) if value == Wire::OutputNull as i32 => Ok(Some(Mode::OutputNull)),
+        Some(_) => Err(ExpressionCodecError::InvalidShape(
+            "explicit array CAST failure mode is unspecified or unknown",
+        )),
+    }
+}
+
 #[derive(Debug)]
 pub enum ExpressionCodecError {
     InvalidShape(&'static str),

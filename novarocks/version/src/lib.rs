@@ -95,6 +95,12 @@ impl StaticPlanInterpreter {
 /// Plan revision 26 admits explicit physical NULL-list lifting to declared
 /// nullable JSON and UTF8 list elements. Earlier peers lack these prepared
 /// casts; the exact plan revision separates them without changing epoch 15.
+/// Plan revision 27 additionally freezes the optional explicit-array CAST
+/// failure mode in the package descriptor. Absent modes retain the existing
+/// interpretation, so this change does not require an execution-only epoch.
+/// Revision 28 adds strict signed/decimal and raw-text JSON array conversion
+/// recipes and their precise successful-NULL obligations. A revision-27 peer
+/// cannot prepare these new shapes; absence keeps the original interpretation.
 ///
 /// RWM-7 retires COW vocabulary and freezes explicit writer W/T declarations,
 /// projected writer values and selected-assignment construction in the package

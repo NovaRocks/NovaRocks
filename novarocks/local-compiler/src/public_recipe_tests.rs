@@ -267,6 +267,7 @@ fn public_cast_recipe_equals_frozen_program_recipe_including_policy_and_allow() 
         &result,
         DecimalOverflowPolicy::ReportError,
         true,
+        None,
         &Control,
     )
     .unwrap();
@@ -369,6 +370,7 @@ fn public_wrappers_preserve_each_family_unsupported_and_type_mismatch() {
             &tiny,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &Control
         ),
         Err(P::Cast(CastPrepareError::Unsupported))
@@ -400,6 +402,7 @@ fn public_wrappers_preserve_each_family_unsupported_and_type_mismatch() {
             &integer,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &Control
         ),
         Err(P::Cast(CastPrepareError::TypeMismatch))
@@ -502,6 +505,7 @@ fn frozen_program_refusals_keep_the_exact_public_wrapper_refusal() {
             &result,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &Control
         )
         .unwrap_err()
@@ -594,6 +598,7 @@ fn each_public_family_and_checked_expression_program_keep_original_control_cause
             &output,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             c,
         )
     });
@@ -687,4 +692,172 @@ fn actual_arithmetic_type_mismatch_is_not_a_capability_refusal_or_invalid_reques
         actual,
         ProgramPrimitiveError::Arithmetic(ArithmeticPrepareError::TypeMismatch)
     );
+}
+
+#[test]
+fn explicit_array_cast_modes_match_public_recipes_and_remain_distinct() {
+    use novarocks_type_contract::ArrayCastFailureMode as ArrayMode;
+    let functions = functions();
+    let list = |item| {
+        FunctionValueType::new(
+            DataType::List(Arc::new(arrow_schema::Field::new(
+                "declared-item",
+                item,
+                true,
+            ))),
+            true,
+        )
+    };
+    let source = list(DataType::Int32);
+    let target = list(DataType::Int64);
+    let mut recipes = vec![];
+    for mode in [Some(ArrayMode::ReportError), Some(ArrayMode::OutputNull)] {
+        let fixture = fixture_with_cast_mode(
+            &functions,
+            Shape::CarrierCast,
+            Mode::Project,
+            source.clone(),
+            target.clone(),
+            OutputClaim::Accurate,
+            None,
+            mode,
+        )
+        .unwrap();
+        let program = compile(package(&functions, fixture), &functions, &Control).unwrap();
+        let direct = prepare_cast_node(
+            CastOperation::Carrier,
+            &source,
+            &target,
+            DecimalOverflowPolicy::ReportError,
+            true,
+            mode,
+            &Control,
+        )
+        .unwrap();
+        assert_eq!(direct.array_failure_mode(), mode);
+        assert_eq!(
+            Some(&direct),
+            program.expressions().cast_recipe(occurrence(&program))
+        );
+        recipes.push(direct);
+    }
+    assert_ne!(recipes[0], recipes[1]);
+    let identity_source = list(DataType::Int32);
+    let legacy = prepare_cast_node(
+        CastOperation::Carrier,
+        &identity_source,
+        &identity_source,
+        DecimalOverflowPolicy::ReportError,
+        true,
+        None,
+        &Control,
+    )
+    .unwrap();
+    for mode in [ArrayMode::ReportError, ArrayMode::OutputNull] {
+        let explicit = prepare_cast_node(
+            CastOperation::Carrier,
+            &identity_source,
+            &identity_source,
+            DecimalOverflowPolicy::ReportError,
+            true,
+            Some(mode),
+            &Control,
+        )
+        .unwrap();
+        assert_ne!(legacy, explicit);
+    }
+}
+
+#[test]
+fn explicit_json_text_public_recipes_preserve_required_child_contracts() {
+    use novarocks_type_contract::{
+        ArrayCastFailureMode, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+    let storage = ValueTypeStorageLifetime::pure();
+    let item = ValueTypeRef::try_new(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        false,
+        storage.clone(),
+    )
+    .unwrap();
+    let value = ValueTypeRef::try_new(ValueKind::List(item), true, storage.clone()).unwrap();
+    let layout = ValueLayout::try_new(
+        &DataType::List(Arc::new(arrow_schema::Field::new(
+            "json",
+            DataType::Utf8,
+            false,
+        ))),
+        storage,
+    )
+    .unwrap();
+    let json = FunctionValueType::try_from_value(value, layout).unwrap();
+    let text = |nullable| {
+        FunctionValueType::new(
+            DataType::List(Arc::new(arrow_schema::Field::new(
+                "text",
+                DataType::Utf8,
+                nullable,
+            ))),
+            true,
+        )
+    };
+    for mode in [
+        ArrayCastFailureMode::ReportError,
+        ArrayCastFailureMode::OutputNull,
+    ] {
+        assert_eq!(
+            prepare_cast_node(
+                CastOperation::Carrier,
+                &json,
+                &text(false),
+                DecimalOverflowPolicy::ReportError,
+                true,
+                Some(mode),
+                &Control
+            ),
+            Err(ProgramPrimitiveError::Cast(CastPrepareError::TypeMismatch))
+        );
+        assert_eq!(
+            prepare_cast_node(
+                CastOperation::Carrier,
+                &text(true),
+                &json,
+                DecimalOverflowPolicy::ReportError,
+                true,
+                Some(mode),
+                &Control
+            ),
+            Err(ProgramPrimitiveError::Cast(CastPrepareError::TypeMismatch))
+        );
+        for (source, result) in [(json.clone(), text(true)), (text(false), json.clone())] {
+            let direct = prepare_cast_node(
+                CastOperation::Carrier,
+                &source,
+                &result,
+                DecimalOverflowPolicy::ReportError,
+                true,
+                Some(mode),
+                &Control,
+            )
+            .unwrap();
+            let functions = functions();
+            let fixture = fixture_with_cast_mode(
+                &functions,
+                Shape::CarrierCast,
+                Mode::Project,
+                source,
+                result,
+                OutputClaim::Accurate,
+                None,
+                Some(mode),
+            )
+            .unwrap();
+            let program = compile(package(&functions, fixture), &functions, &Control).unwrap();
+            assert_eq!(
+                Some(&direct),
+                program.expressions().cast_recipe(occurrence(&program))
+            );
+        }
+    }
 }

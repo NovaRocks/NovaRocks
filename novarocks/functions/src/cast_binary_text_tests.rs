@@ -62,6 +62,7 @@ fn recipe(nullable: bool) -> PreparedCastRecipe {
         &FunctionValueType::new(DataType::Utf8, true),
         DecimalOverflowPolicy::ReportError,
         true,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -80,6 +81,7 @@ fn binary_text_recipe_exact_type_root_null_obligation_and_refuses_other_routes()
                     &FunctionValueType::new(DataType::Utf8, true),
                     policy,
                     allow,
+                    None,
                     &Control::default(),
                 )
                 .unwrap();
@@ -106,6 +108,7 @@ fn binary_text_recipe_exact_type_root_null_obligation_and_refuses_other_routes()
                         &FunctionValueType::new(DataType::Utf8, false),
                         policy,
                         allow,
+                        None,
                         &Control::default()
                     ),
                     Err(CastPrepareError::TypeMismatch)
@@ -137,6 +140,7 @@ fn binary_text_recipe_exact_type_root_null_obligation_and_refuses_other_routes()
                 &FunctionValueType::new(DataType::Utf8, true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &Control::default()
             ),
             Err(CastPrepareError::Unsupported)

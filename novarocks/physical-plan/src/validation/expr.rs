@@ -425,6 +425,7 @@ pub(crate) fn validate_expression(
             target,
             decimal_overflow_policy,
             allow_throw_exception,
+            array_failure_mode,
         } => {
             if allow_throw_exception.expected_key
                 != novarocks_type_contract::SemanticParameterKey::AllowThrowException
@@ -435,6 +436,7 @@ pub(crate) fn validate_expression(
                 ));
             }
             if let Some(input) = fragment.expressions().get(*expr)
+                && array_failure_mode.is_none()
                 && !novarocks_type_contract::is_default_json_structure_cast(
                     &input.ty,
                     &expression.ty,
@@ -453,6 +455,22 @@ pub(crate) fn validate_expression(
                 ));
             }
             if let Some(input) = fragment.expressions().get(*expr)
+                && let Some(mode) = array_failure_mode
+                && !novarocks_type_contract::array_cast_mode_types_valid_observed(
+                    &input.ty,
+                    &expression.ty,
+                    *mode,
+                    || Ok::<_, novarocks_type_contract::ValueTypeError>(()),
+                )
+                .unwrap_or(false)
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "explicit array CAST mode differs from its source and result declarations",
+                ));
+            }
+            if let Some(input) = fragment.expressions().get(*expr)
+                && array_failure_mode.is_none()
                 && !novarocks_type_contract::decimal_error_policy_cast_supported(
                     input.ty.data_type(),
                     target,

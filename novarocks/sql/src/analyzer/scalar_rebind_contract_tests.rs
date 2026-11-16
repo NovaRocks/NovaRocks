@@ -370,6 +370,7 @@ fn scalar_rebind_lawful_canonical_source_keeps_policy_and_catalog_owned_changed_
                 FunctionValueType::new(DataType::Int64, false)
             );
             let ExprKind::Cast {
+                array_failure_mode: None,
                 expr,
                 target,
                 decimal_overflow_policy,

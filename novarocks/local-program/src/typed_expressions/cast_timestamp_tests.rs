@@ -64,6 +64,7 @@ fn timestamp_cast_all_sixteen_live_and_dead_definitions_keep_successful_null_con
                                                 child: ProgramExprId::new(0),
                                                 decimal_overflow_policy: policy,
                                                 allow_throw_exception: allow,
+                                                array_failure_mode: None,
                                             },
                                             result.data_type().clone(),
                                             None,
@@ -105,7 +106,7 @@ fn timestamp_cast_all_sixteen_live_and_dead_definitions_keep_successful_null_con
                                 let snapshot = typed.resolved_calls().snapshot();
                                 assert!(
                                     matches!(snapshot.roots().arenas()[&arena].node(ProgramExprId::new(1)).unwrap().kind(),
-                                    StaticExprKind::PreparedCast { operation: CastOperation::Carrier, child, decimal_overflow_policy, allow_throw_exception }
+                                    StaticExprKind::PreparedCast { operation: CastOperation::Carrier, child, decimal_overflow_policy, allow_throw_exception, array_failure_mode: None }
                                     if *child == ProgramExprId::new(0) && *decimal_overflow_policy == policy && *allow_throw_exception == allow)
                                 );
                                 assert_eq!(

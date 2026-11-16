@@ -1604,6 +1604,7 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::Cast {
+                array_failure_mode,
                 expr: inner,
                 target,
                 decimal_overflow_policy,
@@ -1611,6 +1612,7 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::Cast {
+                    array_failure_mode,
                     expr: Box::new(self.substitute_select_aliases_for_select_inner(
                         *inner, projection, from_scope, inside_agg,
                     )),
@@ -1803,6 +1805,7 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::Cast {
+                array_failure_mode,
                 expr: inner,
                 target,
                 decimal_overflow_policy,
@@ -1810,6 +1813,7 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::Cast {
+                    array_failure_mode,
                     expr: Box::new(
                         self.substitute_select_aliases_inner(*inner, projection, inside_agg),
                     ),
@@ -2945,10 +2949,12 @@ impl<'a> AnalyzerContext<'a> {
                 volatility,
             },
             ExprKind::Cast {
+                array_failure_mode,
                 expr: inner,
                 target,
                 decimal_overflow_policy,
             } => ExprKind::Cast {
+                array_failure_mode,
                 expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
                 target,
                 decimal_overflow_policy,

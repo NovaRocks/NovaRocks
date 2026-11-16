@@ -91,6 +91,7 @@ fn recipe(ty: DataType, nullable: bool) -> PreparedCastRecipe {
         &FunctionValueType::new(DataType::Float32, nullable),
         DecimalOverflowPolicy::ReportError,
         true,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -125,6 +126,7 @@ fn decimal_float32_complete_metadata_policy_nullability_and_effect_contract() {
                                     &target,
                                     policy,
                                     allow,
+                                    None,
                                     &Control::default(),
                                 );
                                 if !target_nullable && (nullable || (!wide && scale < 0)) {
@@ -180,6 +182,7 @@ fn decimal_float32_complete_metadata_policy_nullability_and_effect_contract() {
                     &FunctionValueType::new(DataType::Float32, true),
                     DecimalOverflowPolicy::ReportError,
                     true,
+                    None,
                     &Control::default()
                 ),
                 Err(CastPrepareError::Unsupported)
@@ -199,6 +202,7 @@ fn decimal_float32_complete_metadata_policy_nullability_and_effect_contract() {
             &FunctionValueType::new(DataType::Float32, false),
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &Control::default()
         ),
         Err(CastPrepareError::Unsupported)
@@ -320,6 +324,7 @@ fn decimal_float32_original_hidden_payload_and_scale_min_failure_contract() {
                 &FunctionValueType::new(DataType::Float32, true),
                 policy,
                 allow,
+                None,
                 &Control::default(),
             )
             .unwrap();
@@ -426,6 +431,7 @@ fn decimal_float32_compile_callbacks_preserve_primary_causes_on_success_and_reje
                 &result,
                 DecimalOverflowPolicy::ReportError,
                 true,
+                None,
                 &baseline,
             );
             match (source_nullable, result_nullable, operation) {
@@ -458,6 +464,7 @@ fn decimal_float32_compile_callbacks_preserve_primary_causes_on_success_and_reje
                         &result,
                         DecimalOverflowPolicy::ReportError,
                         true,
+                        None,
                         &control,
                     )
                     .unwrap_err();
@@ -490,6 +497,7 @@ fn decimal_float32_preserves_original_expr_null_and_unsanitized_project_projecti
                 &FunctionValueType::new(DataType::Float32, true),
                 policy,
                 allow,
+                None,
                 &Control::default(),
             )
             .unwrap();
@@ -510,6 +518,7 @@ fn decimal_float32_preserves_original_expr_null_and_unsanitized_project_projecti
                     &FunctionValueType::new(DataType::Float32, false),
                     policy,
                     allow,
+                    None,
                     &Control::default()
                 ),
                 Err(CastPrepareError::TypeMismatch)

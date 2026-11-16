@@ -153,6 +153,7 @@ fn compare(dtype: DataType) {
                 &result,
                 policy,
                 allow,
+                None,
                 &Control,
             )
             .unwrap();

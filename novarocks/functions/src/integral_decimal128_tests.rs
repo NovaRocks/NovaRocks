@@ -90,6 +90,7 @@ fn recipe(
         &FunctionValueType::new(DataType::Decimal128(p, s), true),
         policy,
         allow,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -259,6 +260,7 @@ fn integral_decimal128_recipe_exact_policy_null_effects_and_wide_negative_scale_
                     &target,
                     policy,
                     allow,
+                    None,
                     &Control::default(),
                 );
                 let overflow = dtype != DataType::Int8;
@@ -296,6 +298,7 @@ fn integral_decimal128_recipe_exact_policy_null_effects_and_wide_negative_scale_
                 &FunctionValueType::new(DataType::Decimal128(38, scale), true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &Control::default(),
             )
             .unwrap();
@@ -451,6 +454,7 @@ fn integral_decimal128_preparation_every_callback_preserves_three_compile_causes
                 &target,
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 control,
             )
         };

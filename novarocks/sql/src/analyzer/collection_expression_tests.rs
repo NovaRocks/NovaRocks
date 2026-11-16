@@ -19,6 +19,7 @@
 use super::AnalyzerContext;
 use crate::catalog::{PlannerTableProvider, ResolvedAnalyzerTable};
 use crate::compiler::SqlCompileControl;
+use arrow::datatypes::DataType;
 use novarocks_parser::ast;
 
 struct NoTables;
@@ -267,7 +268,7 @@ fn full_json_list_conversion_does_not_admit_nonempty_utf8_lists() {
 }
 
 #[test]
-fn root_null_uses_typed_null_author_for_a_json_list_target() {
+fn root_null_keeps_the_explicit_array_boundary_and_original_null_source() {
     use crate::analysis::{ExprKind, LiteralValue};
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
@@ -279,7 +280,22 @@ fn root_null_uses_typed_null_author_for_a_json_list_target() {
         )
         .unwrap();
     assert_eq!(actual.value_type, json_list_target());
-    assert!(matches!(actual.kind, ExprKind::Literal(LiteralValue::Null)));
+    let ExprKind::Cast {
+        expr,
+        array_failure_mode,
+        target,
+        ..
+    } = actual.kind
+    else {
+        panic!("explicit array conversion retains its source before optional folding")
+    };
+    assert_eq!(
+        array_failure_mode,
+        Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+    );
+    assert_eq!(target, json_list_target().data_type().clone());
+    assert!(matches!(expr.kind, ExprKind::Literal(LiteralValue::Null)));
+    assert_eq!(expr.value_type.data_type(), &DataType::Null);
 }
 
 #[test]
@@ -378,6 +394,7 @@ fn null_json_list_conversion_plan_retains_the_explicit_carrier_step() {
             &target,
             DecimalOverflowPolicy::OutputNull,
             allow,
+            None,
             &control,
         )
         .unwrap();
@@ -401,8 +418,142 @@ fn null_json_list_conversion_plan_retains_the_explicit_carrier_step() {
             &target,
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &control
         )
         .is_err()
     );
+}
+
+#[test]
+fn explicit_array_cast_modes_preserve_independent_source_and_full_declared_target() {
+    use crate::analysis::ExprKind;
+    use novarocks_type_contract::ArrayCastFailureMode;
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    let scope = ctx.new_scope();
+    for (sql, mode) in [
+        (
+            "SELECT CAST([] AS ARRAY<JSON>)",
+            ArrayCastFailureMode::ReportError,
+        ),
+        (
+            "SELECT TRY_CAST([NULL,NULL] AS ARRAY<JSON>)",
+            ArrayCastFailureMode::OutputNull,
+        ),
+        (
+            "SELECT CAST([1,2] AS ARRAY<INT>)",
+            ArrayCastFailureMode::ReportError,
+        ),
+    ] {
+        let query = query(sql);
+        let ast::Expr::Cast(cast) = projection(&query) else {
+            panic!("explicit CAST")
+        };
+        let original = ctx.analyze_expr(&cast.expression, &scope).unwrap();
+        let declared =
+            super::helpers::sql_type_to_value_type(&cast.data_type, true, &control).unwrap();
+        let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
+        assert_eq!(actual.value_type, declared);
+        assert_eq!(
+            actual.value_type.try_to_field("result").unwrap(),
+            declared.try_to_field("result").unwrap()
+        );
+        let ExprKind::Cast {
+            expr,
+            target,
+            array_failure_mode,
+            ..
+        } = &actual.kind
+        else {
+            panic!("explicit boundary survives analysis")
+        };
+        assert_eq!(*array_failure_mode, Some(mode));
+        assert_eq!(target, declared.data_type());
+        same_typed(expr, &original, &control);
+        if sql.contains("[1,2]") {
+            assert_eq!(
+                expr.value_type.child_at(0).unwrap().data_type(),
+                &DataType::Int32,
+                "the independent integer ARRAY keeps its original common type, even when the target happens to be the same type"
+            );
+        }
+    }
+}
+
+#[test]
+fn array_cast_modes_have_distinct_semantic_and_scalar_identity_and_survive_rebuild() {
+    use crate::analysis::{ExprKind, TypedExpr};
+    use crate::optimizer::scalar::ScalarArena;
+    use crate::planner::optimizer_bridge::scalar::{intern_typed, materialize};
+    use novarocks_type_contract::{ArrayCastFailureMode, DecimalOverflowPolicy};
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    let scope = ctx.new_scope();
+    let source = ctx
+        .analyze_expr(projection(&query("SELECT [NULL]")), &scope)
+        .unwrap();
+    let target = source.value_type.clone().with_nullable(true).unwrap();
+    let mut arena = ScalarArena::new();
+    let mut ids = Vec::new();
+    let mut typed = Vec::new();
+    for mode in [
+        None,
+        Some(ArrayCastFailureMode::ReportError),
+        Some(ArrayCastFailureMode::OutputNull),
+    ] {
+        let actual = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(source.clone()),
+                target: target.data_type().clone(),
+                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                array_failure_mode: mode,
+            },
+            value_type: target.clone(),
+        };
+        let id = intern_typed(&mut arena, &actual, &control).unwrap();
+        let rebuilt = materialize(&arena, id);
+        same_typed(&actual, &rebuilt, &control);
+        assert_eq!(id, intern_typed(&mut arena, &rebuilt, &control).unwrap());
+        let display =
+            crate::analysis::expr_display::typed_expr_display_name(&actual, &control).unwrap();
+        if mode == Some(ArrayCastFailureMode::OutputNull) {
+            assert!(display.starts_with("try_cast("));
+        } else if mode.is_some() {
+            assert!(display.starts_with("cast("));
+        }
+        ids.push(id);
+        typed.push(actual);
+    }
+    let nested_try = TypedExpr {
+        kind: ExprKind::Cast {
+            expr: Box::new(typed[1].clone()),
+            target: target.data_type().clone(),
+            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+            array_failure_mode: Some(ArrayCastFailureMode::OutputNull),
+        },
+        value_type: target.clone(),
+    };
+    let nested_id = intern_typed(&mut arena, &nested_try, &control).unwrap();
+    assert!(
+        crate::optimizer::scalar_expr::can_fail(&arena, ids[1]),
+        "strict conversion retains its own Data failure possibility"
+    );
+    assert!(
+        crate::optimizer::scalar_expr::can_fail(&arena, nested_id),
+        "outer TRY cannot suppress a source expression's failure"
+    );
+    for left in 0..ids.len() {
+        for right in left + 1..ids.len() {
+            assert_ne!(ids[left], ids[right]);
+            assert!(
+                !crate::analysis::expr_identity::typed_expr_semantically_eq(
+                    &typed[left],
+                    &typed[right],
+                    &control
+                )
+                .unwrap()
+            );
+        }
+    }
 }

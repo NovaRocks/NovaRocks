@@ -149,15 +149,18 @@ fn validate_nested_decimal_cast_policy(expr: &TypedExpr) -> Result<(), &'static 
     let visit = validate_nested_decimal_cast_policy;
     match &expr.kind {
         ExprKind::Cast {
+            array_failure_mode,
             expr: child,
             target,
             decimal_overflow_policy,
         } => {
-            if !novarocks_type_contract::decimal_error_policy_cast_supported(
-                child.value_type.data_type(),
-                target,
-                *decimal_overflow_policy,
-            ) {
+            if array_failure_mode.is_none()
+                && !novarocks_type_contract::decimal_error_policy_cast_supported(
+                    child.value_type.data_type(),
+                    target,
+                    *decimal_overflow_policy,
+                )
+            {
                 return Err("ERROR_IF_OVERFLOW is unsupported for nested Decimal numeric CAST");
             }
             visit(child)
@@ -454,6 +457,23 @@ impl<'a> super::AnalyzerContext<'a> {
                 let inner_typed = self.analyze_expr(&cast.expression, scope)?;
                 let declared =
                     super::helpers::sql_type_to_value_type(&cast.data_type, true, self.control)?;
+                if matches!(
+                    inner_typed.value_type.data_type(),
+                    DataType::List(_) | DataType::Null
+                ) && matches!(declared.data_type(), DataType::List(_))
+                {
+                    let mode = if cast.safe {
+                        novarocks_type_contract::ArrayCastFailureMode::OutputNull
+                    } else {
+                        novarocks_type_contract::ArrayCastFailureMode::ReportError
+                    };
+                    return self.cast_explicit_array_to_value_type(
+                        inner_typed,
+                        declared,
+                        mode,
+                        cast.span,
+                    );
+                }
                 let value_type =
                     super::helpers::declared_cast_value_type(&inner_typed, declared, self.control)?;
                 self.cast_to_value_type(inner_typed, value_type, cast.span)
@@ -882,6 +902,7 @@ impl<'a> super::AnalyzerContext<'a> {
         }
         Ok(TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::String(value)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
@@ -2546,6 +2567,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     );
                     *arg = TypedExpr {
                         kind: ExprKind::Cast {
+                            array_failure_mode: None,
                             expr: Box::new(inner),
                             target: DataType::Float64,
                             decimal_overflow_policy: self
@@ -2634,6 +2656,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     );
                     *arg = TypedExpr {
                         kind: ExprKind::Cast {
+                            array_failure_mode: None,
                             expr: Box::new(inner),
                             target: DataType::Boolean,
                             decimal_overflow_policy: self
@@ -2851,6 +2874,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     );
                     *arg = TypedExpr {
                         kind: ExprKind::Cast {
+                            array_failure_mode: None,
                             expr: Box::new(inner),
                             target: DataType::Utf8,
                             decimal_overflow_policy: self
@@ -2895,6 +2919,7 @@ impl<'a> super::AnalyzerContext<'a> {
             );
             *value_arg = TypedExpr {
                 kind: ExprKind::Cast {
+                    array_failure_mode: None,
                     expr: Box::new(inner),
                     target: target.clone(),
                     decimal_overflow_policy: self
@@ -2927,6 +2952,7 @@ impl<'a> super::AnalyzerContext<'a> {
             );
             args_typed[0] = TypedExpr {
                 kind: ExprKind::Cast {
+                    array_failure_mode: None,
                     expr: Box::new(inner),
                     target: DataType::Boolean,
                     decimal_overflow_policy: self
@@ -3911,6 +3937,7 @@ impl<'a> super::AnalyzerContext<'a> {
         )));
         Ok(Some(TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(array_expr),
                 target: target.clone(),
                 decimal_overflow_policy: self.sql_semantics.sql_mode().decimal_overflow_policy(),
@@ -4602,6 +4629,7 @@ fn normalize_slice_arguments(
         );
         args[0] = TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(inner),
                 target: domain.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -4788,6 +4816,7 @@ pub(crate) fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> Typed
         TypedExpr {
             value_type: novarocks_type_contract::FunctionValueType::new(target.clone(), nullable),
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(expr),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -5081,6 +5110,7 @@ pub(super) fn cast_null_preserving_target_type(
         );
     TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(expr),
             target: target.clone(),
             decimal_overflow_policy,
@@ -5210,6 +5240,7 @@ fn cast_to_utf8_if_needed(expr: &mut TypedExpr) -> bool {
     );
     *expr = TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(inner),
             target: DataType::Utf8,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -5535,6 +5566,7 @@ fn coerce_function_argument(
     if matches!(expr.value_type.data_type(), DataType::Null) {
         return Ok(TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(expr),
                 target: target.clone(),
                 decimal_overflow_policy,
@@ -5553,6 +5585,7 @@ fn coerce_function_argument(
         || timestamp_unit_cast_can_return_null(expr.value_type.data_type(), target);
     Ok(TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(expr),
             target: target.clone(),
             decimal_overflow_policy,
@@ -6175,6 +6208,7 @@ fn apply_implicit_aggregate_casts(name: &str, args: &mut [TypedExpr]) -> bool {
         );
         *arg = TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(inner),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -6396,6 +6430,7 @@ fn implicit_cast_to_boolean(expr: TypedExpr) -> TypedExpr {
         );
     TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(expr),
             target: DataType::Boolean,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -7662,6 +7697,7 @@ mod tests {
             );
         }
         let ExprKind::Cast {
+            array_failure_mode: None,
             expr,
             target,
             decimal_overflow_policy,
@@ -8030,6 +8066,9 @@ mod tests {
         }
         for sql in [
             "select array_sortby([json_object('k',1), json_object('k',2)], [2,1])",
+            "select array_sortby(cast(['not JSON', '123'] as array<json>), [2,1])",
+            "with q as (select cast(['not JSON', '123'] as array<json>) as j) select array_sortby(j,[2,1]) from q",
+            "select array_sortby(j2,[2,1]) from (select cast(['not JSON','123'] as array<json>) as j, j as j2) q",
             "select array_sortby(array<json>[json_object('k',1), json_object('k',2)], [2,1])",
             "select array_sortby(cast([json_object('k',1), json_object('k',2)] as array<json>), [2,1])",
             "with q as (select [json_object('k',1), json_object('k',2)] as j) select array_sortby(j,[2,1]) from q",
@@ -8047,9 +8086,6 @@ mod tests {
             "select array<varchar>[json_object('k',1), json_object('k',2)]",
             "select array_sortby(['{\"k\":1}', '{\"k\":2}'], [2,1])",
             "select array_sortby(cast([json_object('k',1), json_object('k',2)] as array<varchar>), [2,1])",
-            "select array_sortby(cast(['not JSON', '123'] as array<json>), [2,1])",
-            "with q as (select cast(['not JSON', '123'] as array<json>) as j) select array_sortby(j,[2,1]) from q",
-            "select array_sortby(j2,[2,1]) from (select cast(['not JSON','123'] as array<json>) as j, j as j2) q",
         ] {
             let expression = analyze_projection_expr(sql).unwrap();
             let DataType::List(item) = &expression.value_type.data_type() else {
@@ -10598,6 +10634,7 @@ mod tests {
             panic!("expected FIELD");
         };
         let ExprKind::Cast {
+            array_failure_mode: None,
             expr: inner,
             target,
             decimal_overflow_policy,
@@ -11154,9 +11191,63 @@ mod tests {
         }
     }
     #[test]
-    fn nested_report_decimal_numeric_cast_is_rejected_with_the_original_sql_span() {
+    fn explicit_array_nested_decimal_cast_keeps_its_report_boundary_at_analysis() {
+        let statements = novarocks_parser::parse(
+            "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(CAST([1] AS ARRAY<DECIMAL(4,0)>) AS ARRAY<DECIMAL(3,0)>)"
+        ).unwrap();
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query")
+        };
+        let (resolved, _, _) = super::super::analyze_with_function_catalog_and_sql_semantics(
+            query,
+            &EmptyCatalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("select")
+        };
+        let mut expression = &select.projection[0].expr;
+        for precision in [3, 4] {
+            let ExprKind::Cast {
+                expr,
+                target,
+                decimal_overflow_policy,
+                array_failure_mode,
+            } = &expression.kind
+            else {
+                panic!("explicit array conversion")
+            };
+            assert_eq!(
+                *array_failure_mode,
+                Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+            );
+            assert_eq!(
+                *decimal_overflow_policy,
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError
+            );
+            let DataType::List(field) = target else {
+                panic!("array target")
+            };
+            assert_eq!(field.data_type(), &DataType::Decimal128(precision, 0));
+            assert_eq!(expression.value_type.data_type(), target);
+            expression = expr;
+        }
+        let DataType::List(field) = expression.value_type.data_type() else {
+            panic!("original array")
+        };
+        assert_eq!(field.data_type(), &DataType::Int32);
+        // Analysis preserves the boundary. Its actual runtime capability is
+        // still checked by the prepared conversion author during lowering.
+    }
+
+    #[test]
+    fn non_array_nested_report_decimal_numeric_cast_is_rejected_with_the_original_sql_span() {
         for sql in [
-            "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(CAST([1] AS ARRAY<DECIMAL(4,0)>) AS ARRAY<DECIMAL(3,0)>)",
             "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(CAST(MAP{1:1} AS MAP<INT,DECIMAL(4,0)>) AS MAP<INT,DECIMAL(3,0)>)",
             "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(CAST(ROW(1) AS STRUCT<a DECIMAL(4,0)>) AS STRUCT<a DECIMAL(3,0)>)",
         ] {
@@ -11390,6 +11481,7 @@ mod tests {
             );
             for arg in args {
                 let ExprKind::Cast {
+                    array_failure_mode: None,
                     expr,
                     target,
                     decimal_overflow_policy,
@@ -11444,6 +11536,7 @@ mod tests {
                     if *value.data_type() == DataType::Decimal128(19, 0)))
             );
             let ExprKind::Cast {
+                array_failure_mode: None,
                 expr,
                 target,
                 decimal_overflow_policy,
@@ -11455,6 +11548,7 @@ mod tests {
             assert_eq!(*target, DataType::Decimal128(19, 0));
             assert_eq!(*decimal_overflow_policy, expected);
             let ExprKind::Cast {
+                array_failure_mode: None,
                 expr,
                 target,
                 decimal_overflow_policy,
@@ -11622,6 +11716,7 @@ mod tests {
                 "{sql}"
             );
             let ExprKind::Cast {
+                array_failure_mode: None,
                 expr,
                 target,
                 decimal_overflow_policy,
@@ -11641,6 +11736,7 @@ mod tests {
                 &coerced.value_type,
                 *decimal_overflow_policy,
                 false,
+                None,
                 &control,
             )
             .expect("real prepared cast accepts the common-type producer declaration");

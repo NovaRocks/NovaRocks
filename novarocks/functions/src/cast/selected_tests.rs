@@ -63,6 +63,7 @@ fn prepare(
         &ty(target),
         policy,
         allow,
+        None,
         crate::binding_test_control(),
     )
     .unwrap()

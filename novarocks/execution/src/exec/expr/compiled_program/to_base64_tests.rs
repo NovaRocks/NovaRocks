@@ -164,6 +164,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
                 output,
                 ty.clone(),
                 ExprKind::Cast {
+                    array_failure_mode: None,
                     expr: child,
                     target: DataType::Utf8,
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
@@ -622,6 +623,7 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
         nodes.push(leaf(
             cast.get(),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: call,
                 target: DataType::Utf8,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

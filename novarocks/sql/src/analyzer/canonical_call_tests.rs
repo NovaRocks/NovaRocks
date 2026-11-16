@@ -203,6 +203,7 @@ fn canonical_day_arithmetic_and_ordinary_calls_keep_four_units_zones_and_source_
                 let date = &call(expression).2[0];
                 if carrier != target {
                     let ExprKind::Cast {
+                        array_failure_mode: None,
                         expr,
                         target: cast_target,
                         decimal_overflow_policy,
@@ -523,6 +524,7 @@ fn canonical_resolved_helper_materializes_text_and_preserves_success_error_contr
                 &FunctionValueType::new(DataType::Date32, true),
             );
             let ExprKind::Cast {
+                array_failure_mode: None,
                 expr,
                 target,
                 decimal_overflow_policy,

@@ -465,6 +465,7 @@ fn all_kinds() -> Fixture {
             target: DataType::Int64,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             allow_throw_exception: allow(u32::MAX),
+            array_failure_mode: None,
         },
         ExprKind::IsNull {
             expr: a,
@@ -953,6 +954,7 @@ fn namespace_intrinsics_require_original_boolean_parameters_and_exact_presence()
             id: SemanticParameterId::new(0),
             expected_key: SemanticParameterKey::TimeZone,
         },
+        array_failure_mode: None,
     });
     assert!(
         wrong
@@ -1273,6 +1275,7 @@ fn namespace_prepare_and_consuming_emit_preserve_every_small_callback_and_ordina
         target: DataType::Int64,
         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         allow_throw_exception: allow(0),
+        array_failure_mode: None,
     });
     prefixes(|c| f.run(c, SOURCE, limits(), false), true);
     prefixes(|c| f.run(c, SOURCE, limits(), true), true);
@@ -1544,3 +1547,58 @@ fn namespace_real_wide_lists_and_definitions_reject_original_quantum_without_rep
 
 #[path = "namespace_owned_tests.rs"]
 mod caller_owned_tests;
+
+#[test]
+fn explicit_array_cast_modes_encode_separately_and_reject_foreign_source_shapes() {
+    use novarocks_type_contract::ArrayCastFailureMode as Mode;
+    let list = |item| {
+        FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("declared-item", item, true))),
+            true,
+        )
+    };
+    let source = list(DataType::Int32);
+    let target = list(DataType::Int64);
+    for (mode, expected) in [
+        (None, None),
+        (Some(Mode::ReportError), Some(1)),
+        (Some(Mode::OutputNull), Some(2)),
+    ] {
+        let mut fixture = Fixture::new(vec![
+            node(0, ExprKind::Value(ValueId::new(44)), source.clone()),
+            node(
+                1,
+                ExprKind::Cast {
+                    expr: ExprId::new(0),
+                    target: target.data_type().clone(),
+                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                    allow_throw_exception: allow(0),
+                    array_failure_mode: mode,
+                },
+                target.clone(),
+            ),
+        ]);
+        fixture.roots.push((11, source.clone()));
+        fixture.roots.push((12, target.clone()));
+        fixture.input[0].type_id = 11;
+        fixture.input[1].type_id = 12;
+        let (_, wire) = fixture
+            .run(&Control::default(), SOURCE, limits(), true)
+            .unwrap();
+        let Some(wire::expression_definition::Kind::Cast(cast)) = &wire[1].kind else {
+            panic!("encoded CAST")
+        };
+        assert_eq!(cast.array_failure_mode, expected);
+        assert_eq!(cast.expr_id, Some(0));
+        if mode.is_some() {
+            // Keep the original namespace's source identity honest while changing its shape.
+            fixture.replace(0, |node| node.ty = int());
+            fixture.input[0].type_id = 0;
+            assert!(
+                fixture
+                    .run(&Control::default(), SOURCE, limits(), true)
+                    .is_err()
+            );
+        }
+    }
+}

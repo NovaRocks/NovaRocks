@@ -951,10 +951,12 @@ pub(crate) fn intern_typed(
             resolved: resolved.clone(),
         },
         ExprKind::Cast {
+            array_failure_mode,
             expr,
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
+            array_failure_mode: *array_failure_mode,
             child: intern_typed(arena, expr, control)?,
             target: target.clone(),
             decimal_overflow_policy: *decimal_overflow_policy,
@@ -1142,10 +1144,12 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             resolved: resolved.clone(),
         },
         ScalarNode::Cast {
+            array_failure_mode,
             child,
             target,
             decimal_overflow_policy,
         } => ExprKind::Cast {
+            array_failure_mode: *array_failure_mode,
             expr: Box::new(materialize(arena, *child)),
             target: target.clone(),
             decimal_overflow_policy: *decimal_overflow_policy,

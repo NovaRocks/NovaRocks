@@ -882,10 +882,12 @@ fn rewrite_expr_children_with<E>(
             body: Box::new(rewrite_child(body)?),
         },
         ExprKind::Cast {
+            array_failure_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
         } => ExprKind::Cast {
+            array_failure_mode: *array_failure_mode,
             expr: Box::new(rewrite_child(inner)?),
             target: target.clone(),
             decimal_overflow_policy: *decimal_overflow_policy,

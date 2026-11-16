@@ -1054,7 +1054,34 @@ fn prepare_core<'loan, 'source, 'control>(
                     ));
                 }
             }
-            if let ExprKind::Cast { target, .. } = &node.kind {
+            if let ExprKind::Cast {
+                expr,
+                target,
+                array_failure_mode,
+                ..
+            } = &node.kind
+            {
+                if let Some(mode) = array_failure_mode {
+                    admission.charge(&mut facts, tree_lookup_work(arena.len())?, work)?;
+                    work.flush()?;
+                    let source = arena.get(*expr);
+                    work.flush()?;
+                    work.step()?;
+                    let source =
+                        source.ok_or_else(|| shape("explicit array CAST source is unknown"))?;
+                    preflight_types(&source.ty, &node.ty, &mut facts, &mut admission, work)?;
+                    if !novarocks_type_contract::array_cast_mode_types_valid_observed(
+                        &source.ty,
+                        &node.ty,
+                        *mode,
+                        || work.step().map_err(Error::from),
+                    )? {
+                        return Err(shape(
+                            "explicit array CAST mode differs from its source and result declarations",
+                        ));
+                    }
+                    work.step()?;
+                }
                 // Reuse the same left topology's already measured full bound.
                 // A raw target has no independent nullable/logical root flags.
                 admission.charge(&mut facts, verified.work_upper_bound(), work)?;

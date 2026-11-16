@@ -266,6 +266,7 @@ fn calendar_time_exact_successful_null_fact_retains_nonnullable_date_and_nano_do
                 &FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), false),
                 DecimalOverflowPolicy::ReportError,
                 false,
+                None,
                 &Control
             )
             .is_ok()
@@ -289,6 +290,7 @@ fn calendar_time_exact_successful_null_fact_retains_nonnullable_date_and_nano_do
                 &FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), false),
                 DecimalOverflowPolicy::ReportError,
                 false,
+                None,
                 &Control
             ),
             Err(CastPrepareError::TypeMismatch)

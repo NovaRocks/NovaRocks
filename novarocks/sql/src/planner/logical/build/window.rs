@@ -479,11 +479,13 @@ fn rewrite_window_calls(
             value_type: expr.value_type.clone(),
         },
         ExprKind::Cast {
+            array_failure_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
         } => TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: *array_failure_mode,
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,

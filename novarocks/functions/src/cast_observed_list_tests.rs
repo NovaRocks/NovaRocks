@@ -116,6 +116,7 @@ fn recipe(
         &FunctionValueType::from_legacy_declared_projection(target.clone(), true),
         policy,
         allow,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -384,6 +385,7 @@ fn list_cast_recipe_no_new_row_error_and_explicit_unsupported_child_forms() {
                 &FunctionValueType::from_legacy_declared_projection(target, true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &Control::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -397,6 +399,7 @@ fn list_cast_recipe_no_new_row_error_and_explicit_unsupported_child_forms() {
             &FunctionValueType::from_legacy_declared_projection(ty, false),
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &Control::default()
         ),
         Err(CastPrepareError::TypeMismatch)
@@ -473,6 +476,7 @@ fn list_cast_recipe_constant_null_root_broadcast_and_nested_logical_identity_gua
             &FunctionValueType::from_legacy_declared_projection(target, true),
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &Control::default()
         ),
         Err(CastPrepareError::Unsupported)
@@ -601,6 +605,7 @@ fn null_list_to_json_or_utf8_keeps_actual_rows_and_nonzero_constant_ordinal() {
             &target,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &Control::default(),
         )
         .unwrap();
@@ -706,6 +711,7 @@ fn null_list_to_json_or_utf8_keeps_exact_profile_journal_and_original_refusals()
                 &ordinary,
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &Control::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -754,6 +760,7 @@ fn null_list_to_json_or_utf8_keeps_exact_profile_journal_and_original_refusals()
                 &wrong,
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &Control::default()
             )
             .is_err()
@@ -766,6 +773,7 @@ fn null_list_to_json_or_utf8_keeps_exact_profile_journal_and_original_refusals()
             &target,
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &Control::default(),
         )
         .unwrap();

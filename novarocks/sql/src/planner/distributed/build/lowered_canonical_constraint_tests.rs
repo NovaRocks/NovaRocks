@@ -155,10 +155,84 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
     ] {
         let owner = crate::compiler::compile_authored_aggregate_for_test(sql);
         let conversions = calls(&owner, CONVERSION);
-        assert!(
-            !conversions.is_empty(),
-            "actual logical-domain conversion must survive"
-        );
+        if nested {
+            // Explicit array CAST owns JSON conversion; the scalar None-mode
+            // byte conversion must not consume or retag its source first.
+            assert!(conversions.is_empty());
+            let mut cast_count = 0;
+            for fragment in owner.plan().fragments().values() {
+                for (_, expression) in fragment.expressions().iter() {
+                    if let ContractExprKind::Cast {
+                        expr,
+                        array_failure_mode: Some(mode),
+                        target,
+                        ..
+                    } = &expression.kind
+                    {
+                        cast_count += 1;
+                        assert_eq!(
+                            *mode,
+                            novarocks_type_contract::ArrayCastFailureMode::ReportError
+                        );
+                        assert_eq!(target, expression.ty.data_type());
+                        let source = fragment.expressions().get(*expr).unwrap();
+                        assert_eq!(
+                            source.ty.child_at(0).unwrap().logical_type(),
+                            ValueLogicalType::Json
+                        );
+                        assert_eq!(
+                            expression.ty.child_at(0).unwrap().logical_type(),
+                            ValueLogicalType::Physical
+                        );
+                        assert_ne!(source.ty, expression.ty);
+                        let ContractExprKind::FunctionCall { function, .. } = &source.kind else {
+                            panic!("original array_sortby source");
+                        };
+                        assert_eq!(
+                            function.function_id.as_str(),
+                            "builtin.scalar/array_sortby/v1"
+                        );
+                        assert_eq!(function.result_type, source.ty);
+                        let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+                        assert_eq!(
+                            receipt.canonical_selection().unwrap().result_type,
+                            FunctionResultType::Scalar(source.ty.clone())
+                        );
+                        assert_loan_prefixes(&owner, fragment, source);
+                    }
+                }
+            }
+            assert!(cast_count >= 1);
+            let arrays = calls(&owner, ARRAY_LITERAL);
+            assert!(!arrays.is_empty());
+            let mut json_values = 0;
+            let mut sort_keys = 0;
+            for (fragment, source) in arrays {
+                let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+                assert_eq!(
+                    receipt.canonical_selection().unwrap().result_type,
+                    FunctionResultType::Scalar(source.ty.clone())
+                );
+                let DataType::List(item) = source.ty.data_type() else {
+                    panic!("original array source");
+                };
+                let domain = source.ty.child_at(0).unwrap().logical_type();
+                match (item.data_type(), domain) {
+                    (DataType::Utf8, ValueLogicalType::Json) => json_values += 1,
+                    (DataType::Int32, ValueLogicalType::Physical) => sort_keys += 1,
+                    actual => panic!("unexpected array source {actual:?}"),
+                }
+                assert_eq!(receipt.captured().request().logical_argument_count, 2);
+                assert_loan_prefixes(&owner, fragment, source);
+            }
+            assert!(json_values >= 1, "original JSON values source retained");
+            assert!(sort_keys >= 1, "original Int32 sort key source retained");
+        } else {
+            assert!(
+                !conversions.is_empty(),
+                "actual scalar logical-domain conversion must survive"
+            );
+        }
         for (fragment, source) in conversions {
             let receipt = assert_constraint(&owner, fragment, source);
             let original = receipt.captured().request();
@@ -172,31 +246,8 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
             };
             let target = receipt.captured().binding().result_constraint().unwrap();
             assert_eq!(target.logical_type(), ValueLogicalType::Physical);
-            if nested {
-                let DataType::List(before) = &value_type.data_type() else {
-                    panic!("JSON list input");
-                };
-                let DataType::List(after) = &target.data_type() else {
-                    panic!("text list target");
-                };
-                assert_eq!(
-                    value_type.child_at(0).unwrap().logical_type(),
-                    ValueLogicalType::Json
-                );
-                assert_eq!(
-                    target.child_at(0).unwrap().logical_type(),
-                    ValueLogicalType::Physical
-                );
-                assert_eq!(before.name(), after.name());
-                assert_eq!(before.is_nullable(), after.is_nullable());
-                assert_eq!(before.data_type(), &DataType::Utf8);
-                assert_eq!(after.data_type(), &DataType::Utf8);
-                assert!(before.metadata().is_empty());
-                assert!(after.metadata().is_empty());
-            } else {
-                assert_eq!(value_type.logical_type(), ValueLogicalType::Json);
-                assert_eq!(target.data_type().clone(), DataType::Utf8);
-            }
+            assert_eq!(value_type.logical_type(), ValueLogicalType::Json);
+            assert_eq!(target.data_type().clone(), DataType::Utf8);
             let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
             assert!(constant(&operational[0]).is_none());
             assert_loan_prefixes(&owner, fragment, source);

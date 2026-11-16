@@ -2857,6 +2857,7 @@ mod tests {
         );
         let order = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: key,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: ReportError,

@@ -77,6 +77,7 @@ fn recipe(
         &FunctionValueType::new(DataType::Decimal128(tp, ts), true),
         policy,
         allow,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -238,6 +239,7 @@ fn decimal128_rescale_recipe_exact_nullable_effects_policy_and_foreign_address_g
                     &result,
                     policy,
                     allow,
+                    None,
                     &Control::default(),
                 );
                 if (source_nullable || crate::decimal128_rescale::can_produce_null(policy, allow))
@@ -438,6 +440,7 @@ fn decimal128_rescale_prepare_every_callback_preserves_three_compile_causes_no_f
         &target,
         DecimalOverflowPolicy::OutputNull,
         false,
+        None,
         &recorder,
     )
     .unwrap();
@@ -458,6 +461,7 @@ fn decimal128_rescale_prepare_every_callback_preserves_three_compile_causes_no_f
                 &target,
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &c,
             )
             .unwrap_err();

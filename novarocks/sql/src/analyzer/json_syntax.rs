@@ -295,11 +295,13 @@ mod tests {
             }
             (
                 ExprKind::Cast {
+                    array_failure_mode: None,
                     expr: actual,
                     target: actual_target,
                     decimal_overflow_policy: actual_policy,
                 },
                 ExprKind::Cast {
+                    array_failure_mode: None,
                     expr: expected,
                     target: expected_target,
                     decimal_overflow_policy: expected_policy,

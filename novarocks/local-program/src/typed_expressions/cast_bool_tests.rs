@@ -40,6 +40,7 @@ fn cast_fixture(
                     child: ProgramExprId::new(0),
                     decimal_overflow_policy: policy,
                     allow_throw_exception: allow,
+                    array_failure_mode: None,
                 },
                 result.data_type().clone(),
                 None,
@@ -113,6 +114,7 @@ fn bool_cast_thirteen_profiles_check_actual_and_dead_full_types_and_frozen_polic
                                     child,
                                     decimal_overflow_policy,
                                     allow_throw_exception,
+                                    array_failure_mode: None,
                                 } if *child == ProgramExprId::new(0)
                                     && *decimal_overflow_policy == policy
                                     && *allow_throw_exception == allow

@@ -630,6 +630,7 @@ fn branch_marker_eq(branch_marker: &OutputColumn, branch: i8) -> TypedExpr {
 fn tinyint_literal(value: i8) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Int(value as i64)),
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
@@ -1105,6 +1106,7 @@ fn branch_case_arm_expr(
     let nullable = expr.value_type.nullable();
     TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(expr),
             target: target.data_type().clone(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

@@ -64,6 +64,7 @@ fn recipe(ty: DataType, nullable: bool) -> PreparedCastRecipe {
         &FunctionValueType::new(DataType::Utf8, nullable),
         DecimalOverflowPolicy::ReportError,
         true,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -126,6 +127,7 @@ fn decimal_text_exact_p_s_null_promise_and_other_cast_domains_stay_separate() {
                         &FunctionValueType::new(DataType::Utf8, false),
                         DecimalOverflowPolicy::OutputNull,
                         false,
+                        None,
                         &Control::default()
                     ),
                     Err(CastPrepareError::TypeMismatch)
@@ -150,6 +152,7 @@ fn decimal_text_exact_p_s_null_promise_and_other_cast_domains_stay_separate() {
                                 &FunctionValueType::from_legacy_declared_projection(target, true),
                                 DecimalOverflowPolicy::ReportError,
                                 true,
+                                None,
                                 &Control::default()
                             ),
                             Err(CastPrepareError::Unsupported)

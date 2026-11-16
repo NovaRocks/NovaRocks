@@ -60,6 +60,7 @@ fn prepare(
         &FunctionValueType::from_legacy_declared_projection(to, nullable),
         policy,
         allow,
+        None,
         crate::binding_test_control(),
     )
     .unwrap()

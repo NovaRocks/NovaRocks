@@ -82,6 +82,7 @@ fn prepare(
         &result,
         policy,
         allow,
+        None,
         &CompileControl::default(),
     )
     .unwrap()
@@ -297,6 +298,7 @@ fn signed_narrowing_is_successful_null_and_nonnullable_result_is_rejected() {
                         &ty(target.clone(), false),
                         policy,
                         allow,
+                        None,
                         &CompileControl::default()
                     ),
                     Err(CastPrepareError::TypeMismatch)
@@ -311,6 +313,7 @@ fn signed_narrowing_is_successful_null_and_nonnullable_result_is_rejected() {
             &ty(DataType::Float64, false),
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &CompileControl::default()
         ),
         Err(CastPrepareError::TypeMismatch)
@@ -560,6 +563,7 @@ fn unsupported_operations_domains_and_foreign_runtime_addresses_are_never_null_f
                 &target,
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &CompileControl::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -588,6 +592,7 @@ fn unsupported_operations_domains_and_foreign_runtime_addresses_are_never_null_f
                 &target,
                 DecimalOverflowPolicy::ReportError,
                 true,
+                None,
                 &CompileControl::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -697,6 +702,7 @@ fn compile_original_control_keeps_entry_quantum_and_tail_on_every_exact_prefix()
             &target,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &baseline,
         );
         let trace = baseline.trace.lock().unwrap().clone();
@@ -721,6 +727,7 @@ fn compile_original_control_keeps_entry_quantum_and_tail_on_every_exact_prefix()
                     &target,
                     DecimalOverflowPolicy::ReportError,
                     true,
+                    None,
                     &control,
                 )
                 .unwrap_err();
@@ -793,6 +800,7 @@ fn same_carrier_without_a_kernel_prepares_an_identity_with_no_row_operation() {
             &ty(carrier.clone(), true),
             DecimalOverflowPolicy::OutputNull,
             true,
+            None,
             &CompileControl::default(),
         )
         .unwrap_or_else(|error| panic!("{carrier:?} identity: {error:?}"));
@@ -817,6 +825,7 @@ fn same_carrier_without_a_kernel_prepares_an_identity_with_no_row_operation() {
                 &ty(carrier.clone(), false),
                 DecimalOverflowPolicy::OutputNull,
                 true,
+                None,
                 &CompileControl::default(),
             ),
             Err(CastPrepareError::TypeMismatch)
@@ -828,6 +837,7 @@ fn same_carrier_without_a_kernel_prepares_an_identity_with_no_row_operation() {
         &ty(DataType::Int64, true),
         DecimalOverflowPolicy::OutputNull,
         true,
+        None,
         &CompileControl::default(),
     )
     .unwrap();
@@ -925,6 +935,7 @@ pub(super) fn assert_f3_admitted_preparation(source: DataType, target: DataType)
                 &target,
                 policy,
                 allow,
+                None,
                 &CompileControl::default(),
             )
             .unwrap();
@@ -947,6 +958,7 @@ pub(super) fn assert_f3_selected_literal_case(source: ArrayRef, expected: ArrayR
                 &result_type,
                 policy,
                 allow,
+                None,
                 &CompileControl::default(),
             )
             .unwrap();
@@ -1023,6 +1035,7 @@ fn exact_largeint_identity_preserves_nominal_domain_and_refuses_narrowing_or_ret
                     &largeint(false),
                     policy,
                     allow,
+                    None,
                     &CompileControl::default()
                 ),
                 Err(CastPrepareError::TypeMismatch)
@@ -1056,6 +1069,7 @@ fn exact_largeint_identity_preserves_nominal_domain_and_refuses_narrowing_or_ret
                         target,
                         policy,
                         allow,
+                        None,
                         &CompileControl::default()
                     ),
                     Err(CastPrepareError::Unsupported)
@@ -1069,6 +1083,7 @@ fn exact_largeint_identity_preserves_nominal_domain_and_refuses_narrowing_or_ret
                         &nominal,
                         policy,
                         allow,
+                        None,
                         &CompileControl::default()
                     ),
                     Err(CastPrepareError::Unsupported)
@@ -1085,6 +1100,7 @@ fn exact_largeint_identity_preserves_nominal_domain_and_refuses_narrowing_or_ret
         &result,
         DecimalOverflowPolicy::ReportError,
         true,
+        None,
         &baseline,
     )
     .unwrap();
@@ -1105,6 +1121,7 @@ fn exact_largeint_identity_preserves_nominal_domain_and_refuses_narrowing_or_ret
                 &result,
                 DecimalOverflowPolicy::ReportError,
                 true,
+                None,
                 &control,
             )
             .unwrap_err();

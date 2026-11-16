@@ -1389,6 +1389,7 @@ mod column_id_helper_tests {
     fn join_equi_keys_peels_cast_wrapper() {
         let cast_col = TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(qcol("l", "a", 1)),
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

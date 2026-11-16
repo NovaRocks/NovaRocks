@@ -57,9 +57,10 @@ pub(super) fn evaluate<'a>(
         // An unzoned primitive rendering fits within 64 bytes, including the
         // widest Chrono year and nanosecond fraction. Check Arrow's i32 offset
         // extent before producing text. This is not a host memory grant.
-        let variable_binary_text =
-            *ty == &DataType::Utf8 && *recipe.source_type().data_type() == DataType::Binary;
-        if *ty == &DataType::Utf8 && !variable_binary_text {
+        let variable_text = *ty == &DataType::Utf8
+            && (*recipe.source_type().data_type() == DataType::Binary
+                || matches!(recipe.body, CastBody::ArrayJson(_)));
+        if *ty == &DataType::Utf8 && !variable_text {
             selection
                 .len()
                 .checked_mul(64)
@@ -152,7 +153,7 @@ pub(super) fn evaluate<'a>(
             .map_err(|_| KernelFailure::ResourceExhausted)?;
         work.flush()?;
         let mut inherited = inherited.iter().peekable();
-        let mut binary_text_bytes = 0_usize;
+        let mut variable_text_bytes = 0_usize;
         for (ordinal, row) in selection.iter().enumerate() {
             let value = if inherited
                 .peek()
@@ -173,8 +174,8 @@ pub(super) fn evaluate<'a>(
             match (&mut output, value) {
                 (Output::Boolean(v), R::Boolean(n)) => v.push(Some(n)),
                 (Output::Text(v), R::Text(n)) => {
-                    if variable_binary_text {
-                        binary_text_bytes = binary_text_bytes
+                    if variable_text {
+                        variable_text_bytes = variable_text_bytes
                             .checked_add(n.len())
                             .filter(|bytes| *bytes <= i32::MAX as usize)
                             .ok_or(KernelFailure::ResourceExhausted)?;

@@ -39,6 +39,7 @@ fn fixture(
                     child: ProgramExprId::new(0),
                     decimal_overflow_policy: policy,
                     allow_throw_exception: allow,
+                    array_failure_mode: None,
                 },
                 result.data_type().clone(),
                 None,
@@ -151,7 +152,7 @@ fn unsigned_cast_seventy_two_profiles_check_all_definition_nullability_and_froze
                             );
                             let snapshot = typed.resolved_calls().snapshot();
                             assert!(
-                                matches!(snapshot.roots().arenas()[&arena].node(ProgramExprId::new(1)).unwrap().kind(), StaticExprKind::PreparedCast { operation: CastOperation::Carrier, child, decimal_overflow_policy, allow_throw_exception } if *child == ProgramExprId::new(0) && *decimal_overflow_policy == policy && *allow_throw_exception == allow)
+                                matches!(snapshot.roots().arenas()[&arena].node(ProgramExprId::new(1)).unwrap().kind(), StaticExprKind::PreparedCast { operation: CastOperation::Carrier, child, decimal_overflow_policy, allow_throw_exception, array_failure_mode: None } if *child == ProgramExprId::new(0) && *decimal_overflow_policy == policy && *allow_throw_exception == allow)
                             );
                             assert_eq!(
                                 snapshot.flows()[&arena].uses().len(),
@@ -336,6 +337,7 @@ fn null_json_fixture(
                     child: ProgramExprId::new(0),
                     decimal_overflow_policy: policy,
                     allow_throw_exception: allow,
+                    array_failure_mode: None,
                 },
                 result.clone(),
             ),
@@ -399,7 +401,7 @@ fn null_list_json_carrier_cast_checks_live_and_dead_definitions_with_full_types(
                         .unwrap();
                     assert_eq!(cast.value_type(), Some(&target));
                     assert!(
-                        matches!(cast.kind(), StaticExprKind::PreparedCast { operation: CastOperation::Carrier, child, decimal_overflow_policy, allow_throw_exception } if *child == ProgramExprId::new(0) && *decimal_overflow_policy == policy && *allow_throw_exception == allow)
+                        matches!(cast.kind(), StaticExprKind::PreparedCast { operation: CastOperation::Carrier, child, decimal_overflow_policy, allow_throw_exception, array_failure_mode: None } if *child == ProgramExprId::new(0) && *decimal_overflow_policy == policy && *allow_throw_exception == allow)
                     );
                     assert_eq!(
                         snapshot.flows()[&arena].uses().len(),

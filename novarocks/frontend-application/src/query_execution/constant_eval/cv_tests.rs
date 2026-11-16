@@ -945,6 +945,7 @@ fn newly_materialized_unsigned_negative_scale_and_nested_metadata_outputs_are_cv
                     target: &target,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     allow_throw_exception: false,
+            array_failure_mode: None,
                 }
             )
         ),

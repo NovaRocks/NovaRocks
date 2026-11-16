@@ -77,6 +77,7 @@ fn cast(id: u32, child: u32, target: DataType) -> ExprNode {
                 id: SemanticParameterId::new(0),
                 expected_key: SemanticParameterKey::AllowThrowException,
             },
+            array_failure_mode: None,
         },
     )
 }

@@ -360,6 +360,7 @@ pub(super) fn inherited_round_fixture_with_target(
             output_node,
             result_type.clone(),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: child,
                 target,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

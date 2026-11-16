@@ -636,6 +636,7 @@ fn primitive_own_effects(
         | ExprKind::Disjunction { .. }
         | ExprKind::Case { .. } => ScopedExpressionEffects::pure_value(context),
         ExprKind::Cast {
+            array_failure_mode,
             expr,
             target,
             decimal_overflow_policy,
@@ -664,6 +665,7 @@ fn primitive_own_effects(
                 &source.ty,
                 *decimal_overflow_policy,
                 allow,
+                *array_failure_mode,
                 control,
             )
             .map_err(|error| match error {

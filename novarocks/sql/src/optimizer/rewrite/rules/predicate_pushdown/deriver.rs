@@ -857,12 +857,14 @@ fn transfer_comparison_operand(
     let ScalarNode::Cast {
         target: cast_target,
         decimal_overflow_policy,
+        array_failure_mode,
         ..
     } = arena.node(operand)
     else {
         unreachable!()
     };
     let node = ScalarNode::Cast {
+        array_failure_mode: *array_failure_mode,
         child: target,
         target: cast_target.clone(),
         decimal_overflow_policy: *decimal_overflow_policy,

@@ -371,6 +371,7 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
                 node,
                 intermediate,
                 ExprKind::Cast {
+                    array_failure_mode: None,
                     expr: literal,
                     target: narrow,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
@@ -383,6 +384,7 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
                 node,
                 output.clone(),
                 ExprKind::Cast {
+                    array_failure_mode: None,
                     expr: inner,
                     target: DataType::UInt64,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

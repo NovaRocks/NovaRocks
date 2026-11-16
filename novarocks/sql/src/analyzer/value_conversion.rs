@@ -29,6 +29,48 @@ use crate::analysis::{ExprKind, LiteralValue, TypedExpr, function_argument};
 use crate::analyze_error::AnalyzeError;
 
 impl super::AnalyzerContext<'_> {
+    /// An explicit array conversion retains the independently analyzed source and
+    /// complete declared target, even for identity and NULL inputs. Preparation
+    /// remains the capability author; this validates only the boundary facts.
+    pub(super) fn cast_explicit_array_to_value_type(
+        &self,
+        source: TypedExpr,
+        target: FunctionValueType,
+        mode: novarocks_type_contract::ArrayCastFailureMode,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        super::helpers::validate_value_type(&source.value_type, self.control)?;
+        super::helpers::validate_value_type(&target, self.control)?;
+        self.control
+            .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
+            .map_err(AnalyzeError::control)?;
+        if !novarocks_type_contract::array_cast_mode_types_valid_observed(
+            &source.value_type,
+            &target,
+            mode,
+            || {
+                self.control
+                    .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+            },
+        )
+        .map_err(AnalyzeError::control)?
+        {
+            return Err(AnalyzeError::unsupported_expression(
+                "invalid explicit array CAST boundary",
+                span,
+            ));
+        }
+        Ok(TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(source),
+                target: target.data_type().clone(),
+                decimal_overflow_policy: self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                array_failure_mode: Some(mode),
+            },
+            value_type: target,
+        })
+    }
+
     /// Preserve ordinary carrier CASTs, but select the exact conversion owner
     /// whenever the root or a nested logical identity changes. Literal NULL
     /// alone can use the existing typed-NULL declaration without evaluation.
@@ -97,6 +139,7 @@ pub(super) fn cast_to_value_type(
         // including JSON children; it is not a same-shape domain bridge.
         return Ok(TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 target: target.data_type().clone(),
                 expr: Box::new(source),
                 decimal_overflow_policy: sql_semantics.sql_mode().decimal_overflow_policy(),
@@ -210,6 +253,7 @@ pub(super) fn convert_value_domain_with_catalog(
     } else {
         Ok(TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(converted),
                 target: target.data_type().clone(),
                 decimal_overflow_policy,

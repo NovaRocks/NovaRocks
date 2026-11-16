@@ -45,6 +45,7 @@ fn recipe(
         &FunctionValueType::new(target, true),
         policy,
         allow,
+        None,
         &Control,
     )
     .unwrap()
@@ -136,6 +137,7 @@ fn decimal_integer_truncates_toward_zero_and_retains_actual_epoch_days() {
                 &FunctionValueType::new(target, true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &Control
             ),
             Err(CastPrepareError::Unsupported)
@@ -354,6 +356,7 @@ fn extended_recipes_do_not_authorize_nominal_domain_changes() {
             &target,
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &Control
         ),
         Err(CastPrepareError::Unsupported)
@@ -635,6 +638,7 @@ fn p05_extended_preparation_types_nullability_and_effects_follow_each_semantic_b
                         &to,
                         policy,
                         allow,
+                        None,
                         &Control,
                     );
                     if !target_nullable && (source_nullable || null_possible) {

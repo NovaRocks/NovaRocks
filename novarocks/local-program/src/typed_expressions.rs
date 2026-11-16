@@ -261,6 +261,7 @@ impl ProgramTypedExpressions {
                             child,
                             decimal_overflow_policy,
                             allow_throw_exception,
+                            array_failure_mode,
                         } = definition.kind()
                         {
                             let Some(FunctionArgumentType::Value(source)) =
@@ -268,21 +269,32 @@ impl ProgramTypedExpressions {
                             else {
                                 return Err(ProgramExpressionTypeError::WrongKind.into());
                             };
+                            if let Some(mode) = array_failure_mode {
+                                if *operation != novarocks_functions::CastOperation::Carrier
+                                    || !novarocks_type_contract::array_cast_mode_types_valid_observed(
+                                        source, value, *mode,
+                                        || work.step().map_err(ProgramExpressionTypeError::Control),
+                                    )? {
+                                    return Err(ProgramExpressionTypeError::TypeMismatch.into());
+                                }
+                            }
                             if ((source.nullable() || *source.data_type() == arrow_schema::DataType::Null) && !value.nullable())
-                                || (!novarocks_type_contract::preserves_value_domains_observed(
-                                    source.value_type(), value.value_type(),
-                                    |_| work.step().map_err(ProgramExpressionTypeError::Control),
-                                )? && !(*operation == novarocks_functions::CastOperation::Carrier
-                                    && novarocks_type_contract::is_null_list_to_json_cast(source, value)))
-                                || !novarocks_type_contract::decimal_error_policy_cast_supported_observed(
+                                || (array_failure_mode.is_none()
+                                    && !novarocks_type_contract::preserves_value_domains_observed(
+                                        source.value_type(), value.value_type(),
+                                        |_| work.step().map_err(ProgramExpressionTypeError::Control),
+                                    )? && !(*operation == novarocks_functions::CastOperation::Carrier
+                                        && novarocks_type_contract::is_null_list_to_json_cast(source, value)))
+                                || (array_failure_mode.is_none() && !novarocks_type_contract::decimal_error_policy_cast_supported_observed(
                                     source.data_type(), value.data_type(), *decimal_overflow_policy,
                                     || work.step().map_err(ProgramExpressionTypeError::Control),
-                                )? {
+                                )?) {
                                 return Err(ProgramExpressionTypeError::TypeMismatch.into());
                             }
                             // Successful NULLs share the primitive cast semantic author;
                             // this does not require a dead definition to be runtime-installed.
                             if *operation == novarocks_functions::CastOperation::Carrier
+                                && array_failure_mode.is_none()
                                 && novarocks_functions::carrier_cast_can_produce_null_with_policy(
                                     source.data_type(),
                                     value.data_type(),

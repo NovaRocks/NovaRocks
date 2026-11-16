@@ -235,6 +235,7 @@ impl AnalyzerContext<'_> {
                         &target,
                         mode.decimal_overflow_policy(),
                         mode.allow_throw_exception(),
+                        None,
                         self.control,
                     )
                     .map_err(AnalyzeError::view_cast_preparation)?;

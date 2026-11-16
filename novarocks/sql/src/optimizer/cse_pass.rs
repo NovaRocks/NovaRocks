@@ -525,10 +525,12 @@ fn substitute(
             resolved,
         },
         ScalarNode::Cast {
+            array_failure_mode,
             child,
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
+            array_failure_mode,
             child: substitute(scalars, child, subst, control)?,
             target,
             decimal_overflow_policy,
@@ -1633,6 +1635,7 @@ mod tests {
     fn cast(arena: &mut ScalarArena, child: ScalarId) -> ScalarId {
         arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1820,6 +1823,7 @@ mod tests {
         let array_map_type = DataType::List(Arc::new(Field::new("item", map_type, true)));
         let cast_null_array = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: null_array,
                 target: array_map_type.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

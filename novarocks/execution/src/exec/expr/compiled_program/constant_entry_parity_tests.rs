@@ -331,6 +331,7 @@ impl Fixture {
             operation: CastOperation::Carrier,
             decimal_overflow_policy,
             allow_throw_exception,
+            array_failure_mode,
             ..
         } = self.kind(at)
         else {
@@ -340,6 +341,7 @@ impl Fixture {
             target: self.ty(at),
             decimal_overflow_policy: *decimal_overflow_policy,
             allow_throw_exception: *allow_throw_exception,
+            array_failure_mode: *array_failure_mode,
         }
     }
     // Stop at the independently declared ORIGINAL input type, so explicit SQL

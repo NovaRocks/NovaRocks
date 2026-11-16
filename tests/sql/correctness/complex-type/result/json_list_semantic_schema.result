@@ -8,12 +8,42 @@ json_values	string_values
 json_values	string_values
 ["{\"k\": 2}","{\"k\": 1}"]	["{\"k\": 2}","{\"k\": 1}"]
 
--- query 3
--- types	array(json)	array(varchar)
-json_values	string_values
-["{\"key\": \"value2\"}","{\"key\": \"value1\"}"]	["{\"key\": \"value2\"}","{\"key\": \"value1\"}"]
-
 -- query 4
 -- types	array(json)	array(varchar)
 json_values	string_values
 []	[]
+
+-- query 5
+-- types	array(json)
+json_values
+["{\"key\": \"value2\"}","{\"key\": \"value1\"}"]
+
+-- query 6
+-- types	array(json)
+json_values
+["\"abc\"","\"{\\\"k\\\":1}\"","\"null\"",null]
+
+-- query 7
+-- types	array(json)
+json_values
+["\"abc\"","\"{\\\"k\\\":1}\"","\"null\"",null]
+
+-- query 8
+-- types	array(varchar)
+string_values
+["100.0","1.0E2",null,"a\n中",null]
+
+-- query 10
+-- types	array(varchar)
+whole_array
+NULL
+
+-- query 12
+-- types	array(varchar)
+whole_array
+NULL
+
+-- query 14
+-- types	array(varchar)
+whole_array
+NULL

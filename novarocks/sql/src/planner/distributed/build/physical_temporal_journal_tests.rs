@@ -76,6 +76,7 @@ fn call(name: &str, args: Vec<TypedExpr>) -> TypedExpr {
 fn cast(input: TypedExpr, target: DataType) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(input),
             target: target.clone(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

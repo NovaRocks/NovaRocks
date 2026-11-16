@@ -783,6 +783,7 @@ fn null_list_json_cast_keeps_its_declared_domain_through_fragment_validation() {
                         id: SemanticParameterId::new(0),
                         expected_key: SemanticParameterKey::AllowThrowException,
                     },
+                    array_failure_mode: None,
                 },
             )
             .unwrap();
@@ -816,6 +817,103 @@ fn null_list_json_cast_keeps_its_declared_domain_through_fragment_validation() {
                     .message()
                     .contains("cannot establish or erase a logical identity")
             }));
+        }
+    }
+}
+
+#[test]
+fn explicit_array_cast_mode_validates_array_boundary_and_whole_try_nullability() {
+    use novarocks_type_contract::{
+        ArrayCastFailureMode as Mode, DecimalOverflowPolicy, SemanticParameterId,
+        SemanticParameterKey, SemanticParameterRef,
+    };
+    let list = |item, nullable| {
+        ValueType::new(
+            DataType::List(Arc::new(arrow_schema::Field::new(
+                "declared-item",
+                item,
+                true,
+            ))),
+            nullable,
+        )
+    };
+    for mode in [Mode::ReportError, Mode::OutputNull] {
+        for (source, target, valid) in [
+            (
+                list(DataType::Int32, true),
+                list(DataType::Int64, true),
+                true,
+            ),
+            (
+                ValueType::new(DataType::Int32, true),
+                list(DataType::Int64, true),
+                false,
+            ),
+            (
+                list(DataType::Int32, true),
+                ValueType::new(DataType::Int64, true),
+                false,
+            ),
+        ] {
+            let mut builder = crate::FragmentBuilder::new(FragmentId::new(906));
+            let node = builder.reserve_node_id().unwrap();
+            let input = builder
+                .add_expression(
+                    node,
+                    source.clone(),
+                    ExprKind::Literal(crate::LiteralValue::Null),
+                )
+                .unwrap();
+            let cast = builder
+                .add_expression(
+                    node,
+                    target.clone(),
+                    ExprKind::Cast {
+                        expr: input,
+                        target: target.data_type().clone(),
+                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                        allow_throw_exception: SemanticParameterRef {
+                            id: SemanticParameterId::new(0),
+                            expected_key: SemanticParameterKey::AllowThrowException,
+                        },
+                        array_failure_mode: Some(mode),
+                    },
+                )
+                .unwrap();
+            let output = builder
+                .add_value(
+                    target,
+                    ValueOrigin::NodeOutput {
+                        node,
+                        output_ordinal: 0,
+                    },
+                )
+                .unwrap();
+            builder
+                .add_values(node, Box::from([Box::from([cast])]), Box::from([output]))
+                .unwrap();
+            let fragment = builder.finish_definition(
+                node,
+                FragmentSink::Noop,
+                crate::PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+                crate::StagePlacementPolicy::Singleton,
+            );
+            if valid {
+                validate_fragment(&fragment.unwrap(), &FragmentCuts::default()).unwrap();
+            } else {
+                let errors = fragment.unwrap_err();
+                assert!(
+                    errors
+                        .errors()
+                        .iter()
+                        .any(|error| error.message().contains("explicit array CAST mode")),
+                    "{errors}"
+                );
+            }
         }
     }
 }

@@ -7541,6 +7541,7 @@ mod control_tests {
         );
         let cast_null = memo.scalars.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: null,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

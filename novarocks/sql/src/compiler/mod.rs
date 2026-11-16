@@ -3076,6 +3076,43 @@ mod tests {
                 result.fields[1].ty.child_at(0).unwrap().logical_type(),
                 novarocks_type_contract::ValueLogicalType::Physical
             );
+            // JSON objects cast to VARCHAR are admitted with the complete
+            // target schema; actual object values must fail with Data9 at runtime.
+            let mut array_cast_count = 0;
+            for fragment in plan.plan().fragments().values() {
+                for (_, expression) in fragment.expressions().iter() {
+                    if let novarocks_physical_plan::ExprKind::Cast {
+                        expr,
+                        array_failure_mode: Some(mode),
+                        target,
+                        ..
+                    } = &expression.kind
+                    {
+                        array_cast_count += 1;
+                        assert_eq!(
+                            *mode,
+                            novarocks_type_contract::ArrayCastFailureMode::ReportError
+                        );
+                        assert_eq!(target, expression.ty.data_type());
+                        let source = fragment
+                            .expressions()
+                            .get(*expr)
+                            .expect("original CAST operand");
+                        assert_eq!(
+                            source.ty.child_at(0).unwrap().logical_type(),
+                            novarocks_type_contract::ValueLogicalType::Json
+                        );
+                        assert_eq!(
+                            expression.ty.child_at(0).unwrap().logical_type(),
+                            novarocks_type_contract::ValueLogicalType::Physical
+                        );
+                        assert_ne!(source.ty, expression.ty);
+                    }
+                }
+            }
+            if sql.contains("array<varchar>") {
+                assert!(array_cast_count >= 1);
+            }
             let mut aggregate_count = 0;
             for fragment in plan.plan().fragments().values() {
                 for node in fragment.nodes().values() {

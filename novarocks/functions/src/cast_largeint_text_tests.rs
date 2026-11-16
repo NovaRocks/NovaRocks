@@ -64,6 +64,7 @@ fn recipe(nullable: bool) -> PreparedCastRecipe {
         &FunctionValueType::new(DataType::Utf8, nullable),
         DecimalOverflowPolicy::ReportError,
         true,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -94,6 +95,7 @@ fn largeint_text_physical_profile_preserves_nominal_gate_and_exact_types() {
                 &FunctionValueType::new(DataType::Utf8, true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &Control::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -106,6 +108,7 @@ fn largeint_text_physical_profile_preserves_nominal_gate_and_exact_types() {
             &FunctionValueType::new(DataType::Utf8, false),
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &Control::default()
         ),
         Err(CastPrepareError::TypeMismatch)
@@ -118,6 +121,7 @@ fn largeint_text_physical_profile_preserves_nominal_gate_and_exact_types() {
                 &FunctionValueType::new(DataType::Utf8, true),
                 DecimalOverflowPolicy::ReportError,
                 true,
+                None,
                 &Control::default()
             ),
             Err(CastPrepareError::Unsupported)

@@ -364,6 +364,7 @@ impl ConstantEvaluator<'_> {
             step.target,
             step.decimal_overflow_policy,
             step.allow_throw_exception,
+            step.array_failure_mode,
             self.control,
         )?;
         work.flush()?;

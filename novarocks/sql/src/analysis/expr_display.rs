@@ -231,6 +231,7 @@ fn expression(
         ExprKind::Cast {
             expr: inner,
             target,
+            array_failure_mode: None,
             ..
         } if matches!(target, arrow::datatypes::DataType::List(_))
             && matches!(&inner.kind, ExprKind::FunctionCall { name, .. } if name == "__array_literal") =>
@@ -240,9 +241,18 @@ fn expression(
         ExprKind::Cast {
             expr: inner,
             target,
+            array_failure_mode,
             ..
         } => {
-            out.append("cast(")?;
+            out.append(
+                if *array_failure_mode
+                    == Some(novarocks_type_contract::ArrayCastFailureMode::OutputNull)
+                {
+                    "try_cast("
+                } else {
+                    "cast("
+                },
+            )?;
             expression(inner, false, out)?;
             out.append(" as ")?;
             // Arrow's type formatter remains opaque. It contains no value pool;

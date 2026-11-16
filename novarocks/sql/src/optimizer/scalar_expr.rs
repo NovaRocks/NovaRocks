@@ -493,9 +493,21 @@ pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String
             order_by,
             ..
         } => aggregate_display_name(arena, name, args, *distinct, order_by),
-        ScalarNode::Cast { child, target, .. } => {
+        ScalarNode::Cast {
+            child,
+            target,
+            array_failure_mode,
+            ..
+        } => {
+            let name = if *array_failure_mode
+                == Some(novarocks_type_contract::ArrayCastFailureMode::OutputNull)
+            {
+                "try_cast"
+            } else {
+                "cast"
+            };
             format!(
-                "cast({} as {:?})",
+                "{name}({} as {:?})",
                 scalar_display_name(arena, *child),
                 target
             )
@@ -960,14 +972,19 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
         ScalarNode::Cast {
             child,
             decimal_overflow_policy,
+            array_failure_mode,
             ..
         } => {
-            cast_has_intrinsic_row_error(arena.data_type(*child), arena.data_type(expr), true)
-                || (*decimal_overflow_policy == DecimalOverflowPolicy::ReportError
-                    && novarocks_type_contract::is_checked_decimal_numeric_cast(
-                        arena.data_type(*child),
-                        arena.data_type(expr),
-                    ))
+            if let Some(mode) = array_failure_mode {
+                *mode == novarocks_type_contract::ArrayCastFailureMode::ReportError
+            } else {
+                cast_has_intrinsic_row_error(arena.data_type(*child), arena.data_type(expr), true)
+                    || (*decimal_overflow_policy == DecimalOverflowPolicy::ReportError
+                        && novarocks_type_contract::is_checked_decimal_numeric_cast(
+                            arena.data_type(*child),
+                            arena.data_type(expr),
+                        ))
+            }
         }
         _ => false,
     };
@@ -1059,6 +1076,7 @@ mod tests {
         );
         let cast = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: source,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1068,6 +1086,7 @@ mod tests {
         assert_eq!(signed_integer_literal(&arena, cast), Some(127));
         let nullable_cast = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: source,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1097,6 +1116,7 @@ mod tests {
             );
             let cast = arena.intern(
                 ScalarNode::Cast {
+                    array_failure_mode: None,
                     child,
                     target: output.clone(),
                     decimal_overflow_policy:
@@ -1171,6 +1191,7 @@ mod tests {
         );
         let nullable = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: integer,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: OutputNull,
@@ -1179,6 +1200,7 @@ mod tests {
         );
         let throwing = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: ReportError,
@@ -1485,6 +1507,7 @@ mod intrinsic_cast_effect_tests {
             ] {
                 let cast = arena.intern(
                     ScalarNode::Cast {
+                        array_failure_mode: None,
                         child,
                         target: target.clone(),
                         decimal_overflow_policy: policy,
@@ -1623,6 +1646,7 @@ mod intrinsic_cast_effect_tests {
             );
             let cast = arena.intern(
                 ScalarNode::Cast {
+                    array_failure_mode: None,
                     child,
                     target: target.clone(),
                     decimal_overflow_policy: OutputNull,

@@ -384,6 +384,7 @@ fn required_real_primitive_capability_refusal_is_not_constant_eligibility() {
         &target_type,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         false,
+        None,
         &control,
     )
     .unwrap_err();

@@ -383,6 +383,7 @@ impl ContractLoweringVisitor<'_> {
                         }
                     })?,
                     ContractExprKind::Cast {
+                        array_failure_mode,
                         expr,
                         target,
                         allow_throw_exception,
@@ -398,12 +399,12 @@ impl ContractLoweringVisitor<'_> {
                         let input = &self.construction_expression(fragment, *expr)?.ty;
                         let mut revised = old.ty.clone();
                         revised = revised.with_nullable(revised.nullable() || (input.nullable()
-                            || novarocks_functions::carrier_cast_can_produce_null_with_policy(
+                            || (array_failure_mode.is_none() && novarocks_functions::carrier_cast_can_produce_null_with_policy(
                                 input.data_type(),
                                 target,
                                 *decimal_overflow_policy,
                                 self.root_allow_throw_exception,
-                            ))).expect("validated root NULL contract");
+                            )) || *array_failure_mode == Some(novarocks_type_contract::ArrayCastFailureMode::OutputNull))).expect("validated root NULL contract");
                         revised
                     }
                     ContractExprKind::Value(value) if dependency_changed => published_value_type(

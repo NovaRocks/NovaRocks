@@ -148,9 +148,10 @@ fn raw(dtype: DataType) {
         for operation in [CastOperation::Time, CastOperation::TimeFromDatetime] {
             let source = FunctionValueType::new(dtype.clone(), true);
             let target = FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), true);
-            let recipe =
-                PreparedCastRecipe::try_new(operation, &source, &target, policy, allow, &Control)
-                    .unwrap();
+            let recipe = PreparedCastRecipe::try_new(
+                operation, &source, &target, policy, allow, None, &Control,
+            )
+            .unwrap();
             let input = corpus(&dtype);
             let expected = expected(&dtype);
             for (array, values) in [
@@ -197,7 +198,7 @@ fn differential(dtype: DataType) {
                 let source = FunctionValueType::new(dtype.clone(), nullable);
                 let target = FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), true);
                 let recipe = PreparedCastRecipe::try_new(
-                    operation, &source, &target, policy, allow, &Control,
+                    operation, &source, &target, policy, allow, None, &Control,
                 )
                 .unwrap();
                 let expected = expected(&dtype);

@@ -64,6 +64,7 @@ fn recipe(dtype: DataType, allow: bool) -> PreparedCastRecipe {
         &FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), true),
         DecimalOverflowPolicy::ReportError,
         allow,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -158,6 +159,7 @@ fn text_time_kernel_original_parser_full_domain_keeps_distinct_carriers_and_type
                 &target,
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &Control::default()
             )
             .is_err()

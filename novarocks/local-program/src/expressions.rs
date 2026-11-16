@@ -166,6 +166,7 @@ pub enum StaticExprKind {
         child: ProgramExprId,
         decimal_overflow_policy: DecimalOverflowPolicy,
         allow_throw_exception: bool,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     },
     /// Intrinsic arithmetic retaining its exact admitted semantic parameter.
     /// Legacy construction tags below confer no prepared recipe authority.

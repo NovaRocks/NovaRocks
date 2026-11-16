@@ -863,18 +863,21 @@ fn try_fold_node_with_services(
     // Its failure stays fatal; only evaluator row errors use fail-open below.
     use crate::compiler::selected_scalar_call as selected;
     let intrinsic = |kind| FrozenFoldNode::Intrinsic(kind);
-    let conversion =
-        |arg: &FoldArg, target: &novarocks_type_contract::FunctionValueType, policy| {
-            selected::freeze_conversion(
-                evaluator.functions,
-                arg,
-                target,
-                policy,
-                evaluator.allow_throw_exception,
-                arena.constant_policy(),
-                work.control(),
-            )
-        };
+    let conversion = |arg: &FoldArg,
+                      target: &novarocks_type_contract::FunctionValueType,
+                      policy,
+                      array_failure_mode| {
+        selected::freeze_conversion(
+            evaluator.functions,
+            arg,
+            target,
+            policy,
+            evaluator.allow_throw_exception,
+            arena.constant_policy(),
+            array_failure_mode,
+            work.control(),
+        )
+    };
     let kind = match &node {
         ScalarNode::FunctionCall { binding, .. } => {
             let Some(call) = selected::freeze_fold_call(
@@ -892,9 +895,15 @@ fn try_fold_node_with_services(
         }
         ScalarNode::Cast {
             decimal_overflow_policy,
+            array_failure_mode,
             ..
         } => intrinsic(FrozenFoldIntrinsic::Cast {
-            plan: conversion(&args[0], arena.value_type(id), *decimal_overflow_policy)?,
+            plan: conversion(
+                &args[0],
+                arena.value_type(id),
+                *decimal_overflow_policy,
+                *array_failure_mode,
+            )?,
         }),
         ScalarNode::UnaryOp { op, .. } => intrinsic(match op {
             crate::common::UnOp::Not => FrozenFoldIntrinsic::Not,
@@ -929,11 +938,13 @@ fn try_fold_node_with_services(
                     &args[0],
                     &selected::comparison_target(&compared, &args[0].value_type),
                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    None,
                 )?;
                 let right = conversion(
                     &args[1],
                     &selected::comparison_target(&compared, &args[1].value_type),
                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    None,
                 )?;
                 intrinsic(if let Some(operator) = selected::comparison_operator(*op) {
                     FrozenFoldIntrinsic::Comparison {
@@ -1765,6 +1776,7 @@ mod tests {
         );
         let cast_source = fixture.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: source,
                 target: DataType::Utf8,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -2348,6 +2360,7 @@ mod overflow_policy_tests {
             let node = |policy| {
                 if cast {
                     ScalarNode::Cast {
+                        array_failure_mode: None,
                         child,
                         target: DataType::Decimal128(9, 0),
                         decimal_overflow_policy: policy,
@@ -2429,6 +2442,7 @@ mod overflow_policy_tests {
             );
             let original = if cast {
                 ScalarNode::Cast {
+                    array_failure_mode: None,
                     child: literal,
                     target: DataType::Decimal128(9, 0),
                     decimal_overflow_policy: OutputNull,
@@ -2566,6 +2580,7 @@ mod complete_fold_type_tests {
             );
             let root = arena.intern(
                 ScalarNode::Cast {
+                    array_failure_mode: None,
                     child,
                     target: result_type.data_type().clone(),
                     decimal_overflow_policy:
@@ -2586,6 +2601,7 @@ mod complete_fold_type_tests {
         // SQL freezing only; it does not claim runtime Struct -> Utf8 support.
         let nested_root = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: nested_child,
                 target: DataType::Utf8,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -2653,6 +2669,7 @@ mod complete_fold_type_tests {
         for result_type in &root_types {
             let root = arena.intern(
                 ScalarNode::Cast {
+                    array_failure_mode: None,
                     child: nested_child,
                     target: result_type.data_type().clone(),
                     decimal_overflow_policy:
@@ -2708,6 +2725,7 @@ mod complete_fold_type_tests {
         );
         let root = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child,
                 target: DataType::Int32,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -2807,6 +2825,7 @@ mod complete_fold_type_tests {
         );
         let root = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child,
                 target: DataType::Int32,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -2875,6 +2894,7 @@ mod complete_fold_type_tests {
         );
         let root = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child,
                 target: DataType::Int32,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -2930,6 +2950,7 @@ mod complete_fold_type_tests {
         );
         let root = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child,
                 target: DataType::Int32,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

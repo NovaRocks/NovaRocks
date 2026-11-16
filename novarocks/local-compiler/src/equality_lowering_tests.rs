@@ -151,6 +151,19 @@ fn fixture(
     output: OutputClaim,
     bits: Option<[u64; 2]>,
 ) -> Result<Fixture, ValidationErrors> {
+    fixture_with_cast_mode(functions, shape, mode, left, right, output, bits, None)
+}
+
+fn fixture_with_cast_mode(
+    functions: &PureEngineFunctionCatalog,
+    shape: Shape,
+    mode: Mode,
+    left: FunctionValueType,
+    right: FunctionValueType,
+    output: OutputClaim,
+    bits: Option<[u64; 2]>,
+    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+) -> Result<Fixture, ValidationErrors> {
     let mut builder = FragmentBuilder::new(FragmentId::new(101));
     builder
         .add_values(
@@ -236,6 +249,7 @@ fn fixture(
                     expected_key:
                         novarocks_type_contract::SemanticParameterKey::AllowThrowException,
                 },
+                array_failure_mode,
             },
             right.clone(),
             vec![a],

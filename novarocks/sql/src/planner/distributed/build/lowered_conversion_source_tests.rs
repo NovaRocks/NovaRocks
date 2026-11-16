@@ -83,6 +83,7 @@ fn selected_json() -> TypedExpr {
 fn cast(input: TypedExpr, target: ValueType, decimal: DecimalOverflowPolicy) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(input),
             target: target.data_type().clone(),
             decimal_overflow_policy: decimal,

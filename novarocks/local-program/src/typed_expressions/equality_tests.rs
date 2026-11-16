@@ -763,6 +763,7 @@ fn dead_cast_definitions_preserve_exact_identity_and_successful_narrowing_null()
                         child: ProgramExprId::new(0),
                         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                         allow_throw_exception: true,
+                        array_failure_mode: None,
                     },
                     result.data_type().clone(),
                     None,
@@ -828,6 +829,7 @@ fn float_integer_cast_all_definitions_use_the_frozen_allow_mode_for_successful_n
                                                 child: ProgramExprId::new(0),
                                                 decimal_overflow_policy: policy,
                                                 allow_throw_exception: allow,
+                                                array_failure_mode: None,
                                             },
                                             target_type.clone(),
                                             None,
@@ -871,3 +873,104 @@ mod cast_unsigned_tests;
 
 #[path = "cast_timestamp_tests.rs"]
 mod cast_timestamp_tests;
+
+#[test]
+fn explicit_array_cast_modes_check_all_definitions_without_granting_other_operations() {
+    use novarocks_functions::CastOperation;
+    use novarocks_type_contract::{ArrayCastFailureMode as Mode, DecimalOverflowPolicy};
+    let list = |item, nullable| {
+        FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("declared-item", item, true))),
+            nullable,
+        )
+    };
+    for dead in [false, true] {
+        for mode in [Mode::ReportError, Mode::OutputNull] {
+            for operation in [
+                CastOperation::Carrier,
+                CastOperation::Time,
+                CastOperation::TimeFromDatetime,
+            ] {
+                for (source, target, valid) in [
+                    (
+                        list(DataType::Int32, true),
+                        list(DataType::Int64, true),
+                        true,
+                    ),
+                    (
+                        list(DataType::Int32, false),
+                        list(DataType::Int64, false),
+                        mode == Mode::ReportError,
+                    ),
+                    (
+                        list(DataType::Int32, true),
+                        FunctionValueType::new(
+                            DataType::List(Arc::new(Field::new(
+                                "declared-item",
+                                DataType::Int64,
+                                false,
+                            ))),
+                            true,
+                        ),
+                        false,
+                    ),
+                    (
+                        list(
+                            DataType::List(Arc::new(Field::new("inner", DataType::Int32, true))),
+                            true,
+                        ),
+                        list(
+                            DataType::List(Arc::new(Field::new("inner", DataType::Int64, false))),
+                            true,
+                        ),
+                        false,
+                    ),
+                    (integer(true), list(DataType::Int64, true), false),
+                    (list(DataType::Int32, true), integer(true), false),
+                    (
+                        list(DataType::Int32, true),
+                        list(DataType::Int64, false),
+                        false,
+                    ),
+                ] {
+                    let root = ProgramExprId::new(if dead { 2 } else { 1 });
+                    let root_type = if dead { boolean(false) } else { target.clone() };
+                    let (calls, types) = assembled(
+                        vec![
+                            slot(0, &source),
+                            StaticExprNode::new(
+                                StaticExprKind::PreparedCast {
+                                    operation,
+                                    child: ProgramExprId::new(0),
+                                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                                    allow_throw_exception: false,
+                                    array_failure_mode: Some(mode),
+                                },
+                                target.data_type().clone(),
+                                None,
+                            ),
+                            slot(2, &boolean(false)),
+                        ],
+                        vec![
+                            FunctionArgumentType::Value(source),
+                            FunctionArgumentType::Value(target),
+                            FunctionArgumentType::Value(boolean(false)),
+                        ],
+                        root,
+                        root_type,
+                        EvaluationDemand::Value,
+                    );
+                    let actual = ProgramTypedExpressions::try_new(calls, types, &Control);
+                    if valid && operation == CastOperation::Carrier {
+                        actual.unwrap();
+                    } else {
+                        assert_eq!(
+                            actual.unwrap_err(),
+                            ProgramExpressionTypeError::TypeMismatch
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

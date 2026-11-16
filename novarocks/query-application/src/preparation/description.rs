@@ -766,6 +766,7 @@ mod tests {
                         node,
                         ty.clone(),
                         ExprKind::Cast {
+                            array_failure_mode: None,
                             expr: literal,
                             target: DataType::Int64,
                             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

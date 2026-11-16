@@ -62,6 +62,7 @@ fn prepare(target: DataType, nullable: bool) -> PreparedCastRecipe {
         &FunctionValueType::from_legacy_declared_projection(target, nullable),
         DecimalOverflowPolicy::ReportError,
         true,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -85,6 +86,7 @@ fn date_float_exact_profiles_nullability_effects_and_nominal_admission() {
                             ),
                             policy,
                             allow,
+                            None,
                             &Control::default(),
                         );
                         if source_nullable && !result_nullable {
@@ -134,6 +136,7 @@ fn date_float_exact_profiles_nullability_effects_and_nominal_admission() {
                 &FunctionValueType::from_legacy_declared_projection(target.clone(), false),
                 DecimalOverflowPolicy::ReportError,
                 true,
+                None,
                 &Control::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -146,6 +149,7 @@ fn date_float_exact_profiles_nullability_effects_and_nominal_admission() {
                     &FunctionValueType::from_legacy_declared_projection(target.clone(), false),
                     DecimalOverflowPolicy::ReportError,
                     true,
+                    None,
                     &Control::default()
                 ),
                 Err(CastPrepareError::Unsupported)

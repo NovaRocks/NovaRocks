@@ -406,6 +406,7 @@ fn single_nested_and_elided_cast_constants_remain_original_none_requests() {
         },
         TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(integer(9)),
                 target: DataType::Int64,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

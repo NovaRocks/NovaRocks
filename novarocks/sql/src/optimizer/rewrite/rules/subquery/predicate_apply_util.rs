@@ -199,6 +199,7 @@ fn normalize_correlated_on_predicate_inner_opt(
                     if arena.data_type(right) != &inner_type {
                         outer_expr = arena.intern_observed(
                             ScalarNode::Cast {
+                                array_failure_mode: None,
                                 child: right,
                                 target: inner_type.clone(),
                                 decimal_overflow_policy:
@@ -475,6 +476,7 @@ mod legacy {
                                 ),
 
                                 kind: ExprKind::Cast {
+                                    array_failure_mode: None,
                                     expr: Box::new(outer_expr),
                                     target: inner_type,
                                     decimal_overflow_policy:

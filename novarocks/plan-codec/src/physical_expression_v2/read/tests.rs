@@ -196,6 +196,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_array_types(false)
+    }
+    fn with_array_types(include_arrays: bool) -> Self {
         let child = Arc::new(
             Field::new("original_child", DataType::Int32, true).with_metadata(
                 std::collections::HashMap::<String, String>::from([(
@@ -205,7 +208,7 @@ impl Fixture {
             ),
         );
         let nested = DataType::Struct(vec![child].into());
-        let source_types = [
+        let mut source_types = vec![
             (0, FunctionValueType::new(DataType::Int64, false)),
             (1, FunctionValueType::new(DataType::Int64, true)),
             (2, FunctionValueType::new(DataType::Boolean, false)),
@@ -237,6 +240,17 @@ impl Fixture {
             (10, FunctionValueType::new(DataType::Utf8, true)),
             (u32::MAX, FunctionValueType::new(DataType::Float64, true)),
         ];
+        if include_arrays {
+            for (id, item) in [(11, DataType::Int32), (12, DataType::Int64)] {
+                source_types.push((
+                    id,
+                    FunctionValueType::new(
+                        DataType::List(Arc::new(Field::new("declared-item", item, true))),
+                        true,
+                    ),
+                ));
+            }
+        }
         let bounds = TypeProjectionLimits {
             max_definitions: 128,
             max_expanded_nodes: 512,
@@ -281,7 +295,11 @@ impl Fixture {
                     as i32,
             intermediate_value_type_id: Some(1),
         }];
-        let values = [(0, 0), (1, 7), (2, 10)]
+        let mut value_types = vec![(0, 0), (1, 7), (2, 10)];
+        if include_arrays {
+            value_types.push((3, 11));
+        }
+        let values = value_types
             .into_iter()
             .map(|(id, ty)| wire::ValueDefinition {
                 id,
@@ -481,6 +499,7 @@ impl Fixture {
                     target_carrier_type_id: Some(self.carrier_i64),
                     decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
                     allow_throw_exception: Some(allow()),
+                    array_failure_mode: None,
                 }),
             ),
             expression(
@@ -1143,6 +1162,7 @@ fn receiving_cast_and_all_arithmetic_parameter_references_are_not_defaults() {
             target_carrier_type_id: Some(fixture.carrier_i64),
             decimal_overflow_policy: semantics::DecimalOverflowPolicy::OutputNull as i32,
             allow_throw_exception: Some(allow()),
+            array_failure_mode: None,
         }),
     );
     let mut defs = vec![cast, small().pop().unwrap()];
@@ -1353,4 +1373,64 @@ fn receiving_expression_success_ordinary_tails_and_real_quantum_preserve_all_con
     let mut ordinary = wide;
     ordinary[159].owner_node_id = None;
     prefixes(&fixture, &ordinary, SOURCE, limits(), false, false);
+}
+
+#[test]
+fn explicit_array_cast_wire_modes_require_known_values_and_actual_array_declarations() {
+    use wire::expression_definition::Kind as K;
+    let fixture = Fixture::with_array_types(true);
+    let carrier = fixture
+        .types
+        .carriers
+        .iter()
+        .find(|(_, ty)| &ty.value == fixture.types.value_type(12).unwrap().data_type())
+        .map(|(id, _)| *id)
+        .unwrap();
+    for mode in [None, Some(1), Some(2)] {
+        let defs = vec![
+            expression(0, 11, K::ValueId(3)),
+            expression(
+                1,
+                12,
+                K::Cast(wire::CastExpression {
+                    expr_id: Some(0),
+                    target_carrier_type_id: Some(carrier),
+                    decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
+                    allow_throw_exception: Some(allow()),
+                    array_failure_mode: mode,
+                }),
+            ),
+        ];
+        assert!(run(&fixture, &defs, SOURCE, limits(), &Control::default()).is_ok());
+        // The optional enum is never decoded as absent when a present tag is invalid.
+        for bad in [0, -1, 3, i32::MAX] {
+            let mut forged = defs.clone();
+            let Some(K::Cast(cast)) = forged[1].kind.as_mut() else {
+                unreachable!()
+            };
+            cast.array_failure_mode = Some(bad);
+            assert!(run(&fixture, &forged, SOURCE, limits(), &Control::default()).is_err());
+        }
+        if mode.is_some() {
+            let mut scalar = defs.clone();
+            scalar[0] = expression(0, 0, K::ValueId(0));
+            assert!(run(&fixture, &scalar, SOURCE, limits(), &Control::default()).is_err());
+            let mut scalar_result = defs.clone();
+            scalar_result[1].value_type_id = Some(1);
+            let Some(K::Cast(cast)) = scalar_result[1].kind.as_mut() else {
+                unreachable!()
+            };
+            cast.target_carrier_type_id = Some(fixture.carrier_i64);
+            assert!(
+                run(
+                    &fixture,
+                    &scalar_result,
+                    SOURCE,
+                    limits(),
+                    &Control::default()
+                )
+                .is_err()
+            );
+        }
+    }
 }

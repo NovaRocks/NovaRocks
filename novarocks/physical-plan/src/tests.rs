@@ -1250,6 +1250,7 @@ fn expression_semantic_depth_is_bounded_without_recursive_validation() {
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     expr: expression,
                     target: DataType::Int64,
+                    array_failure_mode: None,
                 },
             )
             .unwrap();
@@ -2513,6 +2514,7 @@ fn physical_nested_decimal_cast_requires_a_supported_frozen_policy() {
                     expr: operand,
                     target: ty(result_type.clone(), true).data_type().clone(),
                     decimal_overflow_policy: policy,
+                    array_failure_mode: None,
                 },
             )
             .unwrap();

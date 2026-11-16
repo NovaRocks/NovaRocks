@@ -281,6 +281,7 @@ fn remap_scalar(
             )?)
         }
         ScalarNode::Cast {
+            array_failure_mode,
             child,
             target,
             decimal_overflow_policy,
@@ -288,6 +289,7 @@ fn remap_scalar(
             let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
             Some(arena.intern_observed(
                 ScalarNode::Cast {
+                    array_failure_mode,
                     child,
                     target,
                     decimal_overflow_policy,

@@ -3746,6 +3746,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                         read,
                         &converted_ty,
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        None,
                     )?;
                     let converted = self.fragment_mut().add_value(
                         converted_ty,
@@ -7273,6 +7274,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                         expression,
                         &published_type,
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        None,
                     )?
                 };
                 let value = self.fragment_mut().add_value(
@@ -9488,6 +9490,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             &BTreeMap::new(),
             target,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            None,
         )?;
         let lowered_type = self.expression_value_type(lowered)?;
         if lowered_type == *target {
@@ -9719,6 +9722,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             ExprKind::Cast {
                 expr,
                 decimal_overflow_policy,
+                array_failure_mode,
                 ..
             } => {
                 return self.lower_expression_as(
@@ -9727,6 +9731,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     visible,
                     &ty,
                     *decimal_overflow_policy,
+                    *array_failure_mode,
                 );
             }
             ExprKind::IsNull { expr, negated } => ContractExprKind::IsNull {
@@ -9840,6 +9845,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                             visible,
                             &ty,
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                            None,
                         )?,
                     ));
                 }
@@ -9850,6 +9856,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                         visible,
                         &ty,
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        None,
                     )?),
                     None => None,
                 };
@@ -10734,8 +10741,10 @@ impl<'a> ContractLoweringVisitor<'a> {
         visible: &BTreeMap<ColumnId, ValueId>,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        if let Some(source) = self.null_constant_type(expression)?
+        if array_failure_mode.is_none()
+            && let Some(source) = self.null_constant_type(expression)?
             && source != *target
         {
             let mut target = target.clone();
@@ -10756,9 +10765,9 @@ impl<'a> ContractLoweringVisitor<'a> {
             target = target
                 .with_nullable(true)
                 .expect("validated root NULL contract");
-            self.convert_expression_to(owner, lowered, &target, policy)
+            self.convert_expression_to(owner, lowered, &target, policy, array_failure_mode)
         } else {
-            self.convert_expression_to(owner, lowered, target, policy)
+            self.convert_expression_to(owner, lowered, target, policy, array_failure_mode)
         }
     }
 
@@ -10803,8 +10812,10 @@ impl<'a> ContractLoweringVisitor<'a> {
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        let result = self.convert_expression_to_inner(owner, expression, target, policy);
+        let result =
+            self.convert_expression_to_inner(owner, expression, target, policy, array_failure_mode);
         if matches!(&result, Err(ContractLoweringError::Control(_))) {
             return result;
         }
@@ -10818,6 +10829,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     ) -> Result<ExprId, ContractLoweringError> {
         let source = self.expression_value_type(expression)?;
         let plan = crate::compiler::selected_scalar_call::plan_conversion(
@@ -10826,6 +10838,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             target,
             policy,
             self.root_allow_throw_exception,
+            array_failure_mode,
             self.control,
         )
         .map_err(|error| match error {
@@ -10941,6 +10954,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             owner,
             carrier.target().clone(),
             ContractExprKind::Cast {
+                array_failure_mode: carrier.array_failure_mode(),
                 allow_throw_exception,
                 expr: expression,
                 target: carrier.target().data_type().clone(),
@@ -10975,6 +10989,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             expr,
             &target,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            None,
         )
     }
 
@@ -17975,6 +17990,7 @@ mod tests {
             };
             join.condition.keys_mut()[0].right = TypedExpr {
                 kind: ExprKind::Cast {
+                    array_failure_mode: None,
                     expr: Box::new(column_ref(&right)),
                     target: DataType::Int64,
                     decimal_overflow_policy:
@@ -18412,6 +18428,7 @@ mod tests {
                 else_expr: Some(Box::new(literal_int(0))),
             },
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(column_ref(&right)),
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

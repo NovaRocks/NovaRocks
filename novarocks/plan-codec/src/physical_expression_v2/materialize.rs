@@ -786,6 +786,10 @@ fn owned_kind(
                         .ok_or_else(|| shape("cast ALLOW reference is absent"))?,
                     w,
                 )?,
+                array_failure_mode: completed(
+                    super::decode_array_cast_failure_mode(v.array_failure_mode),
+                    w,
+                )?,
             },
             K::IsNull(v) => p::ExprKind::IsNull {
                 expr: expr(v.expr_id, "null-test operand is absent", w)?,

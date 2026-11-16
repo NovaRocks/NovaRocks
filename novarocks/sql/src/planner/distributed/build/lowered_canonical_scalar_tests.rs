@@ -271,6 +271,7 @@ fn canonical_scalar_original_none_survives_nested_and_identity_cast_constant_chi
         },
         TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(text("ABC")),
                 target: DataType::Utf8,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

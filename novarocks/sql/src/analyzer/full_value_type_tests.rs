@@ -881,32 +881,12 @@ fn selected_scalar_text_argument_converts_source_json_before_rebinding() {
 
 #[test]
 fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
-    let expression = projection(
-        "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(ja_meta AS ARRAY<VARCHAR>) FROM source",
-    );
-    let ExprKind::Cast {
-        expr,
-        decimal_overflow_policy,
-        ..
-    } = &expression.kind
-    else {
-        panic!("expected final carrier cast");
-    };
+    let original = projection("SELECT ja_meta FROM source");
     assert_eq!(
-        *decimal_overflow_policy,
-        novarocks_type_contract::DecimalOverflowPolicy::ReportError
+        original.value_type,
+        crate::test_value_types::string_list(false, true, false)
     );
-    assert_selected_conversion(expr, "json_text_same_structure/v1");
-    let DataType::List(item) = &expr.value_type.data_type() else {
-        panic!("expected exact intermediate list");
-    };
-    assert_eq!(item.name(), "item");
-    assert!(!item.is_nullable());
-    assert!(item.metadata().as_arc().is_none());
-    assert_eq!(
-        expr.value_type,
-        crate::test_value_types::string_list(false, false, false),
-    );
+    // Provider layout facts are independent of the canonical analyzed value.
     let source = SourceCatalog
         .resolve_table_for_analysis(None, "default", "source")
         .unwrap();
@@ -916,24 +896,71 @@ fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
         .iter()
         .find(|column| column.name == "ja_meta")
         .unwrap();
-    let DataType::List(source_item) = &declared.data_type else {
-        panic!("expected original source list");
+    let DataType::List(provider_item) = &declared.data_type else {
+        panic!("provider source list");
     };
-    assert_eq!(source_item.name(), "source_item");
+    assert_eq!(provider_item.name(), "source_item");
+    assert!(!provider_item.is_nullable());
     assert_eq!(
-        source_item.metadata().get("provider").map(String::as_str),
+        provider_item.metadata().get("provider").map(String::as_str),
         Some("retained-source")
     );
-    let DataType::List(target) = &expression.value_type.data_type() else {
-        panic!("expected final list");
-    };
-    assert!(target.is_nullable());
-    assert_eq!(target.name(), "item");
-    assert!(target.metadata().as_arc().is_none());
-    assert_eq!(
-        expression.value_type,
-        crate::test_value_types::string_list(true, false, true)
-    );
+    for (cast, mode) in [
+        (
+            "CAST",
+            novarocks_type_contract::ArrayCastFailureMode::ReportError,
+        ),
+        (
+            "TRY_CAST",
+            novarocks_type_contract::ArrayCastFailureMode::OutputNull,
+        ),
+    ] {
+        let expression = projection(&format!(
+            "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ {cast}(ja_meta AS ARRAY<VARCHAR>) FROM source"
+        ));
+        let ExprKind::Cast {
+            expr,
+            decimal_overflow_policy,
+            array_failure_mode,
+            ..
+        } = &expression.kind
+        else {
+            panic!("expected explicit array conversion owner");
+        };
+        assert_eq!(*array_failure_mode, Some(mode));
+        assert_eq!(
+            *decimal_overflow_policy,
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError
+        );
+        // The array owner borrows the original JSON source, without a scalar
+        // byte conversion or a same-carrier domain retag in front of it.
+        assert_eq!(expr.value_type, original.value_type);
+        assert!(matches!(&expr.kind, ExprKind::ColumnRef { column, .. } if column == "ja_meta"));
+        let DataType::List(source_item) = expr.value_type.data_type() else {
+            panic!("original list");
+        };
+        assert_eq!(source_item.name(), "item");
+        assert!(!source_item.is_nullable());
+        assert!(source_item.metadata().as_arc().is_none());
+        assert_eq!(
+            expr.value_type
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .domain(),
+            Some(ValueLogicalType::Json)
+        );
+        assert_eq!(
+            expression.value_type,
+            crate::test_value_types::string_list(true, false, true)
+        );
+        let DataType::List(target) = expression.value_type.data_type() else {
+            panic!("target list");
+        };
+        assert_eq!(target.name(), "item");
+        assert!(target.is_nullable());
+        assert!(target.metadata().as_arc().is_none());
+    }
 }
 
 fn control_binding_arguments(count: usize) -> Vec<crate::analysis::TypedExpr> {

@@ -228,6 +228,11 @@ impl ExecutionFailureInput {
                 == novarocks_function_contract::kernel_failure::INVALID_CAST_ARGUMENT
         {
             K::InvalidCastArgument
+        } else if self.fact.class() == FailureClass::Data
+            && self.fact.reason()
+                == novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT
+        {
+            K::InvalidFunctionArgument
         } else {
             match self.fact.class() {
                 FailureClass::Unsupported if self.is_compiled_capability() => {
@@ -391,6 +396,7 @@ pub enum SqlExecutionErrorKind {
     NumericOutOfRange,
     DivisionByZero,
     InvalidCastArgument,
+    InvalidFunctionArgument,
     Data,
     MergeTargetRowMultipleMatches,
     UpdateTargetRowMultipleMatches,
@@ -419,6 +425,7 @@ impl SqlExecutionErrorDescriptor {
             NumericOutOfRange => ("query.execution.numeric_out_of_range", 1690, "22003"),
             DivisionByZero => ("query.execution.division_by_zero", 1365, "22012"),
             InvalidCastArgument => ("query.execution.invalid_cast_argument", 1105, "HY000"),
+            InvalidFunctionArgument => ("query.execution.invalid_function_argument", 1105, "HY000"),
             Data => ("query.execution.invalid_data", 1105, "HY000"),
             MergeTargetRowMultipleMatches => (
                 "query.execution.merge_target_row_multiple_matches",
@@ -464,6 +471,8 @@ pub const EXECUTION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::NumericOutOfRange).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::DivisionByZero).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::InvalidCastArgument).descriptor,
+    SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::InvalidFunctionArgument)
+        .descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Data).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::MergeTargetRowMultipleMatches)
         .descriptor,
@@ -487,6 +496,7 @@ pub fn execution_descriptor_for_code(code: ErrorCodeId) -> Option<SqlExecutionEr
         NumericOutOfRange,
         DivisionByZero,
         InvalidCastArgument,
+        InvalidFunctionArgument,
         Data,
         MergeTargetRowMultipleMatches,
         UpdateTargetRowMultipleMatches,
@@ -989,6 +999,101 @@ mod boundary_tests {
             let input = ExecutionFailureInput::new(
                 fact,
                 SafeDetail::truncating("invalid cast argument"),
+                ExecutionFailureSite::Coordinator,
+            );
+            assert_eq!(input.fact(), fact);
+            assert_eq!(input.descriptor().descriptor.code.as_str(), expected_code);
+        }
+    }
+
+    #[test]
+    fn invalid_function_argument_requires_the_original_kernel_data_reason() {
+        let reason = novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT;
+        assert_eq!(reason.domain(), domain::KERNEL.get());
+        assert_eq!(reason.code(), 45);
+        let expected =
+            SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::InvalidFunctionArgument);
+        assert_eq!(
+            expected.descriptor.code.as_str(),
+            "query.execution.invalid_function_argument"
+        );
+        assert_eq!((expected.errno, expected.sqlstate), (1105, "HY000"));
+        assert_eq!(expected.descriptor.phase, ErrorPhase::Execution);
+        assert_eq!(expected.descriptor.status, ErrorCodeStatus::Active);
+        assert!(EXECUTION_ERROR_CODE_DESCRIPTORS.contains(&expected.descriptor));
+        assert_eq!(
+            execution_descriptor_for_code(expected.descriptor.code),
+            Some(expected)
+        );
+        for detail in [
+            "unrelated numeric overflow",
+            "invalid encoding",
+            "invalid function argument",
+        ] {
+            let fact = FailureFact::new(FailureClass::Data, reason);
+            let input = ExecutionFailureInput::new(
+                fact,
+                SafeDetail::truncating(detail),
+                ExecutionFailureSite::Coordinator,
+            );
+            let copied = input.clone();
+            assert_eq!(copied.fact(), fact);
+            assert_eq!(copied.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(copied.detail(), input.detail());
+            assert_eq!(copied.descriptor(), expected);
+            assert_eq!(
+                copied.attempt_class(),
+                AttemptFailureClass::ExecutionFailure
+            );
+            assert_eq!(copied.user_error().retry(), RetryClass::Never);
+        }
+        for (class, expected_code) in [
+            (
+                FailureClass::Representation,
+                "query.execution.representation",
+            ),
+            (FailureClass::Invariant, "query.execution.invariant"),
+            (FailureClass::Control, "query.execution.control"),
+            (FailureClass::Dependency, "query.execution.dependency"),
+            (FailureClass::Unexpected, "query.execution.unexpected"),
+            (FailureClass::Resource, "query.execution.resource_exhausted"),
+            (FailureClass::Unsupported, "query.execution.unsupported"),
+        ] {
+            let fact = FailureFact::new(class, reason);
+            let input = ExecutionFailureInput::new(
+                fact,
+                SafeDetail::truncating("invalid function argument"),
+                ExecutionFailureSite::Coordinator,
+            );
+            assert_eq!(input.fact(), fact);
+            assert_eq!(input.descriptor().descriptor.code.as_str(), expected_code);
+        }
+        for (reason, expected_code) in [
+            (
+                FailureReason::new(domain::EXECUTION, NonZeroU16::new(45).unwrap()),
+                "query.execution.invalid_data",
+            ),
+            (
+                FailureReason::new(domain::KERNEL, NonZeroU16::new(40).unwrap()),
+                "query.execution.invalid_data",
+            ),
+            (
+                novarocks_function_contract::kernel_failure::INVALID_CAST_ARGUMENT,
+                "query.execution.invalid_cast_argument",
+            ),
+            (
+                novarocks_function_contract::kernel_failure::NUMERIC_OUT_OF_RANGE,
+                "query.execution.numeric_out_of_range",
+            ),
+            (
+                novarocks_function_contract::kernel_failure::DIVISION_BY_ZERO,
+                "query.execution.division_by_zero",
+            ),
+        ] {
+            let fact = FailureFact::new(FailureClass::Data, reason);
+            let input = ExecutionFailureInput::new(
+                fact,
+                SafeDetail::truncating("invalid function argument"),
                 ExecutionFailureSite::Coordinator,
             );
             assert_eq!(input.fact(), fact);

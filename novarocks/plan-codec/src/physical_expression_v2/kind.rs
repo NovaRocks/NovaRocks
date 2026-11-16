@@ -110,6 +110,7 @@ pub(super) fn encode_kind(
             expr,
             decimal_overflow_policy,
             allow_throw_exception,
+            array_failure_mode,
             ..
         } => Kind::Cast(wire::CastExpression {
             expr_id: Some(expr.get()),
@@ -118,6 +119,7 @@ pub(super) fn encode_kind(
             )?),
             decimal_overflow_policy: encode_decimal_policy(*decimal_overflow_policy),
             allow_throw_exception: Some(allow_throw(allow_throw_exception, work)?),
+            array_failure_mode: super::encode_array_cast_failure_mode(*array_failure_mode),
         }),
         ExprKind::IsNull { expr, negated } => Kind::IsNull(wire::IsNullExpression {
             expr_id: Some(expr.get()),

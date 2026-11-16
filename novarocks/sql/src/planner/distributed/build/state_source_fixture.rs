@@ -283,6 +283,7 @@ pub fn ordinary_extrema_constant_state_source_for_test(
     // retaining the complete Int64 domain of the independent CV2/CV3 sources.
     let narrow_input = TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(integer(i64::from(i8::MIN))),
             target: DataType::Int8,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
@@ -298,6 +299,7 @@ pub fn ordinary_extrema_constant_state_source_for_test(
     };
     let minus = TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(narrow_minus),
             target: DataType::Int64,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
@@ -340,6 +342,7 @@ pub fn ordered_array_state_source_for_test(
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileError> {
     let narrow_input = TypedExpr {
         kind: ExprKind::Cast {
+            array_failure_mode: None,
             expr: Box::new(integer(i64::from(i8::MIN))),
             target: DataType::Int8,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

@@ -179,6 +179,7 @@ fn neutral_sql_scalar_none_folded_constants_and_nonzero_cv_keep_original_identit
         },
         TypedExpr {
             kind: TypedKind::Cast {
+                array_failure_mode: None,
                 expr: Box::new(scalar::text("MiXeD")),
                 target: DataType::Utf8,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

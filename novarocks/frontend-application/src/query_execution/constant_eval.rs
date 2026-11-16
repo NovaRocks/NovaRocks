@@ -207,6 +207,7 @@ fn project_carrier(step: &CarrierStep) -> ConstantCarrierStep<'_> {
         target: step.target(),
         decimal_overflow_policy: step.decimal_overflow_policy(),
         allow_throw_exception: step.allow_throw_exception(),
+        array_failure_mode: step.array_failure_mode(),
     }
 }
 fn project_conversion(plan: &ConversionPlan) -> ConstantConversion<'_> {

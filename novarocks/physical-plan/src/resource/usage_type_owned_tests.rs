@@ -198,6 +198,7 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
                     expected_key:
                         novarocks_type_contract::SemanticParameterKey::AllowThrowException,
                 },
+                array_failure_mode: None,
             },
         });
         let aggregate = binding();

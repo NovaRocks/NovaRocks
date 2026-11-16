@@ -91,6 +91,7 @@ fn recipe(ty: DataType, nullable: bool) -> PreparedCastRecipe {
         &FunctionValueType::new(DataType::Float64, nullable),
         DecimalOverflowPolicy::ReportError,
         true,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -125,6 +126,7 @@ fn decimal_float_complete_metadata_policy_nullability_and_effect_contract() {
                                     &target,
                                     policy,
                                     allow,
+                                    None,
                                     &Control::default(),
                                 );
                                 if nullable && !target_nullable {
@@ -177,6 +179,7 @@ fn decimal_float_complete_metadata_policy_nullability_and_effect_contract() {
                     &FunctionValueType::new(DataType::Float64, true),
                     DecimalOverflowPolicy::ReportError,
                     true,
+                    None,
                     &Control::default()
                 ),
                 Err(CastPrepareError::Unsupported)
@@ -196,6 +199,7 @@ fn decimal_float_complete_metadata_policy_nullability_and_effect_contract() {
             &FunctionValueType::new(DataType::Float64, false),
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &Control::default()
         ),
         Err(CastPrepareError::Unsupported)
@@ -317,6 +321,7 @@ fn decimal_float_original_hidden_payload_and_scale_min_failure_contract() {
                 &FunctionValueType::new(DataType::Float64, true),
                 policy,
                 allow,
+                None,
                 &Control::default(),
             )
             .unwrap();
@@ -424,6 +429,7 @@ fn decimal_float_compile_callbacks_preserve_primary_causes_on_success_and_reject
                 &result,
                 DecimalOverflowPolicy::ReportError,
                 true,
+                None,
                 &baseline,
             );
             match (source_nullable, result_nullable, operation) {
@@ -456,6 +462,7 @@ fn decimal_float_compile_callbacks_preserve_primary_causes_on_success_and_reject
                         &result,
                         DecimalOverflowPolicy::ReportError,
                         true,
+                        None,
                         &control,
                     )
                     .unwrap_err();

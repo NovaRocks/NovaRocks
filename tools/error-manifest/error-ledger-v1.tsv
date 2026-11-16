@@ -10,6 +10,7 @@ query.execution.dependency	Execution	Active
 query.execution.division_by_zero	Execution	Active
 query.execution.invalid_cast_argument	Execution	Active
 query.execution.invalid_data	Execution	Active
+query.execution.invalid_function_argument	Execution	Active
 query.execution.invariant	Execution	Active
 query.execution.merge_target_row_multiple_matches	Execution	Active
 query.execution.numeric_out_of_range	Execution	Active
