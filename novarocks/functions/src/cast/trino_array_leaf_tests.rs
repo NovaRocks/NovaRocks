@@ -815,3 +815,278 @@ fn decimal_upscale_admission_is_rejected_from_types_before_any_value() {
         );
     }
 }
+
+#[test]
+fn signed_widening_admits_only_total_original_width_conversions() {
+    let widths = [
+        (DataType::Int8, SignedWidth::I8, -128, 127),
+        (DataType::Int16, SignedWidth::I16, -32_768, 32_767),
+        (
+            DataType::Int32,
+            SignedWidth::I32,
+            -2_147_483_648,
+            2_147_483_647,
+        ),
+        (DataType::Int64, SignedWidth::I64, i64::MIN, i64::MAX),
+    ];
+    for (source_index, (source, source_width, minimum, maximum)) in widths.iter().enumerate() {
+        for (target_index, (target, _, _, _)) in widths.iter().enumerate() {
+            if source_index >= target_index {
+                assert_eq!(profile(source, target), None);
+                continue;
+            }
+            let leaf = profile(source, target).expect("total widening");
+            assert!(!leaf.may_fail());
+            assert_eq!(common_profile(source, target), Some(leaf));
+            for value in [*minimum, -1, 0, 1, *maximum] {
+                let input = if leaf == Leaf::Int32ToInt64 {
+                    Input::Int32(i32::try_from(value).unwrap())
+                } else {
+                    Input::Signed {
+                        width: *source_width,
+                        value,
+                    }
+                };
+                assert_eq!(leaf.convert(input), Ok(Value::Int64(value)));
+            }
+        }
+    }
+    let leaf = profile(&DataType::Int8, &DataType::Int16).unwrap();
+    for input in [
+        Input::Signed {
+            width: SignedWidth::I8,
+            value: 128,
+        },
+        Input::Signed {
+            width: SignedWidth::I16,
+            value: 127,
+        },
+        Input::Int32(127),
+    ] {
+        assert_eq!(leaf.convert(input), Err(LeafError::TypeMismatch));
+    }
+    assert_eq!(
+        Leaf::SignedWiden {
+            source: SignedWidth::I64,
+            target: SignedWidth::I32
+        }
+        .convert(Input::Signed {
+            width: SignedWidth::I64,
+            value: 0
+        }),
+        Err(LeafError::TypeMismatch)
+    );
+}
+
+#[test]
+fn signed_to_ieee_uses_one_target_width_rounding_and_exact_source_bounds() {
+    let real = profile(&DataType::Int64, &DataType::Float32).unwrap();
+    let double = profile(&DataType::Int64, &DataType::Float64).unwrap();
+    assert!(!real.may_fail());
+    assert!(!double.may_fail());
+    // The integer lies one unit above/below a REAL midpoint. Rounding it to
+    // DOUBLE first loses that unit and reverses the final ties-even decision.
+    for (value, expected, via_double) in [
+        (
+            4_611_686_293_305_294_849_i64,
+            0x5e80_0001_u32,
+            0x5e80_0000_u32,
+        ),
+        (
+            4_611_686_843_061_108_735_i64,
+            0x5e80_0001_u32,
+            0x5e80_0002_u32,
+        ),
+        (i64::MAX, 0x5f00_0000_u32, 0x5f00_0000_u32),
+    ] {
+        for (value, sign) in [(value, 0), (-value, 0x8000_0000)] {
+            let Value::Float32(result) = real
+                .convert(Input::Signed {
+                    width: SignedWidth::I64,
+                    value,
+                })
+                .unwrap()
+            else {
+                panic!("REAL result");
+            };
+            assert_eq!(result.to_bits(), expected | sign);
+            assert_eq!(((value as f64) as f32).to_bits(), via_double | sign);
+        }
+    }
+    for (value, expected) in [
+        (9_007_199_254_740_993, 0x4340_0000_0000_0000),
+        (9_007_199_254_740_995, 0x4340_0000_0000_0002),
+        (i64::MIN, 0xc3e0_0000_0000_0000),
+        (i64::MAX, 0x43e0_0000_0000_0000),
+    ] {
+        let Value::Float64(result) = double
+            .convert(Input::Signed {
+                width: SignedWidth::I64,
+                value,
+            })
+            .unwrap()
+        else {
+            panic!("DOUBLE result");
+        };
+        assert_eq!(result.to_bits(), expected);
+    }
+    for (source, width, minimum, maximum) in [
+        (DataType::Int8, SignedWidth::I8, -128, 127),
+        (DataType::Int16, SignedWidth::I16, -32_768, 32_767),
+        (
+            DataType::Int32,
+            SignedWidth::I32,
+            -2_147_483_648,
+            2_147_483_647,
+        ),
+        (DataType::Int64, SignedWidth::I64, i64::MIN, i64::MAX),
+    ] {
+        for target in [DataType::Float32, DataType::Float64] {
+            let leaf = profile(&source, &target).unwrap();
+            assert!(!leaf.may_fail());
+            assert_eq!(common_profile(&source, &target), Some(leaf));
+            assert!(
+                leaf.convert(Input::Signed {
+                    width,
+                    value: minimum
+                })
+                .is_ok()
+            );
+            assert!(
+                leaf.convert(Input::Signed {
+                    width,
+                    value: maximum
+                })
+                .is_ok()
+            );
+            assert_eq!(
+                leaf.convert(Input::Float64(0.0)),
+                Err(LeafError::TypeMismatch)
+            );
+            if width != SignedWidth::I64 {
+                assert_eq!(
+                    leaf.convert(Input::Signed {
+                        width,
+                        value: maximum + 1
+                    }),
+                    Err(LeafError::TypeMismatch)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn real_to_double_retains_actual_real_payload_and_refuses_wrong_input_width() {
+    let leaf = profile(&DataType::Float32, &DataType::Float64).unwrap();
+    assert_eq!(leaf, Leaf::Float32ToFloat64);
+    assert_eq!(
+        common_profile(&DataType::Float32, &DataType::Float64),
+        Some(leaf)
+    );
+    assert!(!leaf.may_fail());
+    for (input, expected) in [
+        (0x0000_0000, 0x0000_0000_0000_0000),
+        (0x8000_0000, 0x8000_0000_0000_0000),
+        (0x0000_0001, 0x36a0_0000_0000_0000),
+        (0x3dcc_cccd, 0x3fb9_9999_a000_0000),
+        (0x7f7f_ffff, 0x47ef_ffff_e000_0000),
+        (0x7f80_0000, 0x7ff0_0000_0000_0000),
+        (0xff80_0000, 0xfff0_0000_0000_0000),
+    ] {
+        let Value::Float64(result) = leaf.convert(Input::Float32(f32::from_bits(input))).unwrap()
+        else {
+            panic!("DOUBLE result");
+        };
+        assert_eq!(result.to_bits(), expected);
+    }
+    let Value::Float64(nan) = leaf
+        .convert(Input::Float32(f32::from_bits(0x7fc0_0123)))
+        .unwrap()
+    else {
+        panic!("DOUBLE result");
+    };
+    assert!(nan.is_nan());
+    assert_eq!(
+        leaf.convert(Input::Float64(0.1)),
+        Err(LeafError::TypeMismatch)
+    );
+    assert_eq!(profile(&DataType::Float64, &DataType::Float32), None);
+    assert_eq!(common_profile(&DataType::Float64, &DataType::Float32), None);
+}
+
+#[test]
+fn common_decimal_rescale_obeys_neutral_relation_and_keeps_explicit_upscale_closed() {
+    for (source, target) in [
+        (DataType::Decimal128(3, 0), DataType::Decimal128(6, 3)),
+        (DataType::Decimal128(18, 0), DataType::Decimal128(38, 20)),
+        (DataType::Decimal128(38, 0), DataType::Decimal128(38, 1)),
+    ] {
+        assert_eq!(profile(&source, &target), None);
+        assert!(matches!(
+            common_profile(&source, &target),
+            Some(Leaf::CommonDecimalRescale { .. })
+        ));
+    }
+    for (source, target) in [
+        (DataType::Decimal128(14, 0), DataType::Decimal128(18, 18)),
+        (DataType::Decimal128(6, 3), DataType::Decimal128(3, 0)),
+        (DataType::Decimal128(4, 0), DataType::Decimal128(3, 0)),
+        (DataType::Float64, DataType::Decimal128(20, 0)),
+        (DataType::Int64, DataType::Int32),
+        (DataType::Utf8, DataType::Int32),
+        (DataType::Decimal128(0, 0), DataType::Decimal128(38, 0)),
+        (DataType::Decimal128(20, -1), DataType::Decimal128(38, 1)),
+    ] {
+        assert_eq!(common_profile(&source, &target), None);
+    }
+    let short = common_profile(&DataType::Decimal128(3, 0), &DataType::Decimal128(6, 3)).unwrap();
+    assert!(!short.may_fail());
+    for (input, expected) in [(999, 999_000), (-999, -999_000), (0, 0)] {
+        assert_eq!(
+            short.convert(Input::Decimal128(input)),
+            Ok(Value::Decimal128(expected))
+        );
+    }
+    assert_eq!(
+        short.convert(Input::Decimal128(1000)),
+        Err(LeafError::TypeMismatch)
+    );
+    let capped =
+        common_profile(&DataType::Decimal128(38, 0), &DataType::Decimal128(38, 1)).unwrap();
+    assert!(capped.may_fail());
+    let first_overflow = 10_i128.pow(37);
+    for sign in [-1, 1] {
+        assert_eq!(
+            capped.convert(Input::Decimal128(sign * (first_overflow - 1))),
+            Ok(Value::Decimal128(sign * (10_i128.pow(38) - 10)))
+        );
+        assert_eq!(
+            capped.convert(Input::Decimal128(sign * first_overflow)),
+            Err(LeafError::NumericOutOfRange)
+        );
+        assert_eq!(
+            capped.convert(Input::Decimal128(sign * 10_i128.pow(38))),
+            Err(LeafError::TypeMismatch)
+        );
+    }
+    for leaf in [
+        Leaf::CommonDecimalRescale {
+            source_precision: 14,
+            source_scale: 0,
+            target_precision: 18,
+            target_scale: 18,
+        },
+        Leaf::CommonDecimalRescale {
+            source_precision: 6,
+            source_scale: 3,
+            target_precision: 3,
+            target_scale: 0,
+        },
+    ] {
+        assert_eq!(
+            leaf.convert(Input::Decimal128(0)),
+            Err(LeafError::TypeMismatch)
+        );
+    }
+}

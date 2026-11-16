@@ -2479,6 +2479,7 @@ fn dynamic_struct<H>(
 }
 fn bind_dynamic_scalar_result_with_creation<H>(
     function_id: &FunctionId,
+    overload: &FunctionOverloadId,
     name: &str,
     request: FunctionBindingRequest<'_>,
     work: &mut CompileCheckpoints<'_>,
@@ -2504,6 +2505,37 @@ fn bind_dynamic_scalar_result_with_creation<H>(
         }
         binding_control::value_type(expected, work)?;
         return Ok(expected.clone());
+    }
+    if function_id.as_str() == "builtin.scalar/__array_literal/v1" {
+        let arguments = dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+        return with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+            novarocks_type_contract::array_constructor_result_with_construction(
+                &arguments,
+                cx.storage(),
+                cx.observer(),
+            )
+            .map_err(|error| match error {
+                novarocks_type_contract::ArrayCommonTypeFailure::Construction(source) => source,
+                novarocks_type_contract::ArrayCommonTypeFailure::Rule(reason) => {
+                    use novarocks_type_contract::ArrayCommonRuleFailure as Rule;
+                    let error = match reason {
+                        Rule::IncompatibleDomains | Rule::IncompatibleScalarTypes => {
+                            FunctionBindingError::NoMatchingOverload
+                        }
+                        Rule::UnreviewedHeterogeneousFamily
+                        | Rule::UnreviewedLayoutReconciliation => {
+                            FunctionBindingError::UnavailableImplementation(overload.clone())
+                        }
+                        Rule::NonnullableUnknown | Rule::MissingListChild => {
+                            FunctionBindingError::InvalidBinding(
+                                "ARRAY common source has contradictory type facts".into(),
+                            )
+                        }
+                    };
+                    novarocks_type_contract::ValueConstructionFailure::Observer(error.into())
+                }
+            })
+        });
     }
     let argument_types =
         dynamic_argument_data_types_with_creation(request, work, borrow_creator(&mut creation))?;
@@ -2559,30 +2591,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 return Err(FunctionBindingError::NoMatchingOverload.into());
             }
             value_type.data_type().clone()
-        }
-        "__array_literal" => {
-            // The element type is the one every element fits in, not the one
-            // the first element happens to have. Taking the first meant
-            // `[1, 300]` was an array of TINYINT and the 300 became NULL, and
-            // `[1, 2.5]` was an array of integers with the 2.5 truncated --
-            // silently, since nothing downstream can tell a narrowed literal
-            // from a NULL the query asked for.
-            let mut item_type = None;
-            for argument in &argument_types {
-                work.step()?;
-                item_type = Some(match item_type {
-                    None => argument.clone(),
-                    Some(left) => {
-                        with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                            cx.wider(&left, argument)
-                        })?
-                    }
-                });
-            }
-            let item_type = item_type.unwrap_or(DataType::Null);
-            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                list_type_with_construction(item_type, cx)
-            })?
         }
         "__struct_subfield" => {
             let Some(field_name) = utf8_constant(request.arguments.get(1), work)? else {
@@ -2695,21 +2703,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
         borrow_creator(&mut creation),
     )?;
     match name {
-        "__array_literal" => {
-            let arguments =
-                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
-            let item = fold_value_types_with_creation(
-                arguments.iter().copied(),
-                work,
-                borrow_creator(&mut creation),
-            )?;
-            full_result = dynamic_list(
-                &item,
-                full_result.nullable(),
-                work,
-                borrow_creator(&mut creation),
-            )?;
-        }
         "array_repeat" => {
             if value(1)?.logical_type() != ValueLogicalType::Physical {
                 return Err(FunctionBindingError::NoMatchingOverload.into());
@@ -3143,6 +3136,7 @@ impl BuiltinDynamicScalarResolver {
         }
         let result = bind_dynamic_scalar_result_with_creation(
             &self.function_id,
+            &self.overload,
             &self.canonical_name,
             request,
             work,

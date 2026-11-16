@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact, internal value-domain conversions selected by the FE type owner.
+//! Exact internal value conversions selected by the original FE type owner.
 //!
-//! This owner does not authorize a carrier CAST to change logical identity.
+//! Every family explicitly declares its domains and conversion semantics.
+//! Common coercion is exact-selection only; ordinary carrier casts stay separate.
 //! Binding requires an explicit complete target; there is no default target,
 //! name-based source classification or decimal error-policy default. The
 //! structural binder uses the existing bounded FVT validation, not a resource
@@ -50,6 +51,11 @@ use crate::{
 
 pub const VALUE_CONVERSION_NAME: &str = "__value_domain_conversion";
 pub const VALUE_CONVERSION_FUNCTION_ID: &str = "builtin.scalar/value_domain_conversion/v1";
+
+/// Only the original ARRAY binder may explicitly select this declared family.
+/// Automatic domain resolution deliberately never proposes it.
+pub const ARRAY_COMMON_COERCION: &str =
+    "builtin.scalar/value_domain_conversion/array_common_coercion/v1";
 
 pub(super) const JSON_TEXT: &str =
     "builtin.scalar/value_domain_conversion/json_text_same_structure/v1";
@@ -88,11 +94,12 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
     }
 }
 
-/// Decimal overflow remains a row error under the frozen ReportError policy.
-/// The other families retain their original total-value declaration.
+/// The nominal decimal family refines its frozen overflow policy later.
+/// Strict ARRAY common coercion owns conversion Data under every scalar policy;
+/// its dedicated preparation never accepts that policy as a semantic switch.
 pub(super) fn overload_effects(id: &str) -> FunctionEffectDeclaration {
     let mut effects = effects();
-    if id == LARGEINT_DECIMAL {
+    if matches!(id, LARGEINT_DECIMAL | ARRAY_COMMON_COERCION) {
         effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
     }
     effects
@@ -123,6 +130,7 @@ pub(super) fn definition_parts()
         (LARGEINT_TEXT, "LargeInt(FixedSizeBinary16)->Physical(Utf8)", "explicit exact target; original signed big-endian i128 text; NULL preserved"),
         (UTF8_LARGEINT, "Physical Utf8->LargeInt(FixedSizeBinary16)", "explicit nullable exact LargeInt target; trim then signed i128 parse; invalid or out-of-range text returns NULL; NULL preserved"),
         (NULL_LIFT, "Physical Null(nullable=true)->explicit complete nullable target", "evaluate child eagerly; strict NULL protocol produces typed NULL without row implementation"),
+        (ARRAY_COMMON_COERCION, "original complete source->independently inferred ARRAY common element target; exact selection only", "strict Trino common coercion; preserve source NULL/domain/layout obligations; conversion Data propagates; never an automatic domain candidate"),
     ]
     .into_iter()
     .map(|(id, argument_pattern, result_pattern)| {
@@ -174,6 +182,48 @@ pub fn resolve_value_conversion(
             },
             work.control(),
         )
+    })
+}
+
+/// Author one explicit ARRAY common coercion from the installed declaration.
+/// Automatic nominal conversion selection never chooses this family.
+pub fn resolve_array_common_coercion_binding(
+    catalog: &crate::EngineFunctionCatalog,
+    argument: &FunctionArgument,
+    target: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<crate::ResolvedFunctionBinding, FunctionBindingError> {
+    binding_control::scope(control, |work| {
+        let definition = catalog
+            .definition(VALUE_CONVERSION_NAME, FunctionKind::Scalar)
+            .ok_or(FunctionBindingError::UnknownFunction)?;
+        work.step()?;
+        let declaration = definition
+            .binding_declaration()
+            .ok_or(FunctionBindingError::MissingBindingDeclaration)?;
+        let mut exact = None;
+        for overload in declaration.overloads() {
+            work.step()?;
+            if overload.identity.as_str() == ARRAY_COMMON_COERCION {
+                exact = Some(&overload.identity);
+                break;
+            }
+        }
+        let overload = exact.ok_or(FunctionBindingError::MissingBindingDeclaration)?;
+        work.flush()?;
+        let bound = catalog.resolve_bound_trusted_at_overload(
+            declaration.function_id(),
+            FunctionKind::Scalar,
+            overload,
+            FunctionBindingRequest {
+                arguments: std::slice::from_ref(argument),
+                logical_argument_count: 1,
+                expected_result_type: Some(target),
+            },
+            work.control(),
+        )?;
+        work.flush()?;
+        Ok(bound)
     })
 }
 
@@ -562,6 +612,13 @@ fn pair_matches_observed(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, FunctionBindingError> {
     work.step()?;
+    if id == ARRAY_COMMON_COERCION {
+        return novarocks_type_contract::array_common_coercion_types_valid_observed(
+            source,
+            target,
+            || work.step().map_err(FunctionBindingError::from),
+        );
+    }
     if id != JSON_TEXT && id != OPAQUE_BINARY {
         return Ok(pair_matches(id, source, target));
     }
@@ -697,6 +754,7 @@ mod tests {
                 .map(|overload| overload.identity.as_str())
                 .collect::<Vec<_>>(),
             [
+                ARRAY_COMMON_COERCION,
                 JSON_TEXT,
                 LARGEINT_DECIMAL,
                 LARGEINT_FLOAT,

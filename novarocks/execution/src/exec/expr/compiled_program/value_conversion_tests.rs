@@ -78,7 +78,7 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
     builder
         .register(value_conversion_definition().unwrap())
         .unwrap();
-    // This independent installed manifest covers all nine real implementations
+    // This independent installed manifest covers all ten explicit installed implementations
     // of the original hidden definition, without claiming a Server catalogue.
     for stem in [
         "json_text_same_structure",
@@ -90,6 +90,7 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
         "largeint_to_utf8_text",
         "utf8_to_largeint_null_invalid",
         "null_to_typed_nullable",
+        "array_common_coercion",
     ] {
         manifest.push(InstalledPureKernel {
             function: FunctionId::try_new("builtin.scalar/value_domain_conversion/v1").unwrap(),
@@ -944,4 +945,186 @@ fn actual_compiled_largeint_decimal_keeps_exact_coefficients_and_frozen_report_e
         values.iter().collect::<Vec<_>>(),
         vec![None, None, None, Some(42)]
     );
+}
+
+fn array_common_frame_author(
+    functions: &PureEngineFunctionCatalog,
+    source: FunctionValueType,
+    target: FunctionValueType,
+) -> Author {
+    let arguments = vec![argument(source, None)];
+    // A plain scalar request must not automatically select family10.
+    assert!(matches!(
+        functions.metadata().resolve_bound_trusted(
+            VALUE_CONVERSION_NAME,
+            FunctionKind::Scalar,
+            FunctionBindingRequest {
+                arguments: &arguments,
+                logical_argument_count: 1,
+                expected_result_type: Some(&target),
+            },
+            &Control,
+        ),
+        Err(novarocks_functions::FunctionBindingError::NoMatchingOverload)
+    ));
+    let bound =
+        novarocks_functions::builtin::value_conversion::resolve_array_common_coercion_binding(
+            functions.metadata(),
+            &arguments[0],
+            &target,
+            &Control,
+        )
+        .unwrap();
+    let selected = Arc::new(bound.selected.clone());
+    assert_eq!(
+        selected.overload.as_str(),
+        novarocks_functions::builtin::value_conversion::ARRAY_COMMON_COERCION
+    );
+    assert_eq!(
+        selected.result_type,
+        FunctionResultType::Scalar(target.clone())
+    );
+    let function = BoundFunction {
+        function_id: bound.function_id,
+        overload: selected.overload.clone(),
+        kind: bound.kind,
+        argument_types: selected.argument_types.clone(),
+        result_type: target.clone(),
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: bound.semantics.volatility,
+            argument_evaluation: bound.semantics.argument_evaluation,
+            failure_behavior: bound.semantics.failure_behavior,
+            intrinsic_row_error: bound.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
+    };
+    Author {
+        function,
+        selected,
+        arguments,
+        logical_argument_count: 1,
+        constant_policy: options().constants,
+        expected_result_type: Some(target),
+        shape: ControlShape::Eager,
+    }
+}
+
+fn array_common_round_frame_program(convert: bool) -> Arc<LocalProgram> {
+    let decimal = FunctionValueType::new(DataType::Decimal128(38, 0), true);
+    conversion_program(
+        std::slice::from_ref(&decimal),
+        |functions, builder, authors, leaves| {
+            let digits_type = FunctionValueType::new(DataType::Int64, false);
+            let digits = builder
+                .add_expression(
+                    NodeId::new(0),
+                    digits_type.clone(),
+                    ExprKind::Literal(LiteralValue::Int64(-1)),
+                )
+                .unwrap();
+            let round = author(
+                functions,
+                "round",
+                vec![
+                    argument(decimal.clone(), None),
+                    integer_argument(digits_type, -1),
+                ],
+                ControlShape::Eager,
+            );
+            let source = round.result();
+            assert_eq!(source, decimal);
+            let rounded = call(builder, authors, round, vec![leaves[0], digits]);
+            if !convert {
+                return rounded;
+            }
+            call(
+                builder,
+                authors,
+                array_common_frame_author(
+                    functions,
+                    source,
+                    FunctionValueType::new(DataType::Float64, true),
+                ),
+                vec![rounded],
+            )
+        },
+    )
+}
+
+#[test]
+fn actual_compiled_array_common_frame_keeps_upstream_round_data_and_original_sparse_rows() {
+    let source_program = array_common_round_frame_program(false);
+    let common_program = array_common_round_frame_program(true);
+    assert_eq!(
+        result_type(&source_program),
+        FunctionValueType::new(DataType::Decimal128(38, 0), true)
+    );
+    assert_eq!(
+        result_type(&common_program),
+        FunctionValueType::new(DataType::Float64, true)
+    );
+    // Row0 is a real overflow outside the selected domain. Row2 is the only
+    // demanded source error; row3 is an original SQL NULL, not a row error.
+    let max38 = 10_i128.pow(38) - 1;
+    let values: ArrayRef = Arc::new(
+        Decimal128Array::from(vec![Some(max38), Some(25), Some(max38), None, Some(35)])
+            .with_precision_and_scale(38, 0)
+            .unwrap(),
+    );
+    let original = Arc::clone(&values);
+    let source_batch = input_batch(&source_program, vec![Arc::clone(&values)]);
+    let common_batch = input_batch(&common_program, vec![Arc::clone(&values)]);
+    let rows = [1_usize, 2, 3, 4];
+    let source_output = instance(&source_program)
+        .evaluate(
+            &source_batch,
+            Selection::try_sparse(5, &rows).unwrap(),
+            &Control,
+        )
+        .unwrap();
+    let common_output = instance(&common_program)
+        .evaluate(
+            &common_batch,
+            Selection::try_sparse(5, &rows).unwrap(),
+            &Control,
+        )
+        .unwrap();
+    assert!(Arc::ptr_eq(&values, &original));
+    assert_eq!(source_output.selection().iter().collect::<Vec<_>>(), rows);
+    assert_eq!(common_output.selection().iter().collect::<Vec<_>>(), rows);
+    assert_eq!(source_output.errors().len(), 1);
+    assert_eq!(source_output.errors()[0].selected_ordinal(), 1);
+    assert_eq!(
+        source_output.errors()[0].reason(),
+        novarocks_functions::DataFailureReason::NumericOutOfRange
+    );
+    assert_eq!(common_output.errors(), source_output.errors());
+    let before = source_output
+        .values()
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    let after = common_output
+        .values()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(before.value(0), 30);
+    assert_eq!(before.value(3), 40);
+    assert!(before.is_null(1));
+    assert!(before.is_null(2));
+    assert_eq!(after.value(0).to_bits(), 30.0_f64.to_bits());
+    assert_eq!(after.value(3).to_bits(), 40.0_f64.to_bits());
+    assert!(after.is_null(1));
+    assert!(after.is_null(2));
+    // ROUND's existing producer uses a bounded diagnostic, not a domain Error
+    // object. Compare the complete real journal fact; do not invent cross-run
+    // pointer identity for causes that do not carry a source object.
+    assert!(std::error::Error::source(&source_output.errors()[0]).is_none());
+    assert!(std::error::Error::source(&common_output.errors()[0]).is_none());
+    // Decimal38 -> Double cannot create this overflow itself. Success here
+    // requires Execution's real eager Frame to exclude the source-error row,
+    // pass a clean argument to the new family, then restore the original row
+    // ordinal/cause. ScalarEvaluationInstance alone must keep rejecting such
+    // unresolved input journals with ArgumentRowErrors (KERNEL64).
 }

@@ -295,6 +295,17 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         )
     }
 
+    fn resolve_array_common_coercion_binding(
+        &self,
+        argument: &FunctionArgument,
+        target: &FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        novarocks_functions::builtin::value_conversion::resolve_array_common_coercion_binding(
+            self, argument, target, control,
+        )
+    }
+
     fn resolve_value_conversion_binding(
         &self,
         argument: &FunctionArgument,

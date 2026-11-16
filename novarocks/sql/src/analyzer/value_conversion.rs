@@ -167,6 +167,61 @@ pub(super) fn cast_to_value_type(
     Ok(result)
 }
 
+/// Materialize one ordinary ordered child coercion using its real ARRAY
+/// common target. Preserve the original expression and CV; no literal retyping
+/// or scalar CAST(None) policy participates in this conversion.
+pub(super) fn coerce_array_common_argument(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    source: TypedExpr,
+    target: &FunctionValueType,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn PureCompileControl,
+) -> Result<TypedExpr, AnalyzeError> {
+    control
+        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
+        .map_err(AnalyzeError::control)?;
+    if source
+        .value_type
+        .exactly_equals_checked_observed(target, || {
+            control
+                .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+                .map_err(AnalyzeError::control)
+        })?
+    {
+        return Ok(source);
+    }
+    let argument = function_argument(&source, constant_policy, control)
+        .map_err(AnalyzeError::function_binding)?;
+    let bound = catalog
+        .resolve_array_common_coercion_binding(&argument, target, control)
+        .map_err(AnalyzeError::function_binding)?;
+    if bound.function_id.as_str()
+        != novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
+        || bound.selected.overload.as_str()
+            != novarocks_functions::builtin::value_conversion::ARRAY_COMMON_COERCION
+        || !matches!(&bound.selected.result_type, novarocks_functions::FunctionResultType::Scalar(actual) if actual == target)
+    {
+        return Err(AnalyzeError::internal(
+            "ARRAY common conversion lost its exact selected owner or target",
+        ));
+    }
+    Ok(TypedExpr {
+        value_type: target.clone(),
+        kind: ExprKind::FunctionCall {
+            name: novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME.to_string(),
+            volatility: bound.semantics.volatility,
+            binding: crate::binding::SqlFunctionBinding::new_with_array_common_constraint(
+                bound,
+                decimal_overflow_policy,
+                target.clone(),
+            ),
+            args: vec![source],
+            distinct: false,
+        },
+    })
+}
+
 /// A narrow existing binder adapter: the caller owns request observation and
 /// the supplied catalog remains the sole selected conversion authority.
 pub(super) fn convert_value_domain_with_catalog(

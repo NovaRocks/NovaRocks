@@ -340,15 +340,39 @@ fn canonical_hidden_array_literal_materializes_common_width_and_keeps_null_and_n
                 false,
             ),
         );
-        let ExprKind::Cast { expr, target, .. } = &call(first).2[0].kind else {
-            panic!("common width source cast");
+        let coercion = &call(first).2[0];
+        let ExprKind::FunctionCall { binding, args, .. } = &coercion.kind else {
+            panic!("ordered common width conversion");
         };
-        assert_eq!(*target, DataType::Int16);
         assert_eq!(
-            expr.value_type,
+            binding.function_id.as_str(),
+            novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
+        );
+        assert_eq!(
+            binding.selected.overload.as_str(),
+            novarocks_functions::builtin::value_conversion::ARRAY_COMMON_COERCION
+        );
+        assert_eq!(
+            coercion.value_type,
+            FunctionValueType::new(DataType::Int16, nullable)
+        );
+        assert_eq!(binding.result_constraint(), Some(&coercion.value_type));
+        assert!(matches!(
+            binding.result_constraint_origin(),
+            crate::binding::SqlResultConstraintOrigin::ArrayCommonCoercion
+        ));
+        assert_eq!(args.len(), 1);
+        assert_eq!(
+            args[0].value_type,
             FunctionValueType::new(DataType::Int8, nullable)
         );
-        assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
+        assert_eq!(
+            binding.selected.argument_types.as_ref(),
+            &[novarocks_functions::FunctionArgumentType::Value(
+                args[0].value_type.clone()
+            )]
+        );
+        assert!(matches!(args[0].kind, ExprKind::ColumnRef { .. }));
         let second = project(&query, 1);
         assert_bound(
             second,

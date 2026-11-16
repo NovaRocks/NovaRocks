@@ -474,6 +474,64 @@ pub struct PreparedCastRecipe {
     allow_throw_exception: bool,
 }
 impl PreparedCastRecipe {
+    /// Prepare the strict conversion authored by an ARRAY common-type binding.
+    /// The actual conversion overload freezes this context; ordinary scalar
+    /// CAST(None) never reaches this preparation entry.
+    pub(crate) fn prepare_array_common_coercion(
+        source: &FunctionValueType,
+        result: &FunctionValueType,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, CastPrepareError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let outcome = (|| {
+            for value in [source, result] {
+                validate_type_observed(value, &mut work).map_err(CastPrepareError::Kernel)?;
+            }
+            array_mode::prepare_common(source, result, &mut work)
+        })();
+        if outcome
+            .as_ref()
+            .is_err_and(|error| error.control_error().is_some())
+        {
+            return outcome;
+        }
+        work.finish()?;
+        outcome
+    }
+
+    /// Actual owned child Boxes and fresh fixed layout-projection holders.
+    /// Original shared semantic/Arrow backing remains with its creator.
+    pub(crate) fn retained_heap_bytes_observed(
+        &self,
+        mut observe: impl FnMut() -> Result<(), KernelFailure>,
+    ) -> Result<usize, KernelFailure> {
+        let mut bytes = 0_usize;
+        let mut parent = self;
+        while let Some(child) = parent.array_child.as_deref() {
+            observe()?;
+            bytes = bytes
+                .checked_add(std::mem::size_of::<Self>())
+                .ok_or(KernelFailure::ResourceExhausted)?;
+            for ty in [&parent.source, &parent.result] {
+                observe()?;
+                if ty
+                    .typed_binding()
+                    .layout()
+                    .materialized_child_at(0)
+                    .is_none()
+                {
+                    let layout = novarocks_type_contract::ValueLayout::storage_allocation_layout()
+                        .map_err(|_| KernelFailure::ResourceExhausted)?;
+                    bytes = bytes
+                        .checked_add(layout.size())
+                        .ok_or(KernelFailure::ResourceExhausted)?;
+                }
+            }
+            parent = child;
+        }
+        Ok(bytes)
+    }
+
     pub fn try_new(
         operation: CastOperation,
         source: &FunctionValueType,

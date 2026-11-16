@@ -557,3 +557,104 @@ fn array_cast_modes_have_distinct_semantic_and_scalar_identity_and_survive_rebui
         }
     }
 }
+
+#[test]
+fn ordinary_array_common_targets_preserve_original_operands_and_use_trino_rules() {
+    use crate::analysis::ExprKind;
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    let scope = ctx.new_scope();
+    for (sql, expected) in [
+        (
+            "SELECT [CAST(1 AS INT),CAST(2 AS SMALLINT)]",
+            DataType::Int32,
+        ),
+        ("SELECT [CAST(1 AS REAL),CAST(2 AS INT)]", DataType::Float32),
+        ("SELECT [9007199254740993,1e0]", DataType::Float64),
+        (
+            "SELECT [CAST(0 AS DECIMAL(38,0)),CAST(0 AS DECIMAL(38,38))]",
+            DataType::Decimal128(38, 38),
+        ),
+        ("SELECT []", DataType::Null),
+        ("SELECT [NULL,NULL]", DataType::Null),
+    ] {
+        let parsed = query(sql);
+        let ast::Expr::Array(source_array) = projection(&parsed) else {
+            panic!("original array")
+        };
+        let originals = source_array
+            .elements
+            .iter()
+            .map(|item| ctx.analyze_expr(item, &scope).unwrap())
+            .collect::<Vec<_>>();
+        let actual = ctx
+            .analyze_expr(projection(&parsed), &scope)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        assert!(!actual.value_type.nullable());
+        let item = actual.value_type.child_at(0).unwrap();
+        assert_eq!(item.data_type(), &expected, "{sql}");
+        assert!(item.nullable());
+        let ExprKind::FunctionCall { binding, args, .. } = &actual.kind else {
+            panic!("original constructor")
+        };
+        assert_eq!(
+            binding.function_id.as_str(),
+            "builtin.scalar/__array_literal/v1"
+        );
+        assert_eq!(args.len(), originals.len());
+        assert_eq!(binding.selected.argument_types.len(), originals.len());
+        for (argument, original) in args.iter().zip(&originals) {
+            if let ExprKind::FunctionCall { binding, args, .. } = &argument.kind
+                && binding.selected.overload.as_str()
+                    == novarocks_functions::builtin::value_conversion::ARRAY_COMMON_COERCION
+            {
+                assert_eq!(args.len(), 1);
+                same_typed(&args[0], original, &control);
+                assert_eq!(
+                    argument.value_type.nullable(),
+                    original.value_type.nullable()
+                );
+                assert_eq!(binding.result_constraint(), Some(&argument.value_type));
+                assert!(matches!(
+                    binding.result_constraint_origin(),
+                    crate::binding::SqlResultConstraintOrigin::ArrayCommonCoercion
+                ));
+                assert_eq!(
+                    binding.selected.argument_types.as_ref(),
+                    &[novarocks_functions::FunctionArgumentType::Value(
+                        original.value_type.clone()
+                    )]
+                );
+            } else {
+                same_typed(argument, original, &control);
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_array_common_does_not_coerce_numeric_or_json_values_to_text() {
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    let scope = ctx.new_scope();
+    for sql in [
+        "SELECT [1,'2']",
+        "SELECT [JSON '1','2']",
+        "SELECT [[1],['2']]",
+    ] {
+        let parsed = query(sql);
+        let error = ctx.analyze_expr(projection(&parsed), &scope).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch,
+            "{sql}: {error}"
+        );
+    }
+    for sql in ["SELECT [[NULL],NULL]", "SELECT [JSON '1',NULL]"] {
+        let parsed = query(sql);
+        let actual = ctx
+            .analyze_expr(projection(&parsed), &scope)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        assert!(!actual.value_type.nullable());
+    }
+}

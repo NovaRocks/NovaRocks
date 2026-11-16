@@ -411,6 +411,22 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
+    fn resolve_array_common_coercion_binding(
+        &self,
+        _argument: &novarocks_functions::FunctionArgument,
+        _target: &novarocks_functions::FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
     fn resolve_value_conversion_binding(
         &self,
         _argument: &novarocks_functions::FunctionArgument,

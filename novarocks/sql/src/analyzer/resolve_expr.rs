@@ -5397,6 +5397,7 @@ pub(super) fn resolved_scalar_call_at(
             span,
         ));
     }
+    let array_common = binding.function_id.as_str() == "builtin.scalar/__array_literal/v1";
     let args = args
         .into_iter()
         .zip(binding.selected.argument_types.iter())
@@ -5408,6 +5409,16 @@ pub(super) fn resolved_scalar_call_at(
                     format!("function `{name}` selected a value target for a lambda argument"),
                     span,
                 ))
+            }
+            novarocks_functions::FunctionArgumentType::Value(target) if array_common => {
+                super::value_conversion::coerce_array_common_argument(
+                    function_catalog,
+                    argument,
+                    target,
+                    decimal_overflow_policy,
+                    constant_policy,
+                    control,
+                )
             }
             novarocks_functions::FunctionArgumentType::Value(target) => {
                 coerce_selected_function_argument(

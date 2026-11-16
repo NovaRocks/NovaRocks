@@ -1758,9 +1758,15 @@ mod scalar_domain_tests {
             error.to_string().contains("no matching declared overload"),
             "{error}"
         );
+        let mixed_error = super::super::analyze(
+            &query("select element_at([parse_json('{}'),'plain'],1)"),
+            &Catalog,
+            "db",
+        )
+        .unwrap_err();
         assert_eq!(
-            output_domains("select element_at([parse_json('{}'),'plain'],1)"),
-            vec![Some(SqlType::String)]
+            mixed_error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
         );
         // The catalog's explicit recursive declaration is the author even when
         // its external Arrow fields carry no execution-domain annotations.

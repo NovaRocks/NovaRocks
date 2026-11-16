@@ -86,6 +86,23 @@ impl ContractLoweringVisitor<'_> {
                 }
                 Ok(binding.result_constraint().cloned())
             }
+            SqlResultConstraintOrigin::ArrayCommonCoercion => {
+                let [novarocks_functions::FunctionArgument::Value { value_type, .. }] = arguments
+                else {
+                    return Err(invalid(
+                        "ARRAY common constraint lacks its original value source",
+                    ));
+                };
+                let target = binding
+                    .result_constraint()
+                    .ok_or_else(|| invalid("ARRAY common constraint lost its authored target"))?;
+                self.work.flush()?;
+                let target = target
+                    .with_nullable(target.nullable() || value_type.nullable())
+                    .expect("validated root NULL contract");
+                self.work.step()?;
+                Ok(Some(target))
+            }
             SqlResultConstraintOrigin::ValueDomainConversion { final_target } => {
                 let [novarocks_functions::FunctionArgument::Value { value_type, .. }] = arguments
                 else {

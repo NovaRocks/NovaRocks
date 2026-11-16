@@ -85,6 +85,105 @@ pub(super) fn prepare(
     ))
 }
 
+/// The caller freezes this context as a real common-coercion overload. It
+/// cannot acquire explicit JSON/text or numeric narrowing CAST capabilities.
+pub(super) fn prepare_common(
+    source: &FunctionValueType,
+    result: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedCastRecipe, CastPrepareError> {
+    work.step()?;
+    if !novarocks_type_contract::array_common_coercion_types_valid_observed(source, result, || {
+        work.step()
+    })? {
+        return Err(CastPrepareError::TypeMismatch);
+    }
+    let policy = DecimalOverflowPolicy::ReportError;
+    if source.data_type() == &DataType::Null {
+        if result.data_type() == &DataType::Null {
+            // UNKNOWN identity stays with the original constructor. The
+            // selected scalar result author has no NULL-only cast profile.
+            return Err(CastPrepareError::Unsupported);
+        }
+        return Ok(recipe(
+            source,
+            result,
+            CastBody::ArrayNull,
+            None,
+            policy,
+            false,
+            None,
+        ));
+    }
+    if matches!(source.data_type(), DataType::List(_))
+        && source
+            .same_physical_binding_ignoring_root_nullability_observed(result, || work.step())?
+    {
+        // This is the original complete List identity, including UNKNOWN
+        // children. No generic scalar NULL-to-NULL recipe is required.
+        return Ok(recipe(
+            source,
+            result,
+            CastBody::Identity,
+            None,
+            policy,
+            false,
+            None,
+        ));
+    }
+    if matches!(
+        (source.data_type(), result.data_type()),
+        (DataType::List(_), DataType::List(_))
+    ) {
+        let from = source.child_at(0).ok_or(CastPrepareError::TypeMismatch)?;
+        let to = result.child_at(0).ok_or(CastPrepareError::TypeMismatch)?;
+        let child = prepare_common(&from, &to, work)?;
+        work.flush()?;
+        return Ok(recipe(
+            source,
+            result,
+            CastBody::ExplicitArray,
+            Some(Box::new(child)),
+            policy,
+            false,
+            Some(ArrayCastFailureMode::ReportError),
+        ));
+    }
+    if source.logical_type() == ValueLogicalType::Physical
+        && result.logical_type() == ValueLogicalType::Physical
+        && let Some(leaf) =
+            super::trino_array_leaf::common_profile(source.data_type(), result.data_type())
+    {
+        return Ok(recipe(
+            source,
+            result,
+            CastBody::ArrayLeaf(leaf),
+            None,
+            policy,
+            false,
+            None,
+        ));
+    }
+    if source.data_type() == result.data_type()
+        && source
+            .same_value_domain_observed::<KernelFailure>(result, || {
+                work.step().map_err(crate::kernel_control::compile_failure)
+            })
+            .map_err(CastPrepareError::Kernel)?
+    {
+        return Ok(recipe(
+            source,
+            result,
+            CastBody::Identity,
+            None,
+            policy,
+            false,
+            None,
+        ));
+    }
+    Err(CastPrepareError::Unsupported)
+}
+
 fn prepare_element(
     source: &FunctionValueType,
     result: &FunctionValueType,
@@ -440,6 +539,7 @@ pub(super) fn evaluate_leaf(
                 DataType::Int16 => array.as_any().is::<Int16Array>(),
                 DataType::Int32 => array.as_any().is::<Int32Array>(),
                 DataType::Int64 => array.as_any().is::<Int64Array>(),
+                DataType::Float32 => array.as_any().is::<Float32Array>(),
                 DataType::Float64 => array.as_any().is::<Float64Array>(),
                 DataType::Decimal128(..) => array.as_any().is::<Decimal128Array>(),
                 _ => false,
@@ -482,13 +582,13 @@ pub(super) fn evaluate_leaf(
                 .downcast_ref::<Int32Array>()
                 .expect("checked carrier")
                 .value(row);
-            if matches!(leaf, trino_array_leaf::Leaf::SignedToDecimal { .. }) {
+            if matches!(leaf, trino_array_leaf::Leaf::Int32ToInt64) {
+                Input::Int32(value)
+            } else {
                 Input::Signed {
                     width: trino_array_leaf::SignedWidth::I32,
                     value: i64::from(value),
                 }
-            } else {
-                Input::Int32(value)
             }
         }
         DataType::Int64 => Input::Signed {
@@ -500,6 +600,14 @@ pub(super) fn evaluate_leaf(
                 .expect("checked carrier")
                 .value(row),
         },
+        DataType::Float32 => Input::Float32(
+            argument
+                .array()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("checked carrier")
+                .value(row),
+        ),
         DataType::Float64 => Input::Float64(
             argument
                 .array()

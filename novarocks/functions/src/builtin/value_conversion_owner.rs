@@ -37,7 +37,7 @@ use crate::{
     SelectedValues,
 };
 
-fn implementation_pairs() -> [(&'static str, &'static str); 9] {
+fn implementation_pairs() -> [(&'static str, &'static str); 10] {
     [
         (
             value_conversion::JSON_TEXT,
@@ -74,6 +74,10 @@ fn implementation_pairs() -> [(&'static str, &'static str); 9] {
         (
             value_conversion::NULL_LIFT,
             "builtin.scalar/value_domain_conversion/null_to_typed_nullable/selected-v1",
+        ),
+        (
+            value_conversion::ARRAY_COMMON_COERCION,
+            "builtin.scalar/value_domain_conversion/array_common_coercion/selected-v1",
         ),
     ]
 }
@@ -430,3 +434,7 @@ impl ValueConversionOwner {
         work.finish_result(result, compile_failure)
     }
 }
+
+#[cfg(test)]
+#[path = "value_conversion_array_common_tests.rs"]
+mod array_common_tests;

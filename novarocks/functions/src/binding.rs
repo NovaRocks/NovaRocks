@@ -1014,6 +1014,29 @@ impl EngineFunctionCatalog {
         finish_binding_work(result, work)
     }
 
+    /// Resolve one trusted call at its exact installed overload and retain the
+    /// same declaration-authored metadata as ordinary resolution. Selection
+    /// never falls back to automatic overload resolution or an execution ABI.
+    pub fn resolve_bound_trusted_at_overload(
+        &self,
+        function: &FunctionId,
+        kind: FunctionKind,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            let definition = self.definition_by_id(function);
+            work.step()?;
+            let binding =
+                exact_definition(definition.ok_or(FunctionBindingError::UnknownFunction)?)?;
+            let selected = select_exact_definition(binding, kind, overload, request, &mut work)?;
+            resolved_definition_selection(binding, request, selected)
+        })();
+        finish_binding_work(result, work)
+    }
+
     /// Author a canonical selection at one exact installed identity/overload.
     /// The original resolver must implement this capability; there is no user
     /// name, alternate overload resolution or copied-selection fallback. The
@@ -1032,58 +1055,7 @@ impl EngineFunctionCatalog {
             work.step()?;
             let binding =
                 exact_definition(definition.ok_or(FunctionBindingError::UnknownFunction)?)?;
-            let same_kind = kind == binding.declaration.kind;
-            work.step()?;
-            if !same_kind {
-                return Err(invalid_binding(
-                    "exact selection kind differs from the declaration",
-                ));
-            }
-            validate_request(kind, request, &mut work)?;
-            let mut declared = false;
-            for candidate in binding.declaration.overloads() {
-                let same = &candidate.identity == overload;
-                work.step()?;
-                if same {
-                    declared = true;
-                    break;
-                }
-            }
-            if !declared {
-                return Err(invalid_binding(
-                    "exact selection overload is not declared by this function",
-                ));
-            }
-            work.flush()?;
-            let selected =
-                binding
-                    .resolver
-                    .select_at_overload_observed(overload, request, work.control())?;
-            let same_overload = &selected.overload == overload;
-            work.step()?;
-            if !same_overload {
-                return Err(invalid_binding(
-                    "exact selection owner returned a different overload",
-                ));
-            }
-            if let Some(expected) = request.expected_result_type {
-                let matches = match &selected.result_type {
-                    FunctionResultType::Scalar(actual) => actual
-                        .exactly_equals_observed(expected, || {
-                            work.step().map_err(FunctionBindingError::from)
-                        })?,
-                    FunctionResultType::Relation(_) => {
-                        work.step()?;
-                        false
-                    }
-                };
-                if !matches {
-                    return Err(invalid_binding(
-                        "exact selection result differs from the requested result type",
-                    ));
-                }
-            }
-            validate_selected_definition(binding, &selected, request, &mut work)?;
+            let selected = select_exact_definition(binding, kind, overload, request, &mut work)?;
             work.flush()?;
             let selected = Arc::new(selected);
             work.step()?;
@@ -1395,6 +1367,68 @@ fn exact_definition(
         .ok_or(FunctionBindingError::MissingBindingDeclaration)
 }
 
+fn select_exact_definition(
+    binding: &FunctionBindingDefinition,
+    kind: FunctionKind,
+    overload: &FunctionOverloadId,
+    request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FunctionBindingSelection, FunctionBindingError> {
+    let same_kind = kind == binding.declaration.kind;
+    work.step()?;
+    if !same_kind {
+        return Err(invalid_binding(
+            "exact selection kind differs from the declaration",
+        ));
+    }
+    validate_request(kind, request, work)?;
+    let mut declared = false;
+    for candidate in binding.declaration.overloads() {
+        let same = &candidate.identity == overload;
+        work.step()?;
+        if same {
+            declared = true;
+            break;
+        }
+    }
+    if !declared {
+        return Err(invalid_binding(
+            "exact selection overload is not declared by this function",
+        ));
+    }
+    work.flush()?;
+    let selected =
+        binding
+            .resolver
+            .select_at_overload_observed(overload, request, work.control())?;
+    let same_overload = &selected.overload == overload;
+    work.step()?;
+    if !same_overload {
+        return Err(invalid_binding(
+            "exact selection owner returned a different overload",
+        ));
+    }
+    if let Some(expected) = request.expected_result_type {
+        let matches = match &selected.result_type {
+            FunctionResultType::Scalar(actual) => actual
+                .exactly_equals_observed(expected, || {
+                    work.step().map_err(FunctionBindingError::from)
+                })?,
+            FunctionResultType::Relation(_) => {
+                work.step()?;
+                false
+            }
+        };
+        if !matches {
+            return Err(invalid_binding(
+                "exact selection result differs from the requested result type",
+            ));
+        }
+    }
+    validate_selected_definition(binding, &selected, request, work)?;
+    Ok(selected)
+}
+
 fn resolve_definition(
     definition: &FunctionDefinition,
     request: FunctionBindingRequest<'_>,
@@ -1405,6 +1439,14 @@ fn resolve_definition(
     work.flush()?;
     let selected = binding.resolver.resolve(request, work.control())?;
     validate_selection(&binding.declaration, &selected, request, work)?;
+    resolved_definition_selection(binding, request, selected)
+}
+
+fn resolved_definition_selection(
+    binding: &FunctionBindingDefinition,
+    request: FunctionBindingRequest<'_>,
+    selected: FunctionBindingSelection,
+) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
     Ok(ResolvedFunctionBinding {
         declared_scalar_invocation_data: binding
             .declaration

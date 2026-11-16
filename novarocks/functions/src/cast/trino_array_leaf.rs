@@ -28,6 +28,15 @@ const FIRST_FRACTIONLESS_DOUBLE: f64 = 4_503_599_627_370_496.0;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Leaf {
     Int32ToInt64,
+    SignedWiden {
+        source: SignedWidth,
+        target: SignedWidth,
+    },
+    SignedToFloat {
+        source: SignedWidth,
+        width: FloatWidth,
+    },
+    Float32ToFloat64,
     DoubleToDecimal20,
     SignedToDecimal {
         source: SignedWidth,
@@ -35,6 +44,12 @@ pub(super) enum Leaf {
         target_scale: u8,
     },
     DecimalRescale {
+        source_precision: u8,
+        source_scale: u8,
+        target_precision: u8,
+        target_scale: u8,
+    },
+    CommonDecimalRescale {
         source_precision: u8,
         source_scale: u8,
         target_precision: u8,
@@ -62,6 +77,14 @@ pub(super) enum SignedWidth {
 }
 
 impl SignedWidth {
+    fn bits(self) -> u8 {
+        match self {
+            Self::I8 => 8,
+            Self::I16 => 16,
+            Self::I32 => 32,
+            Self::I64 => 64,
+        }
+    }
     fn from_type(source: &DataType) -> Option<Self> {
         match source {
             DataType::Int8 => Some(Self::I8),
@@ -93,6 +116,7 @@ impl SignedWidth {
 pub(super) enum Input {
     Int32(i32),
     Signed { width: SignedWidth, value: i64 },
+    Float32(f32),
     Float64(f64),
     Decimal128(i128),
 }
@@ -119,6 +143,27 @@ pub(super) enum LeafError {
 pub(super) fn profile(source: &DataType, target: &DataType) -> Option<Leaf> {
     match (source, target) {
         (DataType::Int32, DataType::Int64) => Some(Leaf::Int32ToInt64),
+        (DataType::Float32, DataType::Float64) => Some(Leaf::Float32ToFloat64),
+        (source, DataType::Float32 | DataType::Float64)
+            if SignedWidth::from_type(source).is_some() =>
+        {
+            Some(Leaf::SignedToFloat {
+                source: SignedWidth::from_type(source)?,
+                width: if target == &DataType::Float32 {
+                    FloatWidth::F32
+                } else {
+                    FloatWidth::F64
+                },
+            })
+        }
+        (source, target)
+            if SignedWidth::from_type(source).is_some()
+                && SignedWidth::from_type(target).is_some() =>
+        {
+            let source = SignedWidth::from_type(source)?;
+            let target = SignedWidth::from_type(target)?;
+            (source.bits() < target.bits()).then_some(Leaf::SignedWiden { source, target })
+        }
         (DataType::Float64, DataType::Decimal128(20, 0)) => Some(Leaf::DoubleToDecimal20),
         (DataType::Decimal128(precision, scale), DataType::Float32 | DataType::Float64)
             if (1..=38).contains(precision) && *scale >= 0 && (*scale as u8) <= *precision =>
@@ -160,6 +205,35 @@ pub(super) fn profile(source: &DataType, target: &DataType) -> Option<Leaf> {
     }
 }
 
+/// ARRAY common coercion uses the neutral type relation before capability
+/// selection. Explicit narrowing conversions never grant implicit admission.
+pub(super) fn common_profile(source: &DataType, target: &DataType) -> Option<Leaf> {
+    if !novarocks_type_contract::array_common_numeric_coercion(source, target) {
+        return None;
+    }
+    if let (
+        DataType::Decimal128(source_precision, source_scale),
+        DataType::Decimal128(target_precision, target_scale),
+    ) = (source, target)
+    {
+        if !valid_common_decimal(
+            *source_precision,
+            *source_scale as u8,
+            *target_precision,
+            *target_scale as u8,
+        ) {
+            return None;
+        }
+        return Some(Leaf::CommonDecimalRescale {
+            source_precision: *source_precision,
+            source_scale: *source_scale as u8,
+            target_precision: *target_precision,
+            target_scale: *target_scale as u8,
+        });
+    }
+    profile(source, target)
+}
+
 impl Leaf {
     pub(super) fn may_fail(self) -> bool {
         match self {
@@ -180,6 +254,12 @@ impl Leaf {
                 source_scale,
                 target_precision,
                 target_scale,
+            }
+            | Self::CommonDecimalRescale {
+                source_precision,
+                source_scale,
+                target_precision,
+                target_scale,
             } => {
                 if !valid_decimal(source_precision, source_scale) {
                     return true;
@@ -196,6 +276,30 @@ impl Leaf {
     pub(super) fn convert(self, input: Input) -> Result<Value, LeafError> {
         match (self, input) {
             (Self::Int32ToInt64, Input::Int32(value)) => Ok(Value::Int64(i64::from(value))),
+            (Self::SignedWiden { source, target }, Input::Signed { width, value }) => {
+                if source != width || !source.accepts(value) || source.bits() >= target.bits() {
+                    return Err(LeafError::TypeMismatch);
+                }
+                Ok(Value::Int64(value))
+            }
+            (
+                Self::SignedToFloat { source, width },
+                Input::Signed {
+                    width: actual,
+                    value,
+                },
+            ) => {
+                if source != actual || !source.accepts(value) {
+                    return Err(LeafError::TypeMismatch);
+                }
+                // Cast directly to the target IEEE width. Passing through f64
+                // first would double-round some valid BIGINT values to REAL.
+                Ok(match width {
+                    FloatWidth::F32 => Value::Float32(value as f32),
+                    FloatWidth::F64 => Value::Float64(value as f64),
+                })
+            }
+            (Self::Float32ToFloat64, Input::Float32(value)) => Ok(Value::Float64(f64::from(value))),
             (Self::DoubleToDecimal20, Input::Float64(value)) => {
                 decimal20_from_double(value).map(Value::Decimal128)
             }
@@ -251,6 +355,27 @@ impl Leaf {
                 rescale_coefficient(value, source_scale, target_precision, target_scale)
                     .map(Value::Decimal128)
             }
+            (
+                Self::CommonDecimalRescale {
+                    source_precision,
+                    source_scale,
+                    target_precision,
+                    target_scale,
+                },
+                Input::Decimal128(value),
+            ) => {
+                if !valid_common_decimal(
+                    source_precision,
+                    source_scale,
+                    target_precision,
+                    target_scale,
+                ) || value.unsigned_abs() >= 10_u128.pow(u32::from(source_precision))
+                {
+                    return Err(LeafError::TypeMismatch);
+                }
+                rescale_coefficient(value, source_scale, target_precision, target_scale)
+                    .map(Value::Decimal128)
+            }
             _ => Err(LeafError::TypeMismatch),
         }
     }
@@ -261,6 +386,23 @@ fn valid_decimal(precision: u8, scale: u8) -> bool {
 }
 fn valid_decimal_arrow(precision: u8, scale: i8) -> bool {
     scale >= 0 && valid_decimal(precision, scale as u8)
+}
+
+fn valid_common_decimal(
+    source_precision: u8,
+    source_scale: u8,
+    target_precision: u8,
+    target_scale: u8,
+) -> bool {
+    valid_decimal(source_precision, source_scale)
+        && valid_decimal(target_precision, target_scale)
+        && target_scale >= source_scale
+        // A short target must retain every declared source integer digit.
+        && (target_precision > 18 || target_precision - target_scale >= source_precision - source_scale)
+        && novarocks_type_contract::array_common_numeric_coercion(
+            &DataType::Decimal128(source_precision, source_scale as i8),
+            &DataType::Decimal128(target_precision, target_scale as i8),
+        )
 }
 
 /// Exact coefficient conversion shared by signed-to-decimal and rescale leaves.

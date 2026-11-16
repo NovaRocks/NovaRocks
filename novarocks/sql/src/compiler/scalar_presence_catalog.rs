@@ -294,6 +294,20 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             .resolve_scalar_binding_with_expected_result(_name, _arguments, _expected, control)?;
         self.admit(binding, control)
     }
+    fn resolve_array_common_coercion_binding(
+        &self,
+        _argument: &novarocks_functions::FunctionArgument,
+        _target: &novarocks_functions::FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        let binding = self
+            .original
+            .resolve_array_common_coercion_binding(_argument, _target, control)?;
+        self.admit(binding, control)
+    }
     fn resolve_value_conversion_binding(
         &self,
         _argument: &novarocks_functions::FunctionArgument,

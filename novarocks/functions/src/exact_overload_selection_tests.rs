@@ -721,3 +721,73 @@ fn aggregate_state_argument_contract_is_authored_and_revalidated_by_exact_owner(
         }
     }
 }
+
+#[test]
+fn exact_trusted_resolution_uses_original_metadata_without_auto_fallback() {
+    let catalog = catalog();
+    let original = original(&catalog);
+    let arguments = [value(false)];
+    prefixes(
+        |control| {
+            let exact = catalog.resolve_bound_trusted_at_overload(
+                &original.function_id,
+                original.kind,
+                &original.selected.overload,
+                request(&arguments),
+                control,
+            )?;
+            assert_eq!(exact, original);
+            assert_eq!(exact.admitted_execution_abi, None);
+            Ok(())
+        },
+        true,
+    );
+    let absent =
+        FunctionOverloadId::try_new("builtin.scalar/lower/absent-common-coercion/v1").unwrap();
+    prefixes(
+        |control| {
+            catalog
+                .resolve_bound_trusted_at_overload(
+                    &original.function_id,
+                    original.kind,
+                    &absent,
+                    request(&arguments),
+                    control,
+                )
+                .map(|_| ())
+        },
+        false,
+    );
+    prefixes(
+        |control| {
+            catalog
+                .resolve_bound_trusted_at_overload(
+                    &original.function_id,
+                    FunctionKind::Aggregate,
+                    &original.selected.overload,
+                    request(&arguments),
+                    control,
+                )
+                .map(|_| ())
+        },
+        false,
+    );
+    let foreign = FunctionValueType::new(DataType::Int64, false);
+    prefixes(
+        |control| {
+            catalog
+                .resolve_bound_trusted_at_overload(
+                    &original.function_id,
+                    original.kind,
+                    &original.selected.overload,
+                    FunctionBindingRequest {
+                        expected_result_type: Some(&foreign),
+                        ..request(&arguments)
+                    },
+                    control,
+                )
+                .map(|_| ())
+        },
+        false,
+    );
+}

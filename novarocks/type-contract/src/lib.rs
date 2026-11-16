@@ -26,8 +26,13 @@ mod between;
 pub use between::*;
 mod arithmetic;
 mod array_cast;
+mod array_common;
 pub use array_cast::{
     ArrayCastFailureMode, array_cast_mode_types_valid, array_cast_mode_types_valid_observed,
+};
+pub use array_common::{
+    ArrayCommonRuleFailure, ArrayCommonTypeFailure, array_common_coercion_types_valid_observed,
+    array_common_numeric_coercion, array_constructor_result_with_construction,
 };
 mod array_generate;
 mod carrier_parameters;

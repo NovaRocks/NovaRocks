@@ -667,13 +667,29 @@ fn array_literal_and_sortby_preserve_complete_json_child_identity() {
     );
     assert!(!output(&literal).nullable());
     let mixed = [value(json()), value(physical(DataType::Utf8))];
-    let text_literal = resolve_with_materialized_assignments("__array_literal", &mixed);
+    let catalog = builtin_engine_function_catalog();
+    for arguments in [mixed.clone(), [mixed[1].clone(), mixed[0].clone()]] {
+        assert!(matches!(
+            catalog.resolve_bound_user(
+                "__array_literal",
+                FunctionKind::Scalar,
+                request(&arguments),
+                crate::binding_test_control()
+            ),
+            Err(FunctionBindingError::NoMatchingOverload)
+        ));
+    }
+    let strings = [
+        value(physical(DataType::Utf8)),
+        value(physical(DataType::Utf8)),
+    ];
+    let text_literal = resolve("__array_literal", FunctionKind::Scalar, &strings);
     assert_eq!(
-        output(&text_literal).data_type().clone(),
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+        output(&text_literal).data_type(),
+        &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
     );
     assert_eq!(
-        output(&text_literal).logical_type(),
+        output(&text_literal).child_at(0).unwrap().logical_type(),
         ValueLogicalType::Physical
     );
     assert!(!output(&text_literal).nullable());
@@ -685,7 +701,7 @@ fn array_literal_and_sortby_preserve_complete_json_child_identity() {
             .all(|argument| argument == &FunctionArgumentType::Value(physical(DataType::Utf8)))
     );
     assert!(
-        builtin_engine_function_catalog()
+        catalog
             .validate_bound(
                 &text_literal,
                 request(&mixed),

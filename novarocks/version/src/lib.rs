@@ -101,6 +101,8 @@ impl StaticPlanInterpreter {
 /// Revision 28 adds strict signed/decimal and raw-text JSON array conversion
 /// recipes and their precise successful-NULL obligations. A revision-27 peer
 /// cannot prepare these new shapes; absence keeps the original interpretation.
+/// Revision 29 adds ARRAY common-type coercion profiles and binds their real
+/// ordered conversion overload. The original scalar policy remains separate.
 ///
 /// RWM-7 retires COW vocabulary and freezes explicit writer W/T declarations,
 /// projected writer values and selected-assignment construction in the package
