@@ -392,5 +392,4 @@ pub(super) fn evaluate_round<'a>(
 }
 
 #[cfg(test)]
-#[path = "round_tests.rs"]
 mod tests;

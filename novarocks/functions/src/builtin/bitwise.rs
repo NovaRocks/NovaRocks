@@ -308,9 +308,4 @@ fn output_capacity(rows: usize, width: usize) -> Result<(), KernelFailure> {
 }
 
 #[cfg(test)]
-#[path = "bitwise_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "bitwise_shared_core_tests.rs"]
-mod shared_core_tests;

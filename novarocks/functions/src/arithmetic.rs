@@ -22,11 +22,8 @@
 use arrow_array::{Array, Int8Array, Int16Array, Int32Array, Int64Array};
 use arrow_buffer::i256;
 use arrow_schema::DataType;
-#[path = "arithmetic_decimal.rs"]
 mod decimal;
-#[path = "arithmetic_float.rs"]
 mod float;
-#[path = "arithmetic_largeint.rs"]
 mod largeint;
 use novarocks_type_contract::{
     ArithmeticOperator, CompileCheckpoints, CompileControlError, CompilePhase,
@@ -677,5 +674,4 @@ pub(crate) fn checked_row(
 }
 
 #[cfg(test)]
-#[path = "arithmetic_tests.rs"]
 mod tests;

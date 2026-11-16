@@ -656,9 +656,6 @@ fn inlist_own_effects(
         },
     )
 }
-#[cfg(test)]
-#[path = "native_inlist_tests.rs"]
-mod tests;
 
 #[derive(Debug)]
 enum InOperationFailure {
@@ -704,3 +701,6 @@ pub fn arrow_failure(source: arrow_schema::ArrowError) -> KernelFailure {
     KernelFailure::from_domain(InOperationFailure::Arrow(source))
 }
 impl novarocks_failure_contract::OuterFailureProjection for InOperationFailure {}
+
+#[cfg(test)]
+mod tests;
