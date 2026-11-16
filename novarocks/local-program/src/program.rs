@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, FieldRef};
@@ -481,10 +481,42 @@ pub struct StaticWriterProjection {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SortTopNType {
+pub enum PartitionRank {
+    /// Keep the first K rows; ties follow arrival order.
     RowNumber,
+    /// Keep every row whose SQL RANK is at most K, including boundary ties.
     Rank,
+    /// Keep the first K distinct peer groups, including every tied row.
     DenseRank,
+}
+
+/// Closed local ordering operations. Only row-count TopN carries an offset.
+#[derive(Clone, Debug)]
+pub enum LocalSortMode {
+    Full,
+    Partitioned {
+        partition_by: Vec<SortExpression>,
+    },
+    RowsTopN {
+        limit: usize,
+        offset: usize,
+    },
+    PartitionTopN {
+        partition_by: Vec<SortExpression>,
+        limit: NonZeroUsize,
+        rank: PartitionRank,
+    },
+}
+
+impl LocalSortMode {
+    pub fn partition_by(&self) -> &[SortExpression] {
+        match self {
+            Self::Partitioned { partition_by } | Self::PartitionTopN { partition_by, .. } => {
+                partition_by
+            }
+            Self::Full | Self::RowsTopN { .. } => &[],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -680,15 +712,8 @@ pub enum ProgramNodeKind {
     },
     Sort {
         input: ProgramNodeId,
-        use_top_n: bool,
         order_by: Vec<SortExpression>,
-        limit: Option<usize>,
-        offset: usize,
-        topn_type: SortTopNType,
-        max_buffered_rows: Option<usize>,
-        max_buffered_bytes: Option<usize>,
-        partition_exprs: Vec<SortExpression>,
-        partition_limit: Option<usize>,
+        mode: LocalSortMode,
     },
     TableFunction {
         input: ProgramNodeId,
@@ -934,12 +959,8 @@ impl ProgramNodeKind {
                 }
             }
             Self::PositionShard { .. } | Self::WriteLayoutKey { .. } => {}
-            Self::Sort {
-                order_by,
-                partition_exprs,
-                ..
-            } => {
-                for sort in order_by.iter().chain(partition_exprs) {
+            Self::Sort { order_by, mode, .. } => {
+                for sort in order_by.iter().chain(mode.partition_by()) {
                     visit(Some(sort.expr))?;
                 }
             }
@@ -2223,11 +2244,16 @@ fn validate_shape(
         ProgramNodeKind::SetOp { inputs, .. } if inputs.len() < 2 => {
             return Err(LocalProgramError::InvalidNodeShape.into());
         }
-        ProgramNodeKind::Sort {
-            order_by,
-            partition_exprs,
-            ..
-        } if order_by.is_empty() && partition_exprs.is_empty() => {
+        ProgramNodeKind::Sort { order_by, mode, .. }
+            if match mode {
+                LocalSortMode::Full => order_by.is_empty(),
+                LocalSortMode::RowsTopN { limit, offset } => {
+                    order_by.is_empty() || offset.checked_add(*limit).is_none()
+                }
+                LocalSortMode::Partitioned { partition_by }
+                | LocalSortMode::PartitionTopN { partition_by, .. } => partition_by.is_empty(),
+            } =>
+        {
             return Err(LocalProgramError::InvalidNodeShape.into());
         }
         ProgramNodeKind::TableFunction { function_name, .. } if function_name.is_empty() => {
@@ -2628,8 +2654,7 @@ mod tests {
 
     #[test]
     fn partition_only_sort_requires_a_valid_partition_expression() {
-        let make_program = |partition_exprs: Vec<SortExpression>| {
-            let partition_limit = (!partition_exprs.is_empty()).then_some(2);
+        let make_program = |partition_exprs: Vec<SortExpression>, topn: bool| {
             let (values, layout) = values();
             let expressions = Arc::new(
                 ImmutableExpressions::try_new(
@@ -2651,15 +2676,18 @@ mod tests {
                         2,
                         ProgramNodeKind::Sort {
                             input: ProgramNodeId::new(0),
-                            use_top_n: partition_limit.is_some(),
                             order_by: vec![],
-                            limit: None,
-                            offset: 0,
-                            topn_type: SortTopNType::RowNumber,
-                            max_buffered_rows: None,
-                            max_buffered_bytes: None,
-                            partition_exprs,
-                            partition_limit,
+                            mode: if topn {
+                                LocalSortMode::PartitionTopN {
+                                    partition_by: partition_exprs,
+                                    limit: NonZeroUsize::new(2).unwrap(),
+                                    rank: PartitionRank::RowNumber,
+                                }
+                            } else {
+                                LocalSortMode::Partitioned {
+                                    partition_by: partition_exprs,
+                                }
+                            },
                         },
                         layout.clone(),
                     ),
@@ -2676,15 +2704,17 @@ mod tests {
             asc: true,
             nulls_first: true,
         };
-        assert!(make_program(vec![partition(0)]).is_ok());
-        assert!(matches!(
-            make_program(vec![]),
-            Err(LocalProgramError::InvalidNodeShape)
-        ));
-        assert!(matches!(
-            make_program(vec![partition(1)]),
-            Err(LocalProgramError::InvalidExpression)
-        ));
+        for topn in [false, true] {
+            assert!(make_program(vec![partition(0)], topn).is_ok());
+            assert!(matches!(
+                make_program(vec![], topn),
+                Err(LocalProgramError::InvalidNodeShape)
+            ));
+            assert!(matches!(
+                make_program(vec![partition(1)], topn),
+                Err(LocalProgramError::InvalidExpression)
+            ));
+        }
     }
 
     #[test]

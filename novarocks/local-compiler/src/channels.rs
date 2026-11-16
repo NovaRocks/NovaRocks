@@ -549,7 +549,8 @@ fn resolve_core_with_creation<H>(
             NodeKind::Sort {
                 mode:
                     novarocks_physical_plan::SortMode::Global
-                    | novarocks_physical_plan::SortMode::Analytic { .. },
+                    | novarocks_physical_plan::SortMode::Analytic { .. }
+                    | novarocks_physical_plan::SortMode::PartitionTopN { .. },
                 ..
             } => passthrough(fragment, node, &nodes, &ports, work)?,
             // A window passes its input occurrences through on their own

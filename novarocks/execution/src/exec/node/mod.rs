@@ -19,7 +19,6 @@ pub mod join;
 pub mod nljoin;
 pub mod scan;
 pub mod set_op;
-pub mod sort;
 pub mod table_finish;
 pub mod table_function;
 pub mod table_write_aggregate;

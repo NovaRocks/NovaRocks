@@ -174,13 +174,12 @@ fn compiled_global_sort_orders_by_every_key_direction_and_null_placement() {
     let keys = [A_DESC_NULLS_FIRST, B_DESC];
     let program = program(&keys, Shape::Sort);
     let ProgramNodeKind::Sort {
-        use_top_n, limit, ..
+        mode: novarocks_local_program::LocalSortMode::Full,
+        ..
     } = program.graph().nodes()[1].kind()
     else {
         panic!("the compiler emits a local Sort");
     };
-    assert!(!use_top_n);
-    assert_eq!(*limit, None);
     let rows = int64_rows(&run(&program));
     assert_eq!(rows, oracle(&ROWS, &keys, None, 0));
     // Spot-check the independent oracle itself: NULLs first, then 3, 3 with
@@ -211,15 +210,13 @@ fn compiled_single_topn_returns_the_exact_offset_window() {
         },
     );
     let ProgramNodeKind::Sort {
-        use_top_n,
-        limit,
-        offset,
+        mode: novarocks_local_program::LocalSortMode::RowsTopN { limit, offset },
         ..
     } = program.graph().nodes()[1].kind()
     else {
         panic!("the compiler lowers Single TopN into the local Sort owner");
     };
-    assert_eq!((*use_top_n, *limit, *offset), (true, Some(3), 2));
+    assert_eq!((*limit, *offset), (3, 2));
     let rows = int64_rows(&run(&program));
     assert_eq!(rows, oracle(&ROWS, &keys, Some(3), 2));
     assert_eq!(rows.len(), 3);
@@ -428,15 +425,13 @@ fn partial_topn_runs_as_its_instance_prefix() {
     let program = try_compile(package(builder, topn, ConstantPools::empty(), 1), 1)
         .unwrap_or_else(|error| panic!("a row-count partial TopN compiles: {error}"));
     let ProgramNodeKind::Sort {
-        use_top_n,
-        limit,
-        offset,
+        mode: novarocks_local_program::LocalSortMode::RowsTopN { limit, offset },
         ..
     } = program.graph().nodes()[1].kind()
     else {
         panic!("the compiler lowers a partial TopN into the local Sort owner");
     };
-    assert_eq!((*use_top_n, *limit, *offset), (true, Some(3), 0));
+    assert_eq!((*limit, *offset), (3, 0));
     let rows = int64_rows(&run(&program));
     assert_eq!(rows, oracle(&ROWS, &[A_ASC_NULLS_FIRST], Some(3), 0));
 }

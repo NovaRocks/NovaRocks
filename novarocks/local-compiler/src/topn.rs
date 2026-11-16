@@ -38,7 +38,7 @@
 
 use crate::{lowering::FragmentCompileError, sort::lower_sort_keys};
 use novarocks_local_program::{
-    ProgramExprId, ProgramNodeId, ProgramNodeKind, SortTopNType, StaticLayout,
+    LocalSortMode, ProgramExprId, ProgramNodeId, ProgramNodeKind, StaticLayout,
 };
 use novarocks_physical_plan::{ExprId, NodeKind, PhysicalNode, TopNPhase, TopNReduction};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
@@ -74,10 +74,9 @@ fn lower_core(
         reduction: TopNReduction::Rows,
     } = &node.kind
     else {
-        return Err(FragmentCompileError::Unsupported {
-            node: Some(node.id),
-            feature: "grouped-state TopN",
-        });
+        return Err(FragmentCompileError::Invalid(
+            "row-count TopN physical kind differs",
+        ));
     };
     // A partial prefix is cut before global completion, so an offset there
     // would drop rows the final window may need.
@@ -108,24 +107,39 @@ fn lower_core(
         "TopN limit and offset exceed host range",
     ))?;
     let keys = lower_sort_keys(order_by, expressions, work)?;
-    // These are the original ordinary row-count TopN fields for every phase.
-    // No buffering cap, partition rank semantics or task parallelism is
-    // authored here; the phase stays a checked physical fact.
     Ok((
         ProgramNodeKind::Sort {
             input,
-            use_top_n: true,
             order_by: keys,
-            limit: Some(limit),
-            offset,
-            topn_type: SortTopNType::RowNumber,
-            max_buffered_rows: None,
-            max_buffered_bytes: None,
-            partition_exprs: Vec::new(),
-            partition_limit: None,
+            mode: LocalSortMode::RowsTopN { limit, offset },
         },
         layout.clone(),
     ))
+}
+
+/// Admission and lowering share the frozen GroupedStates shape check.
+pub(crate) fn admit_grouped_topn_shape(node: &PhysicalNode) -> Result<(), FragmentCompileError> {
+    let NodeKind::TopN {
+        reduction: TopNReduction::GroupedStates { group_by, .. },
+        phase,
+        offset,
+        ..
+    } = &node.kind
+    else {
+        return Err(FragmentCompileError::Invalid(
+            "GroupedTopN physical kind differs",
+        ));
+    };
+    if *offset != 0
+        || !matches!(phase, TopNPhase::Partial { .. })
+        || group_by.is_empty()
+        || node.inputs.len() != 1
+    {
+        return Err(FragmentCompileError::Invalid(
+            "GroupedTopN requires complete keys and a partial zero-offset input",
+        ));
+    }
+    Ok(())
 }
 
 /// Lower a grouped reduction through the original aggregate call/layout leaves.
@@ -149,24 +163,14 @@ pub(crate) fn lower_grouped_topn_with_creation<H>(
                 },
             order_by,
             limit,
-            offset,
-            phase,
+            ..
         } = &node.kind
         else {
             return Err(
                 (FragmentCompileError::Invalid("GroupedTopN physical kind differs")).into(),
             );
         };
-        if *offset != 0
-            || !matches!(phase, TopNPhase::Partial { .. })
-            || group_by.is_empty()
-            || node.inputs.len() != 1
-        {
-            return Err((FragmentCompileError::Invalid(
-                "GroupedTopN requires complete keys and a partial zero-offset input",
-            ))
-            .into());
-        }
+        admit_grouped_topn_shape(node)?;
         let width = group_by
             .len()
             .checked_add(calls.len())

@@ -17,14 +17,10 @@
 
 //! Compiled global and analytic Sort and ordinary row-count TopN.
 //!
-//! The local compiler emits exactly three shapes of the local Sort
-//! vocabulary: a global sort (`use_top_n = false`, no limit, offset 0), an
-//! analytic sort (the same with partition keys and no partition limit) and an
-//! ordinary row-count TopN (`use_top_n = true`, `limit`, `offset`, RowNumber,
-//! no partition keys). None has a buffering cap. An analytic sort orders by
-//! its partition keys first, each with its own direction and NULL placement,
-//! and then by its order keys; it emits every row, so its partitions arrive
-//! contiguously. Every other Sort shape is an explicit refusal here.
+//! LocalProgram carries a closed ordering mode. Full and partitioned sorts
+//! emit the complete relation; row-count TopN emits its exact offset window.
+//! Partition TopN uses the same partition/order roots and is completed by the
+//! rank-retention implementation.
 //!
 //! The TopN shape serves every phase of a `Rows` reduction alike, because
 //! each is the window of its own instance input. Single and Final read the
@@ -58,8 +54,8 @@ use std::sync::Arc;
 use arrow::array::ArrayRef;
 use arrow::compute::{SortColumn, SortOptions};
 use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind, SortTopNType,
+    LocalProgram, LocalSortMode, ProgramExpressionRootSite, ProgramNodeExpressionRole,
+    ProgramNodeId, ProgramNodeKind,
 };
 
 use super::compiled_expression::{
@@ -110,77 +106,40 @@ impl CompiledSortProcessorFactory {
                 format!("compiled Sort node {} is absent", node.index()),
             )
         })?;
-        let ProgramNodeKind::Sort {
-            use_top_n,
-            order_by,
-            limit,
-            offset,
-            topn_type,
-            max_buffered_rows,
-            max_buffered_bytes,
-            partition_exprs,
-            partition_limit,
-            ..
-        } = graph_node.kind()
-        else {
+        let ProgramNodeKind::Sort { order_by, mode, .. } = graph_node.kind() else {
             return Err(program_binding_failure(
                 PlanBindingKind::InvalidAssignment,
                 format!("compiled local node {} is not a Sort", node.index()),
             ));
         };
         let at = node.index();
-        if partition_limit.is_some() {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                format!(
-                    "compiled Sort at local node {at} with a partition limit is not executable"
-                ),
-            ));
-        }
-        if *use_top_n && !partition_exprs.is_empty() {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                format!("compiled TopN at local node {at} with partition keys is not executable"),
-            ));
-        }
-        if *topn_type != SortTopNType::RowNumber {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                format!(
-                    "compiled TopN at local node {at} with {topn_type:?} ranking is not executable"
-                ),
-            ));
-        }
-        if max_buffered_rows.is_some() || max_buffered_bytes.is_some() {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                format!(
-                    "compiled Sort at local node {at} carries a buffering cap the compiler never authors"
-                ),
-            ));
-        }
+        let partition_exprs = mode.partition_by();
+        let (limit, offset) = match mode {
+            LocalSortMode::Full | LocalSortMode::Partitioned { .. } => (None, 0),
+            LocalSortMode::RowsTopN { limit, offset } => (Some(*limit), *offset),
+            LocalSortMode::PartitionTopN { .. } => {
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format!("compiled partition TopN at local node {at} requires rank retention"),
+                ));
+            }
+        };
         if order_by.is_empty() && partition_exprs.is_empty() {
             return Err(program_binding_failure(
                 PlanBindingKind::InvalidAssignment,
                 format!("compiled Sort at local node {at} has no ordering key"),
             ));
         }
-        let keep = if *use_top_n {
-            let limit = limit.ok_or_else(|| {
-                program_binding_failure(
-                    PlanBindingKind::MissingAssignment,
-                    format!("compiled TopN at local node {at} has no row limit"),
-                )
-            })?;
-            Some(offset.checked_add(limit).ok_or_else(|| {
-                program_binding_failure(
-                    PlanBindingKind::MissingAssignment,
-                    format!("compiled TopN at local node {at} limit and offset overflow"),
-                )
-            })?)
-        } else {
-            None
-        };
+        let keep = limit
+            .map(|limit| {
+                offset.checked_add(limit).ok_or_else(|| {
+                    program_binding_failure(
+                        PlanBindingKind::InvalidAssignment,
+                        format!("compiled TopN at local node {at} limit and offset overflow"),
+                    )
+                })
+            })
+            .transpose()?;
         let mut sites = Vec::with_capacity(partition_exprs.len() + order_by.len());
         let mut options = Vec::with_capacity(partition_exprs.len() + order_by.len());
         // Partition keys lead, then the order keys within each partition.
@@ -214,8 +173,7 @@ impl CompiledSortProcessorFactory {
         let prune_rows = keep.map_or(usize::MAX, |keep| {
             keep.saturating_mul(PRUNE_FACTOR).max(PRUNE_MIN_ROWS)
         });
-        let (limit, offset) = (*limit, *offset);
-        let name = if *use_top_n {
+        let name = if keep.is_some() {
             format!("COMPILED_TOP_N (node={at})")
         } else {
             format!("COMPILED_SORT (node={at})")
