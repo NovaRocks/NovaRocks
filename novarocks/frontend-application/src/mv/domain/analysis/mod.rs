@@ -163,7 +163,7 @@ fn validate_mv_select_raw_query_clauses(query: &Query) -> Result<(), String> {
 fn validate_mv_query_modifiers(
     modifiers: &novarocks_parser::ast::QueryModifiers,
 ) -> Result<(), String> {
-    if !modifiers.order_by.is_empty() {
+    if modifiers.order_by.is_some() {
         return Err(unsupported_mv_query_clause("ORDER BY"));
     }
     if modifiers.limit.is_some() || modifiers.offset.is_some() {

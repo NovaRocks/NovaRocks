@@ -2769,9 +2769,7 @@ impl CompletionRetainedBytes {
         for property in &query.session_properties {
             self.add_vec_capacity::<Ident>(property.name.parts.capacity());
         }
-        self.add_vec_capacity::<novarocks_parser::ast::OrderByExpr>(
-            query.modifiers.order_by.capacity(),
-        );
+        self.add_order_by_containers(&query.modifiers.order_by);
         if let Some(with) = &query.with {
             self.add_vec_capacity::<novarocks_parser::ast::Cte>(with.ctes.capacity());
             for cte in &with.ctes {
@@ -2807,9 +2805,7 @@ impl CompletionRetainedBytes {
     }
 
     fn add_select_containers(&mut self, select: &Select) {
-        self.add_vec_capacity::<novarocks_parser::ast::OrderByExpr>(
-            select.modifiers.order_by.capacity(),
-        );
+        self.add_order_by_containers(&select.modifiers.order_by);
         self.add(std::mem::size_of::<Select>());
         if let SelectQuantifier::Distinct { on, .. } = &select.quantifier {
             self.add_vec_capacity::<Expr>(on.capacity());
@@ -2874,10 +2870,16 @@ impl CompletionRetainedBytes {
         }
     }
 
+    fn add_order_by_containers(&mut self, order_by: &Option<novarocks_parser::ast::OrderBy>) {
+        if let Some(order_by) = order_by {
+            self.add_vec_capacity::<novarocks_parser::ast::SortItem>(order_by.items.capacity());
+        }
+    }
+
     fn add_window_spec_containers(&mut self, window: &WindowSpec) {
         self.add(std::mem::size_of::<WindowSpec>());
         self.add_vec_capacity::<Expr>(window.partition_by.capacity());
-        self.add_vec_capacity::<novarocks_parser::ast::OrderByExpr>(window.order_by.capacity());
+        self.add_order_by_containers(&window.order_by);
     }
 
     fn finish(self) -> Result<u64, SqlCompileError> {
@@ -3227,7 +3229,7 @@ impl Visit for CompletionRetainedBytes {
     fn visit_function_call(&mut self, call: &FunctionCall) {
         self.add(std::mem::size_of::<FunctionCall>());
         self.add_vec_capacity::<Expr>(call.arguments.capacity());
-        self.add_vec_capacity::<novarocks_parser::ast::FunctionOrderBy>(call.order_by.capacity());
+        self.add_order_by_containers(&call.order_by);
         if let Some(over) = &call.over {
             self.add_window_spec_containers(over);
         }
@@ -3898,12 +3900,18 @@ mod tests {
     fn completion_accounting_charges_spare_ast_vector_capacity() {
         const COMPLETION_LIMIT: usize = 32 * 1024 * 1024;
         let mut query = test_query("select 1");
-        let item_size = std::mem::size_of::<novarocks_parser::ast::OrderByExpr>();
+        let item_size = std::mem::size_of::<novarocks_parser::ast::SortItem>();
         let capacity = COMPLETION_LIMIT / item_size + 1;
         let SetExpr::Select(select) = query.body.as_mut() else {
             panic!("SELECT")
         };
-        select.modifiers.order_by = Vec::with_capacity(capacity);
+        let mut items = Vec::with_capacity(capacity);
+        items.push(novarocks_parser::build::sort_item(
+            novarocks_parser::build::number("1").unwrap(),
+            novarocks_parser::ast::SortOrdering::Ascending,
+            novarocks_parser::ast::NullOrdering::Undefined,
+        ));
+        select.modifiers.order_by = Some(novarocks_parser::build::order_by(items).unwrap());
         let definition = SqlMvRewriteDefinitionFacts::try_new(
             1,
             [11; 32],

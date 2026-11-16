@@ -37,7 +37,7 @@ fn call(name: &str, argument: &str, span: Span) -> ast::Expr {
         },
         arguments: vec![column(argument, span)],
         quantifier: ast::FunctionQuantifier::None,
-        order_by: Vec::new(),
+        order_by: None,
         separator: None,
         filter: None,
         null_treatment: None,

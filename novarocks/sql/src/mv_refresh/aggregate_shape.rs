@@ -236,7 +236,7 @@ fn classify_aggregate_call(
         || function.null_treatment.is_some()
         || function.over.is_some()
         || function.filter.is_some()
-        || !function.order_by.is_empty()
+        || function.order_by.is_some()
     {
         return Err(aggregate_error());
     }

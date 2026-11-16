@@ -17,3 +17,7 @@
 
 mod coverage;
 mod lexer;
+
+mod build;
+mod order_by;
+mod validation;

@@ -39,6 +39,7 @@ pub enum BuildError {
     EmptyCase,
     EmptyTuple,
     EmptyInList,
+    EmptyOrderBy,
     EmptyUnion,
     EmptyWildcardPrefix,
     Number(ParserError),
@@ -55,6 +56,9 @@ impl fmt::Display for BuildError {
             Self::EmptyTuple => formatter.write_str("tuple must contain at least one expression"),
             Self::EmptyInList => {
                 formatter.write_str("IN list must contain at least one expression")
+            }
+            Self::EmptyOrderBy => {
+                formatter.write_str("ORDER BY must contain at least one sort item")
             }
             Self::EmptyUnion => formatter.write_str("UNION ALL must contain at least one operand"),
             Self::EmptyWildcardPrefix => {
@@ -410,7 +414,7 @@ pub fn function(name: ObjectName, arguments: Vec<Expr>) -> Expr {
         name,
         arguments,
         quantifier: FunctionQuantifier::None,
-        order_by: Vec::new(),
+        order_by: None,
         separator: None,
         filter: None,
         null_treatment: None,
@@ -679,4 +683,26 @@ pub fn map(entries: Vec<(Expr, Expr)>) -> Expr {
 
 fn cover(spans: impl IntoIterator<Item = Span>) -> Span {
     spans.into_iter().fold(SYNTHETIC, Span::cover)
+}
+
+/// Builds one sort item while retaining its original key expression.
+pub fn sort_item(sort_key: Expr, ordering: SortOrdering, null_ordering: NullOrdering) -> SortItem {
+    let span = sort_key.span();
+    SortItem {
+        sort_key,
+        ordering,
+        null_ordering,
+        span,
+    }
+}
+
+/// Builds an authored ORDER BY node without claiming an original keyword span.
+pub fn order_by(items: Vec<SortItem>) -> Result<OrderBy, BuildError> {
+    if items.is_empty() {
+        return Err(BuildError::EmptyOrderBy);
+    }
+    Ok(OrderBy {
+        items: items.into(),
+        span: SYNTHETIC,
+    })
 }

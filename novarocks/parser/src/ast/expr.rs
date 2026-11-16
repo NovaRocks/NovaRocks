@@ -17,7 +17,7 @@
 
 use crate::{
     Span,
-    ast::{AstBox, AstVec, Ident, Literal, ObjectName, Query, window::WindowSpec},
+    ast::{AstBox, AstVec, Ident, Literal, ObjectName, OrderBy, Query, window::WindowSpec},
 };
 
 /// A SQL expression with source spans retained at every syntax node.
@@ -102,7 +102,7 @@ pub struct FunctionCall {
     pub name: ObjectName,
     pub arguments: Vec<Expr>,
     pub quantifier: FunctionQuantifier,
-    pub order_by: Vec<FunctionOrderBy>,
+    pub order_by: Option<OrderBy>,
     pub separator: Option<Box<Expr>>,
     pub filter: Option<Box<Expr>>,
     pub null_treatment: Option<NullTreatment>,
@@ -117,14 +117,6 @@ pub enum FunctionQuantifier {
     None,
     Distinct,
     All,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FunctionOrderBy {
-    pub expr: Expr,
-    pub asc: Option<bool>,
-    pub nulls_first: Option<bool>,
-    pub span: Span,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

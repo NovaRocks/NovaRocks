@@ -796,3 +796,187 @@ fn dereference_borrows_its_original_interior_constant_before_name_resolution() {
     );
     assert_eq!(actual.value_type(), &ty);
 }
+
+#[test]
+fn order_key_loans_keep_their_exact_owner_field_ordinal_and_null_rules() {
+    use SqlConstantExpressionSite as Site;
+    use SqlConstantExpressionStep as Edge;
+    use arrow::array::{Array, Int32Array};
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_functions::ConstantPool;
+    let control = SqlCompileControl::unbounded();
+    let policy = crate::constant::test_constant_policy();
+    let ty = FunctionValueType::new(DataType::Int32, false);
+    let field = Arc::new(
+        Field::new("original_order_key", DataType::Int32, false).with_metadata(
+            std::collections::HashMap::from([(
+                "provider.unknown".to_string(),
+                "full-field".to_string(),
+            )]),
+        ),
+    );
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        Int32Array::from(vec![7, 11]).to_data(),
+        policy,
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let retained = pool.value(1).unwrap();
+    let functions = build_builtin_engine_function_catalog().unwrap();
+    let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+    for (sql, site, path, ascending, nulls_first) in [
+        (
+            "SELECT 1 UNION ALL SELECT 2 ORDER BY only_original_sort DESC",
+            Site::QueryOrderByKey { index: 0 },
+            Vec::new(),
+            false,
+            false,
+        ),
+        (
+            "SELECT 1 ORDER BY only_original_sort",
+            Site::SelectOrderByKey { index: 0 },
+            Vec::new(),
+            true,
+            true,
+        ),
+        (
+            "SELECT array_agg(1 ORDER BY only_original_sort ASC NULLS LAST)",
+            Site::SelectProjection { column: 0 },
+            vec![Edge::FunctionOrderByKey(0)],
+            true,
+            false,
+        ),
+        (
+            "SELECT row_number() OVER (ORDER BY only_original_sort DESC NULLS FIRST)",
+            Site::SelectProjection { column: 0 },
+            vec![Edge::WindowOrderByKey(0)],
+            false,
+            true,
+        ),
+    ] {
+        let query = query(sql);
+        let constant = |site, path| {
+            SqlExpressionConstant::new(Vec::new(), site, retained.clone())
+                .with_expression_path(path)
+        };
+        let source = MaterializedValues::try_new_expressions(
+            &query,
+            vec![constant(site, path.clone())].into(),
+            &control,
+        )
+        .unwrap();
+        let mut work =
+            novarocks_type_contract::CompileCheckpoints::try_new(&control, CompilePhase::Validate)
+                .unwrap();
+        let key = resolve_expression_site(&query, &[], site, &path, false, &mut work).unwrap();
+        work.finish().unwrap();
+        let owned = source.loan(&query, &control).unwrap();
+        let loan = owned.view();
+        let actual = loan.constant_at(key).unwrap();
+        assert_eq!(actual.ordinal(), 1, "{sql}");
+        assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+        assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+        assert_eq!(actual.field(), field.as_ref());
+        assert_eq!(actual.value_type(), &ty);
+        assert_eq!(
+            actual
+                .field()
+                .metadata()
+                .get("provider.unknown")
+                .map(String::as_str),
+            Some("full-field")
+        );
+        assert!(loan.constant_at(&key.clone()).is_none());
+        let (bad_site, bad_path) = match site {
+            Site::QueryOrderByKey { .. } => (Site::QueryOrderByKey { index: 1 }, Vec::new()),
+            Site::SelectOrderByKey { .. } => (Site::SelectOrderByKey { index: 1 }, Vec::new()),
+            _ => (
+                site,
+                vec![match path[0] {
+                    Edge::FunctionOrderByKey(_) => Edge::FunctionOrderByKey(1),
+                    Edge::WindowOrderByKey(_) => Edge::WindowOrderByKey(1),
+                    _ => unreachable!("only ORDER BY paths"),
+                }],
+            ),
+        };
+        assert!(
+            MaterializedValues::try_new_expressions(
+                &query,
+                vec![constant(bad_site, bad_path)].into(),
+                &control,
+            )
+            .is_err()
+        );
+        let (wrong_site, wrong_path) = match site {
+            Site::QueryOrderByKey { .. } => (Site::SelectOrderByKey { index: 0 }, Vec::new()),
+            Site::SelectOrderByKey { .. } => (Site::QueryOrderByKey { index: 0 }, Vec::new()),
+            _ => (
+                site,
+                vec![match path[0] {
+                    Edge::FunctionOrderByKey(_) => Edge::WindowOrderByKey(0),
+                    Edge::WindowOrderByKey(_) => Edge::FunctionOrderByKey(0),
+                    _ => unreachable!("only ORDER BY paths"),
+                }],
+            ),
+        };
+        assert!(
+            MaterializedValues::try_new_expressions(
+                &query,
+                vec![constant(wrong_site, wrong_path)].into(),
+                &control,
+            )
+            .is_err()
+        );
+        if matches!(site, Site::QueryOrderByKey { .. }) {
+            // A set operand cannot borrow the enclosing Query's sort key.
+            let wrong_owner = SqlExpressionConstant::new(
+                vec![SqlConstantQueryStep::SetOperand { index: 0 }],
+                site,
+                retained.clone(),
+            );
+            assert!(MaterializedValues::try_new_expressions(
+                &query, vec![wrong_owner].into(), &control,
+            ).is_err());
+        }
+        let (resolved, _, _) = crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
+            &query,
+            &catalog,
+            "db",
+            &functions,
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            policy,
+            &control,
+            Some(&source),
+        )
+        .unwrap();
+        let sort = if let Some(sort) = resolved.order_by.first() {
+            sort
+        } else {
+            let crate::analysis::QueryBody::Select(select) = &resolved.body else {
+                panic!("select");
+            };
+            match &select.projection[0].expr.kind {
+                crate::analysis::ExprKind::AggregateCall { order_by, .. }
+                | crate::analysis::ExprKind::WindowCall { order_by, .. } => &order_by[0],
+                _ => panic!("ordered call"),
+            }
+        };
+        assert_eq!(
+            (sort.asc, sort.nulls_first),
+            (ascending, nulls_first),
+            "{sql}"
+        );
+        assert_eq!(sort.expr.value_type, ty);
+        let crate::analysis::ExprKind::Constant(actual) = &sort.expr.kind else {
+            panic!("original key constant");
+        };
+        assert_eq!(actual.ordinal(), 1);
+        assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+        assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+        assert_eq!(actual.field(), field.as_ref());
+        assert_eq!(actual.value_type(), &ty);
+    }
+}

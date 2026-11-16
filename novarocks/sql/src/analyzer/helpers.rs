@@ -1434,9 +1434,9 @@ fn format_function_display_name(function: &ast::FunctionCall) -> String {
         out.push_str("DISTINCT ");
     }
     out.push_str(&arguments);
-    if !function.order_by.is_empty() {
-        let visible = function
-            .order_by
+    if let Some(order_by) = &function.order_by {
+        let visible = order_by
+            .items
             .iter()
             .filter(|item| !is_constant_function_order_by(item, order_arguments))
             .map(|item| format_function_order_by(item, order_arguments))
@@ -1585,10 +1585,10 @@ fn format_map_display_name(function: &ast::FunctionCall) -> String {
     format!("map{{{}}}", pairs.join(","))
 }
 
-fn is_constant_function_order_by(order_by: &ast::FunctionOrderBy, arguments: &[ast::Expr]) -> bool {
-    ordinal_function_argument(&order_by.expr, arguments)
+fn is_constant_function_order_by(order_by: &ast::SortItem, arguments: &[ast::Expr]) -> bool {
+    ordinal_function_argument(&order_by.sort_key, arguments)
         .map(is_constant_expr)
-        .unwrap_or_else(|| is_constant_expr(&order_by.expr))
+        .unwrap_or_else(|| is_constant_expr(&order_by.sort_key))
 }
 
 fn ordinal_function_argument<'a>(
@@ -1618,11 +1618,31 @@ fn is_constant_expr(expr: &ast::Expr) -> bool {
     }
 }
 
-fn format_function_order_by(order_by: &ast::FunctionOrderBy, arguments: &[ast::Expr]) -> String {
-    let expression = ordinal_function_argument(&order_by.expr, arguments)
+fn format_function_order_by(order_by: &ast::SortItem, arguments: &[ast::Expr]) -> String {
+    let expression = ordinal_function_argument(&order_by.sort_key, arguments)
         .map(expr_display_name_preserve_path)
-        .unwrap_or_else(|| expr_display_name(&order_by.expr));
-    format_order_by_display_name(expression, order_by.asc, order_by.nulls_first)
+        .unwrap_or_else(|| expr_display_name(&order_by.sort_key));
+    format_order_by_display_name(
+        expression,
+        Some(matches!(order_by.ordering, ast::SortOrdering::Ascending)),
+        sort_item_explicit_nulls(order_by),
+    )
+}
+
+/// Freeze execution flags using the original NULL placement rule. Undefined
+/// remains an AST fact; this conversion does not rewrite it to a default enum.
+pub(super) fn sort_item_flags(item: &ast::SortItem) -> (bool, bool) {
+    let ascending = matches!(item.ordering, ast::SortOrdering::Ascending);
+    let nulls_first = sort_item_explicit_nulls(item).unwrap_or(ascending);
+    (ascending, nulls_first)
+}
+
+fn sort_item_explicit_nulls(item: &ast::SortItem) -> Option<bool> {
+    match item.null_ordering {
+        ast::NullOrdering::First => Some(true),
+        ast::NullOrdering::Last => Some(false),
+        ast::NullOrdering::Undefined => None,
+    }
 }
 
 fn format_order_by_display_name(
@@ -1660,16 +1680,17 @@ fn format_window_display_name(over: &ast::WindowSpec) -> String {
                 .join(", ")
         ));
     }
-    if !over.order_by.is_empty() {
+    if let Some(order_by) = &over.order_by {
         parts.push(format!(
             "ORDER BY {}",
-            over.order_by
+            order_by
+                .items
                 .iter()
                 .map(|order_by| {
                     format_order_by_display_name(
-                        expr_display_name(&order_by.expr),
-                        order_by.asc,
-                        order_by.nulls_first,
+                        expr_display_name(&order_by.sort_key),
+                        Some(matches!(order_by.ordering, ast::SortOrdering::Ascending)),
+                        sort_item_explicit_nulls(order_by),
                     )
                 })
                 .collect::<Vec<_>>()

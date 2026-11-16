@@ -75,7 +75,7 @@ impl SyntaxEq for Query {
 
 impl SyntaxEq for QueryModifiers {
     fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_slice(&self.order_by, &other.order_by)
+        syntax_eq_option(&self.order_by, &other.order_by)
             && syntax_eq_option(&self.limit, &other.limit)
             && syntax_eq_option(&self.offset, &other.offset)
             && self.limit_comma_offset == other.limit_comma_offset
@@ -255,11 +255,19 @@ impl SyntaxEq for GroupBy {
     }
 }
 
-impl SyntaxEq for OrderByExpr {
+impl SyntaxEq for OrderBy {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.expr.syntax_eq(&other.expr)
-            && self.asc == other.asc
-            && self.nulls_first == other.nulls_first
+        syntax_eq_slice(&self.items, &other.items)
+    }
+}
+
+impl SyntaxEq for SortItem {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.sort_key.syntax_eq(&other.sort_key)
+            && self.ordering == other.ordering
+            && self.null_ordering == other.null_ordering
     }
 }
 
@@ -447,7 +455,7 @@ impl SyntaxEq for WindowSpec {
     fn syntax_eq(&self, other: &Self) -> bool {
         syntax_eq_option(&self.existing_window_name, &other.existing_window_name)
             && syntax_eq_slice(&self.partition_by, &other.partition_by)
-            && syntax_eq_slice(&self.order_by, &other.order_by)
+            && syntax_eq_option(&self.order_by, &other.order_by)
             && syntax_eq_option(&self.window_frame, &other.window_frame)
     }
 }
@@ -521,20 +529,12 @@ impl SyntaxEq for FunctionCall {
         self.name.syntax_eq(&other.name)
             && syntax_eq_slice(&self.arguments, &other.arguments)
             && self.quantifier == other.quantifier
-            && syntax_eq_slice(&self.order_by, &other.order_by)
+            && syntax_eq_option(&self.order_by, &other.order_by)
             && syntax_eq_option(&self.separator, &other.separator)
             && syntax_eq_option(&self.filter, &other.filter)
             && self.null_treatment == other.null_treatment
             && syntax_eq_option(&self.over, &other.over)
             && self.substring_from_syntax == other.substring_from_syntax
-    }
-}
-
-impl SyntaxEq for FunctionOrderBy {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.expr.syntax_eq(&other.expr)
-            && self.asc == other.asc
-            && self.nulls_first == other.nulls_first
     }
 }
 
@@ -738,12 +738,16 @@ mod tests {
                 span: span(start + 7),
             })],
             quantifier: FunctionQuantifier::Distinct,
-            order_by: vec![FunctionOrderBy {
-                expr: number("1", start + 8),
-                asc: Some(false),
-                nulls_first: Some(false),
+            order_by: Some(OrderBy {
+                items: vec![SortItem {
+                    sort_key: number("1", start + 8),
+                    ordering: SortOrdering::Descending,
+                    null_ordering: NullOrdering::Last,
+                    span: span(start + 9),
+                }]
+                .into(),
                 span: span(start + 9),
-            }],
+            }),
             separator: Some(Box::new(Expr::Literal(Literal {
                 kind: LiteralKind::String(",".to_owned()),
                 span: span(start + 10),
@@ -760,12 +764,16 @@ mod tests {
             over: Some(Box::new(WindowSpec {
                 existing_window_name: Some(ident("base", start + 13)),
                 partition_by: vec![Expr::Identifier(ident("k", start + 14))],
-                order_by: vec![OrderByExpr {
-                    expr: Expr::Identifier(ident("ts", start + 15)),
-                    asc: Some(true),
-                    nulls_first: Some(false),
+                order_by: Some(OrderBy {
+                    items: vec![SortItem {
+                        sort_key: Expr::Identifier(ident("ts", start + 15)),
+                        ordering: SortOrdering::Ascending,
+                        null_ordering: NullOrdering::Last,
+                        span: span(start + 16),
+                    }]
+                    .into(),
                     span: span(start + 16),
-                }],
+                }),
                 window_frame: Some(WindowFrame {
                     units: WindowFrameUnits::Rows,
                     start_bound: WindowFrameBound::Preceding(
@@ -829,12 +837,16 @@ mod tests {
                 qualify: None,
                 windows: Vec::new(),
                 modifiers: QueryModifiers {
-                    order_by: vec![OrderByExpr {
-                        expr: Expr::Identifier(ident("result", start + 15)),
-                        asc: Some(false),
-                        nulls_first: Some(true),
+                    order_by: Some(OrderBy {
+                        items: vec![SortItem {
+                            sort_key: Expr::Identifier(ident("result", start + 15)),
+                            ordering: SortOrdering::Descending,
+                            null_ordering: NullOrdering::First,
+                            span: span(start + 16),
+                        }]
+                        .into(),
                         span: span(start + 16),
-                    }],
+                    }),
                     limit: Some(number("10", start + 17)),
                     offset: Some(Offset {
                         value: number("3", start + 18),

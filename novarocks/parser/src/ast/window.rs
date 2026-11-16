@@ -7,7 +7,7 @@
 
 use crate::{
     Span,
-    ast::{Expr, Ident, query::OrderByExpr},
+    ast::{Expr, Ident, query::OrderBy},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,7 +21,7 @@ pub struct NamedWindow {
 pub struct WindowSpec {
     pub existing_window_name: Option<Ident>,
     pub partition_by: Vec<Expr>,
-    pub order_by: Vec<OrderByExpr>,
+    pub order_by: Option<OrderBy>,
     pub window_frame: Option<WindowFrame>,
     pub span: Span,
 }

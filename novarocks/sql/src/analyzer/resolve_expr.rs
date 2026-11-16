@@ -2102,7 +2102,7 @@ impl<'a> super::AnalyzerContext<'a> {
         // value argument, and SEPARATOR belongs exclusively to GROUP_CONCAT.
         // Reject these shapes before aggregate ORDER BY validation so the
         // StarRocks-compatible parse error remains stable.
-        if original_arguments.is_empty() && !func.order_by.is_empty() {
+        if original_arguments.is_empty() && func.order_by.is_some() {
             return Err(AnalyzeError::invalid_query_shape(
                 if matches!(func.quantifier, ast::FunctionQuantifier::Distinct) {
                     "Unexpected input 'order', the most similar input is {a legal identifier}."
@@ -4030,10 +4030,16 @@ impl<'a> super::AnalyzerContext<'a> {
             } else {
                 args
             };
-        if !func.order_by.is_empty() {
-            let mut items = Vec::with_capacity(func.order_by.len());
-            for ob in &func.order_by {
-                let typed = if let Some(pos) = function_order_by_position(&ob.expr) {
+        if let Some(order_by) = &func.order_by {
+            if order_by.items.is_empty() {
+                return Err(AnalyzeError::invalid_argument(
+                    "ORDER BY requires a sort key",
+                    order_by.span,
+                ));
+            }
+            let mut items = Vec::with_capacity(order_by.items.len());
+            for ob in &order_by.items {
+                let typed = if let Some(pos) = function_order_by_position(&ob.sort_key) {
                     let pos_index = usize::try_from(pos).ok();
                     if let Some(pos_index) = pos_index
                         && (1..=visible_args.len()).contains(&pos_index)
@@ -4059,13 +4065,12 @@ impl<'a> super::AnalyzerContext<'a> {
                             ob.span,
                         ));
                     } else {
-                        self.analyze_expr(&ob.expr, scope)?
+                        self.analyze_expr(&ob.sort_key, scope)?
                     }
                 } else {
-                    self.analyze_expr(&ob.expr, scope)?
+                    self.analyze_expr(&ob.sort_key, scope)?
                 };
-                let asc = ob.asc.unwrap_or(true);
-                let nulls_first = ob.nulls_first.unwrap_or(asc);
+                let (asc, nulls_first) = super::helpers::sort_item_flags(ob);
                 items.push(SortItem {
                     expr: typed,
                     asc,
@@ -4099,10 +4104,18 @@ impl<'a> super::AnalyzerContext<'a> {
 
         // ORDER BY
         let mut order_by = Vec::new();
-        for ob in &spec.order_by {
-            let typed = self.analyze_expr(&ob.expr, scope)?;
-            let asc = ob.asc.unwrap_or(true);
-            let nulls_first = ob.nulls_first.unwrap_or(asc);
+        if let Some(order) = &spec.order_by
+            && order.items.is_empty()
+        {
+            return Err(AnalyzeError::invalid_argument(
+                "ORDER BY requires a sort key",
+                order.span,
+            ));
+        }
+        for ob in spec.order_by.iter().flat_map(|order| &order.items) {
+            self.check_control()?;
+            let typed = self.analyze_expr(&ob.sort_key, scope)?;
+            let (asc, nulls_first) = super::helpers::sort_item_flags(ob);
             order_by.push(SortItem {
                 expr: typed,
                 asc,
@@ -4316,7 +4329,8 @@ impl<'a> super::AnalyzerContext<'a> {
                     .any(|expr| self.expr_contains_aggregate(expr))
                     || f.order_by
                         .iter()
-                        .any(|item| self.expr_contains_aggregate(&item.expr))
+                        .flat_map(|order| &order.items)
+                        .any(|item| self.expr_contains_aggregate(&item.sort_key))
             }
             ast::Expr::Binary(binary) => {
                 self.expr_contains_aggregate(&binary.left)

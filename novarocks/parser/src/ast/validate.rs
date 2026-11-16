@@ -110,8 +110,8 @@ fn validate_query(query: &Query) -> Result<(), ValidateError> {
 }
 
 fn validate_query_modifiers(modifiers: &super::QueryModifiers) -> Result<(), ValidateError> {
-    for order_by in &modifiers.order_by {
-        validate_expr(&order_by.expr)?;
+    if let Some(order_by) = &modifiers.order_by {
+        validate_order_by(order_by)?;
     }
     if let Some(limit) = &modifiers.limit {
         validate_expr(limit)?;
@@ -312,8 +312,8 @@ fn validate_window_spec(specification: &WindowSpec) -> Result<(), ValidateError>
     for expression in &specification.partition_by {
         validate_expr(expression)?;
     }
-    for order_by in &specification.order_by {
-        validate_expr(&order_by.expr)?;
+    if let Some(order_by) = &specification.order_by {
+        validate_order_by(order_by)?;
     }
     if let Some(frame) = &specification.window_frame {
         validate_window_frame(frame)?;
@@ -425,8 +425,8 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             for argument in &function.arguments {
                 validate_expr(argument)?;
             }
-            for order_by in &function.order_by {
-                validate_expr(&order_by.expr)?;
+            if let Some(order_by) = &function.order_by {
+                validate_order_by(order_by)?;
             }
             if let Some(separator) = &function.separator {
                 validate_expr(separator)?;
@@ -663,6 +663,20 @@ fn validate_case(
     }
     if let Some(default) = default {
         validate_expr(default)?;
+    }
+    Ok(())
+}
+
+#[recursive::recursive]
+fn validate_order_by(order: &super::OrderBy) -> Result<(), ValidateError> {
+    if order.items.is_empty() {
+        return Err(ValidateError::invalid_structure(
+            StructuralViolation::EmptyOrderBy,
+            order.span,
+        ));
+    }
+    for item in &order.items {
+        validate_expr(&item.sort_key)?;
     }
     Ok(())
 }

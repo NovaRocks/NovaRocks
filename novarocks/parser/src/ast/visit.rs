@@ -21,6 +21,12 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_order_by(&mut self, node: &OrderBy) {
+        walk_order_by(self, node);
+    }
+    fn visit_sort_item(&mut self, node: &SortItem) {
+        walk_sort_item(self, node);
+    }
     fn visit_subscript_expr(&mut self, node: &SubscriptExpr) {
         walk_subscript_expr(self, node);
     }
@@ -521,8 +527,8 @@ pub fn walk_query<V: Visit + ?Sized>(visitor: &mut V, query: &Query) {
 }
 
 pub fn walk_query_modifiers<V: Visit + ?Sized>(visitor: &mut V, modifiers: &QueryModifiers) {
-    for order in &modifiers.order_by {
-        visitor.visit_expr(&order.expr);
+    if let Some(order) = &modifiers.order_by {
+        visitor.visit_order_by(order);
     }
     if let Some(limit) = &modifiers.limit {
         visitor.visit_expr(limit);
@@ -728,8 +734,8 @@ pub fn walk_window_spec<V: Visit + ?Sized>(visitor: &mut V, window: &WindowSpec)
     for expr in &window.partition_by {
         visitor.visit_expr(expr);
     }
-    for order in &window.order_by {
-        visitor.visit_expr(&order.expr);
+    if let Some(order) = &window.order_by {
+        visitor.visit_order_by(order);
     }
     if let Some(frame) = &window.window_frame {
         walk_window_frame_bound(visitor, &frame.start_bound);
@@ -817,8 +823,8 @@ pub fn walk_function_call<V: Visit + ?Sized>(visitor: &mut V, call: &FunctionCal
     for argument in &call.arguments {
         visitor.visit_expr(argument);
     }
-    for order in &call.order_by {
-        visitor.visit_expr(&order.expr);
+    if let Some(order) = &call.order_by {
+        visitor.visit_order_by(order);
     }
     if let Some(separator) = &call.separator {
         visitor.visit_expr(separator);
@@ -846,6 +852,12 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_order_by(&mut self, node: OrderBy) -> OrderBy {
+        fold_order_by(self, node)
+    }
+    fn fold_sort_item(&mut self, node: SortItem) -> SortItem {
+        fold_sort_item(self, node)
+    }
     fn fold_subscript_expr(&mut self, node: SubscriptExpr) -> SubscriptExpr {
         fold_subscript_expr(self, node)
     }
@@ -1498,14 +1510,7 @@ pub fn fold_query_modifiers<F: Fold + ?Sized>(
     folder: &mut F,
     mut modifiers: QueryModifiers,
 ) -> QueryModifiers {
-    modifiers.order_by = modifiers
-        .order_by
-        .into_iter()
-        .map(|mut order| {
-            order.expr = folder.fold_expr(order.expr);
-            order
-        })
-        .collect();
+    modifiers.order_by = modifiers.order_by.map(|order| folder.fold_order_by(order));
     modifiers.limit = modifiers.limit.map(|limit| folder.fold_expr(limit));
     modifiers.offset = modifiers.offset.map(|mut offset| {
         offset.value = folder.fold_expr(offset.value);
@@ -1792,14 +1797,7 @@ pub fn fold_window_spec<F: Fold + ?Sized>(folder: &mut F, mut window: WindowSpec
         .into_iter()
         .map(|expr| folder.fold_expr(expr))
         .collect();
-    window.order_by = window
-        .order_by
-        .into_iter()
-        .map(|mut order| {
-            order.expr = folder.fold_expr(order.expr);
-            order
-        })
-        .collect();
+    window.order_by = window.order_by.map(|order| folder.fold_order_by(order));
     window.window_frame = window.window_frame.map(|mut frame| {
         frame.start_bound = fold_window_frame_bound(folder, frame.start_bound);
         frame.end_bound = frame
@@ -1935,14 +1933,7 @@ pub fn fold_function_call<F: Fold + ?Sized>(
         .into_iter()
         .map(|argument| folder.fold_expr(argument))
         .collect();
-    call.order_by = call
-        .order_by
-        .into_iter()
-        .map(|mut order| {
-            order.expr = folder.fold_expr(order.expr);
-            order
-        })
-        .collect();
+    call.order_by = call.order_by.map(|order| folder.fold_order_by(order));
     call.separator = call
         .separator
         .map(|separator| Box::new(folder.fold_expr(*separator)));
@@ -2072,5 +2063,33 @@ pub fn fold_dereference_expr<F: Fold + ?Sized>(
 ) -> DereferenceExpr {
     node.base = folder.fold_expr(node.base);
     node.field = node.field.map(|field| folder.fold_ident(field));
+    node
+}
+
+#[recursive::recursive]
+pub fn walk_order_by<V: Visit + ?Sized>(visitor: &mut V, node: &OrderBy) {
+    for item in &node.items {
+        visitor.visit_sort_item(item);
+    }
+}
+
+#[recursive::recursive]
+pub fn walk_sort_item<V: Visit + ?Sized>(visitor: &mut V, node: &SortItem) {
+    visitor.visit_expr(&node.sort_key);
+}
+
+#[recursive::recursive]
+pub fn fold_order_by<F: Fold + ?Sized>(folder: &mut F, mut node: OrderBy) -> OrderBy {
+    node.items = node
+        .items
+        .into_iter()
+        .map(|item| folder.fold_sort_item(item))
+        .collect();
+    node
+}
+
+#[recursive::recursive]
+pub fn fold_sort_item<F: Fold + ?Sized>(folder: &mut F, mut node: SortItem) -> SortItem {
+    node.sort_key = folder.fold_expr(node.sort_key);
     node
 }

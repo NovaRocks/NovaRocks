@@ -472,7 +472,14 @@ mod tests {
             panic!("expected function modifiers");
         };
         assert_eq!(call.quantifier, FunctionQuantifier::Distinct);
-        assert_eq!(call.order_by.len(), 1);
+        assert_eq!(
+            call.order_by
+                .as_ref()
+                .expect("function ORDER BY")
+                .items
+                .len(),
+            1
+        );
         assert!(call.separator.is_some());
         assert!(call.filter.is_some());
         let Expr::FunctionCall(call) = parse("lead(v IGNORE NULLS, 1) OVER (ORDER BY x)") else {

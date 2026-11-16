@@ -27,12 +27,12 @@ use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
         AccessExpr, AccessKind, ArrayExpr, BinaryExpr, BinaryOperator, CastExpr, DataTypeParameter,
-        DereferenceExpr, ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier,
-        Ident, InListExpr, IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration,
-        LambdaExpr, Literal, LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment, ObjectName,
-        RowDataTypeField, RowExpr, RowField, SearchedCaseExpr, SimpleCaseExpr, SubqueryExpr,
-        TypeName, UnaryExpr, UnaryOperator, WhenClause, WhenMatch, WindowFrame, WindowFrameBound,
-        WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+        DereferenceExpr, ExistsExpr, Expr, FunctionCall, FunctionQuantifier, Ident, InListExpr,
+        IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration, LambdaExpr, Literal,
+        LiteralKind, MapEntry, MapExpr, NestedExpr, NullOrdering, NullTreatment, ObjectName,
+        OrderBy, RowDataTypeField, RowExpr, RowField, SearchedCaseExpr, SimpleCaseExpr, SortItem,
+        SortOrdering, SubqueryExpr, TypeName, UnaryExpr, UnaryOperator, WhenClause, WhenMatch,
+        WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -1185,7 +1185,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             },
             arguments: vec![field, expression],
             quantifier: FunctionQuantifier::None,
-            order_by: Vec::new(),
+            order_by: None,
             separator: None,
             filter: None,
             null_treatment: None,
@@ -1243,7 +1243,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             },
             arguments,
             quantifier: FunctionQuantifier::None,
-            order_by: Vec::new(),
+            order_by: None,
             separator: None,
             filter: None,
             null_treatment: None,
@@ -1468,8 +1468,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
         }
 
-        let mut order_by = Vec::new();
+        let mut order_by = None;
         if self.current_is_keyword(Keyword::Order) {
+            let order_start = self.current_span().start();
+            let mut order_items = Vec::new();
             self.advance();
             self.skip_trivia();
             if !self.current_is_keyword(Keyword::By) {
@@ -1479,11 +1481,14 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             self.skip_trivia();
             loop {
                 let expr = self.parse_binding_power(0)?;
+                let mut item_end = expr.span().end();
                 let asc = if self.current_is_keyword(Keyword::Asc) {
+                    item_end = self.current_span().end();
                     self.advance();
                     self.skip_trivia();
                     Some(true)
                 } else if self.current_is_keyword(Keyword::Desc) {
+                    item_end = self.current_span().end();
                     self.advance();
                     self.skip_trivia();
                     Some(false)
@@ -1494,10 +1499,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     self.advance();
                     self.skip_trivia();
                     if self.current_is_keyword(Keyword::First) {
+                        item_end = self.current_span().end();
                         self.advance();
                         self.skip_trivia();
                         Some(true)
                     } else if self.current_is_keyword(Keyword::Last) {
+                        item_end = self.current_span().end();
                         self.advance();
                         self.skip_trivia();
                         Some(false)
@@ -1507,11 +1514,19 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 } else {
                     None
                 };
-                order_by.push(FunctionOrderBy {
-                    span: Span::new(expr.span().start(), self.current_span().start()),
-                    expr,
-                    asc,
-                    nulls_first,
+                order_items.push(SortItem {
+                    span: Span::new(expr.span().start(), item_end),
+                    sort_key: expr,
+                    ordering: if asc == Some(false) {
+                        SortOrdering::Descending
+                    } else {
+                        SortOrdering::Ascending
+                    },
+                    null_ordering: match nulls_first {
+                        Some(true) => NullOrdering::First,
+                        Some(false) => NullOrdering::Last,
+                        None => NullOrdering::Undefined,
+                    },
                 });
                 if !self.current_is_symbol(Symbol::Comma) {
                     break;
@@ -1519,6 +1534,15 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 self.advance();
                 self.skip_trivia();
             }
+            let order_end = order_items
+                .last()
+                .expect("nonempty parsed ORDER BY")
+                .span
+                .end();
+            order_by = Some(OrderBy {
+                items: order_items.into(),
+                span: Span::new(order_start, order_end),
+            });
         }
         let separator = if self.current_is_word("SEPARATOR") {
             self.advance();
@@ -1574,7 +1598,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     span: name.span,
                     existing_window_name: Some(name),
                     partition_by: Vec::new(),
-                    order_by: Vec::new(),
+                    order_by: None,
                     window_frame: None,
                 }))
             } else {
@@ -1642,7 +1666,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.skip_trivia();
         let mut existing_window_name = None;
         let mut partition_by = Vec::new();
-        let mut order_by = Vec::new();
+        let mut order_by = None;
         let mut window_frame = None;
         if matches!(
             self.current().map(|token| &token.kind),
@@ -1670,6 +1694,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
         }
         if self.current_is_keyword(Keyword::Order) {
+            let order_start = self.current_span().start();
+            let mut order_items = Vec::new();
             self.advance();
             self.skip_trivia();
             if !self.current_is_keyword(Keyword::By) {
@@ -1679,11 +1705,14 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             self.skip_trivia();
             loop {
                 let expr = self.parse_binding_power(0)?;
+                let mut item_end = expr.span().end();
                 let asc = if self.current_is_keyword(Keyword::Asc) {
+                    item_end = self.current_span().end();
                     self.advance();
                     self.skip_trivia();
                     Some(true)
                 } else if self.current_is_keyword(Keyword::Desc) {
+                    item_end = self.current_span().end();
                     self.advance();
                     self.skip_trivia();
                     Some(false)
@@ -1694,10 +1723,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     self.advance();
                     self.skip_trivia();
                     if self.current_is_keyword(Keyword::First) {
+                        item_end = self.current_span().end();
                         self.advance();
                         self.skip_trivia();
                         Some(true)
                     } else if self.current_is_keyword(Keyword::Last) {
+                        item_end = self.current_span().end();
                         self.advance();
                         self.skip_trivia();
                         Some(false)
@@ -1707,11 +1738,19 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 } else {
                     None
                 };
-                let span = Span::new(expr.span().start(), self.current_span().start());
-                order_by.push(crate::ast::OrderByExpr {
-                    expr,
-                    asc,
-                    nulls_first,
+                let span = Span::new(expr.span().start(), item_end);
+                order_items.push(SortItem {
+                    sort_key: expr,
+                    ordering: if asc == Some(false) {
+                        SortOrdering::Descending
+                    } else {
+                        SortOrdering::Ascending
+                    },
+                    null_ordering: match nulls_first {
+                        Some(true) => NullOrdering::First,
+                        Some(false) => NullOrdering::Last,
+                        None => NullOrdering::Undefined,
+                    },
                     span,
                 });
                 if !self.current_is_symbol(Symbol::Comma) {
@@ -1720,6 +1759,15 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 self.advance();
                 self.skip_trivia();
             }
+            let order_end = order_items
+                .last()
+                .expect("nonempty parsed ORDER BY")
+                .span
+                .end();
+            order_by = Some(OrderBy {
+                items: order_items.into(),
+                span: Span::new(order_start, order_end),
+            });
         }
         if let Some(units) = self.parse_window_frame_units() {
             let frame_start = self.current_span().start();

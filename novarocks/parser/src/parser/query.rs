@@ -21,9 +21,10 @@ use crate::{
     Span, Token, TokenKind,
     ast::{
         Cte, ExplainFormat, ExplainQuery, Expr, Fetch, GroupBy, Ident, Join, JoinConstraint,
-        JoinOperator, NamedWindow, Offset, OffsetRows, OrderByExpr, Query, Select, SelectItem,
-        SelectQuantifier, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
-        TableVersion, TableVersionKind, TableWithJoins, Values, WildcardOptions, With,
+        JoinOperator, NamedWindow, NullOrdering, Offset, OffsetRows, OrderBy, Query, Select,
+        SelectItem, SelectQuantifier, SetExpr, SetOperator, SetQuantifier, SortItem, SortOrdering,
+        Statement, TableFactor, TableVersion, TableVersionKind, TableWithJoins, Values,
+        WildcardOptions, With,
     },
     lex,
     token::{Keyword, Symbol},
@@ -124,11 +125,14 @@ pub(super) fn parse_query(
         body = crate::build::set_operation(body, operator, quantifier, right, None);
     }
 
-    let mut order_by = Vec::new();
-    if parser.consume_if_word("ORDER") {
+    let order_by = if parser.current_is_word("ORDER") {
+        let order_start = parser.current_span().start();
+        parser.consume_word("ORDER")?;
         parser.consume_word("BY")?;
-        order_by = parse_order_by(parser)?;
-    }
+        Some(parse_order_by(parser, order_start)?)
+    } else {
+        None
+    };
     let (limit, limit_offset, limit_comma_offset) = if parser.consume_if_word("LIMIT") {
         let first = parse_expression_until(
             parser,
@@ -194,7 +198,7 @@ pub(super) fn parse_query(
                 offset.as_ref().map_or_else(
                     || {
                         limit.as_ref().map_or_else(
-                            || order_by.last().map_or(body.span(), |order| order.span),
+                            || order_by.as_ref().map_or(body.span(), |order| order.span),
                             |limit| limit.span(),
                         )
                     },
@@ -1265,7 +1269,8 @@ fn parse_parenthesized_expressions(
 
 fn parse_order_by(
     parser: &mut StatementParser<'_, '_>,
-) -> Result<Vec<OrderByExpr>, crate::ParseError> {
+    order_start: usize,
+) -> Result<OrderBy, crate::ParseError> {
     let mut items = Vec::new();
     loop {
         let expr = parse_expression_until(
@@ -1283,17 +1288,22 @@ fn parse_order_by(
             ],
             &[Symbol::Comma, Symbol::Semicolon, Symbol::RParen],
         )?;
-        let asc = if parser.consume_if_word("ASC") {
+        let mut item_end = expr.span().end();
+        let asc = if parser.current_is_word("ASC") {
+            item_end = parser.consume_word("ASC")?.end();
             Some(true)
-        } else if parser.consume_if_word("DESC") {
+        } else if parser.current_is_word("DESC") {
+            item_end = parser.consume_word("DESC")?.end();
             Some(false)
         } else {
             None
         };
         let nulls_first = if parser.consume_if_word("NULLS") {
-            if parser.consume_if_word("FIRST") {
+            if parser.current_is_word("FIRST") {
+                item_end = parser.consume_word("FIRST")?.end();
                 Some(true)
-            } else if parser.consume_if_word("LAST") {
+            } else if parser.current_is_word("LAST") {
+                item_end = parser.consume_word("LAST")?.end();
                 Some(false)
             } else {
                 return Err(parser.unexpected("FIRST or LAST after NULLS"));
@@ -1301,18 +1311,30 @@ fn parse_order_by(
         } else {
             None
         };
-        let span = Span::new(expr.span().start(), parser.current_offset());
-        items.push(OrderByExpr {
-            expr,
-            asc,
-            nulls_first,
+        let span = Span::new(expr.span().start(), item_end);
+        items.push(SortItem {
+            sort_key: expr,
+            ordering: if asc == Some(false) {
+                SortOrdering::Descending
+            } else {
+                SortOrdering::Ascending
+            },
+            null_ordering: match nulls_first {
+                Some(true) => NullOrdering::First,
+                Some(false) => NullOrdering::Last,
+                None => NullOrdering::Undefined,
+            },
             span,
         });
         if !parser.consume_if_symbol(Symbol::Comma) {
             break;
         }
     }
-    Ok(items)
+    let end = items.last().expect("nonempty parsed ORDER BY").span.end();
+    Ok(OrderBy {
+        items: items.into(),
+        span: Span::new(order_start, end),
+    })
 }
 
 fn parse_fetch(

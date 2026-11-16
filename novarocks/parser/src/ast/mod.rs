@@ -66,9 +66,9 @@ pub use dml::{
 pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
     AccessExpr, AccessKind, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr, BinaryOperator,
-    DereferenceExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier, IntervalExpr,
-    IntervalField, JsonOperator, LogicalExpr, LogicalOperator, MapEntry, MapExpr, NestedExpr,
-    NullTreatment, RowExpr, RowField, SubqueryExpr, SubscriptExpr, UnaryExpr, UnaryOperator,
+    DereferenceExpr, Expr, FunctionCall, FunctionQuantifier, IntervalExpr, IntervalField,
+    JsonOperator, LogicalExpr, LogicalOperator, MapEntry, MapExpr, NestedExpr, NullTreatment,
+    RowExpr, RowField, SubqueryExpr, SubscriptExpr, UnaryExpr, UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -89,10 +89,10 @@ pub use materialized_view::{
     MaterializedViewRefreshPolicy, MaterializedViewStatement, RefreshMaterializedView,
 };
 pub use query::{
-    Corresponding, Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, Offset, OffsetRows,
-    OrderByExpr, Query, QueryModifiers, ReplaceSelectItem, Select, SelectItem, SelectQuantifier,
-    SessionProperty, SetExpr, SetOperation, SetOperator, SetQuantifier, Values, WildcardOptions,
-    With,
+    Corresponding, Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, NullOrdering, Offset,
+    OffsetRows, OrderBy, Query, QueryModifiers, ReplaceSelectItem, Select, SelectItem,
+    SelectQuantifier, SessionProperty, SetExpr, SetOperation, SetOperator, SetQuantifier, SortItem,
+    SortOrdering, Values, WildcardOptions, With,
 };
 pub use relation::{
     Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableVersion,
@@ -259,7 +259,7 @@ mod tests {
                     span: span(8, 9),
                 })],
                 quantifier: FunctionQuantifier::None,
-                order_by: Vec::new(),
+                order_by: None,
                 separator: None,
                 filter: None,
                 null_treatment: None,
@@ -371,3 +371,5 @@ pub use visit::{
     fold_array_wildcard_subscript_expr, fold_dereference_expr, fold_subscript_expr,
     walk_array_wildcard_subscript_expr, walk_dereference_expr, walk_subscript_expr,
 };
+
+pub use visit::{fold_order_by, fold_sort_item, walk_order_by, walk_sort_item};

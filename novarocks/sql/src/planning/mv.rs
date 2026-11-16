@@ -3041,7 +3041,7 @@ fn reject_unsupported_query_clauses(query: &Query) -> Result<(), String> {
     if !query.session_properties.is_empty()
         || !query.functions.is_empty()
         || query.with.is_some()
-        || !query.modifiers.order_by.is_empty()
+        || query.modifiers.order_by.is_some()
         || query.modifiers.limit.is_some()
         || query.modifiers.offset.is_some()
         || query.modifiers.fetch.is_some()
@@ -3155,7 +3155,7 @@ fn classify_aggregate_call(expr: &Expr, output_name: String) -> Result<Aggregate
         || function.null_treatment.is_some()
         || function.over.is_some()
         || function.filter.is_some()
-        || !function.order_by.is_empty()
+        || function.order_by.is_some()
     {
         return Err(aggregate_error());
     }
@@ -3377,7 +3377,8 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
                 || function
                     .order_by
                     .iter()
-                    .any(|order_by| expr_contains_aggregate_function(&order_by.expr))
+                    .flat_map(|order| &order.items)
+                    .any(|order_by| expr_contains_aggregate_function(&order_by.sort_key))
         }
         Expr::Binary(binary) => {
             let left = &binary.left;
@@ -3617,7 +3618,7 @@ fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), Strin
         || function_name == "match"
         || function.null_treatment.is_some()
         || function.over.is_some()
-        || !function.order_by.is_empty()
+        || function.order_by.is_some()
         || function.separator.is_some()
         || function.filter.is_some()
         || !matches!(function.quantifier, ast::FunctionQuantifier::None)

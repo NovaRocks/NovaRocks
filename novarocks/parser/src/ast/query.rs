@@ -8,7 +8,7 @@
 
 use crate::{
     Span,
-    ast::{Expr, Ident, relation::TableWithJoins, window::NamedWindow},
+    ast::{AstVec, Expr, Ident, relation::TableWithJoins, window::NamedWindow},
 };
 
 /// One top-level query expression and its query-level modifiers.
@@ -26,7 +26,7 @@ pub struct Query {
 /// Suffix clauses owned by either a query or its direct specification.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryModifiers {
-    pub order_by: Vec<OrderByExpr>,
+    pub order_by: Option<OrderBy>,
     pub limit: Option<Expr>,
     pub offset: Option<Offset>,
     /// Whether this query used MySQL `LIMIT offset, count` spelling.
@@ -36,7 +36,7 @@ pub struct QueryModifiers {
 
 impl QueryModifiers {
     pub fn is_empty(&self) -> bool {
-        self.order_by.is_empty()
+        self.order_by.is_none()
             && self.limit.is_none()
             && self.offset.is_none()
             && self.fetch.is_none()
@@ -223,11 +223,30 @@ pub enum GroupBy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OrderByExpr {
-    pub expr: Expr,
-    pub asc: Option<bool>,
-    pub nulls_first: Option<bool>,
+pub struct OrderBy {
+    pub items: AstVec<SortItem>,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SortItem {
+    pub sort_key: Expr,
+    pub ordering: SortOrdering,
+    pub null_ordering: NullOrdering,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SortOrdering {
+    Ascending,
+    Descending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NullOrdering {
+    First,
+    Last,
+    Undefined,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

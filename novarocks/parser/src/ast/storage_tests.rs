@@ -892,3 +892,348 @@ fn actual_access_children_keep_deep_visit_fold_equivalence_validation_and_printi
     drop(statement);
     drop(tree);
 }
+
+#[test]
+fn actual_function_order_by_owning_cycle_keeps_deep_traits_move_and_drop() {
+    use crate::ast::{Expr, LiteralKind, NullOrdering, SortOrdering};
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    let mut tree = build::integer(7);
+    for marker in 1..=DEPTH {
+        let ordering = if marker % 2 == 0 {
+            SortOrdering::Ascending
+        } else {
+            SortOrdering::Descending
+        };
+        let null_ordering = match marker % 3 {
+            0 => NullOrdering::First,
+            1 => NullOrdering::Last,
+            _ => NullOrdering::Undefined,
+        };
+        let item = build::sort_item(tree, ordering, null_ordering);
+        let mut order_by = build::order_by(vec![item]).unwrap();
+        order_by.span = Span::new(15, 95);
+        let name = build::object_name(vec![build::ident("deep_order", false)]).unwrap();
+        tree = build::function(name, Vec::new());
+        let Expr::FunctionCall(call) = &mut tree else {
+            unreachable!()
+        };
+        call.order_by = Some(order_by);
+        call.span = Span::new(10, 100);
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    let mut cursor = &mut copy;
+    for marker in (1..=DEPTH).rev() {
+        let Expr::FunctionCall(call) = cursor else {
+            panic!("actual call/order-by cycle")
+        };
+        assert!(call.arguments.is_empty());
+        assert!(call.filter.is_none());
+        assert!(call.over.is_none());
+        assert_eq!(call.name.parts[0].value, "deep_order");
+        assert_eq!(call.span, Span::new(10, 100));
+        let order_by = call.order_by.as_mut().unwrap();
+        assert_eq!(order_by.span, Span::new(15, 95));
+        assert_eq!(order_by.items.len(), 1);
+        let item = &mut order_by.items[0];
+        assert_eq!(
+            item.span,
+            if marker == 1 {
+                crate::SYNTHETIC
+            } else {
+                Span::new(10, 100)
+            }
+        );
+        assert_eq!(
+            item.ordering,
+            if marker % 2 == 0 {
+                SortOrdering::Ascending
+            } else {
+                SortOrdering::Descending
+            }
+        );
+        assert_eq!(
+            item.null_ordering,
+            match marker % 3 {
+                0 => NullOrdering::First,
+                1 => NullOrdering::Last,
+                _ => NullOrdering::Undefined,
+            }
+        );
+        cursor = &mut item.sort_key;
+    }
+    let Expr::Literal(literal) = cursor else {
+        panic!("original terminal sort key")
+    };
+    assert!(matches!(
+        literal.kind,
+        LiteralKind::Long {
+            parsed_value: 7,
+            ..
+        }
+    ));
+    literal.kind = LiteralKind::Long {
+        spelling: "8".into(),
+        parsed_value: 8,
+    };
+    assert_ne!(tree, copy);
+    drop(copy);
+    let Expr::FunctionCall(call) = tree else {
+        unreachable!()
+    };
+    let order_by = call.order_by.unwrap();
+    assert_eq!(order_by.span, Span::new(15, 95));
+    let items = order_by.items.into_inner();
+    assert_eq!(items.len(), 1);
+    let item = items.into_iter().next().unwrap();
+    drop(item.sort_key);
+}
+
+#[test]
+fn actual_function_order_by_preserves_facts_and_deep_semantic_children() {
+    use crate::ast::{
+        Expr, Fold, FunctionCall, GroupBy, Ident, Literal, LiteralKind, NullOrdering, OrderBy,
+        SetExpr, SortItem, SortOrdering, Statement, SyntaxEq, Visit,
+    };
+    use crate::{Span, build};
+    fn call(items: Vec<SortItem>) -> Expr {
+        let name = build::object_name(vec![build::ident("deep_order", false)]).unwrap();
+        let mut expression = build::function(name, Vec::new());
+        let Expr::FunctionCall(call) = &mut expression else {
+            unreachable!()
+        };
+        call.order_by = Some(build::order_by(items).unwrap());
+        expression
+    }
+    assert!(matches!(
+        build::order_by(Vec::new()),
+        Err(build::BuildError::EmptyOrderBy)
+    ));
+    let ordered = call(vec![
+        build::sort_item(
+            build::identifier(build::ident("quoted key", true)),
+            SortOrdering::Ascending,
+            NullOrdering::Undefined,
+        ),
+        build::sort_item(
+            build::integer(9),
+            SortOrdering::Descending,
+            NullOrdering::Last,
+        ),
+    ]);
+    let mut absent = ordered.clone();
+    let Expr::FunctionCall(node) = &mut absent else {
+        unreachable!()
+    };
+    node.order_by = None;
+    assert!(!ordered.syntax_eq(&absent));
+    for null_ordering in [NullOrdering::First, NullOrdering::Last] {
+        let mut changed = ordered.clone();
+        let Expr::FunctionCall(node) = &mut changed else {
+            unreachable!()
+        };
+        node.order_by.as_mut().unwrap().items[0].null_ordering = null_ordering;
+        assert!(!ordered.syntax_eq(&changed));
+    }
+    let mut descending = ordered.clone();
+    let Expr::FunctionCall(node) = &mut descending else {
+        unreachable!()
+    };
+    node.order_by.as_mut().unwrap().items[0].ordering = SortOrdering::Descending;
+    assert!(!ordered.syntax_eq(&descending));
+    let mut reversed = ordered.clone();
+    let Expr::FunctionCall(node) = &mut reversed else {
+        unreachable!()
+    };
+    node.order_by.as_mut().unwrap().items.swap(0, 1);
+    assert!(!ordered.syntax_eq(&reversed));
+    let mut unquoted = ordered.clone();
+    let Expr::FunctionCall(node) = &mut unquoted else {
+        unreachable!()
+    };
+    let Expr::Identifier(key) = &mut node.order_by.as_mut().unwrap().items[0].sort_key else {
+        unreachable!()
+    };
+    key.quoted = false;
+    assert!(!ordered.syntax_eq(&unquoted));
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Event {
+        Name(String, bool),
+        Sort(SortOrdering, NullOrdering),
+        Number(i64),
+    }
+    #[derive(Default)]
+    struct Events(Vec<Event>);
+    impl Visit for Events {
+        fn visit_ident(&mut self, node: &Ident) {
+            self.0.push(Event::Name(node.value.clone(), node.quoted));
+        }
+        fn visit_literal(&mut self, node: &Literal) {
+            let LiteralKind::Long {
+                spelling,
+                parsed_value,
+            } = &node.kind
+            else {
+                panic!("fixture Long")
+            };
+            assert_eq!(spelling, &parsed_value.to_string());
+            self.0.push(Event::Number(*parsed_value));
+        }
+        fn visit_sort_item(&mut self, node: &SortItem) {
+            self.0.push(Event::Sort(node.ordering, node.null_ordering));
+            crate::ast::walk_sort_item(self, node);
+        }
+    }
+    const DEPTH: i64 = 20_000;
+    const LEAF: i64 = 1_000_000;
+    let mut tree = build::integer(LEAF);
+    for marker in 1..=DEPTH {
+        let ordering = if marker % 2 == 0 {
+            SortOrdering::Ascending
+        } else {
+            SortOrdering::Descending
+        };
+        let null_ordering = match marker % 3 {
+            0 => NullOrdering::First,
+            1 => NullOrdering::Last,
+            _ => NullOrdering::Undefined,
+        };
+        tree = call(vec![
+            build::sort_item(build::integer(marker), ordering, null_ordering),
+            build::sort_item(tree, SortOrdering::Descending, NullOrdering::Last),
+        ]);
+    }
+    let mut expected = Vec::new();
+    for marker in (1..=DEPTH).rev() {
+        expected.push(Event::Name("deep_order".into(), false));
+        expected.push(Event::Sort(
+            if marker % 2 == 0 {
+                SortOrdering::Ascending
+            } else {
+                SortOrdering::Descending
+            },
+            match marker % 3 {
+                0 => NullOrdering::First,
+                1 => NullOrdering::Last,
+                _ => NullOrdering::Undefined,
+            },
+        ));
+        expected.push(Event::Number(marker));
+        expected.push(Event::Sort(SortOrdering::Descending, NullOrdering::Last));
+    }
+    expected.push(Event::Number(LEAF));
+    let mut actual = Events::default();
+    actual.visit_expr(&tree);
+    assert_eq!(actual.0, expected);
+    let printed = crate::printer::print_expr(&tree);
+    assert_eq!(printed.matches("ORDER BY").count(), DEPTH as usize);
+    assert_eq!(printed.matches("deep_order(").count(), DEPTH as usize);
+    let leaf_text = LEAF.to_string();
+    assert_eq!(printed.matches(leaf_text.as_str()).count(), 1);
+    struct Relocate;
+    impl Fold for Relocate {
+        fn fold_function_call(&mut self, node: FunctionCall) -> FunctionCall {
+            let mut node = crate::ast::fold_function_call(self, node);
+            node.span = Span::new(101, 201);
+            node
+        }
+        fn fold_order_by(&mut self, node: OrderBy) -> OrderBy {
+            let mut node = crate::ast::fold_order_by(self, node);
+            node.span = Span::new(111, 191);
+            node
+        }
+        fn fold_sort_item(&mut self, node: SortItem) -> SortItem {
+            let mut node = crate::ast::fold_sort_item(self, node);
+            node.span = Span::new(121, 181);
+            node
+        }
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.span = Span::new(131, 171);
+            node
+        }
+        fn fold_literal(&mut self, mut node: Literal) -> Literal {
+            node.span = Span::new(141, 161);
+            node
+        }
+    }
+    let relocated = Relocate.fold_expr(tree.clone());
+    assert!(tree.syntax_eq(&relocated));
+    assert_ne!(tree, relocated);
+    let mut actual = Events::default();
+    actual.visit_expr(&relocated);
+    assert_eq!(actual.0, expected);
+    struct Change;
+    impl Fold for Change {
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.value.push('!');
+            node
+        }
+        fn fold_literal(&mut self, mut node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = &node.kind else {
+                unreachable!()
+            };
+            let next = *parsed_value + 1;
+            node.kind = LiteralKind::Long {
+                spelling: next.to_string(),
+                parsed_value: next,
+            };
+            node
+        }
+        fn fold_sort_item(&mut self, node: SortItem) -> SortItem {
+            let mut node = crate::ast::fold_sort_item(self, node);
+            node.ordering = match node.ordering {
+                SortOrdering::Ascending => SortOrdering::Descending,
+                SortOrdering::Descending => SortOrdering::Ascending,
+            };
+            node.null_ordering = match node.null_ordering {
+                NullOrdering::First => NullOrdering::Last,
+                NullOrdering::Last => NullOrdering::First,
+                NullOrdering::Undefined => NullOrdering::Undefined,
+            };
+            node
+        }
+    }
+    let changed = Change.fold_expr(relocated);
+    assert!(!tree.syntax_eq(&changed));
+    let expected_changed = expected
+        .into_iter()
+        .map(|event| match event {
+            Event::Name(mut value, quoted) => {
+                value.push('!');
+                Event::Name(value, quoted)
+            }
+            Event::Number(value) => Event::Number(value + 1),
+            Event::Sort(ordering, null_ordering) => Event::Sort(
+                match ordering {
+                    SortOrdering::Ascending => SortOrdering::Descending,
+                    SortOrdering::Descending => SortOrdering::Ascending,
+                },
+                match null_ordering {
+                    NullOrdering::First => NullOrdering::Last,
+                    NullOrdering::Last => NullOrdering::First,
+                    NullOrdering::Undefined => NullOrdering::Undefined,
+                },
+            ),
+        })
+        .collect::<Vec<_>>();
+    let mut actual = Events::default();
+    actual.visit_expr(&changed);
+    assert_eq!(actual.0, expected_changed);
+    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
+        build::select(
+            vec![build::item(changed, None, false)],
+            Vec::new(),
+            None,
+            GroupBy::None,
+        )
+        .unwrap(),
+    ))));
+    crate::ast::validate_statement(&statement).unwrap();
+    drop(statement);
+    drop(tree);
+}

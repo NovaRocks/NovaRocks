@@ -120,7 +120,7 @@ pub(crate) fn is_literal_expr(expr: &ast::Expr) -> bool {
 
 pub(crate) fn plain_function(function: &ast::FunctionCall) -> bool {
     matches!(function.quantifier, ast::FunctionQuantifier::None)
-        && function.order_by.is_empty()
+        && function.order_by.is_none()
         && function.separator.is_none()
         && function.filter.is_none()
         && function.null_treatment.is_none()
@@ -130,7 +130,7 @@ pub(crate) fn plain_function(function: &ast::FunctionCall) -> bool {
 pub(crate) fn literal_query(query: &ast::Query) -> bool {
     query.functions.is_empty()
         && query.with.is_none()
-        && query.modifiers.order_by.is_empty()
+        && query.modifiers.order_by.is_none()
         && query.modifiers.limit.is_none()
         && query.modifiers.offset.is_none()
         && query.modifiers.fetch.is_none()
@@ -254,7 +254,7 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
 fn legacy_literal_query(query: &ast::Query) -> bool {
     if !query.functions.is_empty()
         || query.with.is_some()
-        || !query.modifiers.order_by.is_empty()
+        || query.modifiers.order_by.is_some()
         || query.modifiers.limit.is_some()
         || query.modifiers.offset.is_some()
         || query.modifiers.fetch.is_some()

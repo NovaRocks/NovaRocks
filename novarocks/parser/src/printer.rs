@@ -198,9 +198,9 @@ impl Printer {
     }
 
     fn write_query_modifiers(&mut self, modifiers: &QueryModifiers) {
-        if !modifiers.order_by.is_empty() {
+        if let Some(order_by) = &modifiers.order_by {
             self.output.push_str(" ORDER BY ");
-            self.write_order_by_list(&modifiers.order_by);
+            self.write_order_by_list(&order_by.items);
         }
         if modifiers.limit_comma_offset {
             let offset = modifiers
@@ -494,22 +494,26 @@ impl Printer {
         }
     }
 
-    fn write_order_by_list(&mut self, order_by: &[OrderByExpr]) {
+    fn write_order_by_list(&mut self, order_by: &[SortItem]) {
         for (index, order) in order_by.iter().enumerate() {
             if index != 0 {
                 self.output.push_str(", ");
             }
-            self.write_expr(&order.expr);
-            match order.asc {
-                Some(true) => self.output.push_str(" ASC"),
-                Some(false) => self.output.push_str(" DESC"),
-                None => {}
-            }
-            match order.nulls_first {
-                Some(true) => self.output.push_str(" NULLS FIRST"),
-                Some(false) => self.output.push_str(" NULLS LAST"),
-                None => {}
-            }
+            self.write_sort_item(order);
+        }
+    }
+
+    #[recursive::recursive]
+    fn write_sort_item(&mut self, item: &SortItem) {
+        self.write_expr(&item.sort_key);
+        self.output.push_str(match item.ordering {
+            SortOrdering::Ascending => " ASC",
+            SortOrdering::Descending => " DESC",
+        });
+        match item.null_ordering {
+            NullOrdering::First => self.output.push_str(" NULLS FIRST"),
+            NullOrdering::Last => self.output.push_str(" NULLS LAST"),
+            NullOrdering::Undefined => {}
         }
     }
 
@@ -712,12 +716,12 @@ impl Printer {
             self.write_expr_list(&specification.partition_by);
             needs_separator = true;
         }
-        if !specification.order_by.is_empty() {
+        if let Some(order_by) = &specification.order_by {
             if needs_separator {
                 self.output.push(' ');
             }
             self.output.push_str("ORDER BY ");
-            self.write_order_by_list(&specification.order_by);
+            self.write_order_by_list(&order_by.items);
             needs_separator = true;
         }
         if let Some(frame) = &specification.window_frame {
@@ -1049,7 +1053,7 @@ impl Printer {
             && call.name.parts[0].value.eq_ignore_ascii_case("EXTRACT")
             && call.arguments.len() == 2
             && matches!(call.quantifier, FunctionQuantifier::None)
-            && call.order_by.is_empty()
+            && call.order_by.is_none()
             && call.separator.is_none()
             && call.filter.is_none()
             && call.null_treatment.is_none()
@@ -1067,7 +1071,7 @@ impl Printer {
             && call.name.parts[0].value.eq_ignore_ascii_case("SUBSTRING")
             && matches!(call.arguments.len(), 2 | 3)
             && matches!(call.quantifier, FunctionQuantifier::None)
-            && call.order_by.is_empty()
+            && call.order_by.is_none()
             && call.separator.is_none()
             && call.filter.is_none()
             && call.null_treatment.is_none()
@@ -1101,27 +1105,12 @@ impl Printer {
                 NullTreatment::RespectNulls => "RESPECT NULLS",
             });
         }
-        if !call.order_by.is_empty() {
+        if let Some(order_by) = &call.order_by {
             if !call.arguments.is_empty() {
                 self.output.push(' ');
             }
             self.output.push_str("ORDER BY ");
-            for (index, order) in call.order_by.iter().enumerate() {
-                if index != 0 {
-                    self.output.push_str(", ");
-                }
-                self.write_expr(&order.expr);
-                match order.asc {
-                    Some(true) => self.output.push_str(" ASC"),
-                    Some(false) => self.output.push_str(" DESC"),
-                    None => {}
-                }
-                match order.nulls_first {
-                    Some(true) => self.output.push_str(" NULLS FIRST"),
-                    Some(false) => self.output.push_str(" NULLS LAST"),
-                    None => {}
-                }
-            }
+            self.write_order_by_list(&order_by.items);
         }
         if let Some(separator) = &call.separator {
             self.output.push_str(" SEPARATOR ");
@@ -2371,14 +2360,14 @@ mod tests {
             name: object_name("Coalesce"),
             arguments: vec![identifier("a"), number("1")],
             quantifier: FunctionQuantifier::Distinct,
-            order_by: Vec::new(),
+            order_by: None,
             separator: None,
             filter: Some(Box::new(crate::build::is_null(identifier("b"), true))),
             null_treatment: Some(NullTreatment::IgnoreNulls),
             over: Some(Box::new(WindowSpec {
                 existing_window_name: None,
                 partition_by: vec![identifier("partition_key")],
-                order_by: Vec::new(),
+                order_by: None,
                 window_frame: None,
                 span: span(),
             })),
@@ -2489,12 +2478,16 @@ mod tests {
                 qualify: None,
                 windows: Vec::new(),
                 modifiers: QueryModifiers {
-                    order_by: vec![OrderByExpr {
-                        expr: identifier("value"),
-                        asc: Some(false),
-                        nulls_first: Some(false),
+                    order_by: Some(OrderBy {
+                        items: vec![SortItem {
+                            sort_key: identifier("value"),
+                            ordering: SortOrdering::Descending,
+                            null_ordering: NullOrdering::Last,
+                            span: span(),
+                        }]
+                        .into(),
                         span: span(),
-                    }],
+                    }),
                     limit: Some(number("10")),
                     offset: Some(Offset {
                         value: number("2"),

@@ -925,8 +925,13 @@ impl<'a> AnalyzerContext<'a> {
             let (mut body, body_output) = ctx.analyze_set_expr(set_expr)?;
 
             // Analyze ORDER BY
-            let order_by =
-                ctx.analyze_order_by(&modifiers.order_by, select, span, &body_output, &body)?;
+            let order_by = ctx.analyze_order_by(
+                modifiers.order_by.as_ref(),
+                select,
+                span,
+                &body_output,
+                &body,
+            )?;
             if let QueryBody::Select(select) = &mut body {
                 ctx.validate_grouping_calls(&select.group_by)?;
                 ctx.append_grouping_calls(select);
@@ -2533,15 +2538,22 @@ impl<'a> AnalyzerContext<'a> {
     /// Analyze ORDER BY clause.
     fn analyze_order_by(
         &self,
-        order_by_exprs: &[ast::OrderByExpr],
+        order_by: Option<&ast::OrderBy>,
         ast_select: Option<&ast::Select>,
         span: novarocks_parser::Span,
         body_output: &[OutputColumn],
         body: &QueryBody,
     ) -> Result<Vec<SortItem>, AnalyzeError> {
-        if order_by_exprs.is_empty() {
+        let Some(order_by) = order_by else {
             return Ok(vec![]);
+        };
+        if order_by.items.is_empty() {
+            return Err(AnalyzeError::invalid_argument(
+                "ORDER BY requires a sort key",
+                order_by.span,
+            ));
         }
+        let order_by_exprs = &order_by.items;
 
         // Build a projection scope from body output columns for ORDER BY resolution.
         let mut projection_scope = self.new_scope();
@@ -2591,7 +2603,7 @@ impl<'a> AnalyzerContext<'a> {
         for ob in order_by_exprs {
             // Try resolving against the projection scope first, then fall back
             // to a numeric literal reference (ORDER BY 1, 2, ...)
-            let typed = match &ob.expr {
+            let typed = match &ob.sort_key {
                 ast::Expr::Literal(ast::Literal {
                     kind:
                         ast::LiteralKind::Long {
@@ -2603,7 +2615,7 @@ impl<'a> AnalyzerContext<'a> {
                     let pos: usize = usize::try_from(*n).map_err(|e| {
                         AnalyzeError::invalid_literal(
                             format!("invalid ORDER BY position: {e}"),
-                            ob.expr.span(),
+                            ob.sort_key.span(),
                         )
                     })?;
                     if pos == 0 || pos > body_output.len() {
@@ -2612,7 +2624,7 @@ impl<'a> AnalyzerContext<'a> {
                                 "ORDER BY position {pos} is out of range (1..{})",
                                 body_output.len()
                             ),
-                            ob.expr.span(),
+                            ob.sort_key.span(),
                         ));
                     }
                     let col = &body_output[pos - 1];
@@ -2630,7 +2642,7 @@ impl<'a> AnalyzerContext<'a> {
                     // a SELECT list expression. If so, resolve as a reference to
                     // the output alias. This handles ORDER BY count(x) matching
                     // SELECT count(x) as alias.
-                    let ob_text = expr_syntax_key(&ob.expr);
+                    let ob_text = expr_syntax_key(&ob.sort_key);
                     let mut matched_alias = None;
                     // Match ORDER BY expression text against SELECT item
                     // expressions (not aliases). This handles ORDER BY
@@ -2649,7 +2661,7 @@ impl<'a> AnalyzerContext<'a> {
                         // for plain identifiers; AST-text matching is still
                         // useful for `ORDER BY a.c` echoing `SELECT a.c`,
                         // where preserving qualifiers matters.
-                        let ob_is_bare_ident = matches!(ob.expr, ast::Expr::Identifier(_));
+                        let ob_is_bare_ident = matches!(ob.sort_key, ast::Expr::Identifier(_));
                         for (ast_item, ir_item) in
                             ast_sel.projection.iter().zip(sel.projection.iter())
                         {
@@ -2723,7 +2735,7 @@ impl<'a> AnalyzerContext<'a> {
                         alias_ref
                     } else {
                         // Try projection scope first, then fall back to FROM scope
-                        match self.analyze_expr(&ob.expr, &projection_scope) {
+                        match self.analyze_expr(&ob.sort_key, &projection_scope) {
                             Ok(typed) => {
                                 if let QueryBody::Select(sel) = body {
                                     self.substitute_select_aliases(typed, &sel.projection)
@@ -2736,7 +2748,7 @@ impl<'a> AnalyzerContext<'a> {
                                 if let QueryBody::Select(sel) = body {
                                     if let Some(ref from_rel) = sel.from {
                                         let (_, from_scope) = self.rebuild_from_scope(from_rel)?;
-                                        match self.analyze_expr(&ob.expr, &from_scope) {
+                                        match self.analyze_expr(&ob.sort_key, &from_scope) {
                                             Ok(typed) => self
                                                 .substitute_select_aliases(typed, &sel.projection),
                                             Err(error) if error.control_error().is_some() => {
@@ -2759,7 +2771,8 @@ impl<'a> AnalyzerContext<'a> {
                                                         );
                                                     }
                                                 }
-                                                match self.analyze_expr(&ob.expr, &alias_scope) {
+                                                match self.analyze_expr(&ob.sort_key, &alias_scope)
+                                                {
                                                     Ok(typed) => self.substitute_select_aliases(
                                                         typed,
                                                         &sel.projection,
@@ -2802,8 +2815,7 @@ impl<'a> AnalyzerContext<'a> {
                 ));
             }
 
-            let asc = ob.asc.unwrap_or(true);
-            let nulls_first = ob.nulls_first.unwrap_or(asc);
+            let (asc, nulls_first) = helpers::sort_item_flags(ob);
 
             sort_items.push(SortItem {
                 expr: typed,

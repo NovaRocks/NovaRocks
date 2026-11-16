@@ -189,7 +189,7 @@ fn register_literal_assignments<'a>(
             }
             ast::Expr::FunctionCall(function)
                 if matches!(function.quantifier, ast::FunctionQuantifier::None)
-                    && function.order_by.is_empty()
+                    && function.order_by.is_none()
                     && function.separator.is_none()
                     && function.filter.is_none()
                     && function.null_treatment.is_none()

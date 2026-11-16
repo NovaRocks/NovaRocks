@@ -131,7 +131,7 @@ fn shape_insert_source_in(
     let uncontrolled_values = matches!(source.body.as_ref(), ast::SetExpr::Values(_))
         && source.functions.is_empty()
         && source.with.is_none()
-        && source.modifiers.order_by.is_empty()
+        && source.modifiers.order_by.is_none()
         && source.modifiers.limit.is_none()
         && source.modifiers.offset.is_none()
         && source.modifiers.fetch.is_none();
@@ -1092,7 +1092,7 @@ pub(crate) fn attach_write_literal_contexts(
 fn source_assignment_before_common_type(query: &ast::Query) -> bool {
     if !query.functions.is_empty()
         || query.with.is_some()
-        || !query.modifiers.order_by.is_empty()
+        || query.modifiers.order_by.is_some()
         || query.modifiers.limit.is_some()
         || query.modifiers.offset.is_some()
         || query.modifiers.fetch.is_some()

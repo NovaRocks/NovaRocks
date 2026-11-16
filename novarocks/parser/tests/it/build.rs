@@ -81,7 +81,7 @@ fn query_suffixes_keep_specification_and_parenthesized_owners_distinct() {
         let SetExpr::Select(select) = parsed.body.as_ref() else {
             panic!("SELECT")
         };
-        assert_eq!(select.modifiers.order_by.len(), 1);
+        assert_eq!(select.modifiers.order_by.as_ref().unwrap().items.len(), 1);
         assert!(select.modifiers.limit.is_some());
         assert!(select.modifiers.offset.is_some());
         ast::validate_statement(&ast::Statement::Query(parsed.clone())).unwrap();
@@ -93,7 +93,7 @@ fn query_suffixes_keep_specification_and_parenthesized_owners_distinct() {
         "(SELECT 11 ORDER BY 1 LIMIT 7 OFFSET 3) ORDER BY 1 LIMIT 5 OFFSET 2",
     ] {
         let parsed = query(source);
-        assert_eq!(parsed.modifiers.order_by.len(), 1);
+        assert_eq!(parsed.modifiers.order_by.as_ref().unwrap().items.len(), 1);
         assert!(parsed.modifiers.limit.is_some());
         assert!(parsed.modifiers.offset.is_some());
         assert!(parsed.syntax_eq(&query(&novarocks_parser::printer::print_query(&parsed))));

@@ -641,8 +641,13 @@ fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, ex
                 for expression in &window.specification.partition_by {
                     visitor.visit_expr(expression);
                 }
-                for order in &window.specification.order_by {
-                    visitor.visit_expr(&order.expr);
+                for order in window
+                    .specification
+                    .order_by
+                    .iter()
+                    .flat_map(|order| &order.items)
+                {
+                    visitor.visit_expr(&order.sort_key);
                 }
                 if let Some(frame) = &window.specification.window_frame {
                     scan_window_frame_bound_for_table_reference(visitor, &frame.start_bound);
@@ -829,7 +834,7 @@ fn remove_bare_top_level_dual(query: &mut Query) {
         || select.qualify.is_some()
         || !select.windows.is_empty()
         || !select.modifiers.is_empty()
-        || !query.modifiers.order_by.is_empty()
+        || query.modifiers.order_by.is_some()
         || query.modifiers.limit.is_some()
         || query.modifiers.offset.is_some()
         || query.modifiers.fetch.is_some()

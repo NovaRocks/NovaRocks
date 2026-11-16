@@ -46,6 +46,8 @@ pub enum SqlConstantExpressionStep {
     DereferenceBase,
     SubscriptBase,
     SubscriptIndex,
+    FunctionOrderByKey(usize),
+    WindowOrderByKey(usize),
     CaseOperand,
     CaseWhenOperand(usize),
     CaseResult(usize),
@@ -57,6 +59,8 @@ pub enum SqlConstantExpressionStep {
 pub enum SqlConstantExpressionSite {
     ValuesCell { row: usize, column: usize },
     SelectProjection { column: usize },
+    QueryOrderByKey { index: usize },
+    SelectOrderByKey { index: usize },
 }
 #[derive(Clone, Debug)]
 pub struct SqlExpressionConstant {
@@ -111,17 +115,22 @@ pub(crate) fn resolve_expression_site<'a>(
     allow_set_operations: bool,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<&'a ast::Expr, SqlCompileError> {
+    let mut query_owner = Some(query);
     let mut body = query.body.as_ref();
     for step in body_path {
         work.step()?;
         body = match (step, body) {
-            (SqlConstantQueryStep::NestedQuery, ast::SetExpr::Query(query)) => query.body.as_ref(),
+            (SqlConstantQueryStep::NestedQuery, ast::SetExpr::Query(query)) => {
+                query_owner = Some(query);
+                query.body.as_ref()
+            }
             (SqlConstantQueryStep::SetOperand { index }, ast::SetExpr::SetOperation(op))
                 if op.corresponding.is_none()
                     && (allow_set_operations
                         || (op.operator == ast::SetOperator::Union
                             && op.quantifier == ast::SetQuantifier::All)) =>
             {
+                query_owner = None;
                 op.inputs.get(*index).ok_or_else(|| {
                     invalid("constant source set operand index differs from its owned query")
                 })?
@@ -134,6 +143,7 @@ pub(crate) fn resolve_expression_site<'a>(
                         "constant source path differs from its owned derived relation",
                     ));
                 };
+                query_owner = Some(subquery);
                 subquery.body.as_ref()
             }
             _ => {
@@ -145,6 +155,18 @@ pub(crate) fn resolve_expression_site<'a>(
     }
     work.step()?;
     let mut expression = match (site, body) {
+        (SqlConstantExpressionSite::QueryOrderByKey { index }, _) => query_owner
+            .and_then(|owner| owner.modifiers.order_by.as_ref())
+            .and_then(|order| order.items.get(index))
+            .map(|item| &item.sort_key),
+        (SqlConstantExpressionSite::SelectOrderByKey { index }, ast::SetExpr::Select(select)) => {
+            select
+                .modifiers
+                .order_by
+                .as_ref()
+                .and_then(|order| order.items.get(index))
+                .map(|item| &item.sort_key)
+        }
         (SqlConstantExpressionSite::ValuesCell { row, column }, ast::SetExpr::Values(values)) => {
             values.rows.get(row).and_then(|row| row.get(column))
         }
@@ -224,6 +246,32 @@ pub(crate) fn resolve_expression_site<'a>(
             }
             (SqlConstantExpressionStep::SubscriptBase, ast::Expr::Subscript(node)) => &node.base,
             (SqlConstantExpressionStep::SubscriptIndex, ast::Expr::Subscript(node)) => &node.index,
+            (
+                SqlConstantExpressionStep::FunctionOrderByKey(index),
+                ast::Expr::FunctionCall(call),
+            ) => {
+                &call
+                    .order_by
+                    .as_ref()
+                    .and_then(|order| order.items.get(*index))
+                    .ok_or_else(|| {
+                        invalid(
+                            "constant source function ORDER BY key differs from its owned syntax",
+                        )
+                    })?
+                    .sort_key
+            }
+            (SqlConstantExpressionStep::WindowOrderByKey(index), ast::Expr::FunctionCall(call)) => {
+                &call
+                    .over
+                    .as_ref()
+                    .and_then(|window| window.order_by.as_ref())
+                    .and_then(|order| order.items.get(*index))
+                    .ok_or_else(|| {
+                        invalid("constant source window ORDER BY key differs from its owned syntax")
+                    })?
+                    .sort_key
+            }
             (SqlConstantExpressionStep::CaseOperand, ast::Expr::SimpleCase(case)) => &case.operand,
             (SqlConstantExpressionStep::CaseWhenOperand(index), ast::Expr::SearchedCase(case)) => {
                 case_when_operand(&case.when_clauses, *index)?

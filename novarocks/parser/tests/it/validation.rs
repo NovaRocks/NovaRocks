@@ -197,7 +197,7 @@ fn named_window(
         specification: WindowSpec {
             existing_window_name: None,
             partition_by: Vec::new(),
-            order_by: Vec::new(),
+            order_by: None,
             window_frame: frame,
             span: SPAN,
         },

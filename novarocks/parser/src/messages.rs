@@ -48,6 +48,9 @@ pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
         StructuralViolation::InvalidSetOperationOperandCount => {
             "invalid SQL structure: invalid set operation operand count".to_owned()
         }
+        StructuralViolation::EmptyOrderBy => {
+            "invalid SQL structure: empty ORDER BY list".to_owned()
+        }
         StructuralViolation::EmptyInList => "invalid SQL structure: empty IN list".to_owned(),
         StructuralViolation::InvalidLogicalTermCount => {
             "invalid SQL structure: logical expression requires at least two terms".to_owned()

@@ -531,8 +531,8 @@ impl<'a> CatalogNeedCollector<'a> {
         modifiers: &ast::QueryModifiers,
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
-        for order in &modifiers.order_by {
-            self.collect_expr(&order.expr, scope)?;
+        for order in modifiers.order_by.iter().flat_map(|order| &order.items) {
+            self.collect_expr(&order.sort_key, scope)?;
         }
         if let Some(limit) = &modifiers.limit {
             self.collect_expr(limit, scope)?;
@@ -651,8 +651,8 @@ impl<'a> CatalogNeedCollector<'a> {
         for expression in &window.partition_by {
             self.collect_expr(expression, scope)?;
         }
-        for order in &window.order_by {
-            self.collect_expr(&order.expr, scope)?;
+        for order in window.order_by.iter().flat_map(|order| &order.items) {
+            self.collect_expr(&order.sort_key, scope)?;
         }
         if let Some(frame) = &window.window_frame {
             self.collect_window_bound(&frame.start_bound, scope)?;
