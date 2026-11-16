@@ -240,6 +240,8 @@ pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut Validatio
                 }
                 if matches!(&route.requirements.colocation, crate::WriteColocation::ByKey(keys) if keys.is_empty())
                     || matches!(&route.requirements.layout, crate::WriteLayoutPreference::ClusterBy(keys) if keys.is_empty())
+                    || matches!(&route.requirements.layout, crate::WriteLayoutPreference::PartitionAffinity(keys)
+                        if keys.is_empty() || route.requirements.colocation != crate::WriteColocation::None)
                     || route
                         .requirements
                         .colocation_keys()
@@ -864,6 +866,46 @@ pub(crate) fn validate_edge(
         }
     }
     validate_edge_partitioning(edge, &path, errors);
+    if !edge.partitioning.routing_only.is_empty() {
+        let recipe = plan.write_layouts().get(&(source.id(), source.root()));
+        let source_root = source.nodes().get(&source.root());
+        let destination_root = destination.nodes().get(&destination.root());
+        let matches = match (
+            recipe,
+            source_root.map(|node| &node.kind),
+            destination_root.map(|node| &node.kind),
+        ) {
+            (
+                Some(recipe),
+                Some(NodeKind::WriteLayoutKey { key_inputs, .. }),
+                Some(NodeKind::TableWriter { target }),
+            ) => {
+                let header = target.handle.header();
+                let fields = target
+                    .target_fields
+                    .iter()
+                    .map(|field| (field.token, field.input))
+                    .collect::<BTreeMap<_, _>>();
+                let imports = ValueMappingIndex::from_pairs(&edge.destination.receive_mapping);
+                header.provider_id() == &recipe.binding().descriptor().provider_id
+                    && header.catalog() == recipe.binding().catalog_handle()
+                    && header.codec_revision() == recipe.payload().header().codec_revision()
+                    && recipe.inputs().len() == key_inputs.len()
+                    && recipe.inputs().iter().zip(key_inputs).all(|(token, key)| {
+                        fields
+                            .get(token)
+                            .is_some_and(|input| imports.contains(*key, *input))
+                    })
+            }
+            _ => false,
+        };
+        if !matches {
+            errors.push(ValidationError::new(
+                &path,
+                "partition affinity does not belong to its exact destination writer provider",
+            ));
+        }
+    }
     match destination.nodes().get(&edge.destination.node) {
         Some(node)
             if matches!(
@@ -873,7 +915,8 @@ pub(crate) fn validate_edge(
                         && imports.as_ref() == edge.destination.receive_mapping.as_ref()
             ) =>
         {
-            if node.output_properties.distribution != edge.partitioning.destination
+            if node.output_properties.distribution
+                != edge.partitioning.destination_output_distribution()
                 || node.output_properties.row_multiplicity
                     != edge.partitioning.destination_multiplicity
                 || !node.output_properties.ordering.is_empty()
@@ -910,58 +953,87 @@ pub(crate) fn validate_mapped_partitioning(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    let layout_valid = match (&partitioning.source, &partitioning.destination) {
-        (Distribution::Unconstrained, Distribution::Unconstrained)
-        | (Distribution::Singleton, Distribution::Singleton)
-        | (Distribution::RoundRobin, Distribution::RoundRobin)
-        | (Distribution::Broadcast, Distribution::Broadcast) => true,
-        (
-            Distribution::Hash {
-                keys: source_keys,
-                scheme: source_scheme,
-            },
-            Distribution::Hash {
-                keys: destination_keys,
-                scheme: destination_scheme,
-            },
-        ) => {
-            source_scheme == destination_scheme
-                && mapped_partition_keys_match(source_keys, destination_keys, mapping)
+    let layout_valid = if !partitioning.routing_only.is_empty() {
+        match (
+            &partitioning.source,
+            &partitioning.destination,
+            partitioning.routing_only.as_ref(),
+        ) {
+            (
+                Distribution::Hash {
+                    keys: source_keys,
+                    scheme: source_scheme,
+                },
+                Distribution::Hash {
+                    keys: destination_keys,
+                    scheme: destination_scheme,
+                },
+                [(source, destination)],
+            ) => {
+                source_scheme == destination_scheme
+                    && source_scheme.definition.algorithm
+                        == novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
+                    && source_keys.as_ref() == [*source]
+                    && destination_keys.as_ref() == [*destination]
+                    && !mapping.iter().any(|(s, d)| s == source || d == destination)
+                    && partitioning.source_multiplicity == RowMultiplicity::SingleCopy
+            }
+            _ => false,
         }
-        (
-            Distribution::ConditionalKey {
-                applies: source_applies,
-                keys: source_keys,
-                scheme: source_scheme,
-            },
-            Distribution::ConditionalKey {
-                applies: destination_applies,
-                keys: destination_keys,
-                scheme: destination_scheme,
-            },
-        ) => {
-            source_scheme == destination_scheme
-                && mapped_partition_keys_match(
-                    std::slice::from_ref(source_applies),
-                    std::slice::from_ref(destination_applies),
-                    mapping,
-                )
-                && mapped_partition_keys_match(source_keys, destination_keys, mapping)
+    } else {
+        match (&partitioning.source, &partitioning.destination) {
+            (Distribution::Unconstrained, Distribution::Unconstrained)
+            | (Distribution::Singleton, Distribution::Singleton)
+            | (Distribution::RoundRobin, Distribution::RoundRobin)
+            | (Distribution::Broadcast, Distribution::Broadcast) => true,
+            (
+                Distribution::Hash {
+                    keys: source_keys,
+                    scheme: source_scheme,
+                },
+                Distribution::Hash {
+                    keys: destination_keys,
+                    scheme: destination_scheme,
+                },
+            ) => {
+                source_scheme == destination_scheme
+                    && mapped_partition_keys_match(source_keys, destination_keys, mapping)
+            }
+            (
+                Distribution::ConditionalKey {
+                    applies: source_applies,
+                    keys: source_keys,
+                    scheme: source_scheme,
+                },
+                Distribution::ConditionalKey {
+                    applies: destination_applies,
+                    keys: destination_keys,
+                    scheme: destination_scheme,
+                },
+            ) => {
+                source_scheme == destination_scheme
+                    && mapped_partition_keys_match(
+                        std::slice::from_ref(source_applies),
+                        std::slice::from_ref(destination_applies),
+                        mapping,
+                    )
+                    && mapped_partition_keys_match(source_keys, destination_keys, mapping)
+            }
+            (
+                Distribution::BucketShuffle {
+                    keys: source_keys,
+                    scheme: source_scheme,
+                },
+                Distribution::BucketShuffle {
+                    keys: destination_keys,
+                    scheme: destination_scheme,
+                },
+            ) => {
+                source_scheme == destination_scheme
+                    && mapped_partition_keys_match(source_keys, destination_keys, mapping)
+            }
+            _ => false,
         }
-        (
-            Distribution::BucketShuffle {
-                keys: source_keys,
-                scheme: source_scheme,
-            },
-            Distribution::BucketShuffle {
-                keys: destination_keys,
-                scheme: destination_scheme,
-            },
-        ) => {
-            source_scheme == destination_scheme
-                && mapped_partition_keys_match(source_keys, destination_keys, mapping)
-        }
-        _ => false,
     };
     let multiplicity_valid = if partitioning.destination == Distribution::Broadcast {
         partitioning.source_multiplicity == RowMultiplicity::SingleCopy
@@ -1062,12 +1134,7 @@ pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext
                                 ));
                             }
                             validate_router_writer_contract(plan, route, edge, &path, errors);
-                            validate_router_partitioning(
-                                route,
-                                &edge.partitioning.source,
-                                &path,
-                                errors,
-                            );
+                            validate_router_partitioning(route, &edge.partitioning, &path, errors);
                         }
                         Some(_) => errors.push(ValidationError::new(
                             &path,
@@ -1168,7 +1235,7 @@ pub(crate) fn validate_router_writer_contract(
             "router write target ordinal differs from its destination table writer",
         ));
     }
-    if target.required_distribution != edge.partitioning.destination {
+    if target.required_distribution != edge.partitioning.destination_output_distribution() {
         errors.push(ValidationError::new(
             path,
             "router edge destination distribution differs from its table writer requirement",
@@ -1198,15 +1265,26 @@ pub(crate) fn validate_router_writer_contract(
 
 pub(crate) fn validate_router_partitioning(
     route: &crate::ChangeStreamRoute,
-    source_distribution: &Distribution,
+    partitioning: &crate::EdgePartitioning,
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    let matches = match (&route.requirements.colocation, source_distribution) {
+    let affinity = matches!(
+        route.requirements.layout,
+        crate::WriteLayoutPreference::PartitionAffinity(_)
+    );
+    let matches = match (&route.requirements.colocation, &partitioning.source) {
+        (crate::WriteColocation::None, Distribution::Hash { .. }) if affinity => {
+            !partitioning.routing_only.is_empty()
+        }
         (crate::WriteColocation::None, Distribution::RoundRobin)
-        | (crate::WriteColocation::Singleton, Distribution::Singleton) => true,
+        | (crate::WriteColocation::Singleton, Distribution::Singleton) => {
+            !affinity && partitioning.routing_only.is_empty()
+        }
         (crate::WriteColocation::ByKey(required), Distribution::Hash { keys, scheme }) => {
-            !required.is_empty()
+            !affinity
+                && partitioning.routing_only.is_empty()
+                && !required.is_empty()
                 && keys.as_ref() == required.as_ref()
                 && scheme.definition.algorithm
                     == novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
@@ -1570,6 +1648,69 @@ pub(crate) fn validate_result_port_fields(
     }
 }
 
+pub(crate) fn validate_write_layout_recipes<'a>(
+    fragment: &Fragment,
+    recipes: impl IntoIterator<
+        Item = (
+            NodeId,
+            &'a novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft,
+        ),
+    >,
+    errors: &mut ValidationContext,
+) {
+    let expected = fragment
+        .nodes()
+        .get(&fragment.root())
+        .and_then(|node| match &node.kind {
+            NodeKind::WriteLayoutKey { key_inputs, .. } => Some((node.id, key_inputs.as_ref())),
+            _ => None,
+        });
+    let mut found = false;
+    let path = format!("fragments[{}].layouts", fragment.id().get());
+    for (id, recipe) in recipes {
+        let matches = expected.is_some_and(|(node, inputs)| {
+            if id != node || inputs.len() != recipe.inputs().len() {
+                return false;
+            }
+            let FragmentSink::Router { routes, .. } = fragment.sink() else {
+                return true;
+            };
+            let mut affinity = routes.iter().filter(|route| {
+                matches!(
+                    route.requirements.layout,
+                    crate::WriteLayoutPreference::PartitionAffinity(_)
+                )
+            });
+            affinity.next().is_some_and(|route| {
+                let inputs_by_token = route
+                    .input_mapping
+                    .iter()
+                    .copied()
+                    .collect::<BTreeMap<_, _>>();
+                route.requirements.layout_keys() == inputs
+                    && recipe
+                        .inputs()
+                        .iter()
+                        .zip(inputs)
+                        .all(|(token, value)| inputs_by_token.get(token) == Some(value))
+            }) && affinity.next().is_none()
+        });
+        if found || !matches {
+            errors.push(ValidationError::new(
+                &path,
+                "layout recipe differs from its exact write layout key inputs",
+            ));
+        }
+        found = true;
+    }
+    if expected.is_some() && !found {
+        errors.push(ValidationError::new(
+            &path,
+            "write layout key node has no provider recipe",
+        ));
+    }
+}
+
 pub(crate) fn validate_cross_fragment_value_origins(
     plan: &PhysicalPlan,
     errors: &mut ValidationContext,
@@ -1600,9 +1741,12 @@ pub(crate) fn validate_cross_fragment_value_origins(
                 {
                     Some(edge_contract)
                         if edge_contract.destination.fragment == fragment.id()
-                            && receive_mappings.get(&edge).is_some_and(|mapping| {
+                            && (receive_mappings.get(&edge).is_some_and(|mapping| {
                                 mapping.contains(&(source_value, value.id))
-                            }) => {}
+                            }) || edge_contract
+                                .partitioning
+                                .routing_only
+                                .contains(&(source_value, value.id))) => {}
                     Some(_) => errors.push(ValidationError::new(
                         &path,
                         "exchange import is not present in the edge receive mapping",

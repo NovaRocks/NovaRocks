@@ -21,7 +21,7 @@ pub(crate) fn inbound_cut_output_properties(
     cut: &crate::InboundFragmentCut,
 ) -> crate::PhysicalProperties {
     crate::PhysicalProperties {
-        distribution: cut.partitioning.destination.clone(),
+        distribution: cut.partitioning.destination_output_distribution(),
         row_multiplicity: cut.partitioning.destination_multiplicity,
         ordering: Box::default(),
     }
@@ -219,6 +219,10 @@ pub(crate) fn preflight_fragment_cut_resources(
             usage.add_items(kind.fields().len() * 2);
         }
         usage.add_items(edge.destination.receive_mapping.len() * if is_outbound { 2 } else { 1 });
+        usage.add_items(edge.partitioning.routing_only.len());
+        usage.add_bytes(std::mem::size_of_val(
+            edge.partitioning.routing_only.as_ref(),
+        ));
         usage.add_distribution(&edge.partitioning.source);
         usage.add_distribution(&edge.partitioning.destination);
         for (source_value, _) in &edge.destination.receive_mapping {
@@ -541,6 +545,39 @@ pub(crate) fn validate_fragment_cuts_into(
             &path,
             errors,
         );
+        if let [(source, destination)] = cut.partitioning.routing_only.as_ref() {
+            let exact_import = fragment.values().get(destination).is_some_and(|value| {
+                value.ty == crate::ValueType::new(arrow_schema::DataType::Int64, false)
+                    && value.origin
+                        == (ValueOrigin::ExchangeImport {
+                            edge: cut.edge,
+                            source_value: *source,
+                        })
+            });
+            let exact_writer = fragment.nodes().get(&fragment.root()).is_some_and(|node| {
+                matches!(&node.kind, NodeKind::TableWriter { target }
+                    if node.inputs.as_ref() == [cut.destination_node]
+                        && target.required_distribution == crate::Distribution::Unconstrained)
+            });
+            if cut.source_port != crate::FragmentOutputPort::Root
+                || !matches!(
+                    cut.payload,
+                    crate::ExchangePayloadContract::Relational
+                        | crate::ExchangePayloadContract::ProviderRoute(_)
+                )
+                || !matches!(
+                    cut.kind,
+                    crate::EdgeKind::Stream | crate::EdgeKind::ChangeStreamRouter
+                )
+                || !exact_import
+                || !exact_writer
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "routing-only values must terminate before their exact receiving table writer",
+                ));
+            }
+        }
         for import in &cut.imports {
             match fragment.values().get(&import.destination) {
                 // The imported column may admit null the sender never writes;
@@ -621,7 +658,11 @@ pub(crate) fn validate_fragment_cuts_into(
             ValueOrigin::ExchangeImport { edge, source_value } => {
                 inbound_indexes.get(&edge).is_some_and(|(cut, imports)| {
                     cut.kind != crate::EdgeKind::CteMulticast
-                        && imports.contains(source_value, value.id)
+                        && (imports.contains(source_value, value.id)
+                            || cut
+                                .partitioning
+                                .routing_only
+                                .contains(&(source_value, value.id)))
                 })
             }
             ValueOrigin::CteImport {
@@ -651,8 +692,48 @@ pub(crate) fn validate_fragment_cuts_into(
         .nodes()
         .get(&fragment.root())
         .map(|root| root.output_properties.row_multiplicity);
+    let layout_key = fragment
+        .nodes()
+        .get(&fragment.root())
+        .and_then(|root| match root.kind {
+            NodeKind::WriteLayoutKey { output_key, .. } => Some(output_key),
+            _ => None,
+        });
+    let mut layout_edges = 0;
     let mut outbound_ids = BTreeSet::new();
     for cut in &cuts.outbound {
+        if let [(source, _)] = cut.partitioning.routing_only.as_ref() {
+            layout_edges += 1;
+            if layout_key != Some(*source)
+                || cut.source_port != crate::FragmentOutputPort::Root
+                || !matches!(
+                    cut.payload,
+                    crate::ExchangePayloadContract::Relational
+                        | crate::ExchangePayloadContract::ProviderRoute(_)
+                )
+                || !matches!(
+                    cut.kind,
+                    crate::EdgeKind::Stream | crate::EdgeKind::ChangeStreamRouter
+                )
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "routing-only key must come from its exact sending fragment layout root",
+                ));
+            }
+        }
+        if cut
+            .projection
+            .iter()
+            .any(|value| Some(value.value) == layout_key)
+            || (cut.partitioning.routing_only.is_empty()
+                && distribution_values(&cut.partitioning.source).any(|key| Some(key) == layout_key))
+        {
+            errors.push(ValidationError::new(
+                &path,
+                "layout key crossed an edge as a logical value",
+            ));
+        }
         validate_summary_cut(
             fragment,
             cut.source_port,
@@ -754,6 +835,12 @@ pub(crate) fn validate_fragment_cuts_into(
             ));
         }
     }
+    if layout_key.is_some() && layout_edges != 1 {
+        errors.push(ValidationError::new(
+            &path,
+            "write layout key must serve exactly one outgoing edge",
+        ));
+    }
     let mut sink_edges = match fragment.sink() {
         FragmentSink::Stream { edge } => vec![*edge],
         FragmentSink::Multicast { edges } => edges.to_vec(),
@@ -813,7 +900,7 @@ pub(crate) fn validate_fragment_cuts_into(
                 ));
             }
             if let Some(cut) = cut {
-                validate_router_partitioning(route, &cut.partitioning.source, &path, errors);
+                validate_router_partitioning(route, &cut.partitioning, &path, errors);
                 let contribution = match (&cut.payload, &cut.partitioning.source) {
                     (
                         crate::ExchangePayloadContract::PositionContribution { group, .. },

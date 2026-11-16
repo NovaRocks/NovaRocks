@@ -19,7 +19,8 @@
 use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
 use novarocks_parser::{Span, ast};
 use novarocks_query_application::sql::session::registry::{
-    SessionPropertyError, SessionPropertyOrigin, SessionPropertyRegistry, SessionPropertyType,
+    SessionCatalogPropertyPort, SessionPropertyError, SessionPropertyRegistry, SessionPropertyType,
+    admit_catalog_properties,
 };
 use novarocks_query_application::sql::{
     session::{SessionSqlState, admit_session_set_assignment, session_property_error},
@@ -34,13 +35,17 @@ use novarocks_sql::compiler::{
     prepare_required_constant,
 };
 use novarocks_workload_control::{ResultWindowAlias, WorkScope};
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    sync::{Arc, RwLock},
+};
 
 pub(crate) struct SessionPropertyCpuInput {
     pub(crate) source: Arc<str>,
     pub(crate) set: ast::SetStatement,
     pub(crate) staged: SessionSqlState,
     pub(crate) registry: Arc<SessionPropertyRegistry>,
+    pub(crate) catalog_properties: Arc<dyn SessionCatalogPropertyPort>,
     pub(crate) interpreter: Arc<crate::RequiredConstantInterpreter>,
     pub(crate) control: SqlCompileControl,
     pub(crate) scope: WorkScope,
@@ -56,13 +61,35 @@ pub(crate) struct PreparedSessionProperties {
 impl SessionPropertyCpuInput {
     pub(crate) fn run(mut self) -> Result<PreparedSessionProperties, QueryServiceError> {
         let mut effects = SessionEffects::default();
+        let mut bound_catalogs = BTreeMap::new();
         for assignment in &self.set.assignments {
             admit_session_set_assignment(&self.source, assignment)?;
             let span = assignment.value.span();
-            let declaration = self
-                .registry
-                .lookup_system(&assignment.name.value, SessionPropertyOrigin::Sql)
-                .map_err(|e| property_error_at(e, &self.source, span))?;
+            let declaration = if let Some(catalog) = &assignment.catalog {
+                let catalog = novarocks_types::naming::normalize_identifier(&catalog.value)
+                    .map_err(|detail| {
+                        QueryServiceError::from_user_error(
+                            SessionAdmitError::InvalidSessionProperty.to_user_error(
+                                &self.source,
+                                catalog.span,
+                                detail,
+                            ),
+                        )
+                    })?;
+                let metadata = match bound_catalogs.entry(catalog) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let admitted =
+                            admit_catalog_properties(self.catalog_properties.as_ref(), entry.key())
+                                .map_err(session_property_error)?;
+                        entry.insert(admitted)
+                    }
+                };
+                metadata.lookup_sql(&assignment.name.value)
+            } else {
+                self.registry.lookup_sql_system(&assignment.name.value)
+            }
+            .map_err(|e| property_error_at(e, &self.source, span))?;
             let target = match declaration.value_type() {
                 SessionPropertyType::Boolean => RequiredConstantTarget::Boolean,
                 SessionPropertyType::Integer => RequiredConstantTarget::Integer,
@@ -88,9 +115,9 @@ impl SessionPropertyCpuInput {
             let value = self
                 .interpreter
                 .evaluate(prepared, &self.scope, &self.window)
-                .map_err(|e| evaluation_error(e, &assignment.name.value))?;
+                .map_err(|e| evaluation_error(e, &declaration.qualified_name()))?;
             let property = declaration
-                .validate_sql_value(&value, &self.control)
+                .validate_value(&value, &self.control)
                 .map_err(|e| property_error_at(e, &self.source, span))?;
             effects.append(SessionEffects::property(property));
         }
@@ -183,6 +210,23 @@ fn evaluation_error(error: SqlConstantEvaluationError, name: &str) -> QueryServi
 }
 
 #[cfg(test)]
+pub(super) struct NoCatalogProperties;
+
+#[cfg(test)]
+impl SessionCatalogPropertyPort for NoCatalogProperties {
+    fn session_property_catalog(
+        &self,
+        _catalog: &str,
+    ) -> Result<
+        novarocks_query_application::sql::session::registry::SessionCatalogPropertyAdmission,
+        QueryServiceError,
+    > {
+        use novarocks_query_application::sql::session::registry::SessionCatalogPropertyAdmission;
+        Ok(SessionCatalogPropertyAdmission::Absent)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use novarocks_workload_control::{
@@ -232,6 +276,7 @@ mod tests {
             SessionPropertyCpuInput {
                 source: Arc::from(sql), set: set.clone(), staged,
                 registry: Arc::new(SessionPropertyRegistry::new().unwrap()),
+                catalog_properties: Arc::new(NoCatalogProperties),
                 interpreter: Arc::new(crate::query_execution::required_constant_eval::test_required_constant_interpreter()),
                 control: SqlCompileControl::unbounded(), scope: self.root.owner.scope(), window: self.window.clone(),
                 catalog: Arc::new(RwLock::new(Default::default())),

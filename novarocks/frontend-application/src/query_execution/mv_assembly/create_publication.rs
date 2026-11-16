@@ -136,6 +136,7 @@ impl CreatePublicationInput {
                 let fields = plan.staged_write_fields(handle)?;
                 Ok(CreatePublicationOutput::Publication {
                     begin: ConnectorWriteBeginRequest {
+                        catalog_session: Default::default(),
                         table: Arc::from(format!(
                             "{}.{}",
                             plan.target.namespace, plan.target.table
@@ -176,9 +177,16 @@ pub(crate) struct EmptyCreateWrite {
     proof: Option<ConnectorStagedWriteProof>,
 }
 impl EmptyCreateWrite {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(
+        session_properties: Arc<
+            novarocks_query_application::sql::session::registry::SessionPropertyInputs,
+        >,
+    ) -> Self {
         Self {
-            begin: WriteBeginReceiving::new(Arc::new(Mutex::new(None))),
+            begin: WriteBeginReceiving::for_statement(
+                Arc::new(Mutex::new(None)),
+                session_properties,
+            ),
             session: None,
             call: None,
             needed: None,

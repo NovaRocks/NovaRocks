@@ -561,6 +561,7 @@ fn package_with_outputs(
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             package_admission(),
             &FixtureControl,

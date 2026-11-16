@@ -374,9 +374,25 @@ pub(crate) fn merge_on_read_input_shape() -> ConnectorWriteInputShape {
 /// perturbs only the input shape or the merge targets and asserts that the
 /// branch structure is what changes.
 pub(crate) fn session_material(input: ConnectorWriteInputShape) -> IcebergSessionMaterial {
+    use novarocks_connector_contract::ConnectorWriteBinding;
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorProviderId,
+    };
     let data = data_branch_plan();
+    let instance_id = ConnectorInstanceId::parse("unit").unwrap();
+    let write_binding = ConnectorWriteBinding::new(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse(crate::PROVIDER_ID).unwrap(),
+            instance_id: instance_id.clone(),
+        },
+        CatalogHandle::new(instance_id, CatalogVersion::from_bytes([1; 32])),
+    );
+    let table = table_facts();
     IcebergSessionMaterial {
-        table: table_facts(),
+        write_binding,
+        write_partition_spec_id: table.default_partition_spec_id(),
+        table,
         input,
         data_output: data.output,
         data_recipe: data.recipe,
@@ -430,12 +446,10 @@ pub(crate) fn equality_delete_recipe() -> IcebergEqualityDeleteRecipe {
 
 pub(crate) fn data_branch_plan() -> IcebergDataBranchPlan {
     IcebergDataBranchPlan {
-        output: IcebergWriterOutput::try_new(
+        output: IcebergWriterOutput::for_test(
             IcebergFileFormat::Parquet,
             parquet::basic::Compression::SNAPPY,
-            None,
-        )
-        .expect("output"),
+            ),
         recipe: IcebergDataBranchRecipe::try_new(Some(serde_json::json!({"type":"struct","schema-id":1,"fields":[{"id":1,"name":"k1","required":false,"type":"long"}]}).to_string()), Vec::new(), Vec::new(), Vec::new(), false)
             .expect("recipe"),
         input: data_input_shape(),
@@ -452,12 +466,7 @@ pub(crate) fn delete_branch_plan(
     };
     IcebergDeleteBranchPlan {
         branch,
-        output: IcebergWriterOutput::try_new(
-            file_format,
-            parquet::basic::Compression::SNAPPY,
-            None,
-        )
-        .expect("output"),
+        output: IcebergWriterOutput::for_test(file_format, parquet::basic::Compression::SNAPPY),
         position_rewrite,
         input: delete_input_shape(branch),
     }

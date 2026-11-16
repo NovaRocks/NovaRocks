@@ -608,7 +608,13 @@ async fn cancelling_borrowed_drain_retains_same_original_reaper_and_records() {
         .await
         .unwrap();
     let original_id = owner.reaper.as_ref().unwrap().id();
-    let original_cleanup_id = cleanup_id(&owner, &lease);
+    // Entering F's destructor can precede publication of its cleanup Join.
+    let mut original_cleanup_id = None;
+    until(|| {
+        original_cleanup_id = cleanup_id(&owner, &lease);
+        original_cleanup_id.is_some()
+    })
+    .await;
     let deadline = Instant::now() + Duration::from_secs(2);
     let first_poll = {
         let mut borrowed = Box::pin(owner.drain_until(deadline));
@@ -621,8 +627,14 @@ async fn cancelling_borrowed_drain_retains_same_original_reaper_and_records() {
         .reaper
         .as_ref()
         .is_some_and(|handle| handle.id() == original_id);
-    let same_cleanup =
-        original_cleanup_id.is_some() && cleanup_id(&owner, &lease) == original_cleanup_id;
+    // The reaper temporarily loans this same phase while it polls the Join.
+    let mut current_cleanup_id = None;
+    until(|| {
+        current_cleanup_id = cleanup_id(&owner, &lease);
+        current_cleanup_id.is_some()
+    })
+    .await;
+    let same_cleanup = current_cleanup_id == original_cleanup_id;
     held.release();
     let actual = owner.drain_until(deadline).await;
     drop(lease);

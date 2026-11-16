@@ -397,6 +397,14 @@ fn source(at: usize) -> p::PhysicalNode {
             stop: p::ExprId::new(0),
             step: Some(p::ExprId::new(0)),
         },
+        8 => p::NodeKind::WriteLayoutKey {
+            key_inputs: Box::new([
+                p::ValueId::new(7),
+                p::ValueId::new(7),
+                p::ValueId::new(u32::MAX),
+            ]),
+            output_key: p::ValueId::new(0),
+        },
         _ => panic!("unknown fixture"),
     };
     p::PhysicalNode {
@@ -481,6 +489,10 @@ fn expected(at: usize) -> wire::PhysicalNode {
             stop_expr_id: Some(0),
             step_expr_id: Some(0),
         }),
+        8 => wire::physical_node::Kind::WriteLayoutKey(wire::WriteLayoutKeyNode {
+            key_input_value_ids: vec![7, 7, u32::MAX],
+            output_key_value_id: Some(0),
+        }),
         _ => panic!("unknown fixture"),
     };
     wire::PhysicalNode {
@@ -496,11 +508,11 @@ fn expected(at: usize) -> wire::PhysicalNode {
     }
 }
 #[test]
-fn simple_nodes_all_five_complete_envelopes_match_independent_wire_and_raw_presence() {
+fn simple_nodes_match_independent_wire_and_raw_presence() {
     let fixture = Fixture::new();
     let c = Control::default();
     fixture.with_tokens(&c, |values, expressions, read| {
-        for at in 0..8 {
+        for at in 0..9 {
             c.arm(None);
             let (wire, _) =
                 encode_simple_node(&source(at), values, expressions, SOURCE, limits()).unwrap();

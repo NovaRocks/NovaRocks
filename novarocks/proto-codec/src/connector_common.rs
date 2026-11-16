@@ -251,6 +251,7 @@ pub fn encode_connector_category(category: ConnectorCodecCategory) -> i32 {
         ConnectorCodecCategory::ReadColumn => dto::ConnectorPayloadCategory::ReadColumn as i32,
         ConnectorCodecCategory::ReadSplit => dto::ConnectorPayloadCategory::ReadSplit as i32,
         ConnectorCodecCategory::WriteHandle => dto::ConnectorPayloadCategory::WriteHandle as i32,
+        ConnectorCodecCategory::WriteLayout => dto::ConnectorPayloadCategory::WriteLayout as i32,
         ConnectorCodecCategory::CommitFragment => {
             dto::ConnectorPayloadCategory::CommitFragment as i32
         }
@@ -279,6 +280,7 @@ pub fn decode_connector_category(value: i32) -> Option<ConnectorCodecCategory> {
         Ok(dto::ConnectorPayloadCategory::ReadColumn) => Some(ConnectorCodecCategory::ReadColumn),
         Ok(dto::ConnectorPayloadCategory::ReadSplit) => Some(ConnectorCodecCategory::ReadSplit),
         Ok(dto::ConnectorPayloadCategory::WriteHandle) => Some(ConnectorCodecCategory::WriteHandle),
+        Ok(dto::ConnectorPayloadCategory::WriteLayout) => Some(ConnectorCodecCategory::WriteLayout),
         Ok(dto::ConnectorPayloadCategory::CommitFragment) => {
             Some(ConnectorCodecCategory::CommitFragment)
         }

@@ -19,7 +19,7 @@
 //!
 //! This module owns the transport-neutral vocabulary every provider write uses:
 //! a frontend-only commit session, immutable logical writer recipes, per-driver
-//! writer execution, independent commit fragments, and the bounded prepared
+//! writer execution, independent commit fragments, and the complete prepared
 //! write set the frontend commits.
 //!
 //! The production flow it describes has exactly one shape:
@@ -63,13 +63,12 @@ pub mod writer;
 pub use adapter::{ProviderWriteRuntime, WriteRuntimeAdapter};
 pub use budget::{UniqueWriterHandleLedger, validate_writer_handle_bytes};
 pub use limits::{
-    MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES,
-    MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES, MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES,
-    MAX_CONNECTOR_WRITE_TARGETS, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+    MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES, MAX_CONNECTOR_WRITE_TARGETS,
+    MAX_CONNECTOR_WRITER_HANDLE_BYTES,
 };
 pub use prepared::{
     ConnectorPreparedWriteSet, ConnectorWriteProductionProof, ConnectorWriteRowChange,
-    PreparedWriteSetLedger, WriteRowCountAccumulator,
+    WriteRowCountAccumulator,
 };
 pub use relation::{
     MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, MAX_WRITE_RELATION_FIELD_NAME_BYTES,

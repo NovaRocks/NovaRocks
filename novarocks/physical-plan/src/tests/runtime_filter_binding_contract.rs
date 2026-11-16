@@ -285,6 +285,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
                 result_port: checked.result_port().cloned(),
                 required: checked.required(),
                 annotations: Box::default(),
+                write_layouts: Default::default(),
             })
         };
     let plan = unchecked(fragments.clone(), runtime_filters.clone());

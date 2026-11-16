@@ -29,6 +29,7 @@ pub enum ConnectorCodecCategory {
     ReadSplit,
     WriteHandle,
     CommitFragment,
+    WriteLayout,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

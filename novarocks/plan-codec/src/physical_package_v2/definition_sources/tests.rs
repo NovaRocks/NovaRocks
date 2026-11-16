@@ -584,6 +584,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         p::FragmentPackageAdmission {
             plan_limits: p::PlanLimits::FROZEN,
@@ -856,6 +857,7 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         p::FragmentPackageAdmission {
             plan_limits: p::PlanLimits::FROZEN,
@@ -1045,6 +1047,7 @@ pub(in crate::physical_package_v2) fn values_package(
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         p::FragmentPackageAdmission {
             plan_limits: p::PlanLimits::FROZEN,

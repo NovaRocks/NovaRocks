@@ -21,8 +21,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use novarocks_connector_contract::{
-    ConnectorWriteInputShape, ConnectorWriteRecipeCompiler, ConnectorWriteRecipeDraft,
-    MAX_CONNECTOR_WRITER_HANDLE_BYTES, PureProviderCompileError,
+    ConnectorWriteInputShape, ConnectorWriteLayoutRecipeCompiler, ConnectorWriteLayoutRecipeDraft,
+    ConnectorWriteRecipeCompiler, ConnectorWriteRecipeDraft, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+    PureProviderCompileError,
 };
 use novarocks_spi::connector::{
     ConnectorCodecCategory, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision,
@@ -54,6 +55,42 @@ impl ConnectorWriteRecipeCompiler for IcebergWriteRecipeCompiler {
     ) -> Result<ConnectorWriteRecipeDraft, Failure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)?;
         let result = compile(draft, control, &mut work);
+        work.finish_result(result, Failure::Control)
+    }
+}
+
+/// The stateless partition-key recipe is checked without a catalog handle lookup.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IcebergWriteLayoutRecipeCompiler;
+impl ConnectorWriteLayoutRecipeCompiler for IcebergWriteLayoutRecipeCompiler {
+    type Error = ConnectorCodecError;
+
+    fn compile_private(
+        &self,
+        draft: &ConnectorWriteLayoutRecipeDraft,
+        control: &dyn PureCompileControl,
+    ) -> Result<ConnectorWriteLayoutRecipeDraft, Failure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)?;
+        let result = (|| {
+            for _ in draft.payload().payload().chunks(COPY_BYTES) {
+                work.step()?;
+            }
+            work.flush()?;
+            let (schema, spec) = crate::commit::partition_key::layout_facts(draft).map_err(lift)?;
+            work.step()?;
+            work.flush()?;
+            let canonical = super::codec::encode_write_layout(&schema, &spec)
+                .map_err(|error| invalid("layout", error.to_string()))?;
+            let payload = novarocks_connector_contract::ConnectorEncodedPayload::new(
+                draft.payload().header().clone(),
+                canonical,
+            );
+            let compiled = draft
+                .with_canonical_payload(payload)
+                .map_err(|error| invalid("layout", error.to_string()))?;
+            work.step()?;
+            Ok(compiled)
+        })();
         work.finish_result(result, Failure::Control)
     }
 }
@@ -350,6 +387,8 @@ fn validate_data(
         transform_exprs: copy_texts(recipe.transform_exprs(), work)?,
         target_schema_json: copy_text(source, work)?,
         parquet_row_group_size_bytes: handle.output().parquet_row_group_size_bytes(),
+        target_file_size_bytes: handle.output().target_file_size_bytes(),
+        max_partitions_per_writer: handle.output().max_partitions_per_writer(),
     };
     work.step()?;
     work.flush()?;

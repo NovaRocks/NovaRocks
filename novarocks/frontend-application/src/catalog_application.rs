@@ -582,6 +582,7 @@ mod tests {
         );
         let facts = CatalogConfigurationObservation {
             runtime: current.clone(),
+            control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             configuration: Arc::clone(&configuration),
         };
         let application = Arc::new(FixedApplication {

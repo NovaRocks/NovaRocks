@@ -388,6 +388,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         FragmentPackageAdmission {
             plan_limits: PlanLimits::FROZEN,

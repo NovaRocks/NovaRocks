@@ -738,6 +738,52 @@ fn an_ordinary_session_yields_unrouted_targets() {
 }
 
 #[test]
+fn partitioned_ordinary_data_target_declares_affinity_and_refuses_unknown_transforms() {
+    use novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference;
+
+    let adapter = adapter("partitioned_ordinary", 1);
+    let mut material = session_material(data_input_shape());
+    material.write_binding = adapter.binding().clone();
+    // Previewed managed repartition supplies writer-side spec identity here.
+    material.write_partition_spec_id = 7;
+    let schema = material
+        .data_recipe
+        .target_schema_json()
+        .unwrap()
+        .to_owned();
+    let recipe = |transform: &str| {
+        super::domain::IcebergDataBranchRecipe::try_new(
+            Some(schema.clone()),
+            vec!["k1".into()],
+            vec!["p".into()],
+            vec![transform.into()],
+            false,
+        )
+        .unwrap()
+    };
+    material.data_recipe = recipe("identity");
+    let plan = plan_ordinary_branches(IcebergWriteFlavor::Append, &material).unwrap();
+    let sealed = neutral_plan(&adapter, flavor_session(plan)).unwrap();
+    let target = &sealed.targets()[0];
+    let token = target.input().fields()[0].token();
+    let ConnectorWriteLayoutPreference::PartitionAffinity {
+        inputs,
+        recipe: layout,
+    } = &target.route().unwrap().requirements().layout
+    else {
+        panic!("partitioned data target must declare affinity");
+    };
+    assert_eq!(inputs, &[token]);
+    assert_eq!(layout.binding(), adapter.binding());
+    let (_, spec) = crate::commit::partition_key::layout_facts(layout).unwrap();
+    assert_eq!(spec.spec_id(), 7);
+
+    material.data_recipe = recipe("unknown");
+    let error = plan_ordinary_branches(IcebergWriteFlavor::Append, &material).unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+}
+
+#[test]
 fn a_row_mutation_yields_one_routed_target_per_branch() {
     // A merge-on-read mutation carries both halves of a change event in one
     // row: the delete branch consumes the before-image identity and the data
@@ -2156,6 +2202,7 @@ fn staged_begin_request(
     target: novarocks_spi::connector::ConnectorTableHandle,
 ) -> novarocks_spi::connector::write_stack::session::ConnectorWriteBeginRequest {
     novarocks_spi::connector::write_stack::session::ConnectorWriteBeginRequest {
+        catalog_session: Default::default(),
         table: Arc::from("db.staged"),
         target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
         intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
@@ -3214,6 +3261,7 @@ impl FrozenRewriteLake {
     ) -> ConnectorWriteBeginRequest {
         let prep = plan.cohorts()[0].preparation();
         ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from("db.t"),
             target_ref: prep.target_ref().clone(),
             intent: prep.intent(),
@@ -3292,6 +3340,7 @@ impl FrozenRewriteLake {
             ConnectorWriteControl, ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
         };
         let request = ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from("db.t"),
             target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             intent,
@@ -3373,7 +3422,7 @@ impl FrozenRewriteLake {
         let fragments = self.executor.block_on(async {
             let mut writer = execution
                 .open_writer(ConnectorOpenWriterRequest {
-                    resources: source.map(|_| super::test_support::writer_resources()),
+                    resources: Some(super::test_support::writer_resources()),
                     handle: target.handle().clone(),
                     target: target.ordinal(),
                     expected_schema: batch.schema(),
@@ -3436,6 +3485,7 @@ impl FrozenRewriteLake {
         let session = self
             .control
             .begin_write(ConnectorWriteBeginRequest {
+                catalog_session: Default::default(),
                 table: Arc::from("db.t"),
                 target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
                 intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
@@ -4437,6 +4487,7 @@ fn async_write_control_commits_real_files_without_a_catalog_join_bridge() {
     };
     let before = bridges();
     let request = ConnectorWriteBeginRequest {
+        catalog_session: Default::default(),
         table: Arc::from("db.t"),
         target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
         intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
@@ -4511,6 +4562,7 @@ fn async_write_control_commits_real_files_without_a_catalog_join_bridge() {
 
 fn ordinary_async_test_begin(context: ConnectorRequestContext) -> ConnectorWriteBeginRequest {
     ConnectorWriteBeginRequest {
+        catalog_session: Default::default(),
         table: Arc::from("db.t"),
         target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
         intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
@@ -4729,7 +4781,7 @@ fn seal_test_data_output(
     let physical = ConnectorWriterPhysicalContext::new([1; 16], 1, [2; 16], 0, 0);
     let mut writer = executor
         .block_on(execution.open_writer(ConnectorOpenWriterRequest {
-            resources: None,
+            resources: Some(super::test_support::writer_resources()),
             handle: target.handle().clone(),
             target: target.ordinal(),
             expected_schema: schema.clone(),
@@ -5576,6 +5628,17 @@ fn partition_replace_routes_after_image_partition_and_old_file_identity() {
         .find(|field| field.field().name() == "_file")
         .unwrap()
         .token();
+    use novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference;
+    let layout = &data.route().unwrap().requirements().layout;
+    assert!(
+        matches!(layout, ConnectorWriteLayoutPreference::PartitionAffinity { inputs, recipe }
+        if inputs == &[new_partition] && recipe.binding() == &material.write_binding)
+    );
+    assert_eq!(
+        delete.route().unwrap().requirements().layout,
+        ConnectorWriteLayoutPreference::ClusterBy(vec![old_file_token])
+    );
+
     assert!(
         data.route()
             .unwrap()
@@ -5666,7 +5729,7 @@ fn open_streaming_data_writer(
     let writer = lake
         .executor
         .block_on(execution.open_writer(ConnectorOpenWriterRequest {
-            resources: None,
+            resources: Some(super::test_support::writer_resources()),
             handle: target.handle().clone(),
             target: target.ordinal(),
             expected_schema: schema.clone(),

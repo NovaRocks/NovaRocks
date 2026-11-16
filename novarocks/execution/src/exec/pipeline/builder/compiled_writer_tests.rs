@@ -485,6 +485,7 @@ fn plan_with_cells(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Singleton,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -2131,6 +2132,7 @@ mod statistics {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Singleton,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
         })
         .unwrap();

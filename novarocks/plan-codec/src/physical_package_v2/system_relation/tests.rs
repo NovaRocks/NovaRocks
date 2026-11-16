@@ -101,6 +101,7 @@ fn package_data(fields: Arc<[FieldRef]>, data: p::SystemRelationData) -> p::Frag
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         FROZEN_PACKAGE_ADMISSION,
         &Control,

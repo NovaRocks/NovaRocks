@@ -372,6 +372,7 @@ fn add_edge(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: distribution,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();

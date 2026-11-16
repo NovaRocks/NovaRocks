@@ -113,9 +113,8 @@ use arrow::record_batch::RecordBatch;
 
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::write_stack::{
-    ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterHandle,
-    MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, WriteTargetOrdinal, WriterRowKind, row_count_to_wire,
-    target_ordinal_to_wire,
+    ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterHandle, WriteTargetOrdinal,
+    WriterRowKind, row_count_to_wire, target_ordinal_to_wire,
 };
 
 use crate::exec::chunk::{Chunk, record_batch_additional_bytes, record_batch_bytes};
@@ -507,15 +506,6 @@ fn encode_writer_completion(
                 error,
             )
         })?;
-        if bytes.len() > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
-            return Err(
-                crate::exec::pipeline::writer_failure::WriterFailure::CommitFragmentLimit {
-                    requested: bytes.len(),
-                    limit: MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES,
-                }
-                .into(),
-            );
-        }
         let accounting = tracker
             .as_ref()
             .map(|tracker| TrackedBytes::try_new(bytes.capacity(), Arc::clone(tracker)))
@@ -2897,6 +2887,7 @@ pub(crate) mod tests {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Singleton,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
             source_port: novarocks_physical_plan::FragmentOutputPort::Root,
             delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
@@ -2936,6 +2927,7 @@ pub(crate) mod tests {
                 scans: BTreeMap::new(),
                 writes: BTreeMap::from([(writer, draft)]),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             FragmentPackageAdmission {
                 plan_limits: PlanLimits::FROZEN,
@@ -4007,68 +3999,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn table_writer_rejects_a_fragment_over_the_frozen_single_fragment_budget() {
-        // Exactly at the limit is accepted.
+    fn table_writer_returns_a_fragment_larger_than_one_mib() {
+        let size = 1024 * 1024 + 1;
         let stats = Arc::new(WriteExecutionStats::default());
-        let execution = Arc::new(
-            TestWriteExecution::new(Arc::clone(&stats))
-                .with_fragments(1, MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES),
-        );
-        let state = test_runtime_state();
-        let factory = writer_factory(&writer_fixture(execution), &state);
-        let mut operator = factory.create(1, 0);
-
-        bind(&mut operator, &state);
-        operator
-            .finish_for_test(&state)
-            .expect("the exact single-fragment budget is legal");
-        wait_for_output(&mut operator, &state).expect("exact-budget output");
-
-        // One byte more is a typed rejection, and the writer is aborted.
-        let stats = Arc::new(WriteExecutionStats::default());
-        let execution = Arc::new(
-            TestWriteExecution::new(Arc::clone(&stats))
-                .with_fragments(1, MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1),
-        );
+        let execution =
+            Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(1, size));
         let state = test_runtime_state();
         let factory = writer_factory(&writer_fixture(execution), &state);
         let mut operator = factory.create(1, 0);
         bind(&mut operator, &state);
-        operator
-            .finish_for_test(&state)
-            .expect("finish request is asynchronous");
-        let error =
-            wait_for_output(&mut operator, &state).expect_err("over the single-fragment budget");
-        let fact = novarocks_failure_contract::FailureProjection::failure_fact(&error);
-        assert_eq!(
-            fact.class(),
-            novarocks_failure_contract::FailureClass::Resource
-        );
-        let resource = fact
-            .resource()
-            .expect("the producing writer reports its exact bound");
-        assert_eq!(
-            resource.dimension,
-            novarocks_failure_contract::ResourceDimension::Bytes
-        );
-        assert_eq!(
-            resource.requested,
-            Some((MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1) as u64)
-        );
-        assert_eq!(
-            resource.limit,
-            Some(MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES as u64)
-        );
-        assert!(
-            error
-                .detail()
-                .contains("exceeds the frozen single-fragment budget")
-        );
-        assert!(poll_until(
-            || stats.aborted.load(Ordering::Relaxed) == 1,
-            Duration::from_secs(5)
-        ));
-        assert_eq!(stats.aborted.load(Ordering::Relaxed), 1);
+        operator.finish_for_test(&state).expect("request finish");
+        let chunks = wait_for_output(&mut operator, &state).expect("writer output");
+        let columns = TableWriteRelationColumns::try_from_relation(&chunks[1]).expect("columns");
+        assert_eq!(columns.fragments.value(0).len(), size);
+        assert_eq!(stats.aborted.load(Ordering::Relaxed), 0);
     }
 
     #[test]

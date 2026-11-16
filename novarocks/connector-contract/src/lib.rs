@@ -44,6 +44,7 @@ mod type_projection;
 mod value;
 mod write;
 mod write_input;
+mod write_layout;
 mod write_recipe;
 mod write_schema;
 
@@ -104,6 +105,9 @@ pub use write_input::{
     ConnectorWriteBinding, ConnectorWriteFieldBinding, ConnectorWriteFieldRef,
     ConnectorWriteInputRef, ConnectorWriteInputShape, validate_write_input_projection_observed,
     write_field_matches_execution_type_observed, write_input_projection_identity_observed,
+};
+pub use write_layout::{
+    ConnectorWriteLayoutRecipe, ConnectorWriteLayoutRecipeCompiler, ConnectorWriteLayoutRecipeDraft,
 };
 pub use write_recipe::{
     ConnectorWriteRecipe, ConnectorWriteRecipeCompileError, ConnectorWriteRecipeCompiler,

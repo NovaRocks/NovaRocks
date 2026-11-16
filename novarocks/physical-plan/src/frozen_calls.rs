@@ -1133,6 +1133,7 @@ pub(crate) fn visit_relational_node_calls_observed<'a, E: From<FrozenCallError>>
             | NodeKind::AssertOneRow(_)
             | NodeKind::ChangeEventExpand { .. }
             | NodeKind::PositionShard(_)
+            | NodeKind::WriteLayoutKey { .. }
             | NodeKind::ExchangeSource { .. } => {}
         }
         work.step().map_err(FrozenCallError::Control)?;

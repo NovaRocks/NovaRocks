@@ -644,6 +644,7 @@ fn fixture(spec: Spec) -> Fixture {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Broadcast,
                 destination_multiplicity: RowMultiplicity::Replicated,
+                routing_only: Box::default(),
             },
         })
         .unwrap();
@@ -712,6 +713,7 @@ fn fixture(spec: Spec) -> Fixture {
                     source_multiplicity: RowMultiplicity::SingleCopy,
                     destination: Distribution::Singleton,
                     destination_multiplicity: RowMultiplicity::SingleCopy,
+                    routing_only: Box::default(),
                 },
             })
             .unwrap();

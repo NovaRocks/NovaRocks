@@ -266,6 +266,7 @@ fn plan_with_local_nullability(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: destination_distribution,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -1266,6 +1267,7 @@ fn drop_distribution_key_project_plan(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: destination_distribution,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();

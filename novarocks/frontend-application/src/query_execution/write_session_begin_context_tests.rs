@@ -116,12 +116,68 @@ fn assert_attempt_at_provider(
     );
 }
 
+fn property_inputs(
+    runtime: spi::ConnectorControlRuntimeId,
+) -> Arc<novarocks_query_application::sql::session::registry::SessionPropertyInputs> {
+    use novarocks_query_application::sql::session::registry::*;
+    struct Factory(spi::ConnectorProviderId);
+    impl CatalogPropertyDeclarationFactory for Factory {
+        fn provider_id(&self) -> &spi::ConnectorProviderId {
+            &self.0
+        }
+        fn declarations(
+            &self,
+            _: &CatalogPropertyIdentity,
+            _: &[(String, String)],
+        ) -> Result<Vec<PropertyDeclaration>, SessionPropertyError> {
+            Ok(vec![PropertyDeclaration::catalog(
+                "max_partitions_per_writer",
+                SessionPropertyType::Integer,
+                Some(SessionPropertyValue::Integer(100)),
+                "Writer limit",
+                false,
+                |_| Ok(()),
+            )?])
+        }
+    }
+    let provider_id = spi::ConnectorProviderId::parse("iceberg").unwrap();
+    let instance_id = catalog_handle().catalog_name().clone();
+    let registry = SessionPropertyRegistry::with_catalog_factories(vec![Arc::new(Factory(
+        provider_id.clone(),
+    ))])
+    .unwrap();
+    let catalog = instance_id.as_str().to_owned();
+    let metadata = registry
+        .bind_catalog(
+            &catalog,
+            CatalogPropertyIdentity {
+                attachment_id: uuid::Uuid::nil(),
+                control_runtime_id: runtime,
+                instance_id,
+                provider_id,
+                generation: 1,
+            },
+            &[],
+        )
+        .unwrap();
+    let mut properties = SessionPropertyInputs::default();
+    properties.insert(
+        metadata
+            .prepare_header(&catalog, "max_partitions_per_writer", "2")
+            .unwrap(),
+    );
+    Arc::new(properties)
+}
+
 #[test]
 fn ordinary_and_pending_begin_bind_exact_catalog_to_original_attempt() {
     for pending in [false, true] {
         let (lease, recorded) = unopened_begin();
         let original_session = Arc::new(Mutex::new(None));
-        let receiving = WriteBeginReceiving::new(Arc::clone(&original_session));
+        let receiving = WriteBeginReceiving::for_statement(
+            Arc::clone(&original_session),
+            property_inputs(lease.control_runtime_id()),
+        );
         let stop = spi::ConnectorStopOwner::new();
         let (context, sink) = attempt_context(&stop);
         let original = context.clone();
@@ -154,6 +210,12 @@ fn ordinary_and_pending_begin_bind_exact_catalog_to_original_attempt() {
         drop(original_session);
         let mut recorded = recorded.lock().unwrap();
         assert_eq!(recorded.begin, 1);
+        assert_eq!(
+            recorded
+                .begin_catalog_session
+                .get("max_partitions_per_writer"),
+            Some(&spi::read_stack::SessionPropertyValue::Integer(2)),
+        );
         let captured = recorded.begin_context.take().unwrap();
         assert_attempt_at_provider(&captured, &original, &sink, &properties);
         assert!(original.vended_credential_lease_collection().is_none());

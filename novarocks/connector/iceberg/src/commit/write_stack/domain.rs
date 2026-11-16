@@ -782,32 +782,52 @@ impl IcebergMutationReadRecipe {
 pub struct IcebergWriterOutput {
     file_format: IcebergFileFormat,
     compression: Compression,
-    parquet_row_group_size_bytes: Option<u64>,
+    parquet_row_group_size_bytes: u64,
+    target_file_size_bytes: u64,
+    max_partitions_per_writer: u32,
 }
 
 impl IcebergWriterOutput {
     pub fn try_new(
         file_format: IcebergFileFormat,
         compression: Compression,
-        parquet_row_group_size_bytes: Option<u64>,
+        parquet_row_group_size_bytes: u64,
+        target_file_size_bytes: u64,
+        max_partitions_per_writer: u32,
     ) -> Result<Self, ConnectorError> {
         if file_format == IcebergFileFormat::Unknown {
             return Err(invalid(
                 "Iceberg writer output requires an exact file format",
             ));
         }
-        if let Some(size) = parquet_row_group_size_bytes
-            && (size == 0 || file_format != IcebergFileFormat::Parquet)
-        {
-            return Err(invalid(
-                "Iceberg Parquet row group size requires a positive value on a Parquet writer",
-            ));
+        if parquet_row_group_size_bytes == 0 {
+            return Err(invalid("Iceberg Parquet row group size must be positive"));
+        }
+        if target_file_size_bytes == 0 {
+            return Err(invalid("Iceberg target file size must be positive"));
+        }
+        if max_partitions_per_writer == 0 {
+            return Err(invalid("Iceberg maximum open partitions must be positive"));
         }
         Ok(Self {
             file_format,
             compression,
             parquet_row_group_size_bytes,
+            target_file_size_bytes,
+            max_partitions_per_writer,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(file_format: IcebergFileFormat, compression: Compression) -> Self {
+        Self::try_new(
+            file_format,
+            compression,
+            crate::commit::data_writer::DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES,
+            crate::catalog_config::DEFAULT_TARGET_FILE_SIZE_BYTES,
+            crate::catalog_config::DEFAULT_MAX_PARTITIONS_PER_WRITER,
+        )
+        .expect("positive test writer output settings")
     }
 
     pub const fn file_format(&self) -> IcebergFileFormat {
@@ -816,8 +836,14 @@ impl IcebergWriterOutput {
     pub const fn compression(&self) -> Compression {
         self.compression
     }
-    pub const fn parquet_row_group_size_bytes(&self) -> Option<u64> {
+    pub const fn parquet_row_group_size_bytes(&self) -> u64 {
         self.parquet_row_group_size_bytes
+    }
+    pub const fn target_file_size_bytes(&self) -> u64 {
+        self.target_file_size_bytes
+    }
+    pub const fn max_partitions_per_writer(&self) -> u32 {
+        self.max_partitions_per_writer
     }
 }
 

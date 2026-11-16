@@ -510,7 +510,8 @@ pub(crate) fn validate_node_output_closure(
         | NodeKind::SystemRelation { .. }
         | NodeKind::GenerateSeries { .. }
         | NodeKind::ChangeEventExpand { .. }
-        | NodeKind::PositionShard(_) => None,
+        | NodeKind::PositionShard(_)
+        | NodeKind::WriteLayoutKey { .. } => None,
     };
     if let Some(exact) = exact
         && exact.as_slice() != node.output.columns.as_ref()
@@ -766,7 +767,8 @@ pub(crate) fn value_origin_allowed(
             | NodeKind::GenerateSeries { .. }
             | NodeKind::TableFunction { .. }
             | NodeKind::ChangeEventExpand { .. }
-            | NodeKind::PositionShard(_),
+            | NodeKind::PositionShard(_)
+            | NodeKind::WriteLayoutKey { .. },
             ValueOrigin::NodeOutput {
                 node: owner,
                 output_ordinal,
@@ -2117,6 +2119,41 @@ pub(crate) fn validate_node_semantics(
                         "generate-series argument type differs from its output",
                     ));
                 }
+            }
+        }
+        NodeKind::WriteLayoutKey {
+            key_inputs,
+            output_key,
+        } => {
+            let child = node.inputs.first().and_then(|id| fragment.nodes().get(id));
+            let visible = indexes
+                .visible_input(node.id)
+                .expect("node input is indexed");
+            let output_valid = child.is_some_and(|child| {
+                node.output.columns.iter().eq(child
+                    .output
+                    .columns
+                    .iter()
+                    .chain(std::iter::once(output_key)))
+                    && !child.output.columns.contains(output_key)
+            }) && fragment
+                .values()
+                .get(output_key)
+                .is_some_and(|value| value.ty == crate::ValueType::new(DataType::Int64, false));
+            let inputs_valid =
+                !key_inputs.is_empty() && key_inputs.iter().all(|key| visible.contains(key));
+            if fragment.root() != node.id
+                || !matches!(
+                    fragment.sink(),
+                    crate::FragmentSink::Stream { .. } | crate::FragmentSink::Router { .. }
+                )
+                || !output_valid
+                || !inputs_valid
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "write layout key must append one non-null BIGINT at the sending fragment root",
+                ));
             }
         }
         NodeKind::PositionShard(spec) => {

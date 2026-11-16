@@ -3,3 +3,10 @@
 # empty snapshot is valid; a missing or malformed file fails FE startup.
 format_version = 1
 catalogs = []
+
+# Set these optional Iceberg defaults in the catalog's [catalogs.properties] table.
+# "iceberg.max-partitions-per-writer" = "100"
+# "iceberg.target-max-file-size" = "1GB"
+# These are the defaults. A table's write.target-file-size-bytes overrides
+# the file target. A catalog session can lower its open-partition cap with
+# SET SESSION lake.max_partitions_per_writer = 32, where lake is the catalog.

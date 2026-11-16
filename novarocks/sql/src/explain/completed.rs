@@ -1304,6 +1304,7 @@ fn render_sink(
                     match &route.requirements.layout {
                         novarocks_physical_plan::WriteLayoutPreference::None => "none",
                         novarocks_physical_plan::WriteLayoutPreference::ClusterBy(_) => "cluster-by",
+                        novarocks_physical_plan::WriteLayoutPreference::PartitionAffinity(_) => "partition-affinity",
                     },
                     joined(route.requirements.layout_keys(), ",", |value: &ValueId, output: &mut fmt::Formatter<'_>| context.value_name(fragment_id, *value).fmt(output)),
                     route.edge.get()
@@ -1654,6 +1655,7 @@ fn connector_codec_category(
         novarocks_spi::connector::ConnectorCodecCategory::ReadSplit => "read-split",
         novarocks_spi::connector::ConnectorCodecCategory::WriteHandle => "write-handle",
         novarocks_spi::connector::ConnectorCodecCategory::CommitFragment => "commit-fragment",
+        novarocks_spi::connector::ConnectorCodecCategory::WriteLayout => "write-layout",
     }
 }
 
@@ -3244,6 +3246,11 @@ condition,
                         ))
                 ))
         )),
+        NodeKind::WriteLayoutKey { key_inputs, output_key } => lines.push(format_args!(
+            "{pad}  partition-inputs=[{}], layout-key=v{}",
+            format_value_ids(key_inputs),
+            output_key.get(),
+        )),
         NodeKind::PositionShard(spec) => lines.push(format_args!(
             "{pad}  target={}, contribution-routes={}",
             spec.target.get(),
@@ -3841,6 +3848,7 @@ impl fmt::Display for NodeHeaderDisplay<'_> {
             )?,
             NodeKind::AssertOneRow(_) => formatter.write_str("ASSERT ONE ROW")?,
             NodeKind::ChangeEventExpand { .. } => formatter.write_str("CHANGE EVENT EXPAND")?,
+            NodeKind::WriteLayoutKey { .. } => formatter.write_str("WRITE LAYOUT KEY")?,
             NodeKind::PositionShard(_) => formatter.write_str("POSITION SHARD AGGREGATION")?,
             NodeKind::ExchangeSource { edge, .. } => {
                 let label = context.plan.edges().get(edge).map_or("EXCHANGE", |edge| {

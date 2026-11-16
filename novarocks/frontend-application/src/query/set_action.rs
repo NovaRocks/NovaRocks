@@ -132,6 +132,7 @@ struct SetStatementAction {
     live: Arc<Mutex<SessionSqlState>>,
     compiler: FrontendQueryCompiler,
     registry: Arc<SessionPropertyRegistry>,
+    catalog_properties: novarocks_query_application::sql::catalog::SessionCatalogService,
     interpreter: Arc<RequiredConstantInterpreter>,
     control: SqlCompileControl,
     tail: Option<Box<SetNativeTail>>,
@@ -174,6 +175,7 @@ impl SetStatementAction {
                             self.set.take().expect("one admitted SET payload"),
                             staged,
                             Arc::clone(&self.registry),
+                            Arc::clone(&self.catalog_properties),
                             Arc::clone(&self.interpreter),
                             self.control.clone(),
                             owner.scope().clone(),
@@ -284,6 +286,7 @@ impl FrontendQuerySession {
             live: Arc::clone(&self.state),
             compiler: self.service.query_compiler.clone(),
             registry: Arc::clone(&self.service.session_properties),
+            catalog_properties: Arc::clone(&self.service.session_catalog_resolver),
             interpreter: Arc::clone(&self.service.required_constant_interpreter),
             control,
             tail: Some(Box::new(SetNativeTail {

@@ -318,6 +318,7 @@ fn package_input(fragment: Fragment) -> FragmentPackageInput {
         scans: BTreeMap::new(),
         writes: BTreeMap::new(),
         annotations: Box::default(),
+        layouts: Default::default(),
     }
 }
 fn property(input: &FragmentPackageInput, control: &Control) -> Result<bool, CompileControlError> {

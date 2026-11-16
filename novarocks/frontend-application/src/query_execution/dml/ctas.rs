@@ -1472,6 +1472,7 @@ impl CoreStandardCtasTargetSession {
             crate::connector::write_target::derive_write_stack_lease(host, &self.planning_pin)
                 .map_err(internal_failure)?;
         let request = novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from(format!("{}.{}", self.target.namespace, self.target.table).as_str()),
             target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             intent: ConnectorWriteIntent::Append,

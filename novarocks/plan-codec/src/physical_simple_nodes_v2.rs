@@ -82,6 +82,9 @@ fn physical_outer(input: &p::PhysicalNode) -> Result<(usize, usize), Error> {
             bytes::<(p::ExprId, p::ValueId)>(expressions.len())?,
         ),
         p::NodeKind::Values { rows } => (rows.len(), bytes::<Box<[p::ExprId]>>(rows.len())?),
+        p::NodeKind::WriteLayoutKey { key_inputs, .. } => {
+            (key_inputs.len(), bytes::<p::ValueId>(key_inputs.len())?)
+        }
         p::NodeKind::PositionShard(spec) => (
             spec.inputs.len(),
             bytes::<p::PositionShardInput>(spec.inputs.len())?,
@@ -105,6 +108,10 @@ fn wire_outer(input: &wire::PhysicalNode) -> Result<(usize, usize), Error> {
         Some(wire::physical_node::Kind::Values(v)) => (
             v.rows.len(),
             bytes::<wire::ExpressionIds>(v.rows.capacity())?,
+        ),
+        Some(wire::physical_node::Kind::WriteLayoutKey(v)) => (
+            v.key_input_value_ids.len(),
+            bytes::<u32>(v.key_input_value_ids.capacity())?,
         ),
         Some(wire::physical_node::Kind::PositionShard(v)) => (
             v.inputs.len(),
@@ -214,6 +221,11 @@ fn prepare_encode(
             total
         }
         p::NodeKind::GenerateSeries { step, .. } => 2 + usize::from(step.is_some()),
+        p::NodeKind::WriteLayoutKey { key_inputs, .. } => {
+            model.refs = add(model.refs, add(key_inputs.len(), 1)?)?;
+            model.request::<u32>(key_inputs.len(), 1)?;
+            0
+        }
         p::NodeKind::PositionShard(spec) => {
             model.refs = add(model.refs, add(mul(spec.inputs.len(), 4)?, 9)?)?;
             model.request::<wire::PositionShardInput>(spec.inputs.len(), 1)?;
@@ -288,6 +300,14 @@ fn prepare_encode(
             expression_encode(*stop, expressions, w)?;
             if let Some(step) = step {
                 expression_encode(*step, expressions, w)?;
+            }
+        }
+        p::NodeKind::WriteLayoutKey {
+            key_inputs,
+            output_key,
+        } => {
+            for id in key_inputs.iter().chain(std::iter::once(output_key)) {
+                reference(id.get(), values, w)?;
             }
         }
         p::NodeKind::PositionShard(spec) => {
@@ -409,6 +429,11 @@ fn prepare_decode(
         Some(wire::physical_node::Kind::GenerateSeries(v)) => {
             2 + usize::from(v.step_expr_id.is_some())
         }
+        Some(wire::physical_node::Kind::WriteLayoutKey(v)) => {
+            model.refs = add(model.refs, add(v.key_input_value_ids.len(), 1)?)?;
+            model.request::<p::ValueId>(v.key_input_value_ids.len(), 2)?;
+            0
+        }
         Some(wire::physical_node::Kind::PositionShard(v)) => {
             model.refs = add(model.refs, add(mul(v.inputs.len(), 4)?, 9)?)?;
             model.request::<p::PositionShardInput>(v.inputs.len(), 2)?;
@@ -488,6 +513,12 @@ fn prepare_decode(
             expression_decode(required(v.stop_expr_id, w)?, expressions, w)?;
             if let Some(step) = v.step_expr_id {
                 expression_decode(step, expressions, w)?;
+            }
+        }
+        Some(wire::physical_node::Kind::WriteLayoutKey(v)) => {
+            reference(required(v.output_key_value_id, w)?, values, w)?;
+            for id in &v.key_input_value_ids {
+                reference(*id, values, w)?;
             }
         }
         Some(wire::physical_node::Kind::PositionShard(v)) => {
@@ -643,6 +674,20 @@ fn emit_encode(
                 step_expr_id: step.map(p::ExprId::get),
             })
         }
+        p::NodeKind::WriteLayoutKey {
+            key_inputs,
+            output_key,
+        } => {
+            let mut ids = reserve(key_inputs.len(), w)?;
+            for id in key_inputs {
+                ids.push(id.get());
+                w.step()?;
+            }
+            wire::physical_node::Kind::WriteLayoutKey(wire::WriteLayoutKeyNode {
+                key_input_value_ids: ids,
+                output_key_value_id: Some(output_key.get()),
+            })
+        }
         p::NodeKind::PositionShard(spec) => {
             let mut routes = reserve(spec.inputs.len(), w)?;
             for input in &spec.inputs {
@@ -732,6 +777,17 @@ fn emit_decode(
             stop: p::ExprId::new(required(v.stop_expr_id, w)?),
             step: v.step_expr_id.map(p::ExprId::new),
         },
+        Some(wire::physical_node::Kind::WriteLayoutKey(v)) => {
+            let mut ids = reserve(v.key_input_value_ids.len(), w)?;
+            for id in &v.key_input_value_ids {
+                ids.push(p::ValueId::new(*id));
+                w.step()?;
+            }
+            p::NodeKind::WriteLayoutKey {
+                key_inputs: boxed(ids, w)?,
+                output_key: p::ValueId::new(required(v.output_key_value_id, w)?),
+            }
+        }
         Some(wire::physical_node::Kind::PositionShard(v)) => {
             let mut routes = reserve(v.inputs.len(), w)?;
             for input in &v.inputs {

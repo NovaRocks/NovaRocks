@@ -461,6 +461,7 @@ impl<H> RootCollector<'_, '_, H> {
             | ProgramNodeKind::Repeat { .. }
             | ProgramNodeKind::UnionAll { .. }
             | ProgramNodeKind::PositionShard { .. }
+            | ProgramNodeKind::WriteLayoutKey { .. }
             | ProgramNodeKind::Limit { .. }
             | ProgramNodeKind::TableFunction { .. }
             | ProgramNodeKind::GenerateSeries { .. }

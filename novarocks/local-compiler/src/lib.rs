@@ -100,6 +100,7 @@ pub struct ProviderValidatedFragment {
     package: Arc<FragmentPackage>,
     reads: BTreeMap<NodeId, ConnectorReadProgramRecipe>,
     writes: BTreeMap<NodeId, ConnectorWriteRecipe>,
+    layouts: BTreeMap<NodeId, novarocks_connector_contract::ConnectorWriteLayoutRecipe>,
 }
 impl ProviderValidatedFragment {
     pub fn package(&self) -> &Arc<FragmentPackage> {
@@ -120,8 +121,9 @@ impl ProviderValidatedFragment {
         Arc<FragmentPackage>,
         BTreeMap<NodeId, ConnectorReadProgramRecipe>,
         BTreeMap<NodeId, ConnectorWriteRecipe>,
+        BTreeMap<NodeId, novarocks_connector_contract::ConnectorWriteLayoutRecipe>,
     ) {
-        (self.package, self.reads, self.writes)
+        (self.package, self.reads, self.writes, self.layouts)
     }
 }
 
@@ -180,6 +182,7 @@ pub fn validate_fragment_providers<E: Error + 'static>(
         (|| {
             let mut reads = BTreeMap::new();
             let mut writes = BTreeMap::new();
+            let mut layouts = BTreeMap::new();
             for (&node, frozen) in package.scans() {
                 work.flush()?;
                 let recipe = catalog
@@ -206,10 +209,24 @@ pub fn validate_fragment_providers<E: Error + 'static>(
                 writes.insert(node, recipe);
                 work.step()?;
             }
+            for (&node, draft) in package.layouts() {
+                work.flush()?;
+                let recipe = catalog
+                    .compile_write_layout(draft, work.control())
+                    .map_err(|error| match error {
+                        PureProviderProgramError::Control(error) => {
+                            ProviderPreparationError::Control(error)
+                        }
+                        error => ProviderPreparationError::Write { node, error },
+                    })?;
+                layouts.insert(node, recipe);
+                work.step()?;
+            }
             Ok(ProviderValidatedFragment {
                 package,
                 reads,
                 writes,
+                layouts,
             })
         })();
     work.finish_result(result, ProviderPreparationError::Control)

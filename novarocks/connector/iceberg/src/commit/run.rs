@@ -736,6 +736,7 @@ mod keyed_publication_trace_tests {
         let control = write_control(&fixture);
         let plan = control
             .begin_write(ConnectorWriteBeginRequest {
+                catalog_session: Default::default(),
                 table: Arc::from("db.t"),
                 target_ref: ConnectorWriteTargetRef::main(),
                 intent: ConnectorWriteIntent::Append,

@@ -954,15 +954,6 @@ ci_classify_sql_results() {
   return "$code"
 }
 
-ci_should_use_runner_suite_timeout() {
-  local suite="$1"
-
-  # The prepared-write-set entry-budget case intentionally materializes 16,385
-  # files and can run for roughly 90 seconds. Keep the runner's suite default
-  # authoritative unless the caller explicitly requests a CI-wide override.
-  [ "$suite" = "iceberg-dml" ] && [ -z "${SQL_QUERY_TIMEOUT_SECONDS:-}" ]
-}
-
 ci_sql_native_exit_acceptable() {
   [ "$1" = "$CI_SQL_RECORDED_EXIT_CODE" ] || return 1
   [ "$1" -eq 0 ] || { [ "$1" -eq 1 ] && [ "$CI_SQL_ACCEPTS_CASE_FAILURE" = true ]; }
@@ -1013,9 +1004,7 @@ run_sql_suites() {
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-300}"
         ;;
     esac
-    if ! ci_should_use_runner_suite_timeout "$suite"; then
-      suite_query_timeout_args=(--query-timeout "$query_timeout")
-    fi
+    suite_query_timeout_args=(--query-timeout "$query_timeout")
     novarocks_bin="$(ci_bound_binary novarocks)" || return $?
     sql_runner="$(ci_bound_binary novarocks-sql-test)" || return $?
     local results_file="${log_path%.log}.results.jsonl" sql_materials
@@ -1167,9 +1156,7 @@ run_native_cross_process_sql_suites() {
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-300}"
         ;;
     esac
-    if ! ci_should_use_runner_suite_timeout "$suite"; then
-      suite_query_timeout_args=(--query-timeout "$query_timeout")
-    fi
+    suite_query_timeout_args=(--query-timeout "$query_timeout")
 
     novarocks_bin="$(ci_bound_binary novarocks)" || return $?
     sql_runner="$(ci_bound_binary novarocks-sql-test)" || return $?

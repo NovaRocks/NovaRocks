@@ -50,17 +50,13 @@ use novarocks_failure_contract::BoundedDetail;
 use novarocks_failure_contract::ResourceDimension;
 use novarocks_type_contract::ValueTypeStorageLifetime;
 
-/// Limits one writer's retained input. A single input page must fit both
-/// per-page limits. `need_input` reserves against the worst legal next page, so
-/// it remains an exact admission predicate even though the pipeline contract
-/// does not pass that next page to it for inspection.
+/// Backpressure thresholds for one writer's retained input. The page that
+/// reaches or crosses a threshold is admitted and charged to the query.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AsyncWriterQueueConfig {
     pub(crate) max_batches: usize,
     pub(crate) max_rows: usize,
     pub(crate) max_bytes: usize,
-    pub(crate) max_batch_rows: usize,
-    pub(crate) max_batch_bytes: usize,
     pub(crate) abort_timeout: Duration,
 }
 
@@ -70,8 +66,6 @@ impl Default for AsyncWriterQueueConfig {
             max_batches: 4,
             max_rows: 4 * 1_048_576,
             max_bytes: 64 * 1024 * 1024,
-            max_batch_rows: 1_048_576,
-            max_batch_bytes: 16 * 1024 * 1024,
             abort_timeout: Duration::from_secs(5),
         }
     }
@@ -197,6 +191,22 @@ struct QueueUsage {
     batches: usize,
     rows: usize,
     bytes: usize,
+}
+
+impl QueueUsage {
+    fn full_dimension(&self, config: &AsyncWriterQueueConfig) -> Option<ResourceDimension> {
+        if self.batches == 0 {
+            None
+        } else if self.batches >= config.max_batches {
+            Some(ResourceDimension::Items)
+        } else if self.rows >= config.max_rows {
+            Some(ResourceDimension::Positions)
+        } else if self.bytes >= config.max_bytes {
+            Some(ResourceDimension::Bytes)
+        } else {
+            None
+        }
+    }
 }
 
 impl<O> WriterShared<O> {
@@ -481,15 +491,7 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
             .queue_usage
             .lock()
             .expect("async writer queue usage lock");
-        let can_accept = usage.batches < self.config.max_batches
-            && usage
-                .rows
-                .checked_add(self.config.max_batch_rows)
-                .is_some_and(|rows| rows <= self.config.max_rows)
-            && usage
-                .bytes
-                .checked_add(self.config.max_batch_bytes)
-                .is_some_and(|bytes| bytes <= self.config.max_bytes);
+        let can_accept = usage.full_dimension(&self.config).is_none();
         if !can_accept {
             self.shared
                 .queue_blocked_checks
@@ -536,59 +538,26 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         if self.shared.unresolved.load(Ordering::Acquire) {
             return Err(WriterFailure::ExitUnresolved.into());
         }
-        if rows > self.config.max_batch_rows {
-            return Err(WriterFailure::InputBatchRows {
-                rows,
-                limit: self.config.max_batch_rows,
-            }
-            .into());
-        }
-        if retained_bytes > self.config.max_batch_bytes {
-            return Err(WriterFailure::InputBatchBytes {
-                bytes: retained_bytes,
-                limit: self.config.max_batch_bytes,
-            }
-            .into());
-        }
         {
             let mut usage = self
                 .shared
                 .queue_usage
                 .lock()
                 .expect("async writer queue usage lock");
-            let refusal = if usage.batches >= self.config.max_batches {
-                Some((
-                    ResourceDimension::Items,
-                    1,
-                    usage.batches,
-                    self.config.max_batches,
-                ))
-            } else if usage
-                .rows
-                .checked_add(rows)
-                .is_none_or(|rows| rows > self.config.max_rows)
-            {
-                Some((
-                    ResourceDimension::Positions,
-                    rows,
-                    usage.rows,
-                    self.config.max_rows,
-                ))
-            } else if usage
-                .bytes
-                .checked_add(retained_bytes)
-                .is_none_or(|bytes| bytes > self.config.max_bytes)
-            {
-                Some((
-                    ResourceDimension::Bytes,
-                    retained_bytes,
-                    usage.bytes,
-                    self.config.max_bytes,
-                ))
-            } else {
-                None
-            };
-            if let Some((dimension, incoming, live, limit)) = refusal {
+            let next_rows = usage.rows.checked_add(rows);
+            let next_bytes = usage.bytes.checked_add(retained_bytes);
+            let blocked_dimension = usage
+                .full_dimension(&self.config)
+                .or_else(|| next_rows.is_none().then_some(ResourceDimension::Positions))
+                .or_else(|| next_bytes.is_none().then_some(ResourceDimension::Bytes));
+            if let Some(dimension) = blocked_dimension {
+                let (incoming, live, limit) = match dimension {
+                    ResourceDimension::Items => (1, usage.batches, self.config.max_batches),
+                    ResourceDimension::Positions => (rows, usage.rows, self.config.max_rows),
+                    ResourceDimension::Bytes => {
+                        (retained_bytes, usage.bytes, self.config.max_bytes)
+                    }
+                };
                 return Err(WriterFailure::QueueCapacity {
                     dimension,
                     incoming,
@@ -598,8 +567,8 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
                 .into());
             }
             usage.batches += 1;
-            usage.rows += rows;
-            usage.bytes += retained_bytes;
+            usage.rows = next_rows.expect("writer queue rows checked");
+            usage.bytes = next_bytes.expect("writer queue bytes checked");
             self.shared.observe_queue_usage(*usage);
         }
         if additional_bytes > retained_bytes {
@@ -2166,8 +2135,6 @@ pub(crate) mod tests {
             max_batches: 2,
             max_rows: usize::MAX,
             max_bytes: 2,
-            max_batch_rows: usize::MAX,
-            max_batch_bytes: 1,
             abort_timeout: Duration::from_secs(1),
         };
         let owner =
@@ -2610,8 +2577,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let (mut owner, error, tracker, _runtime) = owner(
@@ -2641,6 +2606,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn oversized_page_crosses_queue_threshold_and_drains_normally() {
+        let calls = Arc::new(Calls::default());
+        let gate = Arc::new(Notify::new());
+        let config = AsyncWriterQueueConfig {
+            max_bytes: 8 * 1024 * 1024,
+            ..AsyncWriterQueueConfig::default()
+        };
+        let (mut writer, error, tracker, _runtime) = owner(
+            Arc::clone(&calls),
+            Some(Arc::clone(&gate)),
+            false,
+            false,
+            config,
+        );
+        let small = batch(1);
+        let small_bytes = crate::exec::chunk::record_batch_bytes(&small);
+        writer.enqueue(small, small_bytes).unwrap();
+        assert!(writer.can_accept());
+
+        let rows = 4 * 1024 * 1024 + 1;
+        let oversized = batch(rows);
+        let bytes = crate::exec::chunk::record_batch_bytes(&oversized);
+        assert!(bytes > 16 * 1024 * 1024);
+        writer.enqueue(oversized, bytes).unwrap();
+        assert_eq!(writer.queued_usage(), (rows + 1, bytes + small_bytes));
+        assert_eq!(
+            tracker.current(),
+            i64::try_from(bytes + small_bytes).unwrap()
+        );
+        assert!(!writer.can_accept());
+
+        gate.notify_one();
+        wait_until(|| writer.queued_usage() == (rows, bytes));
+        assert!(!writer.can_accept());
+        gate.notify_one();
+        wait_until(|| writer.can_accept());
+        assert_eq!(writer.queued_usage(), (0, 0));
+        assert_eq!(tracker.current(), 0);
+        writer.request_finish().unwrap();
+        wait_until(|| writer.has_output());
+        assert_eq!(writer.take_output(), Some(u64::try_from(rows + 1).unwrap()));
+        assert!(error.error().is_none());
+    }
+
+    #[test]
     fn query_memory_limit_rejects_queue_admission_without_leaking_reservation() {
         let calls = Arc::new(Calls::default());
         let gate = Arc::new(Notify::new());
@@ -2648,14 +2658,13 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let (owner, _error, tracker, _runtime) = owner(calls, Some(gate), false, false, config);
         tracker.install_limit_once(1).expect("install query limit");
 
-        let input = batch(2);
+        let input = batch(4 * 1024 * 1024 + 1);
+        assert!(owner.can_accept());
         let bytes = crate::exec::chunk::record_batch_bytes(&input);
         let error = owner
             .enqueue(input, bytes)
@@ -2683,8 +2692,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let (mut owner, error, tracker, _runtime) =
@@ -2899,8 +2906,6 @@ pub(crate) mod tests {
                 max_batches: 1,
                 max_rows: 4,
                 max_bytes: 4096,
-                max_batch_rows: 4,
-                max_batch_bytes: 4096,
                 abort_timeout: Duration::from_secs(1),
             },
             Box::new(|rows, _| Ok(rows)),
@@ -3118,8 +3123,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let (mut owner, error, tracker, _runtime) =
@@ -3162,8 +3165,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let (mut owner, error, tracker, _runtime) =
@@ -3234,8 +3235,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let (mut owner, error, tracker, _runtime) =
@@ -3315,8 +3314,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let (mut owner, _error, tracker, _runtime) = owner(calls, None, false, false, config);
@@ -3348,8 +3345,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 4096,
-            max_batch_rows: 4,
-            max_batch_bytes: 4096,
             abort_timeout: Duration::from_secs(1),
         };
         let (mut owner, error, tracker, _runtime) =
@@ -3407,8 +3402,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let (mut owner, _error, tracker, _runtime) = owner(calls, None, false, false, config);
@@ -3453,8 +3446,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let execution = Arc::new(ControlledExecution {
@@ -3512,8 +3503,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let (owner, error, tracker, _runtime) =
@@ -3543,8 +3532,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let (mut owner, error, tracker, _runtime) = owner(
@@ -4143,8 +4130,6 @@ pub(crate) mod tests {
             max_batches: 1,
             max_rows: 4,
             max_bytes: 1024,
-            max_batch_rows: 4,
-            max_batch_bytes: 1024,
             abort_timeout: Duration::from_secs(1),
         };
         let (mut owner, error, _tracker, _runtime) =

@@ -35,8 +35,9 @@ use crate::{
 };
 use novarocks_connector_contract::{
     ConnectorError, ConnectorWriteFieldBinding, ConnectorWriteFieldRef, ConnectorWriteFieldToken,
-    ConnectorWriteInputRef, ConnectorWriteInputShape, ConnectorWriteRecipeDraft,
-    PureProviderCompileError, WriterOwnedCreationFailure, WriterOwnedResourceFacts,
+    ConnectorWriteInputRef, ConnectorWriteInputShape, ConnectorWriteLayoutRecipeDraft,
+    ConnectorWriteRecipeDraft, PureProviderCompileError, WriterOwnedCreationFailure,
+    WriterOwnedResourceFacts,
 };
 use novarocks_physical_plan::NodeId;
 use novarocks_proto_models::physical_package_v2 as wire;
@@ -604,6 +605,123 @@ fn decode_group<'a>(
         work.step()?;
     }
     Ok(output)
+}
+
+// A layout recipe borrows the same provider and payload namespaces as a writer.
+// Its only additional backing is the exact sequence of input tokens.
+pub(crate) fn encode_write_layouts_in(
+    sources: &std::collections::BTreeMap<NodeId, ConnectorWriteLayoutRecipeDraft>,
+    bindings: &EncodedProviderBindings<'_, '_>,
+    payloads: &EncodedConnectorPayloads<'_, '_>,
+    source: usize,
+    limits: WriterRecipeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(Vec<wire::FrozenWriteLayoutRecipe>, usize), E> {
+    let mut model = Model::new::<wire::FrozenWriteLayoutRecipe>(sources.len(), source)?;
+    for recipe in sources.values() {
+        let count = recipe.inputs().len();
+        model.fields(count)?;
+        model.request(array::<[u8; 32]>(count)?, 1)?;
+        work.step()?;
+    }
+    let facts = model.combined(&Default::default(), limits)?;
+    let mut output = reserve(sources.len(), work)?;
+    for (node, recipe) in sources {
+        let provider_binding_id = bindings.write_source_id_observed(recipe.binding(), work)?;
+        let recipe_payload_id = payloads.source_id_observed(recipe.payload(), work)?;
+        let mut input_field_tokens = reserve(mul(recipe.inputs().len(), 32)?, work)?;
+        for token in recipe.inputs() {
+            input_field_tokens.extend_from_slice(&token.to_bytes());
+            work.step()?;
+        }
+        output.push(wire::FrozenWriteLayoutRecipe {
+            node_id: Some(node.get()),
+            provider_binding_id: Some(provider_binding_id),
+            recipe_payload_id: Some(recipe_payload_id),
+            input_field_tokens,
+        });
+        work.step()?;
+    }
+    Ok((
+        output,
+        facts.coexisting_source_and_request_bytes_upper_bound,
+    ))
+}
+
+pub(crate) fn decode_write_layouts_in(
+    sources: &[wire::FrozenWriteLayoutRecipe],
+    bindings: &DecodedProviderBindings<'_, '_>,
+    payloads: &DecodedConnectorPayloads<'_, '_>,
+    source: usize,
+    limits: WriterRecipeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (
+        std::collections::BTreeMap<NodeId, ConnectorWriteLayoutRecipeDraft>,
+        usize,
+    ),
+    E,
+> {
+    let recipe = match sources {
+        [] => return Ok((std::collections::BTreeMap::new(), source)),
+        [recipe] => recipe,
+        _ => {
+            return Err(E::InvalidShape(
+                "a fragment has at most one write layout recipe at its root",
+            ));
+        }
+    };
+    let count = recipe.input_field_tokens.len() / 32;
+    if count == 0 || !recipe.input_field_tokens.len().is_multiple_of(32) {
+        return Err(E::InvalidShape(
+            "write layout recipe input tokens must have 32 bytes each",
+        ));
+    }
+    let mut model = Model::new::<(NodeId, ConnectorWriteLayoutRecipeDraft)>(1, source)?;
+    model.fields(count)?;
+    let slice_layout = array::<ConnectorWriteFieldToken>(count)?;
+    model.request(slice_layout, 1)?;
+    let arc_layout = novarocks_type_contract::owned_resources::layout::arc_layout(slice_layout)
+        .map_err(E::ConstructionResource)?;
+    model.request(arc_layout, 1)?;
+    // Ordered input identities are validated before the draft is published.
+    let set_node = btree_resources_v2::node_layout_typed::<&ConnectorWriteFieldToken, ()>()
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    model.request(set_node, count)?;
+    let map_node =
+        btree_resources_v2::node_layout_typed::<NodeId, ConnectorWriteLayoutRecipeDraft>()
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+    model.request(map_node, 1)?;
+    let facts = model.combined(&Default::default(), limits)?;
+    let node = recipe
+        .node_id
+        .ok_or(E::InvalidShape("write layout node ID is absent"))?;
+    let binding_id = recipe.provider_binding_id.ok_or(E::InvalidShape(
+        "write layout provider binding ID is absent",
+    ))?;
+    let payload_id = recipe
+        .recipe_payload_id
+        .ok_or(E::InvalidShape("write layout payload ID is absent"))?;
+    let binding = bindings
+        .write_binding_observed(binding_id, work)?
+        .ok_or(E::InvalidShape("write layout provider binding is missing"))?;
+    let payload = payloads
+        .payload_observed(payload_id, work)?
+        .ok_or(E::InvalidShape("write layout payload is missing"))?;
+    let mut inputs = reserve(count, work)?;
+    for token in recipe.input_field_tokens.as_chunks::<32>().0 {
+        inputs.push(ConnectorWriteFieldToken::from_bytes(*token));
+        work.step()?;
+    }
+    work.flush()?;
+    let draft = ConnectorWriteLayoutRecipeDraft::try_new(binding.clone(), payload.clone(), inputs)
+        .map_err(E::Provider)?;
+    let output = std::collections::BTreeMap::from([(NodeId::new(node), draft)]);
+    work.step()?;
+    Ok((
+        output,
+        facts.coexisting_source_and_request_bytes_upper_bound,
+    ))
 }
 
 /// Encode all five original ordered roles on the caller's existing scope.

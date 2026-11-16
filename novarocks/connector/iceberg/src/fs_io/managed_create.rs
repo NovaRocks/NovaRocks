@@ -26,7 +26,9 @@ use novarocks_spi::connector::{
 use sha2::{Digest, Sha256};
 
 use crate::access_binding::IcebergReadBinding;
-use crate::commit::data_writer::{CreateClaim, ObjectContent, ObjectOwner, StagedPathJournal};
+use crate::commit::data_writer::{
+    CreateClaim, ObjectContent, ObjectOwner, StagedPathJournal, StagedWriteProgress,
+};
 use crate::commit::write_stack::domain::{IcebergCreationReceipt, IcebergCreationScope};
 use crate::delete_file::IcebergFileFormat;
 use crate::iceberg::io::{FileMetadata, FileWrite};
@@ -97,6 +99,9 @@ impl ManagedWriteObjects {
             .identity(self.physical, path, self.format)
             .map_err(iceberg_error)?;
         let claim = self.journal.begin(path, identity).map_err(journal_error)?;
+        let progress = self.journal.write_progress(path).ok_or_else(|| {
+            journal_error("conditional writer lost its path write count".to_owned())
+        })?;
         let cancellation = FileCancellation::from_connector_request(original);
         let stream = phase
             .as_ref()
@@ -125,6 +130,7 @@ impl ManagedWriteObjects {
             phase,
             stream,
             size: 0,
+            progress,
             digest: Sha256::new(),
         }))
     }
@@ -220,6 +226,7 @@ struct ManagedFileWrite {
     phase: Option<ConnectorIoPermit>,
     stream: Option<ConnectorIoStreamCustody>,
     size: u64,
+    progress: StagedWriteProgress,
     digest: Sha256,
 }
 
@@ -384,7 +391,9 @@ impl FileWrite for ManagedFileWrite {
         writer.write(bytes.clone(), &self.cancellation).await?;
         self.digest.update(bytes);
         self.size = size;
-        self.original.check_active().map_err(iceberg_error)
+        self.original.check_active().map_err(iceberg_error)?;
+        self.progress.record_accepted(size);
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<FileMetadata> {

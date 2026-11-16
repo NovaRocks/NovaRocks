@@ -346,6 +346,7 @@ fn add_edge_with_kind(
             } else {
                 RowMultiplicity::SingleCopy
             },
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -913,6 +914,7 @@ fn replace_source_fragment(
         result_port: plan.result_port().cloned(),
         required: plan.required(),
         annotations: plan.annotations().to_vec().into_boxed_slice(),
+        write_layouts: Default::default(),
     })
 }
 

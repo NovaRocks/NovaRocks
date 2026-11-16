@@ -398,6 +398,7 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
             scans: BTreeMap::from([(scan, frozen)]),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         admission(),
         &Setup,

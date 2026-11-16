@@ -191,7 +191,7 @@ impl FailureProjection for crate::PureProviderCatalogError {
                 ContractReason::ProviderReadUnavailable,
                 FailureClass::Unsupported,
             ),
-            E::WriteUnavailable(_) => fact(
+            E::WriteUnavailable(_) | E::WriteLayoutUnavailable(_) => fact(
                 ContractReason::ProviderWriteUnavailable,
                 FailureClass::Unsupported,
             ),

@@ -237,6 +237,8 @@ pub struct IcebergFileSystemFactory {
     admission: Option<Arc<dyn IcebergWriteAdmission>>,
     #[serde(skip, default)]
     creation: Option<ManagedWriteObjects>,
+    #[serde(skip, default)]
+    staged_paths: Option<crate::commit::data_writer::StagedPathJournal>,
 }
 
 impl IcebergFileSystemFactory {
@@ -245,6 +247,7 @@ impl IcebergFileSystemFactory {
             binding: Some(binding),
             admission: None,
             creation: None,
+            staged_paths: None,
         }
     }
 }
@@ -263,6 +266,7 @@ impl StorageFactory for IcebergFileSystemFactory {
             listing: None,
             admission: self.admission.clone(),
             creation: self.creation.clone(),
+            staged_paths: self.staged_paths.clone(),
         }))
     }
 }
@@ -277,6 +281,8 @@ pub struct IcebergFsStorage {
     admission: Option<Arc<dyn IcebergWriteAdmission>>,
     #[serde(skip, default)]
     creation: Option<ManagedWriteObjects>,
+    #[serde(skip, default)]
+    staged_paths: Option<crate::commit::data_writer::StagedPathJournal>,
 }
 
 impl IcebergFsStorage {
@@ -286,6 +292,7 @@ impl IcebergFsStorage {
             listing: None,
             admission: None,
             creation: None,
+            staged_paths: None,
         }
     }
 
@@ -545,6 +552,18 @@ impl Storage for IcebergFsStorage {
             })?;
             return creation.open(binding, path).await;
         }
+        let progress = self
+            .staged_paths
+            .as_ref()
+            .map(|journal| {
+                journal.write_progress(path).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "staged writer path was not registered",
+                    )
+                })
+            })
+            .transpose()?;
         let permit = match &self.admission {
             Some(admission) => Some(admission.clone().admit(path)?.acquire().await?),
             None => None,
@@ -621,6 +640,7 @@ impl Storage for IcebergFsStorage {
             stream,
             local_closed: false,
             accepted_bytes: 0,
+            progress,
         }))
     }
 
@@ -784,9 +804,17 @@ struct IcebergFsFileWrite {
     local_closed: bool,
     // Only writes returned successfully to the SDK contribute to stored size.
     accepted_bytes: u64,
+    progress: Option<crate::commit::data_writer::StagedWriteProgress>,
 }
 
 impl IcebergFsFileWrite {
+    fn record_accepted(&mut self, bytes: u64) {
+        self.accepted_bytes = bytes;
+        if let Some(progress) = &self.progress {
+            progress.record_accepted(bytes);
+        }
+    }
+
     fn closed_metadata(&self, metadata: crate::opendal::Metadata) -> Result<FileMetadata> {
         let reported = metadata.content_length();
         if reported != 0 && reported != self.accepted_bytes {
@@ -943,7 +971,7 @@ impl FileWrite for IcebergFsFileWrite {
                 .write(bs)
                 .await
                 .map_err(|e| Error::new(ErrorKind::Unexpected, format!("fs write: {e}")))?;
-            self.accepted_bytes = accepted_bytes;
+            self.record_accepted(accepted_bytes);
             return Ok(());
         }
         let mut writer = self
@@ -960,7 +988,7 @@ impl FileWrite for IcebergFsFileWrite {
         .await;
         match result {
             Ok((accepted_bytes, None)) => {
-                self.accepted_bytes = accepted_bytes;
+                self.record_accepted(accepted_bytes);
                 self.writer = Some(writer);
                 Ok(())
             }
@@ -1042,6 +1070,7 @@ pub(crate) fn build_admitted_file_io_for_location(
         binding: Some(binding),
         admission: Some(admission),
         creation: None,
+        staged_paths: None,
     }))
     .build()
 }
@@ -1076,8 +1105,20 @@ pub(crate) fn build_managed_file_io(
             format,
             journal,
         }),
+        staged_paths: None,
     }))
     .build())
+}
+
+pub(crate) fn build_tracked_staged_file_io(
+    binding: IcebergReadBinding,
+    staged_paths: crate::commit::data_writer::StagedPathJournal,
+) -> FileIO {
+    FileIOBuilder::new(Arc::new(IcebergFileSystemFactory {
+        staged_paths: Some(staged_paths),
+        ..IcebergFileSystemFactory::new(binding)
+    }))
+    .build()
 }
 
 pub fn build_file_io_for_location(location: &str, binding: IcebergReadBinding) -> FileIO {
@@ -1142,6 +1183,7 @@ pub(crate) async fn list_directories(
         listing: Some(bound),
         admission: None,
         creation: None,
+        staged_paths: None,
     };
     storage.list_directories(location).await
 }
@@ -1597,6 +1639,7 @@ mod tests {
                 stream: None,
                 local_closed: false,
                 accepted_bytes: 0,
+                progress: None,
             },
             admission,
             events,
@@ -1988,6 +2031,7 @@ mod tests {
             listing: Some(novarocks_spi::connector::ConnectorListingPageSize::new(1).unwrap()),
             admission: None,
             creation: None,
+            staged_paths: None,
         };
         assert_eq!(
             complete.list_directories(&location).await.unwrap(),
@@ -2517,6 +2561,7 @@ pub(crate) mod manifest_stream_tests {
                 stream: None,
                 local_closed: false,
                 accepted_bytes: 0,
+                progress: None,
             }))
         }
     }

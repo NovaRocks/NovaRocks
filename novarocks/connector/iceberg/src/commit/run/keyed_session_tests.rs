@@ -181,6 +181,7 @@ async fn prepare_keyed(fixture: &Fixture, payload: &'static [u8]) -> PreparedKey
 
 fn keyed_begin(prepared: &PreparedKeyed) -> ConnectorWriteBeginRequest {
     ConnectorWriteBeginRequest {
+        catalog_session: Default::default(),
         table: Arc::from("db.t"),
         target_ref: ConnectorWriteTargetRef::main(),
         intent: ConnectorWriteIntent::Overwrite,
@@ -432,7 +433,7 @@ async fn keyed_data_finish<'a>(
     );
     let mut writer = execution
         .open_writer(ConnectorOpenWriterRequest {
-            resources: None,
+            resources: Some(crate::commit::write_stack::test_support::writer_resources()),
             handle: target.handle().clone(),
             target: target.ordinal(),
             expected_schema: schema,

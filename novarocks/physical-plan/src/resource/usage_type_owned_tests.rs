@@ -425,6 +425,7 @@ fn partitioning() -> EdgePartitioning {
         destination: Distribution::Singleton,
         source_multiplicity: RowMultiplicity::SingleCopy,
         destination_multiplicity: RowMultiplicity::SingleCopy,
+        routing_only: Box::default(),
     }
 }
 fn filter() -> RuntimeFilter {

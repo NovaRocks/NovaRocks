@@ -202,6 +202,7 @@ fn fixture_plan_parameters(plan: &PhysicalPlan, parameters: SemanticParameters) 
         result_port: plan.result_port().cloned(),
         required: plan.required(),
         annotations: plan.annotations().to_vec().into_boxed_slice(),
+        write_layouts: Default::default(),
     }
     .into();
     validate_plan(&plan).unwrap();
@@ -268,6 +269,7 @@ pub(super) fn package_input_with_controls(
         scans: BTreeMap::new(),
         writes: BTreeMap::new(),
         annotations: Box::default(),
+        layouts: Default::default(),
     }
 }
 

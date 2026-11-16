@@ -71,7 +71,9 @@ fn frozen_facts(location: &str, fields: Vec<Arc<NestedField>>) -> FrozenDataWrit
                 .unwrap(),
         )
         .unwrap(),
-        parquet_row_group_size_bytes: Some(1024),
+        parquet_row_group_size_bytes: 1024,
+        target_file_size_bytes: crate::catalog_config::DEFAULT_TARGET_FILE_SIZE_BYTES,
+        max_partitions_per_writer: crate::catalog_config::DEFAULT_MAX_PARTITIONS_PER_WRITER,
     }
 }
 

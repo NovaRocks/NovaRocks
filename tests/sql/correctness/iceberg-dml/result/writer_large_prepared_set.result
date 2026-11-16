@@ -1,0 +1,9 @@
+-- query 2
+-- types	bigint	bigint
+n	partition_sum
+16385	134242305
+
+-- query 3
+-- types	bigint
+data_files
+16385

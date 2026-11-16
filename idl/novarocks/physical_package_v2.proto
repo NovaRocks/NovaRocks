@@ -66,6 +66,7 @@ message FragmentPackage {
   repeated PublicSourceSchemaFactsDefinition public_source_schemas = 23;
   novarocks.physical_type_v2.SourceFieldTable source_fields = 24;
   repeated SystemRelationUnits system_relation_units = 25;
+  repeated FrozenWriteLayoutRecipe layouts = 26;
 }
 message RequiredContracts { uint32 plan_contract_revision = 1; }
 message Fragment {
@@ -630,6 +631,7 @@ message PhysicalNode {
     WriterFinish table_finish = 26;
     SystemRelationNode system_relation = 27;
     PositionShardNode position_shard = 28;
+    WriteLayoutKeyNode write_layout_key = 29;
   }
 }
 message OutputPort {
@@ -919,6 +921,10 @@ enum RowMutationEffect {
   ROW_MUTATION_EFFECT_REPLACE = 2;
   ROW_MUTATION_EFFECT_INSERT = 3;
 }
+message WriteLayoutKeyNode {
+  repeated uint32 key_input_value_ids = 1;
+  optional uint32 output_key_value_id = 2;
+}
 message PositionShardNode {
   bytes contribution_group_id = 1;
   repeated PositionShardInput inputs = 2;
@@ -1066,6 +1072,7 @@ message WriteRouteRequirements {
   oneof layout {
     novarocks.physical_control_v2.Empty no_layout = 4;
     WriteRouteKeyFields cluster_by = 5;
+    WriteRouteKeyFields partition_affinity = 6;
   }
 }
 message WriteRouteKeyFields { repeated uint32 value_ids = 1; }
@@ -1147,6 +1154,11 @@ message EdgePartitioning {
   RowMultiplicity source_multiplicity = 2;
   Distribution destination = 3;
   RowMultiplicity destination_multiplicity = 4;
+  repeated RoutingOnlyValue routing_only = 5;
+}
+message RoutingOnlyValue {
+  optional uint32 source_value_id = 1;
+  optional uint32 destination_value_id = 2;
 }
 message CutValue {
   optional uint32 value_id = 1;
@@ -1640,6 +1652,13 @@ message ConnectorCallExpression {
   repeated uint32 argument_connector_expression_ids = 3;
 }
 
+message FrozenWriteLayoutRecipe {
+  optional uint32 node_id = 1;
+  optional uint32 provider_binding_id = 2;
+  optional uint32 recipe_payload_id = 3;
+  // Concatenated 32-byte field tokens, in the node's key input order.
+  bytes input_field_tokens = 4;
+}
 message FrozenWriterRecipe {
   optional uint32 node_id = 1;
   optional uint32 provider_binding_id = 2;

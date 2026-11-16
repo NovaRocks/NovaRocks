@@ -109,6 +109,9 @@ impl FixtureCatalogs {
         use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
         let identity = CatalogPropertyIdentity {
             attachment_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId::from_bytes(
+                [1; 16],
+            ),
             instance_id: ConnectorInstanceId::parse("input_lake").unwrap(),
             provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
             generation: 7,

@@ -226,6 +226,7 @@ mod tests {
             ],
             object_store_config: None,
             warehouse_path: PathBuf::from("/tmp/warehouse"),
+            write: Default::default(),
         });
 
         assert!(!state.is_s3());
@@ -249,6 +250,7 @@ mod tests {
                 properties: Vec::new(),
                 object_store_config: None,
                 warehouse_path: PathBuf::from("/tmp/warehouse"),
+                write: Default::default(),
             })
         };
         registry

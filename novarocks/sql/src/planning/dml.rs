@@ -499,6 +499,15 @@ impl DmlFinalWritePlanContext {
 }
 
 impl DmlWritePlanInput {
+    /// Carry the Provider route's original placement preference into planning.
+    pub fn with_write_layout(
+        mut self,
+        layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference,
+    ) -> Self {
+        self.0.write_layout = layout;
+        self
+    }
+
     /// Project every signed field of an ordinal root writer into its own
     /// ordinary source-assignment occurrence. Explicit output selections are
     /// already authored typed inputs; their per-field W/T normalization still
@@ -628,6 +637,8 @@ impl DmlWritePlanInput {
             crate::planner::distributed::write::contract::SqlWritePlanInput {
                 contract: SqlWriteSinkContract::try_new(mode.into(), target, input_columns)?,
                 position_materialization: None,
+                write_layout:
+                    novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
                 input,
                 finish_count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 root_output_exprs: None,

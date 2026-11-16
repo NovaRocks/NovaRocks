@@ -93,9 +93,15 @@ async fn managed_local_creation_records_actual_bytes_and_refuses_identical_forei
     journal.record(&path);
     let mut writer = io.new_output(&path).unwrap().writer().await.unwrap();
     writer.write(Bytes::from_static(b"a")).await.unwrap();
+    let progress = journal.write_progress(&path).unwrap();
+    assert_eq!(progress.accepted_bytes(), 1);
     assert!(!target.exists());
     writer.write(Bytes::from_static(b"bc")).await.unwrap();
     assert_eq!(writer.close().await.unwrap().size, 3);
+    assert_eq!(
+        progress.accepted_bytes(),
+        std::fs::metadata(&target).unwrap().len()
+    );
     let receipt = journal.receipt(&path).unwrap().unwrap();
     assert_eq!(receipt.physical(), &physical());
     assert_eq!(
@@ -168,6 +174,8 @@ async fn installed_local_writer(
     let receipt =
         IcebergCreationReceipt::try_new(physical(), claim.id, claim.identity, 3, sha256_abc())
             .unwrap();
+    let progress = journal.write_progress(path).unwrap();
+    progress.record_accepted(3);
     (
         ManagedFileWrite {
             writer: None,
@@ -181,6 +189,7 @@ async fn installed_local_writer(
             phase: None,
             stream: None,
             size: 3,
+            progress,
             digest: Sha256::new(),
         },
         writer,

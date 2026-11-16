@@ -229,6 +229,29 @@ pub struct IcebergWriteSessionControl {
     runtime: Arc<IcebergMetadataContext>,
 }
 
+pub(crate) fn freeze_writer_output(
+    properties: &std::collections::HashMap<String, String>,
+    config: crate::catalog_config::IcebergCatalogWriteConfig,
+) -> Result<IcebergWriterOutput, ConnectorError> {
+    use crate::commit::data_writer::{
+        DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES, TARGET_FILE_SIZE_BYTES_PROPERTY, positive_table_bytes,
+    };
+
+    let row_group_size = crate::commit::data_writer::parquet_row_group_size_bytes(properties)
+        .map_err(corrupt)?
+        .unwrap_or(DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES);
+    let target_file_size = positive_table_bytes(properties, TARGET_FILE_SIZE_BYTES_PROPERTY)
+        .map_err(corrupt)?
+        .unwrap_or(config.target_file_size_bytes);
+    IcebergWriterOutput::try_new(
+        crate::delete_file::IcebergFileFormat::Parquet,
+        parquet::basic::Compression::SNAPPY,
+        row_group_size,
+        target_file_size,
+        config.max_partitions_per_writer,
+    )
+}
+
 impl IcebergWriteSessionControl {
     #[cfg(novarocks_dev_controls)]
     pub fn with_test_observation(
@@ -2876,16 +2899,29 @@ impl IcebergWriteSessionControl {
         } else {
             None
         };
+        let mut write_config = self.runtime.control_state().configuration().write;
+        if let Some(value) = request
+            .catalog_session
+            .get(crate::catalog_config::MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY)
+        {
+            match value {
+                novarocks_spi::connector::read_stack::SessionPropertyValue::Integer(limit)
+                    if *limit > 0
+                        && (*limit as u32) <= write_config.max_partitions_per_writer() =>
+                {
+                    write_config.max_partitions_per_writer = *limit as u32;
+                }
+                _ => {
+                    return Err(invalid(
+                        "Admitted max_partitions_per_writer is outside the Iceberg catalog limit",
+                    ));
+                }
+            }
+        }
         let material = IcebergSessionMaterial {
-            data_output: IcebergWriterOutput::try_new(
-                crate::delete_file::IcebergFileFormat::Parquet,
-                parquet::basic::Compression::SNAPPY,
-                crate::commit::data_writer::parquet_row_group_size_bytes(
-                    writer_metadata.properties(),
-                )
-                .map_err(invalid)?
-                .map(|size| size as u64),
-            )?,
+            write_binding: self.adapter.binding().clone(),
+            write_partition_spec_id: writer_metadata.default_partition_spec_id(),
+            data_output: freeze_writer_output(writer_metadata.properties(), write_config)?,
             data_recipe: if let Some(scope) = rewrite_scope.as_ref() {
                 rewrite_source::data_recipe(
                     writer_metadata,

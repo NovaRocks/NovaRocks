@@ -212,6 +212,7 @@ mod router_runtime_tests {
                         destination: p::Distribution::RoundRobin,
                         source_multiplicity: multiplicity,
                         destination_multiplicity: multiplicity,
+                        routing_only: Box::default(),
                     },
                     source_port: p::FragmentOutputPort::Root,
                     payload: p::ExchangePayloadContract::ProviderRoute(p::ChangeStreamWriterCut {
@@ -254,6 +255,7 @@ mod router_runtime_tests {
                 destination: p::Distribution::Singleton,
                 source_multiplicity: multiplicity,
                 destination_multiplicity: multiplicity,
+                routing_only: Box::default(),
             },
             source_port: p::FragmentOutputPort::Summary(p::SummaryKind::WriteCounts),
             payload: p::ExchangePayloadContract::Summary(p::SummaryCut {
@@ -306,6 +308,7 @@ mod router_runtime_tests {
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             admission(),
             &FixtureControl,
@@ -343,6 +346,7 @@ mod router_runtime_tests {
             destination: p::Distribution::RoundRobin,
             source_multiplicity: p::RowMultiplicity::SingleCopy,
             destination_multiplicity: p::RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         }
     }
 
@@ -433,6 +437,7 @@ mod router_runtime_tests {
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             admission(),
             &FixtureControl,

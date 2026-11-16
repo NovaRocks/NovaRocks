@@ -60,6 +60,9 @@ pub enum CompiledExchangeRouting {
 pub struct CompiledExchangeInput {
     /// Complete cut-source declarations in wire ordinal order, mapped to local slots.
     pub wire_layout: crate::StaticLayout,
+    /// Local decoded transport layout when the exchange carries an additional
+    /// write-layout key. The local writer shuffle consumes and removes the key.
+    pub routing_layout: Option<crate::StaticLayout>,
     pub role: crate::ProgramOutputRole,
     pub delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
     pub routing: CompiledExchangeRouting,
@@ -495,8 +498,28 @@ fn validate_exchange_inputs(
         }
         for (id, input) in exchange_inputs {
             let layout = graph.nodes()[id.index()].output_layout();
-            let slots = layout.slots();
-            validate_exchange_wire_layout(*id, &input.wire_layout, layout, &mut work)?;
+            let transport = input.routing_layout.as_ref().unwrap_or(layout);
+            let slots = transport.slots();
+            validate_exchange_wire_layout(*id, &input.wire_layout, transport, &mut work)?;
+            if input.routing_layout.is_some() {
+                let [key] = input.hash_partition_slots.as_ref() else {
+                    return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
+                };
+                let prefix = layout.slots().len();
+                let exact = slots.len() == prefix + 1
+                    && slots.starts_with(layout.slots())
+                    && slots.last() == Some(key)
+                    && matches!(input.routing, CompiledExchangeRouting::Hash {
+                        algorithm: novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
+                    });
+                if !exact
+                    || !matches!(graph.nodes()[graph.root().index()].kind(),
+                    ProgramNodeKind::TableWriter { input, .. } if input == id)
+                {
+                    return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
+                }
+                validate_exchange_layout_prefix(*id, transport, layout, &mut work)?;
+            }
             let requirement = declarations.get(id).copied();
             if requirement != Some((input.role, input.delivery))
                 || (input.role != crate::ProgramOutputRole::Relational
@@ -563,8 +586,9 @@ fn validate_exchange_inputs(
                     if slot == key {
                         occurrences += 1;
                         supported = algorithm.is_some_and(|algorithm| {
-                            algorithm
-                                .supports_partition_key(layout.schema().field(ordinal).data_type())
+                            algorithm.supports_partition_key(
+                                transport.schema().field(ordinal).data_type(),
+                            )
                         });
                     }
                     work.step().map_err(LocalProgramCompileError::Control)?;
@@ -594,6 +618,15 @@ fn validate_exchange_wire_layout(
     if !wire.is_typed() || !local.is_typed() || wire.slots() != local.slots() {
         return Err(LocalProgramCompileError::ExchangeInputMismatch(id));
     }
+    validate_exchange_layout_prefix(id, wire, local, work)
+}
+
+fn validate_exchange_layout_prefix(
+    id: ProgramNodeId,
+    wire: &crate::StaticLayout,
+    local: &crate::StaticLayout,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), LocalProgramCompileError> {
     for ordinal in 0..local.slots().len() {
         work.step().map_err(LocalProgramCompileError::Control)?;
         let source = wire

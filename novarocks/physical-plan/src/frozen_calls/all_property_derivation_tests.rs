@@ -509,6 +509,7 @@ pub(super) fn exchange() -> (Fixture, FragmentCuts) {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::RoundRobin,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
             source_port: crate::FragmentOutputPort::Root,
             delivery: crate::DeliveryRequirement::DemandDriven,

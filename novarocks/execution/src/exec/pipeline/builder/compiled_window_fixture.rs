@@ -985,6 +985,7 @@ pub(super) fn package_typed(
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             admission(),
             &FixtureControl,

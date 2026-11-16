@@ -52,9 +52,6 @@ pub const MAX_CONNECTOR_STATISTICS_COLUMNS: usize = 1024;
 /// [`StatisticsMetric::RowCount`] metric.
 pub const MAX_CONNECTOR_STATISTICS_METRICS: usize = MAX_CONNECTOR_STATISTICS_COLUMNS * 5;
 
-/// Maximum number of provider artifacts produced by one statistics session.
-pub const MAX_CONNECTOR_STATISTICS_ARTIFACTS: usize = 4096;
-
 /// One artifact body must fit an ordinary native result packet.
 pub const MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -65,14 +62,6 @@ pub const MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES: usize = 16 * 1024 * 1024
 /// artifact could never make progress: Unpivot can split between rows, but it
 /// cannot split one artifact body across batches.
 pub const MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES: usize = 32 * 1024 * 1024;
-
-/// Maximum retained artifact body bytes accumulated by one FE result decoder.
-///
-/// The current 1,024-column ANALYZE ceiling can legitimately produce 1,024
-/// saturated default-lg-k Theta compact sketches (65,560 bytes each), which is
-/// slightly larger than 64 MiB. Keep a finite headroom while ensuring the
-/// declared column limit is actually executable.
-pub const MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 /// Opaque provider token that pins a table's data state. It is deliberately
 /// distinct from `ConnectorTableMetadata::version`, whose current providers
@@ -618,12 +607,6 @@ fn validate_collection_start(
     read_version_ordinal: Option<i64>,
     expectations: &[StatisticsArtifactIdentity],
 ) -> Result<(), ConnectorError> {
-    if required_aggregations.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "statistics aggregation requirement count exceeds the metric limit",
-        ));
-    }
     let identities = required_aggregations
         .iter()
         .map(|requirement| requirement.artifact().clone())

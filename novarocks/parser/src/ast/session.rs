@@ -103,6 +103,7 @@ pub struct SetStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetAssignment {
     pub scope: SetScope,
+    pub catalog: Option<Ident>,
     pub name: Ident,
     pub value: Expr,
     pub span: Span,

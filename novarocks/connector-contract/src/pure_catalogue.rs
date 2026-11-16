@@ -19,7 +19,8 @@
 
 use crate::{
     ConnectorError, ConnectorProviderId, ConnectorReadProgramCompileError,
-    ConnectorReadProgramCompiler, ConnectorReadProgramRecipe, ConnectorWriteRecipe,
+    ConnectorReadProgramCompiler, ConnectorReadProgramRecipe, ConnectorWriteLayoutRecipe,
+    ConnectorWriteLayoutRecipeCompiler, ConnectorWriteLayoutRecipeDraft, ConnectorWriteRecipe,
     ConnectorWriteRecipeCompileError, ConnectorWriteRecipeCompiler, ConnectorWriteRecipeDraft,
     FrozenConnectorRead,
 };
@@ -36,6 +37,7 @@ pub struct PureProviderManifestEntry {
     provider: ConnectorProviderId,
     read: bool,
     write: bool,
+    write_layout: bool,
 }
 impl PureProviderManifestEntry {
     pub const fn new(provider: ConnectorProviderId, read: bool, write: bool) -> Self {
@@ -43,7 +45,12 @@ impl PureProviderManifestEntry {
             provider,
             read,
             write,
+            write_layout: false,
         }
+    }
+    pub const fn with_write_layout(mut self) -> Self {
+        self.write_layout = true;
+        self
     }
     pub const fn provider(&self) -> &ConnectorProviderId {
         &self.provider
@@ -62,6 +69,7 @@ pub struct PureProviderProgramDefinition<E: Error + 'static> {
     provider: ConnectorProviderId,
     read: Option<Arc<dyn ConnectorReadProgramCompiler<Error = E>>>,
     write: Option<Arc<dyn ConnectorWriteRecipeCompiler<Error = E>>>,
+    write_layout: Option<Arc<dyn ConnectorWriteLayoutRecipeCompiler<Error = E>>>,
 }
 impl<E: Error + 'static> PureProviderProgramDefinition<E> {
     pub fn new(
@@ -73,7 +81,15 @@ impl<E: Error + 'static> PureProviderProgramDefinition<E> {
             provider,
             read,
             write,
+            write_layout: None,
         }
+    }
+    pub fn with_write_layout(
+        mut self,
+        layout: Arc<dyn ConnectorWriteLayoutRecipeCompiler<Error = E>>,
+    ) -> Self {
+        self.write_layout = Some(layout);
+        self
     }
     pub const fn provider(&self) -> &ConnectorProviderId {
         &self.provider
@@ -91,6 +107,7 @@ pub enum PureProviderCatalogError {
     MissingProvider(ConnectorProviderId),
     ReadUnavailable(ConnectorProviderId),
     WriteUnavailable(ConnectorProviderId),
+    WriteLayoutUnavailable(ConnectorProviderId),
     Control(CompileControlError),
 }
 impl fmt::Display for PureProviderCatalogError {
@@ -107,6 +124,7 @@ impl fmt::Display for PureProviderCatalogError {
             Self::MissingProvider(p) => ("provider is absent from the installed pure catalogue", p),
             Self::ReadUnavailable(p) => ("provider has no pure read port", p),
             Self::WriteUnavailable(p) => ("provider has no pure write port", p),
+            Self::WriteLayoutUnavailable(p) => ("provider has no pure write layout port", p),
             Self::Control(e) => return fmt::Display::fmt(e, f),
         };
         write!(f, "pure provider '{}': {reason}", provider.as_str())
@@ -200,14 +218,17 @@ impl<E: Error + 'static> PureProviderProgramCatalog<E> {
         let result = (|| {
             let mut expected = BTreeMap::new();
             for entry in manifest {
-                let old = expected.insert(entry.provider.clone(), (entry.read, entry.write));
+                let old = expected.insert(
+                    entry.provider.clone(),
+                    (entry.read, entry.write, entry.write_layout),
+                );
                 work.step()?;
                 if old.is_some() {
                     return Err(PureProviderCatalogError::DuplicateManifest(
                         entry.provider.clone(),
                     ));
                 }
-                if !entry.read && !entry.write {
+                if !entry.read && !entry.write && !entry.write_layout {
                     return Err(PureProviderCatalogError::EmptyManifestEntry(
                         entry.provider.clone(),
                     ));
@@ -218,10 +239,13 @@ impl<E: Error + 'static> PureProviderProgramCatalog<E> {
                 let id = definition.provider.clone();
                 let expected_facets = expected.get(&id).copied();
                 work.step()?;
-                let Some((read, write)) = expected_facets else {
+                let Some((read, write, write_layout)) = expected_facets else {
                     return Err(PureProviderCatalogError::UnexpectedDefinition(id));
                 };
-                if definition.read.is_some() != read || definition.write.is_some() != write {
+                if definition.read.is_some() != read
+                    || definition.write.is_some() != write
+                    || definition.write_layout.is_some() != write_layout
+                {
                     return Err(PureProviderCatalogError::CapabilityMismatch(id));
                 }
                 let duplicate = installed.insert(id.clone(), definition).is_some();
@@ -278,6 +302,23 @@ impl<E: Error + 'static> PureProviderProgramCatalog<E> {
             Ok(recipe)
         })();
         work.finish_result(result, PureProviderProgramError::Control)
+    }
+
+    pub fn compile_write_layout(
+        &self,
+        draft: &ConnectorWriteLayoutRecipeDraft,
+        control: &dyn PureCompileControl,
+    ) -> Result<ConnectorWriteLayoutRecipe, PureProviderProgramError<E>> {
+        let id = &draft.binding().descriptor().provider_id;
+        let definition = self
+            .definitions
+            .get(id)
+            .ok_or_else(|| PureProviderCatalogError::MissingProvider(id.clone()))?;
+        let port = definition
+            .write_layout
+            .as_ref()
+            .ok_or_else(|| PureProviderCatalogError::WriteLayoutUnavailable(id.clone()))?;
+        ConnectorWriteLayoutRecipe::compile(draft, port.as_ref(), control)
     }
 
     pub fn compile_write(

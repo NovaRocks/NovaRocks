@@ -30,9 +30,8 @@
 //! DELETE_VERIFICATION has zero header payload declarations and exactly 40 payload
 //! bytes: three i64LE counts and a 16-byte little-endian fingerprint.
 //!
-//! Every single-value, count and cumulative limit the frontend applies is
-//! checked from the row's lengths BEFORE its header is written, so a refused
-//! row emits no byte. Exactly one ROW_COUNT is required: a second one is refused
+//! Record shape, artifact framing, and cumulative property bytes are checked
+//! before writing a row's header. Exactly one ROW_COUNT is required: a second one is refused
 //! before emission, and its absence is refused by [`WriteCommitTotals::finish`]
 //! at the sealed End. Field-ID/property-key uniqueness, the frozen target and
 //! artifact sets, and commit authority stay with the frontend decoder, which
@@ -49,9 +48,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field};
 use novarocks_result_render::{RenderTurn, RenderTurnStatus};
 use novarocks_spi::connector::write_stack::{
-    MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES,
-    MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES, MAX_CONNECTOR_WRITE_TARGETS,
-    ROOT_WRITE_RESULT_BLOB_TYPE_COLUMN, ROOT_WRITE_RESULT_BODY_COLUMN,
+    MAX_CONNECTOR_WRITE_TARGETS, ROOT_WRITE_RESULT_BLOB_TYPE_COLUMN, ROOT_WRITE_RESULT_BODY_COLUMN,
     ROOT_WRITE_RESULT_COLUMN_COUNT, ROOT_WRITE_RESULT_FRAGMENT_COLUMN,
     ROOT_WRITE_RESULT_INPUT_FIELDS_COLUMN, ROOT_WRITE_RESULT_INSUFFICIENT_FINGERPRINT_COLUMN,
     ROOT_WRITE_RESULT_INSUFFICIENT_KEYS_COLUMN, ROOT_WRITE_RESULT_KIND_COLUMN,
@@ -60,9 +57,8 @@ use novarocks_spi::connector::write_stack::{
     ROOT_WRITE_RESULT_TARGET_COLUMN, RootRowKind,
 };
 use novarocks_spi::connector::{
-    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
-    MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-    MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
+    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_COLUMNS,
+    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
 };
 
 pub const WRITE_COMMIT_HEADER_BYTES: usize = 48;
@@ -102,8 +98,6 @@ pub enum WriteCommitCodecError {
     DuplicateDeleteVerification,
     DeleteVerificationCount,
     MissingRowCount,
-    FragmentLimit,
-    ArtifactLimit,
     FieldIds,
     BlobType,
     BodyLimit,
@@ -113,6 +107,7 @@ pub enum WriteCommitCodecError {
     TruncatedHeader,
     HeaderVersion,
     RecordLength,
+    FragmentLength,
     TruncatedRecord,
     TrailingRecordBytes,
     Failed,
@@ -131,8 +126,6 @@ impl std::fmt::Display for WriteCommitCodecError {
             Self::DuplicateDeleteVerification => {
                 "write commit stream contains more than one DELETE_VERIFICATION"
             }
-            Self::FragmentLimit => "prepared write set exceeds its frozen fragment budget",
-            Self::ArtifactLimit => "write commit artifact count exceeds its bounded profile",
             Self::FieldIds => "write commit artifact field IDs must be positive and bounded",
             Self::BlobType => "write commit artifact blob type is empty or too large",
             Self::BodyLimit => "write commit artifact body exceeds its bounded profile",
@@ -142,6 +135,7 @@ impl std::fmt::Display for WriteCommitCodecError {
             Self::TruncatedHeader => "write commit record header is truncated",
             Self::HeaderVersion => "unsupported write commit record header",
             Self::RecordLength => "write commit record length disagrees with its declarations",
+            Self::FragmentLength => "write commit fragment exceeds its 32-bit wire length",
             Self::TruncatedRecord => "write commit record is truncated",
             Self::TrailingRecordBytes => "write commit record has trailing bytes",
             Self::Failed => "write commit cursor has failed",
@@ -172,7 +166,7 @@ impl WriteCommitRecordHeader {
         Self::try_new(RootRowKind::RowCount, 0, row_count, 0, [0; 5])
     }
     fn fragment(target: i32, bytes: usize) -> Result<Self, WriteCommitCodecError> {
-        let bytes = u32::try_from(bytes).map_err(|_| WriteCommitCodecError::FragmentLimit)?;
+        let bytes = u32::try_from(bytes).map_err(|_| WriteCommitCodecError::FragmentLength)?;
         Self::try_new(RootRowKind::PreparedFragment, target, 0, bytes, [0; 5])
     }
     fn artifact(
@@ -234,9 +228,6 @@ impl WriteCommitRecordHeader {
                 valid_target(target)?;
                 if row_count != 0 || !artifact_empty {
                     return Err(WriteCommitCodecError::Shape);
-                }
-                if fragment_bytes as usize > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
-                    return Err(WriteCommitCodecError::FragmentLimit);
                 }
             }
             RootRowKind::ArtifactDraft => {
@@ -505,11 +496,6 @@ impl<'a> WriteCommitRecordView<'a> {
 pub struct WriteCommitTotals {
     row_count_seen: bool,
     delete_verification_seen: bool,
-    /// `PreparedWriteSetLedger` semantics: reaching a bound is legal.
-    fragments: usize,
-    fragment_bytes: usize,
-    artifacts: usize,
-    body_bytes: usize,
     property_bytes: usize,
 }
 impl WriteCommitTotals {
@@ -532,29 +518,8 @@ impl WriteCommitTotals {
                 }
                 next.row_count_seen = true;
             }
-            RootRowKind::PreparedFragment => {
-                next.fragments = next
-                    .fragments
-                    .checked_add(1)
-                    .filter(|count| *count <= MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES)
-                    .ok_or(WriteCommitCodecError::FragmentLimit)?;
-                next.fragment_bytes = next
-                    .fragment_bytes
-                    .checked_add(header.fragment_bytes())
-                    .filter(|bytes| *bytes <= MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES)
-                    .ok_or(WriteCommitCodecError::FragmentLimit)?;
-            }
+            RootRowKind::PreparedFragment => {}
             RootRowKind::ArtifactDraft => {
-                next.artifacts = next
-                    .artifacts
-                    .checked_add(1)
-                    .filter(|count| *count <= MAX_CONNECTOR_STATISTICS_ARTIFACTS)
-                    .ok_or(WriteCommitCodecError::ArtifactLimit)?;
-                next.body_bytes = next
-                    .body_bytes
-                    .checked_add(header.body_bytes())
-                    .filter(|bytes| *bytes <= MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES)
-                    .ok_or(WriteCommitCodecError::BodyLimit)?;
                 next.property_bytes = next
                     .property_bytes
                     .checked_add(header.property_bytes())
@@ -574,15 +539,6 @@ impl WriteCommitTotals {
     }
     pub const fn row_count_seen(&self) -> bool {
         self.row_count_seen
-    }
-    pub const fn fragments(&self) -> usize {
-        self.fragments
-    }
-    pub const fn fragment_bytes(&self) -> usize {
-        self.fragment_bytes
-    }
-    pub const fn artifacts(&self) -> usize {
-        self.artifacts
     }
 }
 
@@ -1174,8 +1130,7 @@ impl novarocks_execution_contract::failure::FailureProjection for WriteCommitCod
             Self::RowCount => (FailureClass::Data, 204),
             Self::DuplicateRowCount => (FailureClass::Invariant, 205),
             Self::MissingRowCount => (FailureClass::Invariant, 206),
-            Self::FragmentLimit => (FailureClass::Resource, 207),
-            Self::ArtifactLimit => (FailureClass::Resource, 208),
+            Self::FragmentLength => (FailureClass::Resource, 207),
             Self::FieldIds => (FailureClass::Data, 209),
             Self::BlobType => (FailureClass::Data, 210),
             Self::BodyLimit => (FailureClass::Resource, 211),

@@ -70,4 +70,4 @@ pub use planning::{
     IcebergWriteBranchPlan, IcebergWriteSessionPlanInput, IcebergWriteTargetPlan,
     plan_branch_session, plan_write_session,
 };
-pub use program_recipe::IcebergWriteRecipeCompiler;
+pub use program_recipe::{IcebergWriteLayoutRecipeCompiler, IcebergWriteRecipeCompiler};

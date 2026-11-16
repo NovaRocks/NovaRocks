@@ -249,16 +249,14 @@ fn facts(base: Option<i64>, version: u8) -> IcebergWriteTableFacts {
     .unwrap()
 }
 fn output(branch: IcebergWriteBranch) -> IcebergWriterOutput {
-    IcebergWriterOutput::try_new(
+    IcebergWriterOutput::for_test(
         if branch == IcebergWriteBranch::DeletionVector {
             IcebergFileFormat::Puffin
         } else {
             IcebergFileFormat::Parquet
         },
         parquet::basic::Compression::SNAPPY,
-        None,
     )
-    .unwrap()
 }
 
 #[test]
@@ -387,6 +385,7 @@ fn empty_delete_session(version: crate::iceberg::spec::FormatVersion, variant: b
     let session = lake
         .control
         .begin_write(ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from(format!("{namespace}.{name}")),
             target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
@@ -492,6 +491,7 @@ fn ordinary_equality_delete_sessions_apply_the_existing_table_shape_guards() {
         let before = physical_bytes(lake._warehouse.path());
         let context = request_context();
         let result = lake.control.begin_write(ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from(table_name),
             target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,

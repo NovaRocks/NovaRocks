@@ -265,6 +265,7 @@ fn checked_package(pool: &ConstantPool, ordinals: &[u32]) -> FragmentPackage {
             writes: BTreeMap::new(),
             annotations: Box::default(),
             pruning,
+            layouts: Default::default(),
         },
         package_admission(),
         &Control::good(),

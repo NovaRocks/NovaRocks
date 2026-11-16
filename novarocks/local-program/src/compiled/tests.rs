@@ -593,6 +593,7 @@ fn exchange_input_addresses_cover_exactly_the_actual_exchange_sources() {
             &[1],
             "wire",
         ),
+        routing_layout: None,
         role: crate::ProgramOutputRole::Relational,
         delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
         routing: crate::CompiledExchangeRouting::Unpartitioned,

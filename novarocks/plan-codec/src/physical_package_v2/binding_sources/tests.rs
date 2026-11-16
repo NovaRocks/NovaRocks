@@ -535,6 +535,7 @@ fn package() -> p::FragmentPackage {
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         p::FragmentPackageAdmission {
             plan_limits: p::PlanLimits::FROZEN,
@@ -1391,6 +1392,7 @@ fn wide_package() -> p::FragmentPackage {
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         p::FragmentPackageAdmission {
             plan_limits: p::PlanLimits::FROZEN,

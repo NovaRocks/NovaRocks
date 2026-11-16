@@ -1980,6 +1980,7 @@ mod conditional_compiled_selection {
                     scans: BTreeMap::new(),
                     writes: BTreeMap::new(),
                     annotations: Box::default(),
+                    layouts: Default::default(),
                 },
                 // Explicit bounded fixture invoices; no production defaults.
                 FragmentPackageAdmission {

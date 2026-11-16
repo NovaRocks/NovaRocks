@@ -156,6 +156,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
+- [ADR-0235](ADR-0235-iceberg-write-layout-and-data-plane-capacity.md) — Iceberg 写入为何由 Provider 签发分区亲和、Execution 扩散热点，并以冻结文件政策和真实容量作者承接数据面（active。部分替代 ADR-0023/0030/0133 的固定片段与写集额度。单 root、原提交/清理所有权与根结果分帧保留）
 - [ADR-0234](ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md) — Iceberg 产物为何由同一 operation 保管到终态、按依据复用，以构造时覆盖断言决定发布引用，并让证据和回执只承载有界事实（active；部分替代 ADR-0171 的产物类别、每轮清理、完整账本证据与对象数预算；ADR-0179 的 journal 结论与 ADR-0198 的原责任/退出不变；代码接线已完成，定向验证与最终验收范围另核）
 - [ADR-0232](ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md) — 维护与统计为何归原语句执行，取消为何保留原 Source 至真实退出，状态为何分别由统计、MV 系统关系与管理 API 提供（active；部分替代 ADR-0169/0111/0226，GC Accelerator、Catalog 准入与三态 publication 保留）
 - [ADR-0233](ADR-0233-iceberg-mor-only-and-provider-owned-write-validation.md) — Iceberg UPDATE/MERGE 为何统一 MOR、表属性为何不选算法、完整 V/W/T、可达字节与赋值 NULL 为何由原写入作者验证（active；替代 ADR-0063，部分替代 ADR-0049/0055/0191/0221 的 COW 接缝，其余 Provider、折叠与共享 codec 规则保留）
@@ -184,7 +185,7 @@ code-anchors:
 - ADR-0016 — Connector 为何共享逻辑 identity、但不共享 FE control 与 BE execution runtime（active）
 - ADR-0017 — Connector catalog mutation 为何使用 FE-only lease 与三态 external outcome（active）
 - ADR-0018 — 静态 Connector predicate 为何以 Exact/PruningOnly/Unsupported 协商、而不扩展 native wire（active）
-- [ADR-0133](ADR-0133-dataflow-connector-writer-and-frontend-commit.md) — 分布式 writer 为何是普通执行算子、产物走数据流、且只有 FE 能提交（active；全参与者成功门及缺失输出的清理假设由 ADR-0198 部分替代，dataflow writer、单 root 有界聚合、FE 提交与语句累计上界保留）
+- [ADR-0133](ADR-0133-dataflow-connector-writer-and-frontend-commit.md) — 分布式 writer 为何是普通执行算子、产物走数据流、且只有 FE 能提交（active；全参与者成功门及缺失输出的清理假设由 ADR-0198 部分替代。固定片段与写集额度由 ADR-0235 部分替代。dataflow writer、单 root 的实际资源窗口、每 driver 保管与 FE 提交保留）
 - ADR-0024 — 无需 BE staging 的 data mutation 为何使用 FE-only frozen plan 与 marker-only reconcile（active）
 - ADR-0028 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active；持久计划、恢复、私有产物与回收条款由 ADR-0177 部分替代，FE-only capability、准确 generation 与原子 marker 保留）
 - [ADR-0177](ADR-0177-attempt-local-maintenance-inputs-and-single-rewrite-plan.md) — 维护输入为何只驻留当前尝试，且重写读取、writer 与提交为何共用同一份冻结计划（active；部分替代 ADR-0028）
@@ -230,8 +231,8 @@ code-anchors:
 - ADR-0082 — 同一快照上的统计发布为何以覆盖度排序、且冲突重试必须重新判定（superseded → ADR-0136）
 
 - ADR-0048 — distributed write为何以 Provider-signed preparation、exact lease 与中立 durable terminal fact 收敛 caller authority（superseded → ADR-0051）
-- ADR-0023 — distributed writer 为何以 operation/cohort/execution/writer 分层，并由 FE 聚合外部提交（superseded → ADR-0133）
-- ADR-0030 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（superseded → ADR-0133）
+- ADR-0023 — distributed writer 为何以 operation/cohort/execution/writer 分层，并由 FE 聚合外部提交（superseded → ADR-0133。固定 16,384 writer 与 64 MiB 聚合额度由 ADR-0235 取代）
+- ADR-0030 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（superseded → ADR-0133。继承的固定 16,384 writer 与 64 MiB 聚合额度由 ADR-0235 取代）
 - ADR-0051 — distributed write 为何在 preparation 与 planning 之间强制 exact-generation Provider activation（superseded → ADR-0133）
 - ADR-0062 — Copy-on-Write row mutation 的读源为何由 Provider 按 cohort 冻结并以中立 recipe 签发（superseded → ADR-0063）
 - ADR-0060 — MV refresh base pin 为何必须从同一 exact metadata 投影 UUID 与 current snapshot（superseded → ADR-0086）

@@ -218,6 +218,7 @@ pub enum WriteColocation {
 pub enum WriteLayoutPreference {
     None,
     ClusterBy(Box<[ValueId]>),
+    PartitionAffinity(Box<[ValueId]>),
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WriteRouteRequirements {
@@ -233,7 +234,8 @@ impl WriteRouteRequirements {
     }
     pub fn layout_keys(&self) -> &[ValueId] {
         match &self.layout {
-            WriteLayoutPreference::ClusterBy(keys) => keys,
+            WriteLayoutPreference::ClusterBy(keys)
+            | WriteLayoutPreference::PartitionAffinity(keys) => keys,
             _ => &[],
         }
     }

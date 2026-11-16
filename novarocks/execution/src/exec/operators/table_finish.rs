@@ -20,9 +20,9 @@
 //! One driver on one Root BE consumes every writer row that arrives through the
 //! gather Exchange. It validates each row's shape against the frozen relation,
 //! checks the target ordinal against the sealed set, hands the canonical bytes
-//! to the validator port for a structural check, and charges both the frozen
-//! per-fragment and prepared-write-set budgets. Exceeding a budget is a typed
-//! rejection, never a truncation.
+//! to the validator port for a structural check, and tracks the retained bytes.
+//! Output batches respect Native framing. The operator reports resource refusals
+//! without truncating its input.
 //!
 //! Nothing is emitted before every sender reaches EOS: a prepared write set is
 //! complete or it does not exist. On abort the buffered fragments are released
@@ -64,10 +64,10 @@ use arrow::record_batch::RecordBatch;
 
 use novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES;
 use novarocks_spi::connector::write_stack::{
-    PreparedWriteSetLedger, RootRowKind, RootWriteResultRowShape, WriteRowCountAccumulator,
-    WriteTargetOrdinal, WriterRowKind, row_count_from_wire, row_count_to_wire,
-    target_ordinal_from_wire, target_ordinal_to_wire, validate_artifact_draft_nested_values,
-    validate_root_write_result_row, validate_writer_multiplex_row,
+    RootRowKind, RootWriteResultRowShape, WriteRowCountAccumulator, WriteTargetOrdinal,
+    WriterRowKind, row_count_from_wire, row_count_to_wire, target_ordinal_from_wire,
+    target_ordinal_to_wire, validate_artifact_draft_nested_values, validate_root_write_result_row,
+    validate_writer_multiplex_row,
 };
 
 use crate::exec::chunk::Chunk;
@@ -377,7 +377,6 @@ impl TableFinishOperatorFactory {
             rows: WriteRowCountAccumulator::new(),
             logical_rows: None,
             delete_verification: None,
-            ledger: PreparedWriteSetLedger::new(),
             fragments: Vec::new(),
             aggregate: None,
             construction: None,
@@ -558,7 +557,7 @@ impl PrefixOutputCursor {
 
         // The conservative estimate should normally fit on the first attempt.
         // Retrying with a smaller prefix keeps even unusual Arrow/IPC overhead
-        // bounded to one candidate batch instead of copying the complete ledger.
+        // bounded to one candidate batch instead of copying the complete set.
         loop {
             let batch = self.build_fragment_batch(selected)?;
             let size = root_output_size(&batch, self.tracker.as_ref())?;
@@ -704,7 +703,6 @@ struct TableFinishOperator {
     // Set only by the finish-owned logical input after both inputs reach EOS.
     logical_rows: Option<novarocks_local_program::LogicalChangeCounts>,
     delete_verification: Option<novarocks_result_contract::DeleteVerificationCounts>,
-    ledger: PreparedWriteSetLedger,
     fragments: Vec<BufferedFragment>,
     aggregate: Option<ChildStep>,
     construction: Option<Arc<dyn InputConstructionFactory>>,
@@ -908,9 +906,6 @@ impl TableFinishOperator {
                 let encoded = columns.fragments.value(row);
                 self.fragment_validator
                     .validate(target, encoded)
-                    .map_err(finish_connector)?;
-                self.ledger
-                    .reserve_fragment(encoded.len())
                     .map_err(finish_connector)?;
                 let bytes = encoded.to_vec();
                 let accounting = self
@@ -2021,10 +2016,8 @@ mod tests {
     use arrow::array::{BinaryArray, ListArray, StringArray};
     use arrow::datatypes::DataType;
     use novarocks_spi::connector::write_stack::{
-        MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES,
-        MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES, ROOT_WRITE_RESULT_BLOB_TYPE_INDEX,
-        ROOT_WRITE_RESULT_BODY_INDEX, ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX,
-        ROOT_WRITE_RESULT_PROPERTIES_INDEX,
+        ROOT_WRITE_RESULT_BLOB_TYPE_INDEX, ROOT_WRITE_RESULT_BODY_INDEX,
+        ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX, ROOT_WRITE_RESULT_PROPERTIES_INDEX,
     };
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
@@ -3217,86 +3210,6 @@ mod tests {
     }
 
     #[test]
-    fn table_finish_accepts_the_exact_single_fragment_limit_and_rejects_one_more() {
-        let state = RuntimeState::default();
-        let at_limit = factory(1);
-        let mut operator = at_limit.create(1, 0);
-        install_protocol_creator(operator.as_mut());
-        operator.prepare().expect("prepare");
-        complete_input(
-            operator.as_mut(),
-            &state,
-            writer_rows(vec![fragment_row(
-                0,
-                vec![7; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
-            )]),
-        )
-        .expect("the exact single-fragment budget is legal");
-
-        let over_limit = factory(1);
-        let mut operator = over_limit.create(1, 0);
-        install_protocol_creator(operator.as_mut());
-        operator.prepare().expect("prepare");
-        let error = complete_input(
-            operator.as_mut(),
-            &state,
-            writer_rows(vec![fragment_row(
-                0,
-                vec![7; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1],
-            )]),
-        )
-        .expect_err("over the single-fragment budget");
-        assert!(
-            error
-                .detail()
-                .contains("exceeds the frozen single-fragment budget")
-        );
-    }
-
-    #[test]
-    fn table_finish_rejects_the_prepared_write_set_byte_budget() {
-        let factory = factory(1);
-        let mut operator = factory.create(1, 0);
-        install_protocol_creator(operator.as_mut());
-        operator.prepare().expect("prepare");
-        let state = RuntimeState::default();
-        let mut processor = TestDriver::new(operator.as_mut(), &state);
-        let full = MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES / MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES;
-        for _ in 0..full {
-            processor
-                .input_without_output(writer_rows(vec![fragment_row(
-                    0,
-                    vec![1; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
-                )]))
-                .expect("within the set byte budget");
-        }
-        let error = processor
-            .input_without_output(writer_rows(vec![fragment_row(0, vec![1])]))
-            .expect_err("over the set byte budget");
-        assert!(error.detail().contains("exceeds the frozen byte budget"));
-    }
-
-    #[test]
-    fn table_finish_rejects_the_prepared_write_set_entry_budget() {
-        let factory = factory(1);
-        let mut operator = factory.create(1, 0);
-        install_protocol_creator(operator.as_mut());
-        operator.prepare().expect("prepare");
-        let state = RuntimeState::default();
-        let mut processor = TestDriver::new(operator.as_mut(), &state);
-        let rows = (0..MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES)
-            .map(|_| fragment_row(0, vec![1]))
-            .collect::<Vec<_>>();
-        processor
-            .input_without_output(writer_rows(rows))
-            .expect("the exact entry budget is legal");
-        let error = processor
-            .input_without_output(writer_rows(vec![fragment_row(0, vec![1])]))
-            .expect_err("over the entry budget");
-        assert!(error.detail().contains("exceeds the frozen entry budget"));
-    }
-
-    #[test]
     fn table_finish_streams_a_large_prepared_set_in_byte_bounded_batches() {
         let factory = factory(1);
         let mut operator = factory.create(1, 0);
@@ -3305,14 +3218,13 @@ mod tests {
         install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
-        for index in 0..40u8 {
+        let fragments = 34u8;
+        let fragment_size = 2 * 1024 * 1024;
+        for index in 0..fragments {
             complete_input(
                 operator.as_mut(),
                 &state,
-                writer_rows(vec![fragment_row(
-                    0,
-                    vec![index; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
-                )]),
+                writer_rows(vec![fragment_row(0, vec![index; fragment_size])]),
             )
             .expect("bounded prepared fragment");
         }
@@ -3353,7 +3265,7 @@ mod tests {
             })
             .filter(|kind| *kind == RootRowKind::PreparedFragment.to_wire())
             .count();
-        assert_eq!(fragment_rows, 40);
+        assert_eq!(fragment_rows, usize::from(fragments));
         assert_eq!(
             outputs
                 .iter()
@@ -3368,7 +3280,7 @@ mod tests {
         );
         drop(outputs);
         assert_eq!(tracker.current(), 0, "all prefix/output leases released");
-        assert!(tracker.peak() > 40 * 1024 * 1024);
+        assert!(tracker.peak() >= (usize::from(fragments) * fragment_size) as i64);
     }
 
     #[test]
@@ -5664,6 +5576,7 @@ mod tests {
                         source_multiplicity: RowMultiplicity::SingleCopy,
                         destination: Distribution::Singleton,
                         destination_multiplicity: RowMultiplicity::SingleCopy,
+                        routing_only: Box::default(),
                     },
                 })
                 .unwrap();

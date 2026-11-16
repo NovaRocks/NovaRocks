@@ -151,6 +151,14 @@ fn validate_package_core(
         usage.add_bytes(scan.retained_bytes());
         usage.add_items(scan.scan().assignments().len());
     }
+    usage.add_items(input.layouts.len());
+    for layout in input.layouts.values() {
+        usage.add_items(layout.inputs().len());
+        usage.add_bytes(layout.inputs().len().saturating_mul(std::mem::size_of::<
+            novarocks_connector_contract::ConnectorWriteFieldToken,
+        >()));
+        usage.add_bytes(layout.payload().payload().len());
+    }
     usage.add_items(input.writes.len());
     for write in input.writes.values() {
         usage.add_bytes(write.charged_bytes());
@@ -243,6 +251,11 @@ fn validate_package_core(
     );
     validate_package_scans(input, &mut errors);
     validate_package_writes(input, &mut errors);
+    super::graph::validate_write_layout_recipes(
+        &input.fragment,
+        input.layouts.iter().map(|(node, recipe)| (*node, recipe)),
+        &mut errors,
+    );
     if errors.is_empty() {
         Ok(())
     } else {

@@ -367,6 +367,7 @@ fn rewrite_begin_request_from_identity(
 
     Ok(
         novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from(
                 format!("{}.{}", table.namespace, table.table).as_str(),
             ),

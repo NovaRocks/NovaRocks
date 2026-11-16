@@ -274,6 +274,7 @@ pub(crate) fn connector_write_begin_request_on_base(
 ) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, String> {
     Ok(
         novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from(format!("{}.{}", target.namespace, target.table).as_str()),
             target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse(target_ref)
                 .map_err(|error| format!("validate connector write target ref: {error}"))?,

@@ -426,6 +426,7 @@ fn package_input(fixture: &Fixture) -> FragmentPackageInput {
         scans: BTreeMap::new(),
         writes: BTreeMap::new(),
         annotations: Box::default(),
+        layouts: Default::default(),
     }
 }
 fn package(fixture: &Fixture) -> Arc<FragmentPackage> {

@@ -352,7 +352,7 @@ fn lower_with_creation<
     metadata: &mut ProjectMetadataMode<'_, P>,
 ) -> Result<LocalProgram, crate::FragmentCreationError<H>> {
     // Each validated provider recipe moves into its one lowered owner.
-    let (package, mut reads, mut writes) = input.into_parts();
+    let (package, mut reads, mut writes, mut layouts) = input.into_parts();
     let package = &package;
     let physical = package.fragment();
     let dop = u32::try_from(options.pipeline_dop.get())
@@ -431,6 +431,7 @@ fn lower_with_creation<
             .into());
         }
     };
+    let mut routing_receivers = BTreeSet::new();
     for cut in package.cuts().inbound.iter() {
         work.step()?;
         if cut.kind != EdgeKind::Stream && cut.kind != EdgeKind::ChangeStreamRouter {
@@ -439,6 +440,9 @@ fn lower_with_creation<
                 feature: "inbound CTE edge",
             })
             .into());
+        }
+        if !cut.partitioning.routing_only.is_empty() {
+            routing_receivers.insert(cut.destination_node);
         }
     }
     // Provider reads and writes are admitted per scan and writer below; each
@@ -712,6 +716,7 @@ fn lower_with_creation<
             | NodeKind::Unpivot { .. }
             | NodeKind::ChangeEventExpand { .. }
             | NodeKind::Aggregate { .. } => node.inputs.len() == 1,
+            NodeKind::WriteLayoutKey { .. } => node.id == physical.root() && node.inputs.len() == 1,
             NodeKind::PositionShard(spec) => {
                 node.id == physical.root()
                     && !spec.inputs.is_empty()
@@ -851,15 +856,15 @@ fn lower_with_creation<
         }
         let sorted = node.inputs.len() == 1 && properties.get(&node.inputs[0]).is_some_and(|p| p.1);
         let changes = matches!(node.kind, NodeKind::ChangeEventExpand { .. });
-        // A table function keeps each outer row on its driver and emits its
-        // rows in outer order; the property law keeps exactly the input
-        // ordering prefix its pass-through values carry.
+        // A table function and a write layout key keep each outer row on its
+        // driver and preserve the ordering of the pass-through occurrences.
         let transparent = matches!(
             node.kind,
             NodeKind::Project { .. }
                 | NodeKind::Filter { .. }
                 | NodeKind::Limit { .. }
                 | NodeKind::TableFunction { .. }
+                | NodeKind::WriteLayoutKey { .. }
         );
         let partial_rows = matches!(
             node.kind,
@@ -941,7 +946,12 @@ fn lower_with_creation<
         // placement. Keep that placement fact, not a guessed distribution.
         // Network join admissibility was checked by orient_join above.
         let join_placed = probe_input.is_some() && node.inputs.iter().all(checked_input_placement);
-        let scan_rooted = matches!(node.kind, NodeKind::Scan { .. })
+        // The exact inbound cut places each row even when the routing key
+        // was consumed at the exchange and the node has no visible hash key.
+        let routed_exchange =
+            matches!(node.kind, NodeKind::ExchangeSource { .. }) && routing_receivers.contains(&id);
+        let runtime_placed = matches!(node.kind, NodeKind::Scan { .. })
+            || routed_exchange
             || projected_placement
             || repeat_placed
             || join_placed
@@ -957,7 +967,7 @@ fn lower_with_creation<
         // descendant could consume.
         let writer_rooted = matches!(node.kind, NodeKind::TableWriter { .. });
         work.step()?;
-        if unknown && !expanded && !changes && !scan_rooted && !writer_rooted {
+        if unknown && !expanded && !changes && !runtime_placed && !writer_rooted {
             return Err((FragmentCompileError::Unsupported {
                 node: Some(id),
                 feature: "unconstrained distribution without a runtime-split scan placement",
@@ -999,7 +1009,7 @@ fn lower_with_creation<
             })
             .into());
         }
-        properties.insert(id, (expanded || changes, ordered, scan_rooted));
+        properties.insert(id, (expanded || changes, ordered, runtime_placed));
     }
     work.flush()?;
     let channels_plan =
@@ -1568,6 +1578,33 @@ fn lower_with_creation<
                     },
                     &planned.slots,
                     work.control(),
+                    creation,
+                )?
+            }
+            NodeKind::WriteLayoutKey {
+                key_inputs,
+                output_key,
+            } => {
+                let child =
+                    *local_ids
+                        .get(&node.inputs[0])
+                        .ok_or(FragmentCompileError::Invalid(
+                            "missing lowered layout input",
+                        ))?;
+                let recipe = layouts
+                    .remove(&source)
+                    .ok_or(FragmentCompileError::Invalid(
+                        "missing sealed write layout recipe",
+                    ))?;
+                lower_write_layout_key(
+                    package,
+                    node,
+                    (key_inputs, *output_key),
+                    child,
+                    nodes[child.index()].output_layout(),
+                    &planned.slots,
+                    recipe,
+                    work,
                     creation,
                 )?
             }
@@ -2636,6 +2673,100 @@ fn lower_with_creation<
         None => LocalProgram::try_new(lexical, operators, &allowed, facts, work.control())
             .map_err(Into::into),
     }
+}
+
+fn lower_write_layout_key<H>(
+    package: &novarocks_physical_plan::FragmentPackage,
+    node: &novarocks_physical_plan::PhysicalNode,
+    (key_inputs, output_key): (
+        &[novarocks_physical_plan::ValueId],
+        novarocks_physical_plan::ValueId,
+    ),
+    input: ProgramNodeId,
+    input_layout: &novarocks_local_program::StaticLayout,
+    slots: &[novarocks_types::SlotId],
+    recipe: novarocks_connector_contract::ConnectorWriteLayoutRecipe,
+    work: &mut CompileCheckpoints<'_>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, novarocks_local_program::StaticLayout), crate::FragmentCreationError<H>>
+{
+    use novarocks_physical_plan::ValueId;
+    let fragment = package.fragment();
+    let child = &fragment.nodes()[&node.inputs[0]];
+    let local_slot = |value: ValueId, work: &mut CompileCheckpoints<'_>| {
+        for (ordinal, candidate) in child.output.columns.iter().enumerate() {
+            work.step()?;
+            if *candidate == value {
+                return Ok(input_layout.slots()[ordinal]);
+            }
+        }
+        Err(FragmentCompileError::Invalid(
+            "layout key reads outside its input",
+        ))
+    };
+    let mut key_slots = Vec::new();
+    crate::assert_rows::reserve_vec(&mut key_slots, key_inputs.len(), work)?;
+    for value in key_inputs {
+        key_slots.push(local_slot(*value, work)?);
+    }
+    let cut = package.cuts().outbound.iter().find(|cut| {
+        matches!(cut.partitioning.routing_only.as_ref(), [(key, _)] if *key == output_key)
+    }).ok_or(FragmentCompileError::Invalid("layout key lacks its exact output edge"))?;
+    let (branch, effects) = match fragment.sink() {
+        FragmentSink::Stream { edge } if *edge == cut.edge => (0, None),
+        FragmentSink::Router { effect, routes } => {
+            let (branch, route) = routes
+                .iter()
+                .enumerate()
+                .find(|(_, route)| route.edge == cut.edge)
+                .ok_or(FragmentCompileError::Invalid(
+                    "layout key lacks the router branch",
+                ))?;
+            // The original ChangeEventExpand produces one effect per page.
+            if !matches!(child.kind, NodeKind::ChangeEventExpand { effect_output: value, .. } if value == *effect)
+            {
+                return Err(FragmentCompileError::Unsupported {
+                    node: Some(node.id),
+                    feature: "write layout router input other than its original change-event expansion",
+                }.into());
+            }
+            (
+                branch,
+                Some(novarocks_local_program::ProgramWriteLayoutEffects {
+                    slot: local_slot(*effect, work)?,
+                    accepted: Arc::from(route.accepted_effects.clone()),
+                }),
+            )
+        }
+        _ => return Err(FragmentCompileError::Invalid("layout key has an invalid sink").into()),
+    };
+    let mut layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(slots.len(), work, creation)?;
+    for (ordinal, value) in node.output.columns.iter().enumerate() {
+        let name = if ordinal < input_layout.slots().len() {
+            crate::typed_layout::copy_name_with_creation(
+                input_layout.schema().field(ordinal).name(),
+                work,
+                creation,
+            )?
+        } else {
+            crate::typed_layout::copy_name_with_creation("write_layout_key", work, creation)?
+        };
+        layout.push_with_creation(&fragment.values()[value].ty, name, work, creation)?;
+    }
+    Ok((
+        ProgramNodeKind::WriteLayoutKey {
+            input,
+            key_inputs: key_slots.into_boxed_slice(),
+            output_key: *slots
+                .last()
+                .ok_or(FragmentCompileError::Invalid("missing layout key slot"))?,
+            recipe,
+            branch,
+            effects,
+        },
+        layout.finish_with_creation(slots, work, creation)?,
+    ))
 }
 
 fn lower_position_shard<H>(

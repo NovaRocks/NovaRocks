@@ -36,9 +36,8 @@
 use arrow::array::{Array, BinaryArray, Int32Array, ListArray, MapArray, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field};
 use novarocks_spi::connector::{
-    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
-    MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-    MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
+    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_COLUMNS,
+    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
 };
 
 pub const STATISTICS_HEADER_BYTES: usize = 24;
@@ -55,7 +54,7 @@ pub enum StatisticsCodecError {
     FieldIds,
     BlobType,
     BodyLimit,
-    RowLimit,
+    RowCountOverflow,
     MetadataLimit,
     Properties,
     TruncatedHeader,
@@ -74,7 +73,7 @@ impl std::fmt::Display for StatisticsCodecError {
             Self::FieldIds => "statistics artifact field IDs must be positive, unique and bounded",
             Self::BlobType => "statistics artifact blob type is empty or too large",
             Self::BodyLimit => "statistics artifact body exceeds its bounded profile",
-            Self::RowLimit => "statistics artifact row count exceeds its bounded profile",
+            Self::RowCountOverflow => "statistics artifact row count overflow",
             Self::MetadataLimit => "statistics artifact metadata exceeds its bounded profile",
             Self::Properties => "ANALYZE statistics artifact properties must be empty",
             Self::TruncatedHeader => "statistics artifact header is truncated",
@@ -99,49 +98,7 @@ pub struct StatisticsCodecTotals {
     pub metadata_bytes: usize,
 }
 impl StatisticsCodecTotals {
-    /// Charge only the cumulative result-body coordinate using this codec's
-    /// original bounded profile. This is pure admission, not a record receipt.
-    pub fn checked_body_total(
-        current: usize,
-        additional: usize,
-    ) -> Result<usize, StatisticsCodecError> {
-        let body_bytes = current
-            .checked_add(additional)
-            .ok_or(StatisticsCodecError::BodyLimit)?;
-        Self {
-            rows: 0,
-            body_bytes,
-            metadata_bytes: 0,
-        }
-        .validate()?;
-        Ok(body_bytes)
-    }
-
-    /// Charge only the cumulative row coordinate using the same profile as
-    /// completed-record preflight. Reaching the bound remains legal.
-    pub fn checked_row_total(
-        current: usize,
-        additional: usize,
-    ) -> Result<usize, StatisticsCodecError> {
-        let rows = current
-            .checked_add(additional)
-            .ok_or(StatisticsCodecError::RowLimit)?;
-        Self {
-            rows,
-            body_bytes: 0,
-            metadata_bytes: 0,
-        }
-        .validate()?;
-        Ok(rows)
-    }
-
     fn validate(self) -> Result<(), StatisticsCodecError> {
-        if self.rows > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
-            return Err(StatisticsCodecError::RowLimit);
-        }
-        if self.body_bytes > MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES {
-            return Err(StatisticsCodecError::BodyLimit);
-        }
         if self.metadata_bytes > STATISTICS_METADATA_BYTES {
             return Err(StatisticsCodecError::MetadataLimit);
         }
@@ -156,7 +113,7 @@ impl StatisticsCodecTotals {
             rows: self
                 .rows
                 .checked_add(1)
-                .ok_or(StatisticsCodecError::RowLimit)?,
+                .ok_or(StatisticsCodecError::RowCountOverflow)?,
             body_bytes: self
                 .body_bytes
                 .checked_add(header.body_bytes())
@@ -363,13 +320,6 @@ impl StatisticsArtifactEncoder {
         totals: StatisticsCodecTotals,
     ) -> Result<Self, StatisticsCodecError> {
         totals.validate()?;
-        if totals
-            .rows
-            .checked_add(batch.num_rows())
-            .is_none_or(|rows| rows > MAX_CONNECTOR_STATISTICS_ARTIFACTS)
-        {
-            return Err(StatisticsCodecError::RowLimit);
-        }
         validate_schema(&batch)?;
         Ok(Self {
             state: CursorState {
@@ -667,7 +617,7 @@ impl novarocks_execution_contract::failure::FailureProjection for StatisticsCode
             Self::FieldIds => (FailureClass::Data, 102),
             Self::BlobType => (FailureClass::Data, 103),
             Self::BodyLimit => (FailureClass::Resource, 104),
-            Self::RowLimit => (FailureClass::Resource, 105),
+            Self::RowCountOverflow => (FailureClass::Resource, 105),
             Self::MetadataLimit => (FailureClass::Resource, 106),
             Self::Properties => (FailureClass::Data, 107),
             Self::TruncatedHeader => (FailureClass::Data, 108),

@@ -1182,6 +1182,7 @@ pub(super) fn cross_fragment_scan_lineage_plan() -> (PhysicalPlan, FragmentId, F
             source_multiplicity: properties.row_multiplicity,
             destination: properties.distribution,
             destination_multiplicity: properties.row_multiplicity,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -2106,6 +2107,7 @@ fn join_build_frontier_fixture() -> JoinBuildFrontierFixture {
                 } else {
                     RowMultiplicity::SingleCopy
                 },
+                routing_only: Box::default(),
             },
         });
     }
@@ -2133,6 +2135,7 @@ fn join_build_frontier_fixture() -> JoinBuildFrontierFixture {
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Broadcast,
             destination_multiplicity: RowMultiplicity::Replicated,
+            routing_only: Box::default(),
         },
     });
     fragments.push(nested);

@@ -307,7 +307,7 @@ fn decode_sink_requests(
 }
 fn physical_route_keys(route: &p::ChangeStreamRoute) -> Result<usize, Error> {
     if matches!(&route.requirements.colocation, p::WriteColocation::ByKey(keys) if keys.is_empty())
-        || matches!(&route.requirements.layout, p::WriteLayoutPreference::ClusterBy(keys) if keys.is_empty())
+        || matches!(&route.requirements.layout, p::WriteLayoutPreference::ClusterBy(keys) | p::WriteLayoutPreference::PartitionAffinity(keys) if keys.is_empty())
     {
         return Err(invalid("write requirement key must be nonempty"));
     }
@@ -338,10 +338,13 @@ fn wire_requirement_lists(
         .ok_or_else(|| invalid("write layout is absent"))?
     {
         wire::write_route_requirements::Layout::NoLayout(_) => &[][..],
-        wire::write_route_requirements::Layout::ClusterBy(keys) if !keys.value_ids.is_empty() => {
+        wire::write_route_requirements::Layout::ClusterBy(keys)
+        | wire::write_route_requirements::Layout::PartitionAffinity(keys)
+            if !keys.value_ids.is_empty() =>
+        {
             keys.value_ids.as_slice()
         }
-        _ => return Err(invalid("write ClusterBy layout is empty")),
+        _ => return Err(invalid("write layout input is empty")),
     };
     Ok((colocation, layout))
 }
@@ -395,6 +398,9 @@ fn encode_requirements(
             p::WriteLayoutPreference::ClusterBy(ids) => {
                 wire::write_route_requirements::Layout::ClusterBy(keys(ids, w)?)
             }
+            p::WriteLayoutPreference::PartitionAffinity(ids) => {
+                wire::write_route_requirements::Layout::PartitionAffinity(keys(ids, w)?)
+            }
         }),
     })
 }
@@ -416,6 +422,12 @@ fn decode_requirements(
         wire::write_route_requirements::Layout::NoLayout(_) => p::WriteLayoutPreference::None,
         wire::write_route_requirements::Layout::ClusterBy(_) => {
             p::WriteLayoutPreference::ClusterBy(boxed(
+                list(layout, w, |id, _| Ok(p::ValueId::new(*id)))?,
+                w,
+            )?)
+        }
+        wire::write_route_requirements::Layout::PartitionAffinity(_) => {
+            p::WriteLayoutPreference::PartitionAffinity(boxed(
                 list(layout, w, |id, _| Ok(p::ValueId::new(*id)))?,
                 w,
             )?)

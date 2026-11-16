@@ -66,9 +66,10 @@ pub use binding::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlWriteBinding,
     ConnectorExecutionReadBinding, ConnectorExecutionRoleBinding, ConnectorExecutionWriteBinding,
     ConnectorMaterializationError, ConnectorMaterializationErrorClass,
-    ConnectorMaterializationRetryDisposition, ConnectorReadAttemptAccess,
-    ConnectorReadAttemptCapabilities, ConnectorReadAttemptCapabilitiesFuture,
-    MaterializationContext, NormalizedCatalogProperties,
+    ConnectorMaterializationRetryDisposition, ConnectorPartitionKeyEvaluator,
+    ConnectorReadAttemptAccess, ConnectorReadAttemptCapabilities,
+    ConnectorReadAttemptCapabilitiesFuture, ConnectorWriteLayoutExecution, MaterializationContext,
+    NormalizedCatalogProperties,
 };
 pub use cancellation::{ConnectorStopOwner, ConnectorStopView};
 pub use catalog::{
@@ -337,10 +338,9 @@ pub use staged_create::{
 pub use statistics::{
     AsyncStatisticsCollectionSession, AsyncStatisticsCollectionStart, ConnectorStatistics,
     ConnectorStatisticsResolver, ConnectorStatisticsSession,
-    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
-    MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_METRICS,
-    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
-    MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES, StatisticsArtifactDraft,
+    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_COLUMNS,
+    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
+    MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES, StatisticsArtifactDraft,
     StatisticsArtifactIdentity, StatisticsArtifactParts, StatisticsArtifactsCpuSource,
     StatisticsBasisRelation, StatisticsBindingCpuSource, StatisticsCollection,
     StatisticsCollectionSession, StatisticsCollectionStart, StatisticsCollectionStartRequest,

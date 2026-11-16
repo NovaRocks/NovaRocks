@@ -391,6 +391,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   冻结放置与装配见 [ADR-0206](docs/adr/ADR-0206-frozen-write-placement-and-task-completion-assembly.md)，
   类型化种类、作者单位与逐种类完成见 [ADR-0222](docs/adr/ADR-0222-typed-task-summaries-and-per-kind-completion.md)。
 
+- `novarocks/execution/src/exec/operators/{write_layout_key,write_spread}.rs`
+  分区亲和边的发送算子向已绑定 Provider 求分区键，Execution 按目的 Task 与发送端实际 DOP 扩散热点。
+  `routing_only` 键穿过 `NativeHierarchicalV1` 的实例级及 driver 级 hash，接收端在本地交换后将它剥离。
+  `ByKey` 的输入和归属契约仍由原作者校验。writer 队列的空位准入、软占用阈值与真实 tracker
+  见 `exec/pipeline/async_writer.rs`，TableWriter multiplex 的单行分帧另行生效。
+  见 [ADR-0235](docs/adr/ADR-0235-iceberg-write-layout-and-data-plane-capacity.md)。
+
 - `novarocks/execution/src/exec/pipeline/driver.rs`
   Driver execution logic.
 
@@ -534,6 +541,14 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `commit/write_adaptation.rs` 适配执行输入；Variant/uuid 数据写出准入与逻辑 Variant 读取分别属于 Provider。
   CREATE / ALTER ADD 在所有格式版本递归拒绝新 Variant 列；已有表的 DELETE、合法普通键 equality delete、
   TRUNCATE 与普通 metadata 修改保留原边界。schema ALTER 先在同一代 generation pin 做 Provider 纯准入，再执行原 MV / DROP 保护。
+
+  分区亲和配方与求值器在 `commit/partition_key.rs`，用同一写出适配和 SDK 分区变换。
+  `commit/write_stack/control.rs` 冻结成形设置，`commit/data_writer/streaming.rs` 与
+  `commit/data_writer/staged_paths.rs` 保管 rolling writer、闲置关闭与每文件成功写出字节。
+  `commit/write_stack/execution.rs` 向原 Task 账本预留尚未落盘的 Parquet 编码估计。
+  写集的载体和解码对象分别由 FE Internal 结果窗口计费，Provider 回执随对象实际退出。
+  根结果 32 MiB 分帧仍由原载体约束。文件政策与容量作者见
+  [ADR-0235](docs/adr/ADR-0235-iceberg-write-layout-and-data-plane-capacity.md)。
 
   Iceberg 意图、依赖与字段契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)，产物责任、复用与有界发布事实见 [ADR-0234](docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)。修改前先读：
   - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑/物理身份与继承字段；对象来源、写入与退休状态、覆盖记录及准确发布引用分别保留。
@@ -732,6 +747,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `[iceberg]`
   Embedded-JVM toggle for Iceberg metadata-table and remote metadata planning.
+
+- Iceberg catalog 写入属性
+  `iceberg.max-partitions-per-writer` 为正 SQL INTEGER，默认 100。
+  catalog session 属性 `max_partitions_per_writer` 可在 1 到该值间覆盖。
+  `iceberg.target-max-file-size` 接受正字节数或带单位的大小，默认 1 GiB，
+  表属性 `write.target-file-size-bytes` 优先。表属性 `write.parquet.row-group-size-bytes` 默认 128 MiB。
+  这些属性经 catalog properties 与 FE 写会话冻结。示例见 `novarocks-catalogs.toml.example`。
 
 - `[standalone_server]`
   `trino_port`（默认 `8080`，`0` 由 OS 分配）、`trino_client_timeout_ms`（默认 `300000`）、
@@ -1224,6 +1246,15 @@ differ.
   and Trino success/error projection; consult ADR-0198 and ADR-0217 before changing these boundaries.
   资源修改沿原 worker、Transport 与结果预算 owner；保留 typed Source、完整 D 和实际退出证据。
   局部组件通过不证明原生调用面或最终全工作区验证完成。
+- **Iceberg 数据文件成形与写集容量**见
+  [ADR-0235](docs/adr/ADR-0235-iceberg-write-layout-and-data-plane-capacity.md)。
+  路由从 Provider `commit/partition_key.rs` 到 SQL `planner/distributed/build/contract_lowering.rs`，
+  在 LocalCompiler `lowering.rs` 冻结局部布局，由 Native Adapter `compiled_writer_binding.rs` 绑定执行能力，
+  由 Execution 的 `write_layout_key.rs`、`write_spread.rs` 与原写入交换消费。
+  配置和 writer 生命周期见 Iceberg `catalog_config.rs`、`commit/write_stack/{control,execution}.rs`。
+  FE 回执看 `query_execution/write_computation.rs` 与 `write_result.rs`。
+  写集回执、operation 账本及建表回执附件各自保留真实所有权和退出边界。
+
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
   `commit/attempt.rs`、`commit/operation.rs` 和 `commit/write_stack/control/publication.rs` 开始。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、

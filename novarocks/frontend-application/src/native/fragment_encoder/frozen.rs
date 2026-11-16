@@ -651,6 +651,7 @@ pub(crate) mod tests {
                     source_multiplicity: p::RowMultiplicity::SingleCopy,
                     destination: p::Distribution::Singleton,
                     destination_multiplicity: p::RowMultiplicity::SingleCopy,
+                    routing_only: Box::default(),
                 };
                 edges.insert(
                     edge_id,
@@ -734,6 +735,7 @@ pub(crate) mod tests {
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
             &control,

@@ -1599,6 +1599,7 @@ mod tests {
             runtime,
         );
         let result = control.begin_write(ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
             table: Arc::from("db.t"),
             target_ref: ConnectorWriteTargetRef::parse(target_ref).expect("target ref"),
             intent,

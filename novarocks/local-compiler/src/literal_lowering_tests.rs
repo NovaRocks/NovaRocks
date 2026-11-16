@@ -124,6 +124,7 @@ fn literal_package(ty: FunctionValueType, literal: LiteralValue) -> Arc<Fragment
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
                 pruning,
+                layouts: Default::default(),
             },
             package_admission(),
             &FixtureControl,
