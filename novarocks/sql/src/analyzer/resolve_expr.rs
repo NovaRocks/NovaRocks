@@ -1368,6 +1368,24 @@ impl<'a> super::AnalyzerContext<'a> {
             ),
         })
     }
+    /// Borrow only the old positional tuple profile; field names never grant
+    /// multi-column IN or higher-order map coercion.
+    pub(super) fn anonymous_row<'e>(
+        &self,
+        expression: &'e ast::Expr,
+    ) -> Result<Option<&'e ast::RowExpr>, AnalyzeError> {
+        let ast::Expr::Row(row) = expression else {
+            return Ok(None);
+        };
+        for field in &row.fields {
+            self.check_control()?;
+            if field.name.is_some() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(row))
+    }
+
     fn analyze_in_subquery_predicate(
         &self,
         value: &ast::Expr,
@@ -1377,7 +1395,7 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         // Multi-column LHS `(a, b) IN (SELECT c, d FROM ...)` arrives
-        // here wrapped as `Expr::Tuple(...)` (or `Expr::Nested(Tuple(...))`).
+        // here wrapped as `Expr::Row(...)` (or `Expr::Nested(Row(...))`).
         // The whole tuple is not a single scalar expression — the
         // analyzer's catch-all rejects it as "unsupported expression".
         // `subquery_rewrite::rewrite_in_subquery` handles the
@@ -1385,11 +1403,8 @@ impl<'a> super::AnalyzerContext<'a> {
         // skip the BITMAP / JSON / HLL precheck here: those checks
         // are per-column and only meaningful for a single-column LHS.
         let lhs_is_tuple = match value {
-            ast::Expr::Tuple(_) => true,
-            ast::Expr::Nested(inner) => {
-                matches!(inner.expression.as_ref(), ast::Expr::Tuple(_))
-            }
-            _ => false,
+            ast::Expr::Nested(inner) => self.anonymous_row(&inner.expression)?.is_some(),
+            other => self.anonymous_row(other)?.is_some(),
         };
         let mut json_probe = false;
         if !lhs_is_tuple {
@@ -3615,7 +3630,7 @@ impl<'a> super::AnalyzerContext<'a> {
     /// `transform_values((k, v) -> nv, m)`. The 2-parameter lambda binds
     /// `k` to the map's key Arrow type and `v` to the value type. For
     /// `map_apply` the body must be a `(new_key, new_value)` tuple (the native
-    /// parser represents it as `Expr::Tuple`); we rewrite it as a `row(...)` call so
+    /// parser represents it as an anonymous `Expr::Row`); we rewrite it as a `row(...)` call so
     /// downstream codegen sees a 2-field Struct.
     fn analyze_map_higher_order_lambda_arguments(
         &self,
@@ -3715,13 +3730,13 @@ impl<'a> super::AnalyzerContext<'a> {
             };
         let (new_key, new_value) = match name {
             "map_apply" => {
-                let tuple_items: Vec<&ast::Expr> = match body_expr {
-                    ast::Expr::Tuple(tuple) => tuple.expressions.iter().collect(),
-                    ast::Expr::Nested(inner) => match inner.expression.as_ref() {
-                        ast::Expr::Tuple(tuple) => tuple.expressions.iter().collect(),
-                        _ => Vec::new(),
-                    },
-                    _ => Vec::new(),
+                let tuple_body = match body_expr {
+                    ast::Expr::Nested(inner) => inner.expression.as_ref(),
+                    other => other,
+                };
+                let tuple_items: Vec<&ast::Expr> = match self.anonymous_row(tuple_body)? {
+                    Some(row) => row.fields.iter().map(|field| &field.expression).collect(),
+                    None => Vec::new(),
                 };
                 if tuple_items.len() != 2 {
                     return Err(AnalyzeError::invalid_argument(
@@ -4293,18 +4308,14 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::InList(list) => list.values.iter().any(|e| self.expr_contains_aggregate(e)),
             ast::Expr::Nested(nested) => self.expr_contains_aggregate(&nested.expression),
             ast::Expr::Cast(cast) => self.expr_contains_aggregate(&cast.expression),
-            ast::Expr::Tuple(tuple) => tuple
-                .expressions
-                .iter()
-                .any(|item| self.expr_contains_aggregate(item)),
             ast::Expr::Array(array) => array
                 .values
                 .iter()
                 .any(|item| self.expr_contains_aggregate(item)),
-            ast::Expr::Struct(structure) => structure
+            ast::Expr::Row(structure) => structure
                 .fields
                 .iter()
-                .any(|field| self.expr_contains_aggregate(&field.value)),
+                .any(|field| self.expr_contains_aggregate(&field.expression)),
             ast::Expr::Map(map) => map.entries.iter().any(|entry| {
                 self.expr_contains_aggregate(&entry.key)
                     || self.expr_contains_aggregate(&entry.value)

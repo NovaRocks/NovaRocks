@@ -663,3 +663,34 @@ fn ordinary_array_common_does_not_coerce_numeric_or_json_values_to_text() {
         assert!(!actual.value_type.nullable());
     }
 }
+
+#[test]
+fn multi_column_in_decomposes_only_anonymous_row_fields() {
+    use crate::analyze_error::AnalyzeErrorKind;
+    use novarocks_parser::build;
+
+    let control = SqlCompileControl::unbounded();
+    let positional = query("SELECT 1 WHERE (1, 2) IN (SELECT 1, 2)");
+    context(&control)
+        .analyze_query(&positional)
+        .expect("anonymous fields retain positional IN analysis");
+
+    let mut named = positional;
+    let ast::SetExpr::Select(select) = named.body.as_mut() else {
+        panic!("SELECT fixture");
+    };
+    let Some(ast::Expr::Predicated(predicate)) = select.selection.as_mut() else {
+        panic!("WHERE IN fixture");
+    };
+    let ast::Expr::Row(row) = &mut predicate.value else {
+        panic!("positional row fixture");
+    };
+    // A named field has no positional IN capability, even if all the other
+    // fields are anonymous. Its value must not be resolved as a scalar first.
+    row.fields[0].name = Some(build::ident("First", true));
+    row.fields[0].expression = build::identifier(build::ident("missing", false));
+    let ctx = context(&control);
+    let error = ctx.analyze_query(&named).unwrap_err();
+    assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+    assert!(ctx.collected_subqueries.borrow().is_empty());
+}

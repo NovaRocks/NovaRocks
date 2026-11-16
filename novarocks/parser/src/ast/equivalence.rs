@@ -505,10 +505,9 @@ impl SyntaxEq for Expr {
             (Self::Nested(left), Self::Nested(right)) => left.syntax_eq(right),
             (Self::Interval(left), Self::Interval(right)) => left.syntax_eq(right),
             (Self::Subquery(left), Self::Subquery(right)) => left.syntax_eq(right),
-            (Self::Tuple(left), Self::Tuple(right)) => left.syntax_eq(right),
+            (Self::Row(left), Self::Row(right)) => left.syntax_eq(right),
             (Self::Array(left), Self::Array(right)) => left.syntax_eq(right),
             (Self::Map(left), Self::Map(right)) => left.syntax_eq(right),
-            (Self::Struct(left), Self::Struct(right)) => left.syntax_eq(right),
             (Self::Access(left), Self::Access(right)) => left.syntax_eq(right),
             _ => false,
         }
@@ -583,9 +582,17 @@ impl SyntaxEq for SubqueryExpr {
     }
 }
 
-impl SyntaxEq for TupleExpr {
+impl SyntaxEq for RowExpr {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_slice(&self.expressions, &other.expressions)
+        syntax_eq_slice(&self.fields, &other.fields)
+    }
+}
+
+impl SyntaxEq for RowField {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        syntax_eq_option(&self.name, &other.name) && self.expression.syntax_eq(&other.expression)
     }
 }
 
@@ -605,18 +612,6 @@ impl SyntaxEq for MapExpr {
 impl SyntaxEq for MapEntry {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.key.syntax_eq(&other.key) && self.value.syntax_eq(&other.value)
-    }
-}
-
-impl SyntaxEq for StructExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_slice(&self.fields, &other.fields)
-    }
-}
-
-impl SyntaxEq for StructExprField {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_option(&self.name, &other.name) && self.value.syntax_eq(&other.value)
     }
 }
 

@@ -648,8 +648,15 @@ pub fn tuple_value(expressions: Vec<Expr>) -> Result<Expr, BuildError> {
     if expressions.is_empty() {
         return Err(BuildError::EmptyTuple);
     }
-    Ok(Expr::Tuple(TupleExpr {
-        expressions,
+    Ok(Expr::Row(RowExpr {
+        fields: expressions
+            .into_iter()
+            .map(|expression| RowField {
+                span: expression.span(),
+                name: None,
+                expression,
+            })
+            .collect(),
         span: SYNTHETIC,
     }))
 }

@@ -507,9 +507,9 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
                 validate_expr(precision)?;
             }
         }
-        Expr::Tuple(tuple) => {
-            for expression in &tuple.expressions {
-                validate_expr(expression)?;
+        Expr::Row(row) => {
+            for field in &row.fields {
+                validate_expr(&field.expression)?;
             }
         }
         Expr::Array(array) => {
@@ -521,11 +521,6 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             for entry in &map.entries {
                 validate_expr(&entry.key)?;
                 validate_expr(&entry.value)?;
-            }
-        }
-        Expr::Struct(struct_expr) => {
-            for field in &struct_expr.fields {
-                validate_expr(&field.value)?;
             }
         }
         Expr::Lambda(lambda) => validate_expr(&lambda.body)?,

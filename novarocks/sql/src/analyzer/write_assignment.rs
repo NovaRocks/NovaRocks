@@ -182,14 +182,9 @@ fn register_literal_assignments<'a>(
                     visit(&entry.value, 1)?;
                 }
             }
-            ast::Expr::Tuple(tuple) if matches!(assignment.input().data_type(), DataType::Struct(fields) if fields.len() == tuple.expressions.len()) => {
-                for (ordinal, value) in tuple.expressions.iter().enumerate() {
-                    visit(value, ordinal)?;
-                }
-            }
-            ast::Expr::Struct(structure) if matches!(assignment.input().data_type(), DataType::Struct(fields) if fields.len() == structure.fields.len()) => {
+            ast::Expr::Row(structure) if matches!(assignment.input().data_type(), DataType::Struct(fields) if fields.len() == structure.fields.len()) => {
                 for (ordinal, field) in structure.fields.iter().enumerate() {
-                    visit(&field.value, ordinal)?;
+                    visit(&field.expression, ordinal)?;
                 }
             }
             ast::Expr::FunctionCall(function)
@@ -513,23 +508,13 @@ fn context_literal<'a>(
                 None
             }
         }
-        ast::Expr::Tuple(tuple) if matches!(expected.data_type(), arrow::datatypes::DataType::Struct(fields) if fields.len() == tuple.expressions.len()) =>
-        {
-            for (index, value) in tuple.expressions.iter().enumerate() {
-                let child = expected.child_at(index).ok_or_else(|| {
-                    AnalyzeError::internal("tuple literal context lost its child")
-                })?;
-                context_literal(value, &child, source, policy, control)?;
-            }
-            None
-        }
-        ast::Expr::Struct(structure) if matches!(expected.data_type(), arrow::datatypes::DataType::Struct(fields) if fields.len() == structure.fields.len()) =>
+        ast::Expr::Row(structure) if matches!(expected.data_type(), arrow::datatypes::DataType::Struct(fields) if fields.len() == structure.fields.len()) =>
         {
             for (index, value) in structure.fields.iter().enumerate() {
                 let child = expected.child_at(index).ok_or_else(|| {
                     AnalyzeError::internal("struct literal context lost its child")
                 })?;
-                context_literal(&value.value, &child, source, policy, control)?;
+                context_literal(&value.expression, &child, source, policy, control)?;
             }
             None
         }

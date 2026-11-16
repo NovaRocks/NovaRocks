@@ -515,22 +515,13 @@ fn constrain_literal_in(
                 }
             }
         }
-        ast::Expr::Tuple(tuple) => {
-            if let DataType::Struct(fields) = target.data_type()
-                && fields.len() == tuple.expressions.len()
-            {
-                for (index, value) in tuple.expressions.iter_mut().enumerate() {
-                    *value = constrain_literal(value.clone(), &target_child(target, index)?)?;
-                }
-            }
-        }
-        ast::Expr::Struct(structure) => {
+        ast::Expr::Row(structure) => {
             if let DataType::Struct(fields) = target.data_type()
                 && fields.len() == structure.fields.len()
             {
                 for (index, value) in structure.fields.iter_mut().enumerate() {
-                    value.value =
-                        constrain_literal(value.value.clone(), &target_child(target, index)?)?;
+                    value.expression =
+                        constrain_literal(value.expression.clone(), &target_child(target, index)?)?;
                 }
             }
         }
@@ -709,25 +700,27 @@ pub(crate) fn canonical_insert_wrapper_expression(expr: ast::Expr) -> Result<ast
                 return expression;
             }
             match expression {
-                ast::Expr::Tuple(tuple) => {
-                    let expressions = tuple
-                        .expressions
-                        .into_iter()
-                        .map(|expr| self.fold_expr(expr))
-                        .collect();
-                    match build::tuple(expressions) {
-                        Ok(mut canonical) => {
-                            match &mut canonical {
-                                ast::Expr::Tuple(value) => value.span = tuple.span,
-                                ast::Expr::Nested(value) => value.span = tuple.span,
-                                _ => unreachable!("tuple constructor returns tuple or parentheses"),
-                            }
-                            canonical
-                        }
-                        Err(error) => {
-                            self.error = Some(error.to_string());
+                // The SELECT wrapper preserves the original positional default
+                // rule: one field becomes parentheses; multiple fields retain
+                // their individual locations and positional value shape.
+                ast::Expr::Row(mut row) if row.fields.iter().all(|field| field.name.is_none()) => {
+                    row = ast::fold_row_expr(self, row);
+                    match row.fields.len() {
+                        0 => {
+                            self.error = Some(build::BuildError::EmptyTuple.to_string());
                             build::null()
                         }
+                        1 => {
+                            let mut fields = row.fields.into_iter();
+                            let field = fields.next().expect("one positional field");
+                            let mut canonical = build::nested(field.expression);
+                            let ast::Expr::Nested(nested) = &mut canonical else {
+                                unreachable!("nested constructor returns parentheses");
+                            };
+                            nested.span = row.span;
+                            canonical
+                        }
+                        _ => ast::Expr::Row(row),
                     }
                 }
                 expression => ast::fold_expr(self, expression),

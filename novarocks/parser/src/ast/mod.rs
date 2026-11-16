@@ -66,8 +66,8 @@ pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_
 pub use expr::{
     AccessExpr, AccessKind, ArrayExpr, BinaryExpr, BinaryOperator, CompoundIdentifier, Expr,
     FunctionCall, FunctionOrderBy, FunctionQuantifier, IntervalExpr, IntervalField, JsonOperator,
-    LogicalExpr, LogicalOperator, MapEntry, MapExpr, NestedExpr, NullTreatment, StructExpr,
-    StructExprField, SubqueryExpr, TupleExpr, UnaryExpr, UnaryOperator,
+    LogicalExpr, LogicalOperator, MapEntry, MapExpr, NestedExpr, NullTreatment, RowExpr, RowField,
+    SubqueryExpr, UnaryExpr, UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -362,3 +362,5 @@ pub use json::{
 
 #[cfg(test)]
 mod control_expr_tests;
+
+pub use visit::{fold_row_expr, fold_row_field, walk_row_expr, walk_row_field};

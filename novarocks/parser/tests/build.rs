@@ -274,11 +274,14 @@ fn one_field_value_tuples_remain_distinct_from_source_parentheses() {
         "12345678901234567890123456789012345678".into(),
     ));
     let value = build::tuple_value(vec![field.clone()]).expect("one-field value tuple");
-    let Expr::Tuple(tuple) = value else {
-        panic!("typed one-field tuple");
+    let Expr::Row(row) = value else {
+        panic!("typed one-field Row");
     };
-    assert_eq!(tuple.expressions, vec![field.clone()]);
-    assert_eq!(tuple.span, SYNTHETIC);
+    assert_eq!(row.fields.len(), 1);
+    assert!(row.fields[0].name.is_none());
+    assert_eq!(row.fields[0].expression, field.clone());
+    assert_eq!(row.fields[0].span, field.span());
+    assert_eq!(row.span, SYNTHETIC);
     let source_parentheses = build::tuple(vec![field.clone()]).expect("source parentheses");
     let Expr::Nested(nested) = source_parentheses else {
         panic!("source parentheses retain their Nested shape");

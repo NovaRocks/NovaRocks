@@ -3396,15 +3396,11 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
             expr_contains_aggregate_function(&case.operand)
                 || case_contains_aggregate_function(&case.when_clauses, case.default_value.as_ref())
         }
-        Expr::Tuple(tuple) => tuple
-            .expressions
-            .iter()
-            .any(expr_contains_aggregate_function),
         Expr::Array(array) => array.values.iter().any(expr_contains_aggregate_function),
-        Expr::Struct(record) => record
+        Expr::Row(record) => record
             .fields
             .iter()
-            .any(|field| expr_contains_aggregate_function(&field.value)),
+            .any(|field| expr_contains_aggregate_function(&field.expression)),
         Expr::Map(map) => map.entries.iter().any(|entry| {
             expr_contains_aggregate_function(&entry.key)
                 || expr_contains_aggregate_function(&entry.value)
@@ -3537,11 +3533,10 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
             reject_unsupported_expr(&case.operand)?;
             reject_unsupported_case(&case.when_clauses, case.default_value.as_ref())?;
         }
-        Expr::Tuple(tuple) => reject_unsupported_exprs(&tuple.expressions)?,
         Expr::Array(array) => reject_unsupported_exprs(&array.values)?,
-        Expr::Struct(record) => {
+        Expr::Row(record) => {
             for field in &record.fields {
-                reject_unsupported_expr(&field.value)?;
+                reject_unsupported_expr(&field.expression)?;
             }
         }
         Expr::Map(map) => {

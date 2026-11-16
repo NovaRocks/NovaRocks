@@ -3096,9 +3096,6 @@ impl Visit for CompletionRetainedBytes {
             Expr::Cast(_) => self.add(std::mem::size_of::<novarocks_parser::ast::CastExpr>()),
             Expr::Exists(_) => self.add(std::mem::size_of::<novarocks_parser::ast::ExistsExpr>()),
             Expr::Unique(_) => self.add(std::mem::size_of::<novarocks_parser::ast::UniqueExpr>()),
-            Expr::Tuple(expression) => {
-                self.add_vec_capacity::<Expr>(expression.expressions.capacity());
-            }
             Expr::Array(expression) => {
                 self.add_vec_capacity::<Expr>(expression.values.capacity());
             }
@@ -3107,8 +3104,8 @@ impl Visit for CompletionRetainedBytes {
                     expression.entries.capacity(),
                 );
             }
-            Expr::Struct(expression) => {
-                self.add_vec_capacity::<novarocks_parser::ast::StructExprField>(
+            Expr::Row(expression) => {
+                self.add_vec_capacity::<novarocks_parser::ast::RowField>(
                     expression.fields.capacity(),
                 );
             }

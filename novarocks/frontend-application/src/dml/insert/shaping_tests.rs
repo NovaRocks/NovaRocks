@@ -469,7 +469,7 @@ fn typed_decimal_defaults_keep_coefficients_beyond_source_integer_width() {
 }
 
 #[test]
-fn typed_single_field_struct_defaults_keep_their_values_tuple() {
+fn typed_single_field_struct_defaults_keep_their_values_row() {
     let mut structure = column(
         "s",
         DataType::Struct(Fields::from(vec![Arc::new(Field::new(
@@ -483,11 +483,11 @@ fn typed_single_field_struct_defaults_keep_their_values_tuple() {
         ColumnDefault::Int64(7),
     )]));
     let original = omitted_insert_expr(&structure).unwrap();
-    let ast::Expr::Tuple(tuple) = &original else {
+    let ast::Expr::Row(tuple) = &original else {
         panic!("typed Struct value");
     };
-    assert_eq!(tuple.expressions.len(), 1);
-    assert_eq!(number_text(&tuple.expressions[0]), "7");
+    assert_eq!(tuple.fields.len(), 1);
+    assert_eq!(number_text(&tuple.fields[0].expression), "7");
     let columns = [column("id", DataType::Int32), structure];
     let shaped = shape_insert_source(
         &parse_query("VALUES (1)"),
@@ -500,21 +500,26 @@ fn typed_single_field_struct_defaults_keep_their_values_tuple() {
     let ast::Expr::Cast(cast) = &rows(&shaped)[0][1] else {
         panic!("Struct target cast");
     };
-    assert!(matches!(&cast.expression, ast::Expr::Tuple(tuple) if tuple.expressions.len() == 1));
-    // The original tuple author kept even one field as Tuple, and recursive
-    // target shaping cast its child. The analyzer rejects that Tuple unchanged.
+    assert!(matches!(&cast.expression, ast::Expr::Row(tuple) if tuple.fields.len() == 1));
+    // The positional value author keeps one field as Row, and recursive
+    // target shaping casts its child. Ordinary scalar analysis still rejects it.
     let baseline = baseline_default_values(
-        ast::Expr::Tuple(ast::TupleExpr {
-            expressions: vec![baseline_target_cast(
-                ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::Long {
-                        spelling: "7".into(),
-                        parsed_value: 7,
-                    },
-                    span: SYNTHETIC,
-                }),
-                "BIGINT",
-            )],
+        ast::Expr::Row(ast::RowExpr {
+            fields: vec![ast::RowField {
+                name: None,
+                expression: baseline_target_cast(
+                    ast::Expr::Literal(ast::Literal {
+                        kind: ast::LiteralKind::Long {
+                            spelling: "7".into(),
+                            parsed_value: 7,
+                        },
+                        span: SYNTHETIC,
+                    }),
+                    "BIGINT",
+                ),
+                span: SYNTHETIC,
+            }]
+            .into(),
             span: SYNTHETIC,
         }),
         "STRUCT<`only` BIGINT>",
@@ -526,7 +531,7 @@ fn typed_single_field_struct_defaults_keep_their_values_tuple() {
         "unsupported expression: (CAST(7 AS BIGINT))",
     );
     // The old SELECT wrapper reparsed '(7)' as parentheses. Only that wrapper
-    // takes the canonical syntax path; VALUES must keep its typed tuple.
+    // takes the canonical syntax path; VALUES must keep its typed value row.
     assert!(matches!(
         super::canonical_insert_wrapper_expression(original).unwrap(),
         ast::Expr::Nested(_)
@@ -591,10 +596,10 @@ fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
             ColumnDefault::Map(vec![(ColumnDefault::Int32(7), decimal_default)]),
         ),
     ]));
-    let ast::Expr::Tuple(structure) = omitted_insert_expr(&nested).unwrap() else {
+    let ast::Expr::Row(structure) = omitted_insert_expr(&nested).unwrap() else {
         panic!("expected structured default");
     };
-    let ast::Expr::Array(array) = &structure.expressions[0] else {
+    let ast::Expr::Array(array) = &structure.fields[0].expression else {
         panic!("expected nonempty ARRAY default");
     };
     assert_eq!(number_text(&array.values[0]), "-123456789.123456789");
@@ -605,7 +610,7 @@ fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
             ..
         })
     ));
-    let ast::Expr::Map(map) = &structure.expressions[1] else {
+    let ast::Expr::Map(map) = &structure.fields[1].expression else {
         panic!("expected nonempty MAP default");
     };
     assert_eq!(number_text(&map.entries[0].key), "7");
@@ -620,13 +625,14 @@ fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
     )
     .unwrap()
     .unwrap();
-    let ast::Expr::Tuple(structure) = cast_input(
+    let ast::Expr::Row(structure) = cast_input(
         &rows(&shaped)[0][1],
         "STRUCT<`a` ARRAY<DECIMAL(18, 9)>, `m` MAP<INT, DECIMAL(18, 9)>>",
     ) else {
         panic!("expected target-shaped structured default");
     };
-    let ast::Expr::Array(array) = cast_input(&structure.expressions[0], "ARRAY<DECIMAL(18, 9)>")
+    let ast::Expr::Array(array) =
+        cast_input(&structure.fields[0].expression, "ARRAY<DECIMAL(18, 9)>")
     else {
         panic!("expected target-shaped ARRAY default");
     };
@@ -885,4 +891,84 @@ fn wrapper_keeps_admitted_numeric_category_spelling_and_span() {
             original
         );
     }
+}
+
+#[test]
+fn canonical_insert_wrapper_preserves_twenty_thousand_positional_row_layers() {
+    const DEPTH: i64 = 20_000;
+    const LEAF: i64 = 1_000_000;
+    let row_span = novarocks_parser::Span::new(10, 100);
+    let marker_span = novarocks_parser::Span::new(20, 21);
+    let leaf_span = novarocks_parser::Span::new(70, 71);
+    let number = |value: i64, span| {
+        ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Long {
+                spelling: value.to_string(),
+                parsed_value: value,
+            },
+            span,
+        })
+    };
+    let mut original = number(LEAF, leaf_span);
+    for marker in 1..=DEPTH {
+        let child_span = original.span();
+        original = ast::Expr::Row(ast::RowExpr {
+            fields: vec![
+                ast::RowField {
+                    name: None,
+                    expression: number(marker, marker_span),
+                    span: marker_span,
+                },
+                ast::RowField {
+                    name: None,
+                    expression: original,
+                    span: child_span,
+                },
+            ]
+            .into(),
+            span: row_span,
+        });
+    }
+    // Every layer stays a two-field positional value, exercising the actual
+    // FE wrapper traversal, field order and original source locations.
+    let canonical = super::canonical_insert_wrapper_expression(original)
+        .expect("the original positional wrapper traverses its guarded Row owner");
+    let mut cursor = &canonical;
+    for marker in (1..=DEPTH).rev() {
+        let ast::Expr::Row(row) = cursor else {
+            panic!("the two-field positional value keeps its Row shape");
+        };
+        assert_eq!(row.span, row_span);
+        assert_eq!(row.fields.len(), 2);
+        assert!(row.fields.iter().all(|field| field.name.is_none()));
+        assert_eq!(row.fields[0].span, marker_span);
+        let ast::Expr::Literal(literal) = &row.fields[0].expression else {
+            panic!("the first field is the original ordered marker");
+        };
+        assert_eq!(literal.span, marker_span);
+        assert_eq!(
+            literal.kind,
+            ast::LiteralKind::Long {
+                spelling: marker.to_string(),
+                parsed_value: marker,
+            }
+        );
+        assert_eq!(
+            row.fields[1].span,
+            if marker == 1 { leaf_span } else { row_span }
+        );
+        cursor = &row.fields[1].expression;
+    }
+    let ast::Expr::Literal(literal) = cursor else {
+        panic!("the original terminal value survives the FE wrapper");
+    };
+    assert_eq!(literal.span, leaf_span);
+    assert_eq!(
+        literal.kind,
+        ast::LiteralKind::Long {
+            spelling: LEAF.to_string(),
+            parsed_value: LEAF,
+        }
+    );
+    drop(canonical);
 }

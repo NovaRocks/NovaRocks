@@ -216,18 +216,11 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         ast::Expr::FunctionCall(func) => function_to_literal(func),
-        ast::Expr::Tuple(tuple) => Ok(Literal::Struct(
-            tuple
-                .expressions
-                .iter()
-                .map(expr_to_literal)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        ast::Expr::Struct(struct_expr) => Ok(Literal::Struct(
+        ast::Expr::Row(struct_expr) => Ok(Literal::Struct(
             struct_expr
                 .fields
                 .iter()
-                .map(|field| expr_to_literal(&field.value))
+                .map(|field| expr_to_literal(&field.expression))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         ast::Expr::Map(map) => Ok(Literal::Map(

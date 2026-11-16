@@ -30,7 +30,7 @@ use crate::{
         ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier, Ident, InListExpr,
         IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration, LambdaExpr, Literal,
         LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment, ObjectName, RowDataTypeField,
-        SearchedCaseExpr, SimpleCaseExpr, SubqueryExpr, TupleExpr, TypeName, UnaryExpr,
+        RowExpr, RowField, SearchedCaseExpr, SimpleCaseExpr, SubqueryExpr, TypeName, UnaryExpr,
         UnaryOperator, WhenClause, WhenMatch, WindowFrame, WindowFrameBound, WindowFrameExclusion,
         WindowFrameUnits, WindowSpec,
     },
@@ -432,10 +432,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         match expression {
             Expr::Identifier(ident) => Some(vec![ident.clone()]),
             Expr::Nested(nested) => Self::lambda_parameters(&nested.expression),
-            Expr::Tuple(tuple) => tuple
-                .expressions
+            Expr::Row(row) if row.fields.iter().all(|field| field.name.is_none()) => row
+                .fields
                 .iter()
-                .map(|expression| match expression {
+                .map(|field| match &field.expression {
                     Expr::Identifier(ident) => Some(ident.clone()),
                     _ => None,
                 })
@@ -1843,8 +1843,15 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
             let end = self.current_span().end();
             self.advance();
-            return Ok(Expr::Tuple(TupleExpr {
-                expressions,
+            return Ok(Expr::Row(RowExpr {
+                fields: expressions
+                    .into_iter()
+                    .map(|expression| RowField {
+                        span: expression.span(),
+                        name: None,
+                        expression,
+                    })
+                    .collect(),
                 span: Span::new(opening_span.start(), end),
             }));
         }

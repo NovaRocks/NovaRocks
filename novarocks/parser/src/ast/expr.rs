@@ -48,10 +48,9 @@ pub enum Expr {
     Cast(AstBox<super::CastExpr>),
     Interval(IntervalExpr),
     Subquery(SubqueryExpr),
-    Tuple(TupleExpr),
+    Row(RowExpr),
     Array(ArrayExpr),
     Map(MapExpr),
-    Struct(StructExpr),
     Lambda(AstBox<super::LambdaExpr>),
     Access(AccessExpr),
 }
@@ -84,10 +83,9 @@ impl Expr {
             Self::Cast(expression) => expression.span,
             Self::Interval(expression) => expression.span,
             Self::Subquery(expression) => expression.span,
-            Self::Tuple(expression) => expression.span,
+            Self::Row(expression) => expression.span,
             Self::Array(expression) => expression.span,
             Self::Map(expression) => expression.span,
-            Self::Struct(expression) => expression.span,
             Self::Lambda(expression) => expression.span,
             Self::Access(expression) => expression.span,
         }
@@ -192,8 +190,15 @@ pub struct SubqueryExpr {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TupleExpr {
-    pub expressions: Vec<Expr>,
+pub struct RowExpr {
+    pub fields: AstVec<RowField>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowField {
+    pub name: Option<Ident>,
+    pub expression: Expr,
     pub span: Span,
 }
 
@@ -212,19 +217,6 @@ pub struct MapExpr {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MapEntry {
     pub key: Expr,
-    pub value: Expr,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StructExpr {
-    pub fields: Vec<StructExprField>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StructExprField {
-    pub name: Option<Ident>,
     pub value: Expr,
     pub span: Span,
 }

@@ -100,11 +100,10 @@ pub(crate) fn is_literal_expr(expr: &ast::Expr) -> bool {
             .entries
             .iter()
             .all(|entry| is_literal_expr(&entry.key) && is_literal_expr(&entry.value)),
-        ast::Expr::Tuple(tuple) => tuple.expressions.iter().all(is_literal_expr),
-        ast::Expr::Struct(structure) => structure
+        ast::Expr::Row(structure) => structure
             .fields
             .iter()
-            .all(|field| is_literal_expr(&field.value)),
+            .all(|field| is_literal_expr(&field.expression)),
         ast::Expr::FunctionCall(function) => {
             plain_function(function)
                 && matches!(
@@ -224,15 +223,10 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
                     && legacy_literal_shape(&entry.value).is_some()
             })
             .then_some(Other),
-        ast::Expr::Tuple(tuple) => tuple
-            .expressions
-            .iter()
-            .all(|value| legacy_literal_shape(value).is_some())
-            .then_some(Other),
-        ast::Expr::Struct(structure) => structure
+        ast::Expr::Row(structure) => structure
             .fields
             .iter()
-            .all(|field| legacy_literal_shape(&field.value).is_some())
+            .all(|field| legacy_literal_shape(&field.expression).is_some())
             .then_some(Other),
         ast::Expr::FunctionCall(function) if plain_function(function) => {
             let name = printer::print_object_name(&function.name).to_ascii_lowercase();

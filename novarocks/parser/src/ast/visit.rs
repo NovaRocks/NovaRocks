@@ -21,6 +21,12 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_row_expr(&mut self, node: &RowExpr) {
+        walk_row_expr(self, node);
+    }
+    fn visit_row_field(&mut self, node: &RowField) {
+        walk_row_field(self, node);
+    }
     fn visit_exists_expr(&mut self, node: &ExistsExpr) {
         walk_exists_expr(self, node);
     }
@@ -781,24 +787,12 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
             }
         }
         Expr::Subquery(expression) => visitor.visit_query(&expression.query),
-        Expr::Tuple(expression) => {
-            for expr in &expression.expressions {
-                visitor.visit_expr(expr);
-            }
-        }
+        Expr::Row(expression) => visitor.visit_row_expr(expression),
         Expr::Array(expression) => walk_array_expr(visitor, expression),
         Expr::Map(expression) => {
             for entry in &expression.entries {
                 visitor.visit_expr(&entry.key);
                 visitor.visit_expr(&entry.value);
-            }
-        }
-        Expr::Struct(expression) => {
-            for field in &expression.fields {
-                if let Some(name) = &field.name {
-                    visitor.visit_ident(name);
-                }
-                visitor.visit_expr(&field.value);
             }
         }
 
@@ -847,6 +841,12 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_row_expr(&mut self, node: RowExpr) -> RowExpr {
+        fold_row_expr(self, node)
+    }
+    fn fold_row_field(&mut self, node: RowField) -> RowField {
+        fold_row_field(self, node)
+    }
     fn fold_exists_expr(&mut self, node: ExistsExpr) -> ExistsExpr {
         fold_exists_expr(self, node)
     }
@@ -1878,14 +1878,7 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
             expression.query = Box::new(folder.fold_query(*expression.query));
             Expr::Subquery(expression)
         }
-        Expr::Tuple(mut expression) => {
-            expression.expressions = expression
-                .expressions
-                .into_iter()
-                .map(|expr| folder.fold_expr(expr))
-                .collect();
-            Expr::Tuple(expression)
-        }
+        Expr::Row(expression) => Expr::Row(folder.fold_row_expr(expression)),
         Expr::Array(expression) => Expr::Array(fold_array_expr(folder, expression)),
         Expr::Map(mut expression) => {
             expression.entries = expression
@@ -1898,18 +1891,6 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
                 })
                 .collect();
             Expr::Map(expression)
-        }
-        Expr::Struct(mut expression) => {
-            expression.fields = expression
-                .fields
-                .into_iter()
-                .map(|mut field| {
-                    field.name = field.name.map(|name| folder.fold_ident(name));
-                    field.value = folder.fold_expr(field.value);
-                    field
-                })
-                .collect();
-            Expr::Struct(expression)
         }
 
         Expr::Access(mut expression) => {
@@ -1999,4 +1980,36 @@ pub fn fold_logical_expr<F: Fold + ?Sized>(
         .map(|term| folder.fold_expr(term))
         .collect();
     expression
+}
+
+#[recursive::recursive]
+pub fn walk_row_expr<V: Visit + ?Sized>(visitor: &mut V, node: &RowExpr) {
+    for field in &node.fields {
+        visitor.visit_row_field(field);
+    }
+}
+
+#[recursive::recursive]
+pub fn walk_row_field<V: Visit + ?Sized>(visitor: &mut V, node: &RowField) {
+    if let Some(name) = &node.name {
+        visitor.visit_ident(name);
+    }
+    visitor.visit_expr(&node.expression);
+}
+
+#[recursive::recursive]
+pub fn fold_row_expr<F: Fold + ?Sized>(folder: &mut F, mut node: RowExpr) -> RowExpr {
+    node.fields = node
+        .fields
+        .into_iter()
+        .map(|field| folder.fold_row_field(field))
+        .collect();
+    node
+}
+
+#[recursive::recursive]
+pub fn fold_row_field<F: Fold + ?Sized>(folder: &mut F, mut node: RowField) -> RowField {
+    node.name = node.name.map(|name| folder.fold_ident(name));
+    node.expression = folder.fold_expr(node.expression);
+    node
 }

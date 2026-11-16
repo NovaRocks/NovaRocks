@@ -812,10 +812,9 @@ impl Printer {
             Expr::Cast(expression) => self.write_cast_expr(expression),
             Expr::Interval(expression) => self.write_interval_expr(expression),
             Expr::Subquery(expression) => self.write_subquery_expr(expression),
-            Expr::Tuple(expression) => self.write_tuple_expr(expression),
+            Expr::Row(expression) => self.write_row_expr(expression),
             Expr::Array(expression) => self.write_array_expr(expression),
             Expr::Map(expression) => self.write_map_expr(expression),
-            Expr::Struct(expression) => self.write_struct_expr(expression),
             Expr::Lambda(expression) => self.write_lambda_expr(expression),
             Expr::Access(expression) => self.write_access_expr(expression),
         }
@@ -1440,9 +1439,20 @@ impl Printer {
         self.write_query(&expression.query);
         self.output.push(')');
     }
-    fn write_tuple_expr(&mut self, expression: &TupleExpr) {
-        self.output.push('(');
-        self.write_expr_list(&expression.expressions);
+    #[recursive::recursive]
+    fn write_row_expr(&mut self, expression: &RowExpr) {
+        let named = expression.fields.iter().any(|field| field.name.is_some());
+        self.output.push_str(if named { "STRUCT(" } else { "(" });
+        for (index, field) in expression.fields.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            if let Some(name) = &field.name {
+                self.write_ident(name);
+                self.output.push_str(" := ");
+            }
+            self.write_expr(&field.expression);
+        }
         self.output.push(')');
     }
     fn write_array_expr(&mut self, expression: &ArrayExpr) {
@@ -1462,21 +1472,6 @@ impl Printer {
             self.write_expr(&entry.value);
         }
         self.output.push('}');
-    }
-
-    fn write_struct_expr(&mut self, expression: &StructExpr) {
-        self.output.push_str("STRUCT(");
-        for (index, field) in expression.fields.iter().enumerate() {
-            if index != 0 {
-                self.output.push_str(", ");
-            }
-            if let Some(name) = &field.name {
-                self.write_ident(name);
-                self.output.push_str(" := ");
-            }
-            self.write_expr(&field.value);
-        }
-        self.output.push(')');
     }
 
     fn write_lambda_expr(&mut self, expression: &LambdaExpr) {

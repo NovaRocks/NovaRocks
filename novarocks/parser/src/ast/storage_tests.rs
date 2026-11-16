@@ -375,3 +375,248 @@ fn actual_array_semantic_walk_fold_and_equivalence_preserve_deep_values_and_orde
     drop(statement);
     drop(tree);
 }
+
+#[test]
+fn actual_row_owning_carrier_guards_deep_traits_move_and_drop() {
+    use crate::ast::{Expr, LiteralKind, RowExpr, RowField};
+    use crate::{Span, build};
+    const DEPTH: usize = 20_000;
+    let mut tree = build::integer(7);
+    for _ in 0..DEPTH {
+        tree = Expr::Row(RowExpr {
+            fields: vec![RowField {
+                name: None,
+                expression: tree,
+                span: Span::new(11, 19),
+            }]
+            .into(),
+            span: Span::new(10, 20),
+        });
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH);
+    let mut cursor = &mut copy;
+    for _ in 0..DEPTH {
+        let Expr::Row(row) = cursor else {
+            panic!("actual nested Row");
+        };
+        assert_eq!(row.fields.len(), 1);
+        assert!(row.fields[0].name.is_none());
+        assert_eq!(row.fields[0].span, Span::new(11, 19));
+        assert_eq!(row.span, Span::new(10, 20));
+        cursor = &mut row.fields[0].expression;
+    }
+    let Expr::Literal(literal) = cursor else {
+        panic!("original leaf");
+    };
+    assert!(matches!(
+        literal.kind,
+        LiteralKind::Long {
+            parsed_value: 7,
+            ..
+        }
+    ));
+    literal.kind = LiteralKind::Long {
+        spelling: "8".into(),
+        parsed_value: 8,
+    };
+    assert_ne!(tree, copy);
+    drop(copy);
+    let Expr::Row(row) = tree else { unreachable!() };
+    let fields = row.fields.into_inner();
+    assert_eq!(fields.len(), 1);
+    let field = fields.into_iter().next().unwrap();
+    assert!(field.name.is_none());
+    assert_eq!(field.span, Span::new(11, 19));
+    drop(field.expression);
+}
+
+#[test]
+fn actual_row_fields_preserve_names_order_spans_and_deep_semantic_children() {
+    use crate::ast::{
+        Expr, Fold, GroupBy, Ident, Literal, LiteralKind, RowExpr, RowField, SetExpr, Statement,
+        SyntaxEq, Visit,
+    };
+    use crate::{Span, build};
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Event {
+        Name(String, bool),
+        Number(i64),
+    }
+    #[derive(Default)]
+    struct Events(Vec<Event>);
+    impl Visit for Events {
+        fn visit_ident(&mut self, name: &Ident) {
+            self.0.push(Event::Name(name.value.clone(), name.quoted));
+        }
+        fn visit_literal(&mut self, node: &Literal) {
+            let LiteralKind::Long {
+                spelling,
+                parsed_value,
+            } = &node.kind
+            else {
+                panic!("fixture Long literal");
+            };
+            assert_eq!(spelling, &parsed_value.to_string());
+            self.0.push(Event::Number(*parsed_value));
+        }
+    }
+    fn field(name: Option<Ident>, expression: Expr) -> RowField {
+        RowField {
+            name,
+            expression,
+            span: Span::new(11, 19),
+        }
+    }
+    fn row(fields: Vec<RowField>) -> Expr {
+        Expr::Row(RowExpr {
+            fields: fields.into(),
+            span: Span::new(10, 20),
+        })
+    }
+    // Name presence, decoded text, delimiter fact and field order are syntax
+    // facts. This also keeps one-field Row distinct from Nested parentheses.
+    let small = row(vec![
+        field(
+            Some(build::ident_at("k", false, Span::new(11, 12))),
+            build::integer(1),
+        ),
+        field(None, build::integer(2)),
+    ]);
+    for change in 0..4 {
+        let mut other = small.clone();
+        let Expr::Row(value) = &mut other else {
+            unreachable!()
+        };
+        match change {
+            0 => value.fields[0].name = None,
+            1 => value.fields[0].name.as_mut().unwrap().quoted = true,
+            2 => value.fields[0].name.as_mut().unwrap().value = String::new(),
+            3 => value.fields.swap(0, 1),
+            _ => unreachable!(),
+        }
+        assert!(!small.syntax_eq(&other));
+    }
+    let one = build::tuple_value(vec![build::integer(1)]).unwrap();
+    assert!(
+        matches!(&one, Expr::Row(value) if value.fields.len() == 1 && value.fields[0].name.is_none())
+    );
+    let parentheses = build::tuple(vec![build::integer(1)]).unwrap();
+    assert!(matches!(parentheses, Expr::Nested(_)));
+    assert!(!one.syntax_eq(&parentheses));
+
+    const DEPTH: i64 = 20_000;
+    const LEAF: i64 = 1_000_000;
+    const QUOTED: &str = "尾 \"`\\中";
+    let mut tree = build::integer(LEAF);
+    for marker in 1..=DEPTH {
+        tree = row(vec![
+            field(
+                Some(build::ident_at("head", false, Span::new(11, 15))),
+                build::integer(marker),
+            ),
+            field(None, tree),
+            field(
+                Some(build::ident_at(QUOTED, true, Span::new(16, 19))),
+                build::integer(-marker),
+            ),
+        ]);
+    }
+    let mut expected = Vec::new();
+    for marker in (1..=DEPTH).rev() {
+        expected.push(Event::Name("head".into(), false));
+        expected.push(Event::Number(marker));
+    }
+    expected.push(Event::Number(LEAF));
+    for marker in 1..=DEPTH {
+        expected.push(Event::Name(QUOTED.into(), true));
+        expected.push(Event::Number(-marker));
+    }
+    let mut seen = Events::default();
+    seen.visit_expr(&tree);
+    assert_eq!(seen.0, expected);
+    struct Relocate;
+    impl Fold for Relocate {
+        fn fold_row_expr(&mut self, node: RowExpr) -> RowExpr {
+            let mut node = crate::ast::fold_row_expr(self, node);
+            node.span = Span::new(101, 201);
+            node
+        }
+        fn fold_row_field(&mut self, node: RowField) -> RowField {
+            let mut node = crate::ast::fold_row_field(self, node);
+            node.span = Span::new(111, 191);
+            node
+        }
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.span = Span::new(121, 181);
+            node
+        }
+        fn fold_literal(&mut self, mut node: Literal) -> Literal {
+            node.span = Span::new(131, 171);
+            node
+        }
+    }
+    let relocated = Relocate.fold_expr(tree.clone());
+    assert!(tree.syntax_eq(&relocated));
+    assert_ne!(tree, relocated);
+    let Expr::Row(top) = &relocated else {
+        unreachable!()
+    };
+    assert_eq!(top.span, Span::new(101, 201));
+    assert_eq!(top.fields[0].span, Span::new(111, 191));
+    assert_eq!(
+        top.fields[0].name.as_ref().unwrap().span,
+        Span::new(121, 181)
+    );
+    let mut seen = Events::default();
+    seen.visit_expr(&relocated);
+    assert_eq!(seen.0, expected);
+    struct Change;
+    impl Fold for Change {
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.value.push('!');
+            node
+        }
+        fn fold_literal(&mut self, mut node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = &node.kind else {
+                unreachable!()
+            };
+            let next = *parsed_value + 1;
+            node.kind = LiteralKind::Long {
+                spelling: next.to_string(),
+                parsed_value: next,
+            };
+            node
+        }
+    }
+    let changed = Change.fold_expr(relocated);
+    assert!(!tree.syntax_eq(&changed));
+    let expected_changed = expected
+        .into_iter()
+        .map(|event| match event {
+            Event::Name(mut value, quoted) => {
+                value.push('!');
+                Event::Name(value, quoted)
+            }
+            Event::Number(value) => Event::Number(value + 1),
+        })
+        .collect::<Vec<_>>();
+    let mut seen = Events::default();
+    seen.visit_expr(&changed);
+    assert_eq!(seen.0, expected_changed);
+    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
+        build::select(
+            vec![build::item(changed, None, false)],
+            Vec::new(),
+            None,
+            GroupBy::None,
+        )
+        .unwrap(),
+    ))));
+    crate::ast::validate_statement(&statement).unwrap();
+    drop(statement);
+    drop(tree);
+}

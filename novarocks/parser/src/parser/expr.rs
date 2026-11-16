@@ -413,7 +413,22 @@ mod tests {
         assert_eq!(hex_literal.kind, LiteralKind::Binary(vec![0xAB, 0x01]));
         assert_eq!(crate::printer::print_expr(&hex), "X'AB01'");
         assert!(matches!(parse("map{1: [2, 3], NULL: 4}"), Expr::Map(_)));
-        assert!(matches!(parse("(a, b)"), Expr::Tuple(_)));
+        let Expr::Row(row) = parse("(a, b)") else {
+            panic!("positional row");
+        };
+        assert_eq!(row.span, crate::Span::new(0, 6));
+        assert_eq!(row.fields.len(), 2);
+        for (field, (name, span)) in row
+            .fields
+            .iter()
+            .zip([("a", crate::Span::new(1, 2)), ("b", crate::Span::new(4, 5))])
+        {
+            assert!(field.name.is_none());
+            assert_eq!(field.span, span);
+            assert!(
+                matches!(&field.expression, Expr::Identifier(ident) if ident.value == name && ident.span == span)
+            );
+        }
         assert!(matches!(
             parse("CAST(map{1: NULL} AS MAP<INT, ARRAY<INT>>)"),
             Expr::Cast(_)

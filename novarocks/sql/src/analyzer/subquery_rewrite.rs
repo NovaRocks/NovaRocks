@@ -460,13 +460,11 @@ impl<'a> AnalyzerContext<'a> {
                     .in_expr
                     .as_ref()
                     .ok_or_else(|| AnalyzeError::internal("IN subquery missing LHS expression"))?;
-                if matches!(in_expr.as_ref(), ast::Expr::Tuple(_))
-                    || matches!(
-                        in_expr.as_ref(),
-                        ast::Expr::Nested(ast::NestedExpr { expression, .. })
-                            if matches!(expression.as_ref(), ast::Expr::Tuple(_))
-                    )
-                {
+                let positional_lhs = match in_expr.as_ref() {
+                    ast::Expr::Nested(nested) => nested.expression.as_ref(),
+                    other => other,
+                };
+                if self.anonymous_row(positional_lhs)?.is_some() {
                     let SubqueryKind::InSubquery { negated } = &sq_info.kind else {
                         unreachable!("tuple LHS only exists for IN subqueries");
                     };
@@ -1824,18 +1822,16 @@ impl<'a> AnalyzerContext<'a> {
         })?;
 
         // Multi-column LHS: `(a, b) IN (SELECT c, d FROM ...)`. The typed AST
-        // retains the LHS as `Expr::Tuple` (possibly wrapped in
+        // retains the LHS as an anonymous `Expr::Row` (possibly wrapped in
         // `Expr::Nested`). Analyze each component separately and pair
         // them with the subquery's output columns one-to-one.
-        let lhs_items_ast: Vec<&ast::Expr> = match in_expr_ast.as_ref() {
-            ast::Expr::Tuple(ast::TupleExpr { expressions, .. }) => expressions.iter().collect(),
-            ast::Expr::Nested(ast::NestedExpr { expression, .. }) => match expression.as_ref() {
-                ast::Expr::Tuple(ast::TupleExpr { expressions, .. }) => {
-                    expressions.iter().collect()
-                }
-                other => vec![other],
-            },
-            other => vec![other],
+        let positional_lhs = match in_expr_ast.as_ref() {
+            ast::Expr::Nested(nested) => nested.expression.as_ref(),
+            other => other,
+        };
+        let lhs_items_ast: Vec<&ast::Expr> = match self.anonymous_row(positional_lhs)? {
+            Some(row) => row.fields.iter().map(|field| &field.expression).collect(),
+            None => vec![positional_lhs],
         };
         let lhs_typed_list: Vec<TypedExpr> = lhs_items_ast
             .iter()
