@@ -2493,11 +2493,13 @@ fn collect_join_equality_predicates(
         ast::Expr::Nested(nested) => {
             collect_join_equality_predicates(&nested.expression, predicates)
         }
-        ast::Expr::Binary(binary) => match binary.operator {
-            ast::BinaryOperator::And => {
-                collect_join_equality_predicates(&binary.left, predicates)?;
-                collect_join_equality_predicates(&binary.right, predicates)
+        ast::Expr::Logical(logical) if logical.operator == ast::LogicalOperator::And => {
+            for term in &logical.terms {
+                collect_join_equality_predicates(term, predicates)?;
             }
+            Ok(())
+        }
+        ast::Expr::Binary(binary) => match binary.operator {
             ast::BinaryOperator::Equal => {
                 predicates.push(SqlMvJoinPredicateColumns {
                     left: join_column_ref(&binary.left)?,
@@ -2953,9 +2955,11 @@ fn collect_equi_join_keys(
         Expr::Nested(inner) => {
             collect_equi_join_keys(&inner.expression, left_alias, right_alias, out)
         }
-        Expr::Binary(binary) if binary.operator == ast::BinaryOperator::And => {
-            collect_equi_join_keys(&binary.left, left_alias, right_alias, out)?;
-            collect_equi_join_keys(&binary.right, left_alias, right_alias, out)
+        Expr::Logical(logical) if logical.operator == ast::LogicalOperator::And => {
+            for term in &logical.terms {
+                collect_equi_join_keys(term, left_alias, right_alias, out)?;
+            }
+            Ok(())
         }
         Expr::Binary(binary) if binary.operator == ast::BinaryOperator::Equal => {
             let left_q = qualified_column_alias(&binary.left)?;
@@ -3339,6 +3343,7 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
             let right = &binary.right;
             expr_contains_aggregate_function(left) || expr_contains_aggregate_function(right)
         }
+        Expr::Logical(logical) => logical.terms.iter().any(expr_contains_aggregate_function),
         Expr::Unary(unary) => expr_contains_aggregate_function(&unary.expression),
         Expr::Nested(nested) => expr_contains_aggregate_function(&nested.expression),
         Expr::Cast(cast) => expr_contains_aggregate_function(&cast.expr),
@@ -3479,6 +3484,7 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
             reject_unsupported_expr(&binary.left)?;
             reject_unsupported_expr(&binary.right)?;
         }
+        Expr::Logical(logical) => reject_unsupported_exprs(&logical.terms)?,
         Expr::Like(like) => {
             reject_unsupported_expr(&like.expr)?;
             reject_unsupported_expr(&like.pattern)?;
@@ -4399,6 +4405,55 @@ mod tests {
             }
             other => panic!("expected join shape, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn logical_join_terms_keep_key_order_and_alias_orientation_and_reject_or() {
+        let query = parse_query(
+            "SELECT l.k FROM ice.ns.left_table l JOIN ice.ns.right_table r ON l.a = r.x AND r.y = l.b AND (l.c = r.z)",
+        );
+        let predicates = extract_join_equality_predicates(&query).unwrap();
+        assert_eq!(
+            predicates
+                .iter()
+                .map(|key| (
+                    key.left.qualifier.as_str(),
+                    key.left.column.as_str(),
+                    key.right.qualifier.as_str(),
+                    key.right.column.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("l", "a", "r", "x"),
+                ("r", "y", "l", "b"),
+                ("l", "c", "r", "z")
+            ]
+        );
+        let IncrementalMvShape::JoinProjectionFilter(shape) =
+            classify_incremental_mv_query(&query).unwrap()
+        else {
+            panic!("join shape")
+        };
+        assert_eq!(
+            shape
+                .join_keys
+                .iter()
+                .map(|key| (
+                    printer::print_expr(&key.left_expr),
+                    printer::print_expr(&key.right_expr)
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("l.a".into(), "r.x".into()),
+                ("l.b".into(), "r.y".into()),
+                ("l.c".into(), "r.z".into())
+            ]
+        );
+        let disjunction = parse_query(
+            "SELECT l.k FROM ice.ns.left_table l JOIN ice.ns.right_table r ON l.a = r.x OR l.b = r.y",
+        );
+        assert!(extract_join_equality_predicates(&disjunction).is_err());
+        assert!(classify_incremental_mv_query(&disjunction).is_err());
     }
 
     #[test]

@@ -68,11 +68,12 @@ mod tests {
         assert!(matches!(*outer.left, Expr::Binary(_)));
 
         let expression = parse("NOT a = b AND c");
-        let Expr::Binary(and) = expression else {
+        let Expr::Logical(and) = expression else {
             panic!("expected conjunction");
         };
-        assert_eq!(and.operator, BinaryOperator::And);
-        let Expr::Unary(not) = *and.left else {
+        assert_eq!(and.operator, crate::ast::LogicalOperator::And);
+        let mut terms = and.terms.into_inner().into_iter();
+        let Expr::Unary(not) = terms.next().unwrap() else {
             panic!("expected NOT to bind below comparison and above AND");
         };
         assert_eq!(not.operator, UnaryOperator::Not);
@@ -85,18 +86,19 @@ mod tests {
         let expression = parse(source);
         assert_eq!(expression.span(), Span::new(0, source.len()));
 
-        let Expr::Binary(and) = expression else {
+        let Expr::Logical(and) = expression else {
             panic!("expected conjunction");
         };
-        assert_eq!(and.operator, BinaryOperator::And);
-        let Expr::Unary(not) = *and.left else {
+        assert_eq!(and.operator, crate::ast::LogicalOperator::And);
+        let mut terms = and.terms.into_inner().into_iter();
+        let Expr::Unary(not) = terms.next().unwrap() else {
             panic!("expected unary NOT");
         };
         assert_eq!(not.operator, UnaryOperator::Not);
         assert_eq!(not.span, Span::new(0, 11));
         assert!(matches!(*not.expression, Expr::Nested(_)));
 
-        let Expr::FunctionCall(call) = *and.right else {
+        let Expr::FunctionCall(call) = terms.next().unwrap() else {
             panic!("expected function call");
         };
         assert_eq!(call.span, Span::new(16, source.len()));

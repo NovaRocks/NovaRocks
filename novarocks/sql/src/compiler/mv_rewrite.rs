@@ -3071,6 +3071,9 @@ impl Visit for CompletionRetainedBytes {
             Expr::CompoundIdentifier(identifier) => {
                 self.add_vec_capacity::<Ident>(identifier.parts.capacity());
             }
+            Expr::Logical(expression) => {
+                self.add_vec_capacity::<Expr>(expression.terms.capacity());
+            }
             Expr::InList(expression) => {
                 self.add_vec_capacity::<Expr>(expression.list.capacity());
             }

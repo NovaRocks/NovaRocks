@@ -148,3 +148,113 @@ fn actual_analyzer_preserves_encoded_json_null_and_original_sql_null() {
         crate::analysis::ExprKind::BinaryOp { .. }
     ));
 }
+
+#[test]
+fn logical_term_paths_borrow_only_the_authored_occurrence_and_reject_wrong_edges() {
+    use arrow::array::{Array, BooleanArray};
+    use novarocks_functions::ConstantPool;
+    let control = SqlCompileControl::unbounded();
+    let policy = crate::constant::test_constant_policy();
+    let ty = FunctionValueType::new(arrow::datatypes::DataType::Boolean, false);
+    let field = Arc::new(arrow::datatypes::Field::new(
+        "original",
+        ty.data_type().clone(),
+        false,
+    ));
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        BooleanArray::from(vec![false, true]).to_data(),
+        policy,
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let value = pool.value(1).unwrap();
+    let query = query("SELECT TRUE AND only_original_source AND NULL");
+    let constant = |path| {
+        SqlExpressionConstant::new(
+            vec![],
+            SqlConstantExpressionSite::SelectProjection { column: 0 },
+            value.clone(),
+        )
+        .with_expression_path(path)
+    };
+    let source = MaterializedValues::try_new_expressions(
+        &query,
+        vec![constant(vec![SqlConstantExpressionStep::LogicalTerm(1)])].into(),
+        &control,
+    )
+    .unwrap();
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("select")
+    };
+    let ast::SelectItem::UnnamedExpr(ast::Expr::Logical(logical)) = &select.projection[0] else {
+        panic!("logical projection")
+    };
+    assert_eq!(logical.terms.len(), 3);
+    let owned = source.loan(&query, &control).unwrap();
+    let loan = owned.view();
+    assert!(loan.constant_at(&logical.terms[0]).is_none());
+    assert!(loan.constant_at(&logical.terms[2]).is_none());
+    assert!(loan.constant_at(&logical.terms[1].clone()).is_none());
+    let retained = loan.constant_at(&logical.terms[1]).unwrap();
+    assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
+    assert_eq!(retained.ordinal(), 1);
+    assert_eq!(retained.field(), field.as_ref());
+    assert_eq!(retained.value_type(), &ty);
+    for path in [
+        vec![SqlConstantExpressionStep::LogicalTerm(3)],
+        vec![SqlConstantExpressionStep::Nested],
+        vec![
+            SqlConstantExpressionStep::LogicalTerm(1),
+            SqlConstantExpressionStep::LogicalTerm(0),
+        ],
+    ] {
+        assert!(
+            MaterializedValues::try_new_expressions(&query, vec![constant(path)].into(), &control)
+                .is_err()
+        );
+    }
+    let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+    let functions = build_builtin_engine_function_catalog().unwrap();
+    let (resolved, _, _) = crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
+        &query,
+        &catalog,
+        "db",
+        &functions,
+        &crate::sql_mode::SqlSemanticSettings::default(),
+        policy,
+        &control,
+        Some(&source),
+    )
+    .unwrap();
+    let crate::analysis::QueryBody::Select(select) = resolved.body else {
+        panic!("resolved select")
+    };
+    let expression = &select.projection[0].expr;
+    assert_eq!(
+        expression.value_type.data_type(),
+        &arrow::datatypes::DataType::Boolean
+    );
+    assert!(expression.value_type.nullable());
+    let crate::analysis::ExprKind::BinaryOp {
+        left, right, op, ..
+    } = &expression.kind
+    else {
+        panic!("balanced root")
+    };
+    assert_eq!(*op, crate::analysis::BinOp::And);
+    assert!(matches!(
+        right.kind,
+        crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Null)
+    ));
+    let crate::analysis::ExprKind::BinaryOp { right, .. } = &left.kind else {
+        panic!("first adjacent pair")
+    };
+    let crate::analysis::ExprKind::Constant(retained) = &right.kind else {
+        panic!("original constant")
+    };
+    assert_eq!(retained.ordinal(), 1);
+    assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
+}

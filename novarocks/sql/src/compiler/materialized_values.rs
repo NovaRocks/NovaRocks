@@ -34,6 +34,7 @@ pub enum SqlConstantQueryStep {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlConstantExpressionStep {
     Nested,
+    LogicalTerm(usize),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlConstantExpressionSite {
@@ -144,6 +145,11 @@ pub(crate) fn resolve_expression_site<'a>(
         work.step()?;
         expression = match (step, expression) {
             (SqlConstantExpressionStep::Nested, ast::Expr::Nested(nested)) => &nested.expression,
+            (SqlConstantExpressionStep::LogicalTerm(index), ast::Expr::Logical(logical)) => {
+                logical.terms.get(*index).ok_or_else(|| {
+                    invalid("constant source logical term index differs from its owned syntax")
+                })?
+            }
             _ => {
                 return Err(invalid(
                     "constant source expression path differs from its owned syntax",

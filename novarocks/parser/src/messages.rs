@@ -48,6 +48,9 @@ pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
         StructuralViolation::InvalidSetOperationOperandCount => {
             "invalid SQL structure: invalid set operation operand count".to_owned()
         }
+        StructuralViolation::InvalidLogicalTermCount => {
+            "invalid SQL structure: logical expression requires at least two terms".to_owned()
+        }
         StructuralViolation::InvalidQueryModifierOwner => {
             "direct SELECT modifiers must belong to the query specification".to_string()
         }

@@ -1038,21 +1038,21 @@ fn build_merge_match_query(
     let mut action_cases = Vec::new();
     if let Some(action) = matched_action {
         action_cases.push((
-            build::binary(
+            build::and_all(vec![
                 build::is_null(qualify("_file"), true),
-                ast::BinaryOperator::And,
                 build::nested(matched_predicate.unwrap_or_else(|| build::boolean(true))),
-            ),
+            ])
+            .expect("MERGE matched action has two predicates"),
             build::integer(i64::from(action)),
         ));
     }
     if has_not_matched_insert {
         action_cases.push((
-            build::binary(
+            build::and_all(vec![
                 build::is_null(qualify("_file"), false),
-                ast::BinaryOperator::And,
                 build::nested(not_matched_predicate.unwrap_or_else(|| build::boolean(true))),
-            ),
+            ])
+            .expect("MERGE not-matched action has two predicates"),
             build::integer(i64::from(MERGE_ACTION_NOT_MATCHED_INSERT)),
         ));
     }
@@ -1898,6 +1898,80 @@ mod tests {
             nullable: false,
             write_default: None,
             logical_type: None,
+        }
+    }
+
+    #[test]
+    fn merge_actions_keep_clause_predicates_nested_in_original_order() {
+        let matched = test_expr("s.v > 5 OR (s.v = 5 AND s.id > 0)");
+        let inserted = test_expr("s.id > 10 AND (s.v > 0 OR s.v IS NULL)");
+        let query = build_merge_match_query(
+            test_relation("ice.db1.t AS t"),
+            build::ident("t", None),
+            test_relation("staging.s AS s"),
+            test_expr("t.id = s.id"),
+            Some(matched.clone()),
+            Some(inserted.clone()),
+            &[col("id"), col("v")],
+            Vec::new(),
+            Vec::new(),
+            Some(MERGE_ACTION_MATCHED_UPDATE),
+            true,
+        )
+        .unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let action = select
+            .projection
+            .iter()
+            .find_map(|item| match item {
+                ast::SelectItem::ExprWithAlias { expr, alias, .. }
+                    if alias.value == "__nr_merge_action" =>
+                {
+                    Some(expr)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let ast::Expr::Nested(action) = action else {
+            panic!("action expression boundary");
+        };
+        let ast::Expr::Case(case) = action.expression.as_ref() else {
+            panic!("ordered action CASE");
+        };
+        assert_eq!(case.conditions.len(), 2);
+        for (index, (original, guard, result)) in [
+            (
+                &matched,
+                ast::IsPredicate::NotNull,
+                MERGE_ACTION_MATCHED_UPDATE,
+            ),
+            (
+                &inserted,
+                ast::IsPredicate::Null,
+                MERGE_ACTION_NOT_MATCHED_INSERT,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ast::Expr::Logical(condition) = &case.conditions[index] else {
+                panic!("action AND");
+            };
+            assert_eq!(condition.operator, ast::LogicalOperator::And);
+            assert_eq!(condition.terms.len(), 2);
+            assert!(
+                matches!(&condition.terms[0], ast::Expr::IsPredicate(predicate) if predicate.predicate == guard)
+            );
+            let ast::Expr::Nested(clause) = &condition.terms[1] else {
+                panic!("original clause boundary");
+            };
+            assert_eq!(clause.expression.as_ref(), original);
+            assert_eq!(clause.expression.span(), original.span());
+            assert!(
+                matches!(&case.results[index], ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::Long { parsed_value, .. }, .. }) if *parsed_value == i64::from(result))
+            );
         }
     }
 

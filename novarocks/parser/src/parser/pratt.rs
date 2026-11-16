@@ -17,7 +17,7 @@
 
 //! Data-driven Pratt parsing machinery for the initial expression grammar.
 
-use crate::ast::{AstBox, TypeKind, TypeParameter};
+use crate::ast::{AstBox, LogicalExpr, LogicalOperator, TypeKind, TypeParameter};
 
 use crate::{
     Span, Symbol, Token, TokenKind,
@@ -45,50 +45,6 @@ const ADDITIVE_PRECEDENCE: u8 = 50;
 const MULTIPLICATIVE_PRECEDENCE: u8 = 60;
 const UNARY_ARITHMETIC_PRECEDENCE: u8 = 70;
 
-/// Keep long same-operator boolean chains shallow before any caller clones or
-/// walks the parsed tree. SQL's three-valued AND/OR are associative, and the
-/// in-order sequence of operands is unchanged.
-pub(crate) fn balance_boolean_chain(expression: Expr) -> Expr {
-    let operator = match &expression {
-        Expr::Binary(binary)
-            if matches!(binary.operator, BinaryOperator::And | BinaryOperator::Or) =>
-        {
-            binary.operator
-        }
-        _ => return expression,
-    };
-    let mut pending = vec![expression];
-    let mut operands = Vec::new();
-    while let Some(current) = pending.pop() {
-        match current {
-            Expr::Binary(binary) if binary.operator == operator => {
-                pending.push(*binary.right);
-                pending.push(*binary.left);
-            }
-            other => operands.push(other),
-        }
-    }
-    while operands.len() > 1 {
-        let mut next_level = Vec::with_capacity(operands.len().div_ceil(2));
-        let mut values = operands.into_iter();
-        while let Some(left) = values.next() {
-            if let Some(right) = values.next() {
-                let span = left.span().cover(right.span());
-                next_level.push(Expr::Binary(BinaryExpr {
-                    left: Box::new(left),
-                    operator,
-                    right: Box::new(right),
-                    span,
-                }));
-            } else {
-                next_level.push(left);
-            }
-        }
-        operands = next_level;
-    }
-    operands.pop().expect("a binary expression has operands")
-}
-
 #[derive(Clone, Copy)]
 enum TokenPattern {
     Keyword(Keyword),
@@ -106,9 +62,15 @@ impl TokenPattern {
 }
 
 #[derive(Clone, Copy)]
+enum InfixOperator {
+    Binary(BinaryOperator),
+    Logical(LogicalOperator),
+}
+
+#[derive(Clone, Copy)]
 struct InfixBinding {
     token: TokenPattern,
-    operator: BinaryOperator,
+    operator: InfixOperator,
     precedence: u8,
 }
 
@@ -123,102 +85,102 @@ struct PrefixBinding {
 const INFIX_BINDINGS: &[InfixBinding] = &[
     InfixBinding {
         token: TokenPattern::Keyword(Keyword::Or),
-        operator: BinaryOperator::Or,
+        operator: InfixOperator::Logical(LogicalOperator::Or),
         precedence: OR_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Keyword(Keyword::And),
-        operator: BinaryOperator::And,
+        operator: InfixOperator::Logical(LogicalOperator::And),
         precedence: AND_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Eq),
-        operator: BinaryOperator::Equal,
+        operator: InfixOperator::Binary(BinaryOperator::Equal),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::NullSafeEq),
-        operator: BinaryOperator::NullSafeEqual,
+        operator: InfixOperator::Binary(BinaryOperator::NullSafeEqual),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Neq),
-        operator: BinaryOperator::NotEqual,
+        operator: InfixOperator::Binary(BinaryOperator::NotEqual),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Lt),
-        operator: BinaryOperator::LessThan,
+        operator: InfixOperator::Binary(BinaryOperator::LessThan),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Lte),
-        operator: BinaryOperator::LessThanOrEqual,
+        operator: InfixOperator::Binary(BinaryOperator::LessThanOrEqual),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Gt),
-        operator: BinaryOperator::GreaterThan,
+        operator: InfixOperator::Binary(BinaryOperator::GreaterThan),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Gte),
-        operator: BinaryOperator::GreaterThanOrEqual,
+        operator: InfixOperator::Binary(BinaryOperator::GreaterThanOrEqual),
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Plus),
-        operator: BinaryOperator::Add,
+        operator: InfixOperator::Binary(BinaryOperator::Add),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Minus),
-        operator: BinaryOperator::Subtract,
+        operator: InfixOperator::Binary(BinaryOperator::Subtract),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Star),
-        operator: BinaryOperator::Multiply,
+        operator: InfixOperator::Binary(BinaryOperator::Multiply),
         precedence: MULTIPLICATIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Slash),
-        operator: BinaryOperator::Divide,
+        operator: InfixOperator::Binary(BinaryOperator::Divide),
         precedence: MULTIPLICATIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Percent),
-        operator: BinaryOperator::Modulo,
+        operator: InfixOperator::Binary(BinaryOperator::Modulo),
         precedence: MULTIPLICATIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::DoublePipe),
-        operator: BinaryOperator::StringConcat,
+        operator: InfixOperator::Binary(BinaryOperator::StringConcat),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::ShiftLeft),
-        operator: BinaryOperator::ShiftLeft,
+        operator: InfixOperator::Binary(BinaryOperator::ShiftLeft),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::ShiftRight),
-        operator: BinaryOperator::ShiftRight,
+        operator: InfixOperator::Binary(BinaryOperator::ShiftRight),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Ampersand),
-        operator: BinaryOperator::BitwiseAnd,
+        operator: InfixOperator::Binary(BinaryOperator::BitwiseAnd),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Caret),
-        operator: BinaryOperator::BitwiseXor,
+        operator: InfixOperator::Binary(BinaryOperator::BitwiseXor),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Pipe),
-        operator: BinaryOperator::BitwiseOr,
+        operator: InfixOperator::Binary(BinaryOperator::BitwiseOr),
         precedence: ADDITIVE_PRECEDENCE,
     },
 ];
@@ -328,12 +290,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 || self.current_is_symbol(Symbol::LongArrow)
                 || self.current_is_symbol(Symbol::Dot)
             {
-                left = balance_boolean_chain(left);
                 left = self.parse_postfix_access(left)?;
                 continue;
             }
             if minimum_precedence <= COMPARISON_PRECEDENCE && self.starts_comparison_special() {
-                left = balance_boolean_chain(left);
                 left = self.parse_comparison_special(left)?;
                 continue;
             }
@@ -349,21 +309,30 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             // current table entry. A right-associative future entry can carry a
             // distinct right binding power without changing this parser shape.
             let right = self.parse_binding_power(binding.precedence + 1)?;
-            if !matches!(binding.operator, BinaryOperator::And | BinaryOperator::Or)
-                || !matches!(&left, Expr::Binary(binary) if binary.operator == binding.operator)
-            {
-                left = balance_boolean_chain(left);
-            }
             let span = Span::new(left.span().start(), right.span().end());
-            left = Expr::Binary(BinaryExpr {
-                left: Box::new(left),
-                operator: binding.operator,
-                right: Box::new(right),
-                span,
-            });
+            left = match binding.operator {
+                InfixOperator::Binary(operator) => Expr::Binary(BinaryExpr {
+                    left: Box::new(left),
+                    operator,
+                    right: Box::new(right),
+                    span,
+                }),
+                InfixOperator::Logical(operator) => match left {
+                    Expr::Logical(mut logical) if logical.operator == operator => {
+                        logical.terms.push(right);
+                        logical.span = span;
+                        Expr::Logical(logical)
+                    }
+                    left => Expr::Logical(LogicalExpr {
+                        operator,
+                        terms: vec![left, right].into(),
+                        span,
+                    }),
+                },
+            };
         }
 
-        Ok(balance_boolean_chain(left))
+        Ok(left)
     }
 
     fn parse_postfix_access(&mut self, expr: Expr) -> Result<Expr, ParseError> {

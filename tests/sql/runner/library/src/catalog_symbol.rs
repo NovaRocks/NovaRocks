@@ -631,6 +631,7 @@ impl Visit for CatalogEdits<'_> {
                         | TableFactor::Derived { alias, .. }
                         | TableFactor::TableFunction { alias, .. }
                         | TableFactor::Unnest { alias, .. }
+                        | TableFactor::JsonTable { alias, .. }
                         | TableFactor::NestedJoin { alias, .. } => alias,
                     };
                     if let Some(alias) = alias {
@@ -986,6 +987,23 @@ mod tests {
             "{rewritten}"
         );
         assert!(rewritten.contains("schema_name = 'owned' AND name = 'owned'"));
+        assert_eq!(symbols.rewrite_source(&rewritten).unwrap(), rewritten);
+    }
+
+    #[test]
+    fn nested_metadata_predicates_rewrite_every_catalog_term_and_preserve_source() {
+        let symbols = symbols();
+        let catalog = symbols.lookup("owned").unwrap();
+        let source = "SELECT 'owned' AS business FROM system.metadata.materialized_views \
+                      WHERE (catalog_name = 'owned' AND ('owned' = storage_catalog OR catalog_name <> 'owned')) \
+                      OR (storage_catalog = 'owned' AND name = 'owned');";
+        let expected = format!(
+            "SELECT 'owned' AS business FROM system.metadata.materialized_views \
+             WHERE (catalog_name = '{catalog}' AND ('{catalog}' = storage_catalog OR catalog_name <> '{catalog}')) \
+             OR (storage_catalog = '{catalog}' AND name = 'owned');"
+        );
+        let rewritten = symbols.rewrite_source(source).unwrap();
+        assert_eq!(rewritten, expected);
         assert_eq!(symbols.rewrite_source(&rewritten).unwrap(), rewritten);
     }
 

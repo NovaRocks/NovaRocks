@@ -17,7 +17,7 @@
 
 use crate::{
     Span,
-    ast::{Ident, Literal, ObjectName, Query, TypeName, window::WindowSpec},
+    ast::{AstVec, Ident, Literal, ObjectName, Query, TypeName, window::WindowSpec},
 };
 
 /// A SQL expression with source spans retained at every syntax node.
@@ -37,6 +37,7 @@ pub enum Expr {
     FunctionCall(FunctionCall),
     Unary(UnaryExpr),
     Binary(BinaryExpr),
+    Logical(LogicalExpr),
     Nested(NestedExpr),
     Between(BetweenExpr),
     InList(InListExpr),
@@ -73,6 +74,7 @@ impl Expr {
             Self::FunctionCall(call) => call.span,
             Self::Unary(expression) => expression.span,
             Self::Binary(expression) => expression.span,
+            Self::Logical(expression) => expression.span,
             Self::Nested(expression) => expression.span,
             Self::Between(expression) => expression.span,
             Self::InList(expression) => expression.span,
@@ -358,6 +360,20 @@ pub enum JsonOperator {
     ArrowText,
 }
 
+/// Ordered operands of one syntactic AND or OR expression.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicalExpr {
+    pub operator: LogicalOperator,
+    pub terms: AstVec<Expr>,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogicalOperator {
+    And,
+    Or,
+}
+
 /// Prefix operators initially recognized by the Pratt parser.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnaryOperator {
@@ -371,8 +387,6 @@ pub enum UnaryOperator {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BinaryOperator {
     NamedArgument,
-    Or,
-    And,
     Equal,
     NullSafeEqual,
     NotEqual,

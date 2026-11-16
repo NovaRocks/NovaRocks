@@ -495,6 +495,7 @@ impl SyntaxEq for Expr {
             (Self::FunctionCall(left), Self::FunctionCall(right)) => left.syntax_eq(right),
             (Self::Unary(left), Self::Unary(right)) => left.syntax_eq(right),
             (Self::Binary(left), Self::Binary(right)) => left.syntax_eq(right),
+            (Self::Logical(left), Self::Logical(right)) => left.syntax_eq(right),
             (Self::Nested(left), Self::Nested(right)) => left.syntax_eq(right),
             (Self::Between(left), Self::Between(right)) => left.syntax_eq(right),
             (Self::InList(left), Self::InList(right)) => left.syntax_eq(right),
@@ -542,6 +543,13 @@ impl SyntaxEq for FunctionOrderBy {
 impl SyntaxEq for UnaryExpr {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.operator == other.operator && self.expression.syntax_eq(&other.expression)
+    }
+}
+
+impl SyntaxEq for LogicalExpr {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.operator == other.operator && syntax_eq_slice(&self.terms, &other.terms)
     }
 }
 

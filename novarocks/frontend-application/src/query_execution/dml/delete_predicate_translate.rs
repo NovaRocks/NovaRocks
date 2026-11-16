@@ -22,7 +22,9 @@
 //! AND-only, no OR/functions/subqueries/joins; non-DUP tables require
 //! key columns; floating-point columns reject `=`.
 
-use novarocks_parser::ast::{BinaryOperator, Expr, IsPredicate, LiteralKind, UnaryOperator};
+use novarocks_parser::ast::{
+    BinaryOperator, Expr, IsPredicate, LiteralKind, LogicalOperator, UnaryOperator,
+};
 use novarocks_types::schema::ColumnDef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,12 +120,13 @@ fn flatten_and(expr: &Expr) -> Result<Vec<&Expr>, String> {
     let mut out = Vec::new();
     fn walk<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) -> Result<(), String> {
         match e {
-            Expr::Binary(expression) if expression.operator == BinaryOperator::And => {
-                walk(&expression.left, out)?;
-                walk(&expression.right, out)?;
+            Expr::Logical(expression) if expression.operator == LogicalOperator::And => {
+                for term in &expression.terms {
+                    walk(term, out)?;
+                }
                 Ok(())
             }
-            Expr::Binary(expression) if expression.operator == BinaryOperator::Or => {
+            Expr::Logical(expression) if expression.operator == LogicalOperator::Or => {
                 Err("DELETE on this table model does not support OR; \
                  use only AND of comparisons / IN / IS NULL"
                     .to_string())
@@ -537,6 +540,49 @@ mod tests {
         )
         .expect("translate");
         assert_eq!(t.binary.len(), 2);
+    }
+
+    #[test]
+    fn nested_conjunction_keeps_borrowed_atoms_in_source_order() {
+        let predicate = parse_where("id = 1 AND (name = 'a' AND id = 2) AND id = 3");
+        let Expr::Logical(root) = &predicate else {
+            panic!("root AND");
+        };
+        let Expr::Nested(nested) = &root.terms[1] else {
+            panic!("explicit group");
+        };
+        let Expr::Logical(group) = nested.expression.as_ref() else {
+            panic!("group AND");
+        };
+        let expected = [
+            &root.terms[0],
+            &group.terms[0],
+            &group.terms[1],
+            &root.terms[2],
+        ];
+        let atoms = flatten_and(&predicate).unwrap();
+        assert_eq!(atoms.len(), expected.len());
+        for (actual, expected) in atoms.iter().zip(expected) {
+            assert!(std::ptr::eq(*actual, expected));
+            assert_eq!(actual.span(), expected.span());
+        }
+        let terms = translate_to_delete_predicate(
+            &predicate,
+            &dup_schema_int_str(),
+            &["id".into()],
+            KeysType::Dup,
+        )
+        .unwrap();
+        assert_eq!(
+            terms
+                .binary
+                .iter()
+                .map(|term| term.value.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "a", "2", "3"]
+        );
+        let rejected = parse_where("id = 1 AND (id = 2 OR id = 3)");
+        assert!(flatten_and(&rejected).unwrap_err().contains("OR"));
     }
 
     #[test]

@@ -393,6 +393,7 @@ fn bound_position(bound: &WindowFrameBound) -> FramePosition {
     }
 }
 
+#[recursive::recursive]
 fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
     // The query validator only needs to descend into syntax nodes that can
     // contain a Query or WindowSpec. Other expression-local invariants are
@@ -444,6 +445,17 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             validate_query(&in_subquery.query)?;
         }
         Expr::Unary(unary) => validate_expr(&unary.expression)?,
+        Expr::Logical(logical) => {
+            if logical.terms.len() < 2 {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::InvalidLogicalTermCount,
+                    logical.span,
+                ));
+            }
+            for term in &logical.terms {
+                validate_expr(term)?;
+            }
+        }
         Expr::Binary(binary) => {
             validate_expr(&binary.left)?;
             validate_expr(&binary.right)?;

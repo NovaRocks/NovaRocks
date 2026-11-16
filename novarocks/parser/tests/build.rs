@@ -366,7 +366,7 @@ fn expression_combinations_match_parser_without_reparsing_children() {
 }
 
 #[test]
-fn boolean_chains_reuse_parser_balancing_and_preserve_operand_order() {
+fn boolean_chains_preserve_ordered_operands_in_one_logical_node() {
     for length in [1, 4, 5] {
         let operands = (0..length)
             .map(|index| id(&format!("x{index}")))
@@ -383,11 +383,11 @@ fn boolean_chains_reuse_parser_balancing_and_preserve_operand_order() {
             &sources.join(" OR "),
         );
     }
-    let built = build::binary(
-        build::binary(id("a"), BinaryOperator::And, id("b")),
-        BinaryOperator::And,
-        build::binary(id("c"), BinaryOperator::And, id("d")),
-    );
+    let built = build::and_all(vec![id("a"), id("b"), id("c"), id("d")]).unwrap();
+    let Expr::Logical(node) = &built else {
+        panic!("logical")
+    };
+    assert_eq!(node.terms.len(), 4);
     assert_expression(built, "a AND b AND c AND d");
     assert!(build::and_all(Vec::new()).is_none());
     assert!(build::or_all(Vec::new()).is_none());
@@ -643,9 +643,160 @@ fn decimal_constructor_text_is_not_reinterpreted_as_an_unrelated_number_expressi
     // Trino's DecimalLiteral retains decoded constructor text even when the
     // later numeric analyzer will reject its value. Printing is syntax-only.
     for value in ["", ".", "1..2", "1-2.3", "1+2.3", "-0.0", "+2.3", "1e0"] {
-        assert_expression(
-            build::literal(ast::LiteralKind::Decimal(value.into())),
-            &format!("DECIMAL '{value}'"),
+        let built = build::literal(ast::LiteralKind::Decimal(value.into()));
+        let rendered = novarocks_parser::printer::print_expr(&built);
+        assert_eq!(rendered, format!("DECIMAL '{value}'"));
+        assert!(built.syntax_eq(&expression(&rendered)));
+    }
+}
+
+#[test]
+fn logical_nodes_keep_source_order_grouping_and_every_visitor_child() {
+    use ast::{Fold, Visit};
+    let source = "a = 1 AND (b = 2 OR c = 3 OR d = 4) AND e = 5";
+    let parsed = expression(source);
+    let Expr::Logical(logical) = &parsed else {
+        panic!("logical")
+    };
+    assert_eq!(logical.operator, ast::LogicalOperator::And);
+    assert_eq!(logical.terms.len(), 3);
+    let Expr::Nested(group) = &logical.terms[1] else {
+        panic!("explicit parentheses")
+    };
+    let Expr::Logical(or) = group.expression.as_ref() else {
+        panic!("OR")
+    };
+    assert_eq!(or.operator, ast::LogicalOperator::Or);
+    assert_eq!(or.terms.len(), 3);
+    #[derive(Default)]
+    struct Names(Vec<String>);
+    impl Visit for Names {
+        fn visit_ident(&mut self, value: &ast::Ident) {
+            self.0.push(value.value.clone());
+        }
+    }
+    let mut names = Names::default();
+    names.visit_expr(&parsed);
+    assert_eq!(names.0, ["a", "b", "c", "d", "e"]);
+    struct Identity;
+    impl Fold for Identity {}
+    assert_eq!(Identity.fold_expr(parsed.clone()), parsed);
+    assert!(parsed.syntax_eq(&expression(&novarocks_parser::printer::print_expr(&parsed))));
+    let mut changed = parsed.clone();
+    let Expr::Logical(value) = &mut changed else {
+        unreachable!()
+    };
+    value.span = SYNTHETIC;
+    assert!(parsed.syntax_eq(&changed));
+    let Expr::Logical(value) = &mut changed else {
+        unreachable!()
+    };
+    value.terms.swap(0, 2);
+    assert!(!parsed.syntax_eq(&changed));
+}
+
+#[test]
+fn public_wide_logical_chains_are_flat_without_changing_order_or_literal_facts() {
+    use ast::{Fold, Visit};
+    struct Identity;
+    impl Fold for Identity {}
+    #[derive(Default)]
+    struct Values(Vec<i64>);
+    impl Visit for Values {
+        fn visit_literal(&mut self, value: &ast::Literal) {
+            if let ast::LiteralKind::Long { parsed_value, .. } = value.kind {
+                self.0.push(parsed_value);
+            }
+        }
+    }
+    for operator in ["AND", "OR"] {
+        let source = (0..20_000)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(&format!(" {operator} "));
+        let parsed = expression(&source);
+        let Expr::Logical(node) = &parsed else {
+            panic!("logical")
+        };
+        assert_eq!(node.terms.len(), 20_000);
+        assert!(
+            node.terms
+                .iter()
+                .all(|term| matches!(term, Expr::Literal(_)))
+        );
+        let cloned = parsed.clone();
+        assert_eq!(parsed, cloned);
+        let folded = Identity.fold_expr(cloned);
+        assert!(parsed.syntax_eq(&folded));
+        let mut values = Values::default();
+        values.visit_expr(&folded);
+        assert_eq!(values.0, (0..20_000).collect::<Vec<i64>>());
+        let rendered = novarocks_parser::printer::print_expr(&parsed);
+        assert_eq!(rendered, source);
+        assert!(parsed.syntax_eq(&expression(&rendered)));
+    }
+}
+
+#[test]
+fn logical_minimum_arity_is_checked_without_catalog_or_analysis() {
+    for terms in [vec![], vec![build::boolean(true)]] {
+        let mut parsed = query("SELECT TRUE");
+        let SetExpr::Select(select) = parsed.body.as_mut() else {
+            panic!("SELECT")
+        };
+        let span = Span::new(30, 40);
+        select.projection[0] = ast::SelectItem::UnnamedExpr(Expr::Logical(ast::LogicalExpr {
+            operator: ast::LogicalOperator::And,
+            terms: terms.into(),
+            span,
+        }));
+        let error = ast::validate_statement(&ast::Statement::Query(parsed)).unwrap_err();
+        assert!(
+            matches!(error, novarocks_parser::ValidateError::InvalidStructure { violation: novarocks_parser::StructuralViolation::InvalidLogicalTermCount, span: actual } if actual == span)
         );
     }
+}
+
+#[test]
+fn actual_recursive_logical_storage_guards_clone_walk_fold_compare_validation_print_and_drop() {
+    use ast::{Fold, Visit};
+    let mut node = build::boolean(true);
+    for index in 0..20_000 {
+        node = Expr::Logical(ast::LogicalExpr {
+            operator: if index % 2 == 0 {
+                ast::LogicalOperator::And
+            } else {
+                ast::LogicalOperator::Or
+            },
+            terms: vec![node, build::boolean(false)].into(),
+            span: SYNTHETIC,
+        });
+    }
+    let cloned = node.clone();
+    assert_eq!(node, cloned);
+    assert!(node.syntax_eq(&cloned));
+    struct Identity;
+    impl Fold for Identity {}
+    let folded = Identity.fold_expr(cloned);
+    assert!(node.syntax_eq(&folded));
+    struct Count(usize);
+    impl Visit for Count {
+        fn visit_logical_expr(&mut self, node: &ast::LogicalExpr) {
+            self.0 += 1;
+            ast::walk_logical_expr(self, node);
+        }
+    }
+    let mut count = Count(0);
+    count.visit_expr(&node);
+    assert_eq!(count.0, 20_000);
+    let rendered = novarocks_parser::printer::print_expr(&node);
+    assert!(rendered.starts_with('('));
+    assert!(rendered.ends_with("FALSE"));
+    let mut parsed = query("SELECT TRUE");
+    let SetExpr::Select(select) = parsed.body.as_mut() else {
+        unreachable!()
+    };
+    select.projection[0] = ast::SelectItem::UnnamedExpr(folded);
+    ast::validate_statement(&ast::Statement::Query(parsed)).unwrap();
+    drop(node);
 }

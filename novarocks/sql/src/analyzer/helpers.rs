@@ -943,6 +943,31 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
             binary_operator_display(binary.operator),
             expr_display_name_with_parens(&binary.right)
         ),
+        ast::Expr::Logical(logical) => {
+            let separator = match logical.operator {
+                ast::LogicalOperator::And => " AND ",
+                ast::LogicalOperator::Or => " OR ",
+            };
+            // Output names retain the existing adjacent-pair grouping. Only
+            // rendering strings are grouped; syntax and source terms stay flat.
+            let mut level = logical
+                .terms
+                .iter()
+                .map(expr_display_name_with_parens)
+                .collect::<Vec<_>>();
+            while level.len() > 2 {
+                let mut next = Vec::with_capacity(level.len().div_ceil(2));
+                let mut terms = level.into_iter();
+                while let Some(left) = terms.next() {
+                    next.push(match terms.next() {
+                        Some(right) => format!("({left}{separator}{right})"),
+                        None => left,
+                    });
+                }
+                level = next;
+            }
+            level.join(separator)
+        }
         ast::Expr::InList(in_list) => {
             let not = if in_list.negated { " NOT" } else { "" };
             let items = in_list
@@ -1151,8 +1176,6 @@ fn format_is_predicate_display_name(predicate: &ast::IsPredicateExpr) -> String 
 fn binary_operator_display(operator: ast::BinaryOperator) -> &'static str {
     match operator {
         ast::BinaryOperator::NamedArgument => "=>",
-        ast::BinaryOperator::Or => "OR",
-        ast::BinaryOperator::And => "AND",
         ast::BinaryOperator::Equal => "=",
         ast::BinaryOperator::NullSafeEqual => "<=>",
         ast::BinaryOperator::NotEqual => "!=",
@@ -1789,6 +1812,56 @@ mod tests {
             panic!("expected native cast expression");
         };
         cast.data_type.clone()
+    }
+
+    #[test]
+    fn logical_display_preserves_original_adjacent_group_names_and_projection_contract() {
+        // Independent strings from the existing adjacent-pair parser/display
+        // contract cover even and odd tails, nested operators and operands.
+        for (sql, expected) in [
+            ("SELECT TRUE AND FALSE", "TRUE AND FALSE"),
+            (
+                "SELECT TRUE AND FALSE AND NULL",
+                "(TRUE AND FALSE) AND NULL",
+            ),
+            (
+                "SELECT TRUE AND FALSE AND NULL AND TRUE",
+                "(TRUE AND FALSE) AND (NULL AND TRUE)",
+            ),
+            (
+                "SELECT TRUE AND FALSE AND NULL AND TRUE AND FALSE",
+                "((TRUE AND FALSE) AND (NULL AND TRUE)) AND FALSE",
+            ),
+            (
+                "SELECT TRUE OR FALSE OR NULL OR TRUE OR FALSE",
+                "((TRUE OR FALSE) OR (NULL OR TRUE)) OR FALSE",
+            ),
+            (
+                "SELECT TRUE AND (FALSE OR NULL) AND TRUE",
+                "(TRUE AND (FALSE OR NULL)) AND TRUE",
+            ),
+            (
+                "SELECT 1 = 10 AND 2 = 20 AND 3 = 30",
+                "((1 = 10) AND (2 = 20)) AND (3 = 30)",
+            ),
+        ] {
+            let expression = parse_select_expr(sql);
+            assert_eq!(expr_display_name(&expression), expected, "{sql}");
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query")
+            };
+            let (resolved, _, _) = crate::analyzer::analyze(
+                query,
+                &crate::planning::catalog::PlannerMemoryCatalog::default(),
+                "default",
+            )
+            .unwrap();
+            let crate::analysis::QueryBody::Select(select) = resolved.body else {
+                panic!("resolved select")
+            };
+            assert_eq!(select.projection[0].output_name, expected, "{sql}");
+        }
     }
 
     #[test]

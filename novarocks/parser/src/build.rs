@@ -291,24 +291,29 @@ fn binary_node(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
 }
 
 pub fn binary(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
-    parser::balance_boolean_chain(binary_node(left, operator, right))
+    binary_node(left, operator, right)
 }
 
 /// An empty conjunction represents an absent predicate, not a guessed literal.
 pub fn and_all(operands: Vec<Expr>) -> Option<Expr> {
-    boolean_chain(operands, BinaryOperator::And)
+    boolean_chain(operands, LogicalOperator::And)
 }
 
 /// An empty disjunction represents an absent predicate, not a guessed literal.
 pub fn or_all(operands: Vec<Expr>) -> Option<Expr> {
-    boolean_chain(operands, BinaryOperator::Or)
+    boolean_chain(operands, LogicalOperator::Or)
 }
 
-fn boolean_chain(operands: Vec<Expr>, operator: BinaryOperator) -> Option<Expr> {
-    let mut operands = operands.into_iter();
-    let first = operands.next()?;
-    let expression = operands.fold(first, |left, right| binary_node(left, operator, right));
-    Some(parser::balance_boolean_chain(expression))
+fn boolean_chain(mut operands: Vec<Expr>, operator: LogicalOperator) -> Option<Expr> {
+    match operands.len() {
+        0 => None,
+        1 => operands.pop(),
+        _ => Some(Expr::Logical(LogicalExpr {
+            operator,
+            span: cover(operands.iter().map(Expr::span)),
+            terms: operands.into(),
+        })),
+    }
 }
 
 pub fn is_null(expr: Expr, negated: bool) -> Expr {

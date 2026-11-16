@@ -63,9 +63,9 @@ pub use expr::{
     AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr,
     CastKind, CompoundIdentifier, ExistsExpr, Expr, FunctionCall, FunctionOrderBy,
     FunctionQuantifier, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField, IsPredicate,
-    IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, MapEntry, MapExpr,
-    NestedExpr, NullTreatment, StructExpr, StructExprField, SubqueryExpr, TupleExpr, UnaryExpr,
-    UnaryOperator,
+    IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, LogicalExpr,
+    LogicalOperator, MapEntry, MapExpr, NestedExpr, NullTreatment, StructExpr, StructExprField,
+    SubqueryExpr, TupleExpr, UnaryExpr, UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -109,11 +109,11 @@ pub use table::{
 pub use validate::{validate_statement, validate_statements};
 pub use view::{CreateView, DropView, ShowCreateView, ViewStatement};
 pub use visit::{
-    Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_nested_expr,
-    fold_object_name, fold_query, fold_select, fold_statement, fold_table_factor, fold_unary_expr,
-    fold_view_statement, walk_binary_expr, walk_expr, walk_function_call, walk_ident,
-    walk_nested_expr, walk_object_name, walk_query, walk_select, walk_statement, walk_table_factor,
-    walk_unary_expr, walk_view_statement,
+    Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_logical_expr,
+    fold_nested_expr, fold_object_name, fold_query, fold_select, fold_statement, fold_table_factor,
+    fold_unary_expr, fold_view_statement, walk_binary_expr, walk_expr, walk_function_call,
+    walk_ident, walk_logical_expr, walk_nested_expr, walk_object_name, walk_query, walk_select,
+    walk_statement, walk_table_factor, walk_unary_expr, walk_view_statement,
 };
 pub use window::{
     NamedWindow, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,

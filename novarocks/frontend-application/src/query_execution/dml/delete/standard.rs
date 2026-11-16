@@ -323,37 +323,11 @@ fn delete_position_sink_query_ast(
     let select = build::select(
         projection,
         vec![build::relation(build::table(name, version, None))],
-        Some(delete_selection_for_query(where_clause)),
+        Some(where_clause.clone()),
         ast::GroupBy::None,
     )
     .map_err(|error| format!("internal DELETE query construction failed: {error}"))?;
     Ok(build::query(ast::SetExpr::Select(Box::new(select))))
-}
-
-/// Preserve the grouping at DELETE's generated-query boundary while retaining
-/// the original predicate leaves and their source locations.
-fn delete_selection_for_query(selection: &Expr) -> Expr {
-    use ast::Fold;
-    struct SelectionGrouping;
-    impl ast::Fold for SelectionGrouping {
-        fn fold_expr(&mut self, expression: Expr) -> Expr {
-            let expression = ast::fold_expr(self, expression);
-            let Expr::Binary(binary) = expression else {
-                return expression;
-            };
-            if !matches!(binary.operator, BinaryOperator::And | BinaryOperator::Or) {
-                return Expr::Binary(binary);
-            }
-            let mut right = *binary.right;
-            if matches!(&right, Expr::Binary(value) if value.operator == binary.operator) {
-                right = build::nested(right);
-            }
-            // Rebalance exactly once after grouping the original children.
-            // Revisiting newly balanced nodes would introduce extra groups.
-            build::binary(*binary.left, binary.operator, right)
-        }
-    }
-    SelectionGrouping.fold_expr(selection.clone())
 }
 
 /// The delete-shaped input this statement asks the session to admit.
@@ -469,11 +443,13 @@ fn validate_where_predicate(
     columns: &[ColumnDef],
 ) -> Result<(), crate::dml::error::DmlExecutionError> {
     match expr {
-        Expr::Binary(binary) => match binary.operator {
-            BinaryOperator::And | BinaryOperator::Or => {
-                validate_where_predicate(&binary.left, columns)?;
-                validate_where_predicate(&binary.right, columns)
+        Expr::Logical(logical) => {
+            for term in &logical.terms {
+                validate_where_predicate(term, columns)?;
             }
+            Ok(())
+        }
+        Expr::Binary(binary) => match binary.operator {
             BinaryOperator::Equal
             | BinaryOperator::NotEqual
             | BinaryOperator::LessThan
@@ -858,6 +834,22 @@ mod tests {
     }
 
     #[test]
+    fn delete_logical_validation_reports_the_first_original_term() {
+        let columns = [column("n", DataType::Int8)];
+        for (predicate, first) in [
+            ("n = 128 AND n = 129 AND n = 130", 128),
+            ("n = 130 OR n = 129 OR n = 128", 130),
+            ("n = 1 AND (n = 129 OR n = 130)", 129),
+        ] {
+            let error = super::validate_where(&where_expr(predicate), &columns).unwrap_err();
+            let crate::dml::error::DmlExecutionError::Engine(error) = error else {
+                panic!("original literal validation error");
+            };
+            assert!(error.contains(&format!("literal `{first}`")), "{error}");
+        }
+    }
+
+    #[test]
     fn delete_validate_preserves_declared_scalar_integer_literal_domains() {
         for (data_type, minimum, maximum, below, above) in [
             (DataType::Int8, -128, 127, -129, 128),
@@ -1091,7 +1083,7 @@ mod tests {
 
     #[test]
     fn delete_position_sink_retains_boolean_grouping_and_source_leaves() {
-        use novarocks_parser::ast::{self, SyntaxEq, Visit};
+        use novarocks_parser::ast::{self, Visit};
         #[derive(Default)]
         struct Leaves(Vec<Expr>);
         impl ast::Visit for Leaves {
@@ -1118,14 +1110,6 @@ mod tests {
                     .map(|value| format!("id = {value}"))
                     .collect::<Vec<_>>()
                     .join(&format!(" {operator} "));
-                let expected = if count == 4 {
-                    format!("id = 1 {operator} id = 2 {operator} (id = 3 {operator} id = 4)")
-                } else {
-                    format!(
-                        "id = 1 {operator} id = 2 {operator} (id = 3 {operator} id = 4) \
-                         {operator} (id = 5 {operator} id = 6 {operator} (id = 7 {operator} id = 8))"
-                    )
-                };
                 let original = where_expr(&input);
                 let query =
                     super::build_delete_position_sink_query(&target, &original, &columns, "main")
@@ -1134,7 +1118,21 @@ mod tests {
                     panic!("DELETE selection query");
                 };
                 let actual = select.selection.as_ref().unwrap();
-                assert!(actual.syntax_eq(&where_expr(&expected)), "{input}");
+                let Expr::Logical(original_logical) = &original else {
+                    panic!("original logical chain");
+                };
+                let Expr::Logical(actual_logical) = actual else {
+                    panic!("generated logical chain");
+                };
+                assert_eq!(actual_logical.operator, original_logical.operator);
+                assert_eq!(actual_logical.terms.len(), count);
+                for (actual_term, original_term) in
+                    actual_logical.terms.iter().zip(&original_logical.terms)
+                {
+                    assert_eq!(actual_term, original_term, "{input}");
+                    assert_eq!(actual_term.span(), original_term.span(), "{input}");
+                }
+                assert_eq!(actual, &original, "{input}");
                 let mut original_leaves = Leaves::default();
                 let mut actual_leaves = Leaves::default();
                 original_leaves.visit_expr(&original);
@@ -1151,10 +1149,18 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("DELETE selection query");
         };
-        assert!(select.selection.as_ref().unwrap().syntax_eq(&where_expr(
-            "id <= 18000 OR (id > 20000 AND id <= 38000) \
-             OR ((id > 40000 AND id <= 58000) OR (id > 60000 AND id <= 78000))"
-        )));
+        let actual = select.selection.as_ref().unwrap();
+        assert_eq!(actual, &predicate);
+        let Expr::Logical(logical) = actual else {
+            panic!("original OR chain");
+        };
+        assert_eq!(logical.operator, ast::LogicalOperator::Or);
+        assert_eq!(logical.terms.len(), 4);
+        assert!(
+            logical.terms[1..]
+                .iter()
+                .all(|term| matches!(term, Expr::Nested(_)))
+        );
     }
 
     // --------------- Timestamp predicate tests ---------------

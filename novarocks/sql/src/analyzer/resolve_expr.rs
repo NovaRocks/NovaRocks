@@ -306,6 +306,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 self.analyze_binary_op(&binary.left, &binary.operator, &binary.right, scope)
             }
 
+            ast::Expr::Logical(logical) => self.analyze_boolean_chain(logical, scope),
+
             // A lambda is valid only as a higher-order function argument.
             // Those callers bind its parameters before analyzing the body.
             ast::Expr::Lambda(lambda) => Err(AnalyzeError::unsupported_expression(
@@ -1428,56 +1430,36 @@ impl<'a> super::AnalyzerContext<'a> {
         )
     }
 
-    /// Analyze a binary operation.
-    /// Analyze a same-operator `AND`/`OR` chain without recursing once per
-    /// conjunct.
-    ///
-    /// See [`MAX_BOOLEAN_CHAIN_OPERANDS`] for why the width is still bounded.
-    ///
-    /// How many conditions a query states is not how deeply nested it is. A
-    /// filter panel emitting several hundred of them arrives as one long chain,
-    /// and analyzing it by recursing into the left operand made stack depth a
-    /// function of user input - which is not an error the engine can report,
-    /// because exhausting the stack aborts the process rather than unwinding.
-    ///
-    /// Operands are collected iteratively and analyzed one at a time. Adjacent
-    /// results are combined into a balanced tree. This preserves operand order
-    /// and three-valued boolean semantics while bounding later tree walks by
-    /// logarithmic depth.
+    /// Analyze original logical terms in source order, then balance only the
+    /// typed IR. Each term keeps its actual materialized-source identity.
+    /// See [`MAX_BOOLEAN_CHAIN_OPERANDS`] for the current downstream width bound.
     fn analyze_boolean_chain(
         &self,
-        left: &ast::Expr,
-        op: &ast::BinaryOperator,
-        right: &ast::Expr,
+        logical: &ast::LogicalExpr,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        let mut operands: Vec<&ast::Expr> = Vec::new();
-        let mut pending: Vec<&ast::Expr> = vec![right, left];
-        while let Some(current) = pending.pop() {
-            match current {
-                ast::Expr::Binary(binary) if &binary.operator == op => {
-                    pending.push(&binary.right);
-                    pending.push(&binary.left);
-                }
-                other => operands.push(other),
-            }
+        if logical.terms.len() < 2 {
+            return Err(AnalyzeError::unsupported_expression(
+                "a logical expression requires at least two terms",
+                logical.span,
+            ));
         }
-        if operands.len() > MAX_BOOLEAN_CHAIN_OPERANDS {
+        if logical.terms.len() > MAX_BOOLEAN_CHAIN_OPERANDS {
             return Err(AnalyzeError::unsupported_expression(
                 format!(
                     "boolean chain of {} conditions exceeds the supported maximum of {MAX_BOOLEAN_CHAIN_OPERANDS}",
-                    operands.len()
+                    logical.terms.len()
                 ),
-                left.span(),
+                logical.span,
             ));
         }
-        let mut analyzed = Vec::with_capacity(operands.len());
-        for operand in operands {
-            analyzed.push(self.analyze_expr(operand, scope)?);
+        let mut analyzed = Vec::with_capacity(logical.terms.len());
+        for term in &logical.terms {
+            analyzed.push(self.analyze_expr(term, scope)?);
         }
-        let bin_op = match op {
-            ast::BinaryOperator::And => BinOp::And,
-            _ => BinOp::Or,
+        let bin_op = match logical.operator {
+            ast::LogicalOperator::And => BinOp::And,
+            ast::LogicalOperator::Or => BinOp::Or,
         };
         while analyzed.len() > 1 {
             let mut next_level = Vec::with_capacity(analyzed.len().div_ceil(2));
@@ -1504,7 +1486,9 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             analyzed = next_level;
         }
-        Ok(analyzed.pop().expect("a binary boolean chain has operands"))
+        Ok(analyzed
+            .pop()
+            .expect("a validated logical expression has terms"))
     }
 
     /// Common-type coercion is an implicit CAST, not an exact output
@@ -1539,9 +1523,6 @@ impl<'a> super::AnalyzerContext<'a> {
         right: &ast::Expr,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        if matches!(op, ast::BinaryOperator::And | ast::BinaryOperator::Or) {
-            return self.analyze_boolean_chain(left, op, right, scope);
-        }
         let left_typed = self.analyze_expr(left, scope)?;
         let right_typed = self.analyze_expr(right, scope)?;
 
@@ -1779,16 +1760,6 @@ impl<'a> super::AnalyzerContext<'a> {
             ),
             ast::BinaryOperator::NullSafeEqual => (
                 BinOp::EqForNull,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-
-            // Logical operators -> Boolean
-            ast::BinaryOperator::And => (
-                BinOp::And,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-            ast::BinaryOperator::Or => (
-                BinOp::Or,
                 novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
             ),
 
@@ -4262,6 +4233,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 self.expr_contains_aggregate(&binary.left)
                     || self.expr_contains_aggregate(&binary.right)
             }
+            ast::Expr::Logical(logical) => logical
+                .terms
+                .iter()
+                .any(|term| self.expr_contains_aggregate(term)),
             ast::Expr::Unary(unary) => self.expr_contains_aggregate(&unary.expression),
             ast::Expr::IsPredicate(predicate) => self.expr_contains_aggregate(&predicate.expr),
             ast::Expr::InList(in_list) => {
@@ -7252,6 +7227,343 @@ mod tests {
             sql,
             crate::functions::builtin_sql_function_catalog(),
         )
+    }
+
+    fn logical_context(
+        control: &crate::compiler::SqlCompileControl,
+    ) -> super::super::AnalyzerContext<'_> {
+        super::super::AnalyzerContext {
+            grouping_scope: Default::default(),
+            view_stack: Default::default(),
+            control,
+            constant_policy: crate::constant::test_constant_policy(),
+            materialized_values: None,
+            catalog: &EmptyCatalog,
+            current_database: "default",
+            function_catalog: crate::functions::builtin_sql_function_catalog(),
+            sql_semantics: Default::default(),
+            factory: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::column_id::ColumnRefFactory::new(),
+            )),
+            ctes: Default::default(),
+            pending_ctes: Default::default(),
+            next_subquery_id: Default::default(),
+            next_lambda_slot_id: Default::default(),
+            collected_subqueries: Default::default(),
+            cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
+        }
+    }
+
+    #[test]
+    fn logical_terms_balance_only_typed_ir_and_keep_source_order_and_nullable_bounds() {
+        fn leaves<'a>(expression: &'a TypedExpr, op: BinOp, out: &mut Vec<&'a TypedExpr>) -> usize {
+            if let ExprKind::BinaryOp {
+                left,
+                right,
+                op: actual,
+                ..
+            } = &expression.kind
+            {
+                if *actual == op {
+                    return 1 + leaves(left, op, out).max(leaves(right, op, out));
+                }
+            }
+            out.push(expression);
+            0
+        }
+        for (keyword, op) in [("AND", BinOp::And), ("OR", BinOp::Or)] {
+            let sql = format!(
+                "SELECT 1 = 10 {keyword} 2 = 20 {keyword} 3 = 30 {keyword} 4 = 40 {keyword} 5 = 50"
+            );
+            let actual = analyze_projection_expr(&sql).unwrap();
+            assert_eq!(actual.value_type.data_type(), &DataType::Boolean);
+            assert!(!actual.value_type.nullable());
+            let mut operands = Vec::new();
+            assert_eq!(leaves(&actual, op, &mut operands), 3);
+            let original_order: Vec<_> = operands
+                .iter()
+                .map(|operand| {
+                    let ExprKind::BinaryOp {
+                        left,
+                        right,
+                        op: BinOp::Eq,
+                        ..
+                    } = &operand.kind
+                    else {
+                        panic!("comparison term")
+                    };
+                    let (
+                        ExprKind::Literal(LiteralValue::Int(left)),
+                        ExprKind::Literal(LiteralValue::Int(right)),
+                    ) = (&left.kind, &right.kind)
+                    else {
+                        panic!("original integer arguments")
+                    };
+                    (*left, *right)
+                })
+                .collect();
+            assert_eq!(
+                original_order,
+                vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]
+            );
+            let nullable =
+                analyze_projection_expr(&format!("SELECT TRUE {keyword} NULL {keyword} FALSE"))
+                    .unwrap();
+            assert!(nullable.value_type.nullable());
+            let mut operands = Vec::new();
+            leaves(&nullable, op, &mut operands);
+            assert!(matches!(
+                operands[0].kind,
+                ExprKind::Literal(LiteralValue::Bool(true))
+            ));
+            assert!(matches!(
+                operands[1].kind,
+                ExprKind::Literal(LiteralValue::Null)
+            ));
+            assert!(matches!(
+                operands[2].kind,
+                ExprKind::Literal(LiteralValue::Bool(false))
+            ));
+        }
+        let statements =
+            novarocks_parser::parse("SELECT TRUE AND (FALSE OR NULL) AND COALESCE(FALSE, TRUE)")
+                .unwrap();
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query")
+        };
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("select")
+        };
+        let ast::SelectItem::UnnamedExpr(expression @ ast::Expr::Logical(logical)) =
+            &select.projection[0]
+        else {
+            panic!("logical projection")
+        };
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let ctx = logical_context(&control);
+        let scope = ctx.new_scope();
+        let expected: Vec<_> = logical
+            .terms
+            .iter()
+            .map(|term| ctx.analyze_expr(term, &scope).unwrap())
+            .collect();
+        let mixed = ctx.analyze_expr(expression, &scope).unwrap();
+        let mut terms = Vec::new();
+        leaves(&mixed, BinOp::And, &mut terms);
+        assert_eq!(terms.len(), expected.len());
+        for (actual, expected) in terms.iter().zip(&expected) {
+            assert_eq!(actual.value_type, expected.value_type);
+            assert!(
+                crate::analysis::expr_identity::typed_expr_semantically_eq(
+                    actual, expected, &control
+                )
+                .unwrap(),
+                "the original term keeps its complete typed subtree and canonical bindings"
+            );
+        }
+        let ExprKind::Nested(inner) = &terms[1].kind else {
+            panic!("the original parenthesis owns a typed Nested node")
+        };
+        assert_eq!(
+            terms[1].value_type,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true)
+        );
+        assert_eq!(inner.value_type, terms[1].value_type);
+        let ExprKind::BinaryOp {
+            left,
+            right,
+            op: BinOp::Or,
+            decimal_overflow_policy,
+        } = &inner.kind
+        else {
+            panic!("the nested disjunction remains one source term")
+        };
+        assert_eq!(
+            *decimal_overflow_policy,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull
+        );
+        assert!(matches!(
+            left.kind,
+            ExprKind::Literal(LiteralValue::Bool(false))
+        ));
+        assert!(matches!(right.kind, ExprKind::Literal(LiteralValue::Null)));
+        let ExprKind::FunctionCall {
+            binding: actual_binding,
+            ..
+        } = &terms[2].kind
+        else {
+            panic!("original scalar call")
+        };
+        let ExprKind::FunctionCall {
+            binding: expected_binding,
+            ..
+        } = &expected[2].kind
+        else {
+            panic!("independent scalar call")
+        };
+        assert_eq!(actual_binding, expected_binding);
+    }
+
+    #[test]
+    fn logical_original_terms_keep_nonzero_constant_ordinal_and_write_assignment() {
+        use crate::compiler::materialized_values::{
+            MaterializedValues, SqlConstantExpressionSite, SqlConstantExpressionStep,
+            SqlExpressionConstant,
+        };
+        use crate::compiler::{SqlCompileControl, SqlWriteAssignmentSite};
+        use arrow::array::{Array, BooleanArray};
+        use novarocks_functions::ConstantPool;
+        use novarocks_type_contract::{CompilePhase, FunctionValueType};
+        use std::{borrow::Cow, sync::Arc};
+        let control = SqlCompileControl::unbounded();
+        let policy = crate::constant::test_constant_policy();
+        let field = Arc::new(arrow::datatypes::Field::new(
+            "logical_source",
+            DataType::Boolean,
+            false,
+        ));
+        let pool = ConstantPool::try_new(
+            field.clone(),
+            FunctionValueType::new(DataType::Boolean, false),
+            BooleanArray::from(vec![false, true]).to_data(),
+            policy,
+            CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let value = pool.value(1).unwrap();
+        let statements =
+            novarocks_parser::parse("SELECT only_original_source AND 1 AND NULL").unwrap();
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query")
+        };
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("select")
+        };
+        let ast::SelectItem::UnnamedExpr(expression @ ast::Expr::Logical(logical)) =
+            &select.projection[0]
+        else {
+            panic!("logical")
+        };
+        let constants = vec![
+            SqlExpressionConstant::new(
+                vec![],
+                SqlConstantExpressionSite::SelectProjection { column: 0 },
+                value.clone(),
+            )
+            .with_expression_path(vec![SqlConstantExpressionStep::LogicalTerm(0)]),
+        ]
+        .into();
+        let source = MaterializedValues::try_new_expressions(query, constants, &control).unwrap();
+        let mut owned = source.loan(query, &control).unwrap();
+        let assignment = SqlWriteAssignmentSite::try_new(
+            0,
+            FunctionValueType::new(DataType::Int64, false),
+            None,
+            &control,
+        )
+        .unwrap()
+        .with_source_span(logical.terms[1].span());
+        owned
+            .insert_write_assignment(&logical.terms[1], Cow::Owned(assignment), &control)
+            .unwrap();
+        assert!(
+            owned
+                .view()
+                .write_assignment_at(&logical.terms[1].clone())
+                .is_none()
+        );
+        let mut ctx = logical_context(&control);
+        ctx.materialized_values = Some(owned.view());
+        let scope = ctx.new_scope();
+        let expected: Vec<_> = logical
+            .terms
+            .iter()
+            .map(|term| ctx.analyze_expr(term, &scope).unwrap())
+            .collect();
+        let actual = ctx.analyze_expr(expression, &scope).unwrap();
+        assert_eq!(
+            actual.value_type,
+            FunctionValueType::new(DataType::Boolean, true)
+        );
+        let ExprKind::BinaryOp {
+            left,
+            right,
+            op: BinOp::And,
+            ..
+        } = &actual.kind
+        else {
+            panic!("balanced root")
+        };
+        assert!(matches!(right.kind, ExprKind::Literal(LiteralValue::Null)));
+        assert_eq!(right.value_type, expected[2].value_type);
+        assert!(
+            crate::analysis::expr_identity::typed_expr_semantically_eq(
+                right,
+                &expected[2],
+                &control
+            )
+            .unwrap()
+        );
+        let ExprKind::BinaryOp {
+            left,
+            right,
+            op: BinOp::And,
+            ..
+        } = &left.kind
+        else {
+            panic!("adjacent terms")
+        };
+        let ExprKind::Constant(retained) = &left.kind else {
+            panic!("original constant")
+        };
+        assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
+        assert_eq!(retained.ordinal(), 1);
+        assert_eq!(retained.field(), field.as_ref());
+        assert_eq!(retained.value_type(), value.value_type());
+        let declared = owned.view().write_assignment_at(&logical.terms[1]).unwrap();
+        assert_eq!(
+            declared.input(),
+            &FunctionValueType::new(DataType::Int64, false)
+        );
+        assert_eq!(
+            right.value_type,
+            FunctionValueType::new(DataType::Int64, true)
+        );
+        for (actual_term, expected_term) in
+            [left.as_ref(), right.as_ref()].into_iter().zip(&expected)
+        {
+            assert_eq!(actual_term.value_type, expected_term.value_type);
+            assert!(
+                crate::analysis::expr_identity::typed_expr_semantically_eq(
+                    actual_term,
+                    expected_term,
+                    &control
+                )
+                .unwrap(),
+                "balancing retains the original term's complete typed source conversion"
+            );
+        }
+        let ExprKind::Cast {
+            expr,
+            target,
+            decimal_overflow_policy,
+        } = &right.kind
+        else {
+            panic!("original write assignment cast")
+        };
+        assert_eq!(target, right.value_type.data_type());
+        assert_eq!(target, declared.input().data_type());
+        assert_eq!(
+            *decimal_overflow_policy,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull
+        );
+        assert!(matches!(expr.kind, ExprKind::Literal(LiteralValue::Int(1))));
+        let independent = expression.clone();
+        assert!(
+            ctx.analyze_expr(&independent, &ctx.new_scope()).is_err(),
+            "equal syntax must not acquire this occurrence's source loan"
+        );
     }
 
     #[test]

@@ -792,6 +792,7 @@ impl Printer {
             Expr::FunctionCall(call) => self.write_function_call(call),
             Expr::Unary(expression) => self.write_unary_expr(expression),
             Expr::Binary(expression) => self.write_binary_expr(expression),
+            Expr::Logical(expression) => self.write_logical_expr(expression),
             Expr::Nested(expression) => self.write_nested_expr(expression),
             Expr::Between(expression) => self.write_between_expr(expression),
             Expr::InList(expression) => self.write_in_list_expr(expression),
@@ -1165,12 +1166,40 @@ impl Printer {
         matches!(
             expression,
             Expr::Binary(_)
+                | Expr::Logical(_)
                 | Expr::Between(_)
                 | Expr::InList(_)
                 | Expr::InSubquery(_)
                 | Expr::Like(_)
                 | Expr::IsPredicate(_)
         )
+    }
+
+    #[recursive::recursive]
+    fn write_logical_expr(&mut self, expression: &LogicalExpr) {
+        for (index, term) in expression.terms.iter().enumerate() {
+            if index > 0 {
+                self.output.push(' ');
+                self.output.push_str(expression.operator.sql());
+                self.output.push(' ');
+            }
+            let parentheses = match term {
+                Expr::Logical(child) => {
+                    child.operator.precedence() <= expression.operator.precedence()
+                }
+                Expr::Binary(child) => {
+                    child.operator.precedence() < expression.operator.precedence()
+                }
+                _ => false,
+            };
+            if parentheses {
+                self.output.push('(');
+            }
+            self.write_expr(term);
+            if parentheses {
+                self.output.push(')');
+            }
+        }
     }
 
     fn write_binary_expr(&mut self, expression: &BinaryExpr) {
@@ -1183,6 +1212,7 @@ impl Printer {
 
     fn write_binary_operand(&mut self, operand: &Expr, parent: BinaryOperator, side: BinarySide) {
         let requires_parentheses = match operand {
+            Expr::Logical(child) => child.operator.precedence() < parent.precedence(),
             Expr::Binary(child) => {
                 child.operator.precedence() < parent.precedence()
                     || (child.operator.precedence() == parent.precedence()
@@ -1192,7 +1222,7 @@ impl Printer {
             | Expr::InList(_)
             | Expr::InSubquery(_)
             | Expr::Like(_)
-            | Expr::IsPredicate(_) => parent.precedence() > BinaryOperator::And.precedence(),
+            | Expr::IsPredicate(_) => parent.precedence() > LogicalOperator::And.precedence(),
             _ => false,
         };
         if requires_parentheses {
@@ -1508,12 +1538,25 @@ enum BinarySide {
     Right,
 }
 
+impl LogicalOperator {
+    const fn precedence(self) -> u8 {
+        match self {
+            Self::And => 20,
+            Self::Or => 10,
+        }
+    }
+    const fn sql(self) -> &'static str {
+        match self {
+            Self::And => "AND",
+            Self::Or => "OR",
+        }
+    }
+}
+
 impl BinaryOperator {
     const fn precedence(self) -> u8 {
         match self {
             Self::NamedArgument => 1,
-            Self::Or => 10,
-            Self::And => 20,
             Self::Equal
             | Self::NotEqual
             | Self::NullSafeEqual
@@ -1534,8 +1577,6 @@ impl BinaryOperator {
     const fn sql(self) -> &'static str {
         match self {
             Self::NamedArgument => "=>",
-            Self::Or => "OR",
-            Self::And => "AND",
             Self::Equal => "=",
             Self::NotEqual => "!=",
             Self::NullSafeEqual => "<=>",

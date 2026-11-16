@@ -326,6 +326,10 @@ pub trait Visit {
         walk_unary_expr(self, expression);
     }
 
+    fn visit_logical_expr(&mut self, expression: &LogicalExpr) {
+        walk_logical_expr(self, expression);
+    }
+
     fn visit_binary_expr(&mut self, expression: &BinaryExpr) {
         walk_binary_expr(self, expression);
     }
@@ -681,6 +685,7 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::FunctionCall(call) => visitor.visit_function_call(call),
         Expr::Unary(expression) => visitor.visit_unary_expr(expression),
         Expr::Binary(expression) => visitor.visit_binary_expr(expression),
+        Expr::Logical(expression) => visitor.visit_logical_expr(expression),
         Expr::Nested(expression) => visitor.visit_nested_expr(expression),
         Expr::Between(expression) => {
             visitor.visit_expr(&expression.expr);
@@ -1161,6 +1166,10 @@ pub trait Fold {
 
     fn fold_unary_expr(&mut self, expression: UnaryExpr) -> UnaryExpr {
         fold_unary_expr(self, expression)
+    }
+
+    fn fold_logical_expr(&mut self, expression: LogicalExpr) -> LogicalExpr {
+        fold_logical_expr(self, expression)
     }
 
     fn fold_binary_expr(&mut self, expression: BinaryExpr) -> BinaryExpr {
@@ -1722,6 +1731,7 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::FunctionCall(call) => Expr::FunctionCall(folder.fold_function_call(call)),
         Expr::Unary(expression) => Expr::Unary(folder.fold_unary_expr(expression)),
         Expr::Binary(expression) => Expr::Binary(folder.fold_binary_expr(expression)),
+        Expr::Logical(expression) => Expr::Logical(folder.fold_logical_expr(expression)),
         Expr::Nested(expression) => Expr::Nested(folder.fold_nested_expr(expression)),
         Expr::Between(mut expression) => {
             expression.expr = Box::new(folder.fold_expr(*expression.expr));
@@ -1918,5 +1928,25 @@ pub fn fold_nested_expr<F: Fold + ?Sized>(
     mut expression: NestedExpr,
 ) -> NestedExpr {
     expression.expression = Box::new(folder.fold_expr(*expression.expression));
+    expression
+}
+
+#[recursive::recursive]
+pub fn walk_logical_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &LogicalExpr) {
+    for term in &expression.terms {
+        visitor.visit_expr(term);
+    }
+}
+
+#[recursive::recursive]
+pub fn fold_logical_expr<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut expression: LogicalExpr,
+) -> LogicalExpr {
+    expression.terms = expression
+        .terms
+        .into_iter()
+        .map(|term| folder.fold_expr(term))
+        .collect();
     expression
 }

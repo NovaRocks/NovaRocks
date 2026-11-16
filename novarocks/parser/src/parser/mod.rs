@@ -44,7 +44,6 @@ use crate::{
 };
 
 pub use expr::parse_expression;
-pub(crate) use pratt::balance_boolean_chain;
 
 /// `statements ::= { statement [ ";" ] } EOF`
 ///
