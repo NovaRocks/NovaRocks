@@ -2779,6 +2779,7 @@ impl CompletionRetainedBytes {
         self.add_set_expr_containers(&query.body);
     }
 
+    #[recursive::recursive]
     fn add_set_expr_containers(&mut self, set_expr: &SetExpr) {
         self.add(std::mem::size_of::<SetExpr>());
         match set_expr {
@@ -3088,12 +3089,14 @@ impl Visit for CompletionRetainedBytes {
         novarocks_parser::ast::walk_json_table_plan_parent_child(self, node);
     }
 
+    #[recursive::recursive]
     fn visit_query(&mut self, query: &Query) {
         self.add(std::mem::size_of::<Query>());
         self.add_query_containers(query);
         walk_query(self, query);
     }
 
+    #[recursive::recursive]
     fn visit_expr(&mut self, expression: &Expr) {
         self.add(std::mem::size_of::<Expr>());
         match expression {
@@ -3291,6 +3294,7 @@ impl Visit for CompletionRetainedBytes {
         walk_function_call(self, call);
     }
 
+    #[recursive::recursive]
     fn visit_table_factor(&mut self, factor: &TableFactor) {
         self.add(std::mem::size_of::<TableFactor>());
         match factor {
@@ -3949,6 +3953,80 @@ mod tests {
             catalog.resolutions.load(Ordering::Acquire),
             resolutions_before
         );
+    }
+
+    #[test]
+    fn completion_accounting_grows_on_twenty_thousand_real_set_operations() {
+        use novarocks_parser::ast::{SetOperation, SetOperator, Values};
+        use novarocks_parser::{SYNTHETIC, build};
+        use std::mem::size_of;
+        fn values(row_capacity: usize, rows_capacity: usize) -> SetExpr {
+            let mut row = Vec::with_capacity(row_capacity);
+            row.push(build::boolean(true));
+            let mut rows = Vec::with_capacity(rows_capacity);
+            rows.push(row);
+            SetExpr::Values(Values {
+                rows,
+                explicit_row: false,
+                span: SYNTHETIC,
+            })
+        }
+        let mut definition = SqlMvRewriteDefinitionFacts::try_new(
+            1,
+            [11; 32],
+            build::query(values(1, 1)),
+            test_resolution(),
+            "iceberg".to_string(),
+            None,
+            vec![test_source(SqlMvRewriteBaseTableFacts::unavailable(
+                "not published".to_string(),
+            ))],
+        )
+        .unwrap();
+        // Freeze the unchanged definition metadata and original leaf separately.
+        // Every newly owned buffer below is measured from its actual capacity.
+        let baseline = definition.completion_retained_bytes().unwrap();
+        let original_body =
+            std::mem::replace(&mut definition.select_query.body, Box::new(values(1, 1)));
+        let mut body = *original_body;
+        let mut added_buffer_bytes = 0_u64;
+        const DEPTH: usize = 20_000;
+        for index in 0..DEPTH {
+            let side = values(3 + index % 3, 2 + index % 2);
+            let SetExpr::Values(side_values) = &side else {
+                unreachable!()
+            };
+            added_buffer_bytes += (side_values.rows.capacity() * size_of::<Vec<Expr>>()
+                + side_values.rows[0].capacity() * size_of::<Expr>())
+                as u64;
+            let mut inputs = Vec::with_capacity(5 + index % 3);
+            inputs.push(body);
+            inputs.push(side);
+            added_buffer_bytes += (inputs.capacity() * size_of::<SetExpr>()) as u64;
+            body = SetExpr::SetOperation(SetOperation {
+                inputs: inputs.into(),
+                operator: if index % 2 == 0 {
+                    SetOperator::Union
+                } else {
+                    SetOperator::Intersect
+                },
+                distinct: true,
+                corresponding: None,
+                span: SYNTHETIC,
+            });
+        }
+        definition.select_query.body = Box::new(body);
+        // Each binary operation adds itself and one VALUES sibling. The sibling's
+        // boolean has no heap string and is visited once by the real AST walk.
+        let inline_per_layer = 2 * size_of::<SetExpr>()
+            + size_of::<SetOperation>()
+            + size_of::<Values>()
+            + size_of::<Expr>()
+            + size_of::<Literal>();
+        let expected = baseline + added_buffer_bytes + (DEPTH * inline_per_layer) as u64;
+        assert_eq!(definition.completion_retained_bytes().unwrap(), expected);
+        // Dropping the real graph also consumes the existing AstVec owning edge.
+        drop(definition);
     }
 
     #[test]
