@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::unit_creation::{UnitValidationCreation, ValidationFailure};
 use crate::{ExprId, ExprKind, ValueType};
 use arrow_schema::DataType;
+use novarocks_type_contract::CompileCheckpoints;
 use novarocks_type_contract::{
     FunctionArgumentType, FunctionKind, arithmetic_result_value_shape_with_op,
     is_integer_value_type, is_numeric_value_type,
@@ -130,11 +132,87 @@ impl<'a> TypeChecks<'a> {
         }
     }
 }
-pub(crate) fn value_bindings_match_ignoring_root_nullability(
+// The old pure predicates classified a type-author refusal as false. Keep
+// that semantic result, while preserving every real control/creator failure.
+fn original_type_predicate<'a, H>(
+    result: Result<bool, ValidationFailure<'a, H>>,
+) -> Result<bool, ValidationFailure<'a, H>> {
+    match result {
+        Err(ValidationFailure::Owner(crate::UnitError::Type(_))) => Ok(false),
+        result => result,
+    }
+}
+fn same_domain<'a, H>(
     left: &ValueType,
     right: &ValueType,
-) -> bool {
-    left.same_value_domain(right) && left.typed_binding().layout() == right.typed_binding().layout()
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ValidationFailure<'a, H>> {
+    original_type_predicate(
+        left.same_value_domain_observed(right, || work.step().map_err(ValidationFailure::from)),
+    )
+}
+fn exact_type<'a, H>(
+    left: &ValueType,
+    right: &ValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ValidationFailure<'a, H>> {
+    original_type_predicate(
+        left.exactly_equals_observed(right, || work.step().map_err(ValidationFailure::from)),
+    )
+}
+fn value_bindings_match_ignoring_root_nullability<'a, H>(
+    left: &ValueType,
+    right: &ValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ValidationFailure<'a, H>> {
+    Ok(same_domain(left, right, work)?
+        && left
+            .typed_binding()
+            .layout()
+            .equals_observed(right.typed_binding().layout(), || {
+                work.step().map_err(ValidationFailure::from)
+            })?)
+}
+fn value_types_equal<'a, H>(
+    left: &[ValueType],
+    right: &[ValueType],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ValidationFailure<'a, H>> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left.iter().zip(right) {
+        if !exact_type(left, right, work)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+fn matches_definition<'a, H>(
+    definitions: &[crate::ExprNode],
+    id: ExprId,
+    matches: impl FnOnce(&crate::ExprNode) -> Result<bool, ValidationFailure<'a, H>>,
+) -> Result<bool, ValidationFailure<'a, H>> {
+    definitions
+        .get(id.get() as usize)
+        .map(matches)
+        .transpose()
+        .map(|result| result.unwrap_or(false))
+}
+fn any_definition<'a, H>(
+    definitions: &[crate::ExprNode],
+    ids: impl Iterator<Item = ExprId>,
+    predicate: impl Fn(&crate::ExprNode) -> bool,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ValidationFailure<'a, H>> {
+    for id in ids {
+        let matched = definitions.get(id.get() as usize).is_some_and(&predicate);
+        work.step()?;
+        if matched {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,13 +260,15 @@ pub(crate) fn expression_parent_references(
     }
 }
 
-pub(crate) fn validate_expression_types<'a>(
+pub(crate) fn validate_expression_types<'a, H>(
     definitions: &'a [crate::ExprNode],
     expression: &'a crate::ExprNode,
     operator_roots: &BTreeSet<ExprId>,
     parents: &[ExpressionParentReference],
     errors: &mut TypeChecks<'a>,
-) {
+    creation: &mut UnitValidationCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ValidationFailure<'a, H>> {
     let path = expression.id;
     match &expression.kind {
         ExprKind::Value(_) => {}
@@ -202,10 +282,13 @@ pub(crate) fn validate_expression_types<'a>(
                             parameter_types, ..
                         },
                     ..
-                }) if usize::try_from(*ordinal)
+                }) if match usize::try_from(*ordinal)
                     .ok()
                     .and_then(|ordinal| parameter_types.get(ordinal))
-                    == Some(&expression.ty) => {}
+                {
+                    Some(parameter) => exact_type(parameter, &expression.ty, work)?,
+                    None => false,
+                } => {}
                 Some(_) => errors.push(TypeIssue::new(
                     path,
                     "lambda parameter does not reference a matching lambda owner",
@@ -219,7 +302,13 @@ pub(crate) fn validate_expression_types<'a>(
             // nested in it: `array_map(x -> array_map(y -> x + y, ys), xs)`
             // reads `x` from the scope the inner lambda opens. So the lambda
             // it names is the scope it stands in or one enclosing that.
-            if !lambda_scope_contains(definitions, expression.lambda_scope, *lambda) {
+            if !lambda_scope_contains(
+                definitions,
+                expression.lambda_scope,
+                *lambda,
+                creation,
+                work,
+            )? {
                 errors.push(TypeIssue::new(
                     path,
                     "lambda parameter stands outside the lambda it names",
@@ -246,7 +335,7 @@ pub(crate) fn validate_expression_types<'a>(
                 errors.push(TypeIssue::new(path, "lambda has no parameters"));
             }
             if let Some(body) = definitions.get((*body).get() as usize)
-                && body.ty != expression.ty
+                && !exact_type(&body.ty, &expression.ty, work)?
             {
                 errors.push(TypeIssue::new(
                     path,
@@ -270,7 +359,7 @@ pub(crate) fn validate_expression_types<'a>(
                 let valid = match op {
                     crate::UnaryOperator::Plus | crate::UnaryOperator::Minus => {
                         (is_numeric_value_type(&input.ty) || strict_null)
-                            && input.ty.same_value_domain(&expression.ty)
+                            && same_domain(&input.ty, &expression.ty, work)?
                             && widens
                     }
                     crate::UnaryOperator::Not => {
@@ -280,7 +369,7 @@ pub(crate) fn validate_expression_types<'a>(
                     }
                     crate::UnaryOperator::BitwiseNot => {
                         (is_integer_value_type(&input.ty) || strict_null)
-                            && input.ty.same_value_domain(&expression.ty)
+                            && same_domain(&input.ty, &expression.ty, work)?
                             && widens
                     }
                 };
@@ -337,17 +426,17 @@ pub(crate) fn validate_expression_types<'a>(
                 definitions.get((*left).get() as usize),
                 definitions.get((*right).get() as usize),
             ) {
-                validate_binary_types(left, *op, right, expression, path, errors);
+                validate_binary_types(left, *op, right, expression, path, errors, work)?;
             }
         }
         ExprKind::Conjunction { args } | ExprKind::Disjunction { args } => {
-            validate_boolean_connective_types(definitions, args, expression, path, errors);
+            validate_boolean_connective_types(definitions, args, expression, path, errors, work)?;
         }
         ExprKind::FunctionCall { function, args } => {
             if function.kind != FunctionKind::Scalar {
                 errors.push(TypeIssue::new(path, "scalar call has non-scalar binding"));
             }
-            validate_function_call(definitions, expression, function, args, path, errors);
+            validate_function_call(definitions, expression, function, args, path, errors, work)?;
         }
         ExprKind::Cast {
             expr,
@@ -371,9 +460,13 @@ pub(crate) fn validate_expression_types<'a>(
                 && !novarocks_type_contract::preserves_value_domains_observed(
                     input.ty.value_type(),
                     expression.ty.value_type(),
-                    |_| Ok::<_, novarocks_type_contract::ValueTypeError>(()),
-                )
-                .unwrap_or(false)
+                    |units| {
+                        for _ in 0..units {
+                            work.step()?;
+                        }
+                        Ok::<_, ValidationFailure<'a, H>>(())
+                    },
+                )?
             {
                 errors.push(TypeIssue::new(
                     path,
@@ -381,11 +474,14 @@ pub(crate) fn validate_expression_types<'a>(
                 ));
             }
             if let Some(input) = definitions.get((*expr).get() as usize)
-                && !novarocks_type_contract::decimal_error_policy_cast_supported(
-                    input.ty.data_type(),
-                    target,
-                    *decimal_overflow_policy,
-                )
+                && !original_type_predicate(
+                    novarocks_type_contract::decimal_error_policy_cast_supported_observed(
+                        input.ty.data_type(),
+                        target,
+                        *decimal_overflow_policy,
+                        || work.step().map_err(ValidationFailure::from),
+                    ),
+                )?
             {
                 errors.push(TypeIssue::new(
                     path,
@@ -397,7 +493,11 @@ pub(crate) fn validate_expression_types<'a>(
             // statement may stand this value where null is admitted. It may
             // not claim the reverse: a null-admitting input does not stop
             // admitting null by being converted.
-            if !novarocks_type_contract::arrow_data_types_exact(expression.ty.data_type(), target) {
+            if !original_type_predicate(novarocks_type_contract::arrow_data_types_exact_observed(
+                expression.ty.data_type(),
+                target,
+                || work.step().map_err(ValidationFailure::from),
+            ))? {
                 // Both types, because which half drifted is the diagnosis.
                 errors.push(TypeIssue::new(
                     path,
@@ -423,11 +523,12 @@ pub(crate) fn validate_expression_types<'a>(
             require_boolean_result(&expression.ty, path, errors);
             if let Some(input) = definitions.get((*expr).get() as usize) {
                 let nullable = input.ty.nullable()
-                    || list.iter().any(|candidate| {
-                        definitions
-                            .get((*candidate).get() as usize)
-                            .is_some_and(|candidate| candidate.ty.nullable())
-                    });
+                    || any_definition(
+                        definitions,
+                        list.iter().copied(),
+                        |candidate| candidate.ty.nullable(),
+                        work,
+                    )?;
                 if nullable && !expression.ty.nullable() {
                     errors.push(TypeIssue::new(
                         path,
@@ -435,10 +536,9 @@ pub(crate) fn validate_expression_types<'a>(
                     ));
                 }
                 for candidate in list {
-                    if definitions
-                        .get((*candidate).get() as usize)
-                        .is_some_and(|candidate| !candidate.ty.same_value_domain(&input.ty))
-                    {
+                    if matches_definition(definitions, *candidate, |candidate| {
+                        Ok(!same_domain(&candidate.ty, &input.ty, work)?)
+                    })? {
                         errors.push(TypeIssue::new(
                             path,
                             "IN-list candidate type differs from its input",
@@ -464,10 +564,9 @@ pub(crate) fn validate_expression_types<'a>(
                     ));
                 }
                 for bound in [*low, *high] {
-                    if definitions
-                        .get((bound).get() as usize)
-                        .is_some_and(|bound| !bound.ty.same_value_domain(&input.ty))
-                    {
+                    if matches_definition(definitions, bound, |bound| {
+                        Ok(!same_domain(&bound.ty, &input.ty, work)?)
+                    })? {
                         errors.push(TypeIssue::new(
                             path,
                             "BETWEEN bound type differs from its input",
@@ -509,43 +608,50 @@ pub(crate) fn validate_expression_types<'a>(
             *else_expr,
             path,
             errors,
-        ),
+            work,
+        )?,
     }
+    Ok(())
 }
 
-pub(crate) fn expression_reference_scope_allowed(
-    definitions: &[crate::ExprNode],
+pub(crate) fn expression_reference_scope_allowed<'a, H>(
+    definitions: &'a [crate::ExprNode],
     parent: &crate::ExprNode,
     child_id: ExprId,
     child: &crate::ExprNode,
-) -> bool {
+    creation: &mut UnitValidationCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ValidationFailure<'a, H>> {
     if matches!(parent.kind, ExprKind::Lambda { body, .. } if body == child_id) {
-        return child.lambda_scope == Some(parent.id);
+        return Ok(child.lambda_scope == Some(parent.id));
     }
     if let ExprKind::LambdaParameter { lambda, .. } = child.kind {
-        return lambda_scope_contains(definitions, parent.lambda_scope, lambda);
+        return lambda_scope_contains(definitions, parent.lambda_scope, lambda, creation, work);
     }
-    child.lambda_scope == parent.lambda_scope
+    Ok(child.lambda_scope == parent.lambda_scope)
 }
 
-pub(crate) fn lambda_scope_contains(
-    definitions: &[crate::ExprNode],
+pub(crate) fn lambda_scope_contains<'a, H>(
+    definitions: &'a [crate::ExprNode],
     mut scope: Option<ExprId>,
     expected: ExprId,
-) -> bool {
+    creation: &mut UnitValidationCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ValidationFailure<'a, H>> {
     let mut visited = BTreeSet::new();
     while let Some(id) = scope {
+        work.step()?;
         if id == expected {
-            return true;
+            return Ok(true);
         }
-        if !visited.insert(id) {
-            return false;
+        if !creation.set_insert(&mut visited, id, work)? {
+            return Ok(false);
         }
         scope = definitions
-            .get((id).get() as usize)
+            .get(id.get() as usize)
             .and_then(|expression| expression.lambda_scope);
     }
-    false
+    Ok(false)
 }
 
 /// Types an n-ary `AND`/`OR`.
@@ -553,22 +659,24 @@ pub(crate) fn lambda_scope_contains(
 /// Arity is checked here rather than left open: a connective over fewer than
 /// two arguments would give the same predicate two spellings, and the point of
 /// making the connective n-ary is to have exactly one.
-pub(crate) fn validate_boolean_connective_types<'a>(
+pub(crate) fn validate_boolean_connective_types<'a, H>(
     definitions: &'a [crate::ExprNode],
     args: &[ExprId],
     output: &'a crate::ExprNode,
     path: ExprId,
     errors: &mut TypeChecks<'a>,
-) {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ValidationFailure<'a, H>> {
     if args.len() < 2 {
         errors.push(TypeIssue::new(
             path,
             "boolean connective requires at least two arguments",
         ));
-        return;
+        return Ok(());
     }
     let mut nullable = false;
     for (ordinal, arg) in args.iter().enumerate() {
+        work.step()?;
         let Some(arg) = definitions.get((*arg).get() as usize) else {
             continue;
         };
@@ -589,17 +697,19 @@ pub(crate) fn validate_boolean_connective_types<'a>(
             "boolean connective result type is inconsistent with its arguments",
         ));
     }
+    Ok(())
 }
 
-pub(crate) fn validate_binary_types<'a>(
+pub(crate) fn validate_binary_types<'a, H>(
     left: &crate::ExprNode,
     op: crate::BinaryOperator,
     right: &crate::ExprNode,
     output: &'a crate::ExprNode,
     path: ExprId,
     errors: &mut TypeChecks<'a>,
-) {
-    let same_inputs = left.ty.same_value_domain(&right.ty);
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ValidationFailure<'a, H>> {
+    let same_inputs = same_domain(&left.ty, &right.ty, work)?;
     // An operator may admit null neither operand does -- arithmetic answers
     // with null where it cannot answer with a number, and a plan's nullability
     // widens on the way out. It may not admit less than its operands do.
@@ -656,7 +766,7 @@ pub(crate) fn validate_binary_types<'a>(
         | crate::BinaryOperator::BitXor => {
             same_inputs
                 && is_integer_value_type(&left.ty)
-                && output.ty.same_value_domain(&left.ty)
+                && same_domain(&output.ty, &left.ty, work)?
                 && nullability_widens(output.ty.nullable())
         }
     };
@@ -666,9 +776,10 @@ pub(crate) fn validate_binary_types<'a>(
             "binary expression types are inconsistent with its operator",
         ));
     }
+    Ok(())
 }
 
-pub(crate) fn validate_case_types<'a>(
+pub(crate) fn validate_case_types<'a, H>(
     definitions: &'a [crate::ExprNode],
     expression: &'a crate::ExprNode,
     operand: Option<ExprId>,
@@ -676,7 +787,8 @@ pub(crate) fn validate_case_types<'a>(
     else_expr: Option<ExprId>,
     path: ExprId,
     errors: &mut TypeChecks<'a>,
-) {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ValidationFailure<'a, H>> {
     if when_then.is_empty() {
         errors.push(TypeIssue::new(path, "CASE expression has no branches"));
     }
@@ -684,9 +796,10 @@ pub(crate) fn validate_case_types<'a>(
         operand.and_then(|id| definitions.get((id).get() as usize).map(|node| &node.ty));
     for (when, then) in when_then {
         if let Some(when) = definitions.get((*when).get() as usize) {
-            let valid = operand_type
-                .map(|operand| operand.same_value_domain(&when.ty))
-                .unwrap_or(*when.ty.data_type() == DataType::Boolean);
+            let valid = match operand_type {
+                Some(operand) => same_domain(operand, &when.ty, work)?,
+                None => *when.ty.data_type() == DataType::Boolean,
+            };
             if !valid {
                 errors.push(TypeIssue::new(
                     path,
@@ -697,9 +810,13 @@ pub(crate) fn validate_case_types<'a>(
                 ));
             }
         }
-        if definitions.get((*then).get() as usize).is_some_and(|then| {
-            !value_bindings_match_ignoring_root_nullability(&then.ty, &expression.ty)
-        }) {
+        if matches_definition(definitions, *then, |then| {
+            Ok(!value_bindings_match_ignoring_root_nullability(
+                &then.ty,
+                &expression.ty,
+                work,
+            )?)
+        })? {
             errors.push(TypeIssue::new(
                 path,
                 "CASE result type differs from its output",
@@ -707,11 +824,13 @@ pub(crate) fn validate_case_types<'a>(
         }
     }
     if let Some(else_expr) = else_expr
-        && definitions
-            .get((else_expr).get() as usize)
-            .is_some_and(|otherwise| {
-                !value_bindings_match_ignoring_root_nullability(&otherwise.ty, &expression.ty)
-            })
+        && matches_definition(definitions, else_expr, |otherwise| {
+            Ok(!value_bindings_match_ignoring_root_nullability(
+                &otherwise.ty,
+                &expression.ty,
+                work,
+            )?)
+        })?
     {
         errors.push(TypeIssue::new(
             path,
@@ -719,11 +838,12 @@ pub(crate) fn validate_case_types<'a>(
         ));
     }
     let result_nullable = else_expr.is_none()
-        || when_then.iter().any(|(_, then)| {
-            definitions
-                .get((*then).get() as usize)
-                .is_some_and(|then| then.ty.nullable())
-        })
+        || any_definition(
+            definitions,
+            when_then.iter().map(|(_, then)| *then),
+            |then| then.ty.nullable(),
+            work,
+        )?
         || else_expr.is_some_and(|otherwise| {
             definitions
                 .get((otherwise).get() as usize)
@@ -735,6 +855,7 @@ pub(crate) fn validate_case_types<'a>(
             "CASE result stops admitting null its branches admit",
         ));
     }
+    Ok(())
 }
 
 pub(crate) fn require_boolean_result(ty: &ValueType, path: ExprId, errors: &mut TypeChecks<'_>) {
@@ -763,14 +884,15 @@ pub(crate) fn is_utf8(ty: &DataType) -> bool {
     )
 }
 
-pub(crate) fn validate_function_call<'a>(
+pub(crate) fn validate_function_call<'a, H>(
     definitions: &'a [crate::ExprNode],
     expression: &'a crate::ExprNode,
     function: &'a crate::BoundFunction,
     args: &[ExprId],
     path: ExprId,
     errors: &mut TypeChecks<'a>,
-) {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ValidationFailure<'a, H>> {
     validate_function_arguments(
         definitions,
         &function.function_id,
@@ -778,23 +900,26 @@ pub(crate) fn validate_function_call<'a>(
         args,
         path,
         errors,
-    );
-    if expression.ty != function.result_type {
+        work,
+    )?;
+    if !exact_type(&expression.ty, &function.result_type, work)? {
         errors.push(TypeIssue::new(
             path,
             "function expression type differs from the bound result type",
         ));
     }
+    Ok(())
 }
 
-pub(crate) fn validate_function_arguments<'a>(
+pub(crate) fn validate_function_arguments<'a, H>(
     definitions: &'a [crate::ExprNode],
     function: &'a novarocks_type_contract::FunctionId,
     expected: &'a [FunctionArgumentType],
     args: &[ExprId],
     path: ExprId,
     errors: &mut TypeChecks<'a>,
-) {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ValidationFailure<'a, H>> {
     if expected.len() != args.len() {
         errors.push(TypeIssue::new(
             path,
@@ -803,35 +928,34 @@ pub(crate) fn validate_function_arguments<'a>(
                 actual: args.len(),
             },
         ));
-        return;
+        return Ok(());
     }
     for (ordinal, (expected, argument)) in expected.iter().zip(args).enumerate() {
-        let valid = definitions
-            .get((*argument).get() as usize)
-            .is_some_and(|actual| {
-                match (expected, &actual.kind) {
-                    (FunctionArgumentType::Value(_), ExprKind::Lambda { .. }) => false,
-                    // A parameter that accepts null accepts a value that never
-                    // writes one; the mismatch is the other way round.
-                    (FunctionArgumentType::Value(expected), _) => {
-                        actual.ty.fits_value_type(expected)
-                    }
-                    (
-                        FunctionArgumentType::Lambda {
-                            parameter_types,
-                            result_type,
-                        },
-                        ExprKind::Lambda {
-                            parameter_types: actual_parameters,
-                            ..
-                        },
-                    ) => {
-                        actual_parameters.as_ref() == parameter_types.as_slice()
-                            && &actual.ty == result_type
-                    }
-                    (FunctionArgumentType::Lambda { .. }, _) => false,
+        let valid = matches_definition(definitions, *argument, |actual| {
+            Ok(match (expected, &actual.kind) {
+                (FunctionArgumentType::Value(_), ExprKind::Lambda { .. }) => false,
+                // Preserve the original parameter/root NULL widening rule.
+                (FunctionArgumentType::Value(expected), _) => {
+                    original_type_predicate(actual.ty.fits_value_type_observed(expected, || {
+                        work.step().map_err(ValidationFailure::from)
+                    }))?
                 }
-            });
+                (
+                    FunctionArgumentType::Lambda {
+                        parameter_types,
+                        result_type,
+                    },
+                    ExprKind::Lambda {
+                        parameter_types: actual_parameters,
+                        ..
+                    },
+                ) => {
+                    value_types_equal(actual_parameters, parameter_types.as_slice(), work)?
+                        && exact_type(&actual.ty, result_type, work)?
+                }
+                (FunctionArgumentType::Lambda { .. }, _) => false,
+            })
+        })?;
         if !valid {
             errors.push(TypeIssue::new(
                 path,
@@ -846,4 +970,5 @@ pub(crate) fn validate_function_arguments<'a>(
             ));
         }
     }
+    Ok(())
 }

@@ -275,6 +275,32 @@ impl SealedUnit {
     ) -> Option<&novarocks_type_contract::TemporalSourcePlan<ExprId>> {
         self.temporal_sources.get(&use_id)
     }
+    /// Finish the original sealed control and definitions using the enclosing
+    /// caller's actual validation scratch and escaping-diagnostic storage.
+    pub fn finish_with_creator_in<H>(
+        self,
+        claims: BTreeMap<ExpressionUseId, ExpressionCallClaim>,
+        temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        retained: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<BoundExprSet, crate::UnitConstructionFailure<H>> {
+        let parts = UnitParts::new(
+            self.ports,
+            self.definitions,
+            self.roots,
+            self.root_uses,
+            self.control,
+            claims,
+            self.requests,
+        )
+        .with_storage_lifetime(self.storage)
+        .map_err(|error| {
+            let mut creation =
+                crate::unit_creation::UnitValidationCreation::new(temporary, retained);
+            creation.finish_error(error.into(), work)
+        })?;
+        BoundExprSet::finish_sealed_parts_with_creator_in(parts, temporary, retained, work)
+    }
     pub fn finish(
         self,
         claims: BTreeMap<ExpressionUseId, ExpressionCallClaim>,

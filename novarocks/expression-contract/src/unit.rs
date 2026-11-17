@@ -131,7 +131,10 @@ impl BoundExprSet {
         work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
     ) -> Result<Self, crate::UnitError> {
         crate::validation_calls::validate(&parts, work)?;
-        Ok(Self {
+        Ok(Self::from_validated_parts(parts))
+    }
+    fn from_validated_parts(parts: UnitParts) -> Self {
+        Self {
             ports: parts.ports,
             definitions: parts.definitions,
             roots: parts.roots,
@@ -140,7 +143,105 @@ impl BoundExprSet {
             claims: parts.claims,
             requests: parts.requests,
             storage: parts.storage,
-        })
+        }
+    }
+    /// Validate existing immutable parts using the caller's original scratch
+    /// scope and a separate retained scope for an escaping diagnostic. Input
+    /// payloads and an already checked control flow are never reconstructed.
+    pub fn try_from_parts_with_creator_in<H>(
+        parts: UnitParts,
+        limits: UnitLimits,
+        temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        retained: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<Self, crate::UnitConstructionFailure<H>> {
+        let mut creation = crate::unit_creation::UnitValidationCreation::new(temporary, retained);
+        Self::try_from_parts_created_in(parts, limits, &mut creation, work)
+    }
+    /// The same validation core may borrow one actual caller scope for both
+    /// scratch and diagnostic storage. No second scope or identity is minted;
+    /// the original host retains its own conservative lifetime/refund policy.
+    pub fn try_from_parts_with_single_creator_in<H>(
+        parts: UnitParts,
+        limits: UnitLimits,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<Self, crate::UnitConstructionFailure<H>> {
+        let mut creation = crate::unit_creation::UnitValidationCreation::single(creation);
+        Self::try_from_parts_created_in(parts, limits, &mut creation, work)
+    }
+    /// Observe actual allocation extents and the original opaque SDK bounds
+    /// before the corresponding creator call. The observer and creator keep
+    /// separate failure provenance, using the caller's enclosing error type.
+    pub fn try_from_parts_with_creator_observed_in<H>(
+        parts: UnitParts,
+        limits: UnitLimits,
+        temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        retained: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        observer: &mut dyn FnMut(crate::UnitConstructionRequest) -> Result<(), H>,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<Self, crate::UnitConstructionFailure<H>> {
+        let mut creation = crate::unit_creation::UnitValidationCreation::new(temporary, retained)
+            .with_observer(observer);
+        Self::try_from_parts_created_in(parts, limits, &mut creation, work)
+    }
+    /// The numerical observer and single original creator borrow the same
+    /// construction operation. Neither opens a scope or traverses a second DAG.
+    pub fn try_from_parts_with_single_creator_observed_in<H>(
+        parts: UnitParts,
+        limits: UnitLimits,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        observer: &mut dyn FnMut(crate::UnitConstructionRequest) -> Result<(), H>,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<Self, crate::UnitConstructionFailure<H>> {
+        let mut creation =
+            crate::unit_creation::UnitValidationCreation::single(creation).with_observer(observer);
+        Self::try_from_parts_created_in(parts, limits, &mut creation, work)
+    }
+    /// Pure receiving may observe the same numerical construction facts while
+    /// supplying no creator at all. This performs no capacity admission and
+    /// never fabricates a successful creation port.
+    pub fn try_from_parts_observed_in<H>(
+        parts: UnitParts,
+        limits: UnitLimits,
+        observer: &mut dyn FnMut(crate::UnitConstructionRequest) -> Result<(), H>,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<Self, crate::UnitConstructionFailure<H>> {
+        let mut creation =
+            crate::unit_creation::UnitValidationCreation::pure().with_observer(observer);
+        Self::try_from_parts_created_in(parts, limits, &mut creation, work)
+    }
+    fn try_from_parts_created_in<H>(
+        parts: UnitParts,
+        limits: UnitLimits,
+        creation: &mut crate::unit_creation::UnitValidationCreation<'_, H>,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<Self, crate::UnitConstructionFailure<H>> {
+        let checked = crate::validation::validate_core(
+            &parts.ports,
+            &parts.definitions,
+            &parts.roots,
+            limits,
+            creation,
+            work,
+        )
+        .and_then(|()| crate::validation_calls::validate_core(&parts, creation, work));
+        if let Err(error) = checked {
+            return Err(creation.finish_error(error, work));
+        }
+        Ok(Self::from_validated_parts(parts))
+    }
+    pub(crate) fn finish_sealed_parts_with_creator_in<H>(
+        parts: UnitParts,
+        temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        retained: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<Self, crate::UnitConstructionFailure<H>> {
+        let mut creation = crate::unit_creation::UnitValidationCreation::new(temporary, retained);
+        if let Err(error) = crate::validation_calls::validate_core(&parts, &mut creation, work) {
+            return Err(creation.finish_error(error, work));
+        }
+        Ok(Self::from_validated_parts(parts))
     }
 }
 
@@ -220,3 +321,26 @@ impl BoundExprSet {
     }
 }
 // Design: ADR-0236-self-contained-expression-units-and-explicit-environments.md
+
+impl BoundExprSet {
+    /// Recheck the same immutable structure with actual caller-funded scratch.
+    /// This creates no success storage, control flow, or expression payload.
+    pub fn validate_structure_with_creator_in<H>(
+        &self,
+        limits: crate::UnitLimits,
+        temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        retained: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<(), crate::UnitConstructionFailure<H>> {
+        let mut creation = crate::unit_creation::UnitValidationCreation::new(temporary, retained);
+        crate::validation::validate_core(
+            &self.ports,
+            &self.definitions,
+            &self.roots,
+            limits,
+            &mut creation,
+            work,
+        )
+        .map_err(|error| creation.finish_error(error, work))
+    }
+}

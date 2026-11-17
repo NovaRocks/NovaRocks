@@ -16,6 +16,7 @@
 // under the License.
 
 //! Exact correspondence of rooted control, call claims and original requests.
+use crate::unit_creation::{UnitMessage, UnitValidationCreation, ValidationFailure};
 use crate::{ExprKind, RootOrdinal, UnitError, UnitParts};
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, ControlShape, EffectContractError,
@@ -23,12 +24,13 @@ use novarocks_type_contract::{
 };
 use std::collections::BTreeSet;
 
-pub(crate) fn validate(
-    parts: &UnitParts,
+pub(crate) fn validate_core<'a, H>(
+    parts: &'a UnitParts,
+    creation: &mut UnitValidationCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), UnitError> {
+) -> Result<(), ValidationFailure<'a, H>> {
     if parts.roots.len() != parts.root_uses.len() {
-        return Err(UnitError::invalid(
+        return Err(ValidationFailure::invalid(
             None,
             None,
             "root-use count differs from roots",
@@ -38,14 +40,14 @@ pub(crate) fn validate(
     for (ordinal, (root, &id)) in parts.roots.iter().zip(&parts.root_uses).enumerate() {
         let root_ordinal = RootOrdinal::new(ordinal as u32);
         let invocation = parts.control.uses().get(&id).ok_or_else(|| {
-            UnitError::invalid(
+            ValidationFailure::invalid(
                 Some(root.definition),
                 Some(root_ordinal),
                 "root use is absent",
             )
         })?;
         work.flush()?;
-        let fresh = roots.insert(id);
+        let fresh = creation.set_insert(&mut roots, id, work)?;
         work.step()?;
         work.flush()?;
         if !fresh
@@ -53,7 +55,7 @@ pub(crate) fn validate(
             || invocation.definition != root.definition
             || invocation.context.demand != root.demand
         {
-            return Err(UnitError::invalid(
+            return Err(ValidationFailure::invalid(
                 Some(root.definition),
                 Some(root_ordinal),
                 "root does not bind one exact independent invocation",
@@ -61,7 +63,7 @@ pub(crate) fn validate(
         }
         let region = &parts.control.regions()[&invocation.context.region];
         if region.parent.is_some() || region.guard.is_some() {
-            return Err(UnitError::invalid(
+            return Err(ValidationFailure::invalid(
                 Some(root.definition),
                 Some(root_ordinal),
                 "root invocation belongs to a guarded region",
@@ -69,7 +71,7 @@ pub(crate) fn validate(
         }
     }
     if roots.len() != parts.control.root_use_ids().len() {
-        return Err(UnitError::invalid(
+        return Err(ValidationFailure::invalid(
             None,
             None,
             "control flow contains an unbound root",
@@ -83,7 +85,7 @@ pub(crate) fn validate(
             .definitions
             .get(invocation.definition.get() as usize)
             .ok_or_else(|| {
-                UnitError::invalid(
+                ValidationFailure::invalid(
                     Some(invocation.definition),
                     None,
                     "invocation definition is absent",
@@ -93,45 +95,41 @@ pub(crate) fn validate(
             && (*node.ty.data_type() != arrow_schema::DataType::Boolean
                 || node.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical)
         {
-            return Err(UnitError::invalid(
+            return Err(ValidationFailure::invalid(
                 Some(node.id),
                 None,
                 "TruthOnly invocation is not a physical Boolean",
             ));
         }
         work.flush()?;
-        used_regions.insert(invocation.context.region);
+        creation.set_insert(&mut used_regions, invocation.context.region, work)?;
         work.step()?;
         work.flush()?;
         let mut expected = Vec::new();
         if let Some(shape) = node.kind.intrinsic_control_shape()? {
             if shape != invocation.control {
-                return Err(UnitError::invalid(
+                return Err(ValidationFailure::invalid(
                     Some(node.id),
                     None,
                     "intrinsic control differs from its definition",
                 ));
             }
             node.kind.invocation_references_observed(|id| {
-                crate::validation::reserve(&mut expected, 1, work)?;
+                creation.reserve(&mut expected, 1, work)?;
                 expected.push(id);
                 work.step()?;
-                Ok::<_, UnitError>(())
+                Ok::<_, ValidationFailure<'a, H>>(())
             })?;
         } else {
             let ExprKind::FunctionCall { function, args } = &node.kind else {
-                return Err(UnitError::invalid(
+                return Err(ValidationFailure::invalid(
                     Some(node.id),
                     None,
                     "control names an unknown scalar definition",
                 ));
             };
             let claim = parts.claims.get(&use_id).ok_or_else(|| {
-                UnitError::invalid(
-                    Some(node.id),
-                    None,
-                    format!("function use {} lacks a call claim", use_id.get()),
-                )
+                ValidationFailure::invalid(Some(node.id), None, UnitMessage::MissingClaim(use_id))
             })?;
             call_count += 1;
             work.step()?;
@@ -141,7 +139,7 @@ pub(crate) fn validate(
                     .argument_control
                     .matches_scalar_shape(invocation.control)
             {
-                return Err(UnitError::invalid(
+                return Err(ValidationFailure::invalid(
                     Some(node.id),
                     None,
                     "call claim context/control differs from its invocation",
@@ -150,7 +148,7 @@ pub(crate) fn validate(
             if claim.effects.proof_scope != CallProofScope::Unconditional
                 && claim.effects.proof_scope != CallProofScope::Region(claim.context.region)
             {
-                return Err(UnitError::invalid(
+                return Err(ValidationFailure::invalid(
                     Some(node.id),
                     None,
                     "call proof scope names a foreign region",
@@ -160,13 +158,22 @@ pub(crate) fn validate(
             let mut keys = BTreeSet::new();
             for reference in &claim.effects.environment {
                 work.flush()?;
-                if !references.insert(*reference) || !keys.insert(reference.expected_key) {
+                if !creation.set_insert(&mut references, *reference, work)?
+                    || !creation.set_insert(&mut keys, reference.expected_key, work)?
+                {
                     return Err(EffectContractError::InvalidEnvironmentReference.into());
                 }
                 work.step()?;
                 work.flush()?;
             }
             work.flush()?;
+            let mut environment_dependencies = Vec::new();
+            creation.reserve(&mut environment_dependencies, keys.len(), work)?;
+            for key in keys {
+                environment_dependencies.push(key);
+                work.step()?;
+            }
+            let environment_dependencies = creation.boxed(environment_dependencies, work)?;
             let declaration = FunctionEffectDeclaration {
                 value_stability: claim.effects.value_stability,
                 own_row_error: claim.effects.own_row_error,
@@ -175,7 +182,7 @@ pub(crate) fn validate(
                 argument_control: claim.effects.argument_control,
                 instance_state: claim.effects.instance_state,
                 observable_effects: claim.effects.observable_effects,
-                environment_dependencies: keys.into_iter().collect(),
+                environment_dependencies,
             };
             work.step()?;
             work.flush()?;
@@ -191,14 +198,14 @@ pub(crate) fn validate(
                             work,
                         )?)
                 {
-                    return Err(UnitError::invalid(
+                    return Err(ValidationFailure::invalid(
                         Some(node.id),
                         None,
                         "regexp_count source claim differs from actual emitted source",
                     ));
                 }
             } else if claim.regexp_count_pattern_source.is_some() {
-                return Err(UnitError::invalid(
+                return Err(ValidationFailure::invalid(
                     Some(node.id),
                     None,
                     "unrelated call carries regexp_count source",
@@ -213,14 +220,14 @@ pub(crate) fn validate(
                             work,
                         )?)
                 {
-                    return Err(UnitError::invalid(
+                    return Err(ValidationFailure::invalid(
                         Some(node.id),
                         None,
                         "to_base64 source claim differs from actual emitted source",
                     ));
                 }
             } else if claim.to_base64_byte_source.is_some() {
-                return Err(UnitError::invalid(
+                return Err(ValidationFailure::invalid(
                     Some(node.id),
                     None,
                     "unrelated call carries to_base64 source",
@@ -228,33 +235,34 @@ pub(crate) fn validate(
             }
             match (invocation.control, &claim.temporal_source) {
                 (ControlShape::TemporalSource(shape), Some(plan)) => {
-                    let actual = crate::temporal_source_definitions_observed(
+                    let actual = crate::temporal_source::temporal_source_definitions_for_unit(
                         shape.kind(),
                         &parts.definitions,
                         args,
+                        creation,
                         work,
                     )?;
                     if actual.facts.shape() != shape {
-                        return Err(UnitError::invalid(
+                        return Err(ValidationFailure::invalid(
                             Some(node.id),
                             None,
                             "temporal invocation shape differs from actual emitted source",
                         ));
                     }
                     plan.validate(&actual).map_err(|_| {
-                        UnitError::invalid(
+                        ValidationFailure::invalid(
                             Some(node.id),
                             None,
                             "temporal source claim differs from actual definitions",
                         )
                     })?;
-                    crate::validation::reserve(&mut expected, actual.definitions.len(), work)?;
+                    creation.reserve(&mut expected, actual.definitions.len(), work)?;
                     for &definition in &actual.definitions {
                         expected.push(definition);
                         work.step()?;
                     }
                     if plan.sources.len() != invocation.arguments.len() {
-                        return Err(UnitError::invalid(
+                        return Err(ValidationFailure::invalid(
                             Some(node.id),
                             None,
                             "temporal source use count differs from invocation",
@@ -262,7 +270,7 @@ pub(crate) fn validate(
                     }
                     for (source, &argument) in plan.sources.iter().zip(&invocation.arguments) {
                         if source.use_id != argument {
-                            return Err(UnitError::invalid(
+                            return Err(ValidationFailure::invalid(
                                 Some(node.id),
                                 None,
                                 "temporal source claims a foreign argument use",
@@ -272,7 +280,7 @@ pub(crate) fn validate(
                     }
                 }
                 (ControlShape::TemporalSource(_), None) | (_, Some(_)) => {
-                    return Err(UnitError::invalid(
+                    return Err(ValidationFailure::invalid(
                         Some(node.id),
                         None,
                         "temporal source claim does not match invocation control",
@@ -280,15 +288,15 @@ pub(crate) fn validate(
                 }
                 (ControlShape::TypeOnly | ControlShape::NoArguments, None) => {}
                 (_, None) => node.kind.invocation_references_observed(|id| {
-                    crate::validation::reserve(&mut expected, 1, work)?;
+                    creation.reserve(&mut expected, 1, work)?;
                     expected.push(id);
                     work.step()?;
-                    Ok::<_, UnitError>(())
+                    Ok::<_, ValidationFailure<'a, H>>(())
                 })?,
             }
         }
         if expected.len() != invocation.arguments.len() {
-            return Err(UnitError::invalid(
+            return Err(ValidationFailure::invalid(
                 Some(node.id),
                 None,
                 "invocation child count differs from ordered definition occurrences",
@@ -296,10 +304,10 @@ pub(crate) fn validate(
         }
         for (&definition, argument) in expected.iter().zip(&invocation.arguments) {
             let child = parts.control.uses().get(argument).ok_or_else(|| {
-                UnitError::invalid(Some(node.id), None, "invocation child use is absent")
+                ValidationFailure::invalid(Some(node.id), None, "invocation child use is absent")
             })?;
             if child.definition != definition {
-                return Err(UnitError::invalid(
+                return Err(ValidationFailure::invalid(
                     Some(node.id),
                     None,
                     "invocation child names a different definition occurrence",
@@ -314,7 +322,7 @@ pub(crate) fn validate(
                 .and_then(|id| parts.definitions.get(id.get() as usize))
                 .is_some_and(|body| matches!(body.kind, ExprKind::Lambda { .. }))
         {
-            return Err(UnitError::invalid(
+            return Err(ValidationFailure::invalid(
                 Some(node.id),
                 None,
                 "higher-order control does not name an actual lambda argument",
@@ -323,14 +331,14 @@ pub(crate) fn validate(
         work.step()?;
     }
     if call_count != parts.claims.len() {
-        return Err(UnitError::invalid(
+        return Err(ValidationFailure::invalid(
             None,
             None,
             "call claims include a foreign or non-call use",
         ));
     }
     if used_regions.len() != parts.control.regions().len() {
-        return Err(UnitError::invalid(
+        return Err(ValidationFailure::invalid(
             None,
             None,
             "unit control contains an unused region",
@@ -344,7 +352,7 @@ pub(crate) fn validate(
         };
         requests += 1;
         let request = parts.requests.get(&node.id).ok_or_else(|| {
-            UnitError::invalid(
+            ValidationFailure::invalid(
                 Some(node.id),
                 None,
                 "function definition lacks its original request",
@@ -353,7 +361,7 @@ pub(crate) fn validate(
         if request.arguments.len() != function.argument_types.len()
             || request.logical_argument_count != function.argument_types.len()
         {
-            return Err(UnitError::invalid(
+            return Err(ValidationFailure::invalid(
                 Some(node.id),
                 None,
                 "original request argument counts differ from the scalar signature",
@@ -361,7 +369,7 @@ pub(crate) fn validate(
         }
         for (actual, selected) in request.arguments.iter().zip(function.argument_types.iter()) {
             if !actual.matches_type_observed(selected, work)? {
-                return Err(UnitError::invalid(
+                return Err(ValidationFailure::invalid(
                     Some(node.id),
                     None,
                     "original request argument type differs from the scalar signature",
@@ -371,11 +379,20 @@ pub(crate) fn validate(
         }
     }
     if requests != parts.requests.len() {
-        return Err(UnitError::invalid(
+        return Err(ValidationFailure::invalid(
             None,
             None,
             "original requests include a foreign or non-call definition",
         ));
     }
     Ok(())
+}
+
+pub(crate) fn validate(
+    parts: &UnitParts,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), UnitError> {
+    let mut creation = UnitValidationCreation::<std::convert::Infallible>::pure();
+    validate_core(parts, &mut creation, work)
+        .map_err(|error| crate::unit_creation::pure_error(creation.finish_error(error, work)))
 }

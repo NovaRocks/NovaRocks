@@ -68,3 +68,8 @@ mod builder;
 pub use builder::{BoundExprSetBuilder, SealedUnit, UnitTypeEditor};
 
 mod type_editor;
+
+mod unit_creation;
+pub use unit_creation::{
+    ConstructedUnitError, UnitConstructionFailure, UnitConstructionRequest, UnitConstructionStorage,
+};

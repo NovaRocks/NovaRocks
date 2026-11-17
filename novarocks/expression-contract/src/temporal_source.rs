@@ -16,14 +16,17 @@
 // under the License.
 //! Author exact source facts from the expression the current v1 codec emits.
 //! SQL syntax that was already canonicalized away is not reconstructed.
-//! Callers admit temporary cast/source containers before entry; observation
-//! does not mint funding or authenticate an installed owner.
+//! Pure callers have no funding port. Unit validation borrows its actual
+//! temporary creation scope at each owned cast/source container operation.
+use crate::unit_creation::{UnitAllocationFailure, UnitValidationCreation, ValidationFailure};
 use crate::{ExprId, ExprKind, ExprNode};
 use arrow_schema::DataType;
+use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, MAX_CONTROL_DEPTH, TemporalCastKind,
     TemporalSourceDefinitions, TemporalSourceFacts, TemporalSourceKind,
 };
+use std::alloc::Layout;
 #[derive(Debug)]
 pub enum TemporalSourceProjectionError {
     Control(CompileControlError),
@@ -32,6 +35,41 @@ pub enum TemporalSourceProjectionError {
 impl From<CompileControlError> for TemporalSourceProjectionError {
     fn from(e: CompileControlError) -> Self {
         Self::Control(e)
+    }
+}
+enum TemporalSourceConstructionFailure<H> {
+    Control(CompileControlError),
+    Creator(H),
+    Observer(H),
+    Resource(LayoutResourceError),
+    Owner(TemporalSourceProjectionError),
+}
+impl<H> From<CompileControlError> for TemporalSourceConstructionFailure<H> {
+    fn from(e: CompileControlError) -> Self {
+        Self::Control(e)
+    }
+}
+impl<H> From<TemporalSourceProjectionError> for TemporalSourceConstructionFailure<H> {
+    fn from(e: TemporalSourceProjectionError) -> Self {
+        match e {
+            TemporalSourceProjectionError::Control(e) => Self::Control(e),
+            e => Self::Owner(e),
+        }
+    }
+}
+impl<H> From<UnitAllocationFailure<H>> for TemporalSourceConstructionFailure<H> {
+    fn from(e: UnitAllocationFailure<H>) -> Self {
+        match e {
+            UnitAllocationFailure::Control(e) => Self::Control(e),
+            UnitAllocationFailure::Creator(e) => Self::Creator(e),
+            UnitAllocationFailure::Observer(e) => Self::Observer(e),
+            UnitAllocationFailure::Resource(e) => Self::Resource(e),
+        }
+    }
+}
+impl<H> From<LayoutResourceError> for TemporalSourceConstructionFailure<H> {
+    fn from(e: LayoutResourceError) -> Self {
+        Self::Resource(e)
     }
 }
 pub use novarocks_type_contract::{NonCanonicalNativeV1FunctionName, native_v1_function_name};
@@ -61,12 +99,17 @@ fn cast_kind<'source>(
         TemporalCastKind::Ordinary
     })
 }
-fn own_definitions(
+fn own_definitions<H>(
     source: &[ExprId],
+    creation: &mut UnitValidationCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Box<[ExprId]>, TemporalSourceProjectionError> {
+) -> Result<Box<[ExprId]>, TemporalSourceConstructionFailure<H>> {
     work.flush()?;
     let mut out = Vec::new();
+    creation.request(
+        Layout::array::<ExprId>(source.len()).map_err(|_| LayoutResourceError::Arithmetic)?,
+        work,
+    )?;
     out.try_reserve_exact(source.len())
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     work.flush()?;
@@ -75,16 +118,23 @@ fn own_definitions(
         work.step()?;
     }
     work.flush()?;
+    creation.before_boxed_trim(&out, work)?;
     let out = out.into_boxed_slice();
     work.flush()?;
     Ok(out)
 }
-fn own_cast_chain(
+fn own_cast_chain<H>(
     source: &[TemporalCastKind],
+    creation: &mut UnitValidationCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Box<[TemporalCastKind]>, TemporalSourceProjectionError> {
+) -> Result<Box<[TemporalCastKind]>, TemporalSourceConstructionFailure<H>> {
     work.flush()?;
     let mut out = Vec::new();
+    creation.request(
+        Layout::array::<TemporalCastKind>(source.len())
+            .map_err(|_| LayoutResourceError::Arithmetic)?,
+        work,
+    )?;
     out.try_reserve_exact(source.len())
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     work.flush()?;
@@ -93,6 +143,7 @@ fn own_cast_chain(
         work.step()?;
     }
     work.flush()?;
+    creation.before_boxed_trim(&out, work)?;
     let out = out.into_boxed_slice();
     work.flush()?;
     Ok(out)
@@ -120,6 +171,51 @@ pub fn temporal_source_definitions_from_lookup_observed<'source>(
     args: &[ExprId],
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<TemporalSourceDefinitions<ExprId>, TemporalSourceProjectionError> {
+    let mut creation = UnitValidationCreation::<std::convert::Infallible>::pure();
+    temporal_source_core(kind, definition, args, &mut creation, work).map_err(|error| match error {
+        TemporalSourceConstructionFailure::Control(e) => TemporalSourceProjectionError::Control(e),
+        TemporalSourceConstructionFailure::Creator(never)
+        | TemporalSourceConstructionFailure::Observer(never) => match never {},
+        TemporalSourceConstructionFailure::Resource(_) => {
+            TemporalSourceProjectionError::Control(CompileControlError::ResourceExhausted)
+        }
+        TemporalSourceConstructionFailure::Owner(e) => e,
+    })
+}
+
+/// Only the unit validator borrows funded scratch. The produced Boxes are
+/// consumed and dropped inside that same validation call, before its original
+/// temporary scope is released; they are never published as source authority.
+pub(crate) fn temporal_source_definitions_for_unit<'a, H>(
+    kind: TemporalSourceKind,
+    definitions: &[ExprNode],
+    args: &[ExprId],
+    creation: &mut UnitValidationCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<TemporalSourceDefinitions<ExprId>, ValidationFailure<'a, H>> {
+    temporal_source_core(
+        kind,
+        |id| definitions.get(id.get() as usize),
+        args,
+        creation,
+        work,
+    )
+    .map_err(|error| match error {
+        TemporalSourceConstructionFailure::Control(e) => ValidationFailure::Control(e),
+        TemporalSourceConstructionFailure::Creator(e) => ValidationFailure::Creator(e),
+        TemporalSourceConstructionFailure::Observer(e) => ValidationFailure::Observer(e),
+        TemporalSourceConstructionFailure::Resource(e) => ValidationFailure::Resource(e),
+        TemporalSourceConstructionFailure::Owner(e) => e.into(),
+    })
+}
+
+fn temporal_source_core<'source, H>(
+    kind: TemporalSourceKind,
+    definition: impl Fn(ExprId) -> Option<&'source ExprNode>,
+    args: &[ExprId],
+    creation: &mut UnitValidationCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<TemporalSourceDefinitions<ExprId>, TemporalSourceConstructionFailure<H>> {
     let arity = if kind == TemporalSourceKind::TimeFormat {
         2
     } else {
@@ -128,7 +224,8 @@ pub fn temporal_source_definitions_from_lookup_observed<'source>(
     if args.len() != arity {
         return Err(TemporalSourceProjectionError::Invalid(
             "temporal source signature has wrong arity",
-        ));
+        )
+        .into());
     }
     let normal = args[0];
     let node = definition(normal).ok_or(TemporalSourceProjectionError::Invalid(
@@ -151,9 +248,9 @@ pub fn temporal_source_definitions_from_lookup_observed<'source>(
             (TemporalSourceFacts::FormatOrdinary, None)
         };
         let definitions = if let Some(defs) = defs {
-            own_definitions(&defs, work)?
+            own_definitions(&defs, creation, work)?
         } else {
-            own_definitions(&[normal, args[1]], work)?
+            own_definitions(&[normal, args[1]], creation, work)?
         };
         return Ok(TemporalSourceDefinitions { facts, definitions });
     }
@@ -201,9 +298,9 @@ pub fn temporal_source_definitions_from_lookup_observed<'source>(
         if is_sec && args.len() == 1 {
             work.flush()?;
             let facts = TemporalSourceFacts::SecondsRoundtrip {
-                cast_chain: own_cast_chain(&casts[..cast_count], work)?,
+                cast_chain: own_cast_chain(&casts[..cast_count], creation, work)?,
             };
-            let definitions = own_definitions(&[args[0]], work)?;
+            let definitions = own_definitions(&[args[0]], creation, work)?;
             work.flush()?;
             return Ok(TemporalSourceDefinitions { facts, definitions });
         }
@@ -212,7 +309,7 @@ pub fn temporal_source_definitions_from_lookup_observed<'source>(
         if matches!(dtype(&definition, normal)?, DataType::Utf8) || immediate.is_none() {
             (
                 TemporalSourceFacts::SecondsDirect {
-                    cast_chain: own_cast_chain(&casts[..cast_count], work)?,
+                    cast_chain: own_cast_chain(&casts[..cast_count], creation, work)?,
                 },
                 ([normal, normal, normal], 1),
             )
@@ -223,21 +320,21 @@ pub fn temporal_source_definitions_from_lookup_observed<'source>(
             if matches!(dtype(&definition, immediate)?, DataType::Utf8) {
                 (
                     TemporalSourceFacts::SecondsCastString {
-                        cast_chain: own_cast_chain(&casts[..cast_count], work)?,
+                        cast_chain: own_cast_chain(&casts[..cast_count], creation, work)?,
                     },
                     ([normal, immediate, immediate], 2),
                 )
             } else {
                 (
                     TemporalSourceFacts::SecondsCastOther {
-                        cast_chain: own_cast_chain(&casts[..cast_count], work)?,
+                        cast_chain: own_cast_chain(&casts[..cast_count], creation, work)?,
                     },
                     ([normal, immediate, deepest], 3),
                 )
             }
         };
     work.flush()?;
-    let definitions = own_definitions(&defs.0[..defs.1], work)?;
+    let definitions = own_definitions(&defs.0[..defs.1], creation, work)?;
     work.flush()?;
     Ok(TemporalSourceDefinitions { facts, definitions })
 }
