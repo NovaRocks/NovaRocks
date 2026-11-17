@@ -563,8 +563,8 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
     if count > MAX_CONTROL_DEFINITIONS {
         return Err(ExprCompileError::Invalid("expression definition limit exceeded").into());
     }
-    let mut ids = BTreeMap::new();
-    let mut nodes = Vec::new();
+    let mut ids: BTreeMap<ExprId, CompiledExprId> = BTreeMap::new();
+    let mut nodes: Vec<StaticExprNode> = Vec::new();
     nodes
         .try_reserve_exact(count)
         .map_err(|_| CompileControlError::ResourceExhausted)?;
@@ -669,30 +669,30 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                         .resolve_observed(*reference, &node.ty, work)?,
                 ),
                 ExprKind::Conjunction { args } | ExprKind::Disjunction { args } => {
-                    if args.is_empty()
-                        || node.ty.data_type() != &arrow::datatypes::DataType::Boolean
-                        || node.ty.logical_type()
-                            != novarocks_type_contract::ValueLogicalType::Physical
-                    {
-                        return Err(ExprCompileError::Invalid(
-                            "Boolean connective has an invalid exact result or arity",
-                        )
-                        .into());
+                    let valid =
+                        novarocks_expression_contract::boolean_connective_nullability_observed(
+                            node,
+                            |id| source.definition(id),
+                            |operand, _| {
+                                let local = ids.get(&operand.id).ok_or(
+                                    ExprCompileError::Invalid("Boolean operand was not lowered"),
+                                )?;
+                                let StaticExprKind::Constant(constant) =
+                                    nodes[local.index()].kind()
+                                else {
+                                    return Err(ExprCompileError::Invalid(
+                                        "Boolean source has no original lowered constant",
+                                    ));
+                                };
+                                constant.try_boolean().map_err(ExprCompileError::from)
+                            },
+                            work,
+                        )?;
+                    if !valid {
+                        return Err(ExprCompileError::Invalid("Boolean connective result discards nullable operands without a deciding constant").into());
                     }
                     let mut local_args = Vec::with_capacity(args.len());
                     for child in args {
-                        let child_source = source
-                            .definition(*child)
-                            .ok_or(ExprCompileError::Invalid("missing Boolean operand"))?;
-                        if child_source.ty.data_type() != &arrow::datatypes::DataType::Boolean
-                            || child_source.ty.logical_type()
-                                != novarocks_type_contract::ValueLogicalType::Physical
-                        {
-                            return Err(ExprCompileError::Invalid(
-                                "Boolean operand differs from its exact physical Boolean type",
-                            )
-                            .into());
-                        }
                         local_args.push(
                             *ids.get(child).ok_or(ExprCompileError::Invalid(
                                 "Boolean operand was not lowered",

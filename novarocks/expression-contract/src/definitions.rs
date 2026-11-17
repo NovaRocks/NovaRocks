@@ -411,3 +411,52 @@ pub struct ExprNode {
     pub ty: ValueType,
     pub kind: ExprKind,
 }
+
+/// Complete the Boolean NULL law using the original owner's actual constant
+/// view. Neutral units retain references, so their structural gate cannot
+/// decide this value-dependent proof. The caller supplies checked source
+/// lookup and actual immediate CVs; computed expressions are never folded here.
+/// This borrows the original work without opening an entry, scope or footer.
+pub fn boolean_connective_nullability_observed<'source, E>(
+    source: &ExprNode,
+    definition: impl Fn(ExprId) -> Option<&'source ExprNode>,
+    mut actual_constant: impl FnMut(
+        &ExprNode,
+        &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<Option<bool>, E>,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<bool, E>
+where
+    E: From<novarocks_type_contract::CompileControlError>,
+{
+    let (args, deciding) = match &source.kind {
+        ExprKind::Conjunction { args } => (args, false),
+        ExprKind::Disjunction { args } => (args, true),
+        _ => return Ok(false),
+    };
+    if args.len() < 2
+        || source.ty.data_type() != &arrow_schema::DataType::Boolean
+        || source.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+    {
+        return Ok(false);
+    }
+    let mut nullable = false;
+    let mut constant_decides = false;
+    for id in args {
+        let Some(operand) = definition(*id) else {
+            return Ok(false);
+        };
+        work.step()?;
+        if operand.ty.data_type() != &arrow_schema::DataType::Boolean
+            || operand.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+        {
+            return Ok(false);
+        }
+        nullable |= operand.ty.nullable();
+        if matches!(operand.kind, ExprKind::Constant(_)) {
+            constant_decides |= actual_constant(operand, work)? == Some(deciding);
+            work.step()?;
+        }
+    }
+    Ok(source.ty.nullable() || !nullable || constant_decides)
+}

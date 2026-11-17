@@ -675,23 +675,31 @@ pub(crate) fn validate_boolean_connective_types<'a, H>(
         return Ok(());
     }
     let mut nullable = false;
+    let mut has_immediate_constant_source = false;
     for (ordinal, arg) in args.iter().enumerate() {
         work.step()?;
         let Some(arg) = definitions.get((*arg).get() as usize) else {
             continue;
         };
-        if *arg.ty.data_type() != DataType::Boolean {
+        if *arg.ty.data_type() != DataType::Boolean
+            || arg.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+        {
             errors.push(TypeIssue::new(
                 path,
                 TypeIssueMessage::BooleanArgument(ordinal),
             ));
         }
         nullable |= arg.ty.nullable();
+        has_immediate_constant_source |= matches!(arg.kind, ExprKind::Constant(_));
     }
-    // Three-valued `AND` and `OR` answer null where an argument does, and a
-    // plan's nullability widens on the way out. What they may not do is
-    // answer less than their arguments admit.
-    if *output.ty.data_type() != DataType::Boolean || (nullable && !output.ty.nullable()) {
+    // No external pool value is available in the neutral unit. Only an
+    // immediate ConstantReference can carry a later deciding-value proof.
+    // SQL and BE must check that exact value through the shared source author
+    // before accepting a narrower result; this is not a NULL coercion.
+    if *output.ty.data_type() != DataType::Boolean
+        || output.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+        || (nullable && !output.ty.nullable() && !has_immediate_constant_source)
+    {
         errors.push(TypeIssue::new(
             path,
             "boolean connective result type is inconsistent with its arguments",

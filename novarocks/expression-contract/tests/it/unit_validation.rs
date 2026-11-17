@@ -751,3 +751,93 @@ fn table_function_binding_cannot_be_published_as_a_scalar_call() {
             .contains("scalar call has non-scalar binding")
     );
 }
+
+#[test]
+fn deciding_boolean_source_uses_the_actual_pool_and_preserves_every_control_prefix() {
+    use novarocks_constant_contract::{
+        ConstantPoolId, ConstantPools, ConstantTableError, ConstantValue,
+    };
+    use std::sync::Arc;
+    let value = ConstantValue::from_boolean(
+        Arc::new(arrow_schema::Field::new(
+            "actual_false",
+            DataType::Boolean,
+            true,
+        )),
+        boolean(true),
+        false,
+        policy(),
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap();
+    let reference = novarocks_constant_contract::ConstantReference {
+        pool: ConstantPoolId::new(7),
+        ordinal: value.ordinal(),
+    };
+    let mut pools = ConstantPools::empty();
+    pools.insert(reference.pool, value.pool().clone()).unwrap();
+    let mut b = BoundExprSetBuilder::new(limits());
+    let input = b
+        .add(None, boolean(true), ExprKind::Value(ValueId::new(9)))
+        .unwrap();
+    let literal = b
+        .add(None, boolean(true), ExprKind::Constant(reference))
+        .unwrap();
+    let expression = b
+        .add(
+            None,
+            boolean(false),
+            ExprKind::Conjunction {
+                args: Box::new([input, literal]),
+            },
+        )
+        .unwrap();
+    b.root(expression, EvaluationDemand::TruthOnly, RootScope::Port(0))
+        .unwrap();
+    let unit = no_calls(
+        b,
+        vec![ExprPort {
+            values: Box::new([(ValueId::new(9), boolean(true))]),
+        }],
+        &Control::good(),
+    )
+    .unwrap();
+    let run = |control: &Control, pools: &ConstantPools| -> Result<bool, ConstantTableError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let valid = boolean_connective_nullability_observed(
+            unit.definition(expression).unwrap(),
+            |id| unit.definition(id),
+            |source, work| {
+                let ExprKind::Constant(reference) = source.kind else {
+                    panic!("only the actual immediate source is requested")
+                };
+                pools
+                    .resolve_observed(reference, &source.ty, work)?
+                    .try_boolean()
+                    .map_err(ConstantTableError::Constant)
+            },
+            &mut work,
+        )?;
+        work.finish()?;
+        Ok(valid)
+    };
+    let good = Control::good();
+    assert!(run(&good, &pools).unwrap());
+    assert!(
+        matches!(run(&Control::good(),&ConstantPools::empty()),Err(ConstantTableError::MissingPool(id)) if id==reference.pool)
+    );
+    for at in 0..good.trace().len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control::at(at, cause.clone());
+            assert!(
+                matches!(run(&control,&pools),Err(ConstantTableError::Control(actual)) if actual==cause)
+            );
+            assert_eq!(control.trace(), good.trace()[..=at]);
+        }
+    }
+}

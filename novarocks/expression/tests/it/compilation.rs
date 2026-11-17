@@ -2622,3 +2622,172 @@ fn runtime_columns_keep_canonical_value_reads_after_repeated_publications() {
         4
     );
 }
+
+#[test]
+fn nullable_boolean_connectives_require_actual_deciding_cv_under_both_root_demands() {
+    for or in [false, true] {
+        for constant in [Some(false), Some(true), None] {
+            for demand in [EvaluationDemand::Value, EvaluationDemand::TruthOnly] {
+                for result_nullable in [false, true] {
+                    let source_type = boolean(true);
+                    let field = Arc::new(
+                        Field::new("actual_boolean", DataType::Boolean, true).with_metadata(
+                            std::collections::HashMap::from([(
+                                "fixture_annotation".to_owned(),
+                                "preserved".to_owned(),
+                            )]),
+                        ),
+                    );
+                    let value = match constant {
+                        Some(value) => ConstantValue::from_boolean(
+                            field.clone(),
+                            source_type.clone(),
+                            value,
+                            policy(),
+                            CompilePhase::Validate,
+                            &Control::good(),
+                        ),
+                        None => ConstantValue::null(
+                            field.clone(),
+                            source_type.clone(),
+                            policy(),
+                            CompilePhase::Validate,
+                            &Control::good(),
+                        ),
+                    }
+                    .unwrap();
+                    let reference = ConstantReference {
+                        pool: ConstantPoolId::new(41),
+                        ordinal: value.ordinal(),
+                    };
+                    let mut pools = ConstantPools::empty();
+                    pools.insert(reference.pool, value.pool().clone()).unwrap();
+                    let mut b = builder();
+                    let input = b
+                        .add(None, source_type.clone(), ExprKind::Value(ValueId::new(7)))
+                        .unwrap();
+                    let literal = b
+                        .add(None, source_type.clone(), ExprKind::Constant(reference))
+                        .unwrap();
+                    let args = Box::from([input, literal]);
+                    let root = b
+                        .add(
+                            None,
+                            boolean(result_nullable),
+                            if or {
+                                ExprKind::Disjunction { args }
+                            } else {
+                                ExprKind::Conjunction { args }
+                            },
+                        )
+                        .unwrap();
+                    b.root(root, demand, RootScope::Port(0)).unwrap();
+                    let unit = finish(
+                        b,
+                        vec![ExprPort {
+                            values: Box::from([(ValueId::new(7), source_type.clone())]),
+                        }],
+                    );
+                    let scope = layouts(&[(ValueId::new(7), source_type.clone())]);
+                    let parameters = SemanticParameters::try_new([]).unwrap();
+                    let result = compile(
+                        &unit,
+                        &pools,
+                        &parameters,
+                        ScopeLayouts {
+                            ports: &[scope],
+                            all_ports: None,
+                        },
+                        &Control::good(),
+                    );
+                    if !result_nullable && constant != Some(or) {
+                        assert!(matches!(
+                            result,
+                            Err(ExprCompileError::Invalid(
+                                "Boolean connective result discards nullable operands without a deciding constant"
+                            ))
+                        ));
+                        continue;
+                    }
+                    let compiled = result.unwrap();
+                    let root = &compiled.roots()[0];
+                    assert_eq!(root.demand, demand);
+                    assert_eq!(
+                        compiled.types().get(root.definition.index()),
+                        Some(&FunctionArgumentType::Value(boolean(result_nullable)))
+                    );
+                    let actual = compiled
+                        .definitions()
+                        .nodes()
+                        .iter()
+                        .find_map(|node| match node.kind() {
+                            StaticExprKind::Constant(value) => Some(value),
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(actual.try_boolean().unwrap(), constant);
+                    assert_eq!(actual.value_type(), &source_type);
+                    assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+                    assert_eq!(
+                        actual
+                            .field()
+                            .metadata()
+                            .get("fixture_annotation")
+                            .map(String::as_str),
+                        Some("preserved")
+                    );
+                }
+            }
+        }
+    }
+    // Required inputs do not need a deciding-value exception.
+    for or in [false, true] {
+        let ty = boolean(false);
+        let mut b = builder();
+        let left = b
+            .add(None, ty.clone(), ExprKind::Value(ValueId::new(7)))
+            .unwrap();
+        let right = b
+            .add(None, ty.clone(), ExprKind::Value(ValueId::new(19)))
+            .unwrap();
+        let args = Box::new([left, right]);
+        let root = b
+            .add(
+                None,
+                ty.clone(),
+                if or {
+                    ExprKind::Disjunction { args }
+                } else {
+                    ExprKind::Conjunction { args }
+                },
+            )
+            .unwrap();
+        b.root(root, EvaluationDemand::TruthOnly, RootScope::Port(0))
+            .unwrap();
+        let values = [
+            (ValueId::new(7), ty.clone()),
+            (ValueId::new(19), ty.clone()),
+        ];
+        let unit = finish(
+            b,
+            vec![ExprPort {
+                values: Box::from(values.clone()),
+            }],
+        );
+        let compiled = compile(
+            &unit,
+            &ConstantPools::empty(),
+            &SemanticParameters::try_new([]).unwrap(),
+            ScopeLayouts {
+                ports: &[layouts(&values)],
+                all_ports: None,
+            },
+            &Control::good(),
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.types()[compiled.roots()[0].definition.index()],
+            FunctionArgumentType::Value(ty)
+        );
+    }
+}
