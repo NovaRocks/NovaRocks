@@ -284,3 +284,131 @@ fn table_relation(select: &Select) -> &Table {
         }
     }
 }
+
+#[test]
+fn deep_cte_and_derived_sources_preserve_the_actual_queries_and_leaf_spans() {
+    use novarocks_parser::{Span, ast::LiteralKind};
+    const DEPTH: usize = 4_096;
+    fn parsed(source: &str) -> novarocks_parser::ast::Query {
+        let mut statements = parse(source).unwrap();
+        let Statement::Query(query) = statements.remove(0) else {
+            panic!("query")
+        };
+        query
+    }
+    let source = format!(
+        "{}SELECT 7{}",
+        "WITH c AS (".repeat(DEPTH),
+        ") SELECT 1".repeat(DEPTH)
+    );
+    let query = parsed(&source);
+    let mut cursor = &query;
+    for _ in 0..DEPTH {
+        let with = cursor.with.as_ref().unwrap();
+        assert!(!with.recursive);
+        assert_eq!(with.ctes.len(), 1);
+        let cte = &with.ctes[0];
+        assert_eq!(cte.name.value, "c");
+        assert!(cte.columns.is_none());
+        cursor = &cte.query;
+    }
+    assert!(cursor.with.is_none());
+    let SetExpr::Select(select) = cursor.body.as_ref() else {
+        panic!("actual leaf SELECT")
+    };
+    let novarocks_parser::ast::SelectItem::UnnamedExpr(Expr::Literal(value)) =
+        &select.projection[0]
+    else {
+        panic!("leaf literal")
+    };
+    assert!(matches!(
+        value.kind,
+        LiteralKind::Long {
+            parsed_value: 7,
+            ..
+        }
+    ));
+    let start = source.find('7').unwrap();
+    assert_eq!(value.span, Span::new(start, start + 1));
+    drop(query);
+    let prefix = "SELECT * FROM (";
+    let source = format!("{}SELECT 7{}", prefix.repeat(DEPTH), ")".repeat(DEPTH));
+    let query = parsed(&source);
+    let mut cursor = &query;
+    for level in 0..DEPTH {
+        let SetExpr::Select(select) = cursor.body.as_ref() else {
+            panic!("actual SELECT")
+        };
+        let Some(Relation::TableSubquery(child)) = &select.from else {
+            panic!("real shared subquery")
+        };
+        assert_eq!(
+            child.span,
+            Span::new(
+                level * prefix.len() + prefix.find('(').unwrap(),
+                source.len() - level
+            )
+        );
+        cursor = &child.query;
+    }
+    let SetExpr::Select(select) = cursor.body.as_ref() else {
+        panic!("leaf SELECT")
+    };
+    assert!(select.from.is_none());
+    let novarocks_parser::ast::SelectItem::UnnamedExpr(Expr::Literal(value)) =
+        &select.projection[0]
+    else {
+        panic!("leaf literal")
+    };
+    assert!(matches!(
+        value.kind,
+        LiteralKind::Long {
+            parsed_value: 7,
+            ..
+        }
+    ));
+    let start = source.find('7').unwrap();
+    assert_eq!(value.span, Span::new(start, start + 1));
+    drop(query);
+    // Scalar-subquery ranges exercise the borrowed expression/statement bridge.
+    // This input depth is a test parameter; repeated range scanning remains a
+    // separate algorithm cost from token storage and stack growth.
+    const SCALAR_DEPTH: usize = 1_024;
+    let prefix = "SELECT (";
+    let source = format!(
+        "{}SELECT 7{}",
+        prefix.repeat(SCALAR_DEPTH),
+        ")".repeat(SCALAR_DEPTH)
+    );
+    let query = parsed(&source);
+    let mut cursor = &query;
+    for _ in 0..SCALAR_DEPTH {
+        let SetExpr::Select(select) = cursor.body.as_ref() else {
+            panic!("actual scalar SELECT")
+        };
+        let novarocks_parser::ast::SelectItem::UnnamedExpr(Expr::Subquery(child)) =
+            &select.projection[0]
+        else {
+            panic!("actual scalar subquery")
+        };
+        cursor = &child.query;
+    }
+    let SetExpr::Select(select) = cursor.body.as_ref() else {
+        panic!("leaf SELECT")
+    };
+    let novarocks_parser::ast::SelectItem::UnnamedExpr(Expr::Literal(value)) =
+        &select.projection[0]
+    else {
+        panic!("leaf literal")
+    };
+    assert!(matches!(
+        value.kind,
+        LiteralKind::Long {
+            parsed_value: 7,
+            ..
+        }
+    ));
+    let start = source.find('7').unwrap();
+    assert_eq!(value.span, Span::new(start, start + 1));
+    drop(query);
+}

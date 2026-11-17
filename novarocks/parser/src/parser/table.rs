@@ -276,6 +276,7 @@ fn parse_column(parser: &mut StatementParser<'_, '_>) -> Result<ColumnDefinition
 }
 
 /// `type-name ::= object-name [ "(" number { "," number } ")" | "<" type-argument { "," type-argument } ">" ]`.
+#[recursive::recursive]
 fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, ParseError> {
     let first = parser.parse_contextual_ident()?;
     let start = first.span.start();
@@ -648,6 +649,42 @@ mod tests {
             .expect("statement must parse")
             .pop()
             .expect("one statement")
+    }
+
+    #[test]
+    fn deep_create_type_source_preserves_the_real_leaf_and_following_column() {
+        use crate::ast::{DataTypeParameter, TypeKind};
+        const DEPTH: usize = 4_096;
+        let source = format!(
+            "CREATE TABLE t (a {}INT{}, b INT)",
+            "ARRAY<".repeat(DEPTH),
+            ">".repeat(DEPTH)
+        );
+        let statement = one(&source);
+        let Statement::Table(TableStatement::Create(table)) = &statement else {
+            panic!("CREATE TABLE")
+        };
+        assert_eq!(table.columns.len(), 2);
+        assert_eq!(table.columns[0].name.value, "a");
+        assert_eq!(table.columns[1].name.value, "b");
+        let mut data_type = &table.columns[0].data_type;
+        for _ in 0..DEPTH {
+            let TypeKind::Generic(array) = &data_type.kind else {
+                panic!("generic ARRAY")
+            };
+            assert_eq!(array.name.value, "ARRAY");
+            assert_eq!(array.arguments.len(), 1);
+            let DataTypeParameter::Type(parameter) = &array.arguments[0] else {
+                panic!("actual type child")
+            };
+            data_type = &parameter.data_type;
+        }
+        assert!(
+            matches!(&data_type.kind,TypeKind::Generic(integer)if integer.name.value=="INT" && integer.arguments.is_empty())
+        );
+        assert!(
+            matches!(&table.columns[1].data_type.kind,TypeKind::Generic(integer)if integer.name.value=="INT" && integer.arguments.is_empty())
+        );
     }
 
     #[test]

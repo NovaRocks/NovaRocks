@@ -231,6 +231,7 @@ fn prefix_binding(kind: &TokenKind) -> Option<PrefixBinding> {
 pub(super) struct PrattParser<'source, 'tokens> {
     source: &'source str,
     tokens: &'tokens [Token],
+    boundary_span: Span,
     position: usize,
     pending_type_gt: Option<Span>,
     allow_table_function_named_arguments: bool,
@@ -239,9 +240,24 @@ pub(super) struct PrattParser<'source, 'tokens> {
 
 impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     pub(super) fn new(source: &'source str, tokens: &'tokens [Token]) -> Self {
+        let boundary_span = tokens
+            .last()
+            .filter(|token| token.kind == TokenKind::End)
+            .map_or(Span::new(source.len(), source.len()), |token| token.span);
+        Self::bounded(source, tokens, boundary_span)
+    }
+
+    /// Borrows only the owning caller's token range. The excluded original
+    /// boundary supplies EOF diagnostics without inserting another token.
+    pub(super) fn bounded(
+        source: &'source str,
+        tokens: &'tokens [Token],
+        boundary_span: Span,
+    ) -> Self {
         Self {
             source,
             tokens,
+            boundary_span,
             position: 0,
             pending_type_gt: None,
             allow_table_function_named_arguments: false,
@@ -268,6 +284,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     }
 
     /// `expression ::= prefix-expression { infix-operator expression }`
+    #[recursive::recursive]
     fn parse_binding_power(&mut self, minimum_precedence: u8) -> Result<Expr, ParseError> {
         self.skip_trivia();
         let prefix_start = self.position;
@@ -463,6 +480,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         true
     }
 
+    #[recursive::recursive]
     fn lambda_parameters(expression: &Expr) -> Option<Vec<Ident>> {
         match expression {
             Expr::Identifier(ident) => Some(vec![ident.clone()]),
@@ -1063,7 +1081,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         &mut self,
         start: usize,
     ) -> Result<(AstBox<crate::ast::Query>, Span), ParseError> {
-        let mut parser = StatementParser::new(self.source, &self.tokens[self.position..]);
+        let mut parser = StatementParser::bounded(
+            self.source,
+            &self.tokens[self.position..],
+            self.boundary_span,
+        );
         let mut query = query::parse_query(&mut parser)?;
         query.session_properties.clear();
         self.position += parser.position;
@@ -1429,6 +1451,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         })))
     }
 
+    #[recursive::recursive]
     fn parse_type_name(&mut self) -> Result<TypeName, ParseError> {
         let start = self.current_span().start();
         let Some(token) = self.current().cloned() else {
@@ -2363,7 +2386,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     fn current_span(&self) -> Span {
         self.current()
             .map(|token| token.span)
-            .unwrap_or_else(|| Span::new(self.source.len(), self.source.len()))
+            .unwrap_or(self.boundary_span)
     }
 
     fn current_is_symbol(&self, symbol: Symbol) -> bool {
@@ -2502,8 +2525,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
 pub(super) fn parse_window_specification(
     source: &str,
     tokens: &[Token],
+    boundary_span: Span,
 ) -> Result<WindowSpecification, ParseError> {
-    let mut parser = PrattParser::new(source, tokens);
+    let mut parser = PrattParser::bounded(source, tokens, boundary_span);
     let specification = parser.parse_window_specification()?;
     parser.skip_trivia();
     if parser.is_end() {
@@ -2518,8 +2542,9 @@ pub(super) fn parse_window_specification(
 pub(super) fn parse_table_function_expression(
     source: &str,
     tokens: &[Token],
+    boundary_span: Span,
 ) -> Result<Expr, ParseError> {
-    PrattParser::new(source, tokens)
+    PrattParser::bounded(source, tokens, boundary_span)
         .with_table_function_named_arguments()
         .parse()
 }
@@ -2557,6 +2582,188 @@ fn unescape_string(text: &str, quote: char) -> String {
 #[cfg(test)]
 mod tests {
     use crate::{lex, parser::parse_expression, printer::Printer};
+
+    #[test]
+    fn bounded_expressions_keep_original_boundary_spans_and_do_not_consume_outside_operands() {
+        use crate::{ParseError, Span};
+        for source in ["1 + 9 trailing", "(VALUES (1 + 9)) + 100", "9 trailing"] {
+            let tokens = lex(source).unwrap();
+            let start = source.find('9').unwrap();
+            let span = Span::new(start, start + 1);
+            let end = tokens.iter().position(|token| token.span == span).unwrap();
+            let error = super::PrattParser::bounded(source, &tokens[..end], span)
+                .parse()
+                .unwrap_err();
+            assert_eq!(
+                error,
+                ParseError::UnexpectedToken {
+                    expected: "expression",
+                    found: "EOF".to_owned(),
+                    span
+                }
+            );
+        }
+        let source = "(PARTITION BY 1 + 9) outside";
+        let tokens = lex(source).unwrap();
+        let start = source.find('9').unwrap();
+        let span = Span::new(start, start + 1);
+        let end = tokens.iter().position(|token| token.span == span).unwrap();
+        assert_eq!(
+            super::parse_window_specification(source, &tokens[..end], span).unwrap_err(),
+            ParseError::UnexpectedToken {
+                expected: "expression",
+                found: "EOF".to_owned(),
+                span
+            }
+        );
+        let source = "1 +";
+        let tokens = lex(source).unwrap();
+        assert_eq!(
+            super::PrattParser::new(source, &tokens)
+                .parse()
+                .unwrap_err(),
+            ParseError::UnexpectedToken {
+                expected: "expression",
+                found: "EOF".to_owned(),
+                span: Span::new(source.len(), source.len())
+            }
+        );
+        let source = "(VALUES (7)) + 100";
+        let tokens = lex(source).unwrap();
+        let start = source.find('+').unwrap();
+        let boundary = Span::new(start, start + 1);
+        let end = tokens
+            .iter()
+            .position(|token| token.span == boundary)
+            .unwrap();
+        let expression = super::PrattParser::bounded(source, &tokens[..end], boundary)
+            .parse()
+            .unwrap();
+        let crate::ast::Expr::Subquery(node) = expression else {
+            panic!("actual bounded scalar subquery")
+        };
+        assert_eq!(node.span, Span::new(0, source.find(" +").unwrap()));
+        let crate::ast::SetExpr::Values(values) = node.query.body.as_ref() else {
+            panic!("original VALUES")
+        };
+        let crate::ast::Expr::Literal(value) = &values.rows[0][0] else {
+            panic!("literal")
+        };
+        assert!(matches!(
+            value.kind,
+            crate::ast::LiteralKind::Long {
+                parsed_value: 7,
+                ..
+            }
+        ));
+        let start = source.find('7').unwrap();
+        assert_eq!(value.span, Span::new(start, start + 1));
+    }
+
+    #[test]
+    fn bounded_table_function_port_preserves_named_argument_scope_and_excluded_boundary() {
+        use crate::ast::{BinaryOperator, Expr, LiteralKind};
+        use crate::{ParseError, Span};
+        let source = "f(end => 9), outside";
+        let tokens = lex(source).unwrap();
+        let start = source.find('9').unwrap();
+        let missing = Span::new(start, start + 1);
+        let end = tokens
+            .iter()
+            .position(|token| token.span == missing)
+            .unwrap();
+        assert_eq!(
+            super::parse_table_function_expression(source, &tokens[..end], missing).unwrap_err(),
+            ParseError::UnexpectedToken {
+                expected: "expression",
+                found: "EOF".to_owned(),
+                span: missing
+            }
+        );
+        let start = source.find(',').unwrap();
+        let boundary = Span::new(start, start + 1);
+        let end = tokens
+            .iter()
+            .position(|token| token.span == boundary)
+            .unwrap();
+        let expression =
+            super::parse_table_function_expression(source, &tokens[..end], boundary).unwrap();
+        let Expr::FunctionCall(call) = expression else {
+            panic!("original table call")
+        };
+        assert_eq!(call.name.parts[0].value, "f");
+        assert_eq!(call.arguments.len(), 1);
+        let Expr::Binary(named) = &call.arguments[0].value else {
+            panic!("original named argument producer")
+        };
+        assert_eq!(named.operator, BinaryOperator::NamedArgument);
+        assert!(matches!(named.left.as_ref(),Expr::Identifier(name)if name.value=="end"));
+        assert!(
+            matches!(named.right.as_ref(),Expr::Literal(value)if matches!(value.kind,LiteralKind::Long{parsed_value:9,..}))
+        );
+        assert_eq!(
+            &source[call.arguments[0].span.start()..call.arguments[0].span.end()],
+            "end => 9"
+        );
+    }
+
+    #[test]
+    fn deep_function_and_cast_type_sources_use_their_real_recursive_entries() {
+        use crate::Span;
+        use crate::ast::{DataTypeParameter, Expr, LiteralKind, TypeKind};
+        const DEPTH: usize = 4_096;
+        let source = format!("{}7{}", "f(".repeat(DEPTH), ")".repeat(DEPTH));
+        let expression = parse_expression(&source, &lex(&source).unwrap()).unwrap();
+        let mut cursor = &expression;
+        for _ in 0..DEPTH {
+            let Expr::FunctionCall(call) = cursor else {
+                panic!("one actual call per source level")
+            };
+            assert_eq!(call.name.parts[0].value, "f");
+            assert_eq!(call.arguments.len(), 1);
+            assert!(call.arguments[0].name.is_none());
+            cursor = &call.arguments[0].value;
+        }
+        assert!(
+            matches!(cursor,Expr::Literal(value)if matches!(value.kind,LiteralKind::Long{parsed_value:7,..}))
+        );
+        let start = source.find('7').unwrap();
+        assert_eq!(cursor.span(), Span::new(start, start + 1));
+        drop(expression);
+        let source = format!(
+            "CAST(7 AS {}INT{})",
+            "ARRAY<".repeat(DEPTH),
+            ">".repeat(DEPTH)
+        );
+        let expression = parse_expression(&source, &lex(&source).unwrap()).unwrap();
+        let Expr::Cast(cast) = &expression else {
+            panic!("real CAST")
+        };
+        assert!(!cast.safe);
+        assert!(
+            matches!(&cast.expression,Expr::Literal(value)if matches!(value.kind,LiteralKind::Long{parsed_value:7,..}))
+        );
+        assert_eq!(
+            cast.data_type.span,
+            Span::new(source.find("ARRAY<").unwrap(), source.len() - 1)
+        );
+        let mut data_type = &cast.data_type;
+        for _ in 0..DEPTH {
+            let TypeKind::Generic(array) = &data_type.kind else {
+                panic!("generic ARRAY")
+            };
+            assert_eq!(array.name.value, "ARRAY");
+            assert_eq!(array.arguments.len(), 1);
+            let DataTypeParameter::Type(parameter) = &array.arguments[0] else {
+                panic!("actual type child")
+            };
+            data_type = &parameter.data_type;
+        }
+        assert!(
+            matches!(&data_type.kind,TypeKind::Generic(integer)if integer.name.value=="INT" && integer.arguments.is_empty())
+        );
+        drop(expression);
+    }
 
     #[test]
     fn row_constructor_arrow_and_table_arguments_keep_their_original_grammar() {

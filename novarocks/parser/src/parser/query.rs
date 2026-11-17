@@ -106,6 +106,7 @@ pub(super) fn parse(
     Ok(Some(Statement::Query(parse_query(parser)?)))
 }
 
+#[recursive::recursive]
 pub(super) fn parse_query(
     parser: &mut StatementParser<'_, '_>,
 ) -> Result<Query, crate::ParseError> {
@@ -630,10 +631,9 @@ fn parse_window_specification_until(
     let boundary = parser
         .tokens
         .get(end)
-        .map_or_else(|| parser.current_span(), |token| token.span);
-    let mut tokens = parser.tokens[begin..end].to_vec();
-    tokens.push(Token::new(TokenKind::End, boundary));
-    let specification = parse_window_specification(parser.source, &tokens)?;
+        .map_or(parser.boundary_span, |token| token.span);
+    let specification =
+        parse_window_specification(parser.source, &parser.tokens[begin..end], boundary)?;
     parser.position = end;
     parser.skip_trivia();
     Ok(specification)
@@ -1582,13 +1582,11 @@ fn parse_expression_range(
     begin: usize,
     end: usize,
 ) -> Result<Expr, crate::ParseError> {
-    let mut expression_tokens: Vec<Token> = parser.tokens[begin..end].to_vec();
     let boundary = parser
         .tokens
         .get(end)
-        .map_or_else(|| parser.current_span(), |token| token.span);
-    expression_tokens.push(Token::new(TokenKind::End, boundary));
-    PrattParser::new(parser.source, &expression_tokens).parse()
+        .map_or(parser.boundary_span, |token| token.span);
+    PrattParser::bounded(parser.source, &parser.tokens[begin..end], boundary).parse()
 }
 
 fn parse_table_function_expression_until(
@@ -1612,13 +1610,11 @@ fn parse_table_function_expression_range(
     begin: usize,
     end: usize,
 ) -> Result<Expr, crate::ParseError> {
-    let mut expression_tokens: Vec<Token> = parser.tokens[begin..end].to_vec();
     let boundary = parser
         .tokens
         .get(end)
-        .map_or_else(|| parser.current_span(), |token| token.span);
-    expression_tokens.push(Token::new(TokenKind::End, boundary));
-    parse_table_function_expression(parser.source, &expression_tokens)
+        .map_or(parser.boundary_span, |token| token.span);
+    parse_table_function_expression(parser.source, &parser.tokens[begin..end], boundary)
 }
 
 fn token_is_word(parser: &StatementParser<'_, '_>, token: &Token, word: &str) -> bool {

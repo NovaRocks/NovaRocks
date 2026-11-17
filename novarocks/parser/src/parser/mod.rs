@@ -60,15 +60,27 @@ pub fn parse(source: &str) -> Result<Vec<Statement>, ParserError> {
 struct StatementParser<'source, 'tokens> {
     source: &'source str,
     tokens: &'tokens [Token],
+    boundary_span: Span,
     position: usize,
     pending_type_gt: Option<Span>,
 }
 
 impl<'source, 'tokens> StatementParser<'source, 'tokens> {
     fn new(source: &'source str, tokens: &'tokens [Token]) -> Self {
+        let boundary_span = tokens
+            .last()
+            .filter(|token| token.kind == TokenKind::End)
+            .map_or(Span::new(source.len(), source.len()), |token| token.span);
+        Self::bounded(source, tokens, boundary_span)
+    }
+
+    /// Borrows only the owning caller's token range. The excluded original
+    /// boundary supplies EOF diagnostics without inserting another token.
+    fn bounded(source: &'source str, tokens: &'tokens [Token], boundary_span: Span) -> Self {
         Self {
             source,
             tokens,
+            boundary_span,
             position: 0,
             pending_type_gt: None,
         }
@@ -129,7 +141,7 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
     pub(super) fn current_span(&self) -> Span {
         self.current()
             .map(|token| token.span)
-            .unwrap_or_else(|| Span::new(self.source.len(), self.source.len()))
+            .unwrap_or(self.boundary_span)
     }
 
     pub(super) fn current_is_keyword(&self, keyword: Keyword) -> bool {
