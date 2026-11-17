@@ -3,11 +3,11 @@
 // this work for additional information regarding copyright ownership.
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
-//! Complete SQL/JSON syntax facts for pinned Trino e2d50bb733e.
+//! Complete SQL/JSON syntax facts.
 //! Parsing and execution policy belong to their original owners.
 //! JSON paths are decoded StringLiteral payloads, never raw-SQL placeholders.
 
-use super::{Expr, Fold, Ident, SyntaxEq, TypeName, Visit};
+use super::{AstBox, AstVec, Expr, Fold, Ident, SyntaxEq, TypeName, Visit};
 use crate::Span;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -227,7 +227,7 @@ pub struct JsonTableQueryColumn {
 pub struct JsonTableNestedColumns {
     pub json_path: JsonPathString,
     pub path_name: Option<Ident>,
-    pub columns: Vec<JsonTableColumn>,
+    pub columns: AstVec<JsonTableColumn>,
     pub span: Span,
 }
 
@@ -248,14 +248,14 @@ pub struct JsonTablePlanLeaf {
 pub struct JsonTablePlanParentChild {
     pub plan_type: JsonTableParentChildPlanType,
     pub parent: JsonTablePlanLeaf,
-    pub child: Box<JsonTableSpecificPlan>,
+    pub child: AstBox<JsonTableSpecificPlan>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JsonTablePlanSiblings {
     pub plan_type: JsonTableSiblingsPlanType,
-    pub siblings: Vec<JsonTableSpecificPlan>,
+    pub siblings: AstVec<JsonTableSpecificPlan>,
     pub span: Span,
 }
 
@@ -605,6 +605,7 @@ pub fn walk_json_table_plan_siblings<V: Visit + ?Sized>(
     }
 }
 
+#[recursive::recursive]
 pub fn walk_json_table_column<V: Visit + ?Sized>(visitor: &mut V, node: &JsonTableColumn) {
     match node {
         JsonTableColumn::Ordinality(child) => visitor.visit_json_table_ordinality_column(child),
@@ -621,6 +622,7 @@ pub fn walk_json_table_plan<V: Visit + ?Sized>(visitor: &mut V, node: &JsonTable
     }
 }
 
+#[recursive::recursive]
 pub fn walk_json_table_specific_plan<V: Visit + ?Sized>(
     visitor: &mut V,
     node: &JsonTableSpecificPlan,
@@ -820,7 +822,7 @@ pub fn fold_json_table_plan_parent_child<F: Fold + ?Sized>(
     mut node: JsonTablePlanParentChild,
 ) -> JsonTablePlanParentChild {
     node.parent = folder.fold_json_table_plan_leaf(node.parent);
-    node.child = Box::new(folder.fold_json_table_specific_plan(*node.child));
+    node.child = AstBox::new(folder.fold_json_table_specific_plan(node.child.into_inner()));
     node
 }
 
@@ -836,6 +838,7 @@ pub fn fold_json_table_plan_siblings<F: Fold + ?Sized>(
     node
 }
 
+#[recursive::recursive]
 pub fn fold_json_table_column<F: Fold + ?Sized>(
     folder: &mut F,
     node: JsonTableColumn,
@@ -870,6 +873,7 @@ pub fn fold_json_table_plan<F: Fold + ?Sized>(
     }
 }
 
+#[recursive::recursive]
 pub fn fold_json_table_specific_plan<F: Fold + ?Sized>(
     folder: &mut F,
     node: JsonTableSpecificPlan,
@@ -1077,6 +1081,7 @@ impl SyntaxEq for JsonTablePlanSiblings {
 }
 
 impl SyntaxEq for JsonTableColumn {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Ordinality(left), Self::Ordinality(right)) => left.syntax_eq(right),
@@ -1099,6 +1104,7 @@ impl SyntaxEq for JsonTablePlan {
 }
 
 impl SyntaxEq for JsonTableSpecificPlan {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Leaf(left), Self::Leaf(right)) => left.syntax_eq(right),
@@ -1281,7 +1287,7 @@ impl JsonTableNestedColumns {
         let node = Self {
             json_path,
             path_name,
-            columns,
+            columns: columns.into(),
             span,
         };
         node.validate_constructor_invariants()?;
@@ -1303,7 +1309,7 @@ impl JsonTablePlanSiblings {
     ) -> Result<Self, JsonAstInvariantError> {
         let node = Self {
             plan_type,
-            siblings,
+            siblings: siblings.into(),
             span,
         };
         node.validate_constructor_invariants()?;

@@ -245,13 +245,13 @@ mod tests {
         }
 
         let expression = Expr::Binary(BinaryExpr {
-            left: Box::new(Expr::Identifier(Ident {
+            left: crate::ast::AstBox::new(Expr::Identifier(Ident {
                 value: "a".to_owned(),
                 quoted: false,
                 span: span(0, 1),
             })),
             operator: BinaryOperator::Add,
-            right: Box::new(Expr::FunctionCall(AstBox::new(FunctionCall {
+            right: crate::ast::AstBox::new(Expr::FunctionCall(AstBox::new(FunctionCall {
                 name: ObjectName {
                     parts: vec![Ident {
                         value: "abs".to_owned(),
@@ -300,7 +300,7 @@ mod tests {
         }
 
         let expression = Expr::Nested(NestedExpr {
-            expression: Box::new(Expr::Identifier(Ident {
+            expression: crate::ast::AstBox::new(Expr::Identifier(Ident {
                 value: "old".to_owned(),
                 quoted: false,
                 span: span(1, 4),
@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(
             expression,
             Expr::Nested(NestedExpr {
-                expression: Box::new(Expr::Identifier(Ident {
+                expression: crate::ast::AstBox::new(Expr::Identifier(Ident {
                     value: "new".to_owned(),
                     quoted: false,
                     span: span(1, 4),

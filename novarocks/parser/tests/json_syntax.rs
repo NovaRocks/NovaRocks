@@ -52,7 +52,7 @@ fn every_json_expression_reaches_the_public_printer_and_validator() {
     let doc = build::identifier(build::ident("doc", false));
     let roots = vec![
         (
-            Expr::JsonConstructor(Box::new(JsonConstructor {
+            Expr::JsonConstructor(novarocks_parser::ast::AstBox::new(JsonConstructor {
                 expression: doc.clone(),
                 format: JsonFormat::Json,
                 span: SYNTHETIC,
@@ -60,7 +60,7 @@ fn every_json_expression_reaches_the_public_printer_and_validator() {
             "JSON(doc FORMAT JSON)",
         ),
         (
-            Expr::JsonExists(Box::new(JsonExists {
+            Expr::JsonExists(novarocks_parser::ast::AstBox::new(JsonExists {
                 path_invocation: invocation(),
                 error_behavior: JsonExistsErrorBehavior::False,
                 span: SYNTHETIC,
@@ -68,7 +68,7 @@ fn every_json_expression_reaches_the_public_printer_and_validator() {
             "JSON_EXISTS(doc FORMAT JSON, 'lax $' FALSE ON ERROR)",
         ),
         (
-            Expr::JsonValue(Box::new(
+            Expr::JsonValue(novarocks_parser::ast::AstBox::new(
                 JsonValue::new(
                     invocation(),
                     None,
@@ -87,7 +87,7 @@ fn every_json_expression_reaches_the_public_printer_and_validator() {
             "JSON_QUERY(doc FORMAT JSON, 'lax $' WITHOUT ARRAY WRAPPER NULL ON EMPTY NULL ON ERROR)",
         ),
         (
-            Expr::JsonSerialize(Box::new(JsonSerialize {
+            Expr::JsonSerialize(novarocks_parser::ast::AstBox::new(JsonSerialize {
                 expression: doc,
                 input_format: JsonFormat::Json,
                 returned_type: None,
@@ -98,7 +98,7 @@ fn every_json_expression_reaches_the_public_printer_and_validator() {
             "JSON_SERIALIZE(doc FORMAT JSON)",
         ),
         (
-            Expr::JsonObject(Box::new(JsonObject {
+            Expr::JsonObject(novarocks_parser::ast::AstBox::new(JsonObject {
                 members: vec![],
                 null_on_null: true,
                 unique_keys: false,
@@ -109,7 +109,7 @@ fn every_json_expression_reaches_the_public_printer_and_validator() {
             "JSON_OBJECT()",
         ),
         (
-            Expr::JsonArray(Box::new(JsonArray {
+            Expr::JsonArray(novarocks_parser::ast::AstBox::new(JsonArray {
                 elements: vec![],
                 null_on_null: false,
                 returned_type: None,
@@ -188,8 +188,10 @@ fn public_validation_consumes_json_constructor_invariants_with_original_spans() 
     )
     .unwrap();
     value.error_behavior = JsonValueBehavior::Default;
-    let error =
-        validate_statement(&expression_query(Expr::JsonValue(Box::new(value)))).unwrap_err();
+    let error = validate_statement(&expression_query(Expr::JsonValue(
+        novarocks_parser::ast::AstBox::new(value),
+    )))
+    .unwrap_err();
     assert_eq!(
         error,
         ValidateError::InvalidStructure {

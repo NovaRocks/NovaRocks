@@ -23,13 +23,13 @@ use crate::{
 /// A SQL expression with source spans retained at every syntax node.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Expr {
-    JsonConstructor(Box<super::JsonConstructor>),
-    JsonExists(Box<super::JsonExists>),
-    JsonValue(Box<super::JsonValue>),
+    JsonConstructor(AstBox<super::JsonConstructor>),
+    JsonExists(AstBox<super::JsonExists>),
+    JsonValue(AstBox<super::JsonValue>),
     JsonQuery(AstBox<super::JsonQuery>),
-    JsonSerialize(Box<super::JsonSerialize>),
-    JsonObject(Box<super::JsonObject>),
-    JsonArray(Box<super::JsonArray>),
+    JsonSerialize(AstBox<super::JsonSerialize>),
+    JsonObject(AstBox<super::JsonObject>),
+    JsonArray(AstBox<super::JsonArray>),
 
     Identifier(Ident),
     AllRows(AllRows),
@@ -136,33 +136,33 @@ pub enum NullTreatment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnaryExpr {
     pub operator: UnaryOperator,
-    pub expression: Box<Expr>,
+    pub expression: AstBox<Expr>,
     pub span: Span,
 }
 
 /// A binary expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinaryExpr {
-    pub left: Box<Expr>,
+    pub left: AstBox<Expr>,
     pub operator: BinaryOperator,
-    pub right: Box<Expr>,
+    pub right: AstBox<Expr>,
     pub span: Span,
 }
 
 /// A parenthesized expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NestedExpr {
-    pub expression: Box<Expr>,
+    pub expression: AstBox<Expr>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IntervalExpr {
-    pub value: Box<Expr>,
+    pub value: AstBox<Expr>,
     pub leading_field: IntervalField,
-    pub leading_precision: Option<Box<Expr>>,
+    pub leading_precision: Option<AstBox<Expr>>,
     pub last_field: Option<IntervalField>,
-    pub fractional_seconds_precision: Option<Box<Expr>>,
+    pub fractional_seconds_precision: Option<AstBox<Expr>>,
     pub span: Span,
 }
 

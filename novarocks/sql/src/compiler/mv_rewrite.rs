@@ -4112,14 +4112,16 @@ mod tests {
         };
         let capacity = LIMIT / std::mem::size_of::<novarocks_parser::ast::JsonObjectMember>() + 1;
         select.projection[0] = novarocks_parser::build::item(
-            Expr::JsonObject(Box::new(novarocks_parser::ast::JsonObject {
-                members: Vec::with_capacity(capacity),
-                null_on_null: true,
-                unique_keys: false,
-                returned_type: None,
-                output_format: None,
-                span: novarocks_parser::SYNTHETIC,
-            })),
+            Expr::JsonObject(novarocks_parser::ast::AstBox::new(
+                novarocks_parser::ast::JsonObject {
+                    members: Vec::with_capacity(capacity),
+                    null_on_null: true,
+                    unique_keys: false,
+                    returned_type: None,
+                    output_format: None,
+                    span: novarocks_parser::SYNTHETIC,
+                },
+            )),
             None,
         );
         let definition = SqlMvRewriteDefinitionFacts::try_new(

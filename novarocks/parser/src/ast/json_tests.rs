@@ -149,7 +149,7 @@ fn table(prefix: &str, span: Span) -> JsonTable {
             JsonTableColumn::Nested(JsonTableNestedColumns {
                 json_path: path(prefix, "nested_path", span),
                 path_name: Some(id(prefix, "nested_name", span)),
-                columns: vec![
+                columns: (vec![
                     JsonTableColumn::Value(JsonTableValueColumn {
                         name: id(prefix, "nested_value", span),
                         data_type: simple_type(prefix, "nested_type", span),
@@ -164,8 +164,9 @@ fn table(prefix: &str, span: Span) -> JsonTable {
                         name: id(prefix, "nested_ordinal", span),
                         span,
                     }),
-                ],
-                span,
+                ])
+                .into(),
+                span: span,
             }),
         ],
         plan: Some(JsonTablePlan::Specific(JsonTableSpecificPlan::ParentChild(
@@ -175,15 +176,18 @@ fn table(prefix: &str, span: Span) -> JsonTable {
                     name: id(prefix, "plan_parent", span),
                     span,
                 },
-                child: Box::new(JsonTableSpecificPlan::Siblings(JsonTablePlanSiblings {
-                    plan_type: JsonTableSiblingsPlanType::Cross,
-                    siblings: vec![
-                        leaf(prefix, "plan_left", span),
-                        leaf(prefix, "plan_right", span),
-                    ],
-                    span,
-                })),
-                span,
+                child: crate::ast::AstBox::new(JsonTableSpecificPlan::Siblings(
+                    JsonTablePlanSiblings {
+                        plan_type: JsonTableSiblingsPlanType::Cross,
+                        siblings: (vec![
+                            leaf(prefix, "plan_left", span),
+                            leaf(prefix, "plan_right", span),
+                        ])
+                        .into(),
+                        span: span,
+                    },
+                )),
+                span: span,
             },
         ))),
         error_behavior: Some(JsonTableErrorBehavior::Empty),
@@ -207,10 +211,10 @@ fn fixtures(prefix: &str, span: Span) -> Fixtures {
     Fixtures {
         constructor: JsonConstructor {
             expression: Expr::Binary(BinaryExpr {
-                left: Box::new(expr(prefix, "ctor_left", span)),
+                left: crate::ast::AstBox::new(expr(prefix, "ctor_left", span)),
                 operator: BinaryOperator::Add,
-                right: Box::new(expr(prefix, "ctor_right", span)),
-                span,
+                right: crate::ast::AstBox::new(expr(prefix, "ctor_right", span)),
+                span: span,
             }),
             format: JsonFormat::Utf32,
             span,
@@ -938,7 +942,9 @@ fn parent_plan_leaf_is_visited_folded_and_compared_independently_of_child() {
     };
     assert_distinct(plan, |n| n.parent.name.value = "different_parent".into());
     assert_distinct(plan, |n| n.plan_type = JsonTableParentChildPlanType::Outer);
-    assert_distinct(plan, |n| n.child = Box::new(leaf("", "other_child", s())));
+    assert_distinct(plan, |n| {
+        n.child = super::AstBox::new(leaf("", "other_child", s()))
+    });
     let JsonTableSpecificPlan::Siblings(siblings) = plan.child.as_ref() else {
         panic!("siblings fixture")
     };
@@ -1166,7 +1172,7 @@ fn nested_constructor_requires_child_columns_without_inventing_a_path_name() {
     let nested = JsonTableNestedColumns::new(p.clone(), None, vec![child.clone()], s()).unwrap();
     assert_eq!(nested.json_path, p);
     assert_eq!(nested.path_name, None);
-    assert_eq!(nested.columns, [child]);
+    assert_eq!(nested.columns.as_slice(), &[child]);
 }
 
 #[test]
@@ -1182,7 +1188,7 @@ fn sibling_constructor_checks_cardinality_without_sorting_or_deduplicating() {
     let accepted =
         JsonTablePlanSiblings::new(JsonTableSiblingsPlanType::Cross, children.clone(), s())
             .unwrap();
-    assert_eq!(accepted.siblings, children);
+    assert_eq!(accepted.siblings.as_slice(), children.as_slice());
     assert_eq!(accepted.plan_type, JsonTableSiblingsPlanType::Cross);
     assert!(
         JsonTablePlanSiblings::new(

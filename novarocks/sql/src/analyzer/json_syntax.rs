@@ -726,7 +726,7 @@ mod tests {
             (build::string("duplicate"), build::string("{\"raw\":1}")),
             (
                 build::string("duplicate"),
-                ast::Expr::JsonObject(Box::new(nested)),
+                ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(nested)),
             ),
         ]);
         assert!(is_supported_json_object_profile(&node));
@@ -749,7 +749,10 @@ mod tests {
             ],
             node.span,
         );
-        let actual_query = projection_query(ast::Expr::JsonObject(Box::new(node)), vec![]);
+        let actual_query = projection_query(
+            ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(node)),
+            vec![],
+        );
         let expected_query = projection_query(ordinary, vec![]);
         let (actual, _, _) =
             crate::analyzer::analyze(&actual_query, &NO_TABLES, "default").unwrap();
@@ -841,10 +844,9 @@ mod tests {
                 true,
             ),
             array(
-                vec![ast::Expr::JsonObject(Box::new(object(vec![(
-                    build::string("k"),
-                    build::integer(1),
-                )])))],
+                vec![ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(
+                    object(vec![(build::string("k"), build::integer(1))]),
+                ))],
                 true,
             ),
         ] {
@@ -933,7 +935,7 @@ mod tests {
             assert_eq!(error.span(), Some(node.span));
             let span = node.span;
             let query = projection_query(
-                ast::Expr::JsonObject(Box::new(node)),
+                ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(node)),
                 vec![missing_table("must_not_discover_object")],
             );
             let error = crate::analyzer::analyze(&query, &NO_TABLES, "default").unwrap_err();
@@ -964,7 +966,7 @@ mod tests {
             assert_eq!(error.span(), Some(node.span));
             let span = node.span;
             let query = projection_query(
-                ast::Expr::JsonArray(Box::new(node)),
+                ast::Expr::JsonArray(novarocks_parser::ast::AstBox::new(node)),
                 vec![missing_table("must_not_discover_array")],
             );
             let error = crate::analyzer::analyze(&query, &NO_TABLES, "default").unwrap_err();
@@ -1030,7 +1032,10 @@ mod tests {
             (build::string("assigned"), assigned.clone()),
         ]);
         let object_span = node.span;
-        let actual_query = projection_query(ast::Expr::JsonObject(Box::new(node)), vec![]);
+        let actual_query = projection_query(
+            ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(node)),
+            vec![],
+        );
         let expected_query = projection_query(
             ordinary_constructor(
                 "json_object",
@@ -1124,7 +1129,10 @@ mod tests {
             true,
         );
         let array_span = array.span;
-        let array_query = projection_query(ast::Expr::JsonArray(Box::new(array)), vec![]);
+        let array_query = projection_query(
+            ast::Expr::JsonArray(novarocks_parser::ast::AstBox::new(array)),
+            vec![],
+        );
         let ordinary_query = projection_query(
             ordinary_constructor(
                 "json_array",
@@ -1186,7 +1194,7 @@ mod tests {
         let array = array(vec![build::null()], true);
         for (actual, ordinary) in [
             (
-                ast::Expr::JsonObject(Box::new(object.clone())),
+                ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(object.clone())),
                 ordinary_constructor(
                     "json_object",
                     vec![build::string("k"), build::null()],
@@ -1194,7 +1202,7 @@ mod tests {
                 ),
             ),
             (
-                ast::Expr::JsonArray(Box::new(array.clone())),
+                ast::Expr::JsonArray(novarocks_parser::ast::AstBox::new(array.clone())),
                 ordinary_constructor("json_array", vec![build::null()], array.span),
             ),
         ] {
@@ -1217,7 +1225,7 @@ mod tests {
         let array_node = array(vec![unknown()], true);
         for (typed, ordinary) in [
             (
-                ast::Expr::JsonObject(Box::new(object_node.clone())),
+                ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(object_node.clone())),
                 ordinary_constructor(
                     "json_object",
                     vec![build::string("k"), unknown()],
@@ -1225,7 +1233,7 @@ mod tests {
                 ),
             ),
             (
-                ast::Expr::JsonArray(Box::new(array_node.clone())),
+                ast::Expr::JsonArray(novarocks_parser::ast::AstBox::new(array_node.clone())),
                 ordinary_constructor("json_array", vec![unknown()], array_node.span),
             ),
         ] {
@@ -1250,8 +1258,8 @@ mod tests {
         unsupported_object.unique_keys = true;
         let unsupported_array = array(vec![unknown()], false);
         for typed in [
-            ast::Expr::JsonObject(Box::new(unsupported_object)),
-            ast::Expr::JsonArray(Box::new(unsupported_array)),
+            ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(unsupported_object)),
+            ast::Expr::JsonArray(novarocks_parser::ast::AstBox::new(unsupported_array)),
         ] {
             let error = ctx
                 .analyze_expr(

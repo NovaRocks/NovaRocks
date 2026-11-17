@@ -471,6 +471,13 @@ impl SyntaxEq for DereferenceExpr {
     }
 }
 
+impl<T: SyntaxEq> SyntaxEq for AstBox<T> {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.as_ref().syntax_eq(other.as_ref())
+    }
+}
+
 impl<T: SyntaxEq> SyntaxEq for Box<T> {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.as_ref().syntax_eq(other.as_ref())

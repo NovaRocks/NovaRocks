@@ -1018,10 +1018,10 @@ fn old_table_function(
                 Expr::Binary(binary)
                     if binary.operator == crate::ast::BinaryOperator::NamedArgument =>
                 {
-                    let Expr::Identifier(name) = *binary.left else {
+                    let Expr::Identifier(name) = binary.left.into_inner() else {
                         unreachable!()
                     };
-                    (Some(name), *binary.right)
+                    (Some(name), binary.right.into_inner())
                 }
                 value => (name, value),
             };

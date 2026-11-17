@@ -51,11 +51,11 @@ mod tests {
             panic!("expected subtraction");
         };
         assert_eq!(subtract.operator, BinaryOperator::Subtract);
-        let Expr::Binary(add) = *subtract.left else {
+        let Expr::Binary(add) = subtract.left.into_inner() else {
             panic!("expected addition on the left");
         };
         assert_eq!(add.operator, BinaryOperator::Add);
-        let Expr::Binary(multiply) = *add.right else {
+        let Expr::Binary(multiply) = add.right.into_inner() else {
             panic!("expected multiplication to bind most tightly");
         };
         assert_eq!(multiply.operator, BinaryOperator::Multiply);
@@ -156,11 +156,11 @@ mod tests {
         };
         assert_eq!(unary.operator, UnaryOperator::Minus);
         assert_eq!(unary.span, Span::new(0, source.len()));
-        let Expr::Nested(nested) = *unary.expression else {
+        let Expr::Nested(nested) = unary.expression.into_inner() else {
             panic!("expected original parentheses");
         };
         assert_eq!(nested.span, Span::new(1, source.len()));
-        let Expr::Literal(positive) = *nested.expression else {
+        let Expr::Literal(positive) = nested.expression.into_inner() else {
             panic!("expected positive inner literal");
         };
         assert_eq!(
@@ -174,10 +174,10 @@ mod tests {
         let Expr::Unary(outer) = parse("-(-9223372036854775808)") else {
             panic!("expected outer unary, without parser evaluation");
         };
-        let Expr::Nested(nested) = *outer.expression else {
+        let Expr::Nested(nested) = outer.expression.into_inner() else {
             panic!("expected nested signed minimum");
         };
-        let Expr::Literal(minimum) = *nested.expression else {
+        let Expr::Literal(minimum) = nested.expression.into_inner() else {
             panic!("expected legal signed minimum");
         };
         assert_eq!(
@@ -283,11 +283,11 @@ mod tests {
             panic!("expected subtraction");
         };
         assert_eq!(subtract.operator, BinaryOperator::Subtract);
-        let Expr::Binary(multiply) = *subtract.right else {
+        let Expr::Binary(multiply) = subtract.right.into_inner() else {
             panic!("expected original multiplication precedence");
         };
         assert_eq!(multiply.operator, BinaryOperator::Multiply);
-        let Expr::Literal(negative) = *multiply.left else {
+        let Expr::Literal(negative) = multiply.left.into_inner() else {
             panic!("expected direct negative multiplicand");
         };
         assert_eq!(

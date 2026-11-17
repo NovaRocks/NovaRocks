@@ -3,13 +3,13 @@
 // this work for additional information regarding copyright ownership.
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
-//! Typed inline routine facts matching Trino e2d50bb733e AstBuilder.
+//! Typed inline routine syntax facts.
 //!
 //! This module owns no execution capability or raw SQL fallback. Characteristic
 //! order, duplicate characteristics, optional ELSE clauses, and optional labels
 //! are retained exactly. Grammar and parser construction enforce cardinality.
 
-use super::{Expr, Fold, Ident, ObjectName, SyntaxEq, TypeName, Visit};
+use super::{AstVec, Expr, Fold, Ident, ObjectName, SyntaxEq, TypeName, Visit};
 use crate::Span;
 
 /// One FUNCTION declaration, with exactly one SQL or external body.
@@ -67,7 +67,7 @@ pub struct CaseStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaseStatementWhenClause {
     pub expression: Expr,
-    pub statements: Vec<ControlStatement>,
+    pub statements: AstVec<ControlStatement>,
     pub span: Span,
 }
 
@@ -75,7 +75,7 @@ pub struct CaseStatementWhenClause {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IfStatement {
     pub expression: Expr,
-    pub statements: Vec<ControlStatement>,
+    pub statements: AstVec<ControlStatement>,
     pub else_if_clauses: Vec<ElseIfClause>,
     pub else_clause: Option<ElseClause>,
     pub span: Span,
@@ -85,14 +85,14 @@ pub struct IfStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ElseIfClause {
     pub expression: Expr,
-    pub statements: Vec<ControlStatement>,
+    pub statements: AstVec<ControlStatement>,
     pub span: Span,
 }
 
 /// ELSE presence is distinct from absence, even for programmatic empty lists.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ElseClause {
-    pub statements: Vec<ControlStatement>,
+    pub statements: AstVec<ControlStatement>,
     pub span: Span,
 }
 
@@ -123,7 +123,7 @@ pub struct VariableDeclaration {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompoundStatement {
     pub variable_declarations: Vec<VariableDeclaration>,
-    pub statements: Vec<ControlStatement>,
+    pub statements: AstVec<ControlStatement>,
     pub span: Span,
 }
 
@@ -131,7 +131,7 @@ pub struct CompoundStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoopStatement {
     pub label: Option<Ident>,
-    pub statements: Vec<ControlStatement>,
+    pub statements: AstVec<ControlStatement>,
     pub span: Span,
 }
 
@@ -140,7 +140,7 @@ pub struct LoopStatement {
 pub struct WhileStatement {
     pub label: Option<Ident>,
     pub expression: Expr,
-    pub statements: Vec<ControlStatement>,
+    pub statements: AstVec<ControlStatement>,
     pub span: Span,
 }
 
@@ -148,7 +148,7 @@ pub struct WhileStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepeatStatement {
     pub label: Option<Ident>,
-    pub statements: Vec<ControlStatement>,
+    pub statements: AstVec<ControlStatement>,
     pub condition: Expr,
     pub span: Span,
 }
@@ -523,6 +523,7 @@ pub fn walk_routine_characteristic<V: Visit + ?Sized>(
     }
 }
 
+#[recursive::recursive]
 pub fn walk_control_statement<V: Visit + ?Sized>(visitor: &mut V, node: &ControlStatement) {
     match node {
         ControlStatement::Return(child) => visitor.visit_return_statement(child),
@@ -779,6 +780,7 @@ pub fn fold_routine_characteristic<F: Fold + ?Sized>(
     }
 }
 
+#[recursive::recursive]
 pub fn fold_control_statement<F: Fold + ?Sized>(
     folder: &mut F,
     node: ControlStatement,
@@ -1020,6 +1022,7 @@ impl SyntaxEq for RoutineCharacteristic {
 }
 
 impl SyntaxEq for ControlStatement {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Return(left), Self::Return(right)) => left.syntax_eq(right),

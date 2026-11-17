@@ -261,8 +261,8 @@ pub fn cast(expr: Expr, data_type: TypeName) -> Expr {
 pub fn nested(expr: Expr) -> Expr {
     let span = expr.span();
     Expr::Nested(NestedExpr {
-        expression: Box::new(expr),
-        span,
+        expression: crate::ast::AstBox::new(expr),
+        span: span,
     })
 }
 
@@ -284,9 +284,9 @@ pub fn unary(operator: UnaryOperator, expr: Expr) -> Result<Expr, BuildError> {
         }));
     }
     Ok(Expr::Unary(UnaryExpr {
-        operator,
-        expression: Box::new(expr),
-        span,
+        operator: operator,
+        expression: crate::ast::AstBox::new(expr),
+        span: span,
     }))
 }
 
@@ -294,17 +294,17 @@ pub fn not(expr: Expr) -> Expr {
     let span = expr.span();
     Expr::Unary(UnaryExpr {
         operator: UnaryOperator::Not,
-        expression: Box::new(expr),
-        span,
+        expression: crate::ast::AstBox::new(expr),
+        span: span,
     })
 }
 
 fn binary_node(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
     Expr::Binary(BinaryExpr {
         span: left.span().cover(right.span()),
-        left: Box::new(left),
-        operator,
-        right: Box::new(right),
+        left: crate::ast::AstBox::new(left),
+        operator: operator,
+        right: crate::ast::AstBox::new(right),
     })
 }
 

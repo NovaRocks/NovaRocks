@@ -61,25 +61,25 @@ fn controls() -> Vec<ControlStatement> {
             expression: Some(expr("case_operand")),
             when_clauses: vec![CaseStatementWhenClause {
                 expression: expr("case_when"),
-                statements: vec![ret("case_body")],
+                statements: (vec![ret("case_body")]).into(),
                 span: span(),
             }],
             else_clause: Some(ElseClause {
-                statements: vec![ret("case_else")],
+                statements: (vec![ret("case_else")]).into(),
                 span: span(),
             }),
             span: span(),
         }),
         ControlStatement::If(IfStatement {
             expression: expr("if_condition"),
-            statements: vec![ret("if_then")],
+            statements: (vec![ret("if_then")]).into(),
             else_if_clauses: vec![ElseIfClause {
                 expression: expr("elseif_condition"),
-                statements: vec![ret("elseif_body")],
+                statements: (vec![ret("elseif_body")]).into(),
                 span: span(),
             }],
             else_clause: Some(ElseClause {
-                statements: vec![ret("if_else")],
+                statements: (vec![ret("if_else")]).into(),
                 span: span(),
             }),
             span: span(),
@@ -99,23 +99,23 @@ fn controls() -> Vec<ControlStatement> {
         )),
         ControlStatement::Compound(CompoundStatement {
             variable_declarations: vec![declaration("subdecl_name", "subdecl_type", None)],
-            statements: vec![ret("compound_return")],
+            statements: (vec![ret("compound_return")]).into(),
             span: span(),
         }),
         ControlStatement::Loop(LoopStatement {
             label: Some(ident("loop_label")),
-            statements: vec![ret("loop_return")],
+            statements: (vec![ret("loop_return")]).into(),
             span: span(),
         }),
         ControlStatement::While(WhileStatement {
             label: Some(ident("while_label")),
             expression: expr("while_condition"),
-            statements: vec![ret("while_return")],
+            statements: (vec![ret("while_return")]).into(),
             span: span(),
         }),
         ControlStatement::Repeat(RepeatStatement {
             label: None,
-            statements: vec![ret("repeat_return")],
+            statements: (vec![ret("repeat_return")]).into(),
             condition: expr("repeat_condition"),
             span: span(),
         }),
@@ -190,7 +190,7 @@ fn fixture() -> FunctionSpecification {
     function(RoutineBody::Sql(ControlStatement::Compound(
         CompoundStatement {
             variable_declarations: vec![decl],
-            statements: controls(),
+            statements: (controls()).into(),
             span: span(),
         },
     )))
@@ -632,7 +632,7 @@ fn routine_control_conditions_labels_options_and_statement_order_are_syntax() {
     }
     let original = CompoundStatement {
         variable_declarations: Vec::new(),
-        statements: vec![ret("first"), ret("second")],
+        statements: (vec![ret("first"), ret("second")]).into(),
         span: span(),
     };
     let mut reversed = original.clone();
@@ -642,7 +642,7 @@ fn routine_control_conditions_labels_options_and_statement_order_are_syntax() {
         expression: None,
         when_clauses: vec![CaseStatementWhenClause {
             expression: expr("predicate"),
-            statements: vec![ret("result")],
+            statements: (vec![ret("result")]).into(),
             span: span(),
         }],
         else_clause: None,
@@ -650,7 +650,7 @@ fn routine_control_conditions_labels_options_and_statement_order_are_syntax() {
     };
     let mut explicit_else = searched.clone();
     explicit_else.else_clause = Some(ElseClause {
-        statements: Vec::new(),
+        statements: (Vec::new()).into(),
         span: span(),
     });
     assert!(!searched.syntax_eq(&explicit_else));
@@ -822,15 +822,17 @@ fn statement_validation_reaches_nested_routine_body_and_property_expressions() {
     crate::ast::validate_statement(&crate::ast::Statement::Query(valid)).unwrap();
     let body = RoutineBody::Sql(ControlStatement::Compound(CompoundStatement {
         variable_declarations: Vec::new(),
-        statements: vec![ControlStatement::While(WhileStatement {
+        statements: (vec![ControlStatement::While(WhileStatement {
             label: None,
             expression: expr("valid_condition"),
-            statements: vec![ControlStatement::Return(ReturnStatement {
+            statements: (vec![ControlStatement::Return(ReturnStatement {
                 value: malformed_case_expression(),
                 span: span(),
-            })],
+            })])
+            .into(),
             span: span(),
-        })],
+        })])
+        .into(),
         span: span(),
     }));
     let query = query_with_functions(vec![function(body)]);

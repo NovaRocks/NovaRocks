@@ -2154,6 +2154,7 @@ impl Printer {
         }
     }
 
+    #[recursive::recursive]
     fn write_control_statement(&mut self, statement: &ControlStatement, indent: usize) {
         match statement {
             ControlStatement::Return(statement) => {
@@ -2578,6 +2579,7 @@ impl Printer {
         self.output.push(')');
     }
 
+    #[recursive::recursive]
     fn write_json_table_column(&mut self, column: &JsonTableColumn) {
         match column {
             JsonTableColumn::Ordinality(node) => self.write_json_table_ordinality_column(node),
@@ -2654,6 +2656,7 @@ impl Printer {
         });
     }
 
+    #[recursive::recursive]
     fn write_json_table_specific_plan(&mut self, plan: &JsonTableSpecificPlan) {
         match plan {
             JsonTableSpecificPlan::Leaf(node) => self.write_json_table_plan_leaf(node),
@@ -2736,9 +2739,9 @@ mod tests {
 
     fn binary(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
         Expr::Binary(BinaryExpr {
-            left: Box::new(left),
-            operator,
-            right: Box::new(right),
+            left: crate::ast::AstBox::new(left),
+            operator: operator,
+            right: crate::ast::AstBox::new(right),
             span: span(),
         })
     }

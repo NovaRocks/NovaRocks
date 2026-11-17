@@ -367,10 +367,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     }))
                 }
                 InfixOperator::Binary(operator) => Expr::Binary(BinaryExpr {
-                    left: Box::new(left),
-                    operator,
-                    right: Box::new(right),
-                    span,
+                    left: crate::ast::AstBox::new(left),
+                    operator: operator,
+                    right: crate::ast::AstBox::new(right),
+                    span: span,
                 }),
                 InfixOperator::Logical(operator) => match left {
                     Expr::Logical(mut logical) if logical.operator == operator => {
@@ -800,8 +800,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             let span = Span::new(start, expression.span().end());
             return Ok(Expr::Unary(UnaryExpr {
                 operator: binding.operator,
-                expression: Box::new(expression),
-                span,
+                expression: crate::ast::AstBox::new(expression),
+                span: span,
             }));
         }
 
@@ -993,8 +993,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.skip_trivia();
         let (leading_field, field_span) = self.parse_interval_field()?;
         Ok(Expr::Interval(IntervalExpr {
-            value: Box::new(value),
-            leading_field,
+            value: crate::ast::AstBox::new(value),
+            leading_field: leading_field,
             leading_precision: None,
             last_field: None,
             fractional_seconds_precision: None,
@@ -1059,7 +1059,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         Ok(if negated {
             Expr::Unary(UnaryExpr {
                 operator: UnaryOperator::Not,
-                expression: Box::new(exists),
+                expression: crate::ast::AstBox::new(exists),
                 span: Span::new(start, span.end()),
             })
         } else {
@@ -1966,10 +1966,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let value = self.parse_binding_power(0)?;
         let span = Span::new(start, value.span().end());
         Ok(Expr::Binary(BinaryExpr {
-            left: Box::new(Expr::Identifier(name)),
+            left: crate::ast::AstBox::new(Expr::Identifier(name)),
             operator: BinaryOperator::NamedArgument,
-            right: Box::new(value),
-            span,
+            right: crate::ast::AstBox::new(value),
+            span: span,
         }))
     }
 
@@ -2236,7 +2236,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let end = self.current_span().end();
         self.advance();
         Ok(Expr::Nested(NestedExpr {
-            expression: Box::new(first),
+            expression: crate::ast::AstBox::new(first),
             span: Span::new(opening_span.start(), end),
         }))
     }

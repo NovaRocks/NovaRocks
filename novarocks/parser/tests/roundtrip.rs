@@ -44,9 +44,9 @@ fn ident(value: &str) -> Expr {
 
 fn binary(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
     Expr::Binary(BinaryExpr {
-        left: Box::new(left),
-        operator,
-        right: Box::new(right),
+        left: novarocks_parser::ast::AstBox::new(left),
+        operator: operator,
+        right: novarocks_parser::ast::AstBox::new(right),
         span: span(),
     })
 }

@@ -1961,19 +1961,27 @@ fn fold_array_expr<F: Fold + ?Sized>(folder: &mut F, mut expression: ArrayExpr) 
 #[recursive::recursive]
 pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
     match expression {
-        Expr::JsonConstructor(node) => {
-            Expr::JsonConstructor(Box::new(folder.fold_json_constructor(*node)))
-        }
-        Expr::JsonExists(node) => Expr::JsonExists(Box::new(folder.fold_json_exists(*node))),
-        Expr::JsonValue(node) => Expr::JsonValue(Box::new(folder.fold_json_value(*node))),
+        Expr::JsonConstructor(node) => Expr::JsonConstructor(crate::ast::AstBox::new(
+            folder.fold_json_constructor(node.into_inner()),
+        )),
+        Expr::JsonExists(node) => Expr::JsonExists(crate::ast::AstBox::new(
+            folder.fold_json_exists(node.into_inner()),
+        )),
+        Expr::JsonValue(node) => Expr::JsonValue(crate::ast::AstBox::new(
+            folder.fold_json_value(node.into_inner()),
+        )),
         Expr::JsonQuery(node) => {
             Expr::JsonQuery(AstBox::new(folder.fold_json_query(node.into_inner())))
         }
-        Expr::JsonSerialize(node) => {
-            Expr::JsonSerialize(Box::new(folder.fold_json_serialize(*node)))
-        }
-        Expr::JsonObject(node) => Expr::JsonObject(Box::new(folder.fold_json_object(*node))),
-        Expr::JsonArray(node) => Expr::JsonArray(Box::new(folder.fold_json_array(*node))),
+        Expr::JsonSerialize(node) => Expr::JsonSerialize(crate::ast::AstBox::new(
+            folder.fold_json_serialize(node.into_inner()),
+        )),
+        Expr::JsonObject(node) => Expr::JsonObject(crate::ast::AstBox::new(
+            folder.fold_json_object(node.into_inner()),
+        )),
+        Expr::JsonArray(node) => Expr::JsonArray(crate::ast::AstBox::new(
+            folder.fold_json_array(node.into_inner()),
+        )),
 
         Expr::Identifier(ident) => Expr::Identifier(folder.fold_ident(ident)),
         Expr::AllRows(node) => Expr::AllRows(folder.fold_all_rows(node)),
@@ -2020,13 +2028,13 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::Nested(expression) => Expr::Nested(folder.fold_nested_expr(expression)),
 
         Expr::Interval(mut expression) => {
-            expression.value = Box::new(folder.fold_expr(*expression.value));
+            expression.value = AstBox::new(folder.fold_expr(expression.value.into_inner()));
             expression.leading_precision = expression
                 .leading_precision
-                .map(|precision| Box::new(folder.fold_expr(*precision)));
+                .map(|precision| AstBox::new(folder.fold_expr(precision.into_inner())));
             expression.fractional_seconds_precision = expression
                 .fractional_seconds_precision
-                .map(|precision| Box::new(folder.fold_expr(*precision)));
+                .map(|precision| AstBox::new(folder.fold_expr(precision.into_inner())));
             Expr::Interval(expression)
         }
         Expr::Subquery(mut expression) => {
@@ -2069,7 +2077,7 @@ pub fn fold_function_call<F: Fold + ?Sized>(
 }
 
 pub fn fold_unary_expr<F: Fold + ?Sized>(folder: &mut F, mut expression: UnaryExpr) -> UnaryExpr {
-    expression.expression = Box::new(folder.fold_expr(*expression.expression));
+    expression.expression = AstBox::new(folder.fold_expr(expression.expression.into_inner()));
     expression
 }
 
@@ -2077,8 +2085,8 @@ pub fn fold_binary_expr<F: Fold + ?Sized>(
     folder: &mut F,
     mut expression: BinaryExpr,
 ) -> BinaryExpr {
-    expression.left = Box::new(folder.fold_expr(*expression.left));
-    expression.right = Box::new(folder.fold_expr(*expression.right));
+    expression.left = AstBox::new(folder.fold_expr(expression.left.into_inner()));
+    expression.right = AstBox::new(folder.fold_expr(expression.right.into_inner()));
     expression
 }
 
@@ -2086,7 +2094,7 @@ pub fn fold_nested_expr<F: Fold + ?Sized>(
     folder: &mut F,
     mut expression: NestedExpr,
 ) -> NestedExpr {
-    expression.expression = Box::new(folder.fold_expr(*expression.expression));
+    expression.expression = AstBox::new(folder.fold_expr(expression.expression.into_inner()));
     expression
 }
 

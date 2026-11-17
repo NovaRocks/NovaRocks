@@ -4010,7 +4010,7 @@ mod tests {
             panic!("SELECT")
         };
         select.projection[0] = novarocks_parser::build::item(
-            Expr::JsonObject(Box::new(ast::JsonObject {
+            Expr::JsonObject(novarocks_parser::ast::AstBox::new(ast::JsonObject {
                 members: vec![ast::JsonObjectMember {
                     key: novarocks_parser::build::string("k"),
                     value: novarocks_parser::build::identifier(novarocks_parser::build::ident(

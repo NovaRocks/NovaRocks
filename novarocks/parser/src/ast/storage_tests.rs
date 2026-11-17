@@ -3106,3 +3106,548 @@ fn actual_projection_values_cycles_keep_owning_traits_real_children_and_semantic
     let Query { body, .. } = tree;
     drop(body.into_inner());
 }
+
+#[test]
+fn remaining_core_expression_edges_preserve_deep_order_precision_and_owning_traits() {
+    use crate::ast::*;
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    let span = Span::new(10, 30);
+    let mut tree = build::integer(-7);
+    for marker in 1..=DEPTH {
+        tree = match marker % 7 {
+            0 => Expr::Unary(UnaryExpr {
+                operator: UnaryOperator::Not,
+                expression: AstBox::new(tree),
+                span,
+            }),
+            1 => Expr::Nested(NestedExpr {
+                expression: AstBox::new(tree),
+                span,
+            }),
+            2 => Expr::Binary(BinaryExpr {
+                left: AstBox::new(tree),
+                operator: BinaryOperator::Add,
+                right: AstBox::new(build::integer(marker)),
+                span,
+            }),
+            3 => Expr::Binary(BinaryExpr {
+                left: AstBox::new(build::integer(marker)),
+                operator: BinaryOperator::Multiply,
+                right: AstBox::new(tree),
+                span,
+            }),
+            mode => {
+                let (value, leading, fractional) = match mode {
+                    4 => (tree, build::integer(marker), build::integer(-marker)),
+                    5 => (build::integer(marker), tree, build::integer(-marker)),
+                    _ => (build::integer(marker), build::integer(-marker), tree),
+                };
+                Expr::Interval(IntervalExpr {
+                    value: AstBox::new(value),
+                    leading_field: IntervalField::Day,
+                    leading_precision: Some(AstBox::new(leading)),
+                    last_field: Some(IntervalField::Second),
+                    fractional_seconds_precision: Some(AstBox::new(fractional)),
+                    span,
+                })
+            }
+        };
+    }
+    let copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    drop(copy);
+    #[derive(Default)]
+    struct Numbers(Vec<i64>);
+    impl Visit for Numbers {
+        fn visit_literal(&mut self, node: &Literal) {
+            if let LiteralKind::Long { parsed_value, .. } = node.kind {
+                self.0.push(parsed_value);
+            }
+        }
+    }
+    let mut expected = Vec::new();
+    for marker in (1..=DEPTH).rev() {
+        match marker % 7 {
+            3 | 5 => expected.push(marker),
+            6 => expected.extend([marker, -marker]),
+            _ => {}
+        }
+    }
+    expected.push(-7);
+    for marker in 1..=DEPTH {
+        match marker % 7 {
+            2 => expected.push(marker),
+            4 => expected.extend([marker, -marker]),
+            5 => expected.push(-marker),
+            _ => {}
+        }
+    }
+    let mut facts = Numbers::default();
+    facts.visit_expr(&tree);
+    assert_eq!(facts.0, expected);
+    struct Increment;
+    impl Fold for Increment {
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                return node;
+            };
+            let Expr::Literal(mut next) = build::integer(parsed_value + 1) else {
+                unreachable!()
+            };
+            next.span = node.span;
+            next
+        }
+    }
+    let changed = Increment.fold_expr(tree.clone());
+    let mut facts = Numbers::default();
+    facts.visit_expr(&changed);
+    assert_eq!(
+        facts.0,
+        expected.iter().map(|value| value + 1).collect::<Vec<_>>()
+    );
+    assert!(!tree.syntax_eq(&changed));
+    let query = build::query(SetExpr::Select(AstBox::new(
+        build::select(vec![build::item(changed, None)], None, None, None).unwrap(),
+    )));
+    validate_statement(&Statement::Query(query)).unwrap();
+    let printed = crate::printer::print_expr(&tree);
+    assert!(printed.contains("-7"));
+    assert!(printed.contains(" TO SECOND("));
+    match tree {
+        Expr::Interval(node) => drop(node.fractional_seconds_precision),
+        other => drop(other),
+    }
+}
+
+#[test]
+fn six_json_root_carriers_preserve_real_inputs_and_deep_traits() {
+    use crate::ast::*;
+    use crate::{Span, build};
+    const DEPTH: usize = 20_000;
+    let span = Span::new(10, 30);
+    let mut tree = build::integer(7);
+    for marker in 0..DEPTH {
+        tree = match marker % 6 {
+            0 => Expr::JsonConstructor(AstBox::new(JsonConstructor {
+                expression: tree,
+                format: JsonFormat::Json,
+                span,
+            })),
+            1 => Expr::JsonExists(AstBox::new(JsonExists {
+                path_invocation: JsonPathInvocation::plain(
+                    tree,
+                    JsonPathString::new("strict $".to_string(), span),
+                    span,
+                ),
+                error_behavior: JsonExistsErrorBehavior::Error,
+                span,
+            })),
+            2 => Expr::JsonValue(AstBox::new(JsonValue {
+                path_invocation: JsonPathInvocation::plain(
+                    tree,
+                    JsonPathString::new("lax $".to_string(), span),
+                    span,
+                ),
+                returned_type: None,
+                empty_behavior: JsonValueBehavior::Null,
+                empty_default: None,
+                error_behavior: JsonValueBehavior::Error,
+                error_default: None,
+                span,
+            })),
+            3 => Expr::JsonSerialize(AstBox::new(JsonSerialize {
+                expression: tree,
+                input_format: JsonFormat::Json,
+                returned_type: None,
+                output_format: None,
+                error_behavior: JsonSerializeErrorBehavior::Error,
+                span,
+            })),
+            4 => Expr::JsonObject(AstBox::new(JsonObject {
+                members: vec![JsonObjectMember {
+                    key: build::string("retained_key"),
+                    value: tree,
+                    format: None,
+                    span,
+                }],
+                null_on_null: true,
+                unique_keys: false,
+                returned_type: None,
+                output_format: None,
+                span,
+            })),
+            _ => Expr::JsonArray(AstBox::new(JsonArray {
+                elements: vec![JsonArrayElement {
+                    value: tree,
+                    format: None,
+                    span,
+                }],
+                null_on_null: true,
+                returned_type: None,
+                output_format: None,
+                span,
+            })),
+        };
+    }
+    let copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH);
+    drop(copy);
+    #[derive(Default)]
+    struct Facts {
+        numbers: Vec<i64>,
+        keys: Vec<String>,
+    }
+    impl Visit for Facts {
+        fn visit_literal(&mut self, node: &Literal) {
+            match &node.kind {
+                LiteralKind::Long { parsed_value, .. } => self.numbers.push(*parsed_value),
+                LiteralKind::String(value) => self.keys.push(value.clone()),
+                _ => {}
+            }
+        }
+    }
+    let mut facts = Facts::default();
+    facts.visit_expr(&tree);
+    assert_eq!(facts.numbers, [7]);
+    assert!(facts.keys.iter().all(|key| key == "retained_key"));
+    assert!(!facts.keys.is_empty());
+    struct Change;
+    impl Fold for Change {
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            match node.kind {
+                LiteralKind::Long { .. } => {
+                    let Expr::Literal(mut next) = build::integer(8) else {
+                        unreachable!()
+                    };
+                    next.span = node.span;
+                    next
+                }
+                _ => node,
+            }
+        }
+    }
+    let changed = Change.fold_expr(tree.clone());
+    let mut facts = Facts::default();
+    facts.visit_expr(&changed);
+    assert_eq!(facts.numbers, [8]);
+    assert!(!tree.syntax_eq(&changed));
+    let query = build::query(SetExpr::Select(AstBox::new(
+        build::select(vec![build::item(changed, None)], None, None, None).unwrap(),
+    )));
+    validate_statement(&Statement::Query(query)).unwrap();
+    let printed = crate::printer::print_expr(&tree);
+    assert!(printed.contains("retained_key"));
+    assert!(printed.contains('7'));
+    drop(tree);
+}
+
+#[test]
+fn pure_json_table_column_and_plan_cycles_preserve_order_and_real_metadata() {
+    use crate::ast::*;
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    let span = Span::new(10, 30);
+    let mut column = JsonTableColumn::Ordinality(JsonTableOrdinalityColumn {
+        name: build::ident("ordinal", false),
+        span,
+    });
+    let mut plan = JsonTableSpecificPlan::Leaf(JsonTablePlanLeaf {
+        name: build::ident("plan_leaf", false),
+        span,
+    });
+    for marker in 1..=DEPTH {
+        column = JsonTableColumn::Nested(JsonTableNestedColumns {
+            json_path: JsonPathString::new("lax $".to_string(), span),
+            path_name: Some(build::ident(format!("n{marker}"), true)),
+            columns: vec![column].into(),
+            span,
+        });
+        plan = if marker % 2 == 0 {
+            JsonTableSpecificPlan::ParentChild(JsonTablePlanParentChild {
+                plan_type: JsonTableParentChildPlanType::Inner,
+                parent: JsonTablePlanLeaf {
+                    name: build::ident(format!("p{marker}"), false),
+                    span,
+                },
+                child: AstBox::new(plan),
+                span,
+            })
+        } else {
+            JsonTableSpecificPlan::Siblings(JsonTablePlanSiblings {
+                plan_type: JsonTableSiblingsPlanType::Cross,
+                siblings: vec![
+                    plan,
+                    JsonTableSpecificPlan::Leaf(JsonTablePlanLeaf {
+                        name: build::ident(format!("s{marker}"), false),
+                        span,
+                    }),
+                ]
+                .into(),
+                span,
+            })
+        };
+    }
+    let table = JsonTable {
+        path_invocation: JsonPathInvocation::plain(
+            build::string("{}"),
+            JsonPathString::new("lax $".to_string(), span),
+            span,
+        ),
+        columns: vec![column],
+        plan: Some(JsonTablePlan::Specific(plan)),
+        error_behavior: None,
+        span,
+    };
+    let tree = build::query(SetExpr::Select(AstBox::new(
+        build::select(
+            vec![build::wildcard()],
+            Some(Relation::JsonTable(AstBox::new(table))),
+            None,
+            None,
+        )
+        .unwrap(),
+    )));
+    let copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    drop(copy);
+    #[derive(Default)]
+    struct Names(Vec<(String, bool)>);
+    impl Visit for Names {
+        fn visit_ident(&mut self, node: &Ident) {
+            self.0.push((node.value.clone(), node.quoted));
+        }
+    }
+    let mut expected = (1..=DEPTH)
+        .rev()
+        .map(|marker| (format!("n{marker}"), true))
+        .collect::<Vec<_>>();
+    expected.push(("ordinal".into(), false));
+    expected.extend(
+        (1..=DEPTH)
+            .rev()
+            .filter(|marker| marker % 2 == 0)
+            .map(|marker| (format!("p{marker}"), false)),
+    );
+    expected.push(("plan_leaf".into(), false));
+    expected.extend(
+        (1..=DEPTH)
+            .filter(|marker| marker % 2 == 1)
+            .map(|marker| (format!("s{marker}"), false)),
+    );
+    let mut facts = Names::default();
+    facts.visit_query(&tree);
+    assert_eq!(facts.0, expected);
+    struct Rename;
+    impl Fold for Rename {
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.value.push_str("_next");
+            node
+        }
+    }
+    let changed = Rename.fold_query(tree.clone());
+    let mut facts = Names::default();
+    facts.visit_query(&changed);
+    assert_eq!(
+        facts.0,
+        expected
+            .iter()
+            .map(|(name, quoted)| (format!("{name}_next"), *quoted))
+            .collect::<Vec<_>>()
+    );
+    assert!(!tree.syntax_eq(&changed));
+    validate_statement(&Statement::Query(changed)).unwrap();
+    let printed = crate::printer::print_query(&tree);
+    assert!(printed.contains("ordinal FOR ORDINALITY"));
+    assert!(printed.contains("plan_leaf"));
+    assert!(printed.contains(" INNER ("));
+    assert!(printed.contains(" CROSS "));
+    drop(tree);
+}
+
+#[test]
+fn pure_routine_statement_cycles_keep_each_body_slot_and_original_return_order() {
+    use crate::ast::*;
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    let span = Span::new(10, 30);
+    fn ret(value: i64, span: Span) -> ControlStatement {
+        ControlStatement::Return(ReturnStatement {
+            value: build::integer(value),
+            span,
+        })
+    }
+    fn chain(depth: i64, span: Span) -> ControlStatement {
+        let mut tree = ret(-7, span);
+        for marker in 1..=depth {
+            tree = match marker % 9 {
+                0 => ControlStatement::Case(CaseStatement {
+                    expression: Some(build::integer(marker)),
+                    when_clauses: vec![CaseStatementWhenClause {
+                        expression: build::boolean(true),
+                        statements: vec![tree].into(),
+                        span,
+                    }],
+                    else_clause: None,
+                    span,
+                }),
+                1 => ControlStatement::Case(CaseStatement {
+                    expression: None,
+                    when_clauses: vec![CaseStatementWhenClause {
+                        expression: build::boolean(true),
+                        statements: vec![ret(marker, span)].into(),
+                        span,
+                    }],
+                    else_clause: Some(ElseClause {
+                        statements: vec![tree].into(),
+                        span,
+                    }),
+                    span,
+                }),
+                2 => ControlStatement::If(IfStatement {
+                    expression: build::integer(marker),
+                    statements: vec![tree].into(),
+                    else_if_clauses: Vec::new(),
+                    else_clause: None,
+                    span,
+                }),
+                3 => ControlStatement::If(IfStatement {
+                    expression: build::boolean(true),
+                    statements: vec![ret(marker, span)].into(),
+                    else_if_clauses: vec![ElseIfClause {
+                        expression: build::boolean(false),
+                        statements: vec![tree].into(),
+                        span,
+                    }],
+                    else_clause: None,
+                    span,
+                }),
+                4 => ControlStatement::If(IfStatement {
+                    expression: build::boolean(true),
+                    statements: vec![ret(marker, span)].into(),
+                    else_if_clauses: Vec::new(),
+                    else_clause: Some(ElseClause {
+                        statements: vec![tree].into(),
+                        span,
+                    }),
+                    span,
+                }),
+                5 => ControlStatement::Compound(CompoundStatement {
+                    variable_declarations: vec![VariableDeclaration {
+                        names: vec![build::ident("local", true)],
+                        data_type: build::simple_type("BIGINT"),
+                        default_value: Some(build::integer(marker)),
+                        span,
+                    }],
+                    statements: vec![tree].into(),
+                    span,
+                }),
+                6 => ControlStatement::Loop(LoopStatement {
+                    label: Some(build::ident("loop_label", true)),
+                    statements: vec![ret(marker, span), tree].into(),
+                    span,
+                }),
+                7 => ControlStatement::While(WhileStatement {
+                    label: Some(build::ident("while_label", true)),
+                    expression: build::integer(marker),
+                    statements: vec![tree].into(),
+                    span,
+                }),
+                _ => ControlStatement::Repeat(RepeatStatement {
+                    label: Some(build::ident("repeat_label", true)),
+                    statements: vec![tree].into(),
+                    condition: build::integer(marker),
+                    span,
+                }),
+            }
+        }
+        tree
+    }
+    fn query(body: ControlStatement, span: Span) -> Query {
+        let mut query = build::query(build::values(vec![vec![build::integer(0)]]).unwrap());
+        query.functions.push(FunctionSpecification {
+            name: build::object_name(vec![build::ident("routine", false)]).unwrap(),
+            parameters: Vec::new(),
+            returns: build::simple_type("BIGINT"),
+            characteristics: Vec::new(),
+            body: RoutineBody::Sql(ControlStatement::Compound(CompoundStatement {
+                variable_declarations: Vec::new(),
+                statements: vec![body].into(),
+                span,
+            })),
+            span,
+        });
+        query
+    }
+    let tree = query(chain(DEPTH, span), span);
+    let copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    drop(copy);
+    #[derive(Default)]
+    struct Numbers(Vec<i64>);
+    impl Visit for Numbers {
+        fn visit_literal(&mut self, node: &Literal) {
+            if let LiteralKind::Long { parsed_value, .. } = node.kind {
+                self.0.push(parsed_value);
+            }
+        }
+    }
+    let mut expected = (1..=DEPTH)
+        .rev()
+        .filter(|marker| marker % 9 != 8)
+        .collect::<Vec<_>>();
+    expected.push(-7);
+    expected.extend((1..=DEPTH).filter(|marker| marker % 9 == 8));
+    expected.push(0);
+    let mut facts = Numbers::default();
+    facts.visit_query(&tree);
+    assert_eq!(facts.0, expected);
+    struct Change;
+    impl Fold for Change {
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                return node;
+            };
+            let Expr::Literal(mut next) = build::integer(parsed_value + 1) else {
+                unreachable!()
+            };
+            next.span = node.span;
+            next
+        }
+    }
+    let changed = Change.fold_query(tree.clone());
+    let mut facts = Numbers::default();
+    facts.visit_query(&changed);
+    assert_eq!(
+        facts.0,
+        expected.iter().map(|value| value + 1).collect::<Vec<_>>()
+    );
+    assert!(!tree.syntax_eq(&changed));
+    validate_statement(&Statement::Query(changed)).unwrap();
+    // Routine indentation has quadratic output size for a linearly deep body.
+    // The owning/traversal test stays deep; this distinct rendering input keeps
+    // its actual canonical indentation without materializing gigabytes of text.
+    let printed = crate::printer::print_query(&query(chain(128, span), span));
+    assert!(printed.contains("RETURN -7"));
+    assert!(printed.contains("END REPEAT"));
+    assert!(printed.contains("ELSEIF FALSE"));
+    let functions = tree.functions.into_inner();
+    assert_eq!(functions[0].name.parts[0].value, "routine");
+    drop(functions);
+}
