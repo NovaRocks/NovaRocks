@@ -302,6 +302,7 @@ pub fn not(expr: Expr) -> Expr {
 
 fn binary_node(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
     Expr::Binary(BinaryExpr {
+        left_operand_span: left.span(),
         span: left.span().cover(right.span()),
         left: crate::ast::AstBox::new(left),
         operator: operator,

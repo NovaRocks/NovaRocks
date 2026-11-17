@@ -194,6 +194,7 @@ mod tests {
         }
 
         let expression = Expr::Binary(BinaryExpr {
+            left_operand_span: span(0, 1),
             left: crate::ast::AstBox::new(Expr::Identifier(Ident {
                 value: "a".to_owned(),
                 quoted: false,

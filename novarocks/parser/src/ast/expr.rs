@@ -177,6 +177,8 @@ pub struct UnaryExpr {
 /// A binary expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinaryExpr {
+    /// The original left operand's diagnostic source range.
+    pub left_operand_span: Span,
     pub left: AstBox<Expr>,
     pub operator: BinaryOperator,
     pub right: AstBox<Expr>,

@@ -510,9 +510,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 self.analyze_syntax_function(SyntaxBuiltin::Row, &arguments, row.span, scope)
             }
 
-            ast::Expr::Binary(binary) => {
-                self.analyze_binary_op(&binary.left, &binary.operator, &binary.right, scope)
-            }
+            ast::Expr::Binary(binary) => self.analyze_binary_op(binary, scope),
 
             ast::Expr::Logical(logical) => self.analyze_boolean_chain(logical, scope),
 
@@ -1869,11 +1867,12 @@ impl<'a> super::AnalyzerContext<'a> {
 
     fn analyze_binary_op(
         &self,
-        left: &ast::Expr,
-        op: &ast::BinaryOperator,
-        right: &ast::Expr,
+        binary: &ast::BinaryExpr,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        let left = binary.left.as_ref();
+        let op = &binary.operator;
+        let right = binary.right.as_ref();
         let left_typed = self.analyze_expr(left, scope)?;
         let right_typed = self.analyze_expr(right, scope)?;
 
@@ -1888,7 +1887,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 cast_boolean_operand_to_number(left_typed),
                 cast_boolean_operand_to_number(right_typed),
                 operator,
-                left.span(),
+                binary.left_operand_span,
             )?,
             None => (left_typed, right_typed),
         };
@@ -1898,7 +1897,7 @@ impl<'a> super::AnalyzerContext<'a> {
             &left_typed,
             op,
             &right_typed,
-            left.span(),
+            binary.left_operand_span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
             self.constant_policy,
             self.control,
@@ -1942,7 +1941,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         "arithmetic operator `{operator:?}` has no frozen result rule for {:?} and {:?}",
                         left_typed.value_type.data_type(), right_typed.value_type.data_type()
                     ),
-                    left.span(),
+                    binary.left_operand_span,
                 )
             })
         };
@@ -1993,7 +1992,7 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::BinaryOperator::Legacy(other) => {
                 return Err(AnalyzeError::unsupported_expression(
                     format!("unsupported binary operator: {other:?}"),
-                    left.span(),
+                    binary.left_operand_span,
                 ));
             }
         };
@@ -2003,7 +2002,7 @@ impl<'a> super::AnalyzerContext<'a> {
         {
             return Err(AnalyzeError::invalid_literal(
                 format!("scale {scale} is greater than max {precision}"),
-                left.span(),
+                binary.left_operand_span,
             ));
         }
 
@@ -7758,9 +7757,8 @@ mod tests {
                 "the original term keeps its complete typed subtree and canonical bindings"
             );
         }
-        let ExprKind::Nested(inner) = &terms[1].kind else {
-            panic!("the original parenthesis owns a typed Nested node")
-        };
+        let inner = terms[1];
+        assert!(matches!(logical.terms[1], ast::Expr::Logical(_)));
         assert_eq!(
             terms[1].value_type,
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true)
@@ -8450,6 +8448,316 @@ mod tests {
             assert!(
                 matches!(&sibling.kind, ExprKind::Literal(LiteralValue::String(text)) if text == "DHL")
             );
+        }
+    }
+
+    #[test]
+    fn computed_arithmetic_operands_keep_complete_types_source_bindings_and_effects() {
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+        for nullable in [false, true] {
+            let catalog = UnaryInputCatalog {
+                key_type: DataType::Int32,
+                nullable,
+                logical_type: None,
+            };
+            for (mode, policy) in [
+                ("32", DecimalOverflowPolicy::OutputNull),
+                ("ERROR_IF_OVERFLOW", DecimalOverflowPolicy::ReportError),
+            ] {
+                for (sql, decimal, expected_type, expected_op, right_op) in [
+                    (
+                        "SELECT (k+1)*(v-2) AS result, k, v FROM unary_input",
+                        false,
+                        DataType::Int64,
+                        BinOp::Mul,
+                        BinOp::Sub,
+                    ),
+                    (
+                        "SELECT (CAST(k AS DECIMAL(4,1))+CAST(1 AS DECIMAL(4,1)))+(CAST(v AS DECIMAL(4,1))+CAST(2 AS DECIMAL(4,1))) AS result, k, v FROM unary_input",
+                        true,
+                        DataType::Decimal128(6, 1),
+                        BinOp::Add,
+                        BinOp::Add,
+                    ),
+                ] {
+                    let statements = novarocks_parser::parse(sql).unwrap();
+                    let [ast::Statement::Query(query)] = statements.as_slice() else {
+                        panic!("query");
+                    };
+                    let ast::SetExpr::Select(original) = query.body.as_ref() else {
+                        panic!("SELECT");
+                    };
+                    let ast::SelectItem::SingleColumn(column) = &original.projection[0] else {
+                        panic!("projection");
+                    };
+                    let ast::Expr::Binary(binary) = &column.expression else {
+                        panic!("actual outer arithmetic");
+                    };
+                    assert!(matches!(binary.left.as_ref(), ast::Expr::Binary(_)));
+                    assert!(matches!(binary.right.as_ref(), ast::Expr::Binary(_)));
+                    let control = crate::compiler::SqlCompileControl::unbounded();
+                    let settings = crate::sql_mode::SqlSemanticSettings::default()
+                        .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(mode));
+                    let (resolved, _, _) =
+                        super::super::analyze_with_function_catalog_and_sql_semantics(
+                            query,
+                            &catalog,
+                            "default",
+                            crate::functions::builtin_sql_function_catalog(),
+                            &settings,
+                            crate::constant::test_constant_policy(),
+                            &control,
+                        )
+                        .unwrap();
+                    let QueryBody::Select(select) = &resolved.body else {
+                        panic!("resolved SELECT");
+                    };
+                    let actual = &select.projection[0].expr;
+                    let expected = FunctionValueType::new(expected_type, true);
+                    assert_eq!(actual.value_type, expected, "{mode}: {sql}");
+                    assert_eq!(resolved.output_columns[0].value_type, expected);
+                    assert_eq!(select.projection[0].field_name.as_deref(), Some("result"));
+                    let ExprKind::BinaryOp {
+                        left,
+                        right,
+                        op,
+                        decimal_overflow_policy,
+                    } = &actual.kind
+                    else {
+                        panic!("outer arithmetic");
+                    };
+                    assert_eq!(*op, expected_op);
+                    assert_eq!(*decimal_overflow_policy, policy);
+                    for (computed, source, expected_op) in [
+                        (left.as_ref(), &select.projection[1].expr, BinOp::Add),
+                        (right.as_ref(), &select.projection[2].expr, right_op),
+                    ] {
+                        let ExprKind::BinaryOp {
+                            left,
+                            op,
+                            decimal_overflow_policy,
+                            ..
+                        } = &computed.kind
+                        else {
+                            panic!("original computed child");
+                        };
+                        assert_eq!(*op, expected_op);
+                        assert_eq!(*decimal_overflow_policy, policy);
+                        let source_child = if decimal {
+                            assert_eq!(
+                                computed.value_type,
+                                FunctionValueType::new(DataType::Decimal128(5, 1), true)
+                            );
+                            let ExprKind::Cast {
+                                expr,
+                                target,
+                                array_failure_mode,
+                                decimal_overflow_policy,
+                            } = &left.kind
+                            else {
+                                panic!("original explicit Decimal cast");
+                            };
+                            assert_eq!(*target, DataType::Decimal128(4, 1));
+                            assert_eq!(*array_failure_mode, None);
+                            assert_eq!(*decimal_overflow_policy, policy);
+                            expr.as_ref()
+                        } else {
+                            left.as_ref()
+                        };
+                        assert_eq!(source_child.value_type, source.value_type);
+                        assert!(
+                            crate::analysis::expr_identity::typed_expr_semantically_eq(
+                                source_child,
+                                source,
+                                &control,
+                            )
+                            .unwrap(),
+                            "same-query original column binding and complete FVT"
+                        );
+                    }
+                    assert_eq!(
+                        select.projection[1].expr.value_type,
+                        FunctionValueType::new(DataType::Int32, nullable)
+                    );
+                    assert_eq!(
+                        select.projection[2].expr.value_type,
+                        FunctionValueType::new(DataType::Int64, false)
+                    );
+                    let mut arena = crate::optimizer::scalar::ScalarArena::new();
+                    let scalar = crate::planner::optimizer_bridge::scalar::intern_typed(
+                        &mut arena, actual, &control,
+                    )
+                    .unwrap();
+                    assert_eq!(arena.value_type(scalar), &expected);
+                    assert_eq!(
+                        crate::optimizer::scalar_expr::can_fail(&arena, scalar),
+                        decimal && policy == DecimalOverflowPolicy::ReportError
+                    );
+                    let rebuilt = crate::planner::optimizer_bridge::scalar::materialize_exprs(
+                        &arena,
+                        &[scalar],
+                    );
+                    assert!(
+                        crate::analysis::expr_identity::typed_expr_semantically_eq(
+                            actual,
+                            &rebuilt[0],
+                            &control
+                        )
+                        .unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn computed_operand_diagnostics_keep_the_original_left_range_and_child_error_order() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_parser::Span;
+        for (sql, kind, span, name) in [
+            (
+                "SELECT (1+2) + [1]",
+                AnalyzeErrorKind::TypeMismatch,
+                Span::new(7, 12),
+                None,
+            ),
+            (
+                "SELECT ((1+2)) + [1]",
+                AnalyzeErrorKind::TypeMismatch,
+                Span::new(7, 14),
+                None,
+            ),
+            (
+                "SELECT (TRUE OR FALSE) + [1]",
+                AnalyzeErrorKind::TypeMismatch,
+                Span::new(7, 22),
+                None,
+            ),
+            (
+                "SELECT (only_missing_left+1) + only_missing_right",
+                AnalyzeErrorKind::UnknownColumn,
+                Span::new(8, 25),
+                Some("only_missing_left"),
+            ),
+            (
+                "SELECT (1+2) + only_missing_right",
+                AnalyzeErrorKind::UnknownColumn,
+                Span::new(15, 33),
+                Some("only_missing_right"),
+            ),
+            (
+                "SELECT ([1]+1) + only_missing_right",
+                AnalyzeErrorKind::TypeMismatch,
+                Span::new(8, 11),
+                None,
+            ),
+        ] {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query");
+            };
+            let error = super::super::analyze(query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(error.kind(), kind, "{sql}: {error}");
+            assert_eq!(error.span(), Some(span), "{sql}: {error}");
+            if let Some(name) = name {
+                assert!(error.message().contains(name), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn computed_arithmetic_keeps_the_actual_constant_field_ordinal_and_compiler_source() {
+        use crate::compiler::materialized_values::MaterializedSourceBorrow;
+        use arrow::array::{Array, Int32Array};
+        use novarocks_functions::ConstantPool;
+        use novarocks_type_contract::{CompilePhase, FunctionValueType};
+        use std::sync::Arc;
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let source_type = FunctionValueType::new(DataType::Int32, false);
+        let field = Arc::new(
+            arrow::datatypes::Field::new("computed_source", DataType::Int32, false).with_metadata(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    "actual_computed_input".to_string(),
+                )]),
+            ),
+        );
+        let pool = ConstantPool::try_new(
+            field.clone(),
+            source_type.clone(),
+            Int32Array::from(vec![17, 21]).to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let statements = novarocks_parser::parse("SELECT (source_value+1)*(3+4)").unwrap();
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query");
+        };
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
+            panic!("projection");
+        };
+        let ast::Expr::Binary(outer) = &column.expression else {
+            panic!("actual outer product");
+        };
+        let ast::Expr::Binary(left) = outer.left.as_ref() else {
+            panic!("actual computed left operand");
+        };
+        let source = left.left.as_ref();
+        assert!(matches!(source, ast::Expr::Identifier(name) if name.value == "source_value"));
+        let clone = source.clone();
+        // This existing context port trusts the caller's actual query member.
+        let mut owned = MaterializedSourceBorrow::empty(query);
+        owned
+            .insert_context_constant(source, pool.value(1).unwrap(), &control)
+            .unwrap();
+        assert!(owned.view().constant_at(&clone).is_none());
+        let mut context = logical_context(&control);
+        context.materialized_values = Some(owned.view());
+        let scope = context.new_scope();
+        let actual = context.analyze_expr(&column.expression, &scope).unwrap();
+        assert_eq!(
+            actual.value_type,
+            FunctionValueType::new(DataType::Int32, true)
+        );
+        let mut arena = crate::optimizer::scalar::ScalarArena::new();
+        let scalar =
+            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &actual, &control)
+                .unwrap();
+        assert!(!crate::optimizer::scalar_expr::can_fail(&arena, scalar));
+        let rebuilt =
+            crate::planner::optimizer_bridge::scalar::materialize_exprs(&arena, &[scalar]);
+        for expression in [&actual, &rebuilt[0]] {
+            let ExprKind::BinaryOp {
+                left,
+                op: BinOp::Mul,
+                ..
+            } = &expression.kind
+            else {
+                panic!("original product");
+            };
+            let ExprKind::BinaryOp {
+                left,
+                op: BinOp::Add,
+                ..
+            } = &left.kind
+            else {
+                panic!("original computed sum");
+            };
+            let ExprKind::Constant(retained) = &left.kind else {
+                panic!("original source");
+            };
+            assert_eq!(left.value_type, source_type);
+            assert_eq!(retained.value_type(), &source_type);
+            assert_eq!(retained.ordinal(), 1);
+            assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
+            assert!(Arc::ptr_eq(retained.pool().field_ref(), &field));
+            assert_eq!(retained.field().metadata(), field.metadata());
+            assert!(!retained.field().metadata().is_empty());
         }
     }
 

@@ -2770,6 +2770,7 @@ mod tests {
 
     fn binary(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
         Expr::Binary(BinaryExpr {
+            left_operand_span: left.span(),
             left: crate::ast::AstBox::new(left),
             operator: operator,
             right: crate::ast::AstBox::new(right),

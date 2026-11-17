@@ -211,6 +211,7 @@ fn fixtures(prefix: &str, span: Span) -> Fixtures {
     Fixtures {
         constructor: JsonConstructor {
             expression: Expr::Binary(BinaryExpr {
+                left_operand_span: span,
                 left: crate::ast::AstBox::new(expr(prefix, "ctor_left", span)),
                 operator: BinaryOperator::Add,
                 right: crate::ast::AstBox::new(expr(prefix, "ctor_right", span)),

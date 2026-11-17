@@ -3126,17 +3126,22 @@ fn remaining_core_expression_edges_preserve_deep_order_precision_and_owning_trai
                 span,
             }),
             2 => Expr::Binary(BinaryExpr {
+                left_operand_span: tree.span(),
                 left: AstBox::new(tree),
                 operator: BinaryOperator::Add,
                 right: AstBox::new(build::integer(marker)),
                 span,
             }),
-            3 => Expr::Binary(BinaryExpr {
-                left: AstBox::new(build::integer(marker)),
-                operator: BinaryOperator::Multiply,
-                right: AstBox::new(tree),
-                span,
-            }),
+            3 => {
+                let left = build::integer(marker);
+                Expr::Binary(BinaryExpr {
+                    left_operand_span: left.span(),
+                    left: AstBox::new(left),
+                    operator: BinaryOperator::Multiply,
+                    right: AstBox::new(tree),
+                    span,
+                })
+            }
             mode => {
                 let (value, leading, fractional) = match mode {
                     4 => (tree, build::integer(marker), build::integer(-marker)),

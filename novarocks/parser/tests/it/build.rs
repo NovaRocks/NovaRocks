@@ -675,10 +675,7 @@ fn logical_nodes_keep_source_order_grouping_and_every_visitor_child() {
     };
     assert_eq!(logical.operator, ast::LogicalOperator::And);
     assert_eq!(logical.terms.len(), 3);
-    let Expr::LegacyParenthesized(group) = &logical.terms[1] else {
-        panic!("explicit parentheses")
-    };
-    let Expr::Logical(or) = group.expression.as_ref() else {
+    let Expr::Logical(or) = &logical.terms[1] else {
         panic!("OR")
     };
     assert_eq!(or.operator, ast::LogicalOperator::Or);

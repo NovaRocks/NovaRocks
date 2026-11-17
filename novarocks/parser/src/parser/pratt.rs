@@ -247,6 +247,7 @@ pub(super) struct ParsedExpression {
     pub(super) expression: Expr,
     pub(super) syntax_span: Span,
     pub(super) legacy_metadata_span: Span,
+    pending_parentheses: Vec<Span>,
 }
 impl ParsedExpression {
     fn authored(expression: Expr, syntax_span: Span, legacy_metadata_span: Span) -> Self {
@@ -254,13 +255,49 @@ impl ParsedExpression {
             expression,
             syntax_span,
             legacy_metadata_span,
+            pending_parentheses: Vec::new(),
         }
     }
+
+    /// Materialize only this uncommitted root's real delimiter pairs.
+    fn keep_parentheses(mut self) -> Self {
+        for span in std::mem::take(&mut self.pending_parentheses) {
+            self.expression = Expr::LegacyParenthesized(LegacyParenthesizedExpr {
+                expression: AstBox::new(self.expression),
+                span,
+            });
+        }
+        self
+    }
+
+    /// The actual arithmetic or logical parent consumes this computed root.
+    fn commit_computed_operand(mut self) -> Self {
+        let computed = match &self.expression {
+            Expr::Logical(_) => true,
+            Expr::Binary(binary) => matches!(
+                binary.operator,
+                BinaryOperator::Add
+                    | BinaryOperator::Subtract
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+            ),
+            _ => false,
+        };
+        if computed {
+            self.pending_parentheses.clear();
+            self
+        } else {
+            self.keep_parentheses()
+        }
+    }
+
     fn into_call_argument(self) -> crate::ast::CallArgument {
+        let retained = self.keep_parentheses();
         crate::ast::CallArgument {
             name: None,
-            value: self.expression,
-            span: self.legacy_metadata_span,
+            value: retained.expression,
+            span: retained.legacy_metadata_span,
         }
     }
 }
@@ -332,9 +369,18 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             .map(|parsed| parsed.expression)
     }
 
+    /// Unknown callers retain the original root shape before taking its value.
+    fn parse_binding_power_frame(
+        &mut self,
+        minimum_precedence: u8,
+    ) -> Result<ParsedExpression, ParseError> {
+        self.parse_deferred_binding_power(minimum_precedence)
+            .map(ParsedExpression::keep_parentheses)
+    }
+
     /// Keep grammar ranges local to the invocation that authored them.
     #[recursive::recursive]
-    fn parse_binding_power_frame(
+    fn parse_deferred_binding_power(
         &mut self,
         minimum_precedence: u8,
     ) -> Result<ParsedExpression, ParseError> {
@@ -344,6 +390,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let mut extendable_logical = None;
         loop {
             self.skip_trivia();
+            if self.current_is_symbol(Symbol::Arrow) {
+                left = left.keep_parentheses();
+            }
             if self.current_is_symbol(Symbol::Arrow)
                 && self.arrow_starts_lambda(&left.expression, prefix_start)
             {
@@ -394,12 +443,34 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
             let predicate_start = self.current_span().start();
             self.advance();
-            let right = self.parse_binding_power_frame(binding.precedence + 1)?;
+            let right = self.parse_deferred_binding_power(binding.precedence + 1)?;
             let syntax_span = left.syntax_span.cover(right.syntax_span);
             let span = left.legacy_metadata_span.cover(right.legacy_metadata_span);
             let next_logical = match binding.operator {
                 InfixOperator::Logical(operator) => Some(operator),
                 _ => None,
+            };
+            let left_operand_span = left.legacy_metadata_span;
+            let computed_parent = matches!(binding.operator, InfixOperator::Logical(_))
+                || matches!(
+                    binding.operator,
+                    InfixOperator::Binary(
+                        BinaryOperator::Add
+                            | BinaryOperator::Subtract
+                            | BinaryOperator::Multiply
+                            | BinaryOperator::Divide
+                            | BinaryOperator::Modulo
+                    )
+                );
+            left = if computed_parent {
+                left.commit_computed_operand()
+            } else {
+                left.keep_parentheses()
+            };
+            let right = if computed_parent {
+                right.commit_computed_operand()
+            } else {
+                right.keep_parentheses()
             };
             let expression = match binding.operator {
                 InfixOperator::Comparison(operator) => {
@@ -423,6 +494,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     span,
                 })),
                 InfixOperator::Binary(operator) => Expr::Binary(BinaryExpr {
+                    left_operand_span,
                     left: AstBox::new(left.expression),
                     operator,
                     right: AstBox::new(right.expression),
@@ -455,6 +527,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         &mut self,
         base: ParsedExpression,
     ) -> Result<ParsedExpression, ParseError> {
+        let base = base.keep_parentheses();
         let start = base.legacy_metadata_span.start();
         let syntax_start = base.syntax_span.start();
         if self.current_is_symbol(Symbol::LBracket) {
@@ -661,6 +734,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         &mut self,
         left: ParsedExpression,
     ) -> Result<ParsedExpression, ParseError> {
+        let left = left.keep_parentheses();
         let start = self.current_span().start();
         let negated = if self.current_is_keyword(Keyword::Not) {
             self.advance();
@@ -2105,6 +2179,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let span = Span::new(start, value.legacy_metadata_span.end());
         Ok(ParsedExpression::authored(
             Expr::Binary(BinaryExpr {
+                left_operand_span: name.span,
                 left: crate::ast::AstBox::new(Expr::Identifier(name)),
                 operator: BinaryOperator::Legacy(crate::ast::legacy::BinaryOperator::NamedArgument),
                 right: crate::ast::AstBox::new(value.expression),
@@ -2349,10 +2424,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     ) -> Result<ParsedExpression, ParseError> {
         self.advance();
         self.skip_trivia();
-        let first = self.parse_binding_power_frame(0)?;
+        let mut first = self.parse_deferred_binding_power(0)?;
         self.skip_trivia();
         if self.current_is_symbol(Symbol::Comma) {
-            let mut expressions = vec![first];
+            let mut expressions = vec![first.keep_parentheses()];
             while self.current_is_symbol(Symbol::Comma) {
                 self.advance();
                 self.skip_trivia();
@@ -2387,14 +2462,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let end = self.current_span().end();
         self.advance();
         let span = Span::new(opening_span.start(), end);
-        Ok(ParsedExpression::authored(
-            Expr::LegacyParenthesized(LegacyParenthesizedExpr {
-                expression: crate::ast::AstBox::new(first.expression),
-                span,
-            }),
-            span,
-            span,
-        ))
+        first.pending_parentheses.push(span);
+        first.syntax_span = span;
+        first.legacy_metadata_span = span;
+        Ok(first)
     }
 
     fn parse_array_expression(&mut self, opening_span: Span) -> Result<Expr, ParseError> {
@@ -3263,7 +3334,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_frames_keep_logical_grouping_and_all_current_parenthesis_nodes() {
+    fn parser_frames_keep_logical_grouping_and_unknown_parenthesis_nodes() {
         use crate::ast::{Expr, LogicalOperator};
         for (source, terms, grouped) in [
             ("a OR b OR c", 3, None),
@@ -3277,10 +3348,7 @@ mod tests {
             assert_eq!(logical.operator, LogicalOperator::Or);
             assert_eq!(logical.terms.len(), terms);
             if let Some(index) = grouped {
-                let Expr::LegacyParenthesized(group) = &logical.terms[index] else {
-                    panic!("the old grouping remains materialized")
-                };
-                let Expr::Logical(inner) = group.expression.as_ref() else {
+                let Expr::Logical(inner) = &logical.terms[index] else {
                     panic!("ordered inner logical chain")
                 };
                 assert_eq!(inner.operator, LogicalOperator::Or);
@@ -3371,6 +3439,197 @@ mod tests {
                 row.fields[index].expression,
                 Expr::LegacyParenthesized(_)
             ));
+        }
+    }
+    #[test]
+    fn computed_operands_keep_real_ranges_and_ordered_children() {
+        use crate::{
+            Span,
+            ast::{BinaryOperator, Expr},
+        };
+        let source = "((a+b))*((c+d))";
+        let tree = parse_expression(source, &lex(source).unwrap()).unwrap();
+        let Expr::Binary(product) = &tree else {
+            panic!("product")
+        };
+        assert_eq!(product.operator, BinaryOperator::Multiply);
+        let separator = source.find('*').unwrap();
+        assert_eq!(product.left_operand_span, Span::new(0, separator));
+        assert_eq!(product.span, Span::new(0, source.len()));
+        for (operand, start, names) in [
+            (
+                product.left.as_ref(),
+                source.find("a+b").unwrap(),
+                ["a", "b"],
+            ),
+            (
+                product.right.as_ref(),
+                source.find("c+d").unwrap(),
+                ["c", "d"],
+            ),
+        ] {
+            let Expr::Binary(sum) = operand else {
+                panic!("direct computed operand")
+            };
+            assert_eq!(sum.operator, BinaryOperator::Add);
+            assert_eq!(sum.span, Span::new(start, start + 3));
+            assert_eq!(sum.left_operand_span, Span::new(start, start + 1));
+            for (child, name, offset) in [
+                (sum.left.as_ref(), names[0], 0),
+                (sum.right.as_ref(), names[1], 2),
+            ] {
+                let Expr::Identifier(identifier) = child else {
+                    panic!("real identifier")
+                };
+                assert_eq!(identifier.value, name);
+                assert_eq!(
+                    identifier.span,
+                    Span::new(start + offset, start + offset + 1)
+                );
+            }
+        }
+        let source = "(a OR b) AND (c OR d)";
+        let tree = parse_expression(source, &lex(source).unwrap()).unwrap();
+        let Expr::Logical(and) = tree else {
+            panic!("conjunction")
+        };
+        for term in &and.terms {
+            let Expr::Logical(or) = term else {
+                panic!("direct grouped logical term")
+            };
+            assert_eq!(or.operator, crate::ast::LogicalOperator::Or);
+            assert_eq!(or.terms.len(), 2);
+        }
+    }
+
+    #[test]
+    fn unknown_parents_and_noncomputed_roots_keep_original_parentheses() {
+        use crate::ast::{Expr, Predicate};
+        for source in [
+            "(a)+b",
+            "(1)+b",
+            "(-1)+b",
+            "(f(a))+b",
+            "(a=b) AND TRUE",
+            "(a||b)+c",
+        ] {
+            let tree = parse_expression(source, &lex(source).unwrap()).unwrap();
+            let first = match &tree {
+                Expr::Binary(binary) => binary.left.as_ref(),
+                Expr::Logical(logical) => &logical.terms[0],
+                _ => panic!("known actual parent"),
+            };
+            assert!(matches!(first, Expr::LegacyParenthesized(_)), "{source}");
+        }
+        for source in [
+            "f((a+b))",
+            "-(a+b)",
+            "+(a+b)",
+            "(a+b).field",
+            "(a+b)=c",
+            "a||(b+c)",
+            "ROW((a+b))",
+        ] {
+            let tree = parse_expression(source, &lex(source).unwrap()).unwrap();
+            let retained = match &tree {
+                Expr::FunctionCall(call) => &call.arguments[0].value,
+                Expr::Unary(unary) => unary.expression.as_ref(),
+                Expr::Dereference(node) => &node.base,
+                Expr::Predicated(node) => {
+                    assert!(matches!(node.predicate, Predicate::Comparison(_)));
+                    &node.value
+                }
+                Expr::Binary(binary) => binary.right.as_ref(),
+                Expr::Row(row) => &row.fields[0].expression,
+                _ => panic!("original opaque parent"),
+            };
+            assert!(matches!(retained, Expr::LegacyParenthesized(_)), "{source}");
+        }
+        let source = "((a+b))";
+        let tree = parse_expression(source, &lex(source).unwrap()).unwrap();
+        let Expr::LegacyParenthesized(outer) = tree else {
+            panic!("opaque public root")
+        };
+        let Expr::LegacyParenthesized(inner) = outer.expression.as_ref() else {
+            panic!("second real layer")
+        };
+        assert_eq!(outer.span, crate::Span::new(0, source.len()));
+        assert_eq!(inner.span, crate::Span::new(1, source.len() - 1));
+        assert!(matches!(inner.expression.as_ref(), Expr::Binary(_)));
+    }
+
+    #[test]
+    fn computed_left_ranges_preserve_filter_endpoints_and_span_independent_syntax() {
+        use crate::{
+            Span,
+            ast::{Expr, Fold, SyntaxEq},
+        };
+        let source = "((1 + agg(2) FILTER (WHERE (TRUE)))) * 4";
+        let tree = parse_expression(source, &lex(source).unwrap()).unwrap();
+        let Expr::Binary(product) = &tree else {
+            panic!("product")
+        };
+        let end = source.find(" * ").unwrap();
+        assert_eq!(product.left_operand_span, Span::new(0, end));
+        let Expr::Binary(sum) = product.left.as_ref() else {
+            panic!("computed sum")
+        };
+        let Expr::FunctionCall(call) = sum.right.as_ref() else {
+            panic!("original call")
+        };
+        let selected_end = source.find("(TRUE)").unwrap() + "(TRUE)".len();
+        assert_eq!(call.span.end(), selected_end);
+        assert_eq!(sum.span.end(), selected_end);
+        struct Identity;
+        impl Fold for Identity {}
+        let folded = Identity.fold_expr(tree.clone());
+        assert_eq!(
+            folded, tree,
+            "fold preserves the authored diagnostic metadata"
+        );
+        let mut other = tree.clone();
+        let Expr::Binary(other_product) = &mut other else {
+            unreachable!()
+        };
+        other_product.left_operand_span = Span::new(2, end - 2);
+        assert!(tree.syntax_eq(&other));
+        assert_ne!(tree, other, "ordinary equality retains real span facts");
+        let source = "((a+b)";
+        let error = parse_expression(source, &lex(source).unwrap()).unwrap_err();
+        let crate::error::ParseError::UnexpectedToken { span, expected, .. } = error else {
+            panic!("original missing-delimiter error")
+        };
+        assert_eq!(expected, "')'");
+        assert_eq!(span, Span::new(source.len(), source.len()));
+    }
+
+    #[test]
+    fn deeply_grouped_computed_operand_moves_one_real_subtree() {
+        use crate::ast::{BinaryOperator, Expr};
+        let depth = 2_000;
+        let source = format!("{}a+b{}*c", "(".repeat(depth), ")".repeat(depth));
+        let tree = parse_expression(&source, &lex(&source).unwrap()).unwrap();
+        let Expr::Binary(product) = &tree else {
+            panic!("product")
+        };
+        assert_eq!(product.operator, BinaryOperator::Multiply);
+        assert_eq!(
+            product.left_operand_span,
+            crate::Span::new(0, depth * 2 + 3)
+        );
+        let Expr::Binary(sum) = product.left.as_ref() else {
+            panic!("real computed child")
+        };
+        assert_eq!(sum.operator, BinaryOperator::Add);
+        for (child, expected) in [
+            (sum.left.as_ref(), "a"),
+            (sum.right.as_ref(), "b"),
+            (product.right.as_ref(), "c"),
+        ] {
+            let Expr::Identifier(name) = child else {
+                panic!("original ordered leaf")
+            };
+            assert_eq!(name.value, expected);
         }
     }
 }
