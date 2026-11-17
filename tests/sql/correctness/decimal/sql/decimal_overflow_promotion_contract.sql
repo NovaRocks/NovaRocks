@@ -18,7 +18,8 @@
 -- @order_sensitive=true
 -- @tags=decimal,session,promotion
 -- Test Objective:
--- Freeze Decimal or Float64 multiplication from declaration precision and the effective statement setting.
+-- Freeze Decimal or Float64 multiplication from declaration precision and the effective query setting.
+-- Nested hints are ignored; all query scopes inherit the one frozen root setting.
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.decimal_promotion_contract
@@ -109,8 +110,9 @@ ORDER BY branch;
 -- query 20
 -- @skip_result_check=true
 -- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
+-- D32 target migration: reject an uncaptured root setting, retaining the derived query.
 CREATE VIEW default_catalog.${case_db}.decimal_promotion_nested_view AS
-SELECT v FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v) t;
+SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ v FROM (SELECT 1 AS v) t;
 
 -- query 21
 -- @skip_result_check=true
@@ -122,9 +124,10 @@ SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v;
 -- @skip_result_check=true
 -- @expect_error=invalid decimal_overflow_to_double value
 -- @expect_sql_code=sql.analyze.invalid_argument
--- @expect_error_at=1:62
+-- @expect_error_at=1:47
 -- @expect_error_tier=target
-SELECT 1 FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double='invalid') */ 1 AS v) t;
+-- D32 target migration: validate the same invalid value at the root query boundary.
+SELECT /*+ SET_VAR(decimal_overflow_to_double='invalid') */ 1 FROM (SELECT 1 AS v) t;
 
 -- query 23
 -- @skip_result_check=true
