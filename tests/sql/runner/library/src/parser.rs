@@ -1407,6 +1407,71 @@ pub(crate) fn frame_case_source(source: &str, marker_re: &Regex) -> Result<CaseS
     })
 }
 
+/// Source fields from the native case definition, before runtime name preparation.
+#[derive(Debug, Clone)]
+pub struct CaseSourceDefinition {
+    pub file_preface: std::ops::Range<usize>,
+    pub file_meta: QueryMeta,
+    pub steps: Vec<CaseSourceStep>,
+}
+
+/// One native section, including metadata-only and shell sections.
+#[derive(Debug, Clone)]
+pub struct CaseSourceStep {
+    pub query_number: usize,
+    pub source_range: std::ops::Range<usize>,
+    pub native_sql: String,
+    pub meta: QueryMeta,
+}
+
+/// Extract the original framing and metadata without substituting variables.
+///
+/// Ranges refer to `source`. `native_sql` uses the same preface and line-ending
+/// handling as the native loader; it is not a contiguous source range or a
+/// guarantee that the SQL parses. Callers retain the original source and own
+/// any subsequent preparation receipts. Parsed metadata grants no runtime
+/// control authority. The regular expressions are the native caller's existing
+/// metadata and query-marker inputs, as for `load_sql_case_from_file`.
+pub fn extract_case_source_definition(
+    source: &str,
+    meta_re: &Regex,
+    marker_re: &Regex,
+) -> Result<CaseSourceDefinition> {
+    let frames = frame_case_source(source, marker_re)?;
+    let file_meta_lines = source[frames.file_preface.clone()]
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let (file_meta, _) = extract_meta_and_sql_with_name_binding(
+        &file_meta_lines,
+        meta_re,
+        MetadataNameBinding::LiteralDefinition,
+    )?;
+    let mut steps = Vec::with_capacity(frames.sections.len());
+    for (query_number, source_range) in frames.sections {
+        let section = source[source_range.clone()]
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let (section_meta, native_sql) = extract_meta_and_sql_with_name_binding(
+            &section,
+            meta_re,
+            MetadataNameBinding::LiteralDefinition,
+        )?;
+        steps.push(CaseSourceStep {
+            query_number,
+            source_range,
+            native_sql,
+            meta: merge_meta(&file_meta, &section_meta),
+        });
+    }
+    Ok(CaseSourceDefinition {
+        file_preface: frames.file_preface,
+        file_meta,
+        steps,
+    })
+}
+
 pub fn load_sql_case_from_file(
     sql_path: &Path,
     meta_re: &Regex,
@@ -1669,6 +1734,65 @@ pub fn load_suite_hook(
 mod opt5_directive_tests {
     use super::*;
     use regex::Regex;
+
+    #[test]
+    fn case_source_definition_keeps_original_ranges_and_native_metadata() {
+        let marker = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        let meta = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
+        let source = "-- café\r\n-- @order_sensitive=true\r\n-- query 1 local note\r\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\r\nSELECT @bad;  \r\n-- query 2\r\n-- metadata only\r\n-- query 3\nSELECT 1;\n";
+        let fields = extract_case_source_definition(source, &meta, &marker).unwrap();
+        assert_eq!(
+            &source[fields.file_preface],
+            "-- café\r\n-- @order_sensitive=true\r\n"
+        );
+        assert_eq!(fields.file_meta.order_sensitive, Some(true));
+        assert_eq!(fields.steps.len(), 3);
+        let first = &fields.steps[0];
+        assert_eq!(
+            &source[first.source_range.clone()],
+            "-- query 1 local note\r\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\r\nSELECT @bad;  \r\n"
+        );
+        assert_eq!(first.query_number, 1);
+        assert_eq!(first.native_sql, "SELECT @bad;");
+        assert_eq!(first.meta.order_sensitive, Some(true));
+        let expected = first.meta.expect_trino_error.as_ref().unwrap();
+        assert_eq!(expected.name, "SYNTAX_ERROR");
+        assert_eq!(expected.error_type, "USER_ERROR");
+        assert_eq!(fields.steps[1].native_sql, "");
+        assert!(fields.steps[1].meta.expect_trino_error.is_none());
+        assert_eq!(fields.steps[2].native_sql, "SELECT 1;");
+        assert_eq!(fields.steps[2].meta.order_sensitive, Some(true));
+        assert!(
+            extract_case_source_definition(
+                "-- query 1\nSELECT 1;\n-- query 3\nSELECT 2;",
+                &meta,
+                &marker
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn case_source_definition_does_not_prepare_names_or_execute_shells() {
+        let marker = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        let meta = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
+        let source = "-- query 1\nSELECT '${case_db}', default_catalog.${case_db}.t;\n-- query 2\nshell: echo '${case_db}'\n";
+        let fields = extract_case_source_definition(source, &meta, &marker).unwrap();
+        assert_eq!(
+            fields.steps[0].native_sql,
+            "SELECT '${case_db}', default_catalog.${case_db}.t;"
+        );
+        assert_eq!(fields.steps[1].native_sql, "shell: echo '${case_db}'");
+        assert_eq!(
+            &source[fields.steps[1].source_range.clone()],
+            "-- query 2\nshell: echo '${case_db}'\n"
+        );
+        let decorative = "-- query 14\nSELECT 1; SELECT 2;\n";
+        let fields = extract_case_source_definition(decorative, &meta, &marker).unwrap();
+        assert_eq!(fields.steps.len(), 1);
+        assert_eq!(fields.steps[0].query_number, 1);
+        assert_eq!(fields.steps[0].native_sql, "SELECT 1; SELECT 2;");
+    }
 
     #[test]
     fn native_source_frames_preserve_marked_byte_ranges_and_empty_steps() {

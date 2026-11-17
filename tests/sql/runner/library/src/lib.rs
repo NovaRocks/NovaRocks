@@ -51,6 +51,9 @@ mod statement_controls;
 mod suite_manifest;
 mod types;
 
+pub use parser::{CaseSourceDefinition, CaseSourceStep, extract_case_source_definition};
+pub use types::QueryMeta;
+
 pub use session::split_trino_sql_statements;
 
 #[path = "../../../../../novarocks/types/src/engine_error_codes.rs"]
