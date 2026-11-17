@@ -15,7 +15,7 @@ fn subquery(name: &str) -> Expr {
         unreachable!()
     };
     Expr::Subquery(crate::ast::SubqueryExpr {
-        query: Box::new(query),
+        query: crate::ast::AstBox::new(query),
         span: span(),
     })
 }

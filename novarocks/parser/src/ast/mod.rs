@@ -31,6 +31,7 @@ mod predicate;
 pub use control_expr::*;
 mod query;
 pub use predicate::*;
+pub mod legacy;
 mod relation;
 mod routine;
 
@@ -96,10 +97,7 @@ pub use query::{
     SessionProperty, SetExpr, SetOperation, SetOperator, SimpleGroupBy, SortItem, SortOrdering,
     Values, WildcardOptions, With,
 };
-pub use relation::{
-    Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableVersion,
-    TableVersionKind, TableWithJoins,
-};
+pub use relation::*;
 pub use row_pattern::{
     MeasureDefinition, PatternAnchorKind, PatternInteger, PatternQuantifier, PatternSearchMode,
     PatternSearchModeKind, RowPattern, SkipTo, SubsetDefinition, VariableDefinition,
@@ -118,14 +116,14 @@ pub use table::{
 pub use validate::{validate_statement, validate_statements};
 pub use view::{CreateView, DropView, ShowCreateView, ViewStatement};
 pub use visit::{
-    Fold, Visit, fold_auto_group_by, fold_binary_expr, fold_expr, fold_function_call,
+    Fold, Visit, fold_auto_group_by, fold_binary_expr, fold_cte, fold_expr, fold_function_call,
     fold_group_by, fold_grouping_element, fold_grouping_sets, fold_ident, fold_logical_expr,
-    fold_nested_expr, fold_object_name, fold_query, fold_select, fold_simple_group_by,
-    fold_statement, fold_table_factor, fold_unary_expr, fold_view_statement, walk_auto_group_by,
-    walk_binary_expr, walk_expr, walk_function_call, walk_group_by, walk_grouping_element,
-    walk_grouping_sets, walk_ident, walk_logical_expr, walk_nested_expr, walk_object_name,
-    walk_query, walk_select, walk_simple_group_by, walk_statement, walk_table_factor,
-    walk_unary_expr, walk_view_statement,
+    fold_nested_expr, fold_object_name, fold_query, fold_select, fold_set_expr,
+    fold_simple_group_by, fold_statement, fold_unary_expr, fold_view_statement, fold_with,
+    walk_auto_group_by, walk_binary_expr, walk_cte, walk_expr, walk_function_call, walk_group_by,
+    walk_grouping_element, walk_grouping_sets, walk_ident, walk_logical_expr, walk_nested_expr,
+    walk_object_name, walk_query, walk_select, walk_simple_group_by, walk_statement,
+    walk_unary_expr, walk_view_statement, walk_with,
 };
 pub use window::{
     Window, WindowDefinition, WindowFrame, WindowFrameBound, WindowFrameExclusion,

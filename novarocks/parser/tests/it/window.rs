@@ -100,9 +100,11 @@ fn operation(frame: WindowFrame) -> Expr {
     }))
 }
 fn statement(expr: Expr) -> Statement {
-    Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(vec![build::item(expr, None, false)], Vec::new(), None, None).unwrap(),
-    ))))
+    Statement::Query(build::query(SetExpr::Select(
+        novarocks_parser::ast::AstBox::new(
+            build::select(vec![build::item(expr, None, false)], None, None, None).unwrap(),
+        ),
+    )))
 }
 
 #[test]

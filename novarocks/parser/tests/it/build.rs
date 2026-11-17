@@ -21,7 +21,7 @@
 
 use novarocks_parser::{
     SYNTHETIC, Span,
-    ast::{self, BinaryOperator, Expr, JoinConstraint, JoinOperator, SetExpr, SyntaxEq},
+    ast::{self, BinaryOperator, Expr, JoinCriteria, JoinOn, JoinType, SetExpr, SyntaxEq},
     build::{self, BuildError},
 };
 
@@ -58,10 +58,10 @@ fn assert_expression(built: Expr, source: &str) {
 }
 
 fn select_body(value: i64) -> SetExpr {
-    SetExpr::Select(Box::new(
+    SetExpr::Select(novarocks_parser::ast::AstBox::new(
         build::select(
             vec![build::item(build::integer(value), None, false)],
-            Vec::new(),
+            None,
             None,
             None,
         )
@@ -117,10 +117,10 @@ fn query_suffixes_keep_specification_and_parenthesized_owners_distinct() {
     let SetExpr::Query(inner) = parsed.body.as_mut() else {
         panic!("parenthesized query")
     };
-    let SetExpr::Select(select) = inner.body.as_mut() else {
+    let SetExpr::Select(select) = inner.query.body.as_mut() else {
         panic!("SELECT")
     };
-    inner.modifiers = std::mem::take(&mut select.modifiers);
+    inner.query.modifiers = std::mem::take(&mut select.modifiers);
     let error = ast::validate_statement(&ast::Statement::Query(parsed)).unwrap_err();
     assert!(matches!(
         error,
@@ -404,32 +404,39 @@ fn select_relation_aliases_and_grouping_match_parser() {
         build::ident("source", true),
     ])
     .expect("qualified name");
-    let left = build::relation(build::table(
-        source_name,
-        Some(ast::TableVersion {
-            kind: ast::TableVersionKind::ForVersionAsOf,
-            value: build::string("branch\\tail"),
-            span: SYNTHETIC,
-        }),
-        Some(build::alias(build::ident("s", false), Vec::new(), true)),
-    ));
-    let derived = build::derived(
-        build::query(build::values(vec![vec![build::integer(1)]]).expect("values")),
-        Some(build::alias(
-            build::ident("v", false),
-            vec![build::ident("k1", false)],
-            false,
+    let left = build::alias(
+        build::table(
+            source_name,
+            Some(ast::QueryPeriod {
+                range_type: ast::QueryPeriodRangeType::Version,
+                start: None,
+                end: Some(ast::AstBox::new(build::string("branch\\tail"))),
+                span: SYNTHETIC,
+            }),
+            None,
+        ),
+        build::ident("s", false),
+        None,
+    );
+    let derived = build::alias(
+        build::derived(build::query(
+            build::values(vec![vec![build::integer(1)]]).expect("values"),
         )),
+        build::ident("v", false),
+        Some(vec![build::ident("k1", false)]),
     );
     let joined = build::join(
         left,
-        JoinOperator::LeftOuter,
+        JoinType::Left,
         derived,
-        JoinConstraint::On(build::comparison(
-            build::column(build::ident("s", false), build::ident("k1", false)),
-            ast::ComparisonOperator::Equal,
-            build::column(build::ident("v", false), build::ident("k1", false)),
-        )),
+        Some(JoinCriteria::On(JoinOn {
+            expression: build::comparison(
+                build::column(build::ident("s", false), build::ident("k1", false)),
+                ast::ComparisonOperator::Equal,
+                build::column(build::ident("v", false), build::ident("k1", false)),
+            ),
+            span: SYNTHETIC,
+        })),
     );
     let column = build::column(build::ident("s", false), build::ident("k1", false));
     let select = build::select(
@@ -437,12 +444,12 @@ fn select_relation_aliases_and_grouping_match_parser() {
             build::item(column.clone(), Some(build::ident("k", false)), true),
             build::item(build::count_star(), Some(build::ident("n", false)), false),
         ],
-        vec![joined],
+        Some(joined),
         Some(build::is_null(column.clone(), true)),
         build::group_by(vec![column]),
     )
     .expect("nonempty SELECT");
-    let built = build::query(SetExpr::Select(Box::new(select)));
+    let built = build::query(SetExpr::Select(novarocks_parser::ast::AstBox::new(select)));
     let parsed = query(
         "SELECT s.k1 AS k, COUNT(*) n FROM `cat`.`db`.`source` FOR VERSION AS OF 'branch\\\\tail' AS s \
          LEFT JOIN (VALUES (1)) v(k1) ON s.k1 = v.k1 WHERE s.k1 IS NOT NULL GROUP BY s.k1",
@@ -457,13 +464,14 @@ fn select_relation_aliases_and_grouping_match_parser() {
             build::wildcard(),
             build::qualified_wildcard(vec![build::ident("t", false)]).expect("prefix"),
         ],
-        vec![build::relation(build::table(name("t"), None, None))],
+        Some(build::table(name("t"), None, None)),
         None,
         build::group_by(Vec::new()),
     )
     .expect("wildcard SELECT");
     assert!(
-        build::query(SetExpr::Select(Box::new(select))).syntax_eq(&query("SELECT *, t.* FROM t"))
+        build::query(SetExpr::Select(novarocks_parser::ast::AstBox::new(select)))
+            .syntax_eq(&query("SELECT *, t.* FROM t"))
     );
 }
 
@@ -547,9 +555,8 @@ fn derived_expressions_retain_source_locations_and_envelopes_are_synthetic() {
             .span(),
         source_span
     );
-    let built = build::query(SetExpr::Select(Box::new(
-        build::select(vec![build::item(cast, None, false)], Vec::new(), None, None)
-            .expect("SELECT"),
+    let built = build::query(SetExpr::Select(novarocks_parser::ast::AstBox::new(
+        build::select(vec![build::item(cast, None, false)], None, None, None).expect("SELECT"),
     )));
     assert_eq!(built.span, SYNTHETIC);
     assert_eq!(built.body.span(), SYNTHETIC);
@@ -578,7 +585,7 @@ fn builders_reject_missing_required_structure() {
         Err(BuildError::EmptyObjectName)
     );
     assert_eq!(
-        build::select(Vec::new(), Vec::new(), None, None),
+        build::select(Vec::new(), None, None, None),
         Err(BuildError::EmptyProjection)
     );
     assert_eq!(build::values(Vec::new()), Err(BuildError::EmptyValues));

@@ -224,12 +224,18 @@ impl PreparedMutationFacts {
         };
         let from = mutation_match_select(&mut query)?;
         let (target_factor, preparations) = match self.as_ref() {
-            Self::Update(p) => (&mut from.relation, p.mor_preparations.as_ref()),
+            Self::Update(p) => {
+                let target = match from {
+                    novarocks_parser::ast::Relation::Join(join) => join.left.as_mut(),
+                    relation => relation,
+                };
+                (target, p.mor_preparations.as_ref())
+            }
             Self::Merge(p) => {
-                let [join] = from.joins.as_mut_slice() else {
+                let novarocks_parser::ast::Relation::Join(join) = from else {
                     return Err("generated MERGE lost its match target join".into());
                 };
-                (&mut join.relation, p.mor_preparations.as_ref())
+                (join.right.as_mut(), p.mor_preparations.as_ref())
             }
         };
         let preparations = preparations.ok_or("MOR lost its original match preparation")?;

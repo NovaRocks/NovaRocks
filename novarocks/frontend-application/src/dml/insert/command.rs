@@ -141,17 +141,21 @@ pub(crate) fn literal_query(query: &ast::Query) -> bool {
 
 fn literal_body(body: &ast::SetExpr) -> bool {
     match body {
+        ast::SetExpr::Table(_) => false,
         ast::SetExpr::Values(values) => values.rows.iter().flatten().all(is_literal_expr),
         ast::SetExpr::Select(select) => {
             select.modifiers.is_empty()
-                && select.from.is_empty()
+                && select.from.is_none()
                 && select.projection.iter().all(|item| match item {
                     ast::SelectItem::UnnamedExpr(expr)
                     | ast::SelectItem::ExprWithAlias { expr, .. } => is_literal_expr(expr),
                     _ => false,
                 })
         }
-        ast::SetExpr::Query(query) => literal_query(query),
+        ast::SetExpr::Query(subquery) => {
+            let query = &subquery.query;
+            literal_query(query)
+        }
         ast::SetExpr::SetOperation(operation) => operation.inputs.iter().all(literal_body),
     }
 }
@@ -256,9 +260,10 @@ fn legacy_literal_query(query: &ast::Query) -> bool {
     }
     fn body_is_literal(body: &ast::SetExpr) -> bool {
         match body {
+            ast::SetExpr::Table(_) => false,
             ast::SetExpr::Select(select) => {
                 select.modifiers.is_empty()
-                    && select.from.is_empty()
+                    && select.from.is_none()
                     && select.projection.iter().all(|item| match item {
                         ast::SelectItem::UnnamedExpr(expr)
                         | ast::SelectItem::ExprWithAlias { expr, .. } => {
@@ -272,7 +277,10 @@ fn legacy_literal_query(query: &ast::Query) -> bool {
                 .iter()
                 .flatten()
                 .all(|value| legacy_literal_shape(value).is_some()),
-            ast::SetExpr::Query(query) => legacy_literal_query(query),
+            ast::SetExpr::Query(subquery) => {
+                let query = &subquery.query;
+                legacy_literal_query(query)
+            }
             ast::SetExpr::SetOperation(operation) => operation.inputs.iter().all(body_is_literal),
         }
     }
@@ -281,6 +289,9 @@ fn legacy_literal_query(query: &ast::Query) -> bool {
 
 fn validate_literal_set_operations(body: &ast::SetExpr) -> Result<(), String> {
     match body {
+        ast::SetExpr::Table(_) => {
+            Err("TABLE query bodies are not literal INSERT sources".to_string())
+        }
         ast::SetExpr::SetOperation(operation) => {
             if !matches!(operation.operator, ast::SetOperator::Union) {
                 return Err("INSERT SELECT set operation is only UNION ALL here".to_string());
@@ -299,7 +310,10 @@ fn validate_literal_set_operations(body: &ast::SetExpr) -> Result<(), String> {
             }
             Ok(())
         }
-        ast::SetExpr::Query(query) => validate_literal_set_operations(&query.body),
+        ast::SetExpr::Query(subquery) => {
+            let query = &subquery.query;
+            validate_literal_set_operations(&query.body)
+        }
         _ => Ok(()),
     }
 }

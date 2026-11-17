@@ -138,7 +138,10 @@ fn rows(query: &ast::Query) -> &[Vec<ast::Expr>] {
 fn select(body: &ast::SetExpr) -> &ast::Select {
     match body {
         ast::SetExpr::Select(select) => select,
-        ast::SetExpr::Query(query) => select(&query.body),
+        ast::SetExpr::Query(subquery) => {
+            let query = &subquery.query;
+            select(&query.body)
+        }
         _ => panic!("expected SELECT leaf"),
     }
 }
@@ -584,7 +587,7 @@ fn select_wrapper_normalizes_generated_defaults_and_retains_user_positions() {
     let ast::SetExpr::Query(wrapper) = shaped.body.as_ref() else {
         panic!("target wrapper");
     };
-    assert!(wrapper.as_ref().syntax_eq(&expected));
+    assert!(wrapper.query.as_ref().syntax_eq(&expected));
     let ast::SetExpr::Select(inner) = source.body.as_ref() else {
         panic!("original SELECT");
     };
@@ -820,12 +823,13 @@ fn source_filters_aliases_distinct_and_general_query_controls_are_retained() {
         number_text(cast_input(expr, "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
-    let [relation] = outer.from.as_slice() else {
+    let Some(ast::Relation::Aliased(alias)) = &outer.from else {
         panic!("source controls must precede the target projection");
     };
-    let ast::TableFactor::Derived { subquery, .. } = &relation.relation else {
+    let ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
         panic!("expected preserved source query");
     };
+    let subquery = &node.query;
     assert!(subquery.body.syntax_eq(&source.body));
     assert!(
         matches!(&select(&subquery.body).projection[0], ast::SelectItem::ExprWithAlias { alias, .. } if alias.value == "d")

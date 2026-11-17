@@ -26,8 +26,8 @@ use std::collections::HashSet;
 use crate::{StructuralViolation, ValidateError};
 
 use super::{
-    Cte, Expr, GroupBy, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableStatement,
-    TableWithJoins, Values, WindowFrame, WindowFrameBound, WindowSpecification,
+    Cte, Expr, GroupBy, Query, Select, SelectItem, SetExpr, Statement, TableStatement, Values,
+    WindowFrame, WindowFrameBound, WindowSpecification,
 };
 
 /// Validates every statement in a public parser result.
@@ -68,6 +68,8 @@ fn validate_create_table(table: &super::CreateTable) -> Result<(), ValidateError
     }
     Ok(())
 }
+
+#[recursive::recursive]
 
 fn validate_query(query: &Query) -> Result<(), ValidateError> {
     if matches!(query.body.as_ref(), SetExpr::Select(_)) && !query.modifiers.is_empty() {
@@ -154,7 +156,8 @@ fn validate_set_expr(set_expr: &SetExpr) -> Result<(), ValidateError> {
     match set_expr {
         SetExpr::Select(select) => validate_select(select),
         SetExpr::Values(values) => validate_values(values),
-        SetExpr::Query(query) => validate_query(query),
+        SetExpr::Table(table) => validate_table(table),
+        SetExpr::Query(query) => validate_query(&query.query),
         SetExpr::SetOperation(operation) => {
             let multi_union_all = operation.operator == super::SetOperator::Union
                 && !operation.distinct
@@ -222,8 +225,8 @@ fn validate_select(select: &Select) -> Result<(), ValidateError> {
         }
         validate_window_specification(&window.specification)?;
     }
-    for relation in &select.from {
-        validate_table_with_joins(relation)?;
+    if let Some(relation) = &select.from {
+        validate_relation(relation)?;
     }
     if let Some(selection) = &select.selection {
         validate_expr(selection)?;
@@ -284,46 +287,177 @@ fn validate_group_by(group_by: &GroupBy) -> Result<(), ValidateError> {
     Ok(())
 }
 
-fn validate_table_with_joins(table_with_joins: &TableWithJoins) -> Result<(), ValidateError> {
-    validate_table_factor(&table_with_joins.relation)?;
-    for join in &table_with_joins.joins {
-        validate_table_factor(&join.relation)?;
-        if let super::JoinConstraint::On(expression) = &join.constraint {
-            validate_expr(expression)?;
+#[recursive::recursive]
+fn validate_relation(relation: &super::Relation) -> Result<(), ValidateError> {
+    use super::{JoinCriteria, JoinType, Relation, TableFunctionArgumentValue};
+    match relation {
+        Relation::Table(node) => validate_table(node)?,
+        Relation::TableSubquery(node) => validate_query(&node.query)?,
+        Relation::Lateral(node) => validate_query(&node.query)?,
+        Relation::Aliased(node) => validate_relation(&node.relation)?,
+        Relation::Unnest(node) => {
+            for expr in &node.expressions {
+                validate_expr(expr)?;
+            }
         }
+        Relation::Join(node) => {
+            let valid = match node.kind {
+                JoinType::Cross | JoinType::Implicit => node.criteria.is_none(),
+                JoinType::Legacy(_) => true,
+                _ => node.criteria.is_some(),
+            };
+            if !valid {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::InvalidJoinCriteria,
+                    node.span,
+                ));
+            }
+            validate_relation(&node.left)?;
+            validate_relation(&node.right)?;
+            if let Some(criteria) = &node.criteria {
+                match criteria {
+                    JoinCriteria::On(node) => validate_expr(&node.expression)?,
+                    JoinCriteria::Using(node)
+                        if node.columns.is_empty()
+                            && !matches!(node_kind(relation), Some(JoinType::Legacy(_))) =>
+                    {
+                        return Err(ValidateError::invalid_structure(
+                            StructuralViolation::EmptyJoinUsingColumns,
+                            node.span,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Relation::Sampled(node) => {
+            validate_relation(&node.relation)?;
+            validate_expr(&node.sample_percentage)?;
+        }
+        Relation::Pivot(node) => {
+            for (empty, violation) in [
+                (
+                    node.aggregations.is_empty(),
+                    StructuralViolation::EmptyPivotAggregations,
+                ),
+                (
+                    node.pivot_columns.is_empty(),
+                    StructuralViolation::EmptyPivotColumns,
+                ),
+                (
+                    node.value_groups.is_empty(),
+                    StructuralViolation::EmptyPivotValueGroups,
+                ),
+            ] {
+                if empty {
+                    return Err(ValidateError::invalid_structure(violation, node.span));
+                }
+            }
+            validate_relation(&node.input)?;
+            for aggregation in &node.aggregations {
+                validate_expr(&aggregation.expression)?;
+            }
+            for expression in &node.pivot_columns {
+                validate_expr(expression)?;
+            }
+            for group in &node.value_groups {
+                if group.values.is_empty() {
+                    return Err(ValidateError::invalid_structure(
+                        StructuralViolation::EmptyPivotValues,
+                        group.span,
+                    ));
+                }
+                for expr in &group.values {
+                    validate_expr(expr)?;
+                }
+            }
+            if let Some(group) = &node.group_by {
+                validate_group_by(group)?;
+            }
+        }
+        Relation::Nearest(node) => {
+            validate_relation(&node.relation)?;
+            if let Some(expr) = &node.where_clause {
+                validate_expr(expr)?;
+            }
+            validate_expr(&node.match_expression)?;
+        }
+        Relation::TableFunction(node) => {
+            for argument in &node.arguments {
+                match &argument.value {
+                    TableFunctionArgumentValue::Expression(expr) => validate_expr(expr)?,
+                    TableFunctionArgumentValue::Table(table) => {
+                        validate_relation(&table.table)?;
+                        if let Some(columns) = &table.partition_by {
+                            for expr in columns {
+                                validate_expr(expr)?;
+                            }
+                        }
+                        if let Some(order) = &table.order_by {
+                            validate_order_by(order)?;
+                        }
+                    }
+                    TableFunctionArgumentValue::Descriptor(descriptor) => {
+                        if let Some(descriptor) = &descriptor.descriptor {
+                            if descriptor.fields.is_empty() {
+                                return Err(ValidateError::invalid_structure(
+                                    StructuralViolation::EmptyDescriptorFields,
+                                    descriptor.span,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Relation::JsonTable(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_table(visitor, node))?
+        }
+        Relation::PatternRecognition(node) => {
+            if node.rows_per_match == Some(super::RowsPerMatch::Window) {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::InvalidPatternRowsPerMatch,
+                    node.span,
+                ));
+            }
+            if node.variable_definitions.is_empty() {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::EmptyPatternVariableDefinitions,
+                    node.span,
+                ));
+            }
+            validate_relation(&node.input)?;
+            for expr in &node.partition_by {
+                validate_expr(expr)?;
+            }
+            if let Some(order) = &node.order_by {
+                validate_order_by(order)?;
+            }
+            for measure in &node.measures {
+                validate_expr(&measure.expression)?;
+            }
+            validate_row_pattern(&node.pattern)?;
+            for subset in &node.subsets {
+                if subset.identifiers.is_empty() {
+                    return Err(ValidateError::invalid_structure(
+                        StructuralViolation::EmptySubsetIdentifierList,
+                        subset.span,
+                    ));
+                }
+            }
+            for definition in &node.variable_definitions {
+                validate_expr(&definition.expression)?;
+            }
+        }
+        Relation::LegacyTableFunction(node) => validate_expr(&node.expr)?,
     }
     Ok(())
 }
-
-fn validate_table_factor(table_factor: &TableFactor) -> Result<(), ValidateError> {
-    match table_factor {
-        TableFactor::JsonTable { table, .. } => {
-            validate_json_root(|visitor| super::Visit::visit_json_table(visitor, table))
-        }
-
-        TableFactor::Table { version, .. } => {
-            if let Some(version) = version {
-                validate_expr(&version.value)?;
-            }
-            Ok(())
-        }
-        TableFactor::Derived { subquery, .. } => validate_query(subquery),
-        TableFactor::TableFunction { expr, .. } => validate_expr(expr),
-        TableFactor::Unnest { array_exprs, .. } => {
-            if array_exprs.is_empty() {
-                return Err(ValidateError::invalid_structure(
-                    StructuralViolation::EmptyUnnestExpressionList,
-                    table_factor.span(),
-                ));
-            }
-            for expression in array_exprs {
-                validate_expr(expression)?;
-            }
-            Ok(())
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => validate_table_with_joins(table_with_joins),
+fn node_kind(relation: &super::Relation) -> Option<super::JoinType> {
+    if let super::Relation::Join(node) = relation {
+        Some(node.kind)
+    } else {
+        None
     }
 }
 
@@ -797,4 +931,26 @@ fn validate_row_count(
         return Ok(());
     }
     Err(ValidateError::invalid_structure(violation, node.span()))
+}
+
+#[recursive::recursive]
+fn validate_table(table: &super::Table) -> Result<(), ValidateError> {
+    if table.query_period.is_some() && table.branch.is_some() {
+        return Err(ValidateError::invalid_structure(
+            StructuralViolation::ConflictingTablePeriodAndBranch,
+            table.span,
+        ));
+    }
+    if let Some(period) = &table.query_period {
+        if period.start.is_some() || period.end.is_none() {
+            return Err(ValidateError::invalid_structure(
+                StructuralViolation::InvalidQueryPeriod,
+                period.span,
+            ));
+        }
+        if let Some(end) = &period.end {
+            validate_expr(end)?;
+        }
+    }
+    Ok(())
 }

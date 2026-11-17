@@ -182,7 +182,7 @@ pub enum IntervalField {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubqueryExpr {
-    pub query: Box<Query>,
+    pub query: AstBox<Query>,
     pub span: Span,
 }
 

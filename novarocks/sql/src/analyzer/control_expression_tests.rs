@@ -490,10 +490,34 @@ fn named_arguments_and_processing_modes_refuse_before_ordinary_or_table_lookup()
                 panic!("select");
             };
             let expression: &mut Expr = if table_call {
-                let TableFactor::TableFunction { expr, .. } = &mut select.from[0].relation else {
+                let relation = select.from.take().expect("table call");
+                let Relation::TableFunction(invocation) = relation else {
                     panic!("table call");
                 };
-                expr
+                let invocation = invocation.into_inner();
+                let arguments = invocation
+                    .arguments
+                    .into_iter()
+                    .map(|argument| {
+                        let TableFunctionArgumentValue::Expression(value) = argument.value else {
+                            panic!("scalar argument");
+                        };
+                        value
+                    })
+                    .collect();
+                let expression = build::function(invocation.name, arguments);
+                select.from = Some(Relation::LegacyTableFunction(AstBox::new(
+                    legacy::TableFunction {
+                        expr: expression,
+                        lateral: false,
+                        syntax: legacy::TableFunctionSyntax::BareCall,
+                        span: invocation.span,
+                    },
+                )));
+                let Some(Relation::LegacyTableFunction(node)) = &mut select.from else {
+                    panic!("legacy metadata call");
+                };
+                &mut node.expr
             } else {
                 let SelectItem::UnnamedExpr(expr) = &mut select.projection[0] else {
                     panic!("projection");

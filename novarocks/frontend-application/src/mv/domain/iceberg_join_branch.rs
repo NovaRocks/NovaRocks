@@ -73,15 +73,24 @@ pub(crate) fn is_append_only_join_delta_eligible(query: &ast::Query) -> bool {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    let [from] = select.from.as_slice() else {
+    let Some(ast::Relation::Join(join)) = &select.from else {
         return false;
     };
-    let [join] = from.joins.as_slice() else {
+    // Preserve the original single, non-nested join profile.
+    if matches!(join.left.as_ref(), ast::Relation::Join(_))
+        || matches!(join.right.as_ref(), ast::Relation::Join(_))
+    {
         return false;
-    };
+    }
     matches!(
-        join.operator,
-        ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit | ast::JoinOperator::Cross
+        join.kind,
+        ast::JoinType::Inner
+            | ast::JoinType::Cross
+            | ast::JoinType::Legacy(
+                ast::legacy::JoinOperator::Inner
+                    | ast::legacy::JoinOperator::InnerExplicit
+                    | ast::legacy::JoinOperator::Cross
+            )
     )
 }
 

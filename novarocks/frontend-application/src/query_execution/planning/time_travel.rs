@@ -21,9 +21,7 @@
 
 use crate::catalog_application::resolver::{CatalogAdmission, resolve_table_target};
 use crate::query_execution::kernels::{DmlExecutionKernel, QueryPreparationKernel};
-use novarocks_parser::ast::{
-    Ident, ObjectName as ParserObjectName, Query, SetExpr, TableAlias, TableFactor, TableWithJoins,
-};
+use novarocks_parser::ast::{Ident, ObjectName as ParserObjectName, Query, Relation, SetExpr};
 use novarocks_parser::recursion::GuardedFuture;
 use novarocks_spi::connector::{ConnectorReadReferenceFacts, ConnectorReadReferenceKind};
 use novarocks_sql::analyze_error::AnalyzeError;
@@ -153,7 +151,7 @@ pub(crate) fn project_iceberg_ref_metadata(
 // Time-travel (FOR VERSION/TIMESTAMP AS OF) AST rewrite
 // ---------------------------------------------------------------------------
 
-/// Returns true if the query contains any `TableFactor::Table` node with a
+/// Returns true if the query contains any `Relation::Table` node with a
 /// `version: Some(...)` clause. Used as a cheap pre-check before cloning.
 pub fn has_time_travel_refs(query: &Query) -> bool {
     if let Some(with) = &query.with {
@@ -180,44 +178,29 @@ fn has_time_travel_in_query(query: &Query) -> bool {
 
 fn has_time_travel_in_set_expr(expr: &SetExpr) -> bool {
     match expr {
-        SetExpr::Select(select) => {
-            for tw in &select.from {
-                if has_time_travel_in_factor(&tw.relation) {
-                    return true;
-                }
-                for join in &tw.joins {
-                    if has_time_travel_in_factor(&join.relation) {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
+        SetExpr::Select(select) => select.from.as_ref().is_some_and(has_time_travel_in_factor),
         SetExpr::SetOperation(operation) => {
             operation.inputs.iter().any(has_time_travel_in_set_expr)
         }
-        SetExpr::Query(q) => has_time_travel_in_query(q),
+        SetExpr::Query(subquery) => {
+            let q = &subquery.query;
+            has_time_travel_in_query(q)
+        }
         _ => false,
     }
 }
 
-fn has_time_travel_in_factor(factor: &TableFactor) -> bool {
+fn has_time_travel_in_factor(factor: &Relation) -> bool {
     match factor {
-        TableFactor::Table { version, .. } => version.is_some(),
-        TableFactor::Derived { subquery, .. } => has_time_travel_in_query(subquery),
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => has_time_travel_in_table_with_joins(table_with_joins),
+        Relation::Table(table) => table.query_period.is_some(),
+        Relation::Aliased(alias) => has_time_travel_in_factor(&alias.relation),
+        Relation::Join(join) => {
+            has_time_travel_in_factor(&join.left) || has_time_travel_in_factor(&join.right)
+        }
+        Relation::TableSubquery(node) => has_time_travel_in_query(&node.query),
+        Relation::Lateral(node) => has_time_travel_in_query(&node.query),
         _ => false,
     }
-}
-
-fn has_time_travel_in_table_with_joins(table: &TableWithJoins) -> bool {
-    has_time_travel_in_factor(&table.relation)
-        || table
-            .joins
-            .iter()
-            .any(|join| has_time_travel_in_factor(&join.relation))
 }
 
 /// The exact leaf ports required to rewrite `FOR VERSION/TIMESTAMP AS OF`.
@@ -242,14 +225,14 @@ macro_rules! impl_kernel_time_travel_resolver {
 impl_kernel_time_travel_resolver!(QueryPreparationKernel);
 impl_kernel_time_travel_resolver!(DmlExecutionKernel);
 
-/// Walk the query AST in-place and rewrite each `TableFactor::Table` that has
+/// Walk the query AST in-place and rewrite each `Relation::Table` that has
 /// a `version: Some(...)` clause:
 ///
 /// 1. Resolve `version` → `snapshot_id` via `resolve_read_binding`.
 /// 2. Encode a synthetic, query-local analyzer identity for that snapshot.
 ///    the query catalog materializer memoizes the corresponding exact binding and
 ///    planning pin in its request-local binding store.
-/// 3. Rewrite the `TableFactor::Table`:
+/// 3. Rewrite the `Relation::Table`:
 ///    - Replace `name` with `<catalog>.<namespace>.<synthetic name>` so the
 ///      provider resolves the overlay rather than shared local catalog state.
 ///    - Clear `version` (set to `None`).
@@ -330,25 +313,15 @@ fn rewrite_time_travel_in_set_expr_async<'a>(
     GuardedFuture::from_pin(Box::pin(async move {
         match expr {
             SetExpr::Select(select) => {
-                for tw in &mut select.from {
+                if let Some(relation) = &mut select.from {
                     rewrite_time_travel_in_factor_async(
                         resolver,
                         current_catalog,
                         current_database,
-                        &mut tw.relation,
+                        relation,
                         connector_context,
                     )
                     .await?;
-                    for join in &mut tw.joins {
-                        rewrite_time_travel_in_factor_async(
-                            resolver,
-                            current_catalog,
-                            current_database,
-                            &mut join.relation,
-                            connector_context,
-                        )
-                        .await?;
-                    }
                 }
                 Ok(())
             }
@@ -365,7 +338,8 @@ fn rewrite_time_travel_in_set_expr_async<'a>(
                 }
                 Ok(())
             }
-            SetExpr::Query(q) => {
+            SetExpr::Query(subquery) => {
+                let q = &mut subquery.query;
                 rewrite_time_travel_in_query_async(
                     resolver,
                     current_catalog,
@@ -384,25 +358,61 @@ fn rewrite_time_travel_in_factor_async<'a>(
     resolver: &'a (impl TimeTravelResolver + Sync),
     current_catalog: Option<&'a str>,
     current_database: &'a str,
-    factor: &'a mut TableFactor,
+    factor: &'a mut Relation,
+    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+) -> TimeTravelRewriteFuture<'a> {
+    rewrite_time_travel_in_relation_async(
+        resolver,
+        current_catalog,
+        current_database,
+        factor,
+        false,
+        connector_context,
+    )
+}
+
+// Consume only the real FROM/Table context. The shared semantic view owns
+// metadata classification; the raw remainder preserves its original suffix.
+fn time_travel_table_lookup(table: &novarocks_parser::ast::Table) -> (Vec<String>, Option<String>) {
+    let parts = novarocks_sql::TableNameView::new(&table.name)
+        .parts()
+        .collect::<Vec<_>>();
+    let suffix = parts
+        .last()
+        .zip(table.name.parts.last())
+        .and_then(|(base, raw)| {
+            raw.value
+                .strip_prefix(*base)
+                .filter(|suffix| !suffix.is_empty())
+                .map(str::to_owned)
+        });
+    (
+        parts.into_iter().map(str::to_ascii_lowercase).collect(),
+        suffix,
+    )
+}
+
+fn rewrite_time_travel_in_relation_async<'a>(
+    resolver: &'a (impl TimeTravelResolver + Sync),
+    current_catalog: Option<&'a str>,
+    current_database: &'a str,
+    factor: &'a mut Relation,
+    has_alias: bool,
     connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
 ) -> TimeTravelRewriteFuture<'a> {
     GuardedFuture::from_pin(Box::pin(async move {
         match factor {
-            TableFactor::Table {
-                name,
-                version,
-                alias,
-                ..
-            } if version.is_some() => {
-                let version_clause = version.take().expect("checked is_some above");
-
-                // Extract name parts for our ObjectName lookup
-                let parts: Vec<String> = name
-                    .parts
-                    .iter()
-                    .map(|ident| ident.value.to_ascii_lowercase())
-                    .collect();
+            Relation::Table(table) if table.query_period.is_some() => {
+                if table.branch.is_some() {
+                    return Err(
+                        "iceberg time travel: branch-qualified relations are not supported"
+                            .to_string()
+                            .into(),
+                    );
+                }
+                let version_clause = table.query_period.take().expect("checked is_some above");
+                let (parts, metadata_suffix) = time_travel_table_lookup(table);
+                let name = &mut table.name;
 
                 if parts.is_empty() {
                     return Err("iceberg time travel: table name has no identifier parts"
@@ -468,30 +478,27 @@ fn rewrite_time_travel_in_factor_async<'a>(
                 // only an analyzer key; its exact snapshot table and planning
                 // lease remain in the binding store and never enter the shared
                 // in-memory catalog.
-                let synthetic_table_name = format!("__sqlx1_tt_{}_{}", target.table, snapshot_id);
+                let mut synthetic_table_name =
+                    format!("__sqlx1_tt_{}_{}", target.table, snapshot_id);
+                if let Some(suffix) = metadata_suffix {
+                    // The old AST retained its metadata field while the base was
+                    // rewritten. Keep that same classified suffix on the full name.
+                    synthetic_table_name.push_str(&suffix);
+                }
 
                 // Rewrite the AST node in-place:
                 // - Set alias to original table name if user didn't specify one
                 // - Replace name with the synthetic name resolved against the target namespace
                 // - version is already cleared (we took it above)
-                if alias.is_none() {
-                    // Infer the original table alias from the last non-catalog part of the name
-                    let original_leaf = our_name
+                let inferred_alias = (!has_alias).then(|| Ident {
+                    value: our_name
                         .parts
                         .last()
                         .expect("checked nonempty table name")
-                        .clone();
-                    *alias = Some(TableAlias {
-                        name: Ident {
-                            value: original_leaf,
-                            quoted: false,
-                            span: name_span,
-                        },
-                        columns: vec![],
-                        explicit_as: false,
-                        span: name_span,
-                    });
-                }
+                        .clone(),
+                    quoted: false,
+                    span: name_span,
+                });
 
                 // Route the synthetic analyzer identity through the canonical
                 // connector catalog so the query catalog materializer resolves the
@@ -508,63 +515,67 @@ fn rewrite_time_travel_in_factor_async<'a>(
                     span: name_span,
                 };
 
+                if let Some(alias) = inferred_alias {
+                    // The wrapper owns this real, already rewritten relation.
+                    *factor = novarocks_parser::build::alias(factor.clone(), alias, None);
+                }
+
                 Ok(())
             }
-            TableFactor::Table { .. } => Ok(()),
-            TableFactor::Derived { subquery, .. } => {
+            Relation::Table(_) => Ok(()),
+            Relation::TableSubquery(node) => {
                 rewrite_time_travel_in_query_async(
                     resolver,
                     current_catalog,
                     current_database,
-                    subquery.as_mut(),
+                    &mut node.query,
                     connector_context,
                 )
                 .await
             }
-            TableFactor::NestedJoin {
-                table_with_joins, ..
-            } => {
-                rewrite_time_travel_in_table_with_joins_async(
+            Relation::Lateral(node) => {
+                rewrite_time_travel_in_query_async(
                     resolver,
                     current_catalog,
                     current_database,
-                    table_with_joins,
+                    &mut node.query,
+                    connector_context,
+                )
+                .await
+            }
+            Relation::Aliased(alias) => {
+                rewrite_time_travel_in_relation_async(
+                    resolver,
+                    current_catalog,
+                    current_database,
+                    &mut alias.relation,
+                    true,
+                    connector_context,
+                )
+                .await
+            }
+            Relation::Join(join) => {
+                rewrite_time_travel_in_relation_async(
+                    resolver,
+                    current_catalog,
+                    current_database,
+                    &mut join.left,
+                    false,
+                    connector_context,
+                )
+                .await?;
+                rewrite_time_travel_in_relation_async(
+                    resolver,
+                    current_catalog,
+                    current_database,
+                    &mut join.right,
+                    false,
                     connector_context,
                 )
                 .await
             }
             _ => Ok(()),
         }
-    }))
-}
-
-fn rewrite_time_travel_in_table_with_joins_async<'a>(
-    resolver: &'a (impl TimeTravelResolver + Sync),
-    current_catalog: Option<&'a str>,
-    current_database: &'a str,
-    table: &'a mut TableWithJoins,
-    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
-) -> TimeTravelRewriteFuture<'a> {
-    GuardedFuture::from_pin(Box::pin(async move {
-        rewrite_time_travel_in_factor_async(
-            resolver,
-            current_catalog,
-            current_database,
-            &mut table.relation,
-            connector_context,
-        )
-        .await?;
-        for join in &mut table.joins {
-            rewrite_time_travel_in_factor_async(
-                resolver,
-                current_catalog,
-                current_database,
-                &mut join.relation,
-                connector_context,
-            )
-            .await?;
-        }
-        Ok(())
     }))
 }
 
@@ -671,6 +682,46 @@ mod tests {
             data_sequence_number: None,
             change_op,
             row_id_allow_list: None,
+        }
+    }
+
+    #[test]
+    fn time_travel_lookup_preserves_classified_suffix_and_quoted_ordinary_identity() {
+        use novarocks_parser::ast::{Relation, SetExpr, Statement};
+        for (sql, expected_table, expected_suffix, quoted) in [
+            (
+                "SELECT * FROM ice.db.orders$files FOR VERSION AS OF 42",
+                "orders",
+                Some("$files"),
+                false,
+            ),
+            (
+                "SELECT * FROM ice.db.`orders$files` FOR VERSION AS OF 42",
+                "orders$files",
+                None,
+                true,
+            ),
+        ] {
+            let [Statement::Query(query)]: [Statement; 1] =
+                novarocks_parser::parse(sql).unwrap().try_into().unwrap()
+            else {
+                panic!("query");
+            };
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("SELECT");
+            };
+            let Some(Relation::Table(table)) = &select.from else {
+                panic!("Table");
+            };
+            let before = table.clone();
+            let (parts, suffix) = super::time_travel_table_lookup(table);
+            assert_eq!(parts, ["ice", "db", expected_table]);
+            assert_eq!(suffix.as_deref(), expected_suffix);
+            assert_eq!(
+                table, &before,
+                "lookup keeps original full name, quote, period and spans"
+            );
+            assert_eq!(table.name.parts.last().unwrap().quoted, quoted);
         }
     }
 

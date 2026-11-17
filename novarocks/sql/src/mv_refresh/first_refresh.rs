@@ -2770,7 +2770,7 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql_with_target
                 target_schema,
                 None,
             )?;
-            Ok(*query.body)
+            Ok(query.body.into_inner())
         })
         .collect::<Result<Vec<_>, String>>()?;
     let query = build::query(build::union_all(bodies).map_err(|error| error.to_string())?);
@@ -2977,13 +2977,14 @@ fn aggregate_physical_query(
             BRANCH_ID_COLUMN_NAME,
         ));
     }
-    Ok(build::query(ast::SetExpr::Select(Box::new(
+    Ok(build::query(ast::SetExpr::Select(ast::AstBox::new(
         build::select(
             projection,
-            vec![build::relation(build::derived(
-                state_query,
-                Some(build::alias(build::ident("state", false), Vec::new(), true)),
-            ))],
+            Some(build::alias(
+                build::derived(state_query),
+                build::ident("state", false),
+                None,
+            )),
             None,
             None,
         )
@@ -3916,26 +3917,22 @@ mod tests {
         use ast::Visit;
         struct Versions(Vec<String>);
         impl ast::Visit for Versions {
-            fn visit_table_factor(&mut self, factor: &ast::TableFactor) {
-                if let ast::TableFactor::Table {
-                    version: Some(version),
-                    ..
-                } = factor
-                {
-                    assert_eq!(version.kind, ast::TableVersionKind::ForVersionAsOf);
+            fn visit_table(&mut self, table: &ast::Table) {
+                if let Some(version) = &table.query_period {
+                    assert_eq!(version.range_type, ast::QueryPeriodRangeType::Version);
                     let ast::Expr::Literal(ast::Literal {
                         kind:
                             ast::LiteralKind::Long {
                                 spelling: value, ..
                             },
                         ..
-                    }) = &version.value
+                    }) = crate::analyzer::iceberg_ref::query_period_end(version).unwrap()
                     else {
                         panic!("expected snapshot integer");
                     };
                     self.0.push(value.clone());
                 }
-                ast::walk_table_factor(self, factor);
+                ast::walk_table(self, table);
             }
         }
         let mut versions = Versions(Vec::new());
@@ -4294,27 +4291,20 @@ mod tests {
                     "branch {index} lost exact output alias {name}"
                 );
             }
-            let [from] = select.from.as_slice() else {
-                panic!("state source");
+            let Some(ast::Relation::Aliased(alias)) = &select.from else {
+                panic!("derived state source alias");
             };
-            let ast::TableFactor::Derived {
-                subquery,
-                alias: Some(alias),
-                ..
-            } = &from.relation
-            else {
+            let ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
                 panic!("derived state source");
             };
-            assert_eq!(alias.name.value, "state");
-            let ast::SetExpr::Select(state) = subquery.body.as_ref() else {
+            assert_eq!(alias.alias.value, "state");
+            let ast::SetExpr::Select(state) = node.query.body.as_ref() else {
                 panic!("state SELECT");
             };
-            let [from] = state.from.as_slice() else {
-                panic!("original branch scan");
-            };
-            let ast::TableFactor::Table { name, .. } = &from.relation else {
+            let Some(ast::Relation::Table(table)) = &state.from else {
                 panic!("original table");
             };
+            let name = &table.name;
             assert_eq!(
                 name.parts
                     .iter()

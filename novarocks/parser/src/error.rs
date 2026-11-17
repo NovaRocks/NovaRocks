@@ -118,6 +118,18 @@ pub enum ParseError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StructuralViolation {
     EmptyWithCteList,
+    ConflictingTablePeriodAndBranch,
+    InvalidJoinCriteria,
+    EmptyJoinUsingColumns,
+    EmptyPivotAggregations,
+    EmptyPivotColumns,
+    EmptyPivotValueGroups,
+    EmptyPivotValues,
+    EmptyDescriptorFields,
+    EmptyPatternVariableDefinitions,
+    InvalidPatternRowsPerMatch,
+    InvalidQueryPeriod,
+
     EmptyValuesRowList,
     EmptyValuesRow,
     EmptySelectProjection,

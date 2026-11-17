@@ -17,12 +17,13 @@
 
 //! Row DML grammar owned by SQLP-5.
 
+use crate::ast::legacy::TableAlias;
 use crate::{
     ParseError, Span, Token, TokenKind,
     ast::{
         AddEqualityDelete, Assignment, Delete, DmlStatement, Insert, InsertPartitionEntry,
         InsertPartitions, Merge, MergeClause, MergeMatchedAction, MergeNotMatchedAction,
-        MutationSource, Statement, TableAlias, Update,
+        MutationSource, Statement, Update,
     },
     token::Symbol,
 };
@@ -324,9 +325,9 @@ fn parse_source(parser: &mut StatementParser<'_, '_>) -> Result<MutationSource, 
         let alias = parse_optional_alias(parser)?;
         let end = alias.as_ref().map_or(close, |alias| alias.span.end());
         return Ok(MutationSource::Query {
-            lateral,
-            query,
-            alias,
+            lateral: lateral,
+            query: query,
+            alias: alias,
             span: Span::new(start, end),
         });
     }

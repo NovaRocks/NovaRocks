@@ -24,9 +24,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analyze_error::AnalyzeError;
 use crate::planner::table::TableDef;
-use novarocks_parser::ast::{Query, TableVersion};
+use novarocks_parser::ast::{Query, QueryPeriod};
 #[cfg(test)]
-use novarocks_parser::ast::{SetExpr, Statement, TableFactor};
+use novarocks_parser::ast::{SetExpr, Statement};
 use novarocks_types::naming::TableIdentity;
 use novarocks_types::schema::{CatalogTable, ColumnDef};
 
@@ -221,7 +221,9 @@ impl SqlTimeTravelReferenceMetadataFacts {
     }
 }
 
-pub use crate::analyzer::iceberg_ref::{SqlTimeTravelSelection, parse_time_travel_selection};
+pub use crate::analyzer::iceberg_ref::{
+    SqlTimeTravelSelection, parse_time_travel_selection, query_period_end,
+};
 
 /// Sealed result of resolving one parsed time-travel clause against validated
 /// immutable snapshot facts.  SQL exposes only the frozen snapshot identity
@@ -250,7 +252,7 @@ impl SqlTimeTravelSnapshotBindingFacts {
 /// validated snapshot-reference facts.  Unknown requested snapshots and refs
 /// fail closed in SQL before Core creates a synthetic table identity.
 pub fn resolve_time_travel_snapshot_binding(
-    version: &TableVersion,
+    version: &QueryPeriod,
     metadata: &SqlTimeTravelReferenceMetadataFacts,
     fully_qualified_name: &str,
 ) -> Result<SqlTimeTravelSnapshotBindingFacts, AnalyzeError> {
@@ -995,7 +997,7 @@ mod tests {
         .into_resolved_table()
     }
 
-    fn parsed_time_travel_clause(sql: &str) -> TableVersion {
+    fn parsed_time_travel_clause(sql: &str) -> QueryPeriod {
         let mut statements = novarocks_parser::parse(sql).expect("parse time travel");
         let [statement] = statements.as_mut_slice() else {
             panic!("expected exactly one statement");
@@ -1006,16 +1008,10 @@ mod tests {
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select query");
         };
-        let Some(table_with_joins) = select.from.first() else {
-            panic!("expected FROM relation");
+        let Some(novarocks_parser::ast::Relation::Table(table)) = &select.from else {
+            panic!("table relation");
         };
-        let TableFactor::Table {
-            version: Some(version),
-            ..
-        } = &table_with_joins.relation
-        else {
-            panic!("expected table version clause");
-        };
+        let version = table.query_period.as_ref().expect("query period");
         version.clone()
     }
 

@@ -883,12 +883,16 @@ pub fn first_union_branch_query(
                     .ok_or_else(|| "MV UNION ALL has no input branches".to_string())?;
                 first_branch_body(first)
             }
-            novarocks_parser::ast::SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
+            novarocks_parser::ast::SetExpr::Query(subquery) => {
+                let inner = &subquery.query;
+                first_branch_body(inner.body.as_ref())
+            }
             other => Ok(other),
         }
     }
     let mut branch = query.clone();
-    branch.body = Box::new(first_branch_body(query.body.as_ref())?.clone());
+    branch.body =
+        novarocks_parser::ast::AstBox::new(first_branch_body(query.body.as_ref())?.clone());
     Ok(branch)
 }
 

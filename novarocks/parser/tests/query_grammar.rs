@@ -18,7 +18,7 @@
 //! syntax can round-trip without making it a frontend execution route.
 
 use novarocks_parser::{
-    ast::{BinaryOperator, Expr, SetExpr, Statement, SyntaxEq, TableFactor},
+    ast::{Expr, Relation, Select, SetExpr, Statement, SyntaxEq, Table},
     parse,
     printer::Printer,
 };
@@ -86,7 +86,7 @@ fn source_significant_query_forms_are_retained_by_the_typed_ast() {
 
     assert_eq!(
         Printer::new().statements(&statements),
-        "SELECT t.id AS value FROM source AS t INNER JOIN LATERAL UNNEST(t.items) AS u(item) ON TRUE LEFT OUTER JOIN target AS r ON r.id = t.id"
+        "SELECT t.id AS value FROM source AS t JOIN UNNEST(t.items) AS u(item) ON TRUE LEFT JOIN target AS r ON r.id = t.id"
     );
 }
 
@@ -100,19 +100,16 @@ fn table_function_named_arguments_are_typed_locally() {
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("expected SELECT query body");
     };
-    let TableFactor::TableFunction {
-        expr: Expr::FunctionCall(call),
-        ..
-    } = &select.from[0].relation
-    else {
-        panic!("expected table function call");
+    let Some(Relation::TableFunction(call)) = &select.from else {
+        panic!("expected table function invocation");
     };
-    assert!(call.arguments.iter().all(|argument| {
-        matches!(
-            &argument.value,
-            Expr::Binary(binary) if binary.operator == BinaryOperator::NamedArgument
-        )
-    }));
+    assert_eq!(call.arguments.len(), 2);
+    for (argument, (name, value)) in call.arguments.iter().zip([("end", 5), ("start", 2)]) {
+        assert_eq!(argument.name.as_ref().unwrap().value, name);
+        assert!(
+            matches!(&argument.value,novarocks_parser::ast::TableFunctionArgumentValue::Expression(Expr::Literal(novarocks_parser::ast::Literal {kind:novarocks_parser::ast::LiteralKind::Long{parsed_value,..},..})) if *parsed_value==value)
+        );
+    }
 }
 
 #[test]
@@ -212,18 +209,16 @@ fn metadata_table_suffix_is_typed_parse_broad_and_roundtrips() {
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("expected SELECT");
     };
-    let TableFactor::Table { name, metadata, .. } = &select.from[0].relation else {
-        panic!("expected table relation");
-    };
+    let table = table_relation(select);
+    let name = &table.name;
     assert_eq!(name.parts.len(), 3);
     assert_eq!(name.parts[0].value, "ice");
     assert_eq!(name.parts[1].value, "analytics");
-    assert_eq!(name.parts[2].value, "orders");
-    let metadata = metadata.as_ref().expect("typed metadata suffix");
-    assert_eq!(metadata.value, "future_metadata");
+    assert_eq!(name.parts[2].value, "orders$future_metadata");
+    assert!(!name.parts[2].quoted);
     assert_eq!(
-        &source[metadata.span.start()..metadata.span.end()],
-        "future_metadata"
+        &source[name.parts[2].span.start()..name.parts[2].span.end()],
+        "orders$future_metadata"
     );
 
     let canonical = Printer::new().statements(&statements);
@@ -249,10 +244,16 @@ fn quoted_or_incomplete_dollar_names_remain_regular_table_names() {
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected SELECT");
         };
-        let TableFactor::Table { metadata, .. } = &select.from[0].relation else {
-            panic!("expected table relation");
-        };
-        assert!(metadata.is_none(), "{source}");
+        let table = table_relation(select);
+        assert_eq!(table.name.parts.len(), 1);
+        let last = &table.name.parts[0];
+        assert_eq!(last.quoted, source.contains('`'));
+        assert_eq!(
+            last.value,
+            source
+                .trim_start_matches("SELECT * FROM ")
+                .trim_matches('`')
+        );
         assert_eq!(Printer::new().statements(&statements), source);
     }
 }
@@ -270,5 +271,16 @@ fn table_hints_are_rejected_in_every_relation_position() {
         "SELECT * FROM TABLE(generate_series(1, 3)) [shuffle]",
     ] {
         assert!(parse(source).is_err(), "{source}");
+    }
+}
+
+fn table_relation(select: &Select) -> &Table {
+    let mut relation = select.from.as_ref().unwrap();
+    loop {
+        match relation {
+            Relation::Aliased(node) => relation = &node.relation,
+            Relation::Table(node) => return node,
+            _ => panic!("real table relation"),
+        }
     }
 }

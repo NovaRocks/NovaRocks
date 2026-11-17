@@ -3161,33 +3161,11 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>, AnalyzerScope), AnalyzeError> {
         // --- FROM clause ---
-        let (from, inner_scope) = if select.from.is_empty() {
-            (None, self.new_scope())
-        } else if select.from.len() == 1 {
-            let (rel, scope) = self.analyze_from(&select.from[0])?;
-            (Some(rel), scope)
+        let (from, inner_scope) = if let Some(relation) = &select.from {
+            let (relation, scope) = self.analyze_from(relation)?;
+            (Some(relation), scope)
         } else {
-            let mut iter = select.from.iter();
-            let first = iter.next().unwrap();
-            let (mut current_rel, mut current_scope) = self.analyze_from(first)?;
-            for twj in iter {
-                self.check_control()?;
-                // Comma-separated FROM entries are implicit CROSS JOINs.
-                // Expose the accumulated left-hand scope so that table-valued
-                // functions like `unnest(...)` can reference earlier sibling
-                // columns (StarRocks implicit-lateral semantics).
-                let (right_rel, right_scope) =
-                    self.analyze_from_with_outer(twj, Some(&current_scope))?;
-                current_scope.merge(&right_scope);
-                current_rel = Relation::Join(Box::new(JoinRelation {
-                    naa_author: None,
-                    left: current_rel,
-                    right: right_rel,
-                    join_type: JoinKind::Cross,
-                    condition: None,
-                }));
-            }
-            (Some(current_rel), current_scope)
+            (None, self.new_scope())
         };
 
         // Merged scope: inner tables first (higher priority), then outer scope lookup.

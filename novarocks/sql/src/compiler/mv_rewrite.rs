@@ -25,10 +25,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_parser::ast::{
-    Expr, FunctionCall, Ident, JoinConstraint, Literal, LiteralKind, ObjectName, Query, Select,
-    SelectItem, SelectQuantifier, SetExpr, TableAlias, TableFactor, TableWithJoins, TypeName,
-    Visit, WildcardOptions, WindowSpecification, walk_expr, walk_function_call, walk_object_name,
-    walk_query, walk_table_factor, walk_type_name,
+    Expr, FunctionCall, Ident, Literal, LiteralKind, ObjectName, Query, Select, SelectItem,
+    SelectQuantifier, SetExpr, TypeName, Visit, WildcardOptions, WindowSpecification, walk_expr,
+    walk_function_call, walk_object_name, walk_query, walk_type_name,
 };
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 
@@ -2773,7 +2772,9 @@ impl CompletionRetainedBytes {
         if let Some(with) = &query.with {
             self.add_vec_capacity::<novarocks_parser::ast::Cte>(with.ctes.capacity());
             for cte in &with.ctes {
-                self.add_vec_capacity::<Ident>(cte.columns.capacity());
+                if let Some(columns) = &cte.columns {
+                    self.add_vec_capacity::<Ident>(columns.capacity());
+                }
             }
         }
         self.add_set_expr_containers(&query.body);
@@ -2791,7 +2792,7 @@ impl CompletionRetainedBytes {
                     self.add_vec_capacity::<Expr>(row.capacity());
                 }
             }
-            SetExpr::Query(_) => {}
+            SetExpr::Query(_) | SetExpr::Table(_) => {}
             SetExpr::SetOperation(operation) => {
                 self.add(std::mem::size_of::<novarocks_parser::ast::SetOperation>());
                 self.add_vec_capacity::<SetExpr>(operation.inputs.capacity());
@@ -2824,31 +2825,6 @@ impl CompletionRetainedBytes {
                 SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
             }
         }
-        self.add_vec_capacity::<TableWithJoins>(select.from.capacity());
-        for table in &select.from {
-            self.add_table_with_joins_containers(table);
-        }
-        if let Some(group_by) = &select.group_by {
-            self.add_vec_capacity::<novarocks_parser::ast::GroupingElement>(
-                group_by.elements.capacity(),
-            );
-            for element in &group_by.elements {
-                match element {
-                    novarocks_parser::ast::GroupingElement::Simple(simple) => {
-                        self.add_vec_capacity::<Expr>(simple.columns.capacity())
-                    }
-                    novarocks_parser::ast::GroupingElement::Sets(sets) => {
-                        self.add_vec_capacity::<novarocks_parser::ast::AstVec<Expr>>(
-                            sets.sets.capacity(),
-                        );
-                        for group in &sets.sets {
-                            self.add_vec_capacity::<Expr>(group.capacity());
-                        }
-                    }
-                    novarocks_parser::ast::GroupingElement::Auto(_) => {}
-                }
-            }
-        }
         self.add_vec_capacity::<novarocks_parser::ast::WindowDefinition>(select.windows.capacity());
         for window in &select.windows {
             self.add_window_spec_containers(&window.specification);
@@ -2860,22 +2836,6 @@ impl CompletionRetainedBytes {
         self.add_vec_capacity::<novarocks_parser::ast::ReplaceSelectItem>(
             options.replace.capacity(),
         );
-    }
-
-    fn add_table_with_joins_containers(&mut self, table: &TableWithJoins) {
-        self.add(std::mem::size_of::<TableWithJoins>());
-        self.add_vec_capacity::<novarocks_parser::ast::Join>(table.joins.capacity());
-        for join in &table.joins {
-            if let JoinConstraint::Using { columns, .. } = &join.constraint {
-                self.add_vec_capacity::<Ident>(columns.capacity());
-            }
-        }
-    }
-
-    fn add_alias_containers(&mut self, alias: &Option<TableAlias>) {
-        if let Some(alias) = alias {
-            self.add_vec_capacity::<Ident>(alias.columns.capacity());
-        }
     }
 
     fn add_order_by_containers(&mut self, order_by: &Option<novarocks_parser::ast::OrderBy>) {
@@ -3302,31 +3262,108 @@ impl Visit for CompletionRetainedBytes {
     }
 
     #[recursive::recursive]
-    fn visit_table_factor(&mut self, factor: &TableFactor) {
-        self.add(std::mem::size_of::<TableFactor>());
-        match factor {
-            TableFactor::JsonTable { alias, .. }
-            | TableFactor::Table { alias, .. }
-            | TableFactor::Derived { alias, .. }
-            | TableFactor::TableFunction { alias, .. } => {
-                self.add_alias_containers(alias);
+    fn visit_relation(&mut self, relation: &novarocks_parser::ast::Relation) {
+        use novarocks_parser::ast;
+        self.add(std::mem::size_of::<ast::Relation>());
+        match relation {
+            ast::Relation::Table(_) | ast::Relation::TableSubquery(_) => {}
+            ast::Relation::Aliased(node) => {
+                self.add(std::mem::size_of::<ast::AliasedRelation>());
+                if let Some(columns) = &node.column_names {
+                    self.add_vec_capacity::<Ident>(columns.capacity());
+                }
             }
-            TableFactor::Unnest {
-                array_exprs, alias, ..
-            } => {
-                self.add_vec_capacity::<Expr>(array_exprs.capacity());
-                self.add_alias_containers(alias);
+            ast::Relation::Lateral(_) => self.add(std::mem::size_of::<ast::Lateral>()),
+            ast::Relation::Unnest(node) => {
+                self.add(std::mem::size_of::<ast::Unnest>());
+                self.add_vec_capacity::<Expr>(node.expressions.capacity());
             }
-            TableFactor::NestedJoin {
-                table_with_joins,
-                alias,
-                ..
-            } => {
-                self.add_table_with_joins_containers(table_with_joins);
-                self.add_alias_containers(alias);
+            ast::Relation::Join(node) => {
+                self.add(std::mem::size_of::<ast::Join>());
+                if let Some(ast::JoinCriteria::Using(using)) = &node.criteria {
+                    self.add_vec_capacity::<Ident>(using.columns.capacity());
+                }
+            }
+            ast::Relation::Sampled(_) => self.add(std::mem::size_of::<ast::SampledRelation>()),
+            ast::Relation::Pivot(node) => {
+                self.add(std::mem::size_of::<ast::Pivot>());
+                self.add_vec_capacity::<ast::PivotAggregation>(node.aggregations.capacity());
+                self.add_vec_capacity::<Expr>(node.pivot_columns.capacity());
+                self.add_vec_capacity::<ast::PivotValueGroup>(node.value_groups.capacity());
+            }
+            ast::Relation::Nearest(_) => self.add(std::mem::size_of::<ast::Nearest>()),
+            ast::Relation::TableFunction(node) => {
+                self.add(std::mem::size_of::<ast::TableFunctionInvocation>());
+                self.add_vec_capacity::<ast::TableFunctionArgument>(node.arguments.capacity());
+                self.add_vec_capacity::<Vec<ObjectName>>(node.copartitioning.capacity());
+                for group in &node.copartitioning {
+                    self.add_vec_capacity::<ObjectName>(group.capacity());
+                }
+            }
+            ast::Relation::LegacyTableFunction(_) => {
+                self.add(std::mem::size_of::<ast::legacy::TableFunction>())
+            }
+            ast::Relation::JsonTable(_) => {}
+            ast::Relation::PatternRecognition(node) => {
+                self.add(std::mem::size_of::<ast::PatternRecognitionRelation>());
+                self.add_vec_capacity::<Expr>(node.partition_by.capacity());
+                self.add_order_by_containers(&node.order_by);
+                self.add_vec_capacity::<ast::MeasureDefinition>(node.measures.capacity());
+                self.add_vec_capacity::<ast::SubsetDefinition>(node.subsets.capacity());
+                self.add_vec_capacity::<ast::VariableDefinition>(
+                    node.variable_definitions.capacity(),
+                );
             }
         }
-        walk_table_factor(self, factor);
+        ast::walk_relation(self, relation);
+    }
+    fn visit_table(&mut self, table: &novarocks_parser::ast::Table) {
+        self.add(std::mem::size_of::<novarocks_parser::ast::Table>());
+        novarocks_parser::ast::walk_table(self, table);
+    }
+    fn visit_table_subquery(&mut self, node: &novarocks_parser::ast::TableSubquery) {
+        self.add(std::mem::size_of::<novarocks_parser::ast::TableSubquery>());
+        novarocks_parser::ast::walk_table_subquery(self, node);
+    }
+    fn visit_group_by(&mut self, group_by: &novarocks_parser::ast::GroupBy) {
+        self.add_vec_capacity::<novarocks_parser::ast::GroupingElement>(
+            group_by.elements.capacity(),
+        );
+        for element in &group_by.elements {
+            match element {
+                novarocks_parser::ast::GroupingElement::Simple(simple) => {
+                    self.add_vec_capacity::<Expr>(simple.columns.capacity())
+                }
+                novarocks_parser::ast::GroupingElement::Sets(sets) => {
+                    self.add_vec_capacity::<novarocks_parser::ast::AstVec<Expr>>(
+                        sets.sets.capacity(),
+                    );
+                    for group in &sets.sets {
+                        self.add_vec_capacity::<Expr>(group.capacity());
+                    }
+                }
+                novarocks_parser::ast::GroupingElement::Auto(_) => {}
+            }
+        }
+        novarocks_parser::ast::walk_group_by(self, group_by);
+    }
+    fn visit_pivot_value_group(&mut self, node: &novarocks_parser::ast::PivotValueGroup) {
+        self.add_vec_capacity::<Expr>(node.values.capacity());
+        novarocks_parser::ast::walk_pivot_value_group(self, node);
+    }
+    fn visit_table_function_table_argument(
+        &mut self,
+        node: &novarocks_parser::ast::TableFunctionTableArgument,
+    ) {
+        if let Some(partition) = &node.partition_by {
+            self.add_vec_capacity::<Expr>(partition.capacity());
+        }
+        self.add_order_by_containers(&node.order_by);
+        novarocks_parser::ast::walk_table_function_table_argument(self, node);
+    }
+    fn visit_descriptor(&mut self, node: &novarocks_parser::ast::Descriptor) {
+        self.add_vec_capacity::<novarocks_parser::ast::DescriptorField>(node.fields.capacity());
+        novarocks_parser::ast::walk_descriptor(self, node);
     }
 }
 
@@ -3743,7 +3780,7 @@ impl PlannerTableProvider for DefinitionResolutionCatalog<'_> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: &novarocks_parser::ast::TableVersion,
+        version: &novarocks_parser::ast::QueryPeriod,
     ) -> Result<crate::catalog::ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
         self.inner.resolve_table_version_for_analysis(
             Some(catalog.unwrap_or(self.default_catalog)),
@@ -3993,9 +4030,11 @@ mod tests {
         // Freeze the unchanged definition metadata and original leaf separately.
         // Every newly owned buffer below is measured from its actual capacity.
         let baseline = definition.completion_retained_bytes().unwrap();
-        let original_body =
-            std::mem::replace(&mut definition.select_query.body, Box::new(values(1, 1)));
-        let mut body = *original_body;
+        let original_body = std::mem::replace(
+            &mut definition.select_query.body,
+            novarocks_parser::ast::AstBox::new(values(1, 1)),
+        );
+        let mut body = original_body.into_inner();
         let mut added_buffer_bytes = 0_u64;
         const DEPTH: usize = 20_000;
         for index in 0..DEPTH {
@@ -4022,7 +4061,7 @@ mod tests {
                 span: SYNTHETIC,
             });
         }
-        definition.select_query.body = Box::new(body);
+        definition.select_query.body = novarocks_parser::ast::AstBox::new(body);
         // Each binary operation adds itself and one VALUES sibling. The sibling's
         // boolean has no heap string and is visited once by the real AST walk.
         let inline_per_layer = 2 * size_of::<SetExpr>()

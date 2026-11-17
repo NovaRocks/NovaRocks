@@ -476,61 +476,52 @@ pub fn qualified_wildcard(prefix: Vec<Ident>) -> Result<SelectItem, BuildError> 
     })
 }
 
-pub fn alias(name: Ident, columns: Vec<Ident>, explicit_as: bool) -> TableAlias {
-    TableAlias {
-        span: name
-            .span
-            .cover(cover(columns.iter().map(|column| column.span))),
-        name,
-        columns,
-        explicit_as,
-    }
+/// Wraps one real relation with its authored alias and optional column list.
+pub fn alias(relation: Relation, name: Ident, column_names: Option<Vec<Ident>>) -> Relation {
+    let span = relation.span().cover(name.span).cover(cover(
+        column_names.iter().flatten().map(|column| column.span),
+    ));
+    Relation::Aliased(AstBox::new(AliasedRelation {
+        relation: AstBox::new(relation),
+        alias: name,
+        column_names,
+        span,
+    }))
 }
-
 pub fn table(
     name: ObjectName,
-    version: Option<TableVersion>,
-    alias: Option<TableAlias>,
-) -> TableFactor {
-    TableFactor::Table {
+    query_period: Option<QueryPeriod>,
+    branch: Option<Ident>,
+) -> Relation {
+    let span = name.span;
+    Relation::Table(AstBox::new(Table {
         name,
-        metadata: None,
-        alias,
-        version,
-        span: SYNTHETIC,
-    }
+        query_period,
+        branch,
+        span,
+    }))
 }
-
-pub fn derived(query: Query, alias: Option<TableAlias>) -> TableFactor {
-    TableFactor::Derived {
-        lateral: false,
-        subquery: Box::new(query),
-        alias,
-        span: SYNTHETIC,
-    }
+pub fn derived(query: Query) -> Relation {
+    let span = query.span;
+    Relation::TableSubquery(AstBox::new(TableSubquery {
+        query: AstBox::new(query),
+        span,
+    }))
 }
-
-pub fn relation(relation: TableFactor) -> TableWithJoins {
-    TableWithJoins {
-        relation,
-        joins: Vec::new(),
-        span: SYNTHETIC,
-    }
-}
-
 pub fn join(
-    mut left: TableWithJoins,
-    operator: JoinOperator,
-    right: TableFactor,
-    constraint: JoinConstraint,
-) -> TableWithJoins {
-    left.joins.push(Join {
-        relation: right,
-        operator,
-        constraint,
-        span: SYNTHETIC,
-    });
-    left
+    left: Relation,
+    kind: JoinType,
+    right: Relation,
+    criteria: Option<JoinCriteria>,
+) -> Relation {
+    let span = left.span().cover(right.span());
+    Relation::Join(AstBox::new(Join {
+        left: AstBox::new(left),
+        right: AstBox::new(right),
+        kind,
+        criteria,
+        span,
+    }))
 }
 
 pub fn values(rows: Vec<Vec<Expr>>) -> Result<SetExpr, BuildError> {
@@ -549,7 +540,7 @@ pub fn values(rows: Vec<Vec<Expr>>) -> Result<SetExpr, BuildError> {
 
 pub fn select(
     projection: Vec<SelectItem>,
-    from: Vec<TableWithJoins>,
+    from: Option<Relation>,
     selection: Option<Expr>,
     group_by: Option<GroupBy>,
 ) -> Result<Select, BuildError> {
@@ -558,10 +549,10 @@ pub fn select(
     }
     Ok(Select {
         quantifier: SelectQuantifier::None,
-        projection,
-        from,
-        selection,
-        group_by,
+        projection: projection,
+        from: from,
+        selection: selection,
+        group_by: group_by,
         having: None,
         qualify: None,
         windows: AstVec::new(),
@@ -572,10 +563,10 @@ pub fn select(
 
 pub fn query(body: SetExpr) -> Query {
     Query {
-        session_properties: Vec::new(),
-        functions: Vec::new(),
+        session_properties: AstVec::new(),
+        functions: AstVec::new(),
         with: None,
-        body: Box::new(body),
+        body: AstBox::new(body),
         modifiers: Default::default(),
         span: SYNTHETIC,
     }

@@ -355,8 +355,9 @@ fn context_body<'a>(
             }
         }
         ast::SetExpr::Query(query) => {
-            context_body(&query.body, assignments, source, policy, control)?
+            context_body(&query.query.body, assignments, source, policy, control)?
         }
+        ast::SetExpr::Table(_) => {}
         ast::SetExpr::SetOperation(operation) => {
             // Only literal holes are contextualized here; actual ordinary
             // value conversions remain ABOVE the complete set operation.
@@ -390,7 +391,7 @@ fn case_results(
 fn plain_map_arguments(
     call: &novarocks_parser::ast::FunctionCall,
 ) -> Option<&[novarocks_parser::ast::CallArgument]> {
-    use novarocks_parser::{ast, printer};
+    use novarocks_parser::printer;
     (call.name.parts.len() == 1
         && printer::print_object_name(&call.name).eq_ignore_ascii_case("map")
         && !call.distinct

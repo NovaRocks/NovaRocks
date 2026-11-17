@@ -605,7 +605,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     left,
                     Predicate::In(InPredicate {
                         negated,
-                        value_list: Expr::Subquery(SubqueryExpr { query, span }),
+                        value_list: Expr::Subquery(SubqueryExpr {
+                            query: query,
+                            span: span,
+                        }),
                         span: predicate_span,
                     }),
                 ));
@@ -1030,7 +1033,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let span = Span::new(exists_start, subquery_span.end());
         let exists = Expr::Exists(AstBox::new(ExistsExpr {
             subquery: Expr::Subquery(SubqueryExpr {
-                query,
+                query: query,
                 span: subquery_span,
             }),
             span,
@@ -1050,13 +1053,16 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.advance();
         self.skip_trivia();
         let (query, span) = self.parse_subquery_body(opening_span.start())?;
-        Ok(Expr::Subquery(SubqueryExpr { query, span }))
+        Ok(Expr::Subquery(SubqueryExpr {
+            query: query,
+            span: span,
+        }))
     }
 
     fn parse_subquery_body(
         &mut self,
         start: usize,
-    ) -> Result<(Box<crate::ast::Query>, Span), ParseError> {
+    ) -> Result<(AstBox<crate::ast::Query>, Span), ParseError> {
         let mut parser = StatementParser::new(self.source, &self.tokens[self.position..]);
         let mut query = query::parse_query(&mut parser)?;
         query.session_properties.clear();
@@ -1068,7 +1074,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let end = self.current_span().end();
         self.advance();
         self.skip_trivia();
-        Ok((Box::new(query), Span::new(start, end)))
+        Ok((AstBox::new(query), Span::new(start, end)))
     }
 
     fn parenthesized_query_follows(&self) -> bool {

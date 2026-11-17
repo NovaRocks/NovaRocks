@@ -21,6 +21,93 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_with(&mut self, node: &With) {
+        walk_with(self, node);
+    }
+    fn visit_cte(&mut self, node: &Cte) {
+        walk_cte(self, node);
+    }
+    fn visit_relation(&mut self, node: &Relation) {
+        super::relation::walk_relation(self, node);
+    }
+    fn visit_join_criteria(&mut self, node: &JoinCriteria) {
+        super::relation::walk_join_criteria(self, node);
+    }
+    fn visit_table_function_argument_value(&mut self, node: &TableFunctionArgumentValue) {
+        super::relation::walk_table_function_argument_value(self, node);
+    }
+    fn visit_table(&mut self, node: &Table) {
+        super::relation::walk_table(self, node);
+    }
+    fn visit_table_subquery(&mut self, node: &TableSubquery) {
+        super::relation::walk_table_subquery(self, node);
+    }
+    fn visit_aliased_relation(&mut self, node: &AliasedRelation) {
+        super::relation::walk_aliased_relation(self, node);
+    }
+    fn visit_lateral(&mut self, node: &Lateral) {
+        super::relation::walk_lateral(self, node);
+    }
+    fn visit_unnest(&mut self, node: &Unnest) {
+        super::relation::walk_unnest(self, node);
+    }
+    fn visit_join(&mut self, node: &Join) {
+        super::relation::walk_join(self, node);
+    }
+    fn visit_join_on(&mut self, node: &JoinOn) {
+        super::relation::walk_join_on(self, node);
+    }
+    fn visit_join_using(&mut self, node: &JoinUsing) {
+        super::relation::walk_join_using(self, node);
+    }
+    fn visit_natural_join(&mut self, node: &NaturalJoin) {
+        super::relation::walk_natural_join(self, node);
+    }
+    fn visit_sampled_relation(&mut self, node: &SampledRelation) {
+        super::relation::walk_sampled_relation(self, node);
+    }
+    fn visit_query_period(&mut self, node: &QueryPeriod) {
+        super::relation::walk_query_period(self, node);
+    }
+    fn visit_pivot(&mut self, node: &Pivot) {
+        super::relation::walk_pivot(self, node);
+    }
+    fn visit_pivot_aggregation(&mut self, node: &PivotAggregation) {
+        super::relation::walk_pivot_aggregation(self, node);
+    }
+    fn visit_pivot_value_group(&mut self, node: &PivotValueGroup) {
+        super::relation::walk_pivot_value_group(self, node);
+    }
+    fn visit_nearest(&mut self, node: &Nearest) {
+        super::relation::walk_nearest(self, node);
+    }
+    fn visit_table_function_invocation(&mut self, node: &TableFunctionInvocation) {
+        super::relation::walk_table_function_invocation(self, node);
+    }
+    fn visit_table_function_argument(&mut self, node: &TableFunctionArgument) {
+        super::relation::walk_table_function_argument(self, node);
+    }
+    fn visit_table_function_table_argument(&mut self, node: &TableFunctionTableArgument) {
+        super::relation::walk_table_function_table_argument(self, node);
+    }
+    fn visit_table_function_descriptor_argument(&mut self, node: &TableFunctionDescriptorArgument) {
+        super::relation::walk_table_function_descriptor_argument(self, node);
+    }
+    fn visit_descriptor(&mut self, node: &Descriptor) {
+        super::relation::walk_descriptor(self, node);
+    }
+    fn visit_descriptor_field(&mut self, node: &DescriptorField) {
+        super::relation::walk_descriptor_field(self, node);
+    }
+    fn visit_empty_table_treatment(&mut self, node: &EmptyTableTreatment) {
+        super::relation::walk_empty_table_treatment(self, node);
+    }
+    fn visit_pattern_recognition_relation(&mut self, node: &PatternRecognitionRelation) {
+        super::relation::walk_pattern_recognition_relation(self, node);
+    }
+    fn visit_legacy_table_function(&mut self, node: &super::legacy::TableFunction) {
+        super::relation::walk_legacy_table_function(self, node);
+    }
     fn visit_group_by(&mut self, node: &GroupBy) {
         walk_group_by(self, node);
     }
@@ -527,10 +614,6 @@ pub trait Visit {
     fn visit_nested_expr(&mut self, expression: &NestedExpr) {
         walk_nested_expr(self, expression);
     }
-
-    fn visit_table_factor(&mut self, factor: &TableFactor) {
-        walk_table_factor(self, factor);
-    }
 }
 
 pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement) {
@@ -607,6 +690,8 @@ pub fn walk_explain_query<V: Visit + ?Sized>(visitor: &mut V, query: &ExplainQue
     visitor.visit_query(&query.query);
 }
 
+#[recursive::recursive]
+
 pub fn walk_query<V: Visit + ?Sized>(visitor: &mut V, query: &Query) {
     for function in &query.functions {
         visitor.visit_function_specification(function);
@@ -615,13 +700,7 @@ pub fn walk_query<V: Visit + ?Sized>(visitor: &mut V, query: &Query) {
         visitor.visit_session_property(property);
     }
     if let Some(with) = &query.with {
-        for cte in &with.ctes {
-            visitor.visit_ident(&cte.name);
-            for column in &cte.columns {
-                visitor.visit_ident(column);
-            }
-            visitor.visit_query(&cte.query);
-        }
+        visitor.visit_with(with);
     }
     walk_set_expr(visitor, &query.body);
     walk_query_modifiers(visitor, &query.modifiers);
@@ -654,7 +733,8 @@ pub fn walk_set_expr<V: Visit + ?Sized>(visitor: &mut V, set_expr: &SetExpr) {
                 }
             }
         }
-        SetExpr::Query(query) => visitor.visit_query(query),
+        SetExpr::Table(table) => visitor.visit_table(table),
+        SetExpr::Query(query) => visitor.visit_table_subquery(query),
         SetExpr::SetOperation(operation) => visitor.visit_set_operation(operation),
     }
 }
@@ -689,8 +769,8 @@ pub fn walk_select<V: Visit + ?Sized>(visitor: &mut V, select: &Select) {
             }
         }
     }
-    for relation in &select.from {
-        walk_table_with_joins(visitor, relation);
+    if let Some(relation) = &select.from {
+        visitor.visit_relation(relation);
     }
     if let Some(selection) = &select.selection {
         visitor.visit_expr(selection);
@@ -740,97 +820,6 @@ pub fn walk_grouping_sets<V: Visit + ?Sized>(visitor: &mut V, node: &GroupingSet
 }
 pub fn walk_auto_group_by<V: Visit + ?Sized>(_visitor: &mut V, _node: &AutoGroupBy) {}
 
-pub fn walk_table_with_joins<V: Visit + ?Sized>(visitor: &mut V, table: &TableWithJoins) {
-    visitor.visit_table_factor(&table.relation);
-    for join in &table.joins {
-        visitor.visit_table_factor(&join.relation);
-        match &join.constraint {
-            JoinConstraint::On(expr) => visitor.visit_expr(expr),
-            JoinConstraint::Using { columns, .. } => {
-                for column in columns {
-                    visitor.visit_ident(column);
-                }
-            }
-            JoinConstraint::None | JoinConstraint::Natural(_) => {}
-        }
-    }
-}
-
-pub fn walk_table_factor<V: Visit + ?Sized>(visitor: &mut V, factor: &TableFactor) {
-    match factor {
-        TableFactor::JsonTable { table, alias, .. } => {
-            visitor.visit_json_table(table);
-            if let Some(alias) = alias {
-                walk_table_alias(visitor, alias);
-            }
-        }
-
-        TableFactor::Table {
-            name,
-            metadata,
-            alias,
-            version,
-            ..
-        } => {
-            visitor.visit_object_name(name);
-            if let Some(metadata) = metadata {
-                visitor.visit_ident(metadata);
-            }
-            if let Some(alias) = alias {
-                walk_table_alias(visitor, alias);
-            }
-            if let Some(version) = version {
-                visitor.visit_expr(&version.value);
-            }
-        }
-        TableFactor::Derived {
-            subquery, alias, ..
-        } => {
-            visitor.visit_query(subquery);
-            if let Some(alias) = alias {
-                walk_table_alias(visitor, alias);
-            }
-        }
-        TableFactor::TableFunction { expr, alias, .. } => {
-            visitor.visit_expr(expr);
-            if let Some(alias) = alias {
-                walk_table_alias(visitor, alias);
-            }
-        }
-        TableFactor::Unnest {
-            keyword,
-            array_exprs,
-            alias,
-            ..
-        } => {
-            visitor.visit_ident(keyword);
-            for expr in array_exprs {
-                visitor.visit_expr(expr);
-            }
-            if let Some(alias) = alias {
-                walk_table_alias(visitor, alias);
-            }
-        }
-        TableFactor::NestedJoin {
-            table_with_joins,
-            alias,
-            ..
-        } => {
-            walk_table_with_joins(visitor, table_with_joins);
-            if let Some(alias) = alias {
-                walk_table_alias(visitor, alias);
-            }
-        }
-    }
-}
-
-pub fn walk_table_alias<V: Visit + ?Sized>(visitor: &mut V, alias: &TableAlias) {
-    visitor.visit_ident(&alias.name);
-    for column in &alias.columns {
-        visitor.visit_ident(column);
-    }
-}
-
 #[recursive::recursive]
 pub fn walk_window_definition<V: Visit + ?Sized>(visitor: &mut V, window: &WindowDefinition) {
     visitor.visit_ident(&window.name);
@@ -870,6 +859,7 @@ fn walk_array_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &ArrayExpr) {
     }
 }
 
+#[recursive::recursive]
 pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
     match expression {
         Expr::JsonConstructor(node) => visitor.visit_json_constructor(node),
@@ -960,6 +950,114 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_with(&mut self, node: With) -> With {
+        fold_with(self, node)
+    }
+    fn fold_cte(&mut self, node: Cte) -> Cte {
+        fold_cte(self, node)
+    }
+    fn fold_relation(&mut self, node: Relation) -> Relation {
+        super::relation::fold_relation(self, node)
+    }
+    fn fold_join_criteria(&mut self, node: JoinCriteria) -> JoinCriteria {
+        super::relation::fold_join_criteria(self, node)
+    }
+    fn fold_table_function_argument_value(
+        &mut self,
+        node: TableFunctionArgumentValue,
+    ) -> TableFunctionArgumentValue {
+        super::relation::fold_table_function_argument_value(self, node)
+    }
+    fn fold_table(&mut self, node: Table) -> Table {
+        super::relation::fold_table(self, node)
+    }
+    fn fold_table_subquery(&mut self, node: TableSubquery) -> TableSubquery {
+        super::relation::fold_table_subquery(self, node)
+    }
+    fn fold_aliased_relation(&mut self, node: AliasedRelation) -> AliasedRelation {
+        super::relation::fold_aliased_relation(self, node)
+    }
+    fn fold_lateral(&mut self, node: Lateral) -> Lateral {
+        super::relation::fold_lateral(self, node)
+    }
+    fn fold_unnest(&mut self, node: Unnest) -> Unnest {
+        super::relation::fold_unnest(self, node)
+    }
+    fn fold_join(&mut self, node: Join) -> Join {
+        super::relation::fold_join(self, node)
+    }
+    fn fold_join_on(&mut self, node: JoinOn) -> JoinOn {
+        super::relation::fold_join_on(self, node)
+    }
+    fn fold_join_using(&mut self, node: JoinUsing) -> JoinUsing {
+        super::relation::fold_join_using(self, node)
+    }
+    fn fold_natural_join(&mut self, node: NaturalJoin) -> NaturalJoin {
+        super::relation::fold_natural_join(self, node)
+    }
+    fn fold_sampled_relation(&mut self, node: SampledRelation) -> SampledRelation {
+        super::relation::fold_sampled_relation(self, node)
+    }
+    fn fold_query_period(&mut self, node: QueryPeriod) -> QueryPeriod {
+        super::relation::fold_query_period(self, node)
+    }
+    fn fold_pivot(&mut self, node: Pivot) -> Pivot {
+        super::relation::fold_pivot(self, node)
+    }
+    fn fold_pivot_aggregation(&mut self, node: PivotAggregation) -> PivotAggregation {
+        super::relation::fold_pivot_aggregation(self, node)
+    }
+    fn fold_pivot_value_group(&mut self, node: PivotValueGroup) -> PivotValueGroup {
+        super::relation::fold_pivot_value_group(self, node)
+    }
+    fn fold_nearest(&mut self, node: Nearest) -> Nearest {
+        super::relation::fold_nearest(self, node)
+    }
+    fn fold_table_function_invocation(
+        &mut self,
+        node: TableFunctionInvocation,
+    ) -> TableFunctionInvocation {
+        super::relation::fold_table_function_invocation(self, node)
+    }
+    fn fold_table_function_argument(
+        &mut self,
+        node: TableFunctionArgument,
+    ) -> TableFunctionArgument {
+        super::relation::fold_table_function_argument(self, node)
+    }
+    fn fold_table_function_table_argument(
+        &mut self,
+        node: TableFunctionTableArgument,
+    ) -> TableFunctionTableArgument {
+        super::relation::fold_table_function_table_argument(self, node)
+    }
+    fn fold_table_function_descriptor_argument(
+        &mut self,
+        node: TableFunctionDescriptorArgument,
+    ) -> TableFunctionDescriptorArgument {
+        super::relation::fold_table_function_descriptor_argument(self, node)
+    }
+    fn fold_descriptor(&mut self, node: Descriptor) -> Descriptor {
+        super::relation::fold_descriptor(self, node)
+    }
+    fn fold_descriptor_field(&mut self, node: DescriptorField) -> DescriptorField {
+        super::relation::fold_descriptor_field(self, node)
+    }
+    fn fold_empty_table_treatment(&mut self, node: EmptyTableTreatment) -> EmptyTableTreatment {
+        super::relation::fold_empty_table_treatment(self, node)
+    }
+    fn fold_pattern_recognition_relation(
+        &mut self,
+        node: PatternRecognitionRelation,
+    ) -> PatternRecognitionRelation {
+        super::relation::fold_pattern_recognition_relation(self, node)
+    }
+    fn fold_legacy_table_function(
+        &mut self,
+        node: super::legacy::TableFunction,
+    ) -> super::legacy::TableFunction {
+        super::relation::fold_legacy_table_function(self, node)
+    }
     fn fold_group_by(&mut self, node: GroupBy) -> GroupBy {
         fold_group_by(self, node)
     }
@@ -1477,6 +1575,8 @@ pub trait Fold {
         fold_session_statement(self, statement)
     }
 
+    #[recursive::recursive]
+
     fn fold_query(&mut self, query: Query) -> Query {
         fold_query(self, query)
     }
@@ -1525,10 +1625,6 @@ pub trait Fold {
 
     fn fold_nested_expr(&mut self, expression: NestedExpr) -> NestedExpr {
         fold_nested_expr(self, expression)
-    }
-
-    fn fold_table_factor(&mut self, factor: TableFactor) -> TableFactor {
-        fold_table_factor(self, factor)
     }
 }
 
@@ -1687,6 +1783,8 @@ pub fn fold_explain_query<F: Fold + ?Sized>(
     query
 }
 
+#[recursive::recursive]
+
 pub fn fold_query<F: Fold + ?Sized>(folder: &mut F, mut query: Query) -> Query {
     query.functions = query
         .functions
@@ -1698,24 +1796,8 @@ pub fn fold_query<F: Fold + ?Sized>(folder: &mut F, mut query: Query) -> Query {
         .into_iter()
         .map(|property| folder.fold_session_property(property))
         .collect();
-    query.with = query.with.map(|mut with| {
-        with.ctes = with
-            .ctes
-            .into_iter()
-            .map(|mut cte| {
-                cte.name = folder.fold_ident(cte.name);
-                cte.columns = cte
-                    .columns
-                    .into_iter()
-                    .map(|column| folder.fold_ident(column))
-                    .collect();
-                cte.query = Box::new(folder.fold_query(*cte.query));
-                cte
-            })
-            .collect();
-        with
-    });
-    query.body = Box::new(fold_set_expr(folder, *query.body));
+    query.with = query.with.map(|with| folder.fold_with(with));
+    query.body = AstBox::new(fold_set_expr(folder, query.body.into_inner()));
     query.modifiers = fold_query_modifiers(folder, query.modifiers);
     query
 }
@@ -1744,7 +1826,9 @@ pub fn fold_query_modifiers<F: Fold + ?Sized>(
 #[recursive::recursive]
 pub fn fold_set_expr<F: Fold + ?Sized>(folder: &mut F, set_expr: SetExpr) -> SetExpr {
     match set_expr {
-        SetExpr::Select(select) => SetExpr::Select(Box::new(folder.fold_select(*select))),
+        SetExpr::Select(select) => {
+            SetExpr::Select(AstBox::new(folder.fold_select(select.into_inner())))
+        }
         SetExpr::Values(mut values) => {
             values.rows = values
                 .rows
@@ -1753,7 +1837,10 @@ pub fn fold_set_expr<F: Fold + ?Sized>(folder: &mut F, set_expr: SetExpr) -> Set
                 .collect();
             SetExpr::Values(values)
         }
-        SetExpr::Query(query) => SetExpr::Query(Box::new(folder.fold_query(*query))),
+        SetExpr::Table(table) => SetExpr::Table(AstBox::new(folder.fold_table(table.into_inner()))),
+        SetExpr::Query(query) => {
+            SetExpr::Query(AstBox::new(folder.fold_table_subquery(query.into_inner())))
+        }
         SetExpr::SetOperation(operation) => {
             SetExpr::SetOperation(folder.fold_set_operation(operation))
         }
@@ -1805,11 +1892,7 @@ pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Sele
             }
         })
         .collect();
-    select.from = select
-        .from
-        .into_iter()
-        .map(|table| fold_table_with_joins(folder, table))
-        .collect();
+    select.from = select.from.map(|relation| folder.fold_relation(relation));
     select.selection = select.selection.map(|expr| folder.fold_expr(expr));
     select.group_by = select.group_by.map(|node| folder.fold_group_by(node));
     select.having = select.having.map(|expr| folder.fold_expr(expr));
@@ -1892,121 +1975,6 @@ pub fn fold_auto_group_by<F: Fold + ?Sized>(_folder: &mut F, node: AutoGroupBy) 
     node
 }
 
-pub fn fold_table_with_joins<F: Fold + ?Sized>(
-    folder: &mut F,
-    mut table: TableWithJoins,
-) -> TableWithJoins {
-    table.relation = folder.fold_table_factor(table.relation);
-    table.joins = table
-        .joins
-        .into_iter()
-        .map(|mut join| {
-            join.relation = folder.fold_table_factor(join.relation);
-            join.constraint = match join.constraint {
-                JoinConstraint::On(expr) => JoinConstraint::On(folder.fold_expr(expr)),
-                JoinConstraint::Using { columns, span } => JoinConstraint::Using {
-                    columns: columns
-                        .into_iter()
-                        .map(|column| folder.fold_ident(column))
-                        .collect(),
-                    span,
-                },
-                constraint => constraint,
-            };
-            join
-        })
-        .collect();
-    table
-}
-
-pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) -> TableFactor {
-    match factor {
-        TableFactor::JsonTable { table, alias, span } => TableFactor::JsonTable {
-            table: Box::new(folder.fold_json_table(*table)),
-            alias: alias.map(|alias| fold_table_alias(folder, alias)),
-            span,
-        },
-
-        TableFactor::Table {
-            name,
-            metadata,
-            alias,
-            version,
-            span,
-        } => TableFactor::Table {
-            name: folder.fold_object_name(name),
-            metadata: metadata.map(|metadata| folder.fold_ident(metadata)),
-            alias: alias.map(|alias| fold_table_alias(folder, alias)),
-            version: version.map(|mut version| {
-                version.value = folder.fold_expr(version.value);
-                version
-            }),
-            span,
-        },
-        TableFactor::Derived {
-            lateral,
-            subquery,
-            alias,
-            span,
-        } => TableFactor::Derived {
-            lateral,
-            subquery: Box::new(folder.fold_query(*subquery)),
-            alias: alias.map(|alias| fold_table_alias(folder, alias)),
-            span,
-        },
-        TableFactor::TableFunction {
-            lateral,
-            syntax,
-            expr,
-            alias,
-            span,
-        } => TableFactor::TableFunction {
-            lateral,
-            syntax,
-            expr: folder.fold_expr(expr),
-            alias: alias.map(|alias| fold_table_alias(folder, alias)),
-            span,
-        },
-        TableFactor::Unnest {
-            keyword,
-            lateral,
-            array_exprs,
-            with_offset,
-            alias,
-            span,
-        } => TableFactor::Unnest {
-            keyword: folder.fold_ident(keyword),
-            lateral,
-            array_exprs: array_exprs
-                .into_iter()
-                .map(|expr| folder.fold_expr(expr))
-                .collect(),
-            with_offset,
-            alias: alias.map(|alias| fold_table_alias(folder, alias)),
-            span,
-        },
-        TableFactor::NestedJoin {
-            table_with_joins,
-            alias,
-            span,
-        } => TableFactor::NestedJoin {
-            table_with_joins: Box::new(fold_table_with_joins(folder, *table_with_joins)),
-            alias: alias.map(|alias| fold_table_alias(folder, alias)),
-            span,
-        },
-    }
-}
-
-pub fn fold_table_alias<F: Fold + ?Sized>(folder: &mut F, mut alias: TableAlias) -> TableAlias {
-    alias.name = folder.fold_ident(alias.name);
-    alias.columns = alias
-        .columns
-        .into_iter()
-        .map(|column| folder.fold_ident(column))
-        .collect();
-    alias
-}
-
 #[recursive::recursive]
 pub fn fold_window_definition<F: Fold + ?Sized>(
     folder: &mut F,
@@ -2063,6 +2031,7 @@ fn fold_array_expr<F: Fold + ?Sized>(folder: &mut F, mut expression: ArrayExpr) 
     expression
 }
 
+#[recursive::recursive]
 pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
     match expression {
         Expr::JsonConstructor(node) => {
@@ -2134,7 +2103,7 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
             Expr::Interval(expression)
         }
         Expr::Subquery(mut expression) => {
-            expression.query = Box::new(folder.fold_query(*expression.query));
+            expression.query = AstBox::new(folder.fold_query(expression.query.into_inner()));
             Expr::Subquery(expression)
         }
         Expr::Row(expression) => Expr::Row(folder.fold_row_expr(expression)),
@@ -2474,5 +2443,41 @@ pub fn fold_set_operation<F: Fold + ?Sized>(
             .map(|column| folder.fold_ident(column))
             .collect();
     }
+    node
+}
+
+#[recursive::recursive]
+pub fn walk_with<V: Visit + ?Sized>(visitor: &mut V, node: &With) {
+    for cte in &node.ctes {
+        visitor.visit_cte(cte);
+    }
+}
+#[recursive::recursive]
+pub fn walk_cte<V: Visit + ?Sized>(visitor: &mut V, node: &Cte) {
+    visitor.visit_ident(&node.name);
+    for column in node.columns.iter().flatten() {
+        visitor.visit_ident(column);
+    }
+    visitor.visit_query(&node.query);
+}
+#[recursive::recursive]
+pub fn fold_with<F: Fold + ?Sized>(folder: &mut F, mut node: With) -> With {
+    node.ctes = node
+        .ctes
+        .into_iter()
+        .map(|cte| folder.fold_cte(cte))
+        .collect();
+    node
+}
+#[recursive::recursive]
+pub fn fold_cte<F: Fold + ?Sized>(folder: &mut F, mut node: Cte) -> Cte {
+    node.name = folder.fold_ident(node.name);
+    node.columns = node.columns.map(|columns| {
+        columns
+            .into_iter()
+            .map(|column| folder.fold_ident(column))
+            .collect()
+    });
+    node.query = AstBox::new(folder.fold_query(node.query.into_inner()));
     node
 }

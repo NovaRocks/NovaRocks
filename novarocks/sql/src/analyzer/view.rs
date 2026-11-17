@@ -36,7 +36,7 @@ impl AnalyzerContext<'_> {
     pub(super) fn analyze_view_relation(
         &self,
         view: &SqlViewDefinition,
-        alias: Option<&ast::TableAlias>,
+        alias: Option<super::resolve_from::RelationAlias<'_>>,
         relation_name: &str,
         span: Span,
     ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
@@ -372,7 +372,7 @@ impl PlannerTableProvider for SavedViewCatalog<'_> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: &ast::TableVersion,
+        version: &ast::QueryPeriod,
     ) -> Result<ResolvedAnalyzerTable, AnalyzeError> {
         self.inner.resolve_definition_table_version_for_analysis(
             Some(catalog.unwrap_or(self.catalog)),
@@ -410,7 +410,7 @@ impl PlannerTableProvider for SavedViewCatalog<'_> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: Option<&novarocks_parser::ast::TableVersion>,
+        version: Option<&novarocks_parser::ast::QueryPeriod>,
     ) -> Result<Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>, AnalyzeError>
     {
         self.inner.resolve_definition_system_table_for_analysis(
@@ -1181,10 +1181,10 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_mut() else {
             panic!("select fixture");
         };
-        let ast::TableFactor::Table { name, .. } = &mut select.from[0].relation else {
+        let Some(ast::Relation::Table(table)) = &mut select.from else {
             panic!("view fixture");
         };
-        name.span = Span::new(0, 0);
+        table.name.span = Span::new(0, 0);
         let error = crate::analyzer::analyze(query, &catalog, "db").unwrap_err();
         assert_eq!(error.kind(), AnalyzeErrorKind::ViewIsRecursive);
         assert_eq!(

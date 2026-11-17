@@ -28,34 +28,23 @@ fn invocation() -> JsonPathInvocation {
     )
 }
 fn expression_query(expression: Expr) -> Statement {
-    Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(
-            vec![build::item(expression, None, false)],
-            vec![],
-            None,
-            None,
-        )
-        .unwrap(),
-    ))))
+    Statement::Query(build::query(SetExpr::Select(
+        novarocks_parser::ast::AstBox::new(
+            build::select(vec![build::item(expression, None, false)], None, None, None).unwrap(),
+        ),
+    )))
 }
 fn table_query(table: JsonTable) -> Statement {
-    let from = TableWithJoins {
-        relation: TableFactor::JsonTable {
-            table: Box::new(table),
-            alias: Some(TableAlias {
-                name: build::ident("jt", false),
-                columns: vec![build::ident("x", false)],
-                explicit_as: true,
-                span: SYNTHETIC,
-            }),
-            span: SYNTHETIC,
-        },
-        joins: vec![],
-        span: SYNTHETIC,
-    };
-    Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(vec![build::wildcard()], vec![from], None, None).unwrap(),
-    ))))
+    let from = build::alias(
+        Relation::JsonTable(AstBox::new(table)),
+        build::ident("jt", false),
+        Some(vec![build::ident("x", false)]),
+    );
+    Statement::Query(build::query(SetExpr::Select(
+        novarocks_parser::ast::AstBox::new(
+            build::select(vec![build::wildcard()], Some(from), None, None).unwrap(),
+        ),
+    )))
 }
 
 #[test]

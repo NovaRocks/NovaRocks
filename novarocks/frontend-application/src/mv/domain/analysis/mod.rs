@@ -20,7 +20,7 @@
 pub mod refresh_property;
 use std::collections::HashSet;
 
-use novarocks_parser::ast::{Ident, Query, SetExpr, TableFactor, TableWithJoins};
+use novarocks_parser::ast::{Ident, Query, Relation, SetExpr};
 use novarocks_sql::planning::mv::{
     SqlMvOutputColumnFacts, SqlResolvedMvRefreshInput, SqlResolvedMvRefreshInputSource,
     strip_catalog_from_three_part_names,
@@ -186,8 +186,8 @@ fn validate_mv_select_raw_clauses_in_set_expr(expr: &SetExpr) -> Result<(), Stri
     match expr {
         SetExpr::Select(select) => {
             validate_mv_select_raw_select_clauses(select)?;
-            for from in &select.from {
-                validate_mv_select_raw_clauses_in_table_with_joins(from)?;
+            if let Some(from) = &select.from {
+                validate_mv_select_raw_clauses_in_factor(from)?;
             }
             Ok(())
         }
@@ -197,8 +197,12 @@ fn validate_mv_select_raw_clauses_in_set_expr(expr: &SetExpr) -> Result<(), Stri
             }
             Ok(())
         }
-        SetExpr::Query(query) => validate_mv_select_raw_query_clauses(query),
+        SetExpr::Query(subquery) => {
+            let query = &subquery.query;
+            validate_mv_select_raw_query_clauses(query)
+        }
         SetExpr::Values(_) => Ok(()),
+        SetExpr::Table(_) => Err(unsupported_mv_from_clause("TABLE query bodies")),
     }
 }
 
@@ -215,39 +219,26 @@ fn validate_mv_select_raw_select_clauses(
     Ok(())
 }
 
-fn validate_mv_select_raw_clauses_in_table_with_joins(
-    table: &TableWithJoins,
-) -> Result<(), String> {
-    validate_mv_select_raw_clauses_in_factor(&table.relation)?;
-    for join in &table.joins {
-        validate_mv_select_raw_clauses_in_factor(&join.relation)?;
-    }
-    Ok(())
-}
-
-fn validate_mv_select_raw_clauses_in_factor(factor: &TableFactor) -> Result<(), String> {
+fn validate_mv_select_raw_clauses_in_factor(factor: &Relation) -> Result<(), String> {
     match factor {
-        TableFactor::JsonTable { .. } => Err(unsupported_mv_from_clause("JSON_TABLE")),
-        TableFactor::Table { version, .. } => {
-            if version.is_some() {
+        Relation::Table(table) => {
+            if table.query_period.is_some() || table.branch.is_some() {
                 return Err(unsupported_mv_from_clause("table version qualifiers"));
             }
             Ok(())
         }
-        TableFactor::Derived {
-            lateral, subquery, ..
-        } => {
-            if *lateral {
-                return Err(unsupported_mv_from_clause("LATERAL derived tables"));
-            }
-            validate_mv_select_raw_query_clauses(subquery)
+        Relation::Aliased(alias) => validate_mv_select_raw_clauses_in_factor(&alias.relation),
+        Relation::Join(join) => {
+            validate_mv_select_raw_clauses_in_factor(&join.left)?;
+            validate_mv_select_raw_clauses_in_factor(&join.right)
         }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => validate_mv_select_raw_clauses_in_table_with_joins(table_with_joins),
-        TableFactor::TableFunction { .. } | TableFactor::Unnest { .. } => {
+        Relation::TableSubquery(node) => validate_mv_select_raw_query_clauses(&node.query),
+        Relation::Lateral(_) => Err(unsupported_mv_from_clause("LATERAL derived tables")),
+        Relation::JsonTable(_) => Err(unsupported_mv_from_clause("JSON_TABLE")),
+        Relation::TableFunction(_) | Relation::LegacyTableFunction(_) | Relation::Unnest(_) => {
             Err(unsupported_mv_from_clause("table functions"))
         }
+        _ => Err(unsupported_mv_from_clause("relation modifiers")),
     }
 }
 
@@ -308,19 +299,8 @@ fn qualify_current_catalog_refs_in_set_expr(
 ) {
     match expr {
         SetExpr::Select(select) => {
-            for from in &mut select.from {
-                qualify_current_catalog_refs_in_factor(
-                    &mut from.relation,
-                    catalog,
-                    current_database,
-                );
-                for join in &mut from.joins {
-                    qualify_current_catalog_refs_in_factor(
-                        &mut join.relation,
-                        catalog,
-                        current_database,
-                    );
-                }
+            if let Some(from) = &mut select.from {
+                qualify_current_catalog_refs_in_factor(from, catalog, current_database);
             }
         }
         SetExpr::SetOperation(operation) => {
@@ -328,7 +308,8 @@ fn qualify_current_catalog_refs_in_set_expr(
                 qualify_current_catalog_refs_in_set_expr(input, catalog, current_database);
             }
         }
-        SetExpr::Query(query) => {
+        SetExpr::Query(subquery) => {
+            let query = &mut subquery.query;
             qualify_current_catalog_refs_in_set_expr(
                 query.body.as_mut(),
                 catalog,
@@ -340,12 +321,13 @@ fn qualify_current_catalog_refs_in_set_expr(
 }
 
 fn qualify_current_catalog_refs_in_factor(
-    factor: &mut TableFactor,
+    factor: &mut Relation,
     catalog: &str,
     current_database: &str,
 ) {
     match factor {
-        TableFactor::Table { name, .. } => {
+        Relation::Table(table) => {
+            let name = &mut table.name;
             let parts = name
                 .parts
                 .iter()
@@ -368,12 +350,25 @@ fn qualify_current_catalog_refs_in_factor(
                 ];
             }
         }
-        TableFactor::Derived { subquery, .. } => {
+        Relation::TableSubquery(node) => {
+            let subquery = &mut node.query;
             qualify_current_catalog_refs_in_set_expr(
                 subquery.body.as_mut(),
                 catalog,
                 current_database,
             );
+        }
+        Relation::Lateral(node) => qualify_current_catalog_refs_in_set_expr(
+            node.query.body.as_mut(),
+            catalog,
+            current_database,
+        ),
+        Relation::Aliased(alias) => {
+            qualify_current_catalog_refs_in_factor(&mut alias.relation, catalog, current_database)
+        }
+        Relation::Join(join) => {
+            qualify_current_catalog_refs_in_factor(&mut join.left, catalog, current_database);
+            qualify_current_catalog_refs_in_factor(&mut join.right, catalog, current_database);
         }
         _ => {}
     }
@@ -501,21 +496,8 @@ fn collect_table_refs_from_set_expr(
 ) {
     match expr {
         SetExpr::Select(select) => {
-            for from in &select.from {
-                collect_table_refs_from_factor(
-                    &from.relation,
-                    current_catalog,
-                    current_database,
-                    refs,
-                );
-                for join in &from.joins {
-                    collect_table_refs_from_factor(
-                        &join.relation,
-                        current_catalog,
-                        current_database,
-                        refs,
-                    );
-                }
+            if let Some(from) = &select.from {
+                collect_table_refs_from_factor(from, current_catalog, current_database, refs);
             }
         }
         SetExpr::SetOperation(operation) => {
@@ -523,7 +505,8 @@ fn collect_table_refs_from_set_expr(
                 collect_table_refs_from_set_expr(input, current_catalog, current_database, refs);
             }
         }
-        SetExpr::Query(query) => {
+        SetExpr::Query(subquery) => {
+            let query = &subquery.query;
             collect_table_refs_from_set_expr(
                 query.body.as_ref(),
                 current_catalog,
@@ -536,17 +519,17 @@ fn collect_table_refs_from_set_expr(
 }
 
 fn collect_table_refs_from_factor(
-    factor: &TableFactor,
+    factor: &Relation,
     current_catalog: Option<&str>,
     current_database: &str,
     refs: &mut Vec<ResolvedTableRef>,
 ) {
     match factor {
-        TableFactor::Table { name, .. } => {
-            let parts: Vec<String> = name
-                .parts
-                .iter()
-                .map(|ident| ident.value.to_ascii_lowercase())
+        Relation::Table(table) => {
+            let name = &table.name;
+            let parts: Vec<String> = novarocks_sql::TableNameView::new(name)
+                .parts()
+                .map(str::to_ascii_lowercase)
                 .collect();
             let resolved = match parts.as_slice() {
                 [catalog, namespace, table] => ResolvedTableRef::Iceberg {
@@ -586,7 +569,8 @@ fn collect_table_refs_from_factor(
                 refs.push(resolved);
             }
         }
-        TableFactor::Derived { subquery, .. } => {
+        Relation::TableSubquery(node) => {
+            let subquery = &node.query;
             if let Some(with) = &subquery.with {
                 for cte in &with.ctes {
                     collect_table_refs_from_set_expr(
@@ -603,6 +587,22 @@ fn collect_table_refs_from_factor(
                 current_database,
                 refs,
             );
+        }
+        Relation::Lateral(node) => {
+            for item in
+                collect_table_refs_from_query(&node.query, current_catalog, current_database)
+            {
+                if !refs.contains(&item) {
+                    refs.push(item);
+                }
+            }
+        }
+        Relation::Aliased(alias) => {
+            collect_table_refs_from_factor(&alias.relation, current_catalog, current_database, refs)
+        }
+        Relation::Join(join) => {
+            collect_table_refs_from_factor(&join.left, current_catalog, current_database, refs);
+            collect_table_refs_from_factor(&join.right, current_catalog, current_database, refs);
         }
         _ => {}
     }

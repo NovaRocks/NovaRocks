@@ -528,11 +528,12 @@ mod tests {
         assert!(is_plain_json_query(&node));
     }
 
-    fn projection_query(expression: ast::Expr, from: Vec<ast::TableWithJoins>) -> ast::Query {
-        build::query(ast::SetExpr::Select(Box::new(
+    fn projection_query(expression: ast::Expr, from: Vec<ast::Relation>) -> ast::Query {
+        build::query(ast::SetExpr::Select(ast::AstBox::new(
             build::select(
                 vec![ast::SelectItem::UnnamedExpr(expression)],
-                from,
+                from.into_iter()
+                    .reduce(|left, right| build::join(left, ast::JoinType::Implicit, right, None)),
                 None,
                 None,
             )
@@ -540,16 +541,12 @@ mod tests {
         )))
     }
 
-    fn missing_table(name: &str) -> ast::TableWithJoins {
-        ast::TableWithJoins {
-            relation: build::table(
-                build::object_name(vec![build::ident(name, false)]).unwrap(),
-                None,
-                None,
-            ),
-            joins: vec![],
-            span: Span::new(100, 120),
-        }
+    fn missing_table(name: &str) -> ast::Relation {
+        build::table(
+            build::object_name(vec![build::ident(name, false)]).unwrap(),
+            None,
+            None,
+        )
     }
 
     fn first_projection(query: &crate::analysis::ResolvedQuery) -> &TypedExpr {
@@ -632,15 +629,11 @@ mod tests {
             build::integer(1),
             vec![
                 missing_table("missing_inner_table"),
-                ast::TableWithJoins {
-                    relation: ast::TableFactor::JsonTable {
-                        table: Box::new(table),
-                        alias: None,
-                        span: factor_span,
-                    },
-                    joins: vec![],
-                    span: factor_span,
-                },
+                ast::Relation::JsonTable(ast::AstBox::new({
+                    let mut table = table;
+                    table.span = factor_span;
+                    table
+                })),
             ],
         );
         let mut query = projection_query(
@@ -651,10 +644,11 @@ mod tests {
             recursive: false,
             ctes: vec![ast::Cte {
                 name: build::ident("unused_json", false),
-                columns: vec![],
-                query: Box::new(cte_query),
+                columns: None,
+                query: ast::AstBox::new(cte_query),
                 span: Span::new(150, 295),
-            }],
+            }]
+            .into(),
             span: Span::new(130, 295),
         });
         let error = crate::analyzer::analyze(&query, &NO_TABLES, "default").unwrap_err();

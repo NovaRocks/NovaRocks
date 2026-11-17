@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use novarocks_parser::ast::{Expr, LiteralKind, TableVersion, TableVersionKind};
+use novarocks_parser::ast::{Expr, LiteralKind, QueryPeriod, QueryPeriodRangeType};
 
 use crate::analyze_error::AnalyzeError;
 
@@ -181,7 +181,7 @@ pub struct IcebergDmlTarget {
 /// Phase-1 limitation: timestamp expressions must be literals (integer or quoted string).
 /// Expression-level timestamps (e.g. `CURRENT_TIMESTAMP() - INTERVAL 1 HOUR`) are rejected.
 /// An exact parsed request, before catalog admission freezes its snapshot.
-/// Syntax locations stay on the original TableVersion, not in this memo key.
+/// Syntax locations stay on the original QueryPeriod, not in this memo key.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum SqlTimeTravelSelection {
     SnapshotId(i64),
@@ -189,12 +189,27 @@ pub enum SqlTimeTravelSelection {
     TimestampMillis(i64),
 }
 
+pub fn query_period_end(period: &QueryPeriod) -> Result<&Expr, AnalyzeError> {
+    if period.start.is_some() {
+        return Err(AnalyzeError::unsupported_query_shape(
+            "query period start bounds are not supported",
+            period.span,
+        ));
+    }
+    period.end.as_deref().ok_or_else(|| {
+        AnalyzeError::unsupported_query_shape(
+            "query period requires an end expression",
+            period.span,
+        )
+    })
+}
+
 pub fn parse_time_travel_selection(
-    version: &TableVersion,
+    version: &QueryPeriod,
     fully_qualified_name: &str,
 ) -> Result<SqlTimeTravelSelection, AnalyzeError> {
-    match version.kind {
-        TableVersionKind::ForVersionAsOf => match &version.value {
+    match version.range_type {
+        QueryPeriodRangeType::Version => match query_period_end(version)? {
             Expr::Literal(literal) => match &literal.kind {
                 LiteralKind::Long { parsed_value, .. } => {
                     Ok(SqlTimeTravelSelection::SnapshotId(*parsed_value))
@@ -214,15 +229,15 @@ pub fn parse_time_travel_selection(
                 other.span(),
             )),
         },
-        TableVersionKind::ForSystemTimeAsOf => {
-            resolve_timestamp_expr(&version.value, fully_qualified_name)
+        QueryPeriodRangeType::Timestamp => {
+            resolve_timestamp_expr(query_period_end(version)?, fully_qualified_name)
                 .map(SqlTimeTravelSelection::TimestampMillis)
         }
     }
 }
 
 pub fn resolve_read_binding(
-    version: &TableVersion,
+    version: &QueryPeriod,
     metadata: &SqlIcebergRefMetadata,
     fully_qualified_name: &str,
 ) -> Result<IcebergRefBinding, AnalyzeError> {
@@ -233,7 +248,7 @@ pub fn resolve_read_binding(
                     format!(
                         "iceberg time travel: snapshot {snapshot_id} not found in {fully_qualified_name}"
                     ),
-                    version.value.span(),
+                    query_period_end(version)?.span(),
                 ));
             }
             Ok(IcebergRefBinding {
@@ -243,12 +258,13 @@ pub fn resolve_read_binding(
             })
         }
         SqlTimeTravelSelection::NamedReference(name) => {
+            let reference_span = query_period_end(version)?.span();
             let entry = metadata.named_ref(&name).ok_or_else(|| {
                 AnalyzeError::invalid_argument(
                     format!(
                         "iceberg time travel: ref '{name}' not found in {fully_qualified_name}"
                     ),
-                    version.value.span(),
+                    reference_span,
                 )
             })?;
             Ok(IcebergRefBinding {
@@ -257,9 +273,12 @@ pub fn resolve_read_binding(
                 ref_kind: Some(entry.kind.clone()),
             })
         }
-        SqlTimeTravelSelection::TimestampMillis(ts_ms) => {
-            find_snapshot_at_or_before(metadata, ts_ms, fully_qualified_name, version.value.span())
-        }
+        SqlTimeTravelSelection::TimestampMillis(ts_ms) => find_snapshot_at_or_before(
+            metadata,
+            ts_ms,
+            fully_qualified_name,
+            query_period_end(version)?.span(),
+        ),
     }
 }
 
@@ -440,10 +459,11 @@ mod tests {
         })
     }
 
-    fn version(kind: TableVersionKind, value: Expr) -> TableVersion {
-        TableVersion {
-            kind,
-            value,
+    fn version(kind: QueryPeriodRangeType, value: Expr) -> QueryPeriod {
+        QueryPeriod {
+            range_type: kind,
+            start: None,
+            end: Some(novarocks_parser::ast::AstBox::new(value)),
             span: span(),
         }
     }
@@ -495,7 +515,7 @@ mod tests {
     #[test]
     fn version_as_of_int_resolves_snapshot() {
         let metadata = metadata_with_two_snapshots();
-        let version = version(TableVersionKind::ForVersionAsOf, val_num("2"));
+        let version = version(QueryPeriodRangeType::Version, val_num("2"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 2);
         assert!(binding.ref_name.is_none());
@@ -505,7 +525,7 @@ mod tests {
     #[test]
     fn sqlx2_resolution_iceberg_ref_input_is_provider_neutral() {
         let metadata = metadata_with_ref("dev", IcebergRefKind::Branch);
-        let version = version(TableVersionKind::ForVersionAsOf, val_str("dev"));
+        let version = version(QueryPeriodRangeType::Version, val_str("dev"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t")
             .expect("resolve frozen SQL ref facts");
         assert_eq!(binding.snapshot_id, 1);
@@ -515,7 +535,7 @@ mod tests {
     #[test]
     fn version_as_of_string_resolves_branch() {
         let metadata = metadata_with_ref("dev", IcebergRefKind::Branch);
-        let version = version(TableVersionKind::ForVersionAsOf, val_str("dev"));
+        let version = version(QueryPeriodRangeType::Version, val_str("dev"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 1);
         assert_eq!(binding.ref_name.as_deref(), Some("dev"));
@@ -525,7 +545,7 @@ mod tests {
     #[test]
     fn version_as_of_string_resolves_tag() {
         let metadata = metadata_with_ref("v1.0", IcebergRefKind::Tag);
-        let version = version(TableVersionKind::ForVersionAsOf, val_str("v1.0"));
+        let version = version(QueryPeriodRangeType::Version, val_str("v1.0"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 1);
         assert_eq!(binding.ref_name.as_deref(), Some("v1.0"));
@@ -535,7 +555,7 @@ mod tests {
     #[test]
     fn unknown_ref_errors() {
         let metadata = metadata_with_ref("dev", IcebergRefKind::Branch);
-        let version = version(TableVersionKind::ForVersionAsOf, val_str("nope"));
+        let version = version(QueryPeriodRangeType::Version, val_str("nope"));
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
             err.message().contains("ref 'nope' not found"),
@@ -546,7 +566,7 @@ mod tests {
     #[test]
     fn version_as_of_unknown_snapshot_id_errors() {
         let metadata = metadata_with_two_snapshots();
-        let version = version(TableVersionKind::ForVersionAsOf, val_num("99999"));
+        let version = version(QueryPeriodRangeType::Version, val_num("99999"));
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
             err.message().contains("snapshot 99999 not found"),
@@ -559,10 +579,7 @@ mod tests {
         let metadata = metadata_with_two_snapshots();
         // snapshot 1 is at 1_700_000_000_000 ms, snapshot 2 at 1_700_000_001_000 ms
         // requesting at 1_700_000_000_500 should give snapshot 1
-        let version = version(
-            TableVersionKind::ForSystemTimeAsOf,
-            val_num("1700000000500"),
-        );
+        let version = version(QueryPeriodRangeType::Timestamp, val_num("1700000000500"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 1);
     }
@@ -571,10 +588,7 @@ mod tests {
     fn timestamp_as_of_too_early_errors() {
         let metadata = metadata_with_two_snapshots();
         // before any snapshot
-        let version = version(
-            TableVersionKind::ForSystemTimeAsOf,
-            val_num("1000000000000"),
-        );
+        let version = version(QueryPeriodRangeType::Timestamp, val_num("1000000000000"));
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
             err.message().contains("no snapshot at or before"),
@@ -587,7 +601,7 @@ mod tests {
         let metadata = metadata_with_two_snapshots();
         // 2023-11-14T22:13:20Z = 1700000000 seconds = 1_700_000_000_000 ms (exactly snap1)
         let version = version(
-            TableVersionKind::ForSystemTimeAsOf,
+            QueryPeriodRangeType::Timestamp,
             val_str("2023-11-14T22:13:20Z"),
         );
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
@@ -599,7 +613,7 @@ mod tests {
         let metadata = metadata_with_two_snapshots();
         // Use an identifier expression (not a literal) to trigger the fail-fast path
         let version = version(
-            TableVersionKind::ForSystemTimeAsOf,
+            QueryPeriodRangeType::Timestamp,
             Expr::Identifier(Ident {
                 value: "some_var".to_string(),
                 quoted: false,

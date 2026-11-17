@@ -162,17 +162,20 @@ fn query_three_part_table_refs(
     struct Collector(Vec<(String, String, String)>);
 
     impl novarocks_parser::ast::Visit for Collector {
-        fn visit_table_factor(&mut self, factor: &novarocks_parser::ast::TableFactor) {
-            if let novarocks_parser::ast::TableFactor::Table { name, .. } = factor
-                && let [catalog, namespace, table] = name.parts.as_slice()
-            {
-                self.0.push((
-                    catalog.value.clone(),
-                    namespace.value.clone(),
-                    table.value.clone(),
-                ));
+        fn visit_relation(&mut self, factor: &novarocks_parser::ast::Relation) {
+            if let novarocks_parser::ast::Relation::Table(table_node) = factor {
+                let parts = novarocks_sql::TableNameView::new(&table_node.name)
+                    .parts()
+                    .collect::<Vec<_>>();
+                if let [catalog, namespace, table] = parts.as_slice() {
+                    self.0.push((
+                        catalog.to_string(),
+                        namespace.to_string(),
+                        table.to_string(),
+                    ));
+                }
             }
-            novarocks_parser::ast::walk_table_factor(self, factor);
+            novarocks_parser::ast::walk_relation(self, factor);
         }
     }
 

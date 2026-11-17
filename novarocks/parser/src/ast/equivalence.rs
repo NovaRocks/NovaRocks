@@ -64,6 +64,7 @@ impl SyntaxEq for ExplainQuery {
 }
 
 impl SyntaxEq for Query {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         syntax_eq_slice(&self.session_properties, &other.session_properties)
             && syntax_eq_slice(&self.functions, &other.functions)
@@ -88,15 +89,21 @@ impl SyntaxEq for SessionProperty {
 }
 
 impl SyntaxEq for With {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         self.recursive == other.recursive && syntax_eq_slice(&self.ctes, &other.ctes)
     }
 }
 
 impl SyntaxEq for Cte {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         self.name.syntax_eq(&other.name)
-            && syntax_eq_slice(&self.columns, &other.columns)
+            && match (&self.columns, &other.columns) {
+                (Some(a), Some(b)) => syntax_eq_slice(a, b),
+                (None, None) => true,
+                _ => false,
+            }
             && self.query.syntax_eq(&other.query)
     }
 }
@@ -106,6 +113,7 @@ impl SyntaxEq for SetExpr {
         match (self, other) {
             (Self::Select(left), Self::Select(right)) => left.syntax_eq(right),
             (Self::Values(left), Self::Values(right)) => left.syntax_eq(right),
+            (Self::Table(left), Self::Table(right)) => left.syntax_eq(right),
             (Self::Query(left), Self::Query(right)) => left.syntax_eq(right),
             (Self::SetOperation(left), Self::SetOperation(right)) => left.syntax_eq(right),
             _ => false,
@@ -139,7 +147,7 @@ impl SyntaxEq for Select {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.quantifier.syntax_eq(&other.quantifier)
             && syntax_eq_slice(&self.projection, &other.projection)
-            && syntax_eq_slice(&self.from, &other.from)
+            && syntax_eq_option(&self.from, &other.from)
             && syntax_eq_option(&self.selection, &other.selection)
             && syntax_eq_option(&self.group_by, &other.group_by)
             && syntax_eq_option(&self.having, &other.having)
@@ -307,166 +315,6 @@ impl SyntaxEq for AllRows {
 impl SyntaxEq for Parameter {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.position == other.position
-    }
-}
-
-impl SyntaxEq for TableWithJoins {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.relation.syntax_eq(&other.relation) && syntax_eq_slice(&self.joins, &other.joins)
-    }
-}
-
-impl SyntaxEq for TableFactor {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::JsonTable {
-                    table: left,
-                    alias: la,
-                    ..
-                },
-                Self::JsonTable {
-                    table: right,
-                    alias: ra,
-                    ..
-                },
-            ) => left.syntax_eq(right) && syntax_eq_option(la, ra),
-
-            (
-                Self::Table {
-                    name: left_name,
-                    metadata: left_metadata,
-                    alias: left_alias,
-                    version: left_version,
-                    ..
-                },
-                Self::Table {
-                    name: right_name,
-                    metadata: right_metadata,
-                    alias: right_alias,
-                    version: right_version,
-                    ..
-                },
-            ) => {
-                left_name.syntax_eq(right_name)
-                    && syntax_eq_option(left_metadata, right_metadata)
-                    && syntax_eq_option(left_alias, right_alias)
-                    && syntax_eq_option(left_version, right_version)
-            }
-            (
-                Self::Derived {
-                    lateral: left_lateral,
-                    subquery: left_query,
-                    alias: left_alias,
-                    ..
-                },
-                Self::Derived {
-                    lateral: right_lateral,
-                    subquery: right_query,
-                    alias: right_alias,
-                    ..
-                },
-            ) => {
-                left_lateral == right_lateral
-                    && left_query.syntax_eq(right_query)
-                    && syntax_eq_option(left_alias, right_alias)
-            }
-            (
-                Self::TableFunction {
-                    lateral: left_lateral,
-                    syntax: left_syntax,
-                    expr: left_expr,
-                    alias: left_alias,
-                    ..
-                },
-                Self::TableFunction {
-                    lateral: right_lateral,
-                    syntax: right_syntax,
-                    expr: right_expr,
-                    alias: right_alias,
-                    ..
-                },
-            ) => {
-                left_lateral == right_lateral
-                    && left_syntax == right_syntax
-                    && left_expr.syntax_eq(right_expr)
-                    && syntax_eq_option(left_alias, right_alias)
-            }
-            (
-                Self::Unnest {
-                    keyword: left_keyword,
-                    lateral: left_lateral,
-                    array_exprs: left_exprs,
-                    with_offset: left_offset,
-                    alias: left_alias,
-                    ..
-                },
-                Self::Unnest {
-                    keyword: right_keyword,
-                    lateral: right_lateral,
-                    array_exprs: right_exprs,
-                    with_offset: right_offset,
-                    alias: right_alias,
-                    ..
-                },
-            ) => {
-                left_keyword.syntax_eq(right_keyword)
-                    && left_lateral == right_lateral
-                    && syntax_eq_slice(left_exprs, right_exprs)
-                    && left_offset == right_offset
-                    && syntax_eq_option(left_alias, right_alias)
-            }
-            (
-                Self::NestedJoin {
-                    table_with_joins: left_relation,
-                    alias: left_alias,
-                    ..
-                },
-                Self::NestedJoin {
-                    table_with_joins: right_relation,
-                    alias: right_alias,
-                    ..
-                },
-            ) => {
-                left_relation.syntax_eq(right_relation) && syntax_eq_option(left_alias, right_alias)
-            }
-            _ => false,
-        }
-    }
-}
-
-impl SyntaxEq for TableAlias {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.name.syntax_eq(&other.name)
-            && syntax_eq_slice(&self.columns, &other.columns)
-            && self.explicit_as == other.explicit_as
-    }
-}
-
-impl SyntaxEq for TableVersion {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.kind == other.kind && self.value.syntax_eq(&other.value)
-    }
-}
-
-impl SyntaxEq for Join {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.relation.syntax_eq(&other.relation)
-            && self.operator == other.operator
-            && self.constraint.syntax_eq(&other.constraint)
-    }
-}
-
-impl SyntaxEq for JoinConstraint {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::None, Self::None) | (Self::Natural(_), Self::Natural(_)) => true,
-            (Self::On(left), Self::On(right)) => left.syntax_eq(right),
-            (Self::Using { columns: left, .. }, Self::Using { columns: right, .. }) => {
-                syntax_eq_slice(left, right)
-            }
-            _ => false,
-        }
     }
 }
 
@@ -820,18 +668,18 @@ mod tests {
 
     fn sample_query(start: usize) -> Query {
         Query {
-            session_properties: Vec::new(),
-            functions: Vec::new(),
+            session_properties: crate::ast::AstVec::new(),
+            functions: crate::ast::AstVec::new(),
             with: Some(With {
                 recursive: true,
-                ctes: vec![Cte {
+                ctes: (vec![Cte {
                     name: ident("seed", start),
-                    columns: vec![ident("value", start + 1)],
-                    query: Box::new(Query {
-                        session_properties: Vec::new(),
-                        functions: Vec::new(),
+                    columns: Some(vec![ident("value", start + 1)]),
+                    query: crate::ast::AstBox::new(Query {
+                        session_properties: crate::ast::AstVec::new(),
+                        functions: crate::ast::AstVec::new(),
                         with: None,
-                        body: Box::new(SetExpr::Values(Values {
+                        body: crate::ast::AstBox::new(SetExpr::Values(Values {
                             rows: vec![vec![number("1", start + 2)]],
                             explicit_row: true,
                             span: span(start + 3),
@@ -840,10 +688,11 @@ mod tests {
                         span: span(start + 4),
                     }),
                     span: span(start + 5),
-                }],
+                }])
+                .into(),
                 span: span(start + 6),
             }),
-            body: Box::new(SetExpr::Select(Box::new(Select {
+            body: crate::ast::AstBox::new(SetExpr::Select(crate::ast::AstBox::new(Select {
                 quantifier: SelectQuantifier::Distinct {
                     on: vec![sample_expr(start + 7)],
                     span: span(start + 8),
@@ -854,7 +703,7 @@ mod tests {
                     explicit_as: true,
                     span: span(start + 11),
                 }],
-                from: Vec::new(),
+                from: None,
                 selection: None,
                 group_by: Some(GroupBy {
                     distinct: false,

@@ -529,6 +529,20 @@ impl CatalogEdits<'_> {
             );
         }
     }
+    fn delta_identity_literal(&mut self, literal: &Literal) {
+        if let LiteralKind::String(value) = &literal.kind {
+            match self.symbols.display(value, Display::MvIdentity) {
+                Ok(new) if new != *value => {
+                    self.edits.insert(
+                        literal.span.start(),
+                        (literal.span.end(), quoted(self.sql, literal.span, &new)),
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => self.error = Some(error.to_string()),
+            }
+        }
+    }
 }
 impl Visit for CatalogEdits<'_> {
     fn visit_statement(&mut self, statement: &Statement) {
@@ -583,20 +597,26 @@ impl Visit for CatalogEdits<'_> {
                 .all(|argument| argument.name.is_none())
             && let Some(Expr::Literal(literal)) =
                 call.arguments.first().map(|argument| &argument.value)
-            && let LiteralKind::String(value) = &literal.kind
         {
-            match self.symbols.display(value, Display::MvIdentity) {
-                Ok(new) if new != *value => {
-                    self.edits.insert(
-                        literal.span.start(),
-                        (literal.span.end(), quoted(self.sql, literal.span, &new)),
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => self.error = Some(error.to_string()),
-            }
+            self.delta_identity_literal(literal);
         }
         walk_function_call(self, call);
+    }
+    fn visit_table_function_invocation(&mut self, call: &TableFunctionInvocation) {
+        if call.name.parts.len() == 1
+            && call.name.parts[0]
+                .value
+                .eq_ignore_ascii_case("__nr_ivm_delta")
+            && call
+                .arguments
+                .iter()
+                .all(|argument| argument.name.is_none())
+            && let Some(TableFunctionArgumentValue::Expression(Expr::Literal(literal))) =
+                call.arguments.first().map(|argument| &argument.value)
+        {
+            self.delta_identity_literal(literal);
+        }
+        walk_table_function_invocation(self, call);
     }
     fn visit_expr(&mut self, e: &Expr) {
         if let Some(chain) = syntax_identifier_chain(e) {
@@ -624,32 +644,55 @@ impl Visit for CatalogEdits<'_> {
         let previous_aliases = self.aliases.clone();
         let previous_relations = self.relations.clone();
         if let SetExpr::Select(select) = q.body.as_ref() {
-            for table in &select.from {
-                for factor in std::iter::once(&table.relation)
-                    .chain(table.joins.iter().map(|join| &join.relation))
-                {
-                    if let TableFactor::Table { name, .. } = factor
-                        && name.parts.len() >= 3
-                    {
-                        self.relations.insert(
-                            name.parts[..3]
-                                .iter()
-                                .map(|part| key(&part.value))
-                                .collect(),
-                        );
+            fn collect_scope(
+                relation: &Relation,
+                aliases: &mut BTreeSet<String>,
+                relations: &mut BTreeSet<Vec<String>>,
+            ) {
+                match relation {
+                    Relation::Table(table) => {
+                        if table.name.parts.len() >= 3 {
+                            relations.insert(
+                                novarocks_sql::TableNameView::new(&table.name)
+                                    .parts()
+                                    .take(3)
+                                    .map(key)
+                                    .collect(),
+                            );
+                        }
                     }
-                    let alias = match factor {
-                        TableFactor::Table { alias, .. }
-                        | TableFactor::Derived { alias, .. }
-                        | TableFactor::TableFunction { alias, .. }
-                        | TableFactor::Unnest { alias, .. }
-                        | TableFactor::JsonTable { alias, .. }
-                        | TableFactor::NestedJoin { alias, .. } => alias,
-                    };
-                    if let Some(alias) = alias {
-                        self.aliases.insert(key(&alias.name.value));
+                    Relation::Aliased(alias) => {
+                        aliases.insert(key(&alias.alias.value));
+                        collect_scope(&alias.relation, aliases, relations);
                     }
+                    Relation::Join(join) => {
+                        collect_scope(&join.left, aliases, relations);
+                        collect_scope(&join.right, aliases, relations);
+                    }
+                    Relation::Sampled(node) => collect_scope(&node.relation, aliases, relations),
+                    Relation::Pivot(node) => collect_scope(&node.input, aliases, relations),
+                    Relation::Nearest(node) => collect_scope(&node.relation, aliases, relations),
+                    Relation::PatternRecognition(node) => {
+                        collect_scope(&node.input, aliases, relations)
+                    }
+                    Relation::TableFunction(node) => {
+                        for argument in &node.arguments {
+                            if let TableFunctionArgumentValue::Table(table) = &argument.value {
+                                collect_scope(&table.table, aliases, relations);
+                            }
+                        }
+                    }
+                    // These query owners establish their own saved/restored scope
+                    // through the original visit_query entry below.
+                    Relation::TableSubquery(_)
+                    | Relation::Lateral(_)
+                    | Relation::Unnest(_)
+                    | Relation::LegacyTableFunction(_)
+                    | Relation::JsonTable(_) => {}
                 }
+            }
+            if let Some(relation) = &select.from {
+                collect_scope(relation, &mut self.aliases, &mut self.relations);
             }
             for item in &select.projection {
                 if let SelectItem::QualifiedWildcard { prefix, .. } = item
@@ -712,15 +755,32 @@ fn catalog_column(expr: &Expr) -> Option<&Ident> {
         .contains(&ident.value.to_ascii_lowercase().as_str())
         .then_some(ident)
 }
+fn metadata_relation(relation: &Relation) -> bool {
+    match relation {
+        Relation::Table(table) => metadata_table_name(&table.name),
+        Relation::Aliased(alias) => match alias.relation.as_ref() {
+            Relation::Table(table) => metadata_table_name(&table.name),
+            _ => false,
+        },
+        Relation::Join(join) if join.kind == JoinType::Implicit && join.criteria.is_none() => {
+            metadata_relation(&join.left) && metadata_relation(&join.right)
+        }
+        _ => false,
+    }
+}
+fn metadata_table_name(name: &ObjectName) -> bool {
+    name.parts
+        .iter()
+        .rev()
+        .nth(1)
+        .is_some_and(|part| part.value.eq_ignore_ascii_case("information_schema"))
+        || (name.parts.len() == 3 && name.parts[0].value.eq_ignore_ascii_case("system"))
+}
 fn metadata_query(q: &Query) -> bool {
     let SetExpr::Select(select) = q.body.as_ref() else {
         return false;
     };
-    !select.from.is_empty() && select.from.iter().all(|table| {
-        table.joins.is_empty() && matches!(&table.relation, TableFactor::Table {name,..}
-            if name.parts.iter().rev().nth(1).is_some_and(|part|part.value.eq_ignore_ascii_case("information_schema"))
-                || (name.parts.len()==3 && name.parts[0].value.eq_ignore_ascii_case("system")))
-    })
+    select.from.as_ref().is_some_and(metadata_relation)
 }
 
 const RELATION_ARRAY_COLUMNS: &[&str] = &["base_tables", "upstream_materialized_views"];
@@ -734,13 +794,23 @@ fn materialized_view_state_query(query: &Query) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    select.from.len() == 1
-        && select.from[0].joins.is_empty()
-        && matches!(&select.from[0].relation, TableFactor::Table { name, .. }
-            if name.parts.len() == 3
-                && name.parts[0].value.eq_ignore_ascii_case("system")
-                && name.parts[1].value.eq_ignore_ascii_case("runtime")
-                && name.parts[2].value.eq_ignore_ascii_case("materialized_view_states"))
+    let Some(relation) = &select.from else {
+        return false;
+    };
+    let table = match relation {
+        Relation::Table(table) => table.as_ref(),
+        Relation::Aliased(alias) => match alias.relation.as_ref() {
+            Relation::Table(table) => table.as_ref(),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    table.name.parts.len() == 3
+        && table.name.parts[0].value.eq_ignore_ascii_case("system")
+        && table.name.parts[1].value.eq_ignore_ascii_case("runtime")
+        && table.name.parts[2]
+            .value
+            .eq_ignore_ascii_case("materialized_view_states")
 }
 
 #[derive(Clone, Debug)]
@@ -790,7 +860,7 @@ fn catalog_output_plan(sql: &str) -> Vec<OutputColumn> {
                                 break;
                             }
                         };
-                        let current = select.from.is_empty()
+                        let current = select.from.is_none()
                             && matches!(expr,Expr::FunctionCall(call) if call.name.parts.len()==1 && call.name.parts[0].value.eq_ignore_ascii_case("current_catalog") && call.arguments.is_empty() && call.processing_mode.is_none());
                         let catalog = (metadata && catalog_column(expr).is_some()) || current;
                         let header = alias.unwrap_or_else(|| {
@@ -990,6 +1060,84 @@ mod tests {
         assert!(out.contains(&format!("DROP CATALOG {name}")));
         assert_eq!(out, s.rewrite_source(&out).unwrap());
     }
+    #[test]
+    fn metadata_base_qualifiers_keep_atomic_catalog_edits_and_quoted_dollar_names() {
+        let symbols = symbols();
+        let catalog = symbols.lookup("owned").unwrap();
+        let source = "-- preserve t$files\nSELECT owned.ns.t.*, owned.ns.t.k, 'owned.ns.t$files' AS business FROM owned.ns.t$files;";
+        let expected = format!(
+            "-- preserve t$files\nSELECT {catalog}.ns.t.*, {catalog}.ns.t.k, 'owned.ns.t$files' AS business FROM {catalog}.ns.t$files;"
+        );
+        let statements = novarocks_parser::parse(source).unwrap();
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("original query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("original SELECT");
+        };
+        let Some(Relation::Table(table)) = &select.from else {
+            panic!("original table");
+        };
+        let last = table.name.parts.last().unwrap();
+        assert_eq!(last.value, "t$files");
+        assert!(!last.quoted);
+        assert_eq!(&source[last.span.start()..last.span.end()], "t$files");
+        assert_eq!(
+            novarocks_sql::TableNameView::new(&table.name)
+                .parts()
+                .collect::<Vec<_>>(),
+            ["owned", "ns", "t"]
+        );
+        assert_eq!(
+            last.value, "t$files",
+            "the semantic name view does not mutate the source name"
+        );
+        let edits = symbols.edits(source).unwrap();
+        let mut expected_positions = [
+            source.find("owned.ns.t.*").unwrap(),
+            source.find("owned.ns.t.k").unwrap(),
+            source.rfind("owned.ns.t$files").unwrap(),
+        ];
+        expected_positions.sort();
+        assert_eq!(
+            edits.keys().copied().collect::<Vec<_>>(),
+            expected_positions
+        );
+        for (start, (end, _)) in &edits {
+            assert_eq!(&source[*start..*end], "owned");
+        }
+        assert_eq!(symbols.rewrite_source(source).unwrap(), expected);
+        assert_eq!(symbols.rewrite_source(&expected).unwrap(), expected);
+
+        let quoted = "SELECT owned.ns.t.*, owned.ns.`t$files`.*, owned.ns.`t$files`.k FROM owned.ns.`t$files`;";
+        assert_eq!(
+            symbols.rewrite_source(quoted).unwrap(),
+            format!(
+                "SELECT owned.ns.t.*, {catalog}.ns.`t$files`.*, {catalog}.ns.`t$files`.k FROM {catalog}.ns.`t$files`;"
+            )
+        );
+        let [Statement::Query(query)]: [Statement; 1] =
+            novarocks_parser::parse(quoted).unwrap().try_into().unwrap()
+        else {
+            panic!("quoted query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("quoted SELECT");
+        };
+        let Some(Relation::Table(table)) = &select.from else {
+            panic!("quoted table");
+        };
+        let last = table.name.parts.last().unwrap();
+        assert!(last.quoted);
+        assert_eq!(
+            novarocks_sql::TableNameView::new(&table.name)
+                .parts()
+                .collect::<Vec<_>>(),
+            ["owned", "ns", "t$files"]
+        );
+        assert_eq!(&quoted[last.span.start()..last.span.end()], "`t$files`");
+    }
+
     #[test]
     fn optimize_and_metadata_bind_the_same_catalog_without_rewriting_data() {
         let symbols = symbols();

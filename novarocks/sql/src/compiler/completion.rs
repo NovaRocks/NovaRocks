@@ -142,13 +142,13 @@ pub struct CatalogRelationNeed {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CatalogTableSelection {
-    version: novarocks_parser::ast::TableVersion,
+    version: novarocks_parser::ast::QueryPeriod,
     key: crate::planning::catalog::SqlTimeTravelSelection,
 }
 
 impl CatalogTableSelection {
     pub(super) fn try_new(
-        version: novarocks_parser::ast::TableVersion,
+        version: novarocks_parser::ast::QueryPeriod,
         relation: &TableIdentity,
     ) -> Result<Self, crate::analyze_error::AnalyzeError> {
         let key = crate::planning::catalog::parse_time_travel_selection(&version, &relation.fqn())?;
@@ -197,7 +197,7 @@ impl CatalogRelationNeed {
         self
     }
 
-    pub fn version(&self) -> Option<&novarocks_parser::ast::TableVersion> {
+    pub fn version(&self) -> Option<&novarocks_parser::ast::QueryPeriod> {
         self.selection.as_ref().map(|selection| &selection.version)
     }
 
@@ -3752,7 +3752,12 @@ fn catalog_selection_bytes(
     let Some(selection) = selection else {
         return Ok(0);
     };
-    let source_bytes = match &selection.version.value {
+    let end = selection
+        .version
+        .end
+        .as_deref()
+        .expect("closed time travel selection has an end expression");
+    let source_bytes = match end {
         Expr::Literal(literal) => match &literal.kind {
             LiteralKind::Long {
                 spelling: value, ..
@@ -3764,6 +3769,7 @@ fn catalog_selection_bytes(
     };
     checked_sum([
         checked_size(std::mem::size_of::<CatalogTableSelection>()),
+        checked_size(std::mem::size_of::<Expr>()),
         checked_size(source_bytes),
         checked_size(match &selection.key {
             SqlTimeTravelSelection::NamedReference(name) => name.len(),

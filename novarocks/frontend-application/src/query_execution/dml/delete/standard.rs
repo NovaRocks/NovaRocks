@@ -169,7 +169,7 @@ pub(super) async fn prepare_delete_statement_async(
     let from = super::super::mutation_match_read::mutation_match_select(&mut delete_query)?;
     let match_read = super::super::mutation_match_read::bind_mutation_match_read(
         target,
-        &mut from.relation,
+        from,
         false,
         &mutation,
         target_binding.metadata(),
@@ -315,19 +315,22 @@ fn delete_position_sink_query_ast(
             .collect(),
     )
     .map_err(|error| format!("internal DELETE query construction failed: {error}"))?;
-    let version = (target_ref != "main").then(|| ast::TableVersion {
-        kind: ast::TableVersionKind::ForVersionAsOf,
-        value: build::string(target_ref),
+    let version = (target_ref != "main").then(|| ast::QueryPeriod {
+        range_type: ast::QueryPeriodRangeType::Version,
+        start: None,
+        end: Some(ast::AstBox::new(build::string(target_ref))),
         span: SYNTHETIC,
     });
     let select = build::select(
         projection,
-        vec![build::relation(build::table(name, version, None))],
+        Some(build::table(name, version, None)),
         Some(where_clause.clone()),
         None,
     )
     .map_err(|error| format!("internal DELETE query construction failed: {error}"))?;
-    Ok(build::query(ast::SetExpr::Select(Box::new(select))))
+    Ok(build::query(ast::SetExpr::Select(
+        novarocks_parser::ast::AstBox::new(select),
+    )))
 }
 
 /// The delete-shaped input this statement asks the session to admit.
@@ -1018,11 +1021,11 @@ mod tests {
             assert_eq!(name.value, expected);
             assert!(name.quoted);
         }
-        let novarocks_parser::ast::TableFactor::Table { name, version, .. } =
-            &select.from[0].relation
-        else {
+        let Some(novarocks_parser::ast::Relation::Table(table)) = &select.from else {
             panic!("target table");
         };
+        let name = &table.name;
+        let version = &table.query_period;
         assert_eq!(
             name.parts
                 .iter()
@@ -1055,11 +1058,11 @@ mod tests {
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        let novarocks_parser::ast::TableFactor::Table { name, version, .. } =
-            &select.from[0].relation
-        else {
+        let Some(novarocks_parser::ast::Relation::Table(table)) = &select.from else {
             panic!("target table");
         };
+        let name = &table.name;
+        let version = &table.query_period;
         assert_eq!(
             name.parts
                 .iter()
@@ -1068,12 +1071,13 @@ mod tests {
             vec!["ice", "db", "orders"]
         );
         let version = version.as_ref().expect("branch pin");
+        assert!(version.start.is_none());
         assert_eq!(
-            version.kind,
-            novarocks_parser::ast::TableVersionKind::ForVersionAsOf
+            version.range_type,
+            novarocks_parser::ast::QueryPeriodRangeType::Version
         );
         assert!(
-            matches!(&version.value, Expr::Literal(literal) if literal.kind == LiteralKind::String("dev".into()))
+            matches!(version.end.as_deref(), Some(Expr::Literal(literal)) if literal.kind == LiteralKind::String("dev".into()))
         );
     }
 
@@ -1098,15 +1102,12 @@ mod tests {
             panic!("SELECT");
         };
         assert_eq!(select.selection.as_ref(), Some(&where_clause));
-        let novarocks_parser::ast::TableFactor::Table {
-            version: Some(version),
-            ..
-        } = &select.from[0].relation
-        else {
-            panic!("branch pin");
+        let Some(novarocks_parser::ast::Relation::Table(table)) = &select.from else {
+            panic!("target table");
         };
+        let version = table.query_period.as_ref().expect("branch pin");
         assert!(
-            matches!(&version.value, Expr::Literal(literal) if literal.kind == LiteralKind::String(branch.into()))
+            matches!(version.end.as_deref(), Some(Expr::Literal(literal)) if literal.kind == LiteralKind::String(branch.into()))
         );
     }
 

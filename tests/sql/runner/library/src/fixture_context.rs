@@ -764,10 +764,29 @@ fn rewrite_delta_namespace_refs(
     source: &str,
     mapping: &BTreeMap<String, String>,
 ) -> Result<String> {
-    use novarocks_parser::ast::{Expr, FunctionCall, LiteralKind, Visit, walk_function_call};
+    use novarocks_parser::ast::{
+        Expr, FunctionCall, Literal, LiteralKind, TableFunctionArgumentValue,
+        TableFunctionInvocation, Visit, walk_function_call, walk_table_function_invocation,
+    };
     struct References<'a> {
         mapping: &'a BTreeMap<String, String>,
         edits: Vec<(usize, usize, String)>,
+    }
+    impl References<'_> {
+        fn delta_identity_literal(&mut self, literal: &Literal) {
+            if let LiteralKind::String(value) = &literal.kind {
+                let parts: Vec<_> = value.split('.').collect();
+                if parts.len() == 3
+                    && let Some(namespace) = self.mapping.get(parts[1])
+                {
+                    self.edits.push((
+                        literal.span.start(),
+                        literal.span.end(),
+                        format!("'{}.{namespace}.{}'", parts[0], parts[2]),
+                    ));
+                }
+            }
+        }
     }
     impl Visit for References<'_> {
         fn visit_function_call(&mut self, call: &FunctionCall) {
@@ -782,20 +801,26 @@ fn rewrite_delta_namespace_refs(
                     .all(|argument| argument.name.is_none())
                 && let Some(Expr::Literal(literal)) =
                     call.arguments.first().map(|argument| &argument.value)
-                && let LiteralKind::String(value) = &literal.kind
             {
-                let parts: Vec<_> = value.split('.').collect();
-                if parts.len() == 3
-                    && let Some(namespace) = self.mapping.get(parts[1])
-                {
-                    self.edits.push((
-                        literal.span.start(),
-                        literal.span.end(),
-                        format!("'{}.{namespace}.{}'", parts[0], parts[2]),
-                    ));
-                }
+                self.delta_identity_literal(literal);
             }
             walk_function_call(self, call);
+        }
+        fn visit_table_function_invocation(&mut self, call: &TableFunctionInvocation) {
+            if call.name.parts.len() == 1
+                && call.name.parts[0]
+                    .value
+                    .eq_ignore_ascii_case("__nr_ivm_delta")
+                && call
+                    .arguments
+                    .iter()
+                    .all(|argument| argument.name.is_none())
+                && let Some(TableFunctionArgumentValue::Expression(Expr::Literal(literal))) =
+                    call.arguments.first().map(|argument| &argument.value)
+            {
+                self.delta_identity_literal(literal);
+            }
+            walk_table_function_invocation(self, call);
         }
     }
     let masked = crate::catalog_symbol::sql_source(source);

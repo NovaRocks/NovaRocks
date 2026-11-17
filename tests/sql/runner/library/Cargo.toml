@@ -37,6 +37,7 @@ novarocks-cluster-harness.workspace = true
 novarocks-test-support.workspace = true
 novarocks-failpoint.workspace = true
 novarocks-parser.workspace = true
+novarocks-sql.workspace = true
 novarocks-types.workspace = true
 rayon = "1.10"
 regex.workspace = true

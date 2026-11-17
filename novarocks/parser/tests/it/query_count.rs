@@ -73,7 +73,7 @@ fn old_count_producers_move_real_comma_counts_and_keep_suffix_owners_and_keyword
         panic!("original parentheses");
     };
     assert!(matches!(
-        &modifiers(inner).limit,
+        &modifiers(&inner.query).limit,
         Some(QueryLimit::Limit(_))
     ));
     let offset = parsed.modifiers.offset.as_ref().unwrap();
@@ -309,7 +309,10 @@ fn set_arity_distinct_corresponding_and_union_all_flattening_are_independent_rea
         span: Span::new(7, 8),
     });
     assert!(!all.syntax_eq(&changed));
-    let nested = SetExpr::Query(Box::new(build::query(all)));
+    let nested = SetExpr::Query(AstBox::new(TableSubquery {
+        query: AstBox::new(build::query(all)),
+        span: novarocks_parser::SYNTHETIC,
+    }));
     let composed = build::set_operation(nested, SetOperator::Union, false, values(4), None);
     let SetExpr::SetOperation(operation) = composed else {
         unreachable!()

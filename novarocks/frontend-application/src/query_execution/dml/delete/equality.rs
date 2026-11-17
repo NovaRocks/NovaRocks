@@ -277,20 +277,21 @@ fn equality_delete_sink_query_ast(
         .collect::<Result<Vec<_>, String>>()?;
     let values = build::values(values)
         .map_err(|error| format!("internal equality-delete query construction failed: {error}"))?;
-    let source = build::derived(
-        build::query(values),
-        Some(build::alias(
-            build::ident(alias, true),
+    let source = build::alias(
+        build::derived(build::query(values)),
+        build::ident(alias, true),
+        Some(
             delete_columns
                 .iter()
                 .map(|column| build::ident(column.field().name(), true))
                 .collect(),
-            true,
-        )),
+        ),
     );
-    let select = build::select(projection, vec![build::relation(source)], None, None)
+    let select = build::select(projection, Some(source), None, None)
         .map_err(|error| format!("internal equality-delete query construction failed: {error}"))?;
-    Ok(build::query(ast::SetExpr::Select(Box::new(select))))
+    Ok(build::query(ast::SetExpr::Select(
+        novarocks_parser::ast::AstBox::new(select),
+    )))
 }
 
 fn equality_delete_literal_ast(value: &Expr, data_type: &DataType) -> Result<Expr, String> {
@@ -773,17 +774,23 @@ mod tests {
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        let novarocks_parser::ast::TableFactor::Derived {
-            subquery, alias, ..
-        } = &select.from[0].relation
-        else {
+        let Some(novarocks_parser::ast::Relation::Aliased(alias)) = &select.from else {
+            panic!("VALUES alias");
+        };
+        let novarocks_parser::ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
             panic!("derived VALUES");
         };
-        let alias = alias.as_ref().expect("VALUES columns");
-        assert_eq!(alias.name.value, "__nr_eqdel");
-        assert!(alias.explicit_as);
-        assert!(alias.name.quoted);
-        assert!(alias.columns.iter().all(|column| column.quoted));
+        let subquery = &node.query;
+        assert_eq!(alias.alias.value, "__nr_eqdel");
+        assert!(alias.alias.quoted);
+        assert!(
+            alias
+                .column_names
+                .as_ref()
+                .expect("VALUES columns")
+                .iter()
+                .all(|column| column.quoted)
+        );
         let novarocks_parser::ast::SetExpr::Values(values) = subquery.body.as_ref() else {
             panic!("VALUES");
         };

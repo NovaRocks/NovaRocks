@@ -81,6 +81,7 @@ mod write_assignment;
 #[cfg(test)]
 pub(crate) use resolve_expr::MAX_BOOLEAN_CHAIN_OPERANDS;
 mod resolve_from;
+pub use resolve_from::TableNameView;
 mod scope;
 mod subquery_rewrite;
 
@@ -98,9 +99,9 @@ use crate::catalog::PlannerTableProvider;
 use crate::column_id::ColumnId;
 
 use crate::analysis::{
-    AnalyzedOutputField as OutputColumn, AnalyzedProjectItem as ProjectItem, ExprKind, JoinKind,
-    JoinRelation, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
-    ResolvedValues, SetOpKind, SortItem, SubqueryInfo, TypedExpr,
+    AnalyzedOutputField as OutputColumn, AnalyzedProjectItem as ProjectItem, ExprKind, QueryBody,
+    Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp, ResolvedValues, SetOpKind, SortItem,
+    SubqueryInfo, TypedExpr,
 };
 
 use helpers::{expr_display_name, extract_limit, extract_offset};
@@ -894,10 +895,16 @@ impl<'a> AnalyzerContext<'a> {
             pending_ctes.remove(&name);
             child_ctx.pending_ctes = pending_ctes.clone();
 
+            if cte.columns.as_ref().is_some_and(Vec::is_empty) {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "empty CTE column aliases are not supported",
+                    cte.span,
+                ));
+            }
             let mut resolved_cte = child_ctx.analyze_query(&cte.query)?;
             crate::analysis::schema::apply_column_aliases(
                 &mut resolved_cte.output_columns,
-                &cte.columns,
+                cte.columns.as_deref().unwrap_or(&[]),
                 cte.span,
             )?;
 
@@ -1008,13 +1015,34 @@ impl<'a> AnalyzerContext<'a> {
                 let (sel, cols) = self.analyze_select(s)?;
                 Ok((QueryBody::Select(sel), cols))
             }
+            ast::SetExpr::Table(table) => {
+                let (from, scope) = self.analyze_table_query(table)?;
+                let mut projection = Vec::new();
+                let mut columns = Vec::new();
+                self.append_wildcard_projection(&scope, &mut projection, &mut columns)?;
+                Ok((
+                    QueryBody::Select(ResolvedSelect {
+                        from: Some(from),
+                        filter: None,
+                        group_by: Vec::new(),
+                        having: None,
+                        projection,
+                        has_aggregation: false,
+                        distinct: false,
+                        repeat: None,
+                        apply_specs: Vec::new(),
+                        predicate_apply_specs: Vec::new(),
+                    }),
+                    columns,
+                ))
+            }
             ast::SetExpr::SetOperation(_) => self.analyze_set_operation_chain(set_expr),
             ast::SetExpr::Values(values) => {
                 let (resolved_values, cols) = self.analyze_values(values)?;
                 Ok((QueryBody::Values(resolved_values), cols))
             }
             ast::SetExpr::Query(q) => {
-                let resolved = self.analyze_query(q)?;
+                let resolved = self.analyze_query(&q.query)?;
                 let cols = resolved.output_columns.clone();
                 if resolved.order_by.is_empty()
                     && resolved.limit.is_none()
@@ -1169,7 +1197,7 @@ impl<'a> AnalyzerContext<'a> {
 
     fn analyze_set_operand(&self, set_expr: &ast::SetExpr) -> Result<ResolvedQuery, AnalyzeError> {
         match set_expr {
-            ast::SetExpr::Query(q) => self.analyze_query(q),
+            ast::SetExpr::Query(q) => self.analyze_query(&q.query),
             _ => {
                 let empty = ast::QueryModifiers::default();
                 let modifiers = match set_expr {
@@ -1249,33 +1277,11 @@ impl<'a> AnalyzerContext<'a> {
         group_by_override: Option<&[&ast::Expr]>,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
         // --- FROM clause ---
-        let (from, scope) = if select.from.is_empty() {
-            // SELECT without FROM (dual)
-            (None, self.new_scope())
-        } else if select.from.len() == 1 {
-            let (rel, scope) = self.analyze_from(&select.from[0])?;
-            (Some(rel), scope)
+        let (from, scope) = if let Some(relation) = &select.from {
+            let (relation, scope) = self.analyze_from(relation)?;
+            (Some(relation), scope)
         } else {
-            // Multiple comma-separated FROM items → implicit CROSS JOIN.
-            // Subsequent entries see the accumulated left-hand scope so
-            // table-valued functions (e.g. `unnest(t.arr)`) can reference
-            // earlier sibling columns (StarRocks implicit-lateral semantics).
-            let mut iter = select.from.iter();
-            let first = iter.next().unwrap();
-            let (mut current_rel, mut current_scope) = self.analyze_from(first)?;
-            for twj in iter {
-                let (right_rel, right_scope) =
-                    self.analyze_from_with_outer(twj, Some(&current_scope))?;
-                current_scope.merge(&right_scope);
-                current_rel = Relation::Join(Box::new(JoinRelation {
-                    naa_author: None,
-                    left: current_rel,
-                    right: right_rel,
-                    join_type: JoinKind::Cross,
-                    condition: None,
-                }));
-            }
-            (Some(current_rel), current_scope)
+            (None, self.new_scope())
         };
 
         // Finish FROM recursion before allocating the SELECT analysis frame.
@@ -2266,45 +2272,7 @@ impl<'a> AnalyzerContext<'a> {
                     });
                 }
                 ast::SelectItem::Wildcard { .. } => {
-                    for (qualifier, col_name, col_id, value_type, field_name) in
-                        scope.iter_columns()
-                    {
-                        self.check_control()?;
-                        // FULL OUTER USING columns are exposed as a synthetic
-                        // `COALESCE(left.col, right.col)` expression. SELECT *
-                        // expansion must use that expression instead of the
-                        // raw left-side ColumnRef so right-only rows show
-                        // the right-side value.
-                        let typed = if let Some(expr) = field_name
-                            .as_deref()
-                            .and_then(|name| scope.computed_column_for(name))
-                        {
-                            expr.clone()
-                        } else {
-                            TypedExpr {
-                                kind: ExprKind::ColumnRef {
-                                    column_id: *col_id,
-                                    qualifier: qualifier.clone(),
-                                    column: col_name.clone(),
-                                },
-                                value_type: value_type.clone(),
-                            }
-                        };
-                        output_columns.push(OutputColumn {
-                            field_name: field_name.clone(),
-                            column_id: *col_id,
-                            name: col_name.clone(),
-                            value_type: value_type.clone(),
-
-                            is_internal: false,
-                        });
-                        projection.push(ProjectItem {
-                            field_name: field_name.clone(),
-                            expr: typed,
-                            output_name: col_name.clone(),
-                            output_column_id: *col_id,
-                        });
-                    }
+                    self.append_wildcard_projection(scope, &mut projection, &mut output_columns)?
                 }
                 ast::SelectItem::QualifiedWildcard { prefix, span, .. } => {
                     let qualifier_str = prefix
@@ -2371,6 +2339,52 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         Ok((projection, output_columns))
+    }
+
+    fn append_wildcard_projection(
+        &self,
+        scope: &AnalyzerScope,
+        projection: &mut Vec<ProjectItem>,
+        output_columns: &mut Vec<OutputColumn>,
+    ) -> Result<(), AnalyzeError> {
+        for (qualifier, col_name, col_id, value_type, field_name) in scope.iter_columns() {
+            self.check_control()?;
+            // FULL OUTER USING columns are exposed as a synthetic
+            // `COALESCE(left.col, right.col)` expression. SELECT *
+            // expansion must use that expression instead of the
+            // raw left-side ColumnRef so right-only rows show
+            // the right-side value.
+            let typed = if let Some(expr) = field_name
+                .as_deref()
+                .and_then(|name| scope.computed_column_for(name))
+            {
+                expr.clone()
+            } else {
+                TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: *col_id,
+                        qualifier: qualifier.clone(),
+                        column: col_name.clone(),
+                    },
+                    value_type: value_type.clone(),
+                }
+            };
+            output_columns.push(OutputColumn {
+                field_name: field_name.clone(),
+                column_id: *col_id,
+                name: col_name.clone(),
+                value_type: value_type.clone(),
+
+                is_internal: false,
+            });
+            projection.push(ProjectItem {
+                field_name: field_name.clone(),
+                expr: typed,
+                output_name: col_name.clone(),
+                output_column_id: *col_id,
+            });
+        }
+        Ok(())
     }
 
     /// Like `analyze_projection` but uses `wildcard_scope` for `SELECT *`
@@ -5287,6 +5301,86 @@ mod tests {
             ExprKind::IsTruthValue { expr, .. } => expr_has_placeholder_deep(expr),
             ExprKind::WindowCall { args, .. } => args.iter().any(expr_has_placeholder_deep),
             _ => false,
+        }
+    }
+
+    #[test]
+    fn table_metadata_name_view_keeps_actual_quoted_facts_and_authored_locations() {
+        let source = "SELECT * FROM ice.db.orders$future_metadata";
+        let query = parse_native_query(source).unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let Some(ast::Relation::Table(table)) = &select.from else {
+            panic!("table");
+        };
+        let view = TableNameView::new(&table.name);
+        assert_eq!(
+            view.parts().collect::<Vec<_>>(),
+            vec!["ice", "db", "orders"]
+        );
+        let suffix = view.metadata.unwrap();
+        assert_eq!(suffix.value, "future_metadata");
+        assert_eq!(
+            &source[suffix.span.start()..suffix.span.end()],
+            "future_metadata"
+        );
+        assert_eq!(
+            &source[view.base_span.start()..view.base_span.end()],
+            "ice.db.orders"
+        );
+        let mut name = novarocks_parser::build::object_name(vec![novarocks_parser::build::ident(
+            "orders$files",
+            false,
+        )])
+        .unwrap();
+        let view = TableNameView::new(&name);
+        assert_eq!(view.parts().collect::<Vec<_>>(), vec!["orders"]);
+        assert_eq!(view.metadata.unwrap().span, novarocks_parser::SYNTHETIC);
+        name.span = novarocks_parser::Span::new(100, 100);
+        name.parts[0].span = novarocks_parser::Span::new(0, name.parts[0].value.len());
+        let view = TableNameView::new(&name);
+        assert_eq!(view.parts().collect::<Vec<_>>(), vec!["orders"]);
+        assert_eq!(view.base_span, name.span);
+        assert_eq!(view.metadata.unwrap().span, name.parts[0].span);
+        name.parts[0].quoted = true;
+        let view = TableNameView::new(&name);
+        assert!(view.metadata.is_none());
+        assert_eq!(view.parts().collect::<Vec<_>>(), vec!["orders$files"]);
+    }
+
+    #[test]
+    fn table_query_body_reuses_original_scan_fields_full_types_and_column_ids() {
+        let mut source = parse_native_query("SELECT * FROM t1").unwrap();
+        let (expected, _, _) = analyze(&source, &TestCatalog, "default").unwrap();
+        let ast::SetExpr::Select(select) = source.body.as_mut() else {
+            panic!("source SELECT");
+        };
+        let ast::Relation::Table(table) = select.from.take().expect("source table") else {
+            panic!("source table");
+        };
+        let table_query = novarocks_parser::build::query(ast::SetExpr::Table(table));
+        let (actual, _, _) = analyze(&table_query, &TestCatalog, "default").unwrap();
+        assert_eq!(actual.output_columns.len(), expected.output_columns.len());
+        for (actual, expected) in actual.output_columns.iter().zip(&expected.output_columns) {
+            assert_eq!(actual.field_name, expected.field_name);
+            assert_eq!(actual.column_id, expected.column_id);
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.value_type, expected.value_type);
+        }
+        let (QueryBody::Select(actual), QueryBody::Select(expected)) =
+            (&actual.body, &expected.body)
+        else {
+            panic!("same actual Select IR");
+        };
+        assert_eq!(actual.projection.len(), expected.projection.len());
+        for (actual, expected) in actual.projection.iter().zip(&expected.projection) {
+            assert_eq!(actual.field_name, expected.field_name);
+            assert_eq!(actual.output_column_id, expected.output_column_id);
+            assert_eq!(actual.expr.value_type, expected.expr.value_type);
+            assert!(
+                matches!((&actual.expr.kind, &expected.expr.kind), (ExprKind::ColumnRef { column_id: a, .. }, ExprKind::ColumnRef { column_id: b, .. }) if a == b)
+            );
         }
     }
 

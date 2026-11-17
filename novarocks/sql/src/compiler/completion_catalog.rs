@@ -564,7 +564,8 @@ impl<'a> CatalogNeedCollector<'a> {
                 }
                 Ok(())
             }
-            ast::SetExpr::Query(query) => self.collect_query(query, scope),
+            ast::SetExpr::Query(query) => self.collect_query(&query.query, scope),
+            ast::SetExpr::Table(table) => self.collect_table_node(table, scope),
             ast::SetExpr::SetOperation(operation) => {
                 for input in &operation.inputs {
                     self.collect_set_expr(input, scope)?;
@@ -601,8 +602,8 @@ impl<'a> CatalogNeedCollector<'a> {
                 }
             }
         }
-        for relation in &select.from {
-            self.collect_table_with_joins(relation, scope)?;
+        if let Some(relation) = &select.from {
+            self.collect_relation(relation, scope)?;
         }
         if let Some(selection) = &select.selection {
             self.collect_expr(selection, scope)?;
@@ -686,163 +687,195 @@ impl<'a> CatalogNeedCollector<'a> {
         }
     }
 
-    fn collect_table_with_joins(
+    #[recursive::recursive]
+    fn collect_relation(
         &mut self,
-        relation: &ast::TableWithJoins,
-        scope: &CteScope,
-    ) -> Result<(), SqlCompileError> {
-        self.collect_table_factor(&relation.relation, scope)?;
-        for join in &relation.joins {
-            self.collect_table_factor(&join.relation, scope)?;
-            if let ast::JoinConstraint::On(expression) = &join.constraint {
-                self.collect_expr(expression, scope)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn collect_table_factor(
-        &mut self,
-        factor: &ast::TableFactor,
+        relation: &ast::Relation,
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
         self.step()?;
-        match factor {
-            ast::TableFactor::JsonTable { span, .. } => {
-                Err(crate::analyze_error::AnalyzeError::unsupported_expression(
-                    "JSON_TABLE is not supported",
-                    *span,
-                )
-                .into())
-            }
-
-            ast::TableFactor::Table {
-                name,
-                metadata,
-                version,
-                ..
-            } => {
-                if metadata.is_none() && name.parts.len() == 1 {
-                    let name = name.parts[0].value.to_ascii_lowercase();
-                    if scope.pending.contains(&name) {
-                        if self.defer_semantic_refusals {
-                            return Ok(());
-                        }
-                        return Err(SqlCompileError::Compilation(format!(
-                            "forward CTE reference is not supported: {name}"
-                        )));
-                    }
-                    if scope.visible.contains(&name) {
-                        self.collect_table_decorations(version.as_ref(), scope)?;
-                        return Ok(());
-                    }
+        match relation {
+            ast::Relation::Aliased(node) => self.collect_relation(&node.relation, scope),
+            ast::Relation::Join(node) => {
+                self.collect_relation(&node.left, scope)?;
+                self.collect_relation(&node.right, scope)?;
+                if let Some(ast::JoinCriteria::On(on)) = &node.criteria {
+                    self.collect_expr(&on.expression, scope)?;
                 }
-                let relation = match self.resolve_name(name) {
-                    Ok(relation) => relation,
-                    Err(SqlCompileError::Compilation(_)) if self.defer_semantic_refusals => {
-                        return self.collect_table_decorations(version.as_ref(), scope);
-                    }
-                    Err(error) => return Err(error),
-                };
-                let system_table = crate::system_table::is_system_table_name(
-                    &relation.catalog,
-                    &relation.namespace,
-                );
-                if system_table && (version.is_some() || metadata.is_some()) {
-                    if self.defer_semantic_refusals {
-                        return self.collect_table_decorations(version.as_ref(), scope);
-                    }
-                    return Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
-                        "system tables do not support time travel or metadata suffixes",
-                        name.span,
-                    )
-                    .into());
-                }
-                let target = match metadata {
-                    Some(metadata) => {
-                        let kind = match SqlMetadataTableKind::parse(&metadata.value) {
-                            Ok(kind) => kind,
-                            Err(_) if self.defer_semantic_refusals => {
-                                return self.collect_table_decorations(version.as_ref(), scope);
-                            }
-                            Err(error) => return Err(SqlCompileError::Compilation(error)),
-                        };
-                        // The analyzer expands the partitions view over this exact
-                        // Files fact; it must not request a provider Partitions read.
-                        CatalogLookupTarget::IcebergMetadata {
-                            kind: match kind {
-                                SqlMetadataTableKind::Partitions => SqlMetadataTableKind::Files,
-                                kind => kind,
-                            },
-                        }
-                    }
-                    None if system_table => CatalogLookupTarget::SystemTable,
-                    None => CatalogLookupTarget::Table {
-                        mode: self.lookup_mode,
-                    },
-                };
-                let selection = match version {
-                    Some(version) if metadata.is_some() => {
-                        if self.defer_semantic_refusals {
-                            return self.collect_table_decorations(Some(version), scope);
-                        }
-                        return Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
-                            "time travel is not supported on metadata relations",
-                            version.span,
-                        )
-                        .into());
-                    }
-                    Some(version) => {
-                        match CatalogTableSelection::try_new(version.clone(), &relation) {
-                            Ok(selection) => Some(selection),
-                            Err(_) if self.defer_semantic_refusals => {
-                                return self.collect_table_decorations(Some(version), scope);
-                            }
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                    None => None,
-                };
-                self.add_need_qualified(
-                    relation,
-                    target,
-                    !system_table
-                        && !self.exact_catalog
-                        && metadata.is_none()
-                        && version.is_none()
-                        && name.parts.len() < 3,
-                    selection,
-                )?;
-                self.collect_table_decorations(version.as_ref(), scope)
-            }
-            ast::TableFactor::Derived { subquery, .. } => {
-                self.collect_query(subquery, scope)?;
                 Ok(())
             }
-            ast::TableFactor::TableFunction { expr, .. } => {
-                self.collect_internal_table_function_need(expr)?;
-                self.collect_expr(expr, scope)?;
+            ast::Relation::Table(node) => self.collect_table_node(node, scope),
+            ast::Relation::TableSubquery(node) => self.collect_query(&node.query, scope),
+            ast::Relation::Lateral(node) => self.collect_query(&node.query, scope),
+            ast::Relation::LegacyTableFunction(node) => {
+                self.collect_internal_table_function_need(&node.expr)?;
+                self.collect_expr(&node.expr, scope)
+            }
+            ast::Relation::TableFunction(invocation) => {
+                self.collect_typed_internal_table_function_need(invocation)?;
+                for argument in &invocation.arguments {
+                    match &argument.value {
+                        ast::TableFunctionArgumentValue::Expression(expr) => {
+                            self.collect_expr(expr, scope)?
+                        }
+                        ast::TableFunctionArgumentValue::Table(_)
+                        | ast::TableFunctionArgumentValue::Descriptor(_) => {
+                            return Err(
+                                crate::analyze_error::AnalyzeError::unsupported_expression(
+                                    "table and descriptor function arguments are not supported",
+                                    argument.span,
+                                )
+                                .into(),
+                            );
+                        }
+                    }
+                }
                 Ok(())
             }
-            ast::TableFactor::Unnest { array_exprs, .. } => {
-                for expression in array_exprs {
+            ast::Relation::Unnest(node) => {
+                for expression in &node.expressions {
                     self.collect_expr(expression, scope)?;
                 }
                 Ok(())
             }
-            ast::TableFactor::NestedJoin {
-                table_with_joins, ..
-            } => self.collect_table_with_joins(table_with_joins, scope),
+            ast::Relation::JsonTable(_) => {
+                Err(crate::analyze_error::AnalyzeError::unsupported_expression(
+                    "JSON_TABLE is not supported",
+                    relation.span(),
+                )
+                .into())
+            }
+            ast::Relation::PatternRecognition(_)
+            | ast::Relation::Sampled(_)
+            | ast::Relation::Pivot(_)
+            | ast::Relation::Nearest(_) => {
+                Err(crate::analyze_error::AnalyzeError::unsupported_expression(
+                    "relation profile is not supported",
+                    relation.span(),
+                )
+                .into())
+            }
         }
+    }
+
+    fn collect_table_node(
+        &mut self,
+        node: &ast::Table,
+        scope: &CteScope,
+    ) -> Result<(), SqlCompileError> {
+        let name = &node.name;
+        let version = node.query_period.as_ref();
+        if node.branch.is_some() {
+            return Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
+                "table branches in FROM are not supported",
+                node.span,
+            )
+            .into());
+        }
+        let view = crate::analyzer::TableNameView::new(name);
+        let metadata = view.metadata;
+        if metadata.is_none() && name.parts.len() == 1 {
+            let name = name.parts[0].value.to_ascii_lowercase();
+            if scope.pending.contains(&name) {
+                if self.defer_semantic_refusals {
+                    return Ok(());
+                }
+                return Err(SqlCompileError::Compilation(format!(
+                    "forward CTE reference is not supported: {name}"
+                )));
+            }
+            if scope.visible.contains(&name) {
+                self.collect_table_decorations(version, scope)?;
+                return Ok(());
+            }
+        }
+        let relation = match self.resolve_name_parts(view.parts()) {
+            Ok(relation) => relation,
+            Err(SqlCompileError::Compilation(_)) if self.defer_semantic_refusals => {
+                return self.collect_table_decorations(version, scope);
+            }
+            Err(error) => return Err(error),
+        };
+        let system_table =
+            crate::system_table::is_system_table_name(&relation.catalog, &relation.namespace);
+        if system_table && (version.is_some() || metadata.is_some()) {
+            if self.defer_semantic_refusals {
+                return self.collect_table_decorations(version, scope);
+            }
+            return Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
+                "system tables do not support time travel or metadata suffixes",
+                name.span,
+            )
+            .into());
+        }
+        let target = match metadata {
+            Some(metadata) => {
+                let kind = match SqlMetadataTableKind::parse(&metadata.value) {
+                    Ok(kind) => kind,
+                    Err(_) if self.defer_semantic_refusals => {
+                        return self.collect_table_decorations(version, scope);
+                    }
+                    Err(error) => return Err(SqlCompileError::Compilation(error)),
+                };
+                // The analyzer expands the partitions view over this exact
+                // Files fact; it must not request a provider Partitions read.
+                CatalogLookupTarget::IcebergMetadata {
+                    kind: match kind {
+                        SqlMetadataTableKind::Partitions => SqlMetadataTableKind::Files,
+                        kind => kind,
+                    },
+                }
+            }
+            None if system_table => CatalogLookupTarget::SystemTable,
+            None => CatalogLookupTarget::Table {
+                mode: self.lookup_mode,
+            },
+        };
+        let selection = match version {
+            Some(version) if metadata.is_some() => {
+                if self.defer_semantic_refusals {
+                    return self.collect_table_decorations(Some(version), scope);
+                }
+                return Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
+                    "time travel is not supported on metadata relations",
+                    version.span,
+                )
+                .into());
+            }
+            Some(version) => match CatalogTableSelection::try_new(version.clone(), &relation) {
+                Ok(selection) => Some(selection),
+                Err(_) if self.defer_semantic_refusals => {
+                    return self.collect_table_decorations(Some(version), scope);
+                }
+                Err(error) => return Err(error.into()),
+            },
+            None => None,
+        };
+        self.add_need_qualified(
+            relation,
+            target,
+            !system_table
+                && !self.exact_catalog
+                && metadata.is_none()
+                && version.is_none()
+                && name.parts.len() < 3,
+            selection,
+        )?;
+        self.collect_table_decorations(version, scope)
     }
 
     fn collect_table_decorations(
         &mut self,
-        version: Option<&ast::TableVersion>,
+        version: Option<&ast::QueryPeriod>,
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
         if let Some(version) = version {
-            self.collect_expr(&version.value, scope)?;
+            if let Some(start) = &version.start {
+                self.collect_expr(start, scope)?;
+            }
+            if let Some(end) = &version.end {
+                self.collect_expr(end, scope)?;
+            }
         }
         Ok(())
     }
@@ -890,6 +923,10 @@ impl<'a> CatalogNeedCollector<'a> {
         else {
             return Ok(());
         };
+        self.collect_internal_table_identity(identity)
+    }
+
+    fn collect_internal_table_identity(&mut self, identity: &str) -> Result<(), SqlCompileError> {
         let parts = identity
             .split('.')
             .map(ToOwned::to_owned)
@@ -911,12 +948,41 @@ impl<'a> CatalogNeedCollector<'a> {
         )
     }
 
-    fn resolve_name(&self, name: &ast::ObjectName) -> Result<TableIdentity, SqlCompileError> {
-        let parts = name
-            .parts
-            .iter()
-            .map(|part| part.value.clone())
-            .collect::<Vec<_>>();
+    fn collect_typed_internal_table_function_need(
+        &mut self,
+        invocation: &ast::TableFunctionInvocation,
+    ) -> Result<(), SqlCompileError> {
+        let Some(name) = invocation.name.parts.last() else {
+            return Ok(());
+        };
+        if !name.value.eq_ignore_ascii_case("__nr_ivm_delta")
+            || !invocation.copartitioning.is_empty()
+            || invocation
+                .arguments
+                .iter()
+                .any(|argument| argument.name.is_some())
+        {
+            return Ok(());
+        }
+        let Some(ast::TableFunctionArgument {
+            value:
+                ast::TableFunctionArgumentValue::Expression(ast::Expr::Literal(ast::Literal {
+                    kind: ast::LiteralKind::String(identity),
+                    ..
+                })),
+            ..
+        }) = invocation.arguments.first()
+        else {
+            return Ok(());
+        };
+        self.collect_internal_table_identity(identity)
+    }
+
+    fn resolve_name_parts<'n>(
+        &self,
+        parts: impl Iterator<Item = &'n str>,
+    ) -> Result<TableIdentity, SqlCompileError> {
+        let parts = parts.map(str::to_owned).collect::<Vec<_>>();
         // A name with no catalog of its own is in the session's current
         // catalog, or in the default one when the session has set none.
         // Whether the table is there is what the lookup answers; a name that
@@ -1248,7 +1314,7 @@ impl FactBackedCatalog {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: &ast::TableVersion,
+        version: &ast::QueryPeriod,
         definition_context: bool,
     ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
         use crate::analyze_error::AnalyzeError;
@@ -1281,10 +1347,11 @@ impl FactBackedCatalog {
                     version.span,
                 ))
             }
-            CatalogEntry::SelectionRefused(error) => Err(error
-                .as_ref()
-                .clone()
-                .at_catalog_selection_reference(version.value.span())),
+            CatalogEntry::SelectionRefused(error) => {
+                Err(error.as_ref().clone().at_catalog_selection_reference(
+                    crate::analyzer::iceberg_ref::query_period_end(version)?.span(),
+                ))
+            }
         }
     }
 
@@ -1333,7 +1400,7 @@ impl FactBackedCatalog {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: Option<&novarocks_parser::ast::TableVersion>,
+        version: Option<&novarocks_parser::ast::QueryPeriod>,
     ) -> Result<
         Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>,
         crate::analyze_error::AnalyzeError,
@@ -1383,7 +1450,7 @@ impl PlannerTableProvider for FactBackedCatalog {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: &ast::TableVersion,
+        version: &ast::QueryPeriod,
     ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
         self.resolve_table_version_for_analysis_in_context(
             catalog,
@@ -1450,7 +1517,7 @@ impl PlannerTableProvider for FactBackedCatalog {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: &ast::TableVersion,
+        version: &ast::QueryPeriod,
     ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
         self.resolve_table_version_for_analysis_in_context(catalog, database, table, version, true)
     }
@@ -1468,7 +1535,7 @@ impl PlannerTableProvider for FactBackedCatalog {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: Option<&novarocks_parser::ast::TableVersion>,
+        version: Option<&novarocks_parser::ast::QueryPeriod>,
     ) -> Result<
         Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>,
         crate::analyze_error::AnalyzeError,

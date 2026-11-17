@@ -244,7 +244,7 @@ pub(super) fn branch_union_queries(
         .into_iter()
         .map(|body| {
             let mut branch_query = query.clone();
-            branch_query.body = Box::new(body);
+            branch_query.body = ast::AstBox::new(body);
             Ok(branch_query)
         })
         .collect()
@@ -339,7 +339,7 @@ fn validate_union_projection_set_expr(
             Ok(())
         }
         ast::SetExpr::Query(query) => validate_union_projection_set_expr(
-            query.body.as_ref(),
+            query.query.body.as_ref(),
             branch_count,
             validated_branch_count,
             saw_union_all,
@@ -381,7 +381,7 @@ fn append_union_projection_hidden_columns(
             Ok(())
         }
         ast::SetExpr::Query(query) => {
-            append_union_projection_hidden_columns(query.body.as_mut(), next_branch_id)
+            append_union_projection_hidden_columns(query.query.body.as_mut(), next_branch_id)
         }
         ast::SetExpr::Select(select) => {
             let branch_id = *next_branch_id;
@@ -471,8 +471,8 @@ fn walk_set_expr(
     }
     match expr {
         ast::SetExpr::Select(select) => {
-            for table_with_joins in &mut select.from {
-                walk_table_with_joins(table_with_joins, visible_ctes, state);
+            if let Some(relation) = &mut select.from {
+                walk_factor(relation, visible_ctes, state);
             }
         }
         ast::SetExpr::SetOperation(operation) => {
@@ -485,24 +485,13 @@ fn walk_set_expr(
                 walk_set_expr(input, visible_ctes, state);
             }
         }
-        ast::SetExpr::Query(query) => walk_query(query.as_mut(), visible_ctes, state),
+        ast::SetExpr::Query(query) => walk_query(query.query.as_mut(), visible_ctes, state),
         _ => {}
     }
 }
 
-fn walk_table_with_joins(
-    table_with_joins: &mut ast::TableWithJoins,
-    visible_ctes: &HashSet<String>,
-    state: &mut InjectState<'_>,
-) {
-    walk_factor(&mut table_with_joins.relation, visible_ctes, state);
-    for join in &mut table_with_joins.joins {
-        walk_factor(&mut join.relation, visible_ctes, state);
-    }
-}
-
 fn walk_factor(
-    factor: &mut ast::TableFactor,
+    factor: &mut ast::Relation,
     visible_ctes: &HashSet<String>,
     state: &mut InjectState<'_>,
 ) {
@@ -510,7 +499,8 @@ fn walk_factor(
         return;
     }
     match factor {
-        ast::TableFactor::Table { name, version, .. } => {
+        ast::Relation::Table(table) => {
+            let name = &table.name;
             let parts = name
                 .parts
                 .iter()
@@ -543,7 +533,7 @@ fn walk_factor(
                 ));
                 return;
             }
-            if version.is_some() {
+            if table.query_period.is_some() {
                 state.first_error = Some(format!(
                     "refresh SELECT must not write explicit FOR VERSION AS OF for occurrence {} ({}); refresh pin would conflict",
                     pinned.occurrence_id().get(),
@@ -551,20 +541,22 @@ fn walk_factor(
                 ));
                 return;
             }
-            *version = Some(ast::TableVersion {
-                kind: ast::TableVersionKind::ForVersionAsOf,
-                value: build::integer(pinned.snapshot_id()),
+            table.query_period = Some(ast::QueryPeriod {
+                range_type: ast::QueryPeriodRangeType::Version,
+                start: None,
+                end: Some(ast::AstBox::new(build::integer(pinned.snapshot_id()))),
                 span: Span::new(0, 0),
             });
             state.next_occurrence += 1;
             state.count += 1;
         }
-        ast::TableFactor::Derived { subquery, .. } => {
-            walk_query(subquery.as_mut(), visible_ctes, state)
+        ast::Relation::TableSubquery(node) => walk_query(&mut node.query, visible_ctes, state),
+        ast::Relation::Lateral(node) => walk_query(&mut node.query, visible_ctes, state),
+        ast::Relation::Aliased(node) => walk_factor(&mut node.relation, visible_ctes, state),
+        ast::Relation::Join(node) => {
+            walk_factor(&mut node.left, visible_ctes, state);
+            walk_factor(&mut node.right, visible_ctes, state);
         }
-        ast::TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => walk_table_with_joins(table_with_joins.as_mut(), visible_ctes, state),
         _ => {}
     }
 }
@@ -634,7 +626,9 @@ fn flatten_branch_union_all_set_expr(
             }
             Ok(())
         }
-        ast::SetExpr::Query(query) => flatten_branch_union_all_set_expr(query.body.as_ref(), out),
+        ast::SetExpr::Query(query) => {
+            flatten_branch_union_all_set_expr(query.query.body.as_ref(), out)
+        }
         ast::SetExpr::Select(_) => {
             out.push(body.clone());
             Ok(())
@@ -728,10 +722,10 @@ mod tests {
             let (select, source_select) = match (input, source) {
                 (ast::SetExpr::Query(query), ast::SetExpr::Query(source_query)) => {
                     assert_eq!(query.span, source_query.span);
-                    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+                    let ast::SetExpr::Select(select) = query.query.body.as_ref() else {
                         panic!("wrapped SELECT");
                     };
-                    let ast::SetExpr::Select(source) = source_query.body.as_ref() else {
+                    let ast::SetExpr::Select(source) = source_query.query.body.as_ref() else {
                         panic!("source wrapped SELECT");
                     };
                     (select, source)
@@ -740,29 +734,32 @@ mod tests {
                 _ => panic!("source Query boundary changed"),
             };
             assert_eq!(select.projection[0], source_select.projection[0]);
-            let ast::TableFactor::Table {
-                name,
-                alias,
-                version: Some(version),
-                ..
-            } = &select.from[0].relation
-            else {
-                panic!("pinned table");
-            };
-            let ast::TableFactor::Table {
-                name: original_name,
-                alias: original_alias,
-                ..
-            } = &source_select.from[0].relation
-            else {
-                panic!("source table");
-            };
-            assert_eq!(name, original_name);
+            fn base(
+                relation: &ast::Relation,
+            ) -> (
+                &ast::Table,
+                Option<(&ast::Ident, &Option<Vec<ast::Ident>>, Span)>,
+            ) {
+                match relation {
+                    ast::Relation::Table(table) => (table, None),
+                    ast::Relation::Aliased(alias) => {
+                        let ast::Relation::Table(table) = alias.relation.as_ref() else {
+                            panic!("base table")
+                        };
+                        (table, Some((&alias.alias, &alias.column_names, alias.span)))
+                    }
+                    _ => panic!("base table"),
+                }
+            }
+            let (table, alias) = base(select.from.as_ref().unwrap());
+            let (original_table, original_alias) = base(source_select.from.as_ref().unwrap());
+            assert_eq!(table.name, original_table.name);
             assert_eq!(alias, original_alias);
-            assert_eq!(version.kind, ast::TableVersionKind::ForVersionAsOf);
+            let version = table.query_period.as_ref().expect("pinned query period");
+            assert_eq!(version.range_type, ast::QueryPeriodRangeType::Version);
             assert!(
-                version
-                    .value
+                crate::analyzer::iceberg_ref::query_period_end(version)
+                    .unwrap()
                     .syntax_eq(&build::integer(if index == 0 { 11 } else { 22 }))
             );
             let ast::SelectItem::ExprWithAlias { expr, alias, .. } =

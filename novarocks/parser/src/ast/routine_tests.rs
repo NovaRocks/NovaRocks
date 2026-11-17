@@ -761,7 +761,7 @@ fn query_with_functions(functions: Vec<FunctionSpecification>) -> crate::ast::Qu
     let crate::ast::Statement::Query(mut query) = statements.remove(0) else {
         panic!("query");
     };
-    query.functions = functions;
+    query.functions = functions.into();
     query
 }
 

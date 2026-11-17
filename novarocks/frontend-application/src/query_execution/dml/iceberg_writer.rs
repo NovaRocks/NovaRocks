@@ -554,20 +554,19 @@ fn wrap_insert_query_with_write_projection(
             .map(String::as_str)
             .collect::<Vec<_>>()
     };
-    let wrapped = build::query(ast::SetExpr::Select(Box::new(
+    let alias_source_columns = alias_source_columns
+        .into_iter()
+        .map(|name| build::ident(name, true))
+        .collect::<Vec<_>>();
+    let alias_source_columns = (!alias_source_columns.is_empty()).then_some(alias_source_columns);
+    let wrapped = build::query(ast::SetExpr::Select(novarocks_parser::ast::AstBox::new(
         build::select(
             projection,
-            vec![build::relation(build::derived(
-                query.clone(),
-                Some(build::alias(
-                    build::ident(source_alias, true),
-                    alias_source_columns
-                        .into_iter()
-                        .map(|name| build::ident(name, true))
-                        .collect(),
-                    true,
-                )),
-            ))],
+            Some(build::alias(
+                build::derived(query.clone()),
+                build::ident(source_alias, true),
+                alias_source_columns,
+            )),
             None,
             None,
         )
@@ -590,7 +589,10 @@ fn insert_source_expression_span(query: &Query, ordinal: usize) -> novarocks_par
                     _ => SYNTHETIC,
                 })
         }
-        ast::SetExpr::Query(query) => insert_source_expression_span(query, ordinal),
+        ast::SetExpr::Query(subquery) => {
+            let query = &subquery.query;
+            insert_source_expression_span(query, ordinal)
+        }
         _ => SYNTHETIC,
     }
 }
@@ -1246,9 +1248,13 @@ mod tests {
         let ast::SetExpr::Select(outer) = query.body.as_ref() else {
             panic!("outer SELECT");
         };
-        let ast::TableFactor::Derived { subquery, .. } = &outer.from[0].relation else {
+        let Some(ast::Relation::Aliased(alias)) = &outer.from else {
+            panic!("source alias");
+        };
+        let ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
             panic!("derived source");
         };
+        let subquery = &node.query;
         assert_eq!(
             subquery.as_ref(),
             &source,
@@ -1355,9 +1361,13 @@ mod tests {
                 7
             )])
         );
-        let ast::TableFactor::Derived { subquery, .. } = &select.from[0].relation else {
+        let Some(ast::Relation::Aliased(alias)) = &select.from else {
+            panic!("source alias");
+        };
+        let ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
             panic!("source query");
         };
+        let subquery = &node.query;
         assert_eq!(subquery.as_ref(), &source);
     }
 }

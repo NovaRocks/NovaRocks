@@ -8,17 +8,21 @@
 
 use crate::{
     Span,
-    ast::{AstVec, Expr, Ident, relation::TableWithJoins, window::WindowDefinition},
+    ast::{
+        AstBox, AstVec, Expr, Ident,
+        relation::{Relation, Table, TableSubquery},
+        window::WindowDefinition,
+    },
 };
 
 /// One top-level query expression and its query-level modifiers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Query {
     /// Overrides belonging to the root query, before its CTEs and body.
-    pub session_properties: Vec<SessionProperty>,
-    pub functions: Vec<super::FunctionSpecification>,
+    pub session_properties: AstVec<SessionProperty>,
+    pub functions: AstVec<super::FunctionSpecification>,
     pub with: Option<With>,
-    pub body: Box<SetExpr>,
+    pub body: AstBox<SetExpr>,
     pub modifiers: QueryModifiers,
     pub span: Span,
 }
@@ -75,31 +79,33 @@ pub enum ExplainFormat {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct With {
     pub recursive: bool,
-    pub ctes: Vec<Cte>,
+    pub ctes: AstVec<Cte>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cte {
     pub name: Ident,
-    pub columns: Vec<Ident>,
-    pub query: Box<Query>,
+    pub columns: Option<Vec<Ident>>,
+    pub query: AstBox<Query>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SetExpr {
-    Select(Box<Select>),
+    Select(AstBox<Select>),
     Values(Values),
-    Query(Box<Query>),
+    Table(AstBox<Table>),
+    Query(AstBox<TableSubquery>),
     SetOperation(SetOperation),
 }
 
 impl SetExpr {
-    pub const fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         match self {
             Self::Select(select) => select.span,
             Self::Values(values) => values.span,
+            Self::Table(table) => table.span,
             Self::Query(query) => query.span,
             Self::SetOperation(operation) => operation.span,
         }
@@ -139,7 +145,7 @@ pub struct Values {
 pub struct Select {
     pub quantifier: SelectQuantifier,
     pub projection: Vec<SelectItem>,
-    pub from: Vec<TableWithJoins>,
+    pub from: Option<Relation>,
     pub selection: Option<Expr>,
     pub group_by: Option<GroupBy>,
     pub having: Option<Expr>,
@@ -284,7 +290,7 @@ pub enum QueryLimit {
     FetchFirst(FetchFirst),
 }
 impl QueryLimit {
-    pub const fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         match self {
             Self::Limit(node) => node.span,
             Self::FetchFirst(node) => node.span,
@@ -308,17 +314,17 @@ pub struct FetchFirst {
     pub span: Span,
 }
 impl Limit {
-    pub const fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         self.span
     }
 }
 impl Offset {
-    pub const fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         self.span
     }
 }
 impl FetchFirst {
-    pub const fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         self.span
     }
 }

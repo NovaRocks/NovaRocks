@@ -994,73 +994,8 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
 }
 
 fn format_subquery_display_name(query: &ast::Query) -> String {
-    let mut query = query.clone();
-    mark_query_aliases_explicit(&mut query);
-    printer::print_query(&query)
-}
-
-fn mark_query_aliases_explicit(query: &mut ast::Query) {
-    if let Some(with) = &mut query.with {
-        for cte in &mut with.ctes {
-            mark_query_aliases_explicit(&mut cte.query);
-        }
-    }
-    mark_set_expr_aliases_explicit(&mut query.body);
-}
-
-fn mark_set_expr_aliases_explicit(set_expr: &mut ast::SetExpr) {
-    match set_expr {
-        ast::SetExpr::Select(select) => {
-            for table_with_joins in &mut select.from {
-                mark_table_with_joins_aliases_explicit(table_with_joins);
-            }
-        }
-        ast::SetExpr::Query(query) => mark_query_aliases_explicit(query),
-        ast::SetExpr::SetOperation(operation) => {
-            for input in &mut operation.inputs {
-                mark_set_expr_aliases_explicit(input);
-            }
-        }
-        ast::SetExpr::Values(_) => {}
-    }
-}
-
-fn mark_table_with_joins_aliases_explicit(table_with_joins: &mut ast::TableWithJoins) {
-    mark_table_factor_aliases_explicit(&mut table_with_joins.relation);
-    for join in &mut table_with_joins.joins {
-        mark_table_factor_aliases_explicit(&mut join.relation);
-    }
-}
-
-fn mark_table_factor_aliases_explicit(factor: &mut ast::TableFactor) {
-    match factor {
-        ast::TableFactor::JsonTable { alias, .. }
-        | ast::TableFactor::Table { alias, .. }
-        | ast::TableFactor::TableFunction { alias, .. }
-        | ast::TableFactor::Unnest { alias, .. } => {
-            if let Some(alias) = alias {
-                alias.explicit_as = true;
-            }
-        }
-        ast::TableFactor::Derived {
-            subquery, alias, ..
-        } => {
-            if let Some(alias) = alias {
-                alias.explicit_as = true;
-            }
-            mark_query_aliases_explicit(subquery);
-        }
-        ast::TableFactor::NestedJoin {
-            table_with_joins,
-            alias,
-            ..
-        } => {
-            if let Some(alias) = alias {
-                alias.explicit_as = true;
-            }
-            mark_table_with_joins_aliases_explicit(table_with_joins);
-        }
-    }
+    // AliasedRelation prints the canonical AS form directly.
+    printer::print_query(query)
 }
 
 fn pure_identifier_chain(expr: &ast::Expr) -> Option<ast::IdentifierChain<'_>> {

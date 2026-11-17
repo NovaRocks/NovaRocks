@@ -1544,7 +1544,7 @@ impl<'a> super::AnalyzerContext<'a> {
         self.collected_subqueries.borrow_mut().push(SubqueryInfo {
             id,
             kind: kind.clone(),
-            subquery: Box::new(query.clone()),
+            subquery: ast::AstBox::new(query.clone()),
             data_type: DataType::Boolean,
             in_expr: Some(Box::new(value.clone())),
         });

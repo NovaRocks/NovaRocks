@@ -172,7 +172,10 @@ fn body_has_distinct_set(body: &ast::SetExpr) -> bool {
                 || operation.corresponding.is_some()
                 || operation.inputs.iter().any(body_has_distinct_set)
         }
-        ast::SetExpr::Query(query) => body_has_distinct_set(&query.body),
+        ast::SetExpr::Query(subquery) => {
+            let query = &subquery.query;
+            body_has_distinct_set(&query.body)
+        }
         _ => false,
     }
 }
@@ -218,6 +221,9 @@ fn shape_body(
     constants: &mut ConstantSource<'_>,
 ) -> Result<(), String> {
     match body {
+        ast::SetExpr::Table(_) => {
+            return Err("INSERT literal source does not support TABLE query bodies".to_string());
+        }
         ast::SetExpr::Values(values) => {
             for (row_index, row) in values.rows.iter_mut().enumerate() {
                 let (syntax, authored) = shape_row_in(
@@ -260,30 +266,44 @@ fn shape_body(
             // filters and DISTINCT observe source types before sink conversion.
             // Each leaf's target projection still precedes UNION common typing.
             let inner = build::query(ast::SetExpr::Select(select.clone()));
-            let query = build::query(ast::SetExpr::Select(Box::new(
+            let query = build::query(ast::SetExpr::Select(novarocks_parser::ast::AstBox::new(
                 build::select(
                     expressions
                         .into_iter()
                         .map(|expr| build::item(expr, None, false))
                         .collect(),
-                    vec![build::relation(build::derived(
-                        inner,
-                        Some(build::alias(
-                            build::ident("__nr_insert_literal_src", false),
-                            Vec::new(),
-                            true,
-                        )),
-                    ))],
+                    Some(build::alias(
+                        build::derived(inner),
+                        build::ident("__nr_insert_literal_src", false),
+                        None,
+                    )),
                     None,
                     None,
                 )
                 .map_err(|error| error.to_string())?,
             )));
-            *body = ast::SetExpr::Query(Box::new(query));
+            *body = ast::SetExpr::Query(ast::AstBox::new(ast::TableSubquery {
+                span: query.span,
+                query: ast::AstBox::new(query),
+            }));
             // Bind constants in the final target wrapper. Its original inner
             // SELECT and the published path remain attached to the same tree.
             constants.push(novarocks_sql::compiler::SqlConstantQueryStep::NestedQuery);
             if let Some(authored) = authored.as_ref() {
+                let ast::SetExpr::Query(wrapper) = body else {
+                    unreachable!("published target wrapper")
+                };
+                let ast::SetExpr::Select(wrapper) = wrapper.query.body.as_ref() else {
+                    unreachable!("published target SELECT")
+                };
+                let relation_path = wrapper
+                    .from
+                    .as_ref()
+                    .and_then(derived_source)
+                    .map(|(_, _, path)| path)
+                    .ok_or_else(|| {
+                        "INSERT literal source lost its actual derived wrapper".to_string()
+                    })?;
                 for (column, value) in authored.iter().enumerate() {
                     let (Some(value), Some(source_column)) = (value, mapping[column]) else {
                         continue;
@@ -298,7 +318,7 @@ fn shape_body(
                     let mut path = constants.path.clone();
                     path.push(
                         novarocks_sql::compiler::SqlConstantQueryStep::SelectFromDerived {
-                            from: 0,
+                            relation_path: relation_path.clone(),
                         },
                     );
                     constants.constants.push(
@@ -318,7 +338,8 @@ fn shape_body(
             });
             constants.pop();
         }
-        ast::SetExpr::Query(query) => {
+        ast::SetExpr::Query(subquery) => {
+            let query = &mut subquery.query;
             constants.push(novarocks_sql::compiler::SqlConstantQueryStep::NestedQuery);
             shape_body(&mut query.body, mapping, width, columns, constants)?;
             constants.pop();
@@ -953,21 +974,11 @@ pub(crate) fn attach_write_literal_contexts(
         assignments
     };
 
-    let [from] = select.from.as_slice() else {
-        return Ok(assignments);
-    };
-    if !from.joins.is_empty() {
-        return Ok(assignments);
-    }
-    let ast::TableFactor::Derived {
-        subquery,
-        alias: Some(alias),
-        ..
-    } = &from.relation
+    let Some((subquery, alias, relation_path)) = select.from.as_ref().and_then(derived_source)
     else {
         return Ok(assignments);
     };
-    if alias.name.value != "__nr_insert_src" {
+    if alias.alias.value != "__nr_insert_src" {
         return Ok(assignments);
     }
     let mut contexts = Vec::new();
@@ -989,11 +1000,13 @@ pub(crate) fn attach_write_literal_contexts(
         }
         let qualifier = chain.first();
         let name = chain.last();
-        if qualifier.value != alias.name.value {
+        if qualifier.value != alias.alias.value {
             continue;
         }
         let ordinal = alias
-            .columns
+            .column_names
+            .as_deref()
+            .unwrap_or(&[])
             .iter()
             .position(|column| column.value == name.value)
             .ok_or_else(|| {
@@ -1001,7 +1014,9 @@ pub(crate) fn attach_write_literal_contexts(
                     "INSERT source reference lost its original alias ordinal".into(),
                 )
             })?;
-        let mut path = vec![SqlConstantQueryStep::SelectFromDerived { from: 0 }];
+        let mut path = vec![SqlConstantQueryStep::SelectFromDerived {
+            relation_path: relation_path.clone(),
+        }];
         append_write_literal_sites(
             &subquery.body,
             ordinal,
@@ -1026,6 +1041,29 @@ pub(crate) fn attach_write_literal_contexts(
 }
 /// Keep early assignment within the original literal INSERT sources. Source
 /// controls retain their independent inference above this boundary.
+/// Observe only the original single derived-source profile and its actual wrapper path.
+fn derived_source(
+    relation: &ast::Relation,
+) -> Option<(
+    &ast::Query,
+    &ast::AliasedRelation,
+    Vec<novarocks_sql::compiler::SqlRelationStep>,
+)> {
+    let ast::Relation::Aliased(alias) = relation else {
+        return None;
+    };
+    let query = match alias.relation.as_ref() {
+        ast::Relation::TableSubquery(node) => &node.query,
+        ast::Relation::Lateral(node) => &node.query,
+        _ => return None,
+    };
+    Some((
+        query,
+        alias,
+        vec![novarocks_sql::compiler::SqlRelationStep::Aliased],
+    ))
+}
+
 fn source_assignment_before_common_type(query: &ast::Query) -> bool {
     if !query.functions.is_empty()
         || query.with.is_some()
@@ -1037,10 +1075,11 @@ fn source_assignment_before_common_type(query: &ast::Query) -> bool {
     }
     fn eligible(body: &ast::SetExpr) -> bool {
         match body {
+            ast::SetExpr::Table(_) => false,
             ast::SetExpr::Values(_) => true,
             ast::SetExpr::Select(select) => {
                 select.modifiers.is_empty()
-                    && select.from.is_empty()
+                    && select.from.is_none()
                     && !matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. })
                     && select.selection.is_none()
                     && select.group_by.is_none()
@@ -1055,7 +1094,10 @@ fn source_assignment_before_common_type(query: &ast::Query) -> bool {
                         _ => false,
                     })
             }
-            ast::SetExpr::Query(query) => source_assignment_before_common_type(query),
+            ast::SetExpr::Query(subquery) => {
+                let query = &subquery.query;
+                source_assignment_before_common_type(query)
+            }
             ast::SetExpr::SetOperation(operation) => {
                 matches!(operation.operator, ast::SetOperator::Union)
                     && !operation.distinct
@@ -1082,6 +1124,11 @@ fn append_write_literal_sites(
     use novarocks_type_contract::PureCompileControl;
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
     match body {
+        ast::SetExpr::Table(_) => {
+            return Err(novarocks_sql::compiler::SqlCompileError::InvalidRequest(
+                "TABLE query bodies are not literal write sources".into(),
+            ));
+        }
         ast::SetExpr::Values(values) => {
             for (row, values) in values.rows.iter().enumerate() {
                 if source_ordinal >= values.len() {
@@ -1124,7 +1171,8 @@ fn append_write_literal_sites(
                 });
             }
         }
-        ast::SetExpr::Query(query) => {
+        ast::SetExpr::Query(subquery) => {
+            let query = &subquery.query;
             path.push(Step::NestedQuery);
             append_write_literal_sites(
                 &query.body,
@@ -1175,18 +1223,26 @@ pub(crate) fn capture_typed_write_constants(
         path: Vec::new(),
         constants: Vec::new(),
     };
+    let mut captured_derived = false;
     if let ast::SetExpr::Select(select) = query.body.as_mut()
-        && select.from.len() == 1
-        && let ast::TableFactor::Derived {
-            subquery,
-            alias: Some(alias),
-            ..
-        } = &mut select.from[0].relation
-        && alias.name.value == "__nr_insert_src"
+        && let Some(ast::Relation::Aliased(alias)) = select.from.as_mut()
+        && alias.alias.value == "__nr_insert_src"
     {
-        source.path.push(Step::SelectFromDerived { from: 0 });
-        capture_typed_write_body(&mut subquery.body, &mapping, write_columns, &mut source)?;
-    } else {
+        let subquery = match alias.relation.as_mut() {
+            ast::Relation::TableSubquery(node) => Some(&mut node.query),
+            ast::Relation::Lateral(node) => Some(&mut node.query),
+            _ => None,
+        };
+        if let Some(subquery) = subquery {
+            source.path.push(Step::SelectFromDerived {
+                relation_path: vec![novarocks_sql::compiler::SqlRelationStep::Aliased],
+            });
+            capture_typed_write_body(&mut subquery.body, &mapping, write_columns, &mut source)?;
+            source.pop();
+            captured_derived = true;
+        }
+    }
+    if !captured_derived {
         capture_typed_write_body(&mut query.body, &mapping, write_columns, &mut source)?;
     }
     Ok((!source.constants.is_empty()).then(|| source.constants.into()))
@@ -1229,6 +1285,7 @@ fn capture_typed_write_body(
             Ok(())
         };
     match body {
+        ast::SetExpr::Table(_) => {}
         ast::SetExpr::Values(values) => {
             for (row_index, row) in values.rows.iter_mut().enumerate() {
                 for (target, source_index) in columns.iter().zip(mapping) {
@@ -1273,7 +1330,8 @@ fn capture_typed_write_body(
                 }
             }
         }
-        ast::SetExpr::Query(query) => {
+        ast::SetExpr::Query(subquery) => {
+            let query = &mut subquery.query;
             source.push(Step::NestedQuery);
             capture_typed_write_body(&mut query.body, mapping, columns, source)?;
             source.pop();

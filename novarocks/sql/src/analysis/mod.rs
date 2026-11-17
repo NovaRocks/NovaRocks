@@ -824,7 +824,7 @@ pub(crate) struct ApplyPredicateSpec {
 pub(crate) struct SubqueryInfo {
     pub id: usize,
     pub kind: SubqueryKind,
-    pub subquery: Box<SqlQuery>,
+    pub subquery: novarocks_parser::ast::AstBox<SqlQuery>,
     /// The resolved data type of the subquery result (scalar).
     #[allow(dead_code)]
     pub data_type: DataType,

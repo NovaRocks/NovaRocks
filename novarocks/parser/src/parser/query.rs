@@ -19,13 +19,16 @@
 
 use crate::{
     Span, Token, TokenKind,
+    ast::legacy::JoinOperator,
     ast::{
-        AllRows, Cte, ExplainFormat, ExplainQuery, Expr, FetchFirst, GroupBy, GroupingElement,
-        GroupingSets, GroupingSetsKind, Ident, Join, JoinConstraint, JoinOperator, Limit, Literal,
-        LiteralKind, NullOrdering, Offset, OrderBy, Query, QueryLimit, Select, SelectItem,
-        SelectQuantifier, SetExpr, SetOperator, SimpleGroupBy, SortItem, SortOrdering, Statement,
-        TableFactor, TableVersion, TableVersionKind, TableWithJoins, Values, WildcardOptions,
-        WindowDefinition, With,
+        AliasedRelation, AllRows, AstBox, AstVec, Cte, ExplainFormat, ExplainQuery, Expr,
+        FetchFirst, GroupBy, GroupingElement, GroupingSets, GroupingSetsKind, Ident, Join,
+        JoinCriteria, JoinOn, JoinType, JoinUsing, Lateral, Limit, Literal, LiteralKind,
+        NaturalJoin, NullOrdering, Offset, OrderBy, Query, QueryLimit, QueryPeriod,
+        QueryPeriodRangeType, Relation, Select, SelectItem, SelectQuantifier, SetExpr, SetOperator,
+        SimpleGroupBy, SortItem, SortOrdering, Statement, Table, TableFunctionArgument,
+        TableFunctionArgumentValue, TableFunctionInvocation, TableSubquery, Unnest, Values,
+        WildcardOptions, WindowDefinition, With,
     },
     lex,
     token::{Keyword, Symbol},
@@ -221,11 +224,11 @@ pub(super) fn parse_query(
         modifiers
     };
     Ok(Query {
-        session_properties,
-        functions: Vec::new(),
-        with,
-        body: Box::new(body),
-        modifiers,
+        session_properties: session_properties,
+        functions: AstVec::new(),
+        with: with,
+        body: AstBox::new(body),
+        modifiers: modifiers,
         span: Span::new(start, end),
     })
 }
@@ -309,15 +312,17 @@ fn parse_with(
     loop {
         let name = parser.parse_ident()?;
         let cte_start = name.span.start();
-        let mut columns = Vec::new();
+        let mut columns = None;
         if parser.consume_if_symbol(Symbol::LParen) {
+            let mut names = Vec::new();
             loop {
-                columns.push(parser.parse_ident()?);
+                names.push(parser.parse_ident()?);
                 if !parser.consume_if_symbol(Symbol::Comma) {
                     break;
                 }
             }
             parser.consume_symbol(Symbol::RParen)?;
+            columns = Some(names);
         }
         parser.consume_word("AS")?;
         parser.consume_symbol(Symbol::LParen)?;
@@ -325,9 +330,9 @@ fn parse_with(
         query.session_properties.clear();
         let end = parser.consume_symbol(Symbol::RParen)?.end();
         ctes.push(Cte {
-            name,
-            columns,
-            query: Box::new(query),
+            name: name,
+            columns: columns,
+            query: AstBox::new(query),
             span: Span::new(cte_start, end),
         });
         if !parser.consume_if_symbol(Symbol::Comma) {
@@ -336,31 +341,37 @@ fn parse_with(
     }
     let end = ctes.last().map_or(start, |cte| cte.span.end());
     Ok(With {
-        recursive,
-        ctes,
+        recursive: recursive,
+        ctes: ctes.into(),
         span: Span::new(start, end),
     })
 }
 
 fn parse_set_expr(
     parser: &mut StatementParser<'_, '_>,
-) -> Result<(SetExpr, Vec<crate::ast::SessionProperty>), crate::ParseError> {
+) -> Result<(SetExpr, AstVec<crate::ast::SessionProperty>), crate::ParseError> {
     if parser.current_is_keyword(Keyword::Select) {
         let (select, hints) = parse_select(parser)?;
         return Ok((
-            SetExpr::Select(Box::new(select)),
-            legacy_session_properties(&hints),
+            SetExpr::Select(AstBox::new(select)),
+            legacy_session_properties(&hints).into(),
         ));
     }
     if parser.current_is_keyword(Keyword::Values) {
-        return Ok((SetExpr::Values(parse_values(parser)?), Vec::new()));
+        return Ok((SetExpr::Values(parse_values(parser)?), AstVec::new()));
     }
     if parser.current_is_symbol(Symbol::LParen) {
-        parser.consume_symbol(Symbol::LParen)?;
+        let start = parser.consume_symbol(Symbol::LParen)?.start();
         let mut query = parse_query(parser)?;
         let properties = std::mem::take(&mut query.session_properties);
-        parser.consume_symbol(Symbol::RParen)?;
-        return Ok((SetExpr::Query(Box::new(query)), properties));
+        let end = parser.consume_symbol(Symbol::RParen)?.end();
+        return Ok((
+            SetExpr::Query(AstBox::new(TableSubquery {
+                query: AstBox::new(query),
+                span: Span::new(start, end),
+            })),
+            properties,
+        ));
     }
     Err(parser.unexpected("SELECT, VALUES, or parenthesized query"))
 }
@@ -395,9 +406,9 @@ fn parse_select(
     };
     let projection = parse_projection(parser)?;
     let from = if parser.consume_if_word("FROM") {
-        parse_from(parser)?
+        Some(parse_from(parser)?)
     } else {
-        Vec::new()
+        None
     };
     let selection = if parser.consume_if_word("WHERE") {
         Some(parse_expression_until(
@@ -445,9 +456,9 @@ fn parse_select(
             || {
                 windows.last().map_or_else(
                     || {
-                        from.last().map_or_else(
+                        from.as_ref().map_or_else(
                             || projection.last().map_or(start, |item| item.span().end()),
-                            |relation| relation.span.end(),
+                            |relation| relation.span().end(),
                         )
                     },
                     |window| window.span.end(),
@@ -457,13 +468,13 @@ fn parse_select(
         );
     Ok((
         Select {
-            quantifier,
-            projection,
-            from,
-            selection,
-            group_by,
-            having,
-            qualify,
+            quantifier: quantifier,
+            projection: projection,
+            from: from,
+            selection: selection,
+            group_by: group_by,
+            having: having,
+            qualify: qualify,
             windows: windows.into(),
             modifiers: Default::default(),
             span: Span::new(start, end),
@@ -784,16 +795,11 @@ fn parse_projection_expression(
     Ok((expression, Some(alias)))
 }
 
-fn parse_from(
-    parser: &mut StatementParser<'_, '_>,
-) -> Result<Vec<TableWithJoins>, crate::ParseError> {
-    let mut relations = Vec::new();
+fn parse_from(parser: &mut StatementParser<'_, '_>) -> Result<Relation, crate::ParseError> {
+    let mut result = None;
     loop {
-        let relation = parse_table_factor(parser)?;
-        let start = relation.span().start();
-        let mut joins = Vec::new();
+        let mut left = parse_table_factor(parser)?;
         loop {
-            let join_start = parser.current_span().start();
             let natural = if parser.current_is_keyword(Keyword::Natural) {
                 Some(parser.consume_word("NATURAL")?)
             } else {
@@ -805,62 +811,96 @@ fn parse_from(
                 }
                 break;
             };
-            let relation = parse_table_factor(parser)?;
-            let constraint = if let Some(span) = natural {
-                JoinConstraint::Natural(span)
+            let right = parse_table_factor(parser)?;
+            let criteria = if let Some(span) = natural {
+                Some(JoinCriteria::Natural(NaturalJoin { span }))
             } else if parser.consume_if_word("ON") {
-                JoinConstraint::On(parse_expression_until(
+                let expression = parse_expression_until(
                     parser,
                     join_or_query_clause_words(),
                     &[Symbol::Comma, Symbol::Semicolon, Symbol::RParen],
-                )?)
+                )?;
+                let span = expression.span();
+                Some(JoinCriteria::On(JoinOn { expression, span }))
             } else if parser.consume_if_word("USING") {
-                let using_start = parser.consume_symbol(Symbol::LParen)?.start();
+                let start = parser.consume_symbol(Symbol::LParen)?.start();
                 let mut columns = vec![parser.parse_ident()?];
                 while parser.consume_if_symbol(Symbol::Comma) {
                     columns.push(parser.parse_ident()?);
                 }
                 let end = parser.consume_symbol(Symbol::RParen)?.end();
-                JoinConstraint::Using {
+                Some(JoinCriteria::Using(JoinUsing {
                     columns,
-                    span: Span::new(using_start, end),
-                }
+                    span: Span::new(start, end),
+                }))
             } else {
-                JoinConstraint::None
+                None
             };
-            let end = match &constraint {
-                JoinConstraint::On(expr) => expr.span().end(),
-                JoinConstraint::Using { span, .. } | JoinConstraint::Natural(span) => span.end(),
-                JoinConstraint::None => relation.span().end(),
+            let kind = match operator {
+                JoinOperator::Cross if criteria.is_none() => JoinType::Cross,
+                JoinOperator::Inner | JoinOperator::InnerExplicit if criteria.is_some() => {
+                    JoinType::Inner
+                }
+                JoinOperator::LeftOuter | JoinOperator::LeftOuterExplicit if criteria.is_some() => {
+                    JoinType::Left
+                }
+                JoinOperator::RightOuter | JoinOperator::RightOuterExplicit
+                    if criteria.is_some() =>
+                {
+                    JoinType::Right
+                }
+                JoinOperator::FullOuter | JoinOperator::FullOuterExplicit if criteria.is_some() => {
+                    JoinType::Full
+                }
+                other => JoinType::Legacy(other),
             };
-            joins.push(Join {
-                relation,
-                operator,
-                constraint,
-                span: Span::new(join_start, end),
-            });
+            let end = criteria
+                .as_ref()
+                .map_or(right.span().end(), |criteria| match criteria {
+                    JoinCriteria::On(n) => n.span.end(),
+                    JoinCriteria::Using(n) => n.span.end(),
+                    JoinCriteria::Natural(_) => right.span().end(),
+                });
+            let span = Span::new(left.span().start(), end);
+            left = Relation::Join(AstBox::new(Join {
+                left: AstBox::new(left),
+                right: AstBox::new(right),
+                kind,
+                criteria,
+                span,
+            }));
         }
-        let end = joins
-            .last()
-            .map_or_else(|| relation.span().end(), |join| join.span.end());
-        relations.push(TableWithJoins {
-            relation,
-            joins,
-            span: Span::new(start, end),
+        result = Some(match result {
+            None => left,
+            Some(previous) => crate::build::join(previous, JoinType::Implicit, left, None),
         });
         if !parser.consume_if_symbol(Symbol::Comma) {
             break;
         }
     }
-    Ok(relations)
+    Ok(result.expect("FROM parses at least one relation"))
 }
 
-fn parse_table_factor(
+fn finish_relation(
     parser: &mut StatementParser<'_, '_>,
-) -> Result<TableFactor, crate::ParseError> {
+    relation: Relation,
+) -> Result<Relation, crate::ParseError> {
+    let Some(alias) = parse_optional_table_alias(parser)? else {
+        return Ok(relation);
+    };
+    let span = Span::new(relation.span().start(), alias.span.end());
+    Ok(Relation::Aliased(AstBox::new(AliasedRelation {
+        relation: AstBox::new(relation),
+        alias: alias.name,
+        column_names: alias.columns,
+        span,
+    })))
+}
+
+fn parse_table_factor(parser: &mut StatementParser<'_, '_>) -> Result<Relation, crate::ParseError> {
+    let start = parser.current_span().start();
     let lateral = parser.consume_if_word("LATERAL");
-    if parser.current_is_symbol(Symbol::LParen) {
-        let start = parser.consume_symbol(Symbol::LParen)?.start();
+    if parser.consume_if_symbol(Symbol::LParen) {
         if !(parser.current_is_keyword(Keyword::Select)
             || parser.current_is_keyword(Keyword::Values)
             || parser.current_is_keyword(Keyword::With)
@@ -868,25 +908,29 @@ fn parse_table_factor(
         {
             return Err(parser.unexpected("query after '(' in FROM"));
         }
-        let mut subquery = parse_query(parser)?;
-        subquery.session_properties.clear();
+        let mut query = parse_query(parser)?;
+        query.session_properties.clear();
         let end = parser.consume_symbol(Symbol::RParen)?.end();
-        let alias = parse_optional_table_alias(parser)?;
-        let span_end = alias.as_ref().map_or(end, |alias| alias.span.end());
-        return Ok(TableFactor::Derived {
-            lateral,
-            subquery: Box::new(subquery),
-            alias,
-            span: Span::new(start, span_end),
-        });
+        let span = Span::new(start, end);
+        let relation = if lateral {
+            Relation::Lateral(AstBox::new(Lateral {
+                query: AstBox::new(query),
+                span,
+            }))
+        } else {
+            Relation::TableSubquery(AstBox::new(TableSubquery {
+                query: AstBox::new(query),
+                span,
+            }))
+        };
+        return finish_relation(parser, relation);
     }
     if parser.current_is_keyword(Keyword::Unnest) {
-        let keyword_span = parser.consume_word("UNNEST")?;
-        let start = keyword_span.start();
+        parser.consume_word("UNNEST")?;
         parser.consume_symbol(Symbol::LParen)?;
-        let mut array_exprs = Vec::new();
+        let mut expressions = Vec::new();
         loop {
-            array_exprs.push(parse_expression_until(
+            expressions.push(parse_expression_until(
                 parser,
                 &[],
                 &[Symbol::Comma, Symbol::RParen],
@@ -896,114 +940,113 @@ fn parse_table_factor(
             }
         }
         let end = parser.consume_symbol(Symbol::RParen)?.end();
-        let alias = parse_optional_table_alias(parser)?;
-        let span_end = alias.as_ref().map_or(end, |alias| alias.span.end());
-        return Ok(TableFactor::Unnest {
-            keyword: crate::ast::Ident {
-                value: parser.source_slice(keyword_span).to_owned(),
-                quoted: false,
-                span: keyword_span,
-            },
-            lateral,
-            array_exprs,
-            with_offset: false,
-            alias,
-            span: Span::new(start, span_end),
-        });
+        return finish_relation(
+            parser,
+            Relation::Unnest(AstBox::new(Unnest {
+                expressions: expressions.into(),
+                with_ordinality: false,
+                span: Span::new(start, end),
+            })),
+        );
     }
     if parser.current_is_word("TABLE") {
-        let start = parser.consume_word("TABLE")?.start();
+        parser.consume_word("TABLE")?;
         parser.consume_symbol(Symbol::LParen)?;
         let expr = parse_table_function_expression_until(parser, &[], &[Symbol::RParen])?;
         let end = parser.consume_symbol(Symbol::RParen)?.end();
-        let alias = parse_optional_table_alias(parser)?;
-        let span_end = alias.as_ref().map_or(end, |alias| alias.span.end());
-        return Ok(TableFactor::TableFunction {
-            lateral,
-            syntax: crate::ast::TableFunctionSyntax::TableWrapper,
+        let relation = old_table_function(
             expr,
-            alias,
-            span: Span::new(start, span_end),
-        });
+            lateral,
+            crate::ast::legacy::TableFunctionSyntax::TableWrapper,
+            Span::new(start, end),
+        );
+        return finish_relation(parser, relation);
     }
     let function_start = parser.position;
     let name = parser.parse_object_name()?;
-    let start = name.span.start();
     if parser.current_is_symbol(Symbol::LParen) {
         let end = table_function_end(parser)?;
         let expr = parse_table_function_expression_range(parser, function_start, end)?;
+        let span = Span::new(start, expr.span().end());
         parser.position = end;
         parser.skip_trivia();
-        let alias = parse_optional_table_alias(parser)?;
-        let span_end = alias
-            .as_ref()
-            .map_or(expr.span().end(), |alias| alias.span.end());
-        return Ok(TableFactor::TableFunction {
-            lateral,
-            syntax: crate::ast::TableFunctionSyntax::BareCall,
+        let relation = old_table_function(
             expr,
-            alias,
-            span: Span::new(start, span_end),
-        });
+            lateral,
+            crate::ast::legacy::TableFunctionSyntax::BareCall,
+            span,
+        );
+        return finish_relation(parser, relation);
     }
-    let (name, metadata) = split_metadata_table_suffix(name);
-    let version = parse_table_version(parser)?;
-    let relation_end = version.as_ref().map_or_else(
-        || {
-            metadata
-                .as_ref()
-                .map_or(name.span.end(), |metadata| metadata.span.end())
-        },
-        |version| version.span.end(),
-    );
-    let alias = parse_optional_table_alias(parser)?;
-    let end = alias
+    let query_period = parse_table_version(parser)?;
+    let end = query_period
         .as_ref()
-        .map_or(relation_end, |alias| alias.span.end());
-    Ok(TableFactor::Table {
-        name,
-        metadata,
-        alias,
-        version,
-        span: Span::new(start, end),
-    })
+        .map_or(name.span.end(), |period| period.span.end());
+    // Keep the actual whole qualified-name token, including its quote facts.
+    finish_relation(
+        parser,
+        Relation::Table(AstBox::new(Table {
+            name,
+            query_period,
+            branch: None,
+            span: Span::new(start, end),
+        })),
+    )
 }
 
-/// Splits the final unquoted object-name part at its first `$` into the base
-/// table name and a parser-owned metadata suffix. The split deliberately
-/// accepts every non-empty suffix; catalog/provider capability is an analyze
-/// or admission concern, not a grammar restriction.
-fn split_metadata_table_suffix(
-    mut name: crate::ast::ObjectName,
-) -> (crate::ast::ObjectName, Option<crate::ast::Ident>) {
-    let Some(last) = name.parts.last_mut() else {
-        return (name, None);
+fn old_table_function(
+    expr: Expr,
+    lateral: bool,
+    syntax: crate::ast::legacy::TableFunctionSyntax,
+    span: Span,
+) -> Relation {
+    let plain=match &expr {
+        Expr::FunctionCall(call)=>!call.distinct && call.order_by.is_none() && call.filter.is_none()
+            && call.window.is_none() && call.null_treatment.is_none() && call.processing_mode.is_none()
+            && call.arguments.iter().all(|arg|!matches!(&arg.value,Expr::Binary(binary) if binary.operator==crate::ast::BinaryOperator::NamedArgument && !matches!(binary.left.as_ref(),Expr::Identifier(_)))),
+        _=>false,
     };
-    if last.quoted {
-        return (name, None);
+    if !plain {
+        return Relation::LegacyTableFunction(AstBox::new(crate::ast::legacy::TableFunction {
+            expr,
+            lateral,
+            syntax,
+            span,
+        }));
     }
-    let Some((base, metadata_type)) = last.value.split_once('$') else {
-        return (name, None);
+    let Expr::FunctionCall(call) = expr else {
+        unreachable!()
     };
-    if base.is_empty() || metadata_type.is_empty() {
-        return (name, None);
-    }
-
-    let suffix_start = last.span.start() + base.len();
-    let base = base.to_owned();
-    let metadata_type = metadata_type.to_owned();
-    let suffix_end = last.span.end();
-    last.value = base;
-    last.span = Span::new(last.span.start(), suffix_start);
-    name.span = Span::new(name.span.start(), suffix_start);
-    (
-        name,
-        Some(crate::ast::Ident {
-            value: metadata_type,
-            quoted: false,
-            span: Span::new(suffix_start + 1, suffix_end),
-        }),
-    )
+    let call = call.into_inner();
+    let arguments = call
+        .arguments
+        .into_iter()
+        .map(|argument| {
+            let crate::ast::CallArgument { name, value, span } = argument;
+            let (name, value) = match value {
+                Expr::Binary(binary)
+                    if binary.operator == crate::ast::BinaryOperator::NamedArgument =>
+                {
+                    let Expr::Identifier(name) = *binary.left else {
+                        unreachable!()
+                    };
+                    (Some(name), *binary.right)
+                }
+                value => (name, value),
+            };
+            TableFunctionArgument {
+                name,
+                value: TableFunctionArgumentValue::Expression(value),
+                span,
+            }
+        })
+        .collect();
+    Relation::TableFunction(AstBox::new(TableFunctionInvocation {
+        name: call.name,
+        arguments,
+        copartitioning: Vec::new(),
+        span,
+    }))
 }
 
 fn table_function_end(parser: &StatementParser<'_, '_>) -> Result<usize, crate::ParseError> {
@@ -1030,28 +1073,29 @@ fn table_function_end(parser: &StatementParser<'_, '_>) -> Result<usize, crate::
 
 fn parse_table_version(
     parser: &mut StatementParser<'_, '_>,
-) -> Result<Option<TableVersion>, crate::ParseError> {
+) -> Result<Option<QueryPeriod>, crate::ParseError> {
     if !parser.current_is_keyword(Keyword::For) {
         return Ok(None);
     }
     let start = parser.consume_word("FOR")?.start();
     let kind = if parser.consume_if_word("VERSION") {
-        TableVersionKind::ForVersionAsOf
+        QueryPeriodRangeType::Version
     } else if parser.consume_if_word("SYSTEM_TIME") {
-        TableVersionKind::ForSystemTimeAsOf
+        QueryPeriodRangeType::Timestamp
     } else if parser.consume_if_word("SYSTEM") {
         parser.consume_word("TIME")?;
-        TableVersionKind::ForSystemTimeAsOf
+        QueryPeriodRangeType::Timestamp
     } else {
         return Err(parser.unexpected("VERSION or SYSTEM_TIME after FOR"));
     };
     parser.consume_word("AS")?;
     parser.consume_word("OF")?;
     let value = parse_atomic_expression(parser)?;
-    Ok(Some(TableVersion {
-        kind,
+    Ok(Some(QueryPeriod {
+        range_type: kind,
+        start: None,
         span: Span::new(start, value.span().end()),
-        value,
+        end: Some(AstBox::new(value)),
     }))
 }
 
@@ -1084,9 +1128,15 @@ fn parse_atomic_expression(
     Ok(expression)
 }
 
+struct ParsedTableAlias {
+    name: Ident,
+    columns: Option<Vec<Ident>>,
+    span: Span,
+}
+
 fn parse_optional_table_alias(
     parser: &mut StatementParser<'_, '_>,
-) -> Result<Option<crate::ast::TableAlias>, crate::ParseError> {
+) -> Result<Option<ParsedTableAlias>, crate::ParseError> {
     let explicit_as = parser.consume_if_word("AS");
     let has_alias = matches!(
         parser.current().map(|token| &token.kind),
@@ -1103,22 +1153,23 @@ fn parse_optional_table_alias(
     }
     let name = parser.parse_ident()?;
     let start = name.span.start();
-    let mut columns = Vec::new();
+    let mut columns = None;
     let mut end = name.span.end();
     if parser.consume_if_symbol(Symbol::LParen) {
+        let mut names = Vec::new();
         loop {
             let column = parser.parse_ident()?;
-            columns.push(column);
+            names.push(column);
             if !parser.consume_if_symbol(Symbol::Comma) {
                 break;
             }
         }
         end = parser.consume_symbol(Symbol::RParen)?.end();
+        columns = Some(names);
     }
-    Ok(Some(crate::ast::TableAlias {
+    Ok(Some(ParsedTableAlias {
         name,
         columns,
-        explicit_as,
         span: Span::new(start, end),
     }))
 }

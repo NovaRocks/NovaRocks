@@ -4124,6 +4124,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-parser",
  "novarocks-spi",
+ "novarocks-sql",
  "novarocks-test-support",
  "novarocks-test-trino-client",
  "novarocks-types",

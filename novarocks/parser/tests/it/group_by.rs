@@ -34,9 +34,11 @@ fn clause(source: &str) -> GroupBy {
     select(&query(source)).group_by.clone().unwrap()
 }
 fn statement(group_by: GroupBy) -> Statement {
-    Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(vec![build::wildcard()], Vec::new(), None, Some(group_by)).unwrap(),
-    ))))
+    Statement::Query(build::query(SetExpr::Select(
+        novarocks_parser::ast::AstBox::new(
+            build::select(vec![build::wildcard()], None, None, Some(group_by)).unwrap(),
+        ),
+    )))
 }
 
 #[test]

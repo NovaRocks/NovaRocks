@@ -17,34 +17,17 @@
 
 //! Native typed-query table-reference extraction and catalog stripping.
 
-use novarocks_parser::ast::{self as ast, Fold, TableFactor};
+use novarocks_parser::ast::{self as ast, Fold};
 
 struct CatalogStripper;
 
 impl Fold for CatalogStripper {
-    fn fold_table_factor(&mut self, factor: TableFactor) -> TableFactor {
-        let factor = ast::fold_table_factor(self, factor);
-        match factor {
-            TableFactor::Table {
-                mut name,
-                metadata,
-                alias,
-                version,
-                span,
-            } => {
-                if name.parts.len() == 3 {
-                    name.parts.remove(0);
-                }
-                TableFactor::Table {
-                    name,
-                    metadata,
-                    alias,
-                    version,
-                    span,
-                }
-            }
-            other => other,
+    fn fold_table(&mut self, mut table: ast::Table) -> ast::Table {
+        table = ast::fold_table(self, table);
+        if table.name.parts.len() == 3 {
+            table.name.parts.remove(0);
         }
+        table
     }
 }
 

@@ -1138,83 +1138,57 @@ fn from_clause_is_fan_in_union(query: &ast::Query) -> bool {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    let [from] = select.from.as_slice() else {
+    let Some(mut relation) = select.from.as_ref() else {
         return false;
     };
-    if !from.joins.is_empty() {
-        return false;
+    if let ast::Relation::Aliased(alias) = relation {
+        relation = &alias.relation;
     }
-    let ast::TableFactor::Derived {
-        lateral, subquery, ..
-    } = &from.relation
-    else {
+    let ast::Relation::TableSubquery(node) = relation else {
         return false;
     };
-    if *lateral {
-        return false;
-    }
-    matches!(subquery.body.as_ref(), ast::SetExpr::SetOperation(_))
+    matches!(node.query.body.as_ref(), ast::SetExpr::SetOperation(_))
 }
 
 fn validate_composed_aggregate_fallback_query(query: &ast::Query) -> Result<(), String> {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Err("composed aggregate fallback requires a plain SELECT body".to_string());
     };
-    if select.from.len() != 1 {
+    let Some(from) = &select.from else {
         return Err(
             "composed aggregate fallback requires a single direct FROM join tree".to_string(),
         );
-    }
-    let from = &select.from[0];
-    if from.joins.is_empty() {
+    };
+    if !matches!(from, ast::Relation::Join(_)) {
         return Err(
             "composed aggregate fallback requires the aggregate input to be a direct join tree"
                 .to_string(),
         );
     }
-    validate_composed_aggregate_table_factor(&from.relation)?;
-    for join in &from.joins {
-        validate_composed_aggregate_join(&join.operator, &join.constraint)?;
-        validate_composed_aggregate_table_factor(&join.relation)?;
-    }
-    Ok(())
+    validate_composed_aggregate_table_factor(from)
 }
 
-fn validate_composed_aggregate_table_factor(factor: &ast::TableFactor) -> Result<(), String> {
+fn validate_composed_aggregate_table_factor(factor: &ast::Relation) -> Result<(), String> {
     match factor {
-        ast::TableFactor::Table { .. } => Ok(()),
-        ast::TableFactor::NestedJoin { table_with_joins, .. } => {
-            validate_composed_aggregate_table_factor(&table_with_joins.relation)?;
-            if table_with_joins.joins.is_empty() {
-                return Err(
-                    "composed aggregate fallback nested join must contain at least one join"
-                        .to_string(),
-                );
-            }
-            for join in &table_with_joins.joins {
-                validate_composed_aggregate_join(&join.operator, &join.constraint)?;
-                validate_composed_aggregate_table_factor(&join.relation)?;
-            }
-            Ok(())
+        ast::Relation::Table(_) => Ok(()),
+        ast::Relation::Aliased(alias) => validate_composed_aggregate_table_factor(&alias.relation),
+        ast::Relation::Join(join) => {
+            validate_composed_aggregate_table_factor(&join.left)?;
+            validate_composed_aggregate_join(&join.kind, join.criteria.as_ref())?;
+            validate_composed_aggregate_table_factor(&join.right)
         }
-        _ => Err(
-            "composed aggregate fallback supports only direct base-table joins, not subqueries or table functions"
-                .to_string(),
-        ),
+        _ => Err("composed aggregate fallback supports only direct base-table joins, not subqueries or table functions".to_string()),
     }
 }
 
 fn validate_composed_aggregate_join(
-    operator: &ast::JoinOperator,
-    constraint: &ast::JoinConstraint,
+    operator: &ast::JoinType,
+    constraint: Option<&ast::JoinCriteria>,
 ) -> Result<(), String> {
     match (operator, constraint) {
-        (ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit, ast::JoinConstraint::On(_)) => Ok(()),
-        (ast::JoinOperator::Cross, ast::JoinConstraint::None) => Ok(()),
-        _ => Err(
-            "composed aggregate fallback supports only direct INNER JOIN ... ON predicates or CROSS JOIN"
-                .to_string(),
-        ),
+        (ast::JoinType::Inner | ast::JoinType::Legacy(ast::legacy::JoinOperator::Inner | ast::legacy::JoinOperator::InnerExplicit), Some(ast::JoinCriteria::On(_))) => Ok(()),
+        (ast::JoinType::Cross | ast::JoinType::Legacy(ast::legacy::JoinOperator::Cross), None) => Ok(()),
+        _ => Err("composed aggregate fallback supports only direct INNER JOIN ... ON predicates or CROSS JOIN".to_string()),
     }
 }
 
@@ -1224,7 +1198,10 @@ fn union_branch_count(query: &ast::Query) -> u32 {
     fn count(body: &ast::SetExpr) -> u32 {
         match body {
             ast::SetExpr::SetOperation(operation) => operation.inputs.iter().map(count).sum(),
-            ast::SetExpr::Query(inner) => count(inner.body.as_ref()),
+            ast::SetExpr::Query(subquery) => {
+                let inner = &subquery.query;
+                count(inner.body.as_ref())
+            }
             _ => 1,
         }
     }
@@ -2306,20 +2283,26 @@ pub fn join_base_refs_for_definition<'a>(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn rewrite_snapshot_table_factor(
-    factor: &mut ast::TableFactor,
+    factor: &mut ast::Relation,
     base: &TableIdentity,
     snapshot_id: i64,
     default_alias: Option<&str>,
 ) -> Result<(), String> {
-    let ast::TableFactor::Table {
-        name,
-        version,
-        alias,
-        ..
-    } = factor
-    else {
+    let (relation, has_alias) = match &mut *factor {
+        ast::Relation::Aliased(alias) => (alias.relation.as_mut(), true),
+        other => (other, false),
+    };
+    let ast::Relation::Table(table) = relation else {
         return Err("join snapshot side must be a table".to_string());
     };
+    if table.branch.is_some() {
+        return Err("join snapshot side must not be branch-qualified".to_string());
+    }
+    let ast::Table {
+        name,
+        query_period: version,
+        ..
+    } = table.as_mut();
     if !object_name_matches_base(name, base)? {
         return Err(format!(
             "join snapshot rewrite expected base {}, got {}",
@@ -2328,7 +2311,9 @@ fn rewrite_snapshot_table_factor(
         ));
     }
     if let Some(version) = version {
-        let rendered = novarocks_parser::printer::print_expr(&version.value);
+        let value = novarocks_sql::planning::catalog::query_period_end(version)
+            .map_err(|error| error.to_string())?;
+        let rendered = novarocks_parser::printer::print_expr(value);
         if !rendered.contains(&snapshot_id.to_string()) {
             return Err(format!(
                 "join snapshot side {} has conflicting version {rendered}",
@@ -2338,15 +2323,9 @@ fn rewrite_snapshot_table_factor(
     }
     *name = synthetic_snapshot_object_name(base, snapshot_id);
     *version = None;
-    if alias.is_none()
-        && let Some(default_alias) = default_alias
-    {
-        *alias = Some(ast::TableAlias {
-            name: generated_ident(default_alias),
-            columns: Vec::new(),
-            explicit_as: true,
-            span: Span::new(0, 0),
-        });
+    if !has_alias && let Some(default_alias) = default_alias {
+        *factor =
+            novarocks_parser::build::alias(factor.clone(), generated_ident(default_alias), None);
     }
     Ok(())
 }

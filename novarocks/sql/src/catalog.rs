@@ -74,7 +74,7 @@ pub trait PlannerTableProvider {
         _catalog: Option<&str>,
         _database: &str,
         _table: &str,
-        version: &novarocks_parser::ast::TableVersion,
+        version: &novarocks_parser::ast::QueryPeriod,
     ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
         Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
             "catalog does not supply historical table facts",
@@ -108,7 +108,7 @@ pub trait PlannerTableProvider {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: &novarocks_parser::ast::TableVersion,
+        version: &novarocks_parser::ast::QueryPeriod,
     ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
         self.resolve_table_version_for_analysis(catalog, database, table, version)
     }
@@ -126,7 +126,7 @@ pub trait PlannerTableProvider {
         _catalog: Option<&str>,
         _database: &str,
         _table: &str,
-        _version: Option<&novarocks_parser::ast::TableVersion>,
+        _version: Option<&novarocks_parser::ast::QueryPeriod>,
     ) -> Result<
         Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>,
         crate::analyze_error::AnalyzeError,
@@ -138,7 +138,7 @@ pub trait PlannerTableProvider {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: Option<&novarocks_parser::ast::TableVersion>,
+        version: Option<&novarocks_parser::ast::QueryPeriod>,
     ) -> Result<
         Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>,
         crate::analyze_error::AnalyzeError,

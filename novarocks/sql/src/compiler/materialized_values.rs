@@ -24,11 +24,17 @@ fn invalid(detail: &'static str) -> SqlCompileError {
 }
 /// Structural edges of the producer's existing eligible query body. These
 /// names describe owned AST positions, never SQL text or wire identities.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlConstantQueryStep {
     NestedQuery,
     SetOperand { index: usize },
-    SelectFromDerived { from: usize },
+    SelectFromDerived { relation_path: Vec<SqlRelationStep> },
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlRelationStep {
+    Aliased,
+    JoinLeft,
+    JoinRight,
 }
 /// Exact expression edges below a producer-authored projection or VALUES cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,8 +138,8 @@ pub(crate) fn resolve_expression_site<'a>(
         work.step()?;
         body = match (step, body) {
             (SqlConstantQueryStep::NestedQuery, ast::SetExpr::Query(query)) => {
-                query_owner = Some(query);
-                query.body.as_ref()
+                query_owner = Some(&query.query);
+                query.query.body.as_ref()
             }
             (SqlConstantQueryStep::SetOperand { index }, ast::SetExpr::SetOperation(op))
                 if op.corresponding.is_none()
@@ -145,16 +151,38 @@ pub(crate) fn resolve_expression_site<'a>(
                     invalid("constant source set operand index differs from its owned query")
                 })?
             }
-            (SqlConstantQueryStep::SelectFromDerived { from }, ast::SetExpr::Select(select)) => {
-                let Some(ast::TableFactor::Derived { subquery, .. }) =
-                    select.from.get(*from).map(|from| &from.relation)
-                else {
-                    return Err(invalid(
-                        "constant source path differs from its owned derived relation",
-                    ));
+            (
+                SqlConstantQueryStep::SelectFromDerived { relation_path },
+                ast::SetExpr::Select(select),
+            ) => {
+                let mut relation = select
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| invalid("constant source path has no owned FROM relation"))?;
+                for edge in relation_path {
+                    work.step()?;
+                    relation = match (edge, relation) {
+                        (SqlRelationStep::Aliased, ast::Relation::Aliased(node)) => &node.relation,
+                        (SqlRelationStep::JoinLeft, ast::Relation::Join(node)) => &node.left,
+                        (SqlRelationStep::JoinRight, ast::Relation::Join(node)) => &node.right,
+                        _ => {
+                            return Err(invalid(
+                                "constant source relation edge differs from its owned relation",
+                            ));
+                        }
+                    };
+                }
+                let query = match relation {
+                    ast::Relation::TableSubquery(node) => &node.query,
+                    ast::Relation::Lateral(node) => &node.query,
+                    _ => {
+                        return Err(invalid(
+                            "constant source path differs from its owned derived relation",
+                        ));
+                    }
                 };
-                query_owner = Some(subquery);
-                subquery.body.as_ref()
+                query_owner = Some(query);
+                query.body.as_ref()
             }
             _ => {
                 return Err(invalid(

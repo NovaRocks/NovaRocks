@@ -575,7 +575,7 @@ pub use crate::common::expr::{BinOp, LiteralValue, UnOp};
 pub(crate) mod materialized_values;
 pub use materialized_values::{
     SqlConstantExpressionSite, SqlConstantExpressionStep, SqlConstantQueryStep,
-    SqlExpressionConstant, SqlExpressionConstants,
+    SqlExpressionConstant, SqlExpressionConstants, SqlRelationStep,
 };
 mod fold_observation;
 pub use fold_observation::{

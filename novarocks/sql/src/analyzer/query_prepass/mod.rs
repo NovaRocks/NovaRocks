@@ -21,12 +21,10 @@
 //! It must never rebuild SQL text or invoke a parser.  T4 wires
 //! [`preanalyze`] into the production typed-query admission path.
 
+use novarocks_parser::ast;
 use novarocks_parser::{
     Span,
-    ast::{
-        Expr, Fold, Ident, JoinConstraint, JoinOperator, LiteralKind, Query, Select, SelectItem,
-        SetExpr, SetOperator, TableAlias, TableFactor, TableWithJoins, Visit,
-    },
+    ast::{Expr, Fold, Ident, LiteralKind, Query, Select, SelectItem, SetExpr, SetOperator, Visit},
 };
 
 use crate::analyze_error::AnalyzeError;
@@ -180,15 +178,53 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                 _ => novarocks_parser::ast::walk_literal(self, literal),
             }
         }
-        fn visit_table_factor(&mut self, factor: &TableFactor) {
+        fn visit_query_period(&mut self, period: &ast::QueryPeriod) {
             if self.0.is_some() {
                 return;
             }
-            match factor {
-                TableFactor::JsonTable { span, .. } => {
-                    self.0 = Some(("JSON_TABLE is not supported", *span))
+            if period.start.is_some() || period.end.is_none() {
+                self.0 = Some(("query period requires only an end expression", period.span));
+            } else {
+                ast::walk_query_period(self, period);
+            }
+        }
+        fn visit_relation(&mut self, relation: &ast::Relation) {
+            if self.0.is_some() {
+                return;
+            }
+            match relation {
+                ast::Relation::Aliased(node)
+                    if node.column_names.as_ref().is_some_and(Vec::is_empty) =>
+                {
+                    self.0 = Some(("empty relation column aliases are not supported", node.span))
                 }
-                _ => novarocks_parser::ast::walk_table_factor(self, factor),
+                ast::Relation::Table(node) if node.branch.is_some() => {
+                    self.0 = Some(("table branches in FROM are not supported", node.span))
+                }
+                ast::Relation::JsonTable(_) => {
+                    self.0 = Some(("JSON_TABLE is not supported", relation.span()))
+                }
+                ast::Relation::Sampled(_)
+                | ast::Relation::Pivot(_)
+                | ast::Relation::Nearest(_)
+                | ast::Relation::PatternRecognition(_) => {
+                    self.0 = Some(("relation profile is not supported", relation.span()))
+                }
+                ast::Relation::TableFunction(node)
+                    if !node.copartitioning.is_empty()
+                        || node.arguments.iter().any(|argument| {
+                            !matches!(
+                                argument.value,
+                                ast::TableFunctionArgumentValue::Expression(_)
+                            )
+                        }) =>
+                {
+                    self.0 = Some((
+                        "table function argument profile is not supported",
+                        node.span,
+                    ))
+                }
+                _ => ast::walk_relation(self, relation),
             }
         }
     }
@@ -225,8 +261,8 @@ fn recursive_cte_max_depth(query: &Query) -> Option<usize> {
 fn root_select(body: &SetExpr) -> Option<&Select> {
     match body {
         SetExpr::Select(select) => Some(select),
-        SetExpr::Query(query) => root_select(query.body.as_ref()),
-        SetExpr::Values(_) | SetExpr::SetOperation(_) => None,
+        SetExpr::Query(query) => root_select(query.query.body.as_ref()),
+        SetExpr::Values(_) | SetExpr::Table(_) | SetExpr::SetOperation(_) => None,
     }
 }
 
@@ -278,7 +314,7 @@ fn unroll_with_clause(
             rewritten.push(cte);
         }
     }
-    with.ctes = rewritten;
+    with.ctes = rewritten.into();
     Ok(())
 }
 
@@ -343,7 +379,7 @@ fn try_unroll_cte(
         .map(|(index, query)| inline_iteration(query, &name, index, &aliases, cte.span))
         .collect::<Vec<_>>();
     let mut rewritten = cte.clone();
-    rewritten.query = Box::new(query_with_body(
+    rewritten.query = ast::AstBox::new(query_with_body(
         cte.query.as_ref(),
         build_set_operation_chain(false, &branches),
     ));
@@ -392,8 +428,14 @@ fn derive_column_aliases(
     cte: &novarocks_parser::ast::Cte,
     anchor: &SetExpr,
 ) -> Result<Vec<Ident>, AnalyzeError> {
-    if !cte.columns.is_empty() {
-        return Ok(cte.columns.clone());
+    if let Some(columns) = &cte.columns {
+        if columns.is_empty() {
+            return Err(AnalyzeError::unsupported_query_shape(
+                "empty CTE column aliases are not supported",
+                cte.span,
+            ));
+        }
+        return Ok(columns.clone());
     }
     let Some(select) = root_select(anchor) else {
         return Err(AnalyzeError::invalid_query_shape(
@@ -453,22 +495,22 @@ fn pin_projection_aliases(expr: &mut SetExpr, aliases: &[Ident]) {
                 *item = replacement;
             }
         }
-        SetExpr::Query(query) => pin_projection_aliases(query.body.as_mut(), aliases),
+        SetExpr::Query(query) => pin_projection_aliases(query.query.body.as_mut(), aliases),
         SetExpr::SetOperation(operation) => {
             for input in &mut operation.inputs {
                 pin_projection_aliases(input, aliases);
             }
         }
-        SetExpr::Values(_) => {}
+        SetExpr::Values(_) | SetExpr::Table(_) => {}
     }
 }
 
 fn query_with_body(template: &Query, body: SetExpr) -> Query {
     Query {
-        session_properties: Vec::new(),
-        functions: Vec::new(),
+        session_properties: Vec::new().into(),
+        functions: Vec::new().into(),
         with: None,
-        body: Box::new(body),
+        body: ast::AstBox::new(body),
         modifiers: Default::default(),
         span: template.span,
     }
@@ -495,33 +537,26 @@ fn inline_iteration(
     aliases: &[Ident],
     span: Span,
 ) -> SetExpr {
-    let relation = TableFactor::Derived {
-        lateral: false,
-        subquery: Box::new(query),
-        alias: Some(TableAlias {
-            name: synthetic_ident(format!("__nr_rec_{cte_name}_{index}"), span),
-            columns: aliases.to_vec(),
-            explicit_as: false,
-            span,
-        }),
-        span,
-    };
-    SetExpr::Select(Box::new(Select {
-        quantifier: novarocks_parser::ast::SelectQuantifier::None,
+    let mut relation = novarocks_parser::build::alias(
+        novarocks_parser::build::derived(query),
+        synthetic_ident(format!("__nr_rec_{cte_name}_{index}"), span),
+        Some(aliases.to_vec()),
+    );
+    if let ast::Relation::Aliased(node) = &mut relation {
+        node.span = span;
+    }
+    SetExpr::Select(ast::AstBox::new(Select {
+        quantifier: ast::SelectQuantifier::None,
         projection: vec![SelectItem::Wildcard {
             options: Default::default(),
             span,
         }],
-        from: vec![TableWithJoins {
-            relation,
-            joins: Vec::new(),
-            span,
-        }],
+        from: Some(relation),
         selection: None,
         group_by: None,
         having: None,
         qualify: None,
-        windows: Vec::new().into(),
+        windows: ast::AstVec::new(),
         modifiers: Default::default(),
         span,
     }))
@@ -545,14 +580,12 @@ impl Visit for TableReferenceVisitor<'_> {
         scan_query_for_table_reference(self, query);
     }
 
-    fn visit_table_factor(&mut self, factor: &TableFactor) {
-        if let TableFactor::Table { name, .. } = factor
-            && name.parts.len() == 1
-            && name.parts[0].value.eq_ignore_ascii_case(self.target)
-        {
+    fn visit_table(&mut self, table: &ast::Table) {
+        let name = &table.name;
+        if name.parts.len() == 1 && name.parts[0].value.eq_ignore_ascii_case(self.target) {
             self.found = true;
         }
-        novarocks_parser::ast::walk_table_factor(self, factor);
+        novarocks_parser::ast::walk_table(self, table);
     }
 }
 
@@ -614,14 +647,8 @@ fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, ex
                     }
                 }
             }
-            for table in &select.from {
-                visitor.visit_table_factor(&table.relation);
-                for join in &table.joins {
-                    visitor.visit_table_factor(&join.relation);
-                    if let JoinConstraint::On(expression) = &join.constraint {
-                        visitor.visit_expr(expression);
-                    }
-                }
+            if let Some(relation) = &select.from {
+                visitor.visit_relation(relation);
             }
             if let Some(selection) = &select.selection {
                 visitor.visit_expr(selection);
@@ -660,7 +687,8 @@ fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, ex
                 }
             }
         }
-        SetExpr::Query(query) => scan_query_for_table_reference(visitor, query),
+        SetExpr::Query(query) => scan_query_for_table_reference(visitor, &query.query),
+        SetExpr::Table(table) => visitor.visit_table(table),
         SetExpr::SetOperation(operation) => {
             for input in &operation.inputs {
                 scan_set_expr_for_table_reference(visitor, input);
@@ -705,49 +733,46 @@ fn substitute_table_with_derived(
                         // the query body resolve the same name locally.
                         return query;
                     }
-                    *cte.query = self.fold_query(*cte.query.clone());
+                    cte.query = ast::AstBox::new(self.fold_query(cte.query.clone().into_inner()));
                 }
             }
             novarocks_parser::ast::fold_query(self, query)
         }
 
-        fn fold_table_factor(&mut self, factor: TableFactor) -> TableFactor {
-            let factor = novarocks_parser::ast::fold_table_factor(self, factor);
-            let is_target = matches!(
-                &factor,
-                TableFactor::Table { name, .. }
-                    if name.parts.len() == 1
-                        && name.parts[0].value.eq_ignore_ascii_case(self.target)
-            );
-            if !is_target {
-                return factor;
-            }
-            let TableFactor::Table { alias, span, .. } = factor else {
-                unreachable!("target factor must be a table");
+        fn fold_relation(&mut self, relation: ast::Relation) -> ast::Relation {
+            let target = |table: &ast::Table| {
+                table.name.parts.len() == 1
+                    && table.name.parts[0].value.eq_ignore_ascii_case(self.target)
             };
-            let alias = alias
-                .as_ref()
-                .map(|alias| alias.name.clone())
-                .unwrap_or_else(|| synthetic_ident(self.target.to_owned(), span));
-            TableFactor::Derived {
-                lateral: false,
-                subquery: Box::new(self.replacement.clone()),
-                alias: Some(TableAlias {
-                    name: alias,
-                    columns: self.aliases.to_vec(),
-                    explicit_as: false,
-                    span,
-                }),
-                span,
+            let (alias, span) = match relation {
+                ast::Relation::Aliased(node) if matches!(node.relation.as_ref(), ast::Relation::Table(table) if target(table)) =>
+                {
+                    let node = node.into_inner();
+                    (node.alias, node.span)
+                }
+                ast::Relation::Table(table) if target(&table) => (
+                    synthetic_ident(self.target.to_owned(), table.span),
+                    table.span,
+                ),
+                other => return ast::fold_relation(self, other),
+            };
+            let mut result = novarocks_parser::build::alias(
+                novarocks_parser::build::derived(self.replacement.clone()),
+                alias,
+                Some(self.aliases.to_vec()),
+            );
+            if let ast::Relation::Aliased(node) = &mut result {
+                node.span = span;
             }
+            result
         }
     }
 
     let template = Query {
-        session_properties: Vec::new(),
-        functions: Vec::new(),
+        session_properties: Vec::new().into(),
+        functions: Vec::new().into(),
         with: None,
-        body: Box::new(expr.clone()),
+        body: ast::AstBox::new(expr.clone()),
         modifiers: Default::default(),
         span: expr.span(),
     };
@@ -756,7 +781,7 @@ fn substitute_table_with_derived(
         replacement,
         aliases,
     };
-    *expr = *substituter.fold_query(template).body;
+    *expr = substituter.fold_query(template).body.into_inner();
 }
 
 fn normalize_cross_joins(query: &mut Query) {
@@ -769,60 +794,26 @@ fn normalize_cross_joins(query: &mut Query) {
 }
 
 fn normalize_cross_set_expr(expr: &mut SetExpr) {
-    match expr {
-        SetExpr::Select(select) => {
-            for table in &mut select.from {
-                for join in &mut table.joins {
-                    if join.operator == JoinOperator::Cross
-                        && !matches!(join.constraint, JoinConstraint::None)
-                    {
-                        join.operator = JoinOperator::InnerExplicit;
-                    }
-                    normalize_cross_factor(&mut join.relation);
-                }
-                normalize_cross_factor(&mut table.relation);
+    struct CrossNormalizer;
+    impl Fold for CrossNormalizer {
+        fn fold_relation(&mut self, relation: ast::Relation) -> ast::Relation {
+            let mut relation = ast::fold_relation(self, relation);
+            if let ast::Relation::Join(node) = &mut relation
+                && node.kind == ast::JoinType::Legacy(ast::legacy::JoinOperator::Cross)
+                && node.criteria.is_some()
+            {
+                node.kind = ast::JoinType::Legacy(ast::legacy::JoinOperator::InnerExplicit);
             }
+            relation
         }
-        SetExpr::Query(query) => normalize_cross_joins(query),
-        SetExpr::SetOperation(operation) => {
-            for input in &mut operation.inputs {
-                normalize_cross_set_expr(input);
-            }
-        }
-        SetExpr::Values(_) => {}
     }
-}
-
-fn normalize_cross_factor(factor: &mut TableFactor) {
-    match factor {
-        TableFactor::Derived { subquery, .. } => normalize_cross_joins(subquery),
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            for join in &mut table_with_joins.joins {
-                if join.operator == JoinOperator::Cross
-                    && !matches!(join.constraint, JoinConstraint::None)
-                {
-                    join.operator = JoinOperator::InnerExplicit;
-                }
-                normalize_cross_factor(&mut join.relation);
-            }
-            normalize_cross_factor(&mut table_with_joins.relation);
-        }
-        TableFactor::JsonTable { .. }
-        | TableFactor::Table { .. }
-        | TableFactor::TableFunction { .. }
-        | TableFactor::Unnest { .. } => {}
-    }
+    *expr = ast::fold_set_expr(&mut CrossNormalizer, expr.clone());
 }
 
 fn remove_bare_top_level_dual(query: &mut Query) {
     let SetExpr::Select(select) = query.body.as_mut() else {
         return;
     };
-    if select.from.len() != 1 {
-        return;
-    }
     if select.selection.is_some()
         || select.group_by.is_some()
         || select.having.is_some()
@@ -835,26 +826,17 @@ fn remove_bare_top_level_dual(query: &mut Query) {
     {
         return;
     }
-    let table = &select.from[0];
-    if !table.joins.is_empty() {
-        return;
-    }
-    let TableFactor::Table {
-        name,
-        alias,
-        version,
-        ..
-    } = &table.relation
-    else {
+    let Some(ast::Relation::Table(table)) = &select.from else {
         return;
     };
+    let name = &table.name;
     if name.parts.len() == 1
         && name.parts[0].value.eq_ignore_ascii_case("dual")
         && !name.parts[0].quoted
-        && alias.is_none()
-        && version.is_none()
+        && table.query_period.is_none()
+        && table.branch.is_none()
     {
-        select.from.clear();
+        select.from = None;
     }
 }
 
@@ -1072,13 +1054,13 @@ mod tests {
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select");
         };
-        assert!(select.from.is_empty());
+        assert!(select.from.is_none());
 
         let query = preanalyze(parse_query("SELECT 1 FROM dual WHERE 1 = 1")).expect("prepass");
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select");
         };
-        assert_eq!(select.from.len(), 1);
+        assert!(select.from.is_some());
     }
 
     #[test]
@@ -1089,8 +1071,13 @@ mod tests {
             panic!("expected select");
         };
         assert_eq!(
-            select.from[0].joins[0].operator,
-            JoinOperator::InnerExplicit
+            {
+                let Some(ast::Relation::Join(join)) = &select.from else {
+                    panic!("Join")
+                };
+                join.kind
+            },
+            ast::JoinType::Legacy(ast::legacy::JoinOperator::InnerExplicit)
         );
     }
 }

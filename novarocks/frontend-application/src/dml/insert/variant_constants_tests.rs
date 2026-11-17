@@ -323,12 +323,16 @@ fn select_filter_having_and_distinct_keep_the_original_inner_owner() {
     let ast::SetExpr::Query(wrapper) = query.body.as_ref() else {
         panic!("target wrapper")
     };
-    let ast::SetExpr::Select(wrapper) = wrapper.body.as_ref() else {
+    let ast::SetExpr::Select(wrapper) = wrapper.query.body.as_ref() else {
         panic!("target SELECT")
     };
-    let ast::TableFactor::Derived { subquery, .. } = &wrapper.from[0].relation else {
-        panic!("inner owner")
+    let Some(ast::Relation::Aliased(alias)) = &wrapper.from else {
+        panic!("inner alias");
     };
+    let ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
+        panic!("inner owner");
+    };
+    let subquery = &node.query;
     assert!(subquery.body.syntax_eq(&source.body));
     analyze(query, constants)
         .expect("the original SELECT still owns its cardinality and alias policies");

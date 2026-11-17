@@ -268,10 +268,10 @@ fn actual_array_owning_carrier_guards_deep_traits_move_and_drop() {
     };
     assert_ne!(tree, copy);
     drop(copy);
-    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
+    let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
         build::select(
             vec![build::item(tree.clone(), None, false)],
-            Vec::new(),
+            None,
             None,
             None,
         )
@@ -360,14 +360,8 @@ fn actual_array_semantic_walk_fold_and_equivalence_preserve_deep_values_and_orde
         expected.iter().map(|value| value + 1).collect::<Vec<_>>()
     );
     assert!(!tree.syntax_eq(&shifted));
-    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(
-            vec![build::item(shifted, None, false)],
-            Vec::new(),
-            None,
-            None,
-        )
-        .unwrap(),
+    let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
+        build::select(vec![build::item(shifted, None, false)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -605,14 +599,8 @@ fn actual_row_fields_preserve_names_order_spans_and_deep_semantic_children() {
     let mut seen = Events::default();
     seen.visit_expr(&changed);
     assert_eq!(seen.0, expected_changed);
-    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(
-            vec![build::item(changed, None, false)],
-            Vec::new(),
-            None,
-            None,
-        )
-        .unwrap(),
+    let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
+        build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -877,14 +865,8 @@ fn actual_access_children_keep_deep_visit_fold_equivalence_validation_and_printi
     let mut actual = Events::default();
     actual.visit_expr(&changed);
     assert_eq!(actual.0, expected_changed);
-    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(
-            vec![build::item(changed, None, false)],
-            Vec::new(),
-            None,
-            None,
-        )
-        .unwrap(),
+    let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
+        build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -1222,14 +1204,8 @@ fn actual_function_order_by_preserves_facts_and_deep_semantic_children() {
     let mut actual = Events::default();
     actual.visit_expr(&changed);
     assert_eq!(actual.0, expected_changed);
-    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(
-            vec![build::item(changed, None, false)],
-            Vec::new(),
-            None,
-            None,
-        )
-        .unwrap(),
+    let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
+        build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -1442,14 +1418,8 @@ fn actual_window_operation_cycle_keeps_partition_and_frame_expression_children()
     let mut seen = Events::default();
     seen.visit_expr(&changed);
     assert_eq!(seen.0, expected_changed);
-    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(
-            vec![build::item(changed, None, false)],
-            Vec::new(),
-            None,
-            None,
-        )
-        .unwrap(),
+    let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
+        build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -1700,10 +1670,10 @@ fn actual_row_pattern_box_vec_cycle_keeps_quantifier_facts_and_real_children() {
     let mut seen = Events::default();
     seen.visit_row_pattern(&changed);
     assert_eq!(seen.0, expected_changed);
-    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
+    let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
         build::select(
             vec![build::item(operation(changed), None, false)],
-            Vec::new(),
+            None,
             None,
             None,
         )
@@ -1928,16 +1898,17 @@ fn assert_actual_call_argument_or_filter_cycle(filter_child: bool) {
         printed.matches(" => ").count(),
         if filter_child { 0 } else { DEPTH as usize }
     );
-    let statement =
-        crate::ast::Statement::Query(build::query(crate::ast::SetExpr::Select(Box::new(
+    let statement = crate::ast::Statement::Query(build::query(crate::ast::SetExpr::Select(
+        crate::ast::AstBox::new(
             build::select(
                 vec![build::item(tree.clone(), None, false)],
-                Vec::new(),
+                None,
                 None,
                 None,
             )
             .unwrap(),
-        ))));
+        ),
+    )));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
     let Expr::FunctionCall(call) = tree else {
@@ -2217,16 +2188,17 @@ fn actual_control_call_cycles_keep_all_alternative_child_slots_and_order() {
         expected.iter().map(|n| n + 1).collect::<Vec<_>>()
     );
     drop(changed);
-    let statement =
-        crate::ast::Statement::Query(build::query(crate::ast::SetExpr::Select(Box::new(
+    let statement = crate::ast::Statement::Query(build::query(crate::ast::SetExpr::Select(
+        crate::ast::AstBox::new(
             build::select(
                 vec![build::item(tree.clone(), None, false)],
-                Vec::new(),
+                None,
                 None,
                 None,
             )
             .unwrap(),
-        ))));
+        ),
+    )));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
     let printed = crate::printer::print_expr(&tree).to_ascii_uppercase();
@@ -2340,14 +2312,8 @@ fn actual_extract_owning_and_semantic_cycle_keeps_deep_fields_and_original_leaf(
     let printed = crate::printer::print_expr(&tree);
     assert_eq!(printed.matches("EXTRACT(").count(), DEPTH);
     assert_eq!(printed.matches('7').count(), 1);
-    let statement = Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(
-            vec![build::item(changed, None, false)],
-            Vec::new(),
-            None,
-            None,
-        )
-        .unwrap(),
+    let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
+        build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -2472,7 +2438,7 @@ fn actual_mixed_set_operation_inputs_keep_deep_owning_semantic_and_printing_edge
             + printed.matches("EXCEPT").count(),
         DEPTH as usize
     );
-    let SetExpr::SetOperation(top) = *query.body else {
+    let SetExpr::SetOperation(top) = query.body.into_inner() else {
         unreachable!()
     };
     let inputs = top.inputs.into_inner();
@@ -2584,15 +2550,11 @@ fn actual_plain_json_query_owning_chain_preserves_path_facts_and_original_input(
             .collect::<Vec<_>>()
     );
     assert!(!tree.syntax_eq(&changed));
-    let statement = Statement::Query(build::query(crate::ast::SetExpr::Select(Box::new(
-        build::select(
-            vec![build::item(changed, None, false)],
-            Vec::new(),
-            None,
-            None,
-        )
-        .unwrap(),
-    ))));
+    let statement = Statement::Query(build::query(crate::ast::SetExpr::Select(
+        crate::ast::AstBox::new(
+            build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
+        ),
+    )));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
     let printed = crate::printer::print_expr(&tree);
@@ -2623,8 +2585,8 @@ fn actual_group_by_query_subquery_cycle_preserves_owning_traits_order_hooks_and_
         let expressions = vec![
             build::integer(marker),
             Expr::Subquery(SubqueryExpr {
-                query: Box::new(tree),
-                span,
+                query: crate::ast::AstBox::new(tree),
+                span: span,
             }),
         ];
         let element = match marker % 3 {
@@ -2648,8 +2610,8 @@ fn actual_group_by_query_subquery_cycle_preserves_owning_traits_order_hooks_and_
             elements: vec![element, GroupingElement::Auto(AutoGroupBy { span })].into(),
             span,
         };
-        tree = build::query(SetExpr::Select(Box::new(
-            build::select(vec![build::wildcard()], Vec::new(), None, Some(group)).unwrap(),
+        tree = build::query(SetExpr::Select(crate::ast::AstBox::new(
+            build::select(vec![build::wildcard()], None, None, Some(group)).unwrap(),
         )));
     }
     let mut copy = tree.clone();
@@ -2728,11 +2690,258 @@ fn actual_group_by_query_subquery_cycle_preserves_owning_traits_order_hooks_and_
     assert_eq!(printed.matches(" GROUP BY ").count(), DEPTH as usize);
     // Move through the actual top AstVec edge; there is no second deep wrapper.
     let Query { body, .. } = tree;
-    let SetExpr::Select(top) = *body else {
+    let SetExpr::Select(top) = body.into_inner() else {
         unreachable!()
     };
-    let group = top.group_by.unwrap();
+    let group = top.into_inner().group_by.unwrap();
     let elements = group.elements.into_inner();
     assert_eq!(elements.len(), 2);
     drop(elements);
+}
+
+#[test]
+fn actual_relation_query_alias_join_cycle_preserves_owning_and_all_original_children() {
+    use crate::ast::{
+        Expr, Fold, Ident, Join, JoinCriteria, JoinOn, JoinType, Literal, LiteralKind, Relation,
+        SetExpr, Statement, SyntaxEq, Visit,
+    };
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    let mut tree = build::query(build::values(vec![vec![build::integer(7)]]).unwrap());
+    for marker in 1..=DEPTH {
+        let child = build::alias(
+            build::derived(tree),
+            build::ident(format!("alias_{marker}"), marker % 2 == 0),
+            Some(vec![build::ident(format!("column_{marker}"), false)]),
+        );
+        let right = build::table(
+            build::object_name(vec![build::ident(format!("table_{marker}"), false)]).unwrap(),
+            None,
+            None,
+        );
+        let join = Relation::Join(AstBox::new(Join {
+            left: AstBox::new(child),
+            right: AstBox::new(right),
+            kind: JoinType::Inner,
+            criteria: Some(JoinCriteria::On(JoinOn {
+                expression: build::boolean(true),
+                span: Span::new(10, 14),
+            })),
+            span: Span::new(0, 30),
+        }));
+        tree = build::query(SetExpr::Select(AstBox::new(
+            build::select(
+                vec![build::item(build::integer(marker), None, false)],
+                Some(join),
+                None,
+                None,
+            )
+            .unwrap(),
+        )));
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let SetExpr::Select(select) = copy.body.as_mut() else {
+        unreachable!()
+    };
+    let Some(Relation::Join(join)) = &mut select.from else {
+        unreachable!()
+    };
+    join.span = Span::new(100, 130);
+    assert_ne!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    drop(copy);
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    #[derive(Default)]
+    struct Facts {
+        numbers: Vec<i64>,
+        aliases: Vec<(String, bool)>,
+        tables: Vec<String>,
+    }
+    impl Visit for Facts {
+        fn visit_literal(&mut self, node: &Literal) {
+            if let LiteralKind::Long { parsed_value, .. } = node.kind {
+                self.numbers.push(parsed_value);
+            }
+        }
+        fn visit_ident(&mut self, node: &Ident) {
+            if node.value.starts_with("alias_") {
+                self.aliases.push((node.value.clone(), node.quoted));
+            }
+            if node.value.starts_with("table_") {
+                self.tables.push(node.value.clone());
+            }
+        }
+    }
+    let mut facts = Facts::default();
+    facts.visit_query(&tree);
+    let expected = (1..=DEPTH)
+        .rev()
+        .chain(std::iter::once(7))
+        .collect::<Vec<_>>();
+    assert_eq!(facts.numbers, expected);
+    assert_eq!(
+        facts.aliases,
+        (1..=DEPTH)
+            .map(|marker| (format!("alias_{marker}"), marker % 2 == 0))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        facts.tables,
+        (1..=DEPTH)
+            .map(|marker| format!("table_{marker}"))
+            .collect::<Vec<_>>()
+    );
+    struct Change;
+    impl Fold for Change {
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            match node.kind {
+                LiteralKind::Long { parsed_value, .. } => {
+                    let Expr::Literal(node) = build::integer(parsed_value + 1) else {
+                        unreachable!()
+                    };
+                    node
+                }
+                _ => node,
+            }
+        }
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.value.push_str("_changed");
+            node
+        }
+    }
+    let changed = Change.fold_query(tree.clone());
+    let mut changed_facts = Facts::default();
+    changed_facts.visit_query(&changed);
+    assert_eq!(
+        changed_facts.numbers,
+        expected.iter().map(|value| value + 1).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        changed_facts.aliases,
+        facts
+            .aliases
+            .iter()
+            .map(|(name, quoted)| (format!("{name}_changed"), *quoted))
+            .collect::<Vec<_>>()
+    );
+    assert!(!tree.syntax_eq(&changed));
+    crate::ast::validate_statement(&Statement::Query(changed)).unwrap();
+    let printed = crate::printer::print_query(&tree);
+    assert_eq!(printed.matches(" JOIN ").count(), DEPTH as usize);
+    let SetExpr::Select(select) = tree.body.into_inner() else {
+        unreachable!()
+    };
+    let Some(Relation::Join(join)) = select.into_inner().from else {
+        unreachable!()
+    };
+    let join = join.into_inner();
+    drop(join.left.into_inner());
+    drop(join.right.into_inner());
+}
+
+#[test]
+fn actual_cte_query_cycle_preserves_optional_column_names_and_query_carriers() {
+    use crate::ast::{
+        Cte, Expr, Fold, Ident, Literal, LiteralKind, SetExpr, Statement, SyntaxEq, Visit, With,
+    };
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    let mut tree = build::query(build::values(vec![vec![build::integer(7)]]).unwrap());
+    for marker in 1..=DEPTH {
+        let cte = Cte {
+            name: build::ident(format!("cte_{marker}"), marker % 2 == 0),
+            columns: Some(vec![build::ident(format!("column_{marker}"), true)]),
+            query: AstBox::new(tree),
+            span: Span::new(10, 30),
+        };
+        tree = build::query(build::values(vec![vec![build::integer(marker)]]).unwrap());
+        tree.with = Some(With {
+            recursive: marker % 2 == 0,
+            ctes: vec![cte].into(),
+            span: Span::new(0, 30),
+        });
+    }
+    let copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    drop(copy);
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    #[derive(Default)]
+    struct Facts {
+        names: Vec<(String, bool)>,
+        numbers: Vec<i64>,
+    }
+    impl Visit for Facts {
+        fn visit_ident(&mut self, node: &Ident) {
+            self.names.push((node.value.clone(), node.quoted));
+        }
+        fn visit_literal(&mut self, node: &Literal) {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                panic!("integer")
+            };
+            self.numbers.push(parsed_value);
+        }
+    }
+    let mut facts = Facts::default();
+    facts.visit_query(&tree);
+    assert_eq!(
+        facts.names,
+        (1..=DEPTH)
+            .rev()
+            .flat_map(|marker| [
+                (format!("cte_{marker}"), marker % 2 == 0),
+                (format!("column_{marker}"), true)
+            ])
+            .collect::<Vec<_>>()
+    );
+    let expected = std::iter::once(7).chain(1..=DEPTH).collect::<Vec<_>>();
+    assert_eq!(facts.numbers, expected);
+    struct Change;
+    impl Fold for Change {
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.value.push_str("_next");
+            node
+        }
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                unreachable!()
+            };
+            let Expr::Literal(node) = build::integer(parsed_value + 1) else {
+                unreachable!()
+            };
+            node
+        }
+    }
+    let changed = Change.fold_query(tree.clone());
+    let mut changed_facts = Facts::default();
+    changed_facts.visit_query(&changed);
+    assert_eq!(
+        changed_facts.names,
+        facts
+            .names
+            .iter()
+            .map(|(name, quoted)| (format!("{name}_next"), *quoted))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        changed_facts.numbers,
+        expected.iter().map(|value| value + 1).collect::<Vec<_>>()
+    );
+    assert!(!tree.syntax_eq(&changed));
+    crate::ast::validate_statement(&Statement::Query(changed)).unwrap();
+    let printed = crate::printer::print_query(&tree);
+    assert_eq!(printed.matches("WITH ").count(), DEPTH as usize);
+    let ctes = tree.with.unwrap().ctes.into_inner();
+    assert_eq!(ctes.len(), 1);
+    drop(ctes);
+    let SetExpr::Values(values) = tree.body.into_inner() else {
+        unreachable!()
+    };
+    assert_eq!(values.rows.len(), 1);
 }

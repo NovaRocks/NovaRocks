@@ -23,7 +23,7 @@ pub use crate::mv_refresh::{
 };
 pub use crate::planner::vocabulary::ApplyKeySource;
 use novarocks_parser::{
-    ast::{self as ast, Expr, ObjectName, Query, Select, SelectItem, SetExpr, TableFactor},
+    ast::{self as ast, Expr, ObjectName, Query, Select, SelectItem, SetExpr},
     printer,
 };
 use novarocks_type_contract::{
@@ -128,8 +128,8 @@ fn validate_imv_aggregate_star_set_expr(expr: &SetExpr) -> Result<(), AnalyzeErr
             }
             Ok(())
         }
-        SetExpr::Query(query) => validate_imv_aggregate_star_set_expr(query.body.as_ref()),
-        SetExpr::Values(_) => Ok(()),
+        SetExpr::Query(query) => validate_imv_aggregate_star_set_expr(query.query.body.as_ref()),
+        SetExpr::Values(_) | SetExpr::Table(_) => Ok(()),
     }
 }
 
@@ -2101,7 +2101,7 @@ fn first_union_branch_query(query: &Query) -> Result<Query, String> {
     // This private wrapper selects the actual first source branch, without
     // rebuilding the source set-operation association or its inputs.
     let mut branch = query.clone();
-    branch.body = Box::new((*body).clone());
+    branch.body = ast::AstBox::new((*body).clone());
     Ok(branch)
 }
 
@@ -2357,31 +2357,40 @@ pub fn extract_aggregate_sql_calls(query: &Query) -> Result<SqlMvAggregateCalls,
 }
 
 /// Extract the table names and aliases from a two-relation plain SELECT join.
+fn direct_join(select: &Select) -> Option<&ast::Join> {
+    let ast::Relation::Join(join) = select.from.as_ref()? else {
+        return None;
+    };
+    if join.kind == ast::JoinType::Implicit {
+        return None;
+    }
+    Some(join)
+}
+fn plain_table(relation: &ast::Relation) -> Option<(&ast::Table, Option<&ast::AliasedRelation>)> {
+    match relation {
+        ast::Relation::Table(table) => Some((table, None)),
+        ast::Relation::Aliased(alias)
+            if !alias.column_names.as_ref().is_some_and(Vec::is_empty) =>
+        {
+            if let ast::Relation::Table(table) = alias.relation.as_ref() {
+                Some((table, Some(alias)))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn extract_join_aliases(query: &Query) -> Result<SqlMvJoinAliases, String> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(
             "extract_join_aliases: expected a plain SELECT body, not a set operation".to_string(),
         );
     };
-    let [from] = select.from.as_slice() else {
-        return Err(
-            "extract_join_aliases: expected exactly one FROM clause entry for a two-relation join"
-                .to_string(),
-        );
-    };
-    let [join] = from.joins.as_slice() else {
-        if from.joins.is_empty() {
-            return Err(
-                "extract_join_aliases: expected a two-relation join (FROM ... JOIN ...), but the FROM clause has no joins".to_string(),
-            );
-        }
-        return Err(format!(
-            "extract_join_aliases: expected exactly one JOIN, found {}",
-            from.joins.len()
-        ));
-    };
-    let (left_name, left_alias) = table_factor_name_and_alias(&from.relation)?;
-    let (right_name, right_alias) = table_factor_name_and_alias(&join.relation)?;
+    let join = direct_join(select).ok_or_else(|| "extract_join_aliases: expected a two-relation join (FROM ... JOIN ...), but the FROM clause has no joins".to_string())?;
+    let (left_name, left_alias) = table_factor_name_and_alias(&join.left)?;
+    let (right_name, right_alias) = table_factor_name_and_alias(&join.right)?;
     Ok(SqlMvJoinAliases {
         left_table: printer::print_object_name(&left_name),
         left_alias,
@@ -2428,11 +2437,9 @@ pub fn extract_refresh_join_analysis(query: &Query) -> Result<SqlMvRefreshJoinAn
     let SetExpr::Select(select) = query.body.as_ref() else {
         unreachable!("direct join aliases require SELECT");
     };
-    let join = &select.from[0].joins[0];
-    match (&join.operator, &join.constraint) {
-        (ast::JoinOperator::Cross, ast::JoinConstraint::None) => {
-            Ok(SqlMvRefreshJoinAnalysis::ZeroKeyCrossJoin)
-        }
+    let join = direct_join(select).expect("direct join aliases require Join");
+    match (&join.kind, &join.criteria) {
+        (ast::JoinType::Cross, None) => Ok(SqlMvRefreshJoinAnalysis::ZeroKeyCrossJoin),
         _ => extract_join_equality_predicates(query).map(SqlMvRefreshJoinAnalysis::InnerEquiJoin),
     }
 }
@@ -2454,27 +2461,25 @@ pub fn extract_join_equality_predicates(
                 .to_string(),
         );
     };
-    let [from] = select.from.as_slice() else {
-        return Err(
-            "extract_join_equality_predicates: expected exactly one FROM clause entry".to_string(),
-        );
-    };
-    let [join] = from.joins.as_slice() else {
-        return Err(format!(
-            "extract_join_equality_predicates: expected exactly one JOIN, found {}",
-            from.joins.len()
-        ));
-    };
+    let join = direct_join(select)
+        .ok_or_else(|| "extract_join_equality_predicates: expected exactly one JOIN".to_string())?;
     if !matches!(
-        join.operator,
-        ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit
+        join.kind,
+        ast::JoinType::Inner
+            | ast::JoinType::Legacy(
+                ast::legacy::JoinOperator::Inner | ast::legacy::JoinOperator::InnerExplicit
+            )
     ) {
         return Err(format!(
             "extract_join_equality_predicates: incremental join refresh supports an inner join, not {:?}",
-            join.operator
+            join.kind
         ));
     }
-    let ast::JoinConstraint::On(condition) = &join.constraint else {
+    let Some(ast::JoinCriteria::On(ast::JoinOn {
+        expression: condition,
+        ..
+    })) = &join.criteria
+    else {
         return Err(
             "extract_join_equality_predicates: incremental join refresh requires an ON condition"
                 .to_string(),
@@ -2560,19 +2565,20 @@ pub fn extract_single_scan_table_fqn(query: &Query) -> Result<String, String> {
                 .to_string(),
         );
     };
-    let [from] = select.from.as_slice() else {
-        return Err(
-            "extract_single_scan_table_fqn: expected exactly one FROM clause entry for a single scan"
-                .to_string(),
-        );
-    };
-    if !from.joins.is_empty() {
+    let relation = select.from.as_ref().ok_or_else(|| "extract_single_scan_table_fqn: expected exactly one FROM clause entry for a single scan".to_string())?;
+    if let ast::Relation::Join(join) = relation {
+        if join.kind == ast::JoinType::Implicit {
+            return Err(
+                "extract_single_scan_table_fqn: expected exactly one FROM clause entry for a single scan"
+                    .to_string(),
+            );
+        }
         return Err(
             "extract_single_scan_table_fqn: expected a single-scan FROM, but the FROM clause has joins"
                 .to_string(),
         );
     }
-    let (name, _alias) = table_factor_name_and_alias(&from.relation)?;
+    let (name, _alias) = table_factor_name_and_alias(relation)?;
     Ok(printer::print_object_name(&name))
 }
 
@@ -2661,8 +2667,8 @@ fn flatten_union_all<'a>(body: &'a SetExpr, out: &mut Vec<&'a SetExpr>) -> Resul
             Ok(())
         }
         SetExpr::Query(inner) => {
-            reject_unsupported_query_clauses(inner).map_err(|_| union_all_error())?;
-            flatten_union_all(inner.body.as_ref(), out)
+            reject_unsupported_query_clauses(&inner.query).map_err(|_| union_all_error())?;
+            flatten_union_all(inner.query.body.as_ref(), out)
         }
         _ => Err(union_all_error()),
     }
@@ -2670,7 +2676,7 @@ fn flatten_union_all<'a>(body: &'a SetExpr, out: &mut Vec<&'a SetExpr>) -> Resul
 
 fn wrap_setexpr_as_query(outer: &Query, body: &SetExpr) -> Query {
     let mut query = outer.clone();
-    query.body = Box::new(body.clone());
+    query.body = ast::AstBox::new(body.clone());
     query
 }
 
@@ -2759,22 +2765,21 @@ fn classify_aggregate_mv_query(query: &Query) -> Result<AggregateMvShape, String
 }
 
 fn extract_union_all_fan_in_bases(select: &Select) -> Result<Vec<ObjectName>, String> {
-    let [from] = select.from.as_slice() else {
+    let Some(relation) = &select.from else {
         return Ok(Vec::new());
     };
-    if !from.joins.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let TableFactor::Derived {
-        lateral, subquery, ..
-    } = &from.relation
-    else {
-        return Ok(Vec::new());
+    let relation = if let ast::Relation::Aliased(node) = relation {
+        node.relation.as_ref()
+    } else {
+        relation
     };
-    if *lateral {
+    if matches!(relation, ast::Relation::Lateral(_)) {
         return Err(aggregate_error());
     }
+    let ast::Relation::TableSubquery(node) = relation else {
+        return Ok(Vec::new());
+    };
+    let subquery = &node.query;
     reject_unsupported_query_clauses(subquery).map_err(|_| aggregate_error())?;
     if !matches!(subquery.body.as_ref(), SetExpr::SetOperation(_)) {
         return Ok(Vec::new());
@@ -2895,25 +2900,27 @@ fn classify_join_projection_filter_mv_query(
 fn classify_join_projection_filter_mv_query_for_select(
     select: &Select,
 ) -> Result<JoinProjectionFilterMvShape, String> {
-    let [from] = select.from.as_slice() else {
-        return Err(join_projection_filter_error());
-    };
-    let [join] = from.joins.as_slice() else {
+    let join = direct_join(select).ok_or_else(join_projection_filter_error)?;
+    // The original sequence of JOINs is lowered as a left-deep relation tree.
+    if matches!(join.left.as_ref(), ast::Relation::Join(_)) {
         return Err("incremental join MV requires exactly two Iceberg base tables".to_string());
-    };
+    }
     if !matches!(
-        join.operator,
-        ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit
+        join.kind,
+        ast::JoinType::Inner
+            | ast::JoinType::Legacy(
+                ast::legacy::JoinOperator::Inner | ast::legacy::JoinOperator::InnerExplicit
+            )
     ) {
         return Err("incremental join MV supports only two-table inner equi-join".to_string());
     }
-    let (left_table, left_alias) = table_factor_name_and_alias(&from.relation)?;
-    let (right_table, right_alias) = table_factor_name_and_alias(&join.relation)?;
+    let (left_table, left_alias) = table_factor_name_and_alias(&join.left)?;
+    let (right_table, right_alias) = table_factor_name_and_alias(&join.right)?;
     if left_alias.eq_ignore_ascii_case(&right_alias) {
         return Err("incremental join MV requires distinct join aliases".to_string());
     }
-    let condition = match &join.constraint {
-        ast::JoinConstraint::On(expr) => expr,
+    let condition = match &join.criteria {
+        Some(ast::JoinCriteria::On(on)) => &on.expression,
         _ => return Err("incremental join MV requires JOIN ... ON equi predicates".to_string()),
     };
     let mut join_keys = Vec::new();
@@ -2930,18 +2937,17 @@ fn classify_join_projection_filter_mv_query_for_select(
     })
 }
 
-pub fn table_factor_name_and_alias(factor: &TableFactor) -> Result<(ObjectName, String), String> {
-    let TableFactor::Table {
-        name,
-        alias,
-        version,
-        metadata,
-        ..
-    } = factor
-    else {
-        return Err("incremental join MV base relation must be a table".to_string());
-    };
-    if metadata.is_some() || version.is_some() || !is_three_part_object_name(name) {
+pub fn table_factor_name_and_alias(
+    relation: &ast::Relation,
+) -> Result<(ObjectName, String), String> {
+    let (table, alias) = plain_table(relation)
+        .ok_or_else(|| "incremental join MV base relation must be a table".to_string())?;
+    let name = &table.name;
+    if crate::analyzer::TableNameView::new(name).metadata.is_some()
+        || table.query_period.is_some()
+        || table.branch.is_some()
+        || !is_three_part_object_name(name)
+    {
         return Err(
             "incremental join MV base relation must be a plain 3-part Iceberg table".to_string(),
         );
@@ -2951,11 +2957,12 @@ pub fn table_factor_name_and_alias(factor: &TableFactor) -> Result<(ObjectName, 
         .last()
         .map(|part| part.value.clone())
         .ok_or_else(|| "incremental join MV table name has no identifier".to_string())?;
-    let alias = alias
-        .as_ref()
-        .map(|a| a.name.value.clone())
-        .unwrap_or(fallback);
-    Ok((name.clone(), alias))
+    Ok((
+        name.clone(),
+        alias
+            .map(|alias| alias.alias.value.clone())
+            .unwrap_or(fallback),
+    ))
 }
 
 fn collect_equi_join_keys(
@@ -3032,7 +3039,7 @@ fn is_probably_join_query(query: &Query) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    select.from.len() > 1 || select.from.iter().any(|from| !from.joins.is_empty())
+    matches!(select.from.as_ref(), Some(ast::Relation::Join(_)))
 }
 
 fn join_projection_filter_error() -> String {
@@ -3088,26 +3095,14 @@ fn extract_single_base_table(
     shape_error: fn() -> String,
     single_table_error: fn() -> String,
 ) -> Result<ObjectName, String> {
-    let [from] = select.from.as_slice() else {
-        return Err(single_table_error());
-    };
-    if !from.joins.is_empty() {
-        return Err(single_table_error());
-    }
-
-    let TableFactor::Table {
-        name,
-        version,
-        metadata,
-        ..
-    } = &from.relation
-    else {
-        return Err(shape_error());
-    };
-    if metadata.is_some() || version.is_some() {
-        return Err(single_table_error());
-    }
-    if !is_three_part_object_name(name) {
+    let relation = select.from.as_ref().ok_or_else(single_table_error)?;
+    let (table, _) = plain_table(relation).ok_or_else(shape_error)?;
+    let name = &table.name;
+    if table.query_period.is_some()
+        || table.branch.is_some()
+        || crate::analyzer::TableNameView::new(name).metadata.is_some()
+        || !is_three_part_object_name(name)
+    {
         return Err(single_table_error());
     }
     Ok(name.clone())

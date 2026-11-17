@@ -772,7 +772,9 @@ mod tests {
             ("VALUES (NULL), (NULL)", Vec::new()),
             (
                 "SELECT CASE WHEN TRUE THEN x ELSE NULL END FROM (VALUES (NULL)) s(x)",
-                vec![super::super::SqlConstantQueryStep::SelectFromDerived { from: 0 }],
+                vec![super::super::SqlConstantQueryStep::SelectFromDerived {
+                    relation_path: vec![super::super::SqlRelationStep::Aliased],
+                }],
             ),
         ] {
             let statement = SqlStatementInput::query_with_expression_constants(
@@ -840,7 +842,9 @@ mod tests {
                 .unwrap()
                 .with_literal_contexts(
                     vec![super::super::SqlWriteLiteralContext::new(
-                        vec![super::super::SqlConstantQueryStep::SelectFromDerived { from: 0 }],
+                        vec![super::super::SqlConstantQueryStep::SelectFromDerived {
+                            relation_path: vec![super::super::SqlRelationStep::Aliased],
+                        }],
                         super::super::SqlConstantExpressionSite::SelectProjection { column: 0 },
                         0,
                     )]

@@ -111,7 +111,7 @@ fn lower_object_name(name: &ParsedObjectName) -> ObjectName {
 }
 
 fn lower_alias(
-    alias: &Option<novarocks_parser::ast::TableAlias>,
+    alias: &Option<novarocks_parser::ast::legacy::TableAlias>,
 ) -> Result<Option<String>, String> {
     alias
         .as_ref()

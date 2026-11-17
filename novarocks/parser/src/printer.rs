@@ -165,10 +165,12 @@ impl Printer {
         self.write_query_with_properties(query, &query.session_properties);
     }
 
+    #[recursive::recursive]
+
     fn write_query_with_properties(&mut self, query: &Query, properties: &[SessionProperty]) {
         let mut body = query.body.as_ref();
         while let SetExpr::Query(inner) = body {
-            body = &inner.body;
+            body = &inner.query.body;
         }
         let legacy_select = query.functions.is_empty()
             && matches!(body, SetExpr::Select(_))
@@ -228,9 +230,9 @@ impl Printer {
                 self.output.push_str(", ");
             }
             self.write_ident(&cte.name);
-            if !cte.columns.is_empty() {
+            if let Some(columns) = &cte.columns {
                 self.output.push('(');
-                self.write_ident_list(&cte.columns);
+                self.write_ident_list(columns);
                 self.output.push(')');
             }
             self.output.push_str(" AS (");
@@ -248,7 +250,7 @@ impl Printer {
             SetExpr::Select(select) => self.write_select_with_properties(select, properties),
             SetExpr::Query(query) => {
                 self.output.push('(');
-                self.write_query_with_properties(query, properties);
+                self.write_query_with_properties(&query.query, properties);
                 self.output.push(')');
             }
             _ => self.write_set_expr(expression),
@@ -260,9 +262,13 @@ impl Printer {
         match expression {
             SetExpr::Select(select) => self.write_select(select),
             SetExpr::Values(values) => self.write_values(values),
+            SetExpr::Table(table) => {
+                self.output.push_str("TABLE ");
+                self.write_table(table);
+            }
             SetExpr::Query(query) => {
                 self.output.push('(');
-                self.write_query(query);
+                self.write_query(&query.query);
                 self.output.push(')');
             }
             SetExpr::SetOperation(operation) => {
@@ -351,14 +357,9 @@ impl Printer {
                 self.write_select_item(item);
             }
         }
-        if !select.from.is_empty() {
+        if let Some(relation) = &select.from {
             self.output.push_str(" FROM ");
-            for (index, relation) in select.from.iter().enumerate() {
-                if index != 0 {
-                    self.output.push_str(", ");
-                }
-                self.write_table_with_joins(relation);
-            }
+            self.write_relation(relation);
         }
         if let Some(selection) = &select.selection {
             self.output.push_str(" WHERE ");
@@ -536,171 +537,402 @@ impl Printer {
         });
     }
 
-    fn write_table_with_joins(&mut self, relation: &TableWithJoins) {
-        self.write_table_factor(&relation.relation);
-        for join in &relation.joins {
-            self.output.push(' ');
-            self.write_join(join);
-        }
-    }
-
-    fn write_table_factor(&mut self, factor: &TableFactor) {
-        match factor {
-            TableFactor::JsonTable { table, alias, .. } => {
-                self.write_json_table(table);
-                if let Some(alias) = alias {
-                    self.output.push(' ');
-                    self.write_table_alias(alias);
-                }
-            }
-
-            TableFactor::Table {
-                name,
-                metadata,
-                alias,
-                version,
-                ..
-            } => {
-                self.write_table_name(name, metadata.as_ref());
-                if let Some(version) = version {
-                    self.write_table_version(version);
-                }
-                if let Some(alias) = alias {
-                    self.output.push(' ');
-                    self.write_table_alias(alias);
-                }
-            }
-            TableFactor::Derived {
-                lateral,
-                subquery,
-                alias,
-                ..
-            } => {
-                if *lateral {
-                    self.output.push_str("LATERAL ");
-                }
+    #[recursive::recursive]
+    fn write_relation(&mut self, relation: &Relation) {
+        match relation {
+            Relation::Table(node) => self.write_table(node),
+            Relation::TableSubquery(node) => {
                 self.output.push('(');
-                self.write_query(subquery);
+                self.write_query(&node.query);
                 self.output.push(')');
-                if let Some(alias) = alias {
-                    self.output.push(' ');
-                    self.write_table_alias(alias);
+            }
+            Relation::Lateral(node) => {
+                self.output.push_str("LATERAL (");
+                self.write_query(&node.query);
+                self.output.push(')');
+            }
+            Relation::Aliased(node) => {
+                let parentheses = matches!(node.relation.as_ref(), Relation::Join(_));
+                if parentheses {
+                    self.output.push('(');
+                }
+                self.write_relation(&node.relation);
+                if parentheses {
+                    self.output.push(')');
+                }
+                self.output.push_str(" AS ");
+                self.write_ident(&node.alias);
+                if let Some(columns) = &node.column_names {
+                    self.output.push('(');
+                    self.write_ident_list(columns);
+                    self.output.push(')');
                 }
             }
-            TableFactor::TableFunction {
-                lateral,
-                syntax,
-                expr,
-                alias,
-                ..
-            } => {
-                if *lateral {
+            Relation::Unnest(node) => {
+                self.output.push_str("UNNEST(");
+                self.write_expr_list(&node.expressions);
+                self.output.push(')');
+                if node.with_ordinality {
+                    self.output.push_str(" WITH ORDINALITY");
+                }
+            }
+            Relation::Join(node) => self.write_relation_join(node),
+            Relation::Sampled(node) => {
+                self.write_relation_suffix(&node.relation);
+                self.output.push_str(match node.kind {
+                    SamplingType::Bernoulli => " TABLESAMPLE BERNOULLI (",
+                    SamplingType::System => " TABLESAMPLE SYSTEM (",
+                });
+                self.write_expr(&node.sample_percentage);
+                self.output.push(')');
+            }
+            Relation::Nearest(node) => {
+                self.output.push_str("NEAREST (FROM ");
+                self.write_relation(&node.relation);
+                if let Some(expr) = &node.where_clause {
+                    self.output.push_str(" WHERE ");
+                    self.write_expr(expr);
+                }
+                self.output.push_str(" MATCH ");
+                self.write_expr(&node.match_expression);
+                self.output.push(')');
+            }
+            Relation::Pivot(node) => self.write_pivot(node),
+            Relation::TableFunction(node) => self.write_table_function(node),
+            Relation::JsonTable(node) => self.write_json_table(node),
+            Relation::PatternRecognition(node) => self.write_pattern_recognition(node),
+            Relation::LegacyTableFunction(node) => {
+                if node.lateral {
                     self.output.push_str("LATERAL ");
                 }
-                match syntax {
-                    crate::ast::TableFunctionSyntax::TableWrapper => {
+                match node.syntax {
+                    crate::ast::legacy::TableFunctionSyntax::TableWrapper => {
                         self.output.push_str("TABLE(");
-                        self.write_expr(expr);
+                        self.write_expr(&node.expr);
                         self.output.push(')');
                     }
-                    crate::ast::TableFunctionSyntax::BareCall => self.write_expr(expr),
-                }
-                if let Some(alias) = alias {
-                    self.output.push(' ');
-                    self.write_table_alias(alias);
-                }
-            }
-            TableFactor::Unnest {
-                keyword,
-                lateral,
-                array_exprs,
-                with_offset,
-                alias,
-                ..
-            } => {
-                if *lateral {
-                    self.output.push_str("LATERAL ");
-                }
-                self.write_ident(keyword);
-                self.output.push('(');
-                self.write_expr_list(array_exprs);
-                self.output.push(')');
-                if *with_offset {
-                    self.output.push_str(" WITH OFFSET");
-                }
-                if let Some(alias) = alias {
-                    self.output.push(' ');
-                    self.write_table_alias(alias);
-                }
-            }
-            TableFactor::NestedJoin {
-                table_with_joins,
-                alias,
-                ..
-            } => {
-                self.output.push('(');
-                self.write_table_with_joins(table_with_joins);
-                self.output.push(')');
-                if let Some(alias) = alias {
-                    self.output.push(' ');
-                    self.write_table_alias(alias);
+                    crate::ast::legacy::TableFunctionSyntax::BareCall => {
+                        self.write_expr(&node.expr)
+                    }
                 }
             }
         }
     }
-
-    fn write_table_alias(&mut self, alias: &TableAlias) {
-        if alias.explicit_as {
-            self.output.push_str("AS ");
+    #[recursive::recursive]
+    fn write_table(&mut self, node: &Table) {
+        self.write_object_name(&node.name);
+        if let Some(period) = &node.query_period {
+            self.output.push_str(match period.range_type {
+                QueryPeriodRangeType::Timestamp => " FOR SYSTEM_TIME AS OF ",
+                QueryPeriodRangeType::Version => " FOR VERSION AS OF ",
+            });
+            assert!(
+                period.start.is_none(),
+                "query period start has no public Trino constructor"
+            );
+            self.write_expr(
+                period
+                    .end
+                    .as_ref()
+                    .expect("query period requires its actual end expression"),
+            );
         }
-        self.write_ident(&alias.name);
-        if !alias.columns.is_empty() {
+        if let Some(branch) = &node.branch {
+            self.output.push_str(" @ ");
+            self.write_ident(branch);
+        }
+    }
+    #[recursive::recursive]
+    fn write_relation_suffix(&mut self, relation: &Relation) {
+        let parens = matches!(
+            relation,
+            Relation::Aliased(_)
+                | Relation::Sampled(_)
+                | Relation::PatternRecognition(_)
+                | Relation::Pivot(_)
+                | Relation::Join(_)
+        );
+        if parens {
             self.output.push('(');
-            self.write_ident_list(&alias.columns);
+        }
+        self.write_relation(relation);
+        if parens {
             self.output.push(')');
         }
     }
-
-    fn write_table_version(&mut self, version: &TableVersion) {
-        self.output.push_str(match version.kind {
-            TableVersionKind::ForSystemTimeAsOf => " FOR SYSTEM_TIME AS OF ",
-            TableVersionKind::ForVersionAsOf => " FOR VERSION AS OF ",
-        });
-        self.write_expr(&version.value);
+    #[recursive::recursive]
+    fn write_join_operand(&mut self, relation: &Relation, parent: JoinType, right: bool) {
+        let parentheses = matches!(relation,Relation::Join(child) if if parent==JoinType::Implicit {right && child.kind==JoinType::Implicit} else {right || child.kind==JoinType::Implicit});
+        if parentheses {
+            self.output.push('(');
+        }
+        self.write_relation(relation);
+        if parentheses {
+            self.output.push(')');
+        }
     }
-
-    fn write_join(&mut self, join: &Join) {
-        if matches!(join.constraint, JoinConstraint::Natural(_)) {
+    #[recursive::recursive]
+    fn write_relation_join(&mut self, node: &Join) {
+        self.write_join_operand(&node.left, node.kind, false);
+        if node.kind == JoinType::Implicit {
+            self.output.push_str(", ");
+            self.write_join_operand(&node.right, node.kind, true);
+            return;
+        }
+        self.output.push(' ');
+        if matches!(node.criteria, Some(JoinCriteria::Natural(_))) {
             self.output.push_str("NATURAL ");
         }
-        self.output.push_str(match join.operator {
-            JoinOperator::Inner => "JOIN ",
-            JoinOperator::InnerExplicit => "INNER JOIN ",
-            JoinOperator::LeftOuter => "LEFT JOIN ",
-            JoinOperator::LeftOuterExplicit => "LEFT OUTER JOIN ",
-            JoinOperator::RightOuter => "RIGHT JOIN ",
-            JoinOperator::RightOuterExplicit => "RIGHT OUTER JOIN ",
-            JoinOperator::FullOuter => "FULL JOIN ",
-            JoinOperator::FullOuterExplicit => "FULL OUTER JOIN ",
-            JoinOperator::Cross => "CROSS JOIN ",
-            JoinOperator::LeftSemi => "LEFT SEMI JOIN ",
-            JoinOperator::RightSemi => "RIGHT SEMI JOIN ",
-            JoinOperator::LeftAnti => "LEFT ANTI JOIN ",
-            JoinOperator::RightAnti => "RIGHT ANTI JOIN ",
+        self.output.push_str(match node.kind {
+            JoinType::Cross => "CROSS JOIN ",
+            JoinType::Inner => "JOIN ",
+            JoinType::Left => "LEFT JOIN ",
+            JoinType::Right => "RIGHT JOIN ",
+            JoinType::Full => "FULL JOIN ",
+            JoinType::Implicit => unreachable!(),
+            JoinType::Legacy(operator) => match operator {
+                crate::ast::legacy::JoinOperator::Inner => "JOIN ",
+                crate::ast::legacy::JoinOperator::InnerExplicit => "INNER JOIN ",
+                crate::ast::legacy::JoinOperator::LeftOuter => "LEFT JOIN ",
+                crate::ast::legacy::JoinOperator::LeftOuterExplicit => "LEFT OUTER JOIN ",
+                crate::ast::legacy::JoinOperator::RightOuter => "RIGHT JOIN ",
+                crate::ast::legacy::JoinOperator::RightOuterExplicit => "RIGHT OUTER JOIN ",
+                crate::ast::legacy::JoinOperator::FullOuter => "FULL JOIN ",
+                crate::ast::legacy::JoinOperator::FullOuterExplicit => "FULL OUTER JOIN ",
+                crate::ast::legacy::JoinOperator::Cross => "CROSS JOIN ",
+                crate::ast::legacy::JoinOperator::LeftSemi => "LEFT SEMI JOIN ",
+                crate::ast::legacy::JoinOperator::RightSemi => "RIGHT SEMI JOIN ",
+                crate::ast::legacy::JoinOperator::LeftAnti => "LEFT ANTI JOIN ",
+                crate::ast::legacy::JoinOperator::RightAnti => "RIGHT ANTI JOIN ",
+            },
         });
-        self.write_table_factor(&join.relation);
-        match &join.constraint {
-            JoinConstraint::None | JoinConstraint::Natural(_) => {}
-            JoinConstraint::On(expr) => {
+        self.write_join_operand(&node.right, node.kind, true);
+        match &node.criteria {
+            Some(JoinCriteria::On(n)) => {
                 self.output.push_str(" ON ");
-                self.write_expr(expr);
+                self.write_expr(&n.expression);
             }
-            JoinConstraint::Using { columns, .. } => {
+            Some(JoinCriteria::Using(n)) => {
                 self.output.push_str(" USING (");
+                self.write_ident_list(&n.columns);
+                self.output.push(')');
+            }
+            _ => {}
+        }
+    }
+    #[recursive::recursive]
+    fn write_table_function(&mut self, node: &TableFunctionInvocation) {
+        self.output.push_str("TABLE(");
+        self.write_object_name(&node.name);
+        self.output.push('(');
+        for (index, argument) in node.arguments.iter().enumerate() {
+            if index > 0 {
+                self.output.push_str(", ");
+            }
+            if let Some(name) = &argument.name {
+                self.write_ident(name);
+                self.output.push_str(" => ");
+            }
+            match &argument.value {
+                TableFunctionArgumentValue::Expression(expr) => self.write_expr(expr),
+                TableFunctionArgumentValue::Descriptor(node) => {
+                    if let Some(descriptor) = &node.descriptor {
+                        self.output.push_str("DESCRIPTOR(");
+                        for (index, field) in descriptor.fields.iter().enumerate() {
+                            if index > 0 {
+                                self.output.push_str(", ");
+                            }
+                            self.write_ident(&field.name);
+                            if let Some(ty) = &field.data_type {
+                                self.output.push(' ');
+                                self.write_type_name(ty);
+                            }
+                        }
+                        self.output.push(')');
+                    } else {
+                        self.output.push_str("CAST(NULL AS DESCRIPTOR)");
+                    }
+                }
+                TableFunctionArgumentValue::Table(node) => self.write_table_argument(node),
+            }
+        }
+        if !node.copartitioning.is_empty() {
+            self.output.push_str(" COPARTITION ");
+            for (index, group) in node.copartitioning.iter().enumerate() {
+                if index > 0 {
+                    self.output.push_str(", ");
+                }
+                self.output.push('(');
+                for (index, name) in group.iter().enumerate() {
+                    if index > 0 {
+                        self.output.push_str(", ");
+                    }
+                    self.write_object_name(name);
+                }
+                self.output.push(')');
+            }
+        }
+        self.output.push_str("))");
+    }
+    #[recursive::recursive]
+    fn write_table_argument(&mut self, node: &TableFunctionTableArgument) {
+        let (relation, alias) = match node.table.as_ref() {
+            Relation::Aliased(alias) => (alias.relation.as_ref(), Some(alias.as_ref())),
+            other => (other, None),
+        };
+        self.output.push_str("TABLE(");
+        match relation {
+            Relation::TableSubquery(query) => self.write_query(&query.query),
+            other => self.write_relation(other),
+        }
+        self.output.push(')');
+        if let Some(alias) = alias {
+            self.output.push_str(" AS ");
+            self.write_ident(&alias.alias);
+            if let Some(columns) = &alias.column_names {
+                self.output.push('(');
                 self.write_ident_list(columns);
                 self.output.push(')');
             }
         }
+        if let Some(partition) = &node.partition_by {
+            self.output.push_str(" PARTITION BY ");
+            if partition.is_empty() {
+                self.output.push_str("()");
+            } else {
+                self.write_expr_list(partition);
+            }
+        }
+        if let Some(empty) = &node.empty_table_treatment {
+            self.output.push_str(match empty.treatment {
+                EmptyTableTreatmentKind::Keep => " KEEP WHEN EMPTY",
+                EmptyTableTreatmentKind::Prune => " PRUNE WHEN EMPTY",
+            });
+        }
+        if let Some(order) = &node.order_by {
+            self.output.push_str(" ORDER BY ");
+            self.write_order_by_list(&order.items);
+        }
+    }
+    #[recursive::recursive]
+    fn write_pivot(&mut self, node: &Pivot) {
+        self.write_relation_suffix(&node.input);
+        self.output.push_str(" PIVOT (");
+        for (index, aggregation) in node.aggregations.iter().enumerate() {
+            if index > 0 {
+                self.output.push_str(", ");
+            }
+            self.write_expr(&aggregation.expression);
+            if let Some(alias) = &aggregation.alias {
+                self.output.push_str(" AS ");
+                self.write_ident(alias);
+            }
+        }
+        self.output.push_str(" FOR ");
+        let multi = node.pivot_columns.len() != 1;
+        if multi {
+            self.output.push('(');
+        }
+        self.write_expr_list(&node.pivot_columns);
+        if multi {
+            self.output.push(')');
+        }
+        self.output.push_str(" IN (");
+        for (index, group) in node.value_groups.iter().enumerate() {
+            if index > 0 {
+                self.output.push_str(", ");
+            }
+            let multi = group.values.len() != 1;
+            if multi {
+                self.output.push('(');
+            }
+            self.write_expr_list(&group.values);
+            if multi {
+                self.output.push(')');
+            }
+            if let Some(alias) = &group.alias {
+                self.output.push_str(" AS ");
+                self.write_ident(alias);
+            }
+        }
+        self.output.push(')');
+        if let Some(group) = &node.group_by {
+            self.write_group_by(group);
+        }
+        self.output.push(')');
+    }
+    #[recursive::recursive]
+    fn write_pattern_recognition(&mut self, node: &PatternRecognitionRelation) {
+        self.write_relation_suffix(&node.input);
+        self.output.push_str(" MATCH_RECOGNIZE (");
+        if !node.partition_by.is_empty() {
+            self.output.push_str("PARTITION BY ");
+            self.write_expr_list(&node.partition_by);
+            self.output.push(' ');
+        }
+        if let Some(order) = &node.order_by {
+            self.output.push_str("ORDER BY ");
+            self.write_order_by_list(&order.items);
+            self.output.push(' ');
+        }
+        if !node.measures.is_empty() {
+            self.output.push_str("MEASURES ");
+            for (index, measure) in node.measures.iter().enumerate() {
+                if index > 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_expr(&measure.expression);
+                self.output.push_str(" AS ");
+                self.write_ident(&measure.name);
+            }
+            self.output.push(' ');
+        }
+        if let Some(rows) = node.rows_per_match {
+            self.output.push_str(match rows {
+                RowsPerMatch::One => "ONE ROW PER MATCH ",
+                RowsPerMatch::AllShowEmpty => "ALL ROWS PER MATCH SHOW EMPTY MATCHES ",
+                RowsPerMatch::AllOmitEmpty => "ALL ROWS PER MATCH OMIT EMPTY MATCHES ",
+                RowsPerMatch::AllWithUnmatched => "ALL ROWS PER MATCH WITH UNMATCHED ROWS ",
+                RowsPerMatch::Window => {
+                    unreachable!("WINDOW rows-per-match cannot occur in MATCH_RECOGNIZE")
+                }
+            });
+        }
+        if let Some(skip) = &node.after_match_skip_to {
+            self.write_skip_to(skip);
+            self.output.push(' ');
+        }
+        if let Some(mode) = &node.pattern_search_mode {
+            self.output.push_str(match mode.mode {
+                PatternSearchModeKind::Initial => "INITIAL ",
+                PatternSearchModeKind::Seek => "SEEK ",
+            });
+        }
+        self.output.push_str("PATTERN (");
+        self.write_row_pattern(&node.pattern);
+        self.output.push(')');
+        if !node.subsets.is_empty() {
+            self.output.push_str(" SUBSET ");
+            for (index, subset) in node.subsets.iter().enumerate() {
+                if index > 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_ident(&subset.name);
+                self.output.push_str(" = (");
+                self.write_ident_list(&subset.identifiers);
+                self.output.push(')');
+            }
+        }
+        self.output.push_str(" DEFINE ");
+        for (index, definition) in node.variable_definitions.iter().enumerate() {
+            if index > 0 {
+                self.output.push_str(", ");
+            }
+            self.write_ident(&definition.name);
+            self.output.push_str(" AS ");
+            self.write_expr(&definition.expression);
+        }
+        self.output.push(')');
     }
 
     #[recursive::recursive]
@@ -935,6 +1167,7 @@ impl Printer {
         }
     }
 
+    #[recursive::recursive]
     fn write_expr(&mut self, expression: &Expr) {
         match expression {
             Expr::JsonConstructor(node) => self.write_json_constructor(node),
@@ -1005,14 +1238,6 @@ impl Printer {
 
     fn write_object_name(&mut self, name: &ObjectName) {
         self.write_ident_list_with_separator(&name.parts, ".");
-    }
-
-    fn write_table_name(&mut self, name: &ObjectName, metadata: Option<&Ident>) {
-        self.write_object_name(name);
-        if let Some(metadata) = metadata {
-            self.output.push('$');
-            self.write_ident(metadata);
-        }
     }
 
     #[recursive::recursive]
@@ -2599,18 +2824,18 @@ mod tests {
     #[test]
     fn renders_query_relations_and_modifiers() {
         let query = Query {
-            session_properties: Vec::new(),
-            functions: Vec::new(),
+            session_properties: crate::ast::AstVec::new(),
+            functions: crate::ast::AstVec::new(),
             with: Some(With {
                 recursive: false,
-                ctes: vec![Cte {
+                ctes: (vec![Cte {
                     name: ident("source"),
-                    columns: Vec::new(),
-                    query: Box::new(Query {
-                        session_properties: Vec::new(),
-                        functions: Vec::new(),
+                    columns: None,
+                    query: crate::ast::AstBox::new(Query {
+                        session_properties: crate::ast::AstVec::new(),
+                        functions: crate::ast::AstVec::new(),
                         with: None,
-                        body: Box::new(SetExpr::Values(Values {
+                        body: crate::ast::AstBox::new(SetExpr::Values(Values {
                             rows: vec![vec![number("1")]],
                             explicit_row: false,
                             span: span(),
@@ -2619,10 +2844,11 @@ mod tests {
                         span: span(),
                     }),
                     span: span(),
-                }],
+                }])
+                .into(),
                 span: span(),
             }),
-            body: Box::new(SetExpr::Select(Box::new(Select {
+            body: crate::ast::AstBox::new(SetExpr::Select(crate::ast::AstBox::new(Select {
                 quantifier: SelectQuantifier::Distinct {
                     on: vec![identifier("s")],
                     span: span(),
@@ -2633,22 +2859,11 @@ mod tests {
                     explicit_as: true,
                     span: span(),
                 }],
-                from: vec![TableWithJoins {
-                    relation: TableFactor::Table {
-                        name: object_name("source"),
-                        metadata: None,
-                        alias: Some(TableAlias {
-                            name: ident("s"),
-                            columns: Vec::new(),
-                            explicit_as: false,
-                            span: span(),
-                        }),
-                        version: None,
-                        span: span(),
-                    },
-                    joins: Vec::new(),
-                    span: span(),
-                }],
+                from: Some(crate::build::alias(
+                    crate::build::table(object_name("source"), None, None),
+                    ident("s"),
+                    None,
+                )),
                 selection: None,
                 group_by: None,
                 having: None,
@@ -2687,7 +2902,7 @@ mod tests {
                 query: Box::new(query),
                 span: span(),
             })),
-            "EXPLAIN VERBOSE WITH source AS (VALUES (1)) SELECT DISTINCT ON (s) s AS value FROM source s ORDER BY value DESC NULLS LAST OFFSET 2 ROWS LIMIT 10"
+            "EXPLAIN VERBOSE WITH source AS (VALUES (1)) SELECT DISTINCT ON (s) s AS value FROM source AS s ORDER BY value DESC NULLS LAST OFFSET 2 ROWS LIMIT 10"
         );
     }
 

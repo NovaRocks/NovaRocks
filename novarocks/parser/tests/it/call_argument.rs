@@ -43,9 +43,11 @@ fn typed_call() -> Expr {
     expr
 }
 fn statement(expr: Expr) -> Statement {
-    Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(vec![build::item(expr, None, false)], Vec::new(), None, None).unwrap(),
-    ))))
+    Statement::Query(build::query(SetExpr::Select(
+        novarocks_parser::ast::AstBox::new(
+            build::select(vec![build::item(expr, None, false)], None, None, None).unwrap(),
+        ),
+    )))
 }
 
 #[test]
@@ -86,33 +88,30 @@ fn old_producers_wrap_real_original_values_and_arg_spans_without_new_mode_or_nam
     assert_eq!(subscript.as_ref() as *const SubscriptExpr, original_payload);
     assert_eq!(call.arguments[0].span, source_span);
     assert!(call.arguments[0].name.is_none() && call.processing_mode.is_none());
-    // Existing table-function named syntax deliberately retains its current
-    // Binary owner until the separate producer-normalization slice.
-    let parsed =
-        novarocks_parser::parse("SELECT * FROM TABLE(generate_series(end => 5, start => 2))")
-            .unwrap();
+    // Table-function syntax now owns true named argument fields directly.
+    let source = "SELECT * FROM TABLE(generate_series(end => 5, start => 2))";
+    let parsed = novarocks_parser::parse(source).unwrap();
     let Statement::Query(query) = &parsed[0] else {
         panic!("query")
     };
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select")
     };
-    let TableFactor::TableFunction {
-        expr: Expr::FunctionCall(call),
-        ..
-    } = &select.from[0].relation
-    else {
+    let Some(Relation::TableFunction(call)) = &select.from else {
         panic!("table function")
     };
-    for argument in &call.arguments {
-        assert!(argument.name.is_none());
-        let Expr::Binary(binary) = &argument.value else {
-            panic!("original named owner")
+    for (argument, (name, value)) in call.arguments.iter().zip([("end", 5), ("start", 2)]) {
+        let name_node = argument.name.as_ref().unwrap();
+        assert_eq!(name_node.value, name);
+        assert_eq!(&source[name_node.span.start()..name_node.span.end()], name);
+        let TableFunctionArgumentValue::Expression(Expr::Literal(literal)) = &argument.value else {
+            panic!("real literal child")
         };
-        assert_eq!(binary.operator, BinaryOperator::NamedArgument);
-        assert!(matches!(binary.left.as_ref(), Expr::Identifier(_)));
-        assert!(matches!(binary.right.as_ref(), Expr::Literal(_)));
-        assert_eq!(argument.span, binary.span);
+        assert!(matches!(literal.kind,LiteralKind::Long{parsed_value,..} if parsed_value==value));
+        assert_eq!(
+            &source[argument.span.start()..argument.span.end()],
+            format!("{name} => {value}")
+        );
     }
 }
 

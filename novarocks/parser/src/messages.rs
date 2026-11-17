@@ -35,6 +35,40 @@ use crate::StructuralViolation;
 
 pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
     match violation {
+        StructuralViolation::ConflictingTablePeriodAndBranch => {
+            "invalid SQL structure: a table period and branch cannot be combined".to_owned()
+        }
+        StructuralViolation::InvalidJoinCriteria => {
+            "invalid SQL structure: invalid join criteria".to_owned()
+        }
+        StructuralViolation::EmptyJoinUsingColumns => {
+            "invalid SQL structure: empty JOIN USING column list".to_owned()
+        }
+        StructuralViolation::EmptyPivotAggregations => {
+            "invalid SQL structure: empty PIVOT aggregation list".to_owned()
+        }
+        StructuralViolation::EmptyPivotColumns => {
+            "invalid SQL structure: empty PIVOT column list".to_owned()
+        }
+        StructuralViolation::EmptyPivotValueGroups => {
+            "invalid SQL structure: empty PIVOT value-group list".to_owned()
+        }
+        StructuralViolation::EmptyPivotValues => {
+            "invalid SQL structure: empty PIVOT value list".to_owned()
+        }
+        StructuralViolation::EmptyDescriptorFields => {
+            "invalid SQL structure: empty DESCRIPTOR field list".to_owned()
+        }
+        StructuralViolation::EmptyPatternVariableDefinitions => {
+            "invalid SQL structure: empty row-pattern variable definition list".to_owned()
+        }
+        StructuralViolation::InvalidPatternRowsPerMatch => {
+            "invalid SQL structure: WINDOW rows per match is not valid for MATCH_RECOGNIZE"
+                .to_owned()
+        }
+        StructuralViolation::InvalidQueryPeriod => {
+            "invalid SQL structure: a query period requires only an end expression".to_owned()
+        }
         StructuralViolation::EmptyWithCteList => {
             "invalid SQL structure: empty WITH common-table-expression list".to_owned()
         }

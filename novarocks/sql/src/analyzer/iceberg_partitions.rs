@@ -85,6 +85,15 @@ pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast
     for part in &mut source.parts {
         part.value = part.value.to_lowercase();
     }
+    if let Some(last) = source.parts.last_mut() {
+        let base = super::TableNameView::new(name)
+            .parts()
+            .last()
+            .expect("the last identifier requires a nonempty table name")
+            .to_lowercase();
+        last.value = format!("{base}$files");
+        last.quoted = false;
+    }
     let mut projection = Vec::new();
     if partitioned {
         projection.push(ast::SelectItem::UnnamedExpr(column("partition", span)));
@@ -102,23 +111,13 @@ pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast
         });
     }
     ast::Query {
-        session_properties: Vec::new(),
-        functions: Vec::new(),
+        session_properties: Vec::new().into(),
+        functions: Vec::new().into(),
         with: None,
-        body: Box::new(ast::SetExpr::Select(Box::new(ast::Select {
+        body: ast::AstBox::new(ast::SetExpr::Select(ast::AstBox::new(ast::Select {
             quantifier: ast::SelectQuantifier::None,
             projection,
-            from: vec![ast::TableWithJoins {
-                relation: ast::TableFactor::Table {
-                    name: source,
-                    metadata: Some(ident("files", span)),
-                    alias: None,
-                    version: None,
-                    span,
-                },
-                joins: Vec::new(),
-                span,
-            }],
+            from: Some(novarocks_parser::build::table(source, None, None)),
             selection: Some(comparison(
                 column("content", span),
                 ast::ComparisonOperator::Equal,
@@ -168,23 +167,15 @@ mod tests {
                 let ast::SetExpr::Select(select) = query.body.as_ref() else {
                     panic!("select")
                 };
-                let ast::TableFactor::Table {
-                    name: inner,
-                    metadata,
-                    ..
-                } = &select.from[0].relation
-                else {
+                let Some(ast::Relation::Table(table)) = &select.from else {
                     panic!("metadata table")
                 };
+                let view = crate::analyzer::TableNameView::new(&table.name);
                 assert_eq!(
-                    inner
-                        .parts
-                        .iter()
-                        .map(|p| p.value.as_str())
-                        .collect::<Vec<_>>(),
+                    view.parts().collect::<Vec<_>>(),
                     parts.iter().map(|p| p.to_lowercase()).collect::<Vec<_>>()
                 );
-                assert_eq!(metadata.as_ref().unwrap().value, "files");
+                assert_eq!(view.metadata.unwrap().value, "files");
                 let ast::Expr::Predicated(filter) = select.selection.as_ref().unwrap() else {
                     panic!("content filter")
                 };

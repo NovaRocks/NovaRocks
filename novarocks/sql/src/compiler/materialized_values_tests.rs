@@ -1704,3 +1704,123 @@ fn concat_normalization_reloans_original_value_separator_and_order_occurrences()
         retained(actual, &order);
     }
 }
+
+#[test]
+fn actual_relation_path_keeps_right_derived_nonzero_pool_and_full_field() {
+    use arrow::array::{Array, StringArray};
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_functions::ConstantPool;
+    let control = SqlCompileControl::unbounded();
+    let policy = crate::constant::test_constant_policy();
+    let ty = FunctionValueType::new(DataType::Utf8, false);
+    let field = Arc::new(
+        Field::new("original_derived_value", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::from([(
+                "provider.unknown".to_string(),
+                "original-right".to_string(),
+            )]),
+        ),
+    );
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        StringArray::from(vec!["unused", "kept-right"]).to_data(),
+        policy,
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let retained = pool.value(1).unwrap();
+    let query = query("SELECT r.x FROM (SELECT 1 AS k) l JOIN (SELECT NULL AS x) r ON true");
+    let path = vec![SqlRelationStep::JoinRight, SqlRelationStep::Aliased];
+    let constant = |path| {
+        SqlExpressionConstant::new(
+            vec![SqlConstantQueryStep::SelectFromDerived {
+                relation_path: path,
+            }],
+            SqlConstantExpressionSite::SelectProjection { column: 0 },
+            retained.clone(),
+        )
+    };
+    let source =
+        MaterializedValues::try_new_expressions(&query, vec![constant(path)].into(), &control)
+            .unwrap();
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("outer SELECT");
+    };
+    let Some(ast::Relation::Join(join)) = &select.from else {
+        panic!("actual Join");
+    };
+    let ast::Relation::Aliased(alias) = join.right.as_ref() else {
+        panic!("actual right Alias");
+    };
+    let ast::Relation::TableSubquery(derived) = alias.relation.as_ref() else {
+        panic!("actual derived endpoint");
+    };
+    let ast::SetExpr::Select(inner) = derived.query.body.as_ref() else {
+        panic!("inner SELECT");
+    };
+    let ast::SelectItem::ExprWithAlias { expr, .. } = &inner.projection[0] else {
+        panic!("source value");
+    };
+    let owned = source.loan(&query, &control).unwrap();
+    let loan = owned.view();
+    let actual = loan.constant_at(expr).unwrap();
+    assert_eq!(actual.ordinal(), 1);
+    assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+    assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+    assert_eq!(actual.field(), field.as_ref());
+    assert_eq!(actual.value_type(), &ty);
+    assert_eq!(
+        actual
+            .field()
+            .metadata()
+            .get("provider.unknown")
+            .map(String::as_str),
+        Some("original-right")
+    );
+    assert!(loan.constant_at(&expr.clone()).is_none());
+    for path in [
+        vec![SqlRelationStep::Aliased, SqlRelationStep::JoinRight],
+        vec![SqlRelationStep::JoinRight, SqlRelationStep::JoinLeft],
+        vec![SqlRelationStep::JoinLeft],
+    ] {
+        assert!(
+            MaterializedValues::try_new_expressions(&query, vec![constant(path)].into(), &control)
+                .is_err()
+        );
+    }
+    let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+    let functions = build_builtin_engine_function_catalog().unwrap();
+    let (resolved, _, _) = crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
+        &query,
+        &catalog,
+        "db",
+        &functions,
+        &Default::default(),
+        policy,
+        &control,
+        Some(&source),
+    )
+    .unwrap();
+    let crate::analysis::QueryBody::Select(outer) = &resolved.body else {
+        panic!("outer");
+    };
+    let Some(crate::analysis::Relation::Join(join)) = &outer.from else {
+        panic!("join");
+    };
+    let crate::analysis::Relation::Subquery { query, .. } = &join.right else {
+        panic!("derived");
+    };
+    let crate::analysis::QueryBody::Select(inner) = &query.body else {
+        panic!("inner");
+    };
+    let crate::analysis::ExprKind::Constant(actual) = &inner.projection[0].expr.kind else {
+        panic!("same original constant");
+    };
+    assert_eq!(actual.ordinal(), 1);
+    assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+    assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+    assert_eq!(actual.field(), field.as_ref());
+    assert_eq!(actual.value_type(), &ty);
+}

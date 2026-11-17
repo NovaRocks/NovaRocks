@@ -34,7 +34,7 @@ use crate::catalog_application::resolver::TargetBackend;
 /// observation. Only the generated target occurrence is assigned this overlay.
 pub(super) fn bind_mutation_match_read(
     target: &TargetBackend,
-    target_factor: &mut ast::TableFactor,
+    target_factor: &mut ast::Relation,
     isolate_lookup: bool,
     preparation: &ConnectorRowMutationPreparation,
     original: &ConnectorTableMetadata,
@@ -57,23 +57,21 @@ pub(super) fn bind_mutation_match_read(
     source
         .validate_owner(preparation.owner())
         .map_err(|error| error.to_string())?;
-    let ast::TableFactor::Table {
-        name,
-        alias,
-        version,
-        metadata,
-        ..
-    } = target_factor
-    else {
+    let (relation, has_alias) = match target_factor {
+        ast::Relation::Aliased(alias) => (alias.relation.as_mut(), true),
+        other => (other, false),
+    };
+    let ast::Relation::Table(target_table) = relation else {
         return Err("generated mutation match target is not a table".into());
     };
-    if metadata.is_some()
+    let ast::Table { name, branch, .. } = target_table.as_mut();
+    if branch.is_some()
         || name.parts.iter().map(|part| part.value.as_str()).ne([
             target.catalog.as_str(),
             target.namespace.as_str(),
             target.table.as_str(),
         ])
-        || (isolate_lookup && alias.is_none())
+        || (isolate_lookup && !has_alias)
     {
         return Err("generated mutation match target differs from its admitted table".into());
     }
@@ -96,7 +94,7 @@ pub(super) fn bind_mutation_match_read(
     }
     // The Provider's Current selector is relative to its signed match source.
     // A named SQL ref would ask the catalog to resolve the ref a second time.
-    *version = None;
+    target_table.query_period = None;
 
     let schema = preparation.match_source_schema().clone();
     let snapshot = preparation.base_version_ordinal();
@@ -216,11 +214,9 @@ fn match_source_columns(
     Ok((columns, hidden))
 }
 
-pub(super) fn mutation_match_select(
-    query: &mut ast::Query,
-) -> Result<&mut ast::TableWithJoins, String> {
+pub(super) fn mutation_match_select(query: &mut ast::Query) -> Result<&mut ast::Relation, String> {
     if let ast::SetExpr::Select(select) = query.body.as_mut()
-        && let [from] = select.from.as_mut_slice()
+        && let Some(from) = select.from.as_mut()
     {
         Ok(from)
     } else {

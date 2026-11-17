@@ -473,7 +473,8 @@ fn set_expr_projects_target_wildcard(
         novarocks_parser::ast::SetExpr::Select(select) => {
             select_projects_target_wildcard(select, target)
         }
-        novarocks_parser::ast::SetExpr::Query(query) => {
+        novarocks_parser::ast::SetExpr::Query(subquery) => {
+            let query = &subquery.query;
             query_projects_target_wildcard(query, target)
         }
         novarocks_parser::ast::SetExpr::SetOperation(operation) => operation
@@ -492,7 +493,7 @@ fn select_projects_target_wildcard(
     if select
         .from
         .iter()
-        .any(|from| collect_target_qualifiers_from_table_with_joins(from, target, &mut qualifiers))
+        .any(|from| collect_target_qualifiers_from_factor(from, target, &mut qualifiers))
     {
         return true;
     }
@@ -510,50 +511,51 @@ fn select_projects_target_wildcard(
     })
 }
 
-fn collect_target_qualifiers_from_table_with_joins(
-    table: &novarocks_parser::ast::TableWithJoins,
-    target: &MvDependencyTarget,
-    qualifiers: &mut HashSet<String>,
-) -> bool {
-    collect_target_qualifiers_from_factor(&table.relation, target, qualifiers)
-        || table
-            .joins
-            .iter()
-            .any(|join| collect_target_qualifiers_from_factor(&join.relation, target, qualifiers))
-}
-
 fn collect_target_qualifiers_from_factor(
-    factor: &novarocks_parser::ast::TableFactor,
+    factor: &novarocks_parser::ast::Relation,
     target: &MvDependencyTarget,
     qualifiers: &mut HashSet<String>,
 ) -> bool {
+    use novarocks_parser::ast::Relation;
     match factor {
-        novarocks_parser::ast::TableFactor::Table { name, alias, .. } => {
-            if object_name_matches_target(name, target) {
-                qualifiers.extend(object_name_qualifier_keys(name));
-                if let Some(alias) = alias
-                    && let Ok(normalized) = normalize_identifier(&alias.name.value)
-                {
-                    qualifiers.insert(normalized);
-                }
+        Relation::Table(table) => {
+            if name_parts_match_target(
+                novarocks_sql::TableNameView::new(&table.name).parts(),
+                target,
+            ) {
+                qualifiers.extend(name_parts_qualifier_keys(
+                    novarocks_sql::TableNameView::new(&table.name).parts(),
+                ));
             }
             false
         }
-        novarocks_parser::ast::TableFactor::Derived { subquery, .. } => {
-            query_projects_target_wildcard(subquery, target)
+        Relation::Aliased(alias) => {
+            if let Relation::Table(table) = alias.relation.as_ref()
+                && name_parts_match_target(
+                    novarocks_sql::TableNameView::new(&table.name).parts(),
+                    target,
+                )
+                && let Ok(normalized) = normalize_identifier(&alias.alias.value)
+            {
+                qualifiers.insert(normalized);
+            }
+            collect_target_qualifiers_from_factor(&alias.relation, target, qualifiers)
         }
-        novarocks_parser::ast::TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => collect_target_qualifiers_from_table_with_joins(table_with_joins, target, qualifiers),
+        Relation::TableSubquery(node) => query_projects_target_wildcard(&node.query, target),
+        Relation::Lateral(node) => query_projects_target_wildcard(&node.query, target),
+        Relation::Join(join) => {
+            collect_target_qualifiers_from_factor(&join.left, target, qualifiers)
+                || collect_target_qualifiers_from_factor(&join.right, target, qualifiers)
+        }
         _ => false,
     }
 }
 
-fn object_name_matches_target(
-    name: &novarocks_parser::ast::ObjectName,
+fn name_parts_match_target<'a>(
+    parts: impl Iterator<Item = &'a str>,
     target: &MvDependencyTarget,
 ) -> bool {
-    match normalized_object_name_parts(name).as_deref() {
+    match normalized_name_parts(parts).as_deref() {
         Some([catalog, namespace, table]) => {
             catalog == &target.catalog && namespace == &target.namespace && table == &target.table
         }
@@ -563,8 +565,8 @@ fn object_name_matches_target(
     }
 }
 
-fn object_name_qualifier_keys(name: &novarocks_parser::ast::ObjectName) -> Vec<String> {
-    normalized_object_name_parts(name)
+fn name_parts_qualifier_keys<'a>(parts: impl Iterator<Item = &'a str>) -> Vec<String> {
+    normalized_name_parts(parts)
         .map(|parts| qualifier_keys_from_parts(&parts))
         .unwrap_or_default()
 }
@@ -580,10 +582,9 @@ fn qualifier_keys_from_parts(parts: &[String]) -> Vec<String> {
     keys
 }
 
-fn normalized_object_name_parts(name: &novarocks_parser::ast::ObjectName) -> Option<Vec<String>> {
-    name.parts
-        .iter()
-        .map(|ident| normalize_identifier(&ident.value))
+fn normalized_name_parts<'a>(parts: impl Iterator<Item = &'a str>) -> Option<Vec<String>> {
+    parts
+        .map(normalize_identifier)
         .collect::<Result<Vec<_>, _>>()
         .ok()
 }
@@ -591,3 +592,64 @@ fn normalized_object_name_parts(name: &novarocks_parser::ast::ObjectName) -> Opt
 #[cfg(test)]
 #[path = "iceberg_guard_context_tests.rs"]
 mod context_tests;
+
+#[cfg(test)]
+#[test]
+fn metadata_from_qualifiers_do_not_strip_generic_delete_target_names() {
+    use novarocks_parser::ast::{DmlStatement, Relation, SetExpr, Statement};
+    let target = MvDependencyTarget {
+        catalog: "ice".into(),
+        namespace: "sales".into(),
+        table: "orders".into(),
+    };
+    let source = "SELECT ice.sales.orders.* FROM ice.sales.orders$files";
+    let [Statement::Query(query)]: [Statement; 1] =
+        novarocks_parser::parse(source).unwrap().try_into().unwrap()
+    else {
+        panic!("query");
+    };
+    assert!(query_projects_target_wildcard(&query, &target));
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("SELECT");
+    };
+    let Some(Relation::Table(table)) = &select.from else {
+        panic!("FROM table");
+    };
+    let parts = novarocks_sql::TableNameView::new(&table.name).parts();
+    assert_eq!(
+        name_parts_qualifier_keys(parts),
+        ["ice.sales.orders", "orders", "sales.orders"]
+    );
+    let last = table.name.parts.last().unwrap();
+    assert_eq!(last.value, "orders$files");
+    assert_eq!(&source[last.span.start()..last.span.end()], "orders$files");
+    for source in [
+        "DELETE FROM ice.sales.orders$files WHERE id=1",
+        "DELETE FROM ice.sales.`orders$files` WHERE id=1",
+    ] {
+        let [Statement::Dml(DmlStatement::Delete(delete))]: [Statement; 1] =
+            novarocks_parser::parse(source).unwrap().try_into().unwrap()
+        else {
+            panic!("DELETE target");
+        };
+        let last = delete.target.parts.last().unwrap();
+        assert_eq!(last.value, "orders$files");
+        assert!(!name_parts_match_target(
+            delete.target.parts.iter().map(|part| part.value.as_str()),
+            &target
+        ));
+        assert!(
+            name_parts_qualifier_keys(delete.target.parts.iter().map(|part| part.value.as_str()))
+                .is_empty()
+        );
+    }
+    let [Statement::Query(query)]: [Statement; 1] =
+        novarocks_parser::parse("SELECT * FROM ice.sales.`orders$files`")
+            .unwrap()
+            .try_into()
+            .unwrap()
+    else {
+        panic!("quoted ordinary FROM");
+    };
+    assert!(!query_projects_target_wildcard(&query, &target));
+}
