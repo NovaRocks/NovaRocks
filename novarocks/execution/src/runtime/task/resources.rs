@@ -25,15 +25,14 @@ use crate::runtime::task::error::{
     LocalTaskLaunchError, LocalTaskLaunchErrorKind, LocalTaskLaunchStage,
 };
 use crate::runtime::task::io::{
-    ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration, TaskCommitPort,
-    TaskCommitRegistration,
+    ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration,
 };
 use crate::runtime::task::io::{ResultAbort, ResultWriteSpec, TaskResultSession, TaskResultWriter};
+#[cfg(test)]
 use novarocks_types::UniqueId;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ResourceKind {
-    SinkCommit,
     Result,
     Exchange,
 }
@@ -41,7 +40,6 @@ pub(crate) enum ResourceKind {
 impl ResourceKind {
     fn cleanup_failure_detail(self) -> &'static str {
         match self {
-            Self::SinkCommit => "injected sink commit cleanup failure",
             Self::Result => "injected result registration cleanup failure",
             Self::Exchange => "injected exchange registration cleanup failure",
         }
@@ -83,48 +81,6 @@ impl ResourceCleanupFaults {
 
     fn should_fail(&self, resource: ResourceKind) -> bool {
         self.failed.contains(&resource)
-    }
-}
-
-pub(crate) struct SinkCommitRegistration {
-    registration: Option<Box<dyn TaskCommitRegistration>>,
-    cleanup_should_fail: bool,
-    settled: bool,
-}
-
-impl SinkCommitRegistration {
-    pub(crate) fn acquire(
-        port: &Arc<dyn TaskCommitPort>,
-        task_key: UniqueId,
-        cleanup_should_fail: bool,
-    ) -> Result<Self, LocalTaskLaunchError> {
-        let lease = port.acquire(task_key).map_err(registration_error)?;
-        Ok(Self {
-            registration: Some(lease),
-            cleanup_should_fail,
-            settled: false,
-        })
-    }
-
-    fn rollback(&mut self) -> super::ExecutionResult<()> {
-        if !std::mem::replace(&mut self.settled, true)
-            && let Some(lease) = self.registration.as_mut()
-        {
-            lease.rollback()?;
-        }
-        if self.cleanup_should_fail {
-            self.cleanup_should_fail = false;
-            return Err(super::ExecutionFailure::from_domain(
-                InjectedCleanupFailure(ResourceKind::SinkCommit),
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for SinkCommitRegistration {
-    fn drop(&mut self) {
-        let _ = self.rollback();
     }
 }
 
@@ -448,9 +404,7 @@ impl Drop for ExchangeReceiverRetirement {
 }
 
 pub(crate) struct LocalTaskResources {
-    commit_port: Option<Arc<dyn TaskCommitPort>>,
     exchange_receiver_port: Option<Arc<dyn ExchangeReceiverPort>>,
-    sink_commit: Option<SinkCommitRegistration>,
     result: Option<ResultRegistration>,
     root_result: Option<RootResultRegistration>,
     exchange: Option<ExchangeRegistration>,
@@ -460,14 +414,11 @@ pub(crate) struct LocalTaskResources {
 
 impl LocalTaskResources {
     pub(crate) fn new(
-        commit_port: Arc<dyn TaskCommitPort>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         cleanup_faults: ResourceCleanupFaults,
     ) -> Self {
         Self {
-            commit_port: Some(commit_port),
             exchange_receiver_port: Some(exchange_receiver_port),
-            sink_commit: None,
             result: None,
             root_result: None,
             exchange: None,
@@ -485,18 +436,6 @@ impl LocalTaskResources {
             "one original query Task resource guard"
         );
         self.query_task = guard;
-    }
-
-    pub(crate) fn acquire_sink_commit(
-        &mut self,
-        task_key: UniqueId,
-    ) -> Result<(), LocalTaskLaunchError> {
-        self.sink_commit = Some(SinkCommitRegistration::acquire(
-            self.commit_port.as_ref().expect("preparing commit factory"),
-            task_key,
-            self.cleanup_faults.should_fail(ResourceKind::SinkCommit),
-        )?);
-        Ok(())
     }
 
     pub(crate) fn acquire_result_for_static(
@@ -610,11 +549,6 @@ impl LocalTaskResources {
         {
             diagnostics.push(error);
         }
-        if let Some(mut sink_commit) = self.sink_commit.take()
-            && let Err(error) = sink_commit.rollback()
-        {
-            diagnostics.push(error);
-        }
         diagnostics
     }
 }
@@ -640,9 +574,7 @@ impl LocalTaskResources {
         RuntimeTaskResources {
             root: self.root_result.take().map(ResourceCell::new),
             result: self.result.take().map(ResourceCell::new),
-            sink_commit: self.sink_commit.take().map(ResourceCell::new),
             exchange,
-            commit_port: self.commit_port.take().map(ResourceCell::new),
             exchange_port: self.exchange_receiver_port.take().map(ResourceCell::new),
             query_task: self.query_task.take().map(ResourceCell::new),
         }
@@ -835,9 +767,7 @@ struct RuntimeExchange {
 pub(crate) struct RuntimeTaskResources {
     root: Option<ResourceCell<RootResultRegistration>>,
     result: Option<ResourceCell<ResultRegistration>>,
-    sink_commit: Option<ResourceCell<SinkCommitRegistration>>,
     exchange: Option<RuntimeExchange>,
-    commit_port: Option<ResourceCell<Arc<dyn TaskCommitPort>>>,
     exchange_port: Option<ResourceCell<Arc<dyn ExchangeReceiverPort>>>,
     query_task: Option<ResourceCell<crate::runtime::query_context::QueryTaskGuard>>,
 }
@@ -915,22 +845,12 @@ impl RuntimeTaskResources {
             exchange.registration.hook(control, |_| Ok(()));
             exchange.registration.retire(control);
         }
-        if let Some(commit) = &mut self.sink_commit {
-            commit.hook(control, SinkCommitRegistration::rollback);
-            commit.retire(control);
-        }
-        if let Some(port) = &mut self.commit_port {
-            port.hook(control, |_| Ok(()));
-            port.retire(control);
-        }
         if let Some(port) = &mut self.exchange_port {
             port.hook(control, |_| Ok(()));
             port.retire(control);
         }
         let resources_exited = self.root.as_ref().is_none_or(ResourceCell::exited)
             && self.result.as_ref().is_none_or(ResourceCell::exited)
-            && self.sink_commit.as_ref().is_none_or(ResourceCell::exited)
-            && self.commit_port.as_ref().is_none_or(ResourceCell::exited)
             && self.exchange_port.as_ref().is_none_or(ResourceCell::exited)
             && self.exchange.as_ref().is_none_or(|exchange| {
                 exchange.stop.as_ref().is_none_or(ResourceCell::exited)
@@ -1477,7 +1397,7 @@ mod cleanup_notification_tests {
     impl std::error::Error for OriginalCleanupSource {}
     impl FailureProjection for OriginalCleanupSource {
         fn failure_fact(&self) -> FailureFact {
-            InjectedCleanupFailure(ResourceKind::SinkCommit).failure_fact()
+            InjectedCleanupFailure(ResourceKind::Result).failure_fact()
         }
     }
     impl Drop for OriginalCleanupSource {

@@ -32,7 +32,6 @@ use novarocks_execution::runtime::{
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_memory::{AccountKind, ExternalRef, LimitDimension, MemoryAuthority};
 use novarocks_types::{QueryExecutionId, UniqueId};
-use novarocks_worker::sink_commit::WorkerSinkCommitPort;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -286,8 +285,7 @@ impl NativeTaskAdmissionResources {
             control,
             completion,
         )
-        .with_query_memory(self.query_memory)
-        .with_task_commit_port(Arc::new(WorkerSinkCommitPort));
+        .with_query_memory(self.query_memory);
         if let Some(guard) = self.query_task {
             context = context.with_query_task_guard(guard);
         }

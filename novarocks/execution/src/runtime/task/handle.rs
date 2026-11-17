@@ -31,10 +31,7 @@ use crate::runtime::task::fact::{LocalTaskOutcome, LocalTaskTerminalFact, TaskCa
 use crate::runtime::task::io::NoopTaskEventSink;
 use crate::runtime::task::io::TaskEventSink;
 use crate::runtime::task::io::{ExchangeFrameTransmitter, ResultWriteSpec, TaskResultWriter};
-use crate::runtime::task::io::{
-    ExchangeReceiverPort, TaskCommitPort, UnavailableExchangeReceiverPort,
-    UnavailableTaskCommitPort,
-};
+use crate::runtime::task::io::{ExchangeReceiverPort, UnavailableExchangeReceiverPort};
 use crate::runtime::task::resources::{LocalTaskResources, ResourceCleanupFaults};
 use crate::runtime::task::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
@@ -68,7 +65,6 @@ pub struct LocalTaskPrepareContext {
     execution_runtime: Option<Arc<ExecutionRuntime>>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     query_task: Option<crate::runtime::query_context::QueryTaskGuard>,
-    commit_port: Arc<dyn TaskCommitPort>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     receiver_construction_lifetime: ReceiverConstructionLifetime,
     /// The per-edge send permission this task's push sinks are bound by.
@@ -2430,60 +2426,6 @@ mod owner_tests {
 }
 
 #[cfg(test)]
-struct TestTaskCommitPort;
-
-#[cfg(test)]
-impl TaskCommitPort for TestTaskCommitPort {
-    fn acquire(
-        &self,
-        _task_key: novarocks_types::UniqueId,
-    ) -> crate::runtime::task::ExecutionResult<
-        Box<dyn crate::runtime::task::io::TaskCommitRegistration>,
-    > {
-        Ok(Box::new(TestTaskCommitRegistration))
-    }
-}
-
-#[cfg(test)]
-struct TestTaskCommitRegistration;
-
-#[cfg(test)]
-impl crate::runtime::task::io::TaskCommitRegistration for TestTaskCommitRegistration {
-    fn add_load_stats(
-        &mut self,
-        _stats: crate::runtime::task::io::TaskSinkLoadStats,
-    ) -> super::ExecutionResult<()> {
-        Ok(())
-    }
-
-    fn add_tablet_commit_info(
-        &mut self,
-        _info: crate::runtime::task::io::TabletCommitInfo,
-    ) -> super::ExecutionResult<()> {
-        Ok(())
-    }
-
-    fn add_tablet_fail_info(
-        &mut self,
-        _info: crate::runtime::task::io::TabletFailInfo,
-    ) -> super::ExecutionResult<()> {
-        Ok(())
-    }
-
-    fn finish(&mut self) -> super::ExecutionResult<crate::runtime::task::io::TaskCommitReport> {
-        Ok(crate::runtime::task::io::TaskCommitReport::default())
-    }
-
-    fn handoff(&mut self) -> super::ExecutionResult<()> {
-        Ok(())
-    }
-
-    fn rollback(&mut self) -> super::ExecutionResult<()> {
-        Ok(())
-    }
-}
-
-#[cfg(test)]
 impl Default for LocalTaskPrepareContext {
     fn default() -> Self {
         Self {
@@ -2512,7 +2454,6 @@ impl Default for LocalTaskPrepareContext {
             execution_runtime: Some(crate::runtime::execution_runtime::test_execution_runtime()),
             query_memory: None,
             query_task: None,
-            commit_port: Arc::new(TestTaskCommitPort),
             exchange_receiver_port:
                 crate::runtime::task::io::exchange::in_process_test_exchange_receiver_port(),
             receiver_construction_lifetime: ReceiverConstructionLifetime::KernelBound,
@@ -2567,7 +2508,6 @@ impl LocalTaskPrepareContext {
             execution_runtime: None,
             query_memory: None,
             query_task: None,
-            commit_port: Arc::new(UnavailableTaskCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
             receiver_construction_lifetime: ReceiverConstructionLifetime::KernelBound,
             #[cfg(test)]
@@ -2731,11 +2671,6 @@ impl LocalTaskPrepareContext {
         self
     }
 
-    pub fn with_task_commit_port(mut self, port: Arc<dyn TaskCommitPort>) -> Self {
-        self.commit_port = port;
-        self
-    }
-
     pub fn with_exchange_receiver_port(mut self, port: Arc<dyn ExchangeReceiverPort>) -> Self {
         self.exchange_receiver_port = port;
         self
@@ -2801,13 +2736,8 @@ impl LocalTaskPrepareContext {
     }
 }
 
-#[expect(
-    clippy::enum_variant_names,
-    reason = "Failure injection points intentionally describe the lifecycle point after which they fire."
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrepareFailurePoint {
-    AfterSinkCommit,
     AfterResult,
     AfterExchange,
 }
@@ -2819,7 +2749,6 @@ enum PrepareFailurePoint {
 impl PrepareFailurePoint {
     const fn detail(self) -> &'static str {
         match self {
-            Self::AfterSinkCommit => "injected failure after sink commit registration",
             Self::AfterResult => "injected failure after result registration",
             Self::AfterExchange => "injected failure after exchange registration",
         }

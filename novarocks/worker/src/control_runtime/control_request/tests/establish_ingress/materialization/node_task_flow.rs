@@ -50,14 +50,12 @@ use novarocks_execution::{
         function_set::ExecutionFunctionSetBuilder,
         query_options::QueryOptions,
         task::{
-            CompiledTaskSubmission, ExchangeInputAssignments, ExecutionResult, InstanceOrdinal,
-            LocalTaskOutcome, LocalTaskPrepareContext, PreparedTaskExecution, RunningTaskExecution,
-            ScanAssignments, TaskCancelDetail, TaskInstanceSpec, TaskKey, TaskRuntimeOptions,
-            TaskSinkAssignment,
+            CompiledTaskSubmission, ExchangeInputAssignments, InstanceOrdinal, LocalTaskOutcome,
+            LocalTaskPrepareContext, PreparedTaskExecution, RunningTaskExecution, ScanAssignments,
+            TaskCancelDetail, TaskInstanceSpec, TaskKey, TaskRuntimeOptions, TaskSinkAssignment,
             io::{
-                ExchangeFrameTransmitter, NoopTaskEventSink, ResultWriteSpec, TabletCommitInfo,
-                TabletFailInfo, TaskCommitPort, TaskCommitRegistration, TaskCommitReport,
-                TaskIoError, TaskResultSession, TaskResultWriter, TaskSinkLoadStats,
+                ExchangeFrameTransmitter, NoopTaskEventSink, ResultWriteSpec, TaskIoError,
+                TaskResultSession, TaskResultWriter,
             },
             prepare_compiled_task,
         },
@@ -459,32 +457,6 @@ impl RootResultSession for CountSession {
     }
 }
 struct Ports;
-struct NoopTaskCommitRegistration;
-impl TaskCommitPort for Ports {
-    fn acquire(&self, _: UniqueId) -> ExecutionResult<Box<dyn TaskCommitRegistration>> {
-        Ok(Box::new(NoopTaskCommitRegistration))
-    }
-}
-impl TaskCommitRegistration for NoopTaskCommitRegistration {
-    fn add_load_stats(&mut self, _: TaskSinkLoadStats) -> ExecutionResult<()> {
-        panic!("Noop has no load stats")
-    }
-    fn add_tablet_commit_info(&mut self, _: TabletCommitInfo) -> ExecutionResult<()> {
-        panic!("Noop has no tablet commit")
-    }
-    fn add_tablet_fail_info(&mut self, _: TabletFailInfo) -> ExecutionResult<()> {
-        panic!("Noop has no tablet failure")
-    }
-    fn finish(&mut self) -> ExecutionResult<TaskCommitReport> {
-        Ok(TaskCommitReport::default())
-    }
-    fn handoff(&mut self) -> ExecutionResult<()> {
-        Ok(())
-    }
-    fn rollback(&mut self) -> ExecutionResult<()> {
-        Ok(())
-    }
-}
 // This compiled CountOnly Root has no Exchange input or output. Like
 // Execution's result-only fixture, every active Unit operation must fail here
 // instead of manufacturing a grant, custody acknowledgement or call exit.
@@ -987,8 +959,7 @@ impl TaskExecutionHost for CompiledTaskHost {
             completion_work,
         )
         .with_root_result_session(session)
-        .with_execution_runtime(self.execution.clone())
-        .with_task_commit_port(Arc::new(Ports));
+        .with_execution_runtime(self.execution.clone());
         let dormant = prepare_compiled_task(submission, participation).unwrap();
         let runnable = Arc::new(Runnable {
             identity: descriptor.identity(),

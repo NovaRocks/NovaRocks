@@ -59,7 +59,7 @@ use novarocks_spi::connector::{
     MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
     MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
     MvRefreshTargetObservation, MvSchemaValidationObservation, MvSourceSchemaObservation,
-    MvStorageObservationPort, WriteCommitEvidenceLimits,
+    MvStorageObservationPort,
 };
 
 use novarocks_state_store_runtime::{
@@ -432,11 +432,6 @@ pub fn compose_backend_server_config(
         announce_max_backoff: Duration::from_millis(
             config.cluster.backend_announce_max_backoff_ms(),
         ),
-        write_commit_evidence_limits: WriteCommitEvidenceLimits::try_new(
-            runtime_config.write_commit_evidence_max_bytes,
-            runtime_config.write_commit_evidence_max_entries,
-        )
-        .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
         result_retained_limits: novarocks_worker::WorkerResultRetainedLimits::try_new(
             runtime_config.result_retained_bytes_per_root,
             runtime_config.result_retained_bytes_per_process,

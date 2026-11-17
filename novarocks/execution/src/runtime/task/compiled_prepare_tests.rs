@@ -529,18 +529,8 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
     use crate::runtime::task_control::test_support::Owner;
     use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    struct FirstHostCall(AtomicUsize);
-    impl crate::runtime::task::io::TaskCommitPort for FirstHostCall {
-        fn acquire(
-            &self,
-            _: UniqueId,
-        ) -> ExecutionResult<Box<dyn crate::runtime::task::io::TaskCommitRegistration>> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Err(novarocks_functions::KernelFailure::ResourceExhausted.into())
-        }
-    }
-    // The commit port still runs before the result writer. Both probes must
-    // stay at zero: a submission-boundary refusal cannot reach either host call.
+    // Result-writer open is the first host acquisition. A submission-boundary
+    // refusal must not reach it.
     struct FirstResultOpen(AtomicUsize);
     impl TaskResultWriter for FirstResultOpen {
         fn open(&self, _: ResultWriteSpec) -> Result<Arc<dyn TaskResultSession>, TaskIoError> {
@@ -557,14 +547,12 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
     for scenario in 0..6 {
         let owner = Owner::new();
         let foreign = Owner::new();
-        let commit_calls = Arc::new(FirstHostCall(AtomicUsize::new(0)));
         let writer_calls = Arc::new(FirstResultOpen(AtomicUsize::new(0)));
         let control = Arc::new(owner.view(TaskFailurePhase::Execution));
         let mut context = LocalTaskPrepareContext {
             result_writer: writer_calls.clone(),
             ..LocalTaskPrepareContext::default()
-        }
-        .with_task_commit_port(commit_calls.clone());
+        };
         context = match scenario {
             0 => context
                 .with_result_identity(owner.identity())
@@ -604,11 +592,6 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
             error.kind(),
             LocalTaskLaunchErrorKind::Binding,
             "scenario {scenario}"
-        );
-        assert_eq!(
-            commit_calls.0.load(Ordering::SeqCst),
-            0,
-            "scenario {scenario} reached commit-port acquisition"
         );
         assert_eq!(
             writer_calls.0.load(Ordering::SeqCst),
