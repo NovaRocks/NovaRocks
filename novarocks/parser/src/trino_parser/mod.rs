@@ -20,6 +20,7 @@
 mod cursor;
 mod expression;
 mod failure;
+mod json;
 mod literal;
 mod parameters;
 mod query;

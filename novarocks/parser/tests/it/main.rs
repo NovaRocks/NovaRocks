@@ -43,3 +43,5 @@ mod printer_first_slice;
 mod query;
 mod trino_special;
 mod types;
+
+mod trino_json;

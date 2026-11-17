@@ -649,6 +649,17 @@ impl Parser<'_> {
                 let name = self.qualified_name()?;
                 self.function_expression(name, Some(ProcessingMode { mode, span: start }))?
             }
+            T::Keyword(K::Json) if self.peek(1).kind == T::Symbol(S::LParen) => {
+                self.json_constructor_or_call()?
+            }
+            T::Keyword(
+                K::JsonExists
+                | K::JsonValue
+                | K::JsonQuery
+                | K::JsonSerialize
+                | K::JsonObject
+                | K::JsonArray,
+            ) => self.parse_json_expression()?,
             _ if self.reserved_expression_ahead() => self.parse_reserved_expression()?,
             _ if self.is_identifier(0)
                 && matches!(self.peek(1).kind, T::String | T::UnicodeString) =>
@@ -732,6 +743,25 @@ impl Parser<'_> {
             }
         }
         Ok(parsed)
+    }
+
+    fn json_constructor_or_call(&mut self) -> Result<Expr, ParserError> {
+        let checkpoint = self.checkpoint();
+        match self.parse_json_expression() {
+            Ok(expression) if !self.function_modifier_ahead() => return Ok(expression),
+            Ok(_) | Err(ParserError::Syntax(_)) => self.restore(checkpoint),
+            Err(error @ ParserError::Construction(_)) => return Err(error),
+        }
+        let name = self.qualified_name()?;
+        self.function_expression(name, None)
+    }
+
+    fn function_modifier_ahead(&self) -> bool {
+        (self.at_keyword(K::Filter) && self.peek(1).kind == T::Symbol(S::LParen))
+            || ((self.at_keyword(K::Ignore) || self.at_keyword(K::Respect))
+                && self.peek(1).kind == T::Keyword(K::Nulls))
+            || (self.at_keyword(K::Over)
+                && (self.is_identifier(1) || self.peek(1).kind == T::Symbol(S::LParen)))
     }
 
     fn processing_call_ahead(&self) -> bool {

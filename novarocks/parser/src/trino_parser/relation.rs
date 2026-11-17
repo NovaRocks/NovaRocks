@@ -211,8 +211,11 @@ impl Parser<'_> {
                 span: self.span_since(start),
             })));
         }
-        if self.at_keyword(Keyword::Table) || self.at_keyword(Keyword::JsonTable) {
-            return Err(self.error("table-function or JSON_TABLE syntax (next parser slice)"));
+        if self.at_keyword(Keyword::JsonTable) {
+            return Ok(Relation::JsonTable(AstBox::new(self.parse_json_table()?)));
+        }
+        if self.at_keyword(Keyword::Table) {
+            return Err(self.error("table-function syntax (next parser slice)"));
         }
         if self.at_keyword(Keyword::Nearest)
             && self.peek(1).kind == TokenKind::Symbol(Symbol::LParen)
