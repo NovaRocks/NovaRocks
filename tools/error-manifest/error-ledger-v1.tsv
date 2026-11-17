@@ -24,7 +24,13 @@ sql.admit.create_table_unsupported_form	Admit	Active
 sql.admit.delete_requires_where	Admit	Active
 sql.admit.delete_unsupported_form	Admit	Active
 sql.admit.insert_unsupported_form	Admit	Active
+sql.admit.invalid_analyze_property	Admit	Active
+sql.admit.invalid_branch_property	Admit	Active
+sql.admit.invalid_catalog_property	Admit	Active
+sql.admit.invalid_materialized_view_property	Admit	Active
+sql.admit.invalid_schema_property	Admit	Active
 sql.admit.invalid_session_property	Admit	Active
+sql.admit.invalid_table_property	Admit	Active
 sql.admit.kill_connection_unsupported	Admit	Deprecated
 sql.admit.kill_denied	Admit	Active
 sql.admit.merge_unsupported_form	Admit	Active

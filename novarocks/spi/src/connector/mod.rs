@@ -269,7 +269,8 @@ pub use predicate::{
     validate_static_predicates,
 };
 pub use property::{
-    DdlPropertyDeclaration, DdlPropertyDeclarationError, DdlPropertyType, DdlPropertyValue,
+    DdlPropertyChange, DdlPropertyDeclaration, DdlPropertyDeclarationError, DdlPropertyType,
+    DdlPropertyValue,
 };
 pub use provider::{
     CatalogActivityEvents, CatalogActivityPhase, CatalogActivityReader, CatalogActivitySnapshot,

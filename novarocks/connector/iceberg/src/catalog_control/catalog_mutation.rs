@@ -79,6 +79,27 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         self.incarnation()
     }
 
+    fn table_property_declarations(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::DdlPropertyDeclaration>, ConnectorError> {
+        crate::table_properties::table_property_declarations().map_err(|cause| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                format!("invalid Iceberg table property declaration: {cause}"),
+            )
+        })
+    }
+
+    fn check_table_property_name(&self, canonical_name: &str) -> Result<(), ConnectorError> {
+        if crate::table_properties::is_recognized_unsupported_table_property(canonical_name) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                format!("Iceberg table property '{canonical_name}' is not supported"),
+            ));
+        }
+        Ok(())
+    }
+
     fn admit(&self, request: &ConnectorCatalogMutationRequest) -> Result<(), ConnectorError> {
         validate_request(self, request)?;
         self.runtime()
@@ -1059,7 +1080,7 @@ pub(crate) fn reject_variant_shredding_properties(
     Ok(())
 }
 
-fn reject_variant_shredding_property(key: &str) -> Result<(), ConnectorError> {
+pub(crate) fn reject_variant_shredding_property(key: &str) -> Result<(), ConnectorError> {
     if key.starts_with(VARIANT_SHREDDING_PROPERTY_PREFIX) {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
@@ -1071,13 +1092,18 @@ fn reject_variant_shredding_property(key: &str) -> Result<(), ConnectorError> {
     Ok(())
 }
 
+/// The actual create-table default, shared with the provider's DDL declaration.
+pub(crate) fn default_create_format_version() -> FormatVersion {
+    FormatVersion::V2
+}
+
 pub(crate) fn table_properties(
     columns: &[ConnectorColumnDefinition],
     key: Option<&ConnectorTableKey>,
     input: &[(Arc<str>, Arc<str>)],
 ) -> Result<(FormatVersion, BTreeMap<String, String>), ConnectorError> {
     reject_variant_shredding_properties(input)?;
-    let mut format_version = FormatVersion::V2;
+    let mut format_version = default_create_format_version();
     let mut properties = BTreeMap::new();
     for (key, value) in input {
         crate::document_storage::keyed::write::reject_reserved_property(key)?;
@@ -1549,7 +1575,7 @@ fn property_updates(
     Ok(updates)
 }
 
-fn reserved_property(key: &str) -> Option<&'static str> {
+pub(crate) fn reserved_property(key: &str) -> Option<&'static str> {
     // These ordinary user properties no longer author provider type facts.
     if key.starts_with("novarocks.logical_type.") || key == "novarocks.scalar_integer_domains.v1" {
         return None;
@@ -10052,5 +10078,430 @@ mod tests {
             let requests = provider.runtime().drop_cleanup().take_eligible(i64::MAX);
             assert_eq!(requests.len(), usize::from(code == 204));
         }
+    }
+    #[test]
+    fn ddl_table_property_metadata_preserves_explicit_defaults_and_name_partition() {
+        use novarocks_spi::connector::{DdlPropertyType as T, DdlPropertyValue as V};
+        let declarations = crate::table_properties::table_property_declarations().unwrap();
+        let declaration = |name: &str| {
+            declarations
+                .iter()
+                .find(|property| property.name() == name)
+                .unwrap()
+        };
+        assert_eq!(
+            declaration("format").default_value(),
+            &V::Varchar("PARQUET".into())
+        );
+        assert_eq!(
+            declaration("format_version").default_value(),
+            &V::Integer(2)
+        );
+        assert_eq!(default_create_format_version(), FormatVersion::V2);
+        assert_eq!(
+            declaration("partitioning").default_value(),
+            &V::ArrayVarchar(vec![])
+        );
+        for name in [
+            "location",
+            "gc_enabled",
+            "data_location",
+            "target_max_file_size",
+            "parquet_writer_row_group_size",
+            "max_commit_retry",
+            "extra_properties",
+            "maintenance_enabled",
+            "statistics_collect_on_write",
+        ] {
+            assert_eq!(declaration(name).default_value(), &V::Null, "{name}");
+        }
+        assert_eq!(declaration("max_commit_retry").value_type(), T::Integer);
+        assert_eq!(
+            declaration("extra_properties").value_type(),
+            T::MapVarcharVarchar
+        );
+        assert!(declaration("extra_properties").hidden());
+        assert_eq!(
+            declaration("parquet_writer_row_group_size").value_type(),
+            T::Varchar
+        );
+        let names = declarations
+            .iter()
+            .map(|property| property.name())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(names.len(), 12);
+        let unsupported = [
+            "sorted_by",
+            "compression_codec",
+            "delete_after_commit_enabled",
+            "max_previous_versions",
+            "orc_bloom_filter_columns",
+            "orc_bloom_filter_fpp",
+            "parquet_bloom_filter_columns",
+            "object_store_layout_enabled",
+        ];
+        assert_eq!(
+            crate::table_properties::UNSUPPORTED_TABLE_PROPERTY_NAMES,
+            unsupported
+        );
+        for name in unsupported {
+            assert!(!names.contains(name), "{name}");
+            assert!(crate::table_properties::is_recognized_unsupported_table_property(name));
+        }
+        assert!(!crate::table_properties::is_recognized_unsupported_table_property("unknown"));
+        assert_eq!(names.len(), declarations.len());
+        for name in crate::table_properties::UNSUPPORTED_TABLE_PROPERTY_NAMES {
+            assert!(!names.contains(name));
+            assert!(crate::table_properties::UNSUPPORTED_TABLE_PROPERTY_NAMES.contains(name));
+        }
+    }
+
+    #[test]
+    fn ddl_extra_properties_reject_null_values_and_normalized_duplicate_keys() {
+        use crate::table_properties::{ExtraPropertyWrite as Op, extra_property_sets};
+        use novarocks_spi::connector::DdlPropertyValue as V;
+        for value in [
+            V::Null,
+            V::ArrayVarchar(vec![]),
+            V::MapVarcharVarchar(vec![("k".into(), None)]),
+            V::MapVarcharVarchar(vec![
+                ("Key".into(), Some("one".into())),
+                ("key".into(), Some("two".into())),
+            ]),
+        ] {
+            assert_eq!(
+                extra_property_sets(&value, Op::Create).unwrap_err().kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+        }
+        let null_after_duplicate = V::MapVarcharVarchar(vec![
+            ("Key".into(), Some("one".into())),
+            ("key".into(), Some("two".into())),
+            ("last".into(), None),
+        ]);
+        assert!(
+            crate::table_properties::extra_property_sets(
+                &null_after_duplicate,
+                crate::table_properties::ExtraPropertyWrite::Create,
+            )
+            .unwrap_err()
+            .message()
+            .contains("cannot be NULL")
+        );
+    }
+
+    #[test]
+    fn ddl_extra_properties_reuse_original_variant_document_and_nominal_guard_order() {
+        use crate::table_properties::{ExtraPropertyWrite as Op, extra_property_sets};
+        use novarocks_spi::connector::DdlPropertyValue as V;
+        let value = V::MapVarcharVarchar(vec![
+            ("novarocks.doc.v2.invalid".into(), Some("source".into())),
+            (
+                "write.parquet.variant-shredding.future".into(),
+                Some("source".into()),
+            ),
+        ]);
+        let create = extra_property_sets(&value, Op::Create).unwrap_err();
+        assert_eq!(create.kind(), ConnectorErrorKind::Unsupported);
+        assert!(create.message().contains("variant-shredding"));
+        let alter = extra_property_sets(&value, Op::Alter).unwrap_err();
+        assert_eq!(alter.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(alter.message().contains("reserved for document storage"));
+        let nominal = V::MapVarcharVarchar(vec![(
+            "novarocks.nominal-types.v1".into(),
+            Some("source".into()),
+        )]);
+        assert!(
+            extra_property_sets(&nominal, Op::Create)
+                .unwrap_err()
+                .message()
+                .contains("column definitions")
+        );
+        assert!(
+            extra_property_sets(&nominal, Op::Alter)
+                .unwrap_err()
+                .message()
+                .contains("schema mutations")
+        );
+    }
+
+    #[test]
+    fn ddl_extra_properties_protect_named_raw_keys_without_claiming_a_writer() {
+        use crate::table_properties::{ExtraPropertyWrite as Op, extra_property_sets};
+        use novarocks_spi::connector::{ConnectorPropertyChange, DdlPropertyValue as V};
+        for key in [
+            "format-version",
+            "format_version",
+            "write.format.default",
+            "commit.retry.num-retries",
+            "write.parquet.row-group-size-bytes",
+            "write.target-file-size-bytes",
+            "gc.enabled",
+            "write.data.path",
+            "novarocks.statistics.collect-on-write",
+            "novarocks.maintenance.enabled",
+            "current-schema-id",
+            "novarocks.table.key_columns",
+        ] {
+            let value = V::MapVarcharVarchar(vec![(key.to_uppercase(), Some("source".into()))]);
+            for operation in [Op::Create, Op::Alter] {
+                assert_eq!(
+                    extra_property_sets(&value, operation).unwrap_err().kind(),
+                    ConnectorErrorKind::InvalidRequest,
+                    "{key}"
+                );
+            }
+        }
+        let keys = [
+            "write.parquet.compression-codec",
+            "write.metadata.delete-after-commit.enabled",
+            "write.metadata.previous-versions-max",
+            "write.object-storage.enabled",
+            "write.parquet.bloom-filter-enabled.column.foo",
+            "write.row-lineage",
+            "novarocks.logical_type.future",
+            "novarocks.scalar_integer_domains.v1",
+        ];
+        let value = V::MapVarcharVarchar(
+            keys.iter()
+                .map(|key| (key.to_string(), Some("stored".into())))
+                .collect(),
+        );
+        let changes = extra_property_sets(&value, Op::Create).unwrap();
+        assert_eq!(changes.len(), keys.len());
+        for (change, expected) in changes.iter().zip(keys) {
+            let ConnectorPropertyChange::Set { key, value } = change else {
+                panic!()
+            };
+            assert_eq!(key.as_ref(), expected);
+            assert_eq!(value.as_ref(), "stored");
+        }
+    }
+
+    #[test]
+    fn ddl_extra_unsets_preserve_if_exists_and_original_set_only_variant_refusal() {
+        use novarocks_spi::connector::ConnectorPropertyChange;
+        let keys = vec![
+            "UNKNOWN.KEY".into(),
+            "write.parquet.variant-shredding.future".into(),
+        ];
+        let changes = crate::table_properties::extra_property_unsets(&keys, false).unwrap();
+        for (change, expected) in changes
+            .iter()
+            .zip(["unknown.key", "write.parquet.variant-shredding.future"])
+        {
+            let ConnectorPropertyChange::Unset { key, if_exists } = change else {
+                panic!()
+            };
+            assert_eq!(key.as_ref(), expected);
+            assert!(!if_exists);
+        }
+        assert!(
+            crate::table_properties::extra_property_unsets(&["gc.enabled".into()], true).is_err()
+        );
+    }
+
+    #[test]
+    fn ddl_data_sizes_preserve_pinned_units_rounding_and_raw_projection() {
+        use crate::table_properties::{DataSizeProperty as P, normalize_data_size_property};
+        use novarocks_spi::connector::DdlPropertyValue as V;
+        let control = context();
+        // Expected bytes are independent source-derived examples; execution
+        // against the exact Java dependency remains a separate oracle.
+        for (text, bytes) in [
+            ("1B", 1),
+            ("1kB", 1024),
+            ("1MB", 1 << 20),
+            ("1GB", 1 << 30),
+            ("1TB", 1_i64 << 40),
+            ("1PB", 1_i64 << 50),
+            ("1EB", 1_i64 << 60),
+            (" \t1.5\nkB\r\x0b\x0c", 1536),
+            ("0B", 0),
+            ("-0B", 0),
+            ("-٠B", 0),
+            ("0.49B", 0),
+            ("0.5B", 1),
+            ("0.49999999999999994B", 1),
+            ("0.00048828125kB", 1),
+            ("9007199254740993B", 9_007_199_254_740_993),
+            ("9007199254740993.0B", 9_007_199_254_740_992),
+            ("9223372036854775807B", i64::MAX),
+            ("9223372036854775808.0B", i64::MAX),
+            ("8.0EB", i64::MAX),
+            ("١٢B", 12),
+            ("１２B", 12),
+            ("१2B", 12),
+        ] {
+            let normalized = normalize_data_size_property(
+                P::TargetMaxFileSize,
+                &V::Varchar(text.into()),
+                &control,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(normalized.bytes(), bytes, "{text}");
+            assert_eq!(normalized.property(), P::TargetMaxFileSize);
+            assert_eq!(normalized.raw_key(), "write.target-file-size-bytes");
+            assert_eq!(normalized.raw_value(), bytes.to_string());
+        }
+        let normalized = normalize_data_size_property(
+            P::ParquetWriterRowGroupSize,
+            &V::Varchar("2GB".into()),
+            &control,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(normalized.bytes(), 2_147_483_648);
+        assert_eq!(normalized.raw_key(), "write.parquet.row-group-size-bytes");
+        assert_eq!(
+            normalize_data_size_property(P::TargetMaxFileSize, &V::Null, &control).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn ddl_data_sizes_keep_typed_parse_and_property_range_failures_separate() {
+        use crate::table_properties::{
+            DataSizeFailureReason as R, DataSizeParseFailure as Parse, DataSizeProperty as P,
+            DataSizePropertyFailure, DataSizeRangeFailure as Range, normalize_data_size_property,
+        };
+        use novarocks_failure_contract::SharedFailureCause;
+        use novarocks_spi::connector::DdlPropertyValue as V;
+        use std::error::Error;
+        let control = context();
+        let failure = |property, value| {
+            let error = normalize_data_size_property(property, &value, &control).unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            *error
+                .source()
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap()
+                .downcast_ref::<DataSizePropertyFailure>()
+                .unwrap()
+        };
+        for text in [
+            "",
+            "1",
+            "+1B",
+            "-1B",
+            "1.B",
+            ".5B",
+            "1e3B",
+            "1_000B",
+            "NaNB",
+            "InfinityB",
+            "1\u{00a0}B",
+            "\u{001c}1B",
+            "١٢ B",
+            "١٢kB",
+            "𝟙B",
+            "-0000000000000000000B",
+        ] {
+            let failed = failure(P::TargetMaxFileSize, V::Varchar(text.into()));
+            assert_eq!(failed.property(), P::TargetMaxFileSize);
+            assert_eq!(failed.reason(), R::Parse(Parse::Syntax), "{text}");
+        }
+        for text in ["1KB", "1b", "1KiB", "1mb"] {
+            assert_eq!(
+                failure(P::TargetMaxFileSize, V::Varchar(text.into())).reason(),
+                R::Parse(Parse::Unit)
+            );
+        }
+        for text in ["9223372036854775808B", "8EB"] {
+            assert_eq!(
+                failure(P::TargetMaxFileSize, V::Varchar(text.into())).reason(),
+                R::Parse(Parse::IntegerOverflow)
+            );
+        }
+        assert_eq!(
+            failure(
+                P::TargetMaxFileSize,
+                V::Varchar("8.000000000000002EB".into())
+            )
+            .reason(),
+            R::Parse(Parse::DecimalOverflow)
+        );
+        assert_eq!(
+            failure(
+                P::TargetMaxFileSize,
+                V::Varchar(format!("{}.0B", "9".repeat(400)))
+            )
+            .reason(),
+            R::Parse(Parse::DecimalOverflow)
+        );
+        assert_eq!(
+            failure(P::TargetMaxFileSize, V::Integer(1)).reason(),
+            R::ExpectedVarchar
+        );
+        assert_eq!(
+            failure(P::ParquetWriterRowGroupSize, V::Varchar("0B".into())).reason(),
+            R::Range(Range::ZeroParquetRowGroup)
+        );
+        assert_eq!(
+            failure(
+                P::ParquetWriterRowGroupSize,
+                V::Varchar("2147483649B".into())
+            )
+            .reason(),
+            R::Range(Range::ParquetRowGroupAboveTwoGiB)
+        );
+    }
+
+    #[test]
+    fn ddl_data_size_scan_preserves_original_control_failure_and_source() {
+        use crate::table_properties::{DataSizeProperty, normalize_data_size_property};
+        use novarocks_failure_contract::{FailureFact, FailureProjection};
+        use novarocks_spi::connector::DdlPropertyValue;
+        use std::{
+            error::Error,
+            fmt,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Debug)]
+        struct OriginalControl;
+        impl fmt::Display for OriginalControl {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("original data-size control stop")
+            }
+        }
+        impl Error for OriginalControl {}
+        impl FailureProjection for OriginalControl {
+            fn failure_fact(&self) -> FailureFact {
+                ConnectorErrorKind::Cancelled.failure_fact()
+            }
+        }
+        struct StopAt {
+            calls: AtomicUsize,
+            original: ConnectorError,
+        }
+        impl ConnectorOperationControl for StopAt {
+            fn check_active(&self) -> Result<(), ConnectorError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 7 {
+                    Err(self.original.clone())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let control = StopAt {
+            calls: AtomicUsize::new(0),
+            original: ConnectorError::from_domain(ConnectorErrorKind::Cancelled, OriginalControl),
+        };
+        let error = normalize_data_size_property(
+            DataSizeProperty::TargetMaxFileSize,
+            &DdlPropertyValue::Varchar("123456789.125kB".into()),
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(control.calls.load(Ordering::SeqCst), 8);
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+        assert_eq!(error.failure_fact(), control.original.failure_fact());
+        assert_eq!(error.message(), control.original.message());
+        assert!(std::ptr::eq(
+            error.source().unwrap().source().unwrap(),
+            control.original.source().unwrap().source().unwrap(),
+        ));
     }
 }

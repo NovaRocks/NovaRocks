@@ -23,6 +23,9 @@ use novarocks_constant_contract::{ConstantError, ConstantValue};
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_parser::{Span, ast::Expr};
 use novarocks_spi::connector::{DdlPropertyDeclaration, DdlPropertyType, DdlPropertyValue};
+
+// Keep the application public path while SPI owns the neutral instruction.
+pub use novarocks_spi::connector::DdlPropertyChange;
 use novarocks_sql::compiler::RequiredConstantTarget;
 use novarocks_type_contract::{CompilePhase, PureCompileControl, ValueKind, ValueLogicalType};
 
@@ -76,6 +79,20 @@ impl From<QueryServiceError> for DdlPropertyConstantError {
     }
 }
 
+/// A scope owner's capability check at the original unknown-name position.
+/// Returning Ok does not declare support: the evaluator still rejects Unknown.
+/// Errors retain their original source, control or capability classification.
+pub trait DdlPropertyNamePolicy {
+    fn check_unknown_property(&mut self, canonical: &str) -> Result<(), QueryServiceError>;
+}
+
+struct ClosedNames;
+impl DdlPropertyNamePolicy for ClosedNames {
+    fn check_unknown_property(&mut self, _canonical: &str) -> Result<(), QueryServiceError> {
+        Ok(())
+    }
+}
+
 pub trait DdlPropertyConstantPort {
     fn evaluate(
         &mut self,
@@ -88,14 +105,6 @@ pub trait DdlPropertyConstantPort {
 pub enum DdlPropertyEvaluationMode {
     Create,
     Alter,
-}
-
-/// Reset retains its explicit default, including a NULL default for ALTER.
-/// Neither variant denotes absence; providers still validate non-NULL children.
-#[derive(Clone, Debug, PartialEq)]
-pub enum DdlPropertyChange {
-    Set(DdlPropertyValue),
-    Reset(DdlPropertyValue),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -219,6 +228,32 @@ pub fn evaluate_ddl_properties(
     port: &mut dyn DdlPropertyConstantPort,
     control: &dyn PureCompileControl,
 ) -> Result<EvaluatedDdlProperties, QueryServiceError> {
+    let mut policy = ClosedNames;
+    evaluate_ddl_properties_with_name_policy(
+        scope,
+        mode,
+        source,
+        declarations,
+        assignments,
+        port,
+        control,
+        &mut policy,
+    )
+}
+
+/// Evaluate in original assignment order. Only a missing declaration invokes
+/// the name policy, at that assignment, before the original typed Unknown error.
+/// Known names, duplicate known names and dynamic Catalog keys bypass it.
+pub fn evaluate_ddl_properties_with_name_policy(
+    scope: DdlPropertyScope,
+    mode: DdlPropertyEvaluationMode,
+    source: &str,
+    declarations: &[DdlPropertyDeclaration],
+    assignments: &[DdlPropertyAssignment<'_>],
+    port: &mut dyn DdlPropertyConstantPort,
+    control: &dyn PureCompileControl,
+    policy: &mut dyn DdlPropertyNamePolicy,
+) -> Result<EvaluatedDdlProperties, QueryServiceError> {
     checkpoint(control, 0)?;
     let catalog = scope == DdlPropertyScope::Catalog;
     if catalog && !declarations.is_empty() {
@@ -256,14 +291,18 @@ pub fn evaluate_ddl_properties(
                 declarations
                     .iter()
                     .position(|declaration| declaration.name() == name)
-                    .ok_or_else(|| {
-                        invalid(
-                            scope,
-                            source,
-                            assignment.name_span,
-                            format!("Unknown property '{name}'"),
-                        )
-                    })?,
+                    .map_or_else(
+                        || {
+                            policy.check_unknown_property(&name)?;
+                            Err(invalid(
+                                scope,
+                                source,
+                                assignment.name_span,
+                                format!("Unknown property '{name}'"),
+                            ))
+                        },
+                        Ok,
+                    )?,
             )
         };
         if !seen.insert(copy_string(&name, control)?) {

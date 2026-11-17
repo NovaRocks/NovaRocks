@@ -952,3 +952,266 @@ fn legacy_catalog_preparation_uses_original_literal_facts_and_evaluated_strings(
         )
     );
 }
+
+struct NamePolicy {
+    checked: Vec<String>,
+    reject: Option<(&'static str, QueryServiceError)>,
+}
+impl DdlPropertyNamePolicy for NamePolicy {
+    fn check_unknown_property(&mut self, canonical: &str) -> Result<(), QueryServiceError> {
+        self.checked.push(canonical.to_owned());
+        match &self.reject {
+            Some((name, error)) if *name == canonical => Err(error.clone()),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[test]
+fn ddl_property_name_policy_does_not_preempt_an_earlier_original_port_failure() {
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    let first = parse_expression("first_value").unwrap();
+    let later = parse_expression("later_value").unwrap();
+    let original =
+        QueryServiceError::from_failure_cause(SharedFailureCause::new(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "original property source failure",
+        )));
+    let recognized =
+        QueryServiceError::from_failure_cause(SharedFailureCause::new(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "recognized property has no writer",
+        )));
+    let mut policy = NamePolicy {
+        checked: vec![],
+        reject: Some(("sorted_by", recognized)),
+    };
+    let mut port = Port::new(vec![Call {
+        expression: &first,
+        target: Target::Varchar,
+        result: Err(DdlPropertyConstantError::Failure(original.clone())),
+    }]);
+    let actual = evaluate_ddl_properties_with_name_policy(
+        DdlPropertyScope::Table,
+        DdlPropertyEvaluationMode::Alter,
+        "source",
+        &[declaration("known", Type::Varchar, Value::Null)],
+        &[assignment("known", &first), assignment("SORTED_BY", &later)],
+        &mut port,
+        &Control::default(),
+        &mut policy,
+    )
+    .unwrap_err();
+    assert_eq!(actual, original);
+    assert!(policy.checked.is_empty());
+    assert_eq!(port.seen, vec![&first as *const Expr]);
+    port.exhausted();
+}
+
+#[test]
+fn ddl_property_name_policy_returns_the_original_recognized_capability_cause() {
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    let expression = parse_expression("not_computed").unwrap();
+    let cause = SharedFailureCause::new(ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        "recognized property has no writer",
+    ));
+    let original = QueryServiceError::from_failure_cause(cause.clone());
+    let mut policy = NamePolicy {
+        checked: vec![],
+        reject: Some(("sorted_by", original.clone())),
+    };
+    let mut port = Port::new(vec![]);
+    let actual = evaluate_ddl_properties_with_name_policy(
+        DdlPropertyScope::Table,
+        DdlPropertyEvaluationMode::Create,
+        "source",
+        &[],
+        &[assignment("SORTED_BY", &expression)],
+        &mut port,
+        &Control::default(),
+        &mut policy,
+    )
+    .unwrap_err();
+    assert_eq!(actual, original);
+    assert_eq!(policy.checked, ["sorted_by"]);
+    let retained = actual.failure_cause().unwrap();
+    assert_eq!(retained.failure_fact(), cause.failure_fact());
+    assert_eq!(
+        retained.downcast_ref::<ConnectorError>().unwrap().kind(),
+        ConnectorErrorKind::Unsupported
+    );
+    assert!(std::ptr::eq(
+        retained.downcast_ref::<ConnectorError>().unwrap(),
+        cause.downcast_ref::<ConnectorError>().unwrap(),
+    ));
+    assert!(port.seen.is_empty());
+    port.exhausted();
+}
+
+#[test]
+fn ddl_property_name_policy_ok_still_rejects_unknown_at_the_original_scope_and_site() {
+    let expression = parse_expression("not_computed").unwrap();
+    let source = "  UNKNOWN";
+    let span = novarocks_parser::Span::new(2, source.len());
+    // This input explicitly authors its name extent; no DDL parser custody is
+    // asserted for the separately parsed, unevaluated value expression.
+    let input = DdlPropertyAssignment {
+        name: "UNKNOWN",
+        name_span: span,
+        span,
+        value: DdlPropertyAssignmentValue::Expression(&expression),
+    };
+    for scope in [
+        DdlPropertyScope::Table,
+        DdlPropertyScope::Schema,
+        DdlPropertyScope::MaterializedView,
+        DdlPropertyScope::Analyze,
+        DdlPropertyScope::Branch,
+    ] {
+        let mut policy = NamePolicy {
+            checked: vec![],
+            reject: None,
+        };
+        let mut port = Port::new(vec![]);
+        let actual = evaluate_ddl_properties_with_name_policy(
+            scope,
+            DdlPropertyEvaluationMode::Alter,
+            source,
+            &[],
+            &[input],
+            &mut port,
+            &Control::default(),
+            &mut policy,
+        )
+        .unwrap_err();
+        assert_eq!(
+            actual.user_error().unwrap(),
+            &scope.to_user_error(source, span, "Unknown property 'unknown'")
+        );
+        assert_eq!(policy.checked, ["unknown"]);
+        assert!(port.seen.is_empty());
+        let original = evaluate_ddl_properties(
+            scope,
+            DdlPropertyEvaluationMode::Alter,
+            source,
+            &[],
+            &[input],
+            &mut port,
+            &Control::default(),
+        )
+        .unwrap_err();
+        assert_eq!(actual, original);
+        port.exhausted();
+    }
+}
+
+#[test]
+fn ddl_property_name_policy_bypasses_known_duplicate_and_dynamic_catalog_names() {
+    let expression = parse_expression("'retained'").unwrap();
+    let rejected = QueryServiceError::new(QueryServiceErrorKind::Unsupported, "must not be called");
+    let mut policy = NamePolicy {
+        checked: vec![],
+        reject: Some(("known", rejected)),
+    };
+    let declarations = [declaration("known", Type::Varchar, Value::Null)];
+    let mut port = Port::new(vec![Call {
+        expression: &expression,
+        target: Target::Varchar,
+        result: Ok(text(Some("retained"))),
+    }]);
+    let result = evaluate_ddl_properties_with_name_policy(
+        DdlPropertyScope::Table,
+        DdlPropertyEvaluationMode::Alter,
+        "source",
+        &declarations,
+        &[assignment("KNOWN", &expression)],
+        &mut port,
+        &Control::default(),
+        &mut policy,
+    )
+    .unwrap();
+    assert_eq!(
+        result.properties(),
+        &[EvaluatedDdlProperty {
+            name: "known".into(),
+            change: DdlPropertyChange::Set(Value::Varchar("retained".into())),
+        }]
+    );
+    assert!(policy.checked.is_empty());
+    port.exhausted();
+    let mut port = Port::new(vec![Call {
+        expression: &expression,
+        target: Target::Varchar,
+        result: Ok(text(Some("retained"))),
+    }]);
+    let error = evaluate_ddl_properties_with_name_policy(
+        DdlPropertyScope::Table,
+        DdlPropertyEvaluationMode::Alter,
+        "source",
+        &declarations,
+        &[
+            assignment("KNOWN", &expression),
+            assignment("known", &expression),
+        ],
+        &mut port,
+        &Control::default(),
+        &mut policy,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.user_error().unwrap(),
+        &DdlPropertyScope::Table.to_user_error("source", SYNTHETIC, "Duplicate property 'known'")
+    );
+    assert!(policy.checked.is_empty());
+    assert_eq!(port.seen.len(), 1);
+    port.exhausted();
+    let mut policy = NamePolicy {
+        checked: vec![],
+        reject: Some((
+            "sorted_by",
+            QueryServiceError::new(
+                QueryServiceErrorKind::Unsupported,
+                "not a Catalog declaration",
+            ),
+        )),
+    };
+    let mut port = Port::new(vec![
+        Call {
+            expression: &expression,
+            target: Target::Varchar,
+            result: Ok(text(Some("first"))),
+        },
+        Call {
+            expression: &expression,
+            target: Target::Varchar,
+            result: Ok(text(Some("second"))),
+        },
+    ]);
+    let result = evaluate_ddl_properties_with_name_policy(
+        DdlPropertyScope::Catalog,
+        DdlPropertyEvaluationMode::Create,
+        "source",
+        &[],
+        &[
+            assignment("sorted_by", &expression),
+            assignment("SORTED_BY", &expression),
+        ],
+        &mut port,
+        &Control::default(),
+        &mut policy,
+    )
+    .unwrap();
+    assert_eq!(
+        result
+            .properties()
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["sorted_by", "SORTED_BY"]
+    );
+    assert!(policy.checked.is_empty());
+    assert_eq!(port.seen.len(), 2);
+    port.exhausted();
+}

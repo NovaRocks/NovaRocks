@@ -81,6 +81,14 @@ impl DdlPropertyValue {
     }
 }
 
+/// Reset retains its explicit default, including a NULL default for ALTER.
+/// Neither variant denotes absence; providers still validate non-NULL children.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DdlPropertyChange {
+    Set(DdlPropertyValue),
+    Reset(DdlPropertyValue),
+}
+
 /// Provider/application-authored metadata; this is not a session projector.
 ///
 /// Every declaration has an explicit default_value. Null means a SQL NULL

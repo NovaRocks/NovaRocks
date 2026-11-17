@@ -1116,6 +1116,26 @@ pub struct ConnectorCatalogMutationReconcileRequest {
 pub trait ConnectorCatalogMutation: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ProviderBindingEpoch;
+    /// Pure table/storage declarations from this exact control generation.
+    /// Absence of this capability is explicit; an empty list is not a default.
+    fn table_property_declarations(
+        &self,
+    ) -> Result<Vec<super::DdlPropertyDeclaration>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector catalog mutation does not declare table properties",
+        ))
+    }
+    /// Check one scope-canonical name at its original input position. A provider
+    /// may reject a recognized unsupported name. Unknown names must remain Ok
+    /// so the declaration lookup owner preserves its ordinary unknown error.
+    /// This method performs no external I/O and grants no mutation authority.
+    fn check_table_property_name(&self, _canonical_name: &str) -> Result<(), ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector catalog mutation has no table property name policy",
+        ))
+    }
     /// Admit a complete mutation before a consumer decomposes it into reads
     /// and child mutations. This method must perform no external side effect.
     /// Execution must repeat admission; this answer is not a reusable permit.
@@ -1216,6 +1236,18 @@ impl ConnectorCatalogMutationSession {
     }
     pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
         self.control_runtime_id
+    }
+
+    /// Borrow declarations through this session's original generation lease.
+    pub fn table_property_declarations(
+        &self,
+    ) -> Result<Vec<super::DdlPropertyDeclaration>, ConnectorError> {
+        self.mutation.table_property_declarations()
+    }
+
+    /// Apply the original provider's per-name policy without another lookup.
+    pub fn check_table_property_name(&self, canonical_name: &str) -> Result<(), ConnectorError> {
+        self.mutation.check_table_property_name(canonical_name)
     }
 
     /// Builds a provider request behind an FE-owned control-runtime lease.
@@ -2036,6 +2068,17 @@ mod tests {
             4096,
         )
         .unwrap();
+        assert_eq!(
+            lease.table_property_declarations().unwrap_err().kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        assert_eq!(
+            lease
+                .check_table_property_name("unregistered")
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported
+        );
         let error = lease
             .admit_operation(
                 ConnectorMutationOperationId::new(),
@@ -2050,6 +2093,109 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn table_property_lookup_uses_the_original_session_and_release() {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct PropertyCapability {
+            descriptor: ConnectorInstanceDescriptor,
+            epoch: ProviderBindingEpoch,
+        }
+        impl ConnectorCatalogMutation for PropertyCapability {
+            fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+                &self.descriptor
+            }
+            fn incarnation(&self) -> ProviderBindingEpoch {
+                self.epoch
+            }
+            fn table_property_declarations(
+                &self,
+            ) -> Result<Vec<super::super::DdlPropertyDeclaration>, ConnectorError> {
+                Ok(vec![
+                    super::super::DdlPropertyDeclaration::new(
+                        "test_limit",
+                        super::super::DdlPropertyType::Integer,
+                        super::super::DdlPropertyValue::Integer(7),
+                        false,
+                    )
+                    .expect("valid test declaration"),
+                ])
+            }
+            fn check_table_property_name(&self, name: &str) -> Result<(), ConnectorError> {
+                if name == "known_unsupported" {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "original provider name refusal",
+                    ));
+                }
+                Ok(())
+            }
+            fn execute(
+                &self,
+                _: ConnectorCatalogMutationRequest,
+            ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+            {
+                panic!("property lookup must not execute a mutation")
+            }
+            fn reconcile(
+                &self,
+                _: ConnectorCatalogMutationReconcileRequest,
+            ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+            {
+                panic!("property lookup must not reconcile a mutation")
+            }
+        }
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("analytics").unwrap(),
+        };
+        let epoch = ProviderBindingEpoch::from_bytes([9; 16]);
+        let runtime = ConnectorControlRuntimeId::new();
+        let released = Arc::new(AtomicBool::new(false));
+        let release = released.clone();
+        let lease = ConnectorCatalogMutationSession::new(
+            descriptor.clone(),
+            runtime,
+            epoch,
+            Arc::new(PropertyCapability {
+                descriptor: descriptor.clone(),
+                epoch,
+            }),
+            move || {
+                release.store(true, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        let retained = lease.clone();
+        assert_eq!(lease.descriptor(), &descriptor);
+        assert_eq!(lease.control_runtime_id(), runtime);
+        let properties = lease.table_property_declarations().unwrap();
+        assert_eq!(properties.len(), 1);
+        assert_eq!(properties[0].name(), "test_limit");
+        assert_eq!(
+            properties[0].value_type(),
+            super::super::DdlPropertyType::Integer
+        );
+        assert_eq!(
+            properties[0].default_value(),
+            &super::super::DdlPropertyValue::Integer(7)
+        );
+        assert!(!properties[0].hidden());
+        lease.check_table_property_name("test_limit").unwrap();
+        lease.check_table_property_name("unregistered").unwrap();
+        let error = retained
+            .check_table_property_name("known_unsupported")
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(error.message(), "original provider name refusal");
+        assert!(!released.load(Ordering::SeqCst));
+        drop(lease);
+        assert!(!released.load(Ordering::SeqCst));
+        retained.table_property_declarations().unwrap();
+        drop(retained);
+        assert!(released.load(Ordering::SeqCst));
     }
 
     fn table() -> ConnectorTableIdentity {
