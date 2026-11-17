@@ -46,8 +46,10 @@ mod types;
 
 mod trino_json;
 
+mod printer_advanced_relation;
 mod printer_json;
 mod printer_pattern;
 mod printer_special;
 mod trino_access;
+mod trino_advanced_relation;
 mod trino_pattern;

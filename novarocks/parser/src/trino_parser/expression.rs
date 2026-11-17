@@ -792,7 +792,8 @@ impl Parser<'_> {
             T::End
                 | T::Symbol(S::Comma | S::RParen)
                 | T::Keyword(
-                    K::From
+                    K::For
+                        | K::From
                         | K::Where
                         | K::Group
                         | K::Having

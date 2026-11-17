@@ -18,6 +18,7 @@
 //! Query syntax built directly from the Trino lexical vocabulary.
 
 mod access;
+mod advanced_relation;
 mod cursor;
 mod expression;
 mod failure;

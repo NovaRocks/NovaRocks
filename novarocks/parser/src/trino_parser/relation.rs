@@ -98,7 +98,8 @@ impl Parser<'_> {
             relation = self.parse_pattern_recognition(relation, input_extent)?;
         }
         if self.at_keyword(Keyword::Pivot) {
-            return Err(self.error("pivot syntax (next parser slice)"));
+            let input_extent = self.span_since(start);
+            relation = self.parse_pivot(relation, input_extent)?;
         }
         if self.eat_keyword(Keyword::Tablesample).is_some() {
             let kind = if self.eat_keyword(Keyword::Bernoulli).is_some() {
@@ -220,12 +221,12 @@ impl Parser<'_> {
             return Ok(Relation::JsonTable(AstBox::new(self.parse_json_table()?)));
         }
         if self.at_keyword(Keyword::Table) {
-            return Err(self.error("table-function syntax (next parser slice)"));
+            return self.parse_table_function_relation();
         }
         if self.at_keyword(Keyword::Nearest)
             && self.peek(1).kind == TokenKind::Symbol(Symbol::LParen)
         {
-            return Err(self.error("NEAREST syntax (next parser slice)"));
+            return self.parse_nearest_relation();
         }
         if self.eat_symbol(Symbol::LParen).is_some() {
             if self.relation_query_ahead() {

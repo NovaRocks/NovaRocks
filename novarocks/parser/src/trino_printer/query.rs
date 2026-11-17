@@ -153,33 +153,8 @@ impl Writer {
             self.expression(selection);
         }
         if let Some(group_by) = &value.group_by {
-            self.text(" GROUP BY ");
-            if group_by.distinct {
-                self.text("DISTINCT ");
-            }
-            for (index, element) in group_by.elements.iter().enumerate() {
-                if index != 0 {
-                    self.text(", ");
-                }
-                match element {
-                    GroupingElement::Simple(value) => self.grouping_set(&value.columns),
-                    GroupingElement::Sets(value) => {
-                        self.text(match value.kind {
-                            GroupingSetsKind::Explicit => "GROUPING SETS (",
-                            GroupingSetsKind::Rollup => "ROLLUP (",
-                            GroupingSetsKind::Cube => "CUBE (",
-                        });
-                        for (index, set) in value.sets.iter().enumerate() {
-                            if index != 0 {
-                                self.text(", ");
-                            }
-                            self.grouping_set(set);
-                        }
-                        self.character(')');
-                    }
-                    GroupingElement::Auto(_) => self.text("AUTO"),
-                }
-            }
+            self.character(' ');
+            self.group_by(group_by);
         }
         if let Some(having) = &value.having {
             self.text(" HAVING ");
@@ -198,6 +173,37 @@ impl Writer {
         }
         self.modifiers(&value.modifiers);
     }
+    #[recursive::recursive]
+    pub(super) fn group_by(&mut self, group_by: &GroupBy) {
+        self.text("GROUP BY ");
+        if group_by.distinct {
+            self.text("DISTINCT ");
+        }
+        for (index, element) in group_by.elements.iter().enumerate() {
+            if index != 0 {
+                self.text(", ");
+            }
+            match element {
+                GroupingElement::Simple(value) => self.grouping_set(&value.columns),
+                GroupingElement::Sets(value) => {
+                    self.text(match value.kind {
+                        GroupingSetsKind::Explicit => "GROUPING SETS (",
+                        GroupingSetsKind::Rollup => "ROLLUP (",
+                        GroupingSetsKind::Cube => "CUBE (",
+                    });
+                    for (index, set) in value.sets.iter().enumerate() {
+                        if index != 0 {
+                            self.text(", ");
+                        }
+                        self.grouping_set(set);
+                    }
+                    self.character(')');
+                }
+                GroupingElement::Auto(_) => self.text("AUTO"),
+            }
+        }
+    }
+
     fn grouping_set(&mut self, expressions: &[Expr]) {
         self.character('(');
         self.expressions(expressions);
@@ -249,16 +255,21 @@ impl Writer {
             if index != 0 {
                 self.text(", ");
             }
-            self.expression(&item.sort_key);
-            self.text(match item.ordering {
-                SortOrdering::Ascending => " ASC",
-                SortOrdering::Descending => " DESC",
-            });
-            match item.null_ordering {
-                NullOrdering::Undefined => {}
-                NullOrdering::First => self.text(" NULLS FIRST"),
-                NullOrdering::Last => self.text(" NULLS LAST"),
-            }
+            self.sort_item(item);
+        }
+    }
+
+    #[recursive::recursive]
+    pub(super) fn sort_item(&mut self, item: &SortItem) {
+        self.expression(&item.sort_key);
+        self.text(match item.ordering {
+            SortOrdering::Ascending => " ASC",
+            SortOrdering::Descending => " DESC",
+        });
+        match item.null_ordering {
+            NullOrdering::Undefined => {}
+            NullOrdering::First => self.text(" NULLS FIRST"),
+            NullOrdering::Last => self.text(" NULLS LAST"),
         }
     }
 
@@ -390,7 +401,7 @@ impl Writer {
             Relation::JsonTable(value) => self.json_table(value),
             Relation::PatternRecognition(value) => self.pattern_recognition(value),
             Relation::Pivot(_) | Relation::Nearest(_) | Relation::TableFunction(_) => {
-                unsupported("advanced relation vocabulary")
+                self.advanced_relation(value)
             }
         }
     }

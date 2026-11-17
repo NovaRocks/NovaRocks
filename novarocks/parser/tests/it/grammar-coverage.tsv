@@ -479,8 +479,8 @@ alternative	descriptorArgument	1		0	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x ) )
 alternative	descriptorArgument	2		0	SELECT * FROM TABLE ( x ( CAST ( NULL AS DESCRIPTOR ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	descriptorField	1		1	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	descriptorField	1		0	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	copartitionTables	1		1	SELECT * FROM TABLE ( x ( COPARTITION ( x , x , x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	copartitionTables	1		0	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	copartitionTables	1		1	SELECT * FROM TABLE ( x ( 1 COPARTITION ( x , x , x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	copartitionTables	1		0	SELECT * FROM TABLE ( x ( 1 COPARTITION ( x , x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	expression	1		0	VALUES ?	supported	accept	reviewed-grammar-path	none
 optional	booleanExpression	1		1	VALUES ? < ?	supported	accept	reviewed-grammar-path	none
 alternative	booleanExpression	1	predicated	0	VALUES ?	supported	accept	reviewed-grammar-path	none
@@ -2143,7 +2143,7 @@ alternative	tableArgument	1		g3.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) ORDER B
 alternative	tableArgumentRelation	1		g1.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) x ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	tableArgumentRelation	2		g1.b1	SELECT * FROM TABLE ( x ( TABLE ( TABLE x ) x ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	descriptorArgument	1		g1.b1	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x , x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	copartitionTables	1		g1.b1	SELECT * FROM TABLE ( x ( COPARTITION ( x , x , x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	copartitionTables	1		g1.b1	SELECT * FROM TABLE ( x ( 1 COPARTITION ( x , x , x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	predicate	3		g1.b1	VALUES ? BETWEEN ASYMMETRIC ? AND ?	supported	accept	reviewed-grammar-path	none
 alternative	predicate	3		g1.b2	VALUES ? BETWEEN SYMMETRIC ? AND ?	supported	accept	reviewed-grammar-path	none
 alternative	predicate	4		g1.b1	VALUES ? IN ( ? , ? )	supported	accept	reviewed-grammar-path	none

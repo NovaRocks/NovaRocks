@@ -5,6 +5,7 @@
 use crate::ast::*;
 use std::fmt::Write;
 
+mod advanced_relation;
 mod expression;
 mod json;
 mod literal_type;
