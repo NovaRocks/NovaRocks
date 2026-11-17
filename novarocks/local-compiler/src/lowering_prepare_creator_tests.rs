@@ -50,6 +50,7 @@ struct Observations {
     held: AtomicUsize,
     scope_exits: AtomicUsize,
     factory_exits: AtomicUsize,
+    scope_limit: AtomicUsize,
 }
 impl Observations {
     fn start(&self) {
@@ -76,7 +77,7 @@ impl Observations {
         let next = held
             .load(Ordering::SeqCst)
             .checked_add(bytes)
-            .filter(|bytes| *bytes <= 65536);
+            .filter(|bytes| *bytes <= self.scope_limit.load(Ordering::SeqCst));
         if *self.request_stop.lock().unwrap() == Some(at) || next.is_none() {
             self.stopped.store(true, Ordering::SeqCst);
             return Err(FirstH(token.clone()));
@@ -152,8 +153,14 @@ struct Factory {
 }
 impl Factory {
     fn new() -> Self {
+        Self::with_scope_limit(65536)
+    }
+    fn with_scope_limit(scope_limit: usize) -> Self {
         Self {
-            observations: Arc::new(Observations::default()),
+            observations: Arc::new(Observations {
+                scope_limit: AtomicUsize::new(scope_limit),
+                ..Observations::default()
+            }),
             token: Arc::new(()),
         }
     }
@@ -252,36 +259,33 @@ fn with_actual_call<R>(
         &ConstantPolicy,
     ) -> R,
 ) -> R {
-    let call = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .calls()
-        .values()
-        .next()
+    let project = program
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| node.physical_sources().iter().any(|id| id.get() == 41))
         .unwrap();
+    let ProgramNodeKind::Project { exprs, .. } = project.kind() else {
+        panic!("actual RAND project")
+    };
+    let reference = exprs[0];
+    let compiled = program.unit(reference.unit).unwrap();
+    let root = compiled.root(reference.root).unwrap();
+    let call = &compiled.calls()[&root.use_id];
     let contract = call.call_contract();
-    let frozen =
-        &source.calls().entries()[&PhysicalCallSite::Expression(contract.context().use_id)];
-    let invocation = &source.expression_uses().flow().uses()[&frozen.context.use_id];
-    let definition = source
-        .fragment()
-        .expressions()
-        .get(invocation.definition)
+    let unit = source.fragment().nodes()[&NodeId::new(41)]
+        .expressions
+        .as_ref()
         .unwrap();
+    let frozen = &unit.claims()[&root.use_id];
+    let invocation = &unit.control_flow().uses()[&frozen.context.use_id];
+    let definition = unit.definition(invocation.definition).unwrap();
     let ExprKind::FunctionCall { function, args } = &definition.kind else {
         panic!("actual frozen RAND call")
     };
     assert!(args.is_empty());
     assert!(invocation.arguments.is_empty());
-    let original = source
-        .fragment()
-        .call_requests()
-        .get(novarocks_physical_plan::PhysicalCallDefinition::Expression(
-            invocation.definition,
-        ))
-        .unwrap();
+    let original = &unit.requests()[&invocation.definition];
     let mut work =
         CompileCheckpoints::try_new(&FixtureControl, CompilePhase::FunctionSpecialization).unwrap();
     let request = crate::original_requests::materialize_call_request_observed(
@@ -293,10 +297,13 @@ fn with_actual_call<R>(
     work.finish().unwrap();
     assert_eq!(request.request().logical_argument_count, 0);
     assert_eq!(function.function_id, *contract.function_id());
-    assert_eq!(frozen.context, contract.context());
+    assert_eq!(
+        novarocks_type_contract::CallEffectContext::from(frozen.context),
+        contract.context()
+    );
     let selected = contract.selected_owner().clone();
     let input = CallEffectInput {
-        context: frozen.context,
+        context: frozen.context.into(),
         argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&[]),
         function_id: &function.function_id,
         kind: function.kind,
@@ -328,7 +335,9 @@ fn preparation(
         selected,
         effects,
         PureCallPreparation::Scalar {
-            arguments: ScopedExpressionEffects::pure_value(input.context),
+            arguments: ScopedExpressionEffects::pure_value(
+                input.context.expression().expect("actual scalar context"),
+            ),
         },
         policy,
         scope,
@@ -395,7 +404,9 @@ fn actual_public_frozen_preparation_uses_one_completed_signature_author_and_no_s
                 selected.clone(),
                 effects,
                 PureCallPreparation::Scalar {
-                    arguments: ScopedExpressionEffects::pure_value(input.context),
+                    arguments: ScopedExpressionEffects::pure_value(
+                        input.context.expression().expect("actual scalar context"),
+                    ),
                 },
                 &FixtureControl,
             )
@@ -613,23 +624,18 @@ fn actual_public_compiler_functions_keep_primary_h_and_real_bounded_scope_exit()
     let first = first.expect("actual compiler reaches the full function signature constructor");
     assert_eq!(
         program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()
-            .len(),
+            .units()
+            .iter()
+            .map(|unit| unit.calls().len())
+            .sum::<usize>(),
         2
     );
     for call in program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .calls()
-        .values()
+        .units()
+        .iter()
+        .flat_map(|unit| unit.calls().values())
     {
-        assert_rand(call.specialization());
+        assert_rand(call);
     }
     drop(program);
     assert_eq!(good.observations.held.load(Ordering::SeqCst), 0);
@@ -673,7 +679,7 @@ fn actual_public_compiler_functions_keep_primary_h_and_real_bounded_scope_exit()
 
 // A real original source request uses both shared Value and Lambda channels.
 // Its immutable complete types are FE-authored, not inferred from a carrier.
-fn nonempty_original_request() -> novarocks_physical_plan::PhysicalCallRequest {
+fn nonempty_original_request() -> novarocks_expression_contract::PhysicalCallRequest {
     use novarocks_physical_plan::StaticFunctionArgument as A;
     let json = FunctionValueType::try_with_logical_type(
         DataType::Utf8,
@@ -687,7 +693,7 @@ fn nonempty_original_request() -> novarocks_physical_plan::PhysicalCallRequest {
         novarocks_type_contract::ValueLogicalType::Uuid,
     )
     .unwrap();
-    novarocks_physical_plan::PhysicalCallRequest {
+    novarocks_expression_contract::PhysicalCallRequest {
         arguments: vec![
             A::Value {
                 value_type: json.clone(),
@@ -707,7 +713,7 @@ fn nonempty_original_request() -> novarocks_physical_plan::PhysicalCallRequest {
     }
 }
 fn materialize_created_request<'a>(
-    source: &'a novarocks_physical_plan::PhysicalCallRequest,
+    source: &'a novarocks_expression_contract::PhysicalCallRequest,
     pools: &novarocks_physical_plan::ConstantPools,
     factory: &Factory,
 ) -> Result<
@@ -726,7 +732,7 @@ fn materialize_created_request<'a>(
     )
 }
 fn assert_materialized_source(
-    source: &novarocks_physical_plan::PhysicalCallRequest,
+    source: &novarocks_expression_contract::PhysicalCallRequest,
     materialized: &novarocks_physical_plan::MaterializedCallRequest<'_>,
 ) {
     use novarocks_physical_plan::StaticFunctionArgument as A;
@@ -1035,7 +1041,7 @@ fn original_request_header_gates_and_pending_control_precede_lazy_scope_creation
         assert_eq!(factory.observations.events().len(), 2);
     }
 
-    let source = novarocks_physical_plan::PhysicalCallRequest {
+    let source = novarocks_expression_contract::PhysicalCallRequest {
         arguments: Box::new([]),
         logical_argument_count: 0,
         expected_result_type: None,
@@ -1324,5 +1330,79 @@ fn ordered_topn_compiler_actual_creator_preserves_every_refusal_prefix() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn synthesized_reads_keep_actual_source_quotes_first_refusal_and_independent_flow_storage() {
+    let source = crate::union_lowering_tests::fixture_width(3).package;
+    let functions = crate::union_lowering_tests::functions();
+    // This fixture retains four units and both original/synthetic source tables.
+    // Its explicit test budget accommodates their cumulative actual requests.
+    const SCOPE_LIMIT: usize = 256 * 1024;
+    let good = Factory::with_scope_limit(SCOPE_LIMIT);
+    let program = compile_created(source.clone(), &functions, &good).unwrap_or_else(|_| {
+        let events = good.observations.events();
+        panic!(
+            "actual scoped Union read source refused: events={}, last={:?}, held={}",
+            events.len(),
+            events.last(),
+            good.observations.held.load(Ordering::SeqCst)
+        )
+    });
+    let normalizers = program
+        .graph()
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.kind() {
+            ProgramNodeKind::Project {
+                exprs,
+                is_subordinate: true,
+                ..
+            } => Some(exprs),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(normalizers.len(), 2);
+    assert_eq!(program.units().len(), 4);
+    let first = normalizers[0][0];
+    drop(normalizers);
+    let last_unit = program.unit(first.unit).unwrap().clone();
+    let flow = last_unit.control_flow().clone();
+    assert_eq!(last_unit.roots().len(), 3);
+    assert_eq!(flow.use_reference_count(), 3);
+    let trace = good.observations.events();
+    assert!(trace.iter().any(|event| matches!(event, Event::Exact(..))));
+    assert!(trace.iter().any(|event| matches!(event, Event::Opaque(..))));
+    drop(program);
+    assert!(good.observations.held.load(Ordering::SeqCst) > 0);
+    drop(last_unit);
+    assert!(
+        good.observations.held.load(Ordering::SeqCst) > 0,
+        "the independently cloned compiled flow retains its actual allocation owner"
+    );
+    drop(flow);
+    assert_eq!(good.observations.held.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        good.observations.scope_exits.load(Ordering::SeqCst),
+        good.observations.next_scope.load(Ordering::SeqCst)
+    );
+
+    // Exercise each actual source, temporary, retained and holder request, not
+    // a guessed list of private builder allocations or a successful no-op port.
+    for (at, event) in trace.iter().enumerate() {
+        if matches!(event, Event::Control(..)) {
+            continue;
+        }
+        let refused = Factory::with_scope_limit(SCOPE_LIMIT);
+        *refused.observations.request_stop.lock().unwrap() = Some(at);
+        match compile_created(source.clone(), &functions, &refused) {
+            Err(FragmentCreationError::Creator(FirstH(token))) => {
+                assert!(Arc::ptr_eq(&token, &refused.token));
+            }
+            _ => panic!("the original synthesized read constructor must return its first H"),
+        }
+        assert_eq!(refused.observations.events(), trace[..=at]);
+        assert_eq!(refused.observations.held.load(Ordering::SeqCst), 0);
     }
 }

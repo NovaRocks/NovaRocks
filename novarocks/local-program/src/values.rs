@@ -32,7 +32,7 @@ use novarocks_type_contract::{
     ValueTypeStorageLifetime,
 };
 
-use crate::{ProgramExprId, StaticLayout};
+use crate::{ProgramRootRef, StaticLayout};
 use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
 
 /// Historical policy for ordinary SQL VALUES backing. System relations use
@@ -143,13 +143,12 @@ fn pure<T>(
     })
 }
 
-/// One dynamic cell position and the main-arena definition its
-/// `ValuesCell { row, column }` root evaluates.
+/// One dynamic cell position and its root in the actual compiled unit table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StaticValuesCell {
     pub row: u32,
     pub column: u32,
-    pub definition: ProgramExprId,
+    pub definition: ProgramRootRef,
 }
 
 /// Borrowed view of one Values backing.
@@ -378,7 +377,7 @@ impl StaticValues {
     /// column, exactly that column's constant cells in row order and in the
     /// column's frozen carrier; `dynamic` names every other position, strictly
     /// increasing in (row, column). The cell definitions are checked against
-    /// the program's expression roots, channel types and lexical bindings.
+    /// the program's actual compiled roots, channel types and empty input scope.
     pub fn try_new_with_cells_for_compile(
         rows: usize,
         constants: Vec<ArrayRef>,
@@ -880,7 +879,7 @@ mod tests {
         StaticValuesCell {
             row,
             column,
-            definition: crate::ProgramExprId::new(definition),
+            definition: crate::test_support::root(0, definition as u32),
         }
     }
     fn int64(values: Vec<Option<i64>>) -> ArrayRef {

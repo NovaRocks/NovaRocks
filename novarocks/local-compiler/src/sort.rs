@@ -22,19 +22,16 @@
 
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use novarocks_local_program::{
-    ProgramExprId, ProgramNodeId, ProgramNodeKind, SortExpression, SortTopNType, StaticLayout,
+    ProgramNodeId, ProgramNodeKind, SortExpression, SortTopNType, StaticLayout,
 };
-use novarocks_physical_plan::{
-    ExprId, NodeKind, NullOrdering, PhysicalNode, SortDirection, SortMode,
-};
+use novarocks_physical_plan::{NodeKind, NullOrdering, PhysicalNode, SortDirection, SortMode};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
-use std::collections::BTreeMap;
 
 pub(crate) fn lower_sort(
     node: &PhysicalNode,
     input: ProgramNodeId,
     layout: &StaticLayout,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     control: &dyn PureCompileControl,
 ) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
@@ -49,7 +46,7 @@ fn lower_core(
     node: &PhysicalNode,
     input: ProgramNodeId,
     layout: &StaticLayout,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
     let (order_by, partition_by) = match &node.kind {
@@ -115,7 +112,7 @@ fn lower_core(
 /// projection author.
 pub(crate) fn lower_sort_keys(
     order_by: &[novarocks_physical_plan::SortExpr],
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<SortExpression>, FragmentCompileError> {
     let mut keys = Vec::new();

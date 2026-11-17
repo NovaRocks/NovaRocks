@@ -33,13 +33,12 @@ use crate::{
     channels::{NodeChannels, ResolvedInput, UnionChannelSource},
     creation::FragmentCreationError,
     lowering::FragmentCompileError,
-    union_flow::RuntimeFilterKeyRoot,
 };
 use novarocks_connector_contract::ConnectorReadProgramRecipe;
 use novarocks_local_program::{
     BindingRequirement, FilterConsumerActivation, FilterConsumerAtExpr, FilterMembershipSchema,
     FilterMembershipSchemaError, FilterNullSemantics, FilterProducerKind, FilterReduction,
-    ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId, ProgramNodeId,
+    ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId, ProgramRootRef,
     StaticFilterConsumer, StaticFilterContract, StaticFilterProducer,
 };
 use novarocks_physical_plan::{
@@ -93,7 +92,7 @@ fn has_ordered_consumer(
 struct PlannedJoinConsumer {
     requirement: i32,
     key_ordinal: usize,
-    key: novarocks_physical_plan::ExprId,
+    key: novarocks_expression_contract::RootOrdinal,
     value: novarocks_physical_plan::ValueId,
     consumer: StaticFilterConsumer,
 }
@@ -113,15 +112,13 @@ pub(crate) struct ScanFilterSites {
     pub ordered: bool,
     pub filters: novarocks_local_program::ScanFilterConsumers,
     pub requirements: Vec<BindingRequirement>,
-    pub roots: Vec<RuntimeFilterKeyRoot>,
 }
 
 /// The producers one lowered hash join owns: each build-key ordinal with its
 /// static producer, and their requirements.
 pub(crate) struct JoinFilterSites {
     pub producers: Vec<(usize, StaticFilterProducer)>,
-    pub consumers: Vec<(usize, ProgramExprId, StaticFilterConsumer)>,
-    pub roots: Vec<RuntimeFilterKeyRoot>,
+    pub consumers: Vec<(usize, ProgramRootRef, StaticFilterConsumer)>,
     pub requirements: Vec<BindingRequirement>,
 }
 
@@ -554,11 +551,7 @@ fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
         novarocks_physical_plan::JoinSide::Left => key.left,
         novarocks_physical_plan::JoinSide::Right => key.right,
     };
-    let key_type = &fragment
-        .expressions()
-        .get(build_key)
-        .ok_or(FragmentCompileError::Invalid("missing join key definition"))?
-        .ty;
+    let key_type = &crate::expressions::bound_root(package, node, build_key)?.ty;
     if !key_type.same_physical_binding_ignoring_root_nullability_observed(
         contract_type(&contract)?,
         || work.step(),
@@ -828,15 +821,10 @@ fn plan_join_consumer<H, F: ValueSchemaCreationFactory<H>>(
         novarocks_physical_plan::JoinSide::Left => pair.right,
         novarocks_physical_plan::JoinSide::Right => pair.left,
     };
-    let definition = fragment
-        .expressions()
-        .get(key)
-        .ok_or(FragmentCompileError::Invalid(
-            "missing join probe key definition",
-        ))?;
+    let definition = crate::expressions::bound_root(package, node, key)?;
     // The checked Physical endpoint author requires this exact direct Value.
     // No expression is inferred from a matching datatype or from SQL text.
-    let novarocks_physical_plan::ExprKind::Value(value) = &definition.kind else {
+    let novarocks_expression_contract::ExprKind::Value(value) = &definition.kind else {
         return Err(FragmentCompileError::Invalid(
             "join probe endpoint is not its checked direct value key",
         )
@@ -982,8 +970,8 @@ impl PlannedRuntimeFilters {
     pub(crate) fn take_scan<H, F: ValueSchemaCreationFactory<H>>(
         &mut self,
         scan: NodeId,
-        local: ProgramNodeId,
-        definitions: Option<&Vec<ProgramExprId>>,
+        _local: ProgramNodeId,
+        definitions: Option<&Vec<ProgramRootRef>>,
         factory: Option<&F>,
         mut temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
         work: &mut CompileCheckpoints<'_>,
@@ -1010,7 +998,6 @@ impl PlannedRuntimeFilters {
         };
         let mut filters = Vec::new();
         let mut requirements = Vec::new();
-        let mut roots = Vec::new();
         crate::creation::reserve_vec(
             &mut filters,
             consumers.len(),
@@ -1026,30 +1013,10 @@ impl PlannedRuntimeFilters {
                 crate::creation::borrow_scope(&mut temporary),
                 work,
             )?;
-            crate::creation::reserve_vec(
-                &mut roots,
-                consumers.len(),
-                crate::creation::borrow_scope(&mut temporary),
-                work,
-            )?;
         } else {
             crate::assert_rows::reserve_vec(&mut requirements, consumers.len(), work)?;
-            crate::assert_rows::reserve_vec(&mut roots, consumers.len(), work)?;
         }
-        for (binding, (consumer, &definition)) in consumers.into_iter().zip(definitions).enumerate()
-        {
-            roots.push(RuntimeFilterKeyRoot {
-                node: local,
-                binding: u32::try_from(binding)
-                    .map_err(|_| CompileControlError::ResourceExhausted)?,
-                definition,
-                source: ProgramChannelSite::Layout {
-                    node: local,
-                    role: ProgramChannelLayoutRole::NodeOutput,
-                    ordinal: u32::try_from(consumer.ordinal)
-                        .map_err(|_| CompileControlError::ResourceExhausted)?,
-                },
-            });
+        for (consumer, &definition) in consumers.into_iter().zip(definitions) {
             requirements.push(BindingRequirement::RuntimeFilter {
                 binding_id: consumer.requirement,
             });
@@ -1071,7 +1038,6 @@ impl PlannedRuntimeFilters {
             ordered,
             filters,
             requirements,
-            roots,
         })
     }
 
@@ -1081,14 +1047,13 @@ impl PlannedRuntimeFilters {
         join: NodeId,
         package: &FragmentPackage,
         planned_join: &crate::join::PlannedJoin,
-        definitions: &BTreeMap<novarocks_physical_plan::ExprId, ProgramExprId>,
+        definitions: &crate::expressions::RootMap,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<JoinFilterSites, FragmentCompileError> {
         let planned = self.producers.remove(&join).unwrap_or_default();
         let mut sites = JoinFilterSites {
             producers: Vec::new(),
             consumers: Vec::new(),
-            roots: Vec::new(),
             requirements: Vec::new(),
         };
         crate::assert_rows::reserve_vec(&mut sites.producers, planned.len(), work)?;
@@ -1104,17 +1069,16 @@ impl PlannedRuntimeFilters {
         }
         let consumers = self.join_consumers.remove(&join).unwrap_or_default();
         crate::assert_rows::reserve_vec(&mut sites.consumers, consumers.len(), work)?;
-        crate::assert_rows::reserve_vec(&mut sites.roots, consumers.len(), work)?;
         crate::assert_rows::reserve_vec(&mut sites.requirements, consumers.len(), work)?;
         let probe = &package.fragment().nodes()[&planned_join.probe];
-        for (binding, consumer) in consumers.into_iter().enumerate() {
+        for consumer in consumers {
             let definition =
                 *definitions
                     .get(&consumer.key)
                     .ok_or(FragmentCompileError::Invalid(
                         "missing lowered probe consumer key",
                     ))?;
-            let ordinal = probe
+            let _ordinal = probe
                 .output
                 .columns
                 .iter()
@@ -1122,18 +1086,6 @@ impl PlannedRuntimeFilters {
                 .ok_or(FragmentCompileError::Invalid(
                     "probe consumer value is absent from its probe input",
                 ))?;
-            sites.roots.push(RuntimeFilterKeyRoot {
-                node: planned_join.join,
-                binding: u32::try_from(binding)
-                    .map_err(|_| CompileControlError::ResourceExhausted)?,
-                definition,
-                source: ProgramChannelSite::Layout {
-                    node: planned_join.join,
-                    role: ProgramChannelLayoutRole::JoinLeft,
-                    ordinal: u32::try_from(ordinal)
-                        .map_err(|_| CompileControlError::ResourceExhausted)?,
-                },
-            });
             sites.requirements.push(BindingRequirement::RuntimeFilter {
                 binding_id: consumer.requirement,
             });

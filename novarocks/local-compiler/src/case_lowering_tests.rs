@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::test_units::{self, PureUnitFixture};
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::*;
+use novarocks_failure_contract::{FailureClass, FailureProjection};
+
 use super::*;
 use arrow_schema::DataType;
 use novarocks_functions::{
@@ -24,16 +29,11 @@ use novarocks_functions::{
     PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
     ScopedExpressionEffects,
 };
-use novarocks_local_program::{
-    KernelAbiVersion, ProgramExpressionArena, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeId, StaticExprKind,
-};
+use novarocks_local_program::{KernelAbiVersion, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
-    BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
-    FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning,
-    FrozenPhysicalCall, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
-    PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
-    RootUseBindingError, ValidationErrors, ValueOrigin,
+    Fragment, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackageInput, FragmentSink,
+    FrozenFragmentPruning, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField,
+    ResultPort, ValueOrigin,
 };
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
@@ -143,18 +143,26 @@ impl Author {
 }
 // Transfer the first resolver request; physical child shapes are not request sources.
 fn original_request_sources(
-    fragment: Fragment,
+    builder: &mut FragmentBuilder,
     authors: &BTreeMap<ExprId, Author>,
-    mut pools: novarocks_physical_plan::ConstantPools,
-) -> (Fragment, novarocks_physical_plan::ConstantPools) {
-    use novarocks_physical_plan::{
-        ConstantPoolId, ConstantReference, PhysicalCallDefinition, PhysicalCallRequest,
-        StaticFunctionArgument,
-    };
+    pools: &mut novarocks_physical_plan::ConstantPools,
+) {
+    use novarocks_physical_plan::{ConstantPoolId, ConstantReference, StaticFunctionArgument};
     let mut backing_ids = BTreeMap::new();
-    let mut entries = vec![];
+
     for (&definition, owner) in authors {
         let original = owner.request();
+        builder
+            .unit(NodeId::new(0))
+            .unwrap()
+            .definition_control(
+                definition,
+                DefinitionControl {
+                    shape: owner.shape,
+                    temporal_sources: None,
+                },
+            )
+            .unwrap();
         let arguments = original
             .arguments
             .iter()
@@ -191,23 +199,22 @@ fn original_request_sources(
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        entries.push((
-            PhysicalCallDefinition::Expression(definition),
-            PhysicalCallRequest {
-                arguments,
-                logical_argument_count: original.logical_argument_count,
-                expected_result_type: original.expected_result_type.cloned(),
-                constant_policy: owner.constant_policy,
-            },
-        ));
+        builder
+            .unit(NodeId::new(0))
+            .unwrap()
+            .request(
+                definition,
+                PhysicalCallRequest {
+                    arguments,
+                    logical_argument_count: original.logical_argument_count,
+                    expected_result_type: original.expected_result_type.cloned(),
+                    constant_policy: owner.constant_policy,
+                },
+            )
+            .unwrap();
     }
-    (
-        fragment
-            .with_call_requests_observed(entries, &Control)
-            .unwrap(),
-        pools,
-    )
 }
+
 fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
     ConstantValue::from_i64(
         Arc::new(ty.try_to_field("fixture").unwrap()),
@@ -255,7 +262,7 @@ fn author(
         kind: bound.kind,
         argument_types: selected.argument_types.clone(),
         result_type: result.clone(),
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: bound.semantics.volatility,
             argument_evaluation: bound.semantics.argument_evaluation,
             failure_behavior: bound.semantics.failure_behavior,
@@ -279,7 +286,7 @@ fn call(
     args: Vec<ExprId>,
 ) -> ExprId {
     let expr = builder
-        .add_expression(
+        .fixture_definition(
             NodeId::new(0),
             owner.result(),
             ExprKind::FunctionCall {
@@ -321,12 +328,20 @@ fn add_input(
     builder: &mut FragmentBuilder,
     constants: &mut novarocks_physical_plan::ConstantPools,
     ty: FunctionValueType,
-) -> (ExprId, novarocks_physical_plan::ValueId) {
+) -> (RootOrdinal, novarocks_physical_plan::ValueId) {
     let expr = builder
-        .add_expression(
+        .fixture_definition(
             NodeId::new(44),
             ty.clone(),
             crate::test_constants::null(constants, &ty, options().constants),
+        )
+        .unwrap();
+    let expr = builder
+        .fixture_occurrence(
+            NodeId::new(44),
+            expr,
+            EvaluationDemand::Value,
+            RootScope::Port(0),
         )
         .unwrap();
     let value = builder
@@ -334,14 +349,16 @@ fn add_input(
             ty.clone(),
             ValueOrigin::Expr {
                 node: NodeId::new(44),
-                expr,
+                root: expr,
             },
         )
         .unwrap();
     (expr, value)
 }
 fn literal(builder: &mut FragmentBuilder, ty: FunctionValueType, value: ExprKind) -> ExprId {
-    builder.add_expression(NodeId::new(0), ty, value).unwrap()
+    builder
+        .fixture_definition(NodeId::new(0), ty, value)
+        .unwrap()
 }
 fn fixture(
     functions: &PureEngineFunctionCatalog,
@@ -350,7 +367,7 @@ fn fixture(
     has_else: bool,
     effects: Effects,
     narrow_no_else: bool,
-) -> Result<Fixture, ValidationErrors> {
+) -> Result<Fixture, Box<dyn std::error::Error>> {
     let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(FragmentId::new(97));
     builder
@@ -405,7 +422,7 @@ fn fixture(
     let flag_reference = if matches!(form, Form::Searched) || matches!(mode, Mode::IfArgument) {
         Some(
             builder
-                .add_expression(NodeId::new(0), boolean.clone(), ExprKind::Value(flag_value))
+                .fixture_definition(NodeId::new(0), boolean.clone(), ExprKind::Value(flag_value))
                 .unwrap(),
         )
     } else {
@@ -413,7 +430,7 @@ fn fixture(
     };
     let (operand, when) = if let Some(ty) = operand_type {
         let operand = builder
-            .add_expression(
+            .fixture_definition(
                 NodeId::new(0),
                 ty.clone(),
                 ExprKind::Value(operand_value.unwrap()),
@@ -527,7 +544,7 @@ fn fixture(
         }
         Effects::Decimal => {
             let value = builder
-                .add_expression(
+                .fixture_definition(
                     NodeId::new(0),
                     decimal.clone(),
                     ExprKind::Value(decimal_value.unwrap()),
@@ -573,7 +590,7 @@ fn fixture(
         result_type = result_type.with_nullable(false).unwrap();
     }
     let case = builder
-        .add_expression(
+        .fixture_definition(
             NodeId::new(0),
             result_type.clone(),
             ExprKind::Case {
@@ -606,6 +623,17 @@ fn fixture(
     } else {
         case
     };
+    let output_root = builder
+        .fixture_occurrence(
+            NodeId::new(0),
+            root_expr,
+            match mode {
+                Mode::Filter => EvaluationDemand::TruthOnly,
+                _ => EvaluationDemand::Value,
+            },
+            RootScope::Port(0),
+        )
+        .unwrap();
     match mode {
         Mode::Project | Mode::IfArgument => {
             let ty = authors
@@ -617,7 +645,7 @@ fn fixture(
                     ty,
                     ValueOrigin::Expr {
                         node: NodeId::new(0),
-                        expr: root_expr,
+                        root: output_root,
                     },
                 )
                 .unwrap();
@@ -625,17 +653,19 @@ fn fixture(
                 .add_project(
                     NodeId::new(0),
                     NodeId::new(44),
-                    Box::from([(root_expr, value)]),
+                    Box::from([(output_root, value)]),
                     Box::from([value]),
                 )
                 .unwrap();
         }
         Mode::Filter => {
             builder
-                .add_filter(NodeId::new(0), NodeId::new(44), Box::from([root_expr]))
+                .add_filter(NodeId::new(0), NodeId::new(44), Box::from([output_root]))
                 .unwrap();
         }
     }
+    original_request_sources(&mut builder, &authors, &mut constants);
+    seal_units(&mut builder, functions, &authors)?;
     let fragment = builder.finish_definition(
         NodeId::new(0),
         FragmentSink::Result,
@@ -657,7 +687,6 @@ fn fixture(
 
 #[derive(Clone, Copy)]
 enum FlowClaim {
-    Accurate,
     WrongControl,
     SwappedArms,
     WrongGuard,
@@ -665,9 +694,20 @@ enum FlowClaim {
 #[derive(Debug)]
 enum FlowError {
     Flow(ExpressionControlFlowError),
-    Roots(RootUseBindingError),
+    Unit(UnitError),
 }
-fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<PhysicalRootUses, FlowError> {
+struct Definitions<'a>(&'a [ExprNode]);
+impl novarocks_type_contract::ExpressionDefinitionMembership<ExprId> for Definitions<'_> {
+    fn definition_count(&self) -> usize {
+        self.0.len()
+    }
+    fn contains_definition(&self, id: ExprId) -> bool {
+        self.0
+            .get(id.get() as usize)
+            .is_some_and(|node| node.id == id)
+    }
+}
+fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<BoundExprSet, FlowError> {
     struct FlowAuthor {
         next_use: u32,
         next_region: u32,
@@ -685,32 +725,38 @@ fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<PhysicalRootUses, FlowErr
         ) -> ExpressionUseId {
             let id = ExpressionUseId::new(self.next_use);
             self.next_use += 17;
-            let (mut shape, mut args) =
-                match &fixture.fragment.expressions().get(expr).unwrap().kind {
-                    ExprKind::Case {
-                        operand,
-                        when_then,
-                        else_expr,
-                    } => {
-                        let mut args = Vec::new();
-                        args.extend(*operand);
-                        args.extend(when_then.iter().flat_map(|(when, then)| [*when, *then]));
-                        args.extend(*else_expr);
-                        (
-                            ControlShape::Case {
-                                simple: operand.is_some(),
-                                arms: when_then.len() as u32,
-                                has_else: else_expr.is_some(),
-                            },
-                            args,
-                        )
-                    }
-                    ExprKind::FunctionCall { args, .. } => {
-                        (fixture.authors[&expr].shape, args.to_vec())
-                    }
-                    ExprKind::Value(_) | ExprKind::Constant(_) => (ControlShape::Eager, vec![]),
-                    other => panic!("no exact fixture control for {other:?}"),
-                };
+            let (mut shape, mut args) = match &fixture.fragment.nodes()[&NodeId::new(0)]
+                .expressions
+                .as_deref()
+                .unwrap()
+                .definition(expr)
+                .unwrap()
+                .kind
+            {
+                ExprKind::Case {
+                    operand,
+                    when_then,
+                    else_expr,
+                } => {
+                    let mut args = Vec::new();
+                    args.extend(*operand);
+                    args.extend(when_then.iter().flat_map(|(when, then)| [*when, *then]));
+                    args.extend(*else_expr);
+                    (
+                        ControlShape::Case {
+                            simple: operand.is_some(),
+                            arms: when_then.len() as u32,
+                            has_else: else_expr.is_some(),
+                        },
+                        args,
+                    )
+                }
+                ExprKind::FunctionCall { args, .. } => {
+                    (fixture.authors[&expr].shape, args.to_vec())
+                }
+                ExprKind::Value(_) | ExprKind::Constant(_) => (ControlShape::Eager, vec![]),
+                other => panic!("no exact fixture control for {other:?}"),
+            };
             if expr == fixture.case {
                 if matches!(claim, FlowClaim::WrongControl) {
                     shape = ControlShape::Eager;
@@ -764,17 +810,15 @@ fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<PhysicalRootUses, FlowErr
             guard: None,
         }],
     };
-    let roots = PhysicalExpressionRoots::try_new(&fixture.fragment, &Control).unwrap();
-    let bindings = roots
-        .sites()
+    let unit = fixture.fragment.nodes()[&NodeId::new(0)]
+        .expressions
+        .as_deref()
+        .unwrap();
+    let bindings = unit
+        .roots()
         .iter()
-        .map(|(&site, root)| {
-            (
-                site,
-                author.visit(fixture, root.expr, domain, root.demand, claim),
-            )
-        })
-        .collect();
+        .map(|root| author.visit(fixture, root.definition, domain, root.demand, claim))
+        .collect::<Vec<_>>();
     if matches!(claim, FlowClaim::WrongGuard) {
         author
             .domains
@@ -789,126 +833,34 @@ fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<PhysicalRootUses, FlowErr
     let flow = ExpressionControlFlow::try_new(
         author.domains,
         author.uses,
-        fixture.fragment.expressions(),
+        &Definitions(unit.definitions()),
         CompilePhase::Validate,
         &Control,
     )
     .map_err(FlowError::Flow)?;
-    PhysicalRootUses::try_new(&fixture.fragment, flow, bindings, &Control).map_err(FlowError::Roots)
-}
-fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<FragmentPackage> {
-    let Fixture {
-        constants,
-        fragment,
-        authors,
-        case,
-        ordered,
-    } = fixture;
-    let (fragment, constants) = original_request_sources(fragment, &authors, constants);
-    let fixture = Fixture {
-        constants: constants.clone(),
-        fragment,
-        authors,
-        case,
-        ordered,
-    };
-    let expression_uses = uses(&fixture, FlowClaim::Accurate).unwrap();
-    let flow = expression_uses.flow();
-    let parameters = SemanticParameters::try_new([]).unwrap();
-    let mut summaries = BTreeMap::new();
-    let mut frozen = vec![];
-    fn summary(
-        functions: &PureEngineFunctionCatalog,
-        fixture: &Fixture,
-        flow: &ExpressionControlFlow<ExprId>,
-        id: ExpressionUseId,
-        parameters: &SemanticParameters,
-        summaries: &mut BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
-        frozen: &mut Vec<FrozenPhysicalCall>,
-    ) -> ScopedExpressionEffects {
-        if let Some(summary) = summaries.get(&id) {
-            return *summary;
-        }
-        let invocation = &flow.uses()[&id];
-        let mut children = ScopedExpressionEffects::pure_value(invocation.context);
-        for (ordinal, &child) in invocation.arguments.iter().enumerate() {
-            children = children
-                .join_control_argument(
-                    summary(
-                        functions, fixture, flow, child, parameters, summaries, frozen,
-                    ),
-                    flow,
-                    ordinal,
-                )
-                .unwrap();
-        }
-        let result = if let Some(owner) = fixture.authors.get(&invocation.definition) {
-            let args = invocation
-                .arguments
-                .iter()
-                .copied()
-                .map(Some)
-                .collect::<Vec<_>>();
-            let preparation = if owner.shape == ControlShape::If {
-                PureCallPreparation::ControlIntrinsic {
-                    arguments: children,
-                }
-            } else {
-                PureCallPreparation::Scalar {
-                    arguments: children,
-                }
-            };
-            let token = functions
-                .prepare_fresh(
-                    CallEffectInput {
-                        context: invocation.context,
-                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
-                            &args,
-                        ),
-                        function_id: &owner.function.function_id,
-                        kind: owner.function.kind,
-                        selected: owner.selected.as_ref(),
-                        request: owner.request(),
-                        environment: &[],
-                        parameters,
-                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Region(invocation.context.region),
-                    },
-                    owner.selected.clone(),
-                    preparation,
-                    &Control,
-                )
-                .unwrap();
-            frozen.push(FrozenPhysicalCall {
-                materialized_writer_input: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                site: PhysicalCallSite::Expression(id),
-                context: invocation.context,
-                effects: token.call_contract().effects().clone(),
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            });
-            token.effects()
-        } else {
-            children
-        };
-        summaries.insert(id, result);
-        result
-    }
-    for &root in flow.root_use_ids() {
-        summary(
-            functions,
-            &fixture,
+    let mut work =
+        novarocks_type_contract::CompileCheckpoints::try_new(&Control, CompilePhase::Validate)
+            .unwrap();
+    BoundExprSet::try_from_parts_in(
+        UnitParts::new(
+            unit.ports().to_vec().into(),
+            unit.definitions().to_vec().into(),
+            unit.roots().to_vec().into(),
+            bindings.into(),
             flow,
-            root,
-            &parameters,
-            &mut summaries,
-            &mut frozen,
-        );
-    }
-    let calls = FrozenFragmentCalls::try_new(&fixture.fragment, &expression_uses, frozen, &Control)
-        .unwrap();
+            unit.claims().clone(),
+            unit.requests().clone(),
+        ),
+        UnitLimits {
+            expression_semantic_depth: novarocks_type_contract::MAX_CONTROL_DEPTH,
+        },
+        &mut work,
+    )
+    .map_err(FlowError::Unit)
+}
+fn package(_functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<FragmentPackage> {
+    let constants = fixture.constants.clone();
+    let parameters = SemanticParameters::try_new([]).unwrap();
     let root = &fixture.fragment.nodes()[&fixture.fragment.root()];
     let result = ResultPort {
         scalar_schema: None,
@@ -936,9 +888,8 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
                 version: PlanVersionId::try_new([97; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 constants,
+                statement_constant_policy: options().constants,
                 fragment: fixture.fragment,
-                expression_uses,
-                calls,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters,
@@ -954,15 +905,17 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
         .unwrap(),
     )
 }
-fn root(mode: Mode) -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(2),
-        role: match mode {
-            Mode::Filter => ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
-            _ => ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-        },
+fn root(
+    program: &novarocks_local_program::LocalProgram,
+    mode: Mode,
+) -> novarocks_local_program::ProgramRootRef {
+    match (mode, program.graph().nodes()[2].kind()) {
+        (Mode::Filter, ProgramNodeKind::Filter { predicates, .. }) => predicates[0],
+        (_, ProgramNodeKind::Project { exprs, .. }) => exprs[0],
+        _ => panic!("the exact actual runtime root"),
     }
 }
+
 fn compile(
     source: Arc<FragmentPackage>,
     functions: &PureEngineFunctionCatalog,
@@ -1020,12 +973,16 @@ fn searched_and_simple_case_keep_ordered_children_flags_root_types_and_demands()
                 let physical_case = fixture.case;
                 let source = package(&functions, fixture);
                 let program = compile(source.clone(), &functions, &Control).unwrap();
-                let typed = program.checked().channels().expressions();
-                let calls = typed.resolved_calls();
-                let snapshot = calls.snapshot();
-                let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-                let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-                let invocation = &flow.uses()[&snapshot.bindings()[&root(mode)]];
+                let (unit, compiled_root) =
+                    test_units::compiled_root(&program, root(&program, mode));
+                let calls = unit;
+                let flow = unit.control_flow();
+                let arena = unit.definitions();
+                let invocation = &flow.uses()[&compiled_root.use_id];
+                let source_unit = source.fragment().nodes()[&NodeId::new(0)]
+                    .expressions
+                    .as_deref()
+                    .unwrap();
                 let simple = matches!(form, Form::SimpleInteger);
                 let parent_demand = if matches!(mode, Mode::Filter) {
                     EvaluationDemand::TruthOnly
@@ -1041,9 +998,15 @@ fn searched_and_simple_case_keep_ordered_children_flags_root_types_and_demands()
                     }
                 );
                 assert_eq!(invocation.context.demand, parent_demand);
-                assert_eq!(invocation.context.region, EvaluationRegionId::new(u32::MAX));
                 assert_eq!(
-                    source.expression_uses().flow().uses()[&invocation.context.use_id].definition,
+                    invocation.context.region,
+                    source_unit.control_flow().uses()
+                        [&source_unit.root_use(RootOrdinal::new(0)).unwrap()]
+                        .context
+                        .region
+                );
+                assert_eq!(
+                    source_unit.control_flow().uses()[&invocation.context.use_id].definition,
                     physical_case
                 );
                 let StaticExprKind::Case {
@@ -1067,7 +1030,7 @@ fn searched_and_simple_case_keep_ordered_children_flags_root_types_and_demands()
                     let child = &flow.uses()[&child_use];
                     assert_eq!(child.definition, child_id);
                     assert_eq!(
-                        source.expression_uses().flow().uses()[&child_use].definition,
+                        source_unit.control_flow().uses()[&child_use].definition,
                         ordered[ordinal]
                     );
                     if simple && ordinal == 0 {
@@ -1075,7 +1038,7 @@ fn searched_and_simple_case_keep_ordered_children_flags_root_types_and_demands()
                         assert_eq!(child.context.region, invocation.context.region);
                         assert!(matches!(
                             arena.node(child_id).unwrap().kind(),
-                            StaticExprKind::SlotId(_)
+                            StaticExprKind::Input
                         ));
                         continue;
                     }
@@ -1114,7 +1077,7 @@ fn searched_and_simple_case_keep_ordered_children_flags_root_types_and_demands()
                     assert_ne!(child.context.region, invocation.context.region);
                 }
                 assert_eq!(
-                    typed.definition_type(ProgramExpressionArena::Main, invocation.definition),
+                    unit.types().get((invocation.definition).index()),
                     Some(&FunctionArgumentType::Value(FunctionValueType::new(
                         DataType::Boolean,
                         !has_else
@@ -1152,11 +1115,10 @@ fn simple_case_retains_exact_nominal_operand_and_when_types_for_later_equality_a
         .unwrap(),
     );
     let program = compile(source, &functions, &Control).unwrap();
-    let channels = program.checked().channels();
-    let typed = channels.expressions();
-    let snapshot = typed.resolved_calls().snapshot();
-    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-    let invocation = &flow.uses()[&snapshot.bindings()[&root(Mode::Project)]];
+    let channels = program.channels();
+    let (unit, compiled_root) = test_units::compiled_root(&program, root(&program, Mode::Project));
+    let flow = unit.control_flow();
+    let invocation = &flow.uses()[&compiled_root.use_id];
     let uuid = FunctionValueType::try_from_legacy_declared_projection(
         DataType::FixedSizeBinary(16),
         true,
@@ -1167,7 +1129,7 @@ fn simple_case_retains_exact_nominal_operand_and_when_types_for_later_equality_a
         let child = &flow.uses()[&invocation.arguments[ordinal]];
         assert_eq!(child.context.demand, EvaluationDemand::Value);
         assert_eq!(
-            typed.definition_type(ProgramExpressionArena::Main, child.definition),
+            unit.types().get((child.definition).index()),
             Some(&FunctionArgumentType::Value(uuid.clone()))
         );
     }
@@ -1179,7 +1141,7 @@ fn simple_case_retains_exact_nominal_operand_and_when_types_for_later_equality_a
         }),
         Some(&uuid)
     );
-    assert!(typed.resolved_calls().calls().is_empty());
+    assert!(unit.calls().is_empty());
 }
 
 #[test]
@@ -1198,11 +1160,16 @@ fn case_as_actual_if_argument_is_nonconstant_and_preserves_rand_and_round_full_e
         let physical_case = fixture.case;
         let source = package(&functions, fixture);
         let program = compile(source.clone(), &functions, &Control).unwrap();
-        let calls = program.checked().channels().expressions().resolved_calls();
-        let snapshot = calls.snapshot();
-        let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-        let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-        let parent = &flow.uses()[&snapshot.bindings()[&root(Mode::IfArgument)]];
+        let (unit, compiled_root) =
+            test_units::compiled_root(&program, root(&program, Mode::IfArgument));
+        let calls = unit;
+        let flow = unit.control_flow();
+        let arena = unit.definitions();
+        let parent = &flow.uses()[&compiled_root.use_id];
+        let source_unit = source.fragment().nodes()[&NodeId::new(0)]
+            .expressions
+            .as_deref()
+            .unwrap();
         assert_eq!(parent.control, ControlShape::If);
         let left = &flow.uses()[&parent.arguments[1]];
         let right = &flow.uses()[&parent.arguments[2]];
@@ -1224,20 +1191,15 @@ fn case_as_actual_if_argument_is_nonconstant_and_preserves_rand_and_round_full_e
                 StaticExprKind::Case { .. }
             ));
             assert_eq!(
-                source.expression_uses().flow().uses()[&case.context.use_id].definition,
+                source_unit.control_flow().uses()[&case.context.use_id].definition,
                 physical_case
             );
-            assert!(
-                !source
-                    .calls()
-                    .entries()
-                    .contains_key(&PhysicalCallSite::Expression(case.context.use_id))
-            );
+            assert!(!source_unit.claims().contains_key(&case.context.use_id));
         }
         let parent_call = calls
             .calls()
             .values()
-            .find(|call| call.call_contract().context() == parent.context)
+            .find(|call| call.call_contract().context() == parent.context.into())
             .unwrap();
         assert_eq!(
             parent_call.implementation().abi,
@@ -1267,13 +1229,12 @@ fn case_as_actual_if_argument_is_nonconstant_and_preserves_rand_and_round_full_e
                 assert!(!summary.has_instance_state);
             }
         }
-        assert_eq!(calls.calls().len(), source.calls().entries().len());
+        assert_eq!(calls.calls().len(), source_unit.claims().len());
         for call in calls.calls().values() {
             let contract = call.call_contract();
-            let frozen =
-                &source.calls().entries()[&PhysicalCallSite::Expression(contract.context().use_id)];
+            let frozen = &source_unit.claims()[&contract.context().expression().unwrap().use_id];
             assert_eq!(contract.effects(), &frozen.effects);
-            assert_eq!(contract.context(), frozen.context);
+            assert_eq!(contract.context(), frozen.context.into());
             assert_eq!(
                 contract.decimal_overflow_policy(),
                 DecimalOverflowPolicy::ReportError
@@ -1302,17 +1263,17 @@ fn case_wrong_control_arm_order_and_guard_are_rejected_by_the_original_flow_auth
         let fixture = fixture(&functions, form, Mode::Project, true, Effects::Pure, false).unwrap();
         assert!(matches!(
             uses(&fixture, FlowClaim::WrongControl),
-            Err(FlowError::Roots(RootUseBindingError::WrongControl))
+            Err(FlowError::Unit(UnitError::Invalid { message, .. })) if message.contains("intrinsic control differs")
         ));
         assert!(matches!(
             uses(&fixture, FlowClaim::SwappedArms),
-            Err(FlowError::Roots(RootUseBindingError::WrongArguments))
+            Err(FlowError::Unit(UnitError::Invalid { message, .. })) if message.contains("child names a different definition occurrence")
         ));
         let error = uses(&fixture, FlowClaim::WrongGuard).unwrap_err();
         let FlowError::Flow(cause) = error else {
             panic!("invalid guard must fail in the shared control author")
         };
-        assert!(!cause.to_string().is_empty());
+        assert_eq!(cause, ExpressionControlFlowError::InvalidReference);
     }
 }
 
@@ -1322,11 +1283,12 @@ fn case_without_else_cannot_claim_a_nonnullable_result() {
     for form in [Form::Searched, Form::SimpleInteger] {
         assert!(
             match fixture(&functions, form, Mode::Project, false, Effects::Pure, true) {
-                Err(error) =>
-                    error.is_producer_defect()
-                        && error
-                            .to_string()
-                            .contains("CASE result stops admitting null"),
+                Err(error) => error
+                    .downcast_ref::<UnitError>()
+                    .is_some_and(|error| error.failure_fact().class() == FailureClass::Invariant)
+                    && error
+                        .to_string()
+                        .contains("CASE result stops admitting null"),
                 Ok(_) => false,
             }
         );
@@ -1379,4 +1341,128 @@ fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
             max_projection_work: 16 * 1024 * 1024,
         },
     }
+}
+
+fn seal_units(
+    builder: &mut FragmentBuilder,
+    functions: &PureEngineFunctionCatalog,
+    authors: &BTreeMap<ExprId, Author>,
+) -> Result<(), UnitError> {
+    let mut work =
+        novarocks_type_contract::CompileCheckpoints::try_new(&Control, CompilePhase::Validate)?;
+    let node = NodeId::new(44);
+    let ports = builder.node_ports(node).unwrap();
+    let input = builder
+        .take_unit_builder(node)
+        .unwrap()
+        .seal(ports, &mut work)?
+        .finish(BTreeMap::new(), &mut work)?;
+    builder.install_unit(node, Arc::new(input)).unwrap();
+    let node = NodeId::new(0);
+    let ports = builder.node_ports(node).unwrap();
+    let sealed = builder
+        .take_unit_builder(node)
+        .unwrap()
+        .seal(ports, &mut work)?;
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let mut summaries = BTreeMap::new();
+    let mut claims = BTreeMap::new();
+    fn summary(
+        functions: &PureEngineFunctionCatalog,
+        authors: &BTreeMap<ExprId, Author>,
+        flow: &ExpressionControlFlow<ExprId>,
+        id: ExpressionUseId,
+        parameters: &SemanticParameters,
+        summaries: &mut BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+        claims: &mut BTreeMap<ExpressionUseId, ExpressionCallClaim>,
+    ) -> ScopedExpressionEffects {
+        if let Some(summary) = summaries.get(&id) {
+            return *summary;
+        }
+        let invocation = &flow.uses()[&id];
+        let mut children = ScopedExpressionEffects::pure_value(invocation.context);
+        for (ordinal, &child) in invocation.arguments.iter().enumerate() {
+            children = children
+                .join_control_argument(
+                    summary(
+                        functions, authors, flow, child, parameters, summaries, claims,
+                    ),
+                    flow,
+                    ordinal,
+                )
+                .unwrap();
+        }
+        let result = if let Some(owner) = authors.get(&invocation.definition) {
+            let args = invocation
+                .arguments
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<_>>();
+            let preparation = if owner.shape == ControlShape::If {
+                PureCallPreparation::ControlIntrinsic {
+                    arguments: children,
+                }
+            } else {
+                PureCallPreparation::Scalar {
+                    arguments: children,
+                }
+            };
+            let token = functions
+                .prepare_fresh(
+                    CallEffectInput {
+                        context: invocation.context.into(),
+                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
+                            &args,
+                        ),
+                        function_id: &owner.function.function_id,
+                        kind: owner.function.kind,
+                        selected: owner.selected.as_ref(),
+                        request: owner.request(),
+                        environment: &[],
+                        parameters,
+                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                        proof_scope: CallProofScope::Region(invocation.context.region),
+                    },
+                    owner.selected.clone(),
+                    preparation,
+                    &Control,
+                )
+                .unwrap();
+            claims.insert(
+                id,
+                ExpressionCallClaim {
+                    regexp_count_pattern_source: None,
+                    to_base64_byte_source: None,
+                    temporal_source: None,
+                    context: invocation.context,
+                    effects: token.call_contract().effects().clone(),
+                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                },
+            );
+            ScopedExpressionEffects::primitive(
+                invocation.context,
+                token.effects().for_use(invocation.context).unwrap(),
+            )
+        } else {
+            children
+        };
+        summaries.insert(id, result);
+        result
+    }
+    let flow = sealed.control_flow();
+    for &root in flow.root_use_ids() {
+        summary(
+            functions,
+            authors,
+            flow,
+            root,
+            &parameters,
+            &mut summaries,
+            &mut claims,
+        );
+    }
+    let unit = sealed.finish(claims, &mut work)?;
+    builder.install_unit(node, Arc::new(unit)).unwrap();
+    Ok(())
 }

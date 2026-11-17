@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::ExprKind;
+
 use super::*;
 use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::PureProviderProgramCatalog;
@@ -24,22 +27,18 @@ use novarocks_functions::{
     PureImplementationId, PureKernelAbi,
 };
 use novarocks_local_program::{
-    KernelAbiVersion, LocalOperatorId, LocalOperatorOrigin, ProgramChannelLayoutRole,
-    ProgramChannelSite, ProgramExpressionArena, ProgramExpressionRootSite, ProgramLexicalSource,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, ProgramUseRef, StaticExprKind,
+    KernelAbiVersion, LocalOperatorId, LocalOperatorOrigin, ProgramNodeId, ProgramNodeKind,
     StaticSinkProgram,
 };
 use novarocks_physical_plan::{
-    BuildError, Distribution, ExprKind, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage,
-    FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, NodeId, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain,
-    PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts, RequiredInputs,
-    ResultField, ResultPort, SetOperationKind, ValueDef, ValueId, ValueOrigin,
+    BuildError, Distribution, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage,
+    FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentPruning, NodeId,
+    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
+    RequiredInputs, ResultField, ResultPort, SetOperationKind, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    FunctionArgumentType, FunctionValueType, PureCompileControl, SemanticParameters,
+    CompileControlError, CompilePhase, ControlShape, FunctionArgumentType, FunctionValueType,
+    PureCompileControl, SemanticParameters,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -50,6 +49,75 @@ use std::{
     },
 };
 
+use novarocks_expression_contract::{RootOrdinal, RootScope};
+use novarocks_local_program::ProgramRootRef;
+use novarocks_type_contract::EvaluationDemand;
+
+trait PureFixtureUnit {
+    fn fixture_root(
+        &mut self,
+        node: NodeId,
+        ty: FunctionValueType,
+        kind: ExprKind,
+        scope: RootScope,
+        demand: EvaluationDemand,
+    ) -> Result<RootOrdinal, novarocks_expression_contract::UnitError>;
+    fn finish_fixture_unit(&mut self, node: NodeId);
+}
+impl PureFixtureUnit for FragmentBuilder {
+    fn fixture_root(
+        &mut self,
+        node: NodeId,
+        ty: FunctionValueType,
+        kind: ExprKind,
+        scope: RootScope,
+        demand: EvaluationDemand,
+    ) -> Result<RootOrdinal, novarocks_expression_contract::UnitError> {
+        let unit = self.unit(node).unwrap();
+        let definition = unit.add(None, ty, kind)?;
+        unit.root(definition, demand, scope)
+    }
+    fn finish_fixture_unit(&mut self, node: NodeId) {
+        let ports = self.node_ports(node).unwrap();
+        let draft = self.take_unit_builder(node).unwrap();
+        let mut work =
+            novarocks_type_contract::CompileCheckpoints::try_new(&Control, CompilePhase::Validate)
+                .unwrap();
+        let unit = draft
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        self.install_unit(node, Arc::new(unit)).unwrap();
+    }
+}
+
+fn compiled_root(
+    program: &novarocks_local_program::LocalProgram,
+    root: ProgramRootRef,
+) -> (
+    &novarocks_expression::CompiledExprSet,
+    novarocks_expression::CompiledRoot,
+) {
+    let unit = program.unit(root.unit).unwrap();
+    (unit, *unit.root(root.root).unwrap())
+}
+fn root_type(
+    program: &novarocks_local_program::LocalProgram,
+    root: ProgramRootRef,
+) -> &FunctionArgumentType {
+    let (unit, root) = compiled_root(program, root);
+    &unit.types()[root.definition.index()]
+}
+fn input_ordinal(program: &novarocks_local_program::LocalProgram, root: ProgramRootRef) -> u32 {
+    let (unit, root) = compiled_root(program, root);
+    assert!(matches!(
+        unit.definitions().node(root.definition).unwrap().kind(),
+        StaticExprKind::Input
+    ));
+    unit.input(root.use_id).unwrap().ordinal
+}
+
 struct Control;
 impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
@@ -57,7 +125,7 @@ impl PureCompileControl for Control {
     }
 }
 
-fn functions() -> PureEngineFunctionCatalog {
+pub(super) fn functions() -> PureEngineFunctionCatalog {
     let actual =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let mut builder = EngineFunctionCatalogBuilder::new();
@@ -127,8 +195,8 @@ fn options() -> LocalCompileOptions {
 }
 
 #[derive(Clone, Copy)]
-struct Case {
-    width: usize,
+pub(super) struct Case {
+    pub(super) width: usize,
     project_branches: bool,
     downstream: bool,
     right_nullable: bool,
@@ -137,7 +205,7 @@ struct Case {
     kind: SetOperationKind,
 }
 impl Case {
-    fn ordinary() -> Self {
+    pub(super) fn ordinary() -> Self {
         Self {
             width: 3,
             project_branches: false,
@@ -149,15 +217,15 @@ impl Case {
         }
     }
 }
-struct Fixture {
-    package: Arc<FragmentPackage>,
+pub(super) struct Fixture {
+    pub(super) package: Arc<FragmentPackage>,
     union: NodeId,
     branch_nodes: [NodeId; 2],
     branch_values: [Vec<ValueId>; 2],
     downstream: Option<NodeId>,
 }
 
-fn fixture(case: Case) -> Fixture {
+pub(super) fn fixture(case: Case) -> Fixture {
     let fragment_id = FragmentId::new(73);
     let left = NodeId::new(u32::MAX);
     let right = NodeId::new(0);
@@ -193,7 +261,15 @@ fn fixture(case: Case) -> Fixture {
                     options().constants,
                 )
             };
-            let expression = builder.add_expression(node, ty.clone(), literal).unwrap();
+            let expression = builder
+                .fixture_root(
+                    node,
+                    ty.clone(),
+                    literal,
+                    RootScope::AllPorts,
+                    EvaluationDemand::Value,
+                )
+                .unwrap();
             // Explicit sparse value identities are authored by the real builder.
             let value = ValueId::new([[0, 7], [900, 901]][branch][column]);
             builder
@@ -216,6 +292,7 @@ fn fixture(case: Case) -> Fixture {
                 branch_values[branch].clone().into_boxed_slice(),
             )
             .unwrap();
+        builder.finish_fixture_unit(node);
         if case.project_branches {
             let projected = NodeId::new([19, 2][branch]);
             let mut expressions = Vec::new();
@@ -230,14 +307,20 @@ fn fixture(case: Case) -> Fixture {
                     FunctionValueType::new(DataType::Int64, branch == 1 && case.right_nullable)
                 };
                 let expr = builder
-                    .add_expression(projected, ty.clone(), ExprKind::Value(*value))
+                    .fixture_root(
+                        projected,
+                        ty.clone(),
+                        ExprKind::Value(*value),
+                        RootScope::Port(0),
+                        EvaluationDemand::Value,
+                    )
                     .unwrap();
                 let output = builder
                     .add_value(
                         ty,
                         ValueOrigin::Expr {
                             node: projected,
-                            expr,
+                            root: expr,
                         },
                     )
                     .unwrap();
@@ -252,6 +335,7 @@ fn fixture(case: Case) -> Fixture {
                     outputs.clone().into_boxed_slice(),
                 )
                 .unwrap();
+            builder.finish_fixture_unit(projected);
             branch_values[branch] = outputs;
             branch_nodes[branch] = projected;
         }
@@ -305,17 +389,29 @@ fn fixture(case: Case) -> Fixture {
         assert_eq!(case.width, 3);
         let project = NodeId::new(17);
         let first = builder
-            .add_expression(project, target.clone(), ExprKind::Value(outputs[2]))
+            .fixture_root(
+                project,
+                target.clone(),
+                ExprKind::Value(outputs[2]),
+                RootScope::Port(0),
+                EvaluationDemand::Value,
+            )
             .unwrap();
         let second = builder
-            .add_expression(project, target.clone(), ExprKind::Value(outputs[0]))
+            .fixture_root(
+                project,
+                target.clone(),
+                ExprKind::Value(outputs[0]),
+                RootScope::Port(0),
+                EvaluationDemand::Value,
+            )
             .unwrap();
         let a = builder
             .add_value(
                 target.clone(),
                 ValueOrigin::Expr {
                     node: project,
-                    expr: first,
+                    root: first,
                 },
             )
             .unwrap();
@@ -324,22 +420,29 @@ fn fixture(case: Case) -> Fixture {
                 target.clone(),
                 ValueOrigin::Expr {
                     node: project,
-                    expr: second,
+                    root: second,
                 },
             )
             .unwrap();
         let values = vec![a, b, a];
+        let definition = builder.unit(project).unwrap().roots()[first.get() as usize].definition;
+        let third = builder
+            .unit(project)
+            .unwrap()
+            .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .add_project(
                 project,
                 union,
-                Box::from([(first, a), (second, b), (first, a)]),
+                Box::from([(first, a), (second, b), (third, a)]),
                 values.clone().into_boxed_slice(),
             )
             .unwrap();
+        builder.finish_fixture_unit(project);
         let filter = NodeId::new(18);
         let predicate = builder
-            .add_expression(
+            .fixture_root(
                 filter,
                 FunctionValueType::new(DataType::Boolean, false),
                 crate::test_constants::boolean(
@@ -348,11 +451,14 @@ fn fixture(case: Case) -> Fixture {
                     true,
                     options().constants,
                 ),
+                RootScope::Port(0),
+                EvaluationDemand::TruthOnly,
             )
             .unwrap();
         builder
             .add_filter(filter, project, Box::from([predicate]))
             .unwrap();
+        builder.finish_fixture_unit(filter);
         let limit = NodeId::new(20);
         builder.add_limit(limit, filter, Some(7), 2).unwrap();
         (limit, values, Some(project))
@@ -390,42 +496,6 @@ fn finish_package(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationRegionId::new(u32::MAX);
-    let mut invocations = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let use_id = ExpressionUseId::new(match ordinal {
-            0 => u32::MAX,
-            1 => 0,
-            n => n as u32 + 7,
-        });
-        invocations.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id,
-                region: domain,
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, use_id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
@@ -449,8 +519,7 @@ fn finish_package(
             version: PlanVersionId::try_new([73; 16]).unwrap(),
             required: RequiredContracts::default(),
             fragment,
-            expression_uses: uses,
-            calls,
+            statement_constant_policy: options().constants,
             pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &Control).unwrap(),
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -467,7 +536,7 @@ fn finish_package(
     Arc::new(package)
 }
 
-fn compile(
+pub(super) fn compile(
     fixture: &Fixture,
     functions: &PureEngineFunctionCatalog,
     control: &dyn PureCompileControl,
@@ -553,9 +622,19 @@ fn assert_mapping(
             .slots();
         for (ordinal, &expr) in exprs.iter().enumerate() {
             let expected = if ordinal % 3 == 1 { 0 } else { 1 };
-            assert!(
-                matches!(program.graph().expressions().node(expr).unwrap().kind(),
-                StaticExprKind::SlotId(slot) if *slot==source_slots[expected])
+            assert_eq!(input_ordinal(program, expr), expected as u32);
+            let (unit, root) = compiled_root(program, expr);
+            assert!(Arc::ptr_eq(
+                unit.scope(root.scope).unwrap().schema(),
+                program.graph().nodes()[input.index()]
+                    .output_layout()
+                    .schema()
+            ));
+            assert_eq!(
+                source_slots[expected],
+                program.graph().nodes()[input.index()]
+                    .output_layout()
+                    .slots()[expected]
             );
         }
         if width >= 3 {
@@ -617,11 +696,17 @@ fn union_all_branch_projects_and_downstream_aliases_keep_sources() {
     };
     let slots = union_node(&program).output_layout().slots();
     for (&expr, ordinal) in exprs.iter().zip([2, 0, 2]) {
-        assert!(
-            matches!(program.graph().expressions().node(expr).unwrap().kind(),StaticExprKind::SlotId(slot) if *slot==slots[ordinal])
-        );
+        assert_eq!(input_ordinal(&program, expr), ordinal as u32);
+        assert_eq!(slots.len(), 3);
     }
-    assert_eq!(exprs[0], exprs[2]);
+    assert_eq!(
+        compiled_root(&program, exprs[0]).1.definition,
+        compiled_root(&program, exprs[2]).1.definition
+    );
+    assert_ne!(
+        compiled_root(&program, exprs[0]).1.use_id,
+        compiled_root(&program, exprs[2]).1.use_id
+    );
     assert_ne!(
         projected.output_layout().slots()[0],
         projected.output_layout().slots()[2]
@@ -669,12 +754,8 @@ fn union_all_root_nullable_widening_preserves_source_full_types_and_nested_field
                     source.branch_values[branch][if ordinal % 3 == 1 { 0 } else { 1 }];
                 let original = &source.package.fragment().values()[&source_value].ty;
                 assert_eq!(
-                    program
-                        .checked()
-                        .channels()
-                        .expressions()
-                        .definition_type(ProgramExpressionArena::Main, expr),
-                    Some(&FunctionArgumentType::Value(original.clone()))
+                    root_type(&program, expr),
+                    &FunctionArgumentType::Value(original.clone())
                 );
                 if case.nested {
                     let DataType::Struct(fields) = &original.data_type() else {
@@ -682,13 +763,7 @@ fn union_all_root_nullable_widening_preserves_source_full_types_and_nested_field
                     };
                     assert_eq!(fields[0].name(), "original-nested");
                     assert!(fields[0].metadata().is_empty());
-                    let FunctionArgumentType::Value(actual) = program
-                        .checked()
-                        .channels()
-                        .expressions()
-                        .definition_type(ProgramExpressionArena::Main, expr)
-                        .unwrap()
-                    else {
+                    let FunctionArgumentType::Value(actual) = root_type(&program, expr) else {
                         unreachable!()
                     };
                     let DataType::Struct(actual_fields) = &actual.data_type() else {
@@ -740,79 +815,66 @@ fn union_all_split_provenance_and_fresh_root_lexical_coverage_are_complete() {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([0, 1, 2])
     );
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    assert!(
-        program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()
-            .is_empty()
-    );
-    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
+    assert!(program.resolved_calls().calls().is_empty());
     let ProgramNodeKind::UnionAll { inputs } = union.kind() else {
         unreachable!()
     };
     let mut new_uses = BTreeSet::new();
     let mut new_regions = BTreeSet::new();
+    let mut synthetic_units = BTreeSet::new();
     for &normalizer in inputs {
         let ProgramNodeKind::Project { exprs, input, .. } =
             program.graph().nodes()[normalizer.index()].kind()
         else {
             unreachable!()
         };
-        for (ordinal, &definition) in exprs.iter().enumerate() {
-            let root = ProgramExpressionRootSite::Node {
-                node: normalizer,
-                role: ProgramNodeExpressionRole::ProjectOutput {
-                    expression: ordinal as u32,
-                },
-            };
-            let use_id = snapshot.bindings()[&root];
-            let invocation = &flow.uses()[&use_id];
-            assert_eq!(invocation.definition, definition);
+        synthetic_units.insert(exprs[0].unit);
+        for (ordinal, &reference) in exprs.iter().enumerate() {
+            let (unit, root) = compiled_root(&program, reference);
+            let invocation = &unit.control_flow().uses()[&root.use_id];
+            assert_eq!(invocation.definition, root.definition);
             assert_eq!(invocation.control, ControlShape::Eager);
-            assert_eq!(
-                invocation.context.demand,
-                novarocks_type_contract::EvaluationDemand::Value
-            );
+            assert_eq!(invocation.context.demand, EvaluationDemand::Value);
             assert!(invocation.arguments.is_empty());
-            assert!(new_uses.insert(use_id));
-            assert!(new_regions.insert(invocation.context.region));
-            let domain = &flow.regions()[&invocation.context.region];
-            assert!(domain.parent.is_none() && domain.guard.is_none());
+            assert!(new_uses.insert((reference.unit, root.use_id)));
+            assert!(new_regions.insert((reference.unit, invocation.context.region)));
+            let region = &unit.control_flow().regions()[&invocation.context.region];
+            assert!(region.parent.is_none() && region.guard.is_none());
             assert_eq!(
-                program.checked().slots()[&ProgramUseRef {
-                    arena: ProgramExpressionArena::Main,
-                    use_id
-                }],
-                ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                    node: *input,
-                    role: ProgramChannelLayoutRole::NodeOutput,
-                    ordinal: if ordinal % 3 == 1 { 0 } else { 1 }
-                })
+                unit.input(root.use_id).unwrap().ordinal,
+                if ordinal % 3 == 1 { 0 } else { 1 }
             );
+            assert!(Arc::ptr_eq(
+                unit.scope(root.scope).unwrap().schema(),
+                program.graph().nodes()[input.index()]
+                    .output_layout()
+                    .schema()
+            ));
         }
     }
     assert_eq!(new_uses.len(), 6);
     assert_eq!(new_regions.len(), 6);
-    // The original branch reads survive with their original sparse context.
-    for (site, &original_use) in source.package.expression_uses().bindings() {
-        if matches!(
-            site.role,
-            novarocks_physical_plan::ExpressionRootRole::ProjectOutput { .. }
-        ) {
-            assert!(flow.uses().contains_key(&original_use));
-            assert!(!new_uses.contains(&original_use));
+    assert_eq!(synthetic_units.len(), 2);
+    // Node-local identities retain their actual original contexts. Different
+    // units may reuse the same numeric use and region without sharing identity.
+    for &physical in &source.branch_nodes {
+        let bound = source.package.fragment().nodes()[&physical]
+            .expressions
+            .as_ref()
+            .unwrap();
+        let ProgramNodeKind::Project { exprs, .. } =
+            program.graph().nodes()[physical_local(&program, physical).index()].kind()
+        else {
+            unreachable!()
+        };
+        for (ordinal, &reference) in exprs.iter().enumerate() {
+            assert!(!synthetic_units.contains(&reference.unit));
+            let (unit, root) = compiled_root(&program, reference);
+            let original_use = bound.root_use(RootOrdinal::new(ordinal as u32)).unwrap();
+            assert_eq!(root.use_id, original_use);
             assert_eq!(
-                flow.uses()[&original_use].context,
-                source.package.expression_uses().flow().uses()[&original_use].context
+                unit.control_flow().uses()[&root.use_id].context,
+                bound.control_flow().uses()[&original_use].context
             );
         }
     }
@@ -959,7 +1021,7 @@ fn nested_union_package(layers: usize) -> (Arc<FragmentPackage>, Vec<NodeId>) {
         for (ordinal, number) in numbers.into_iter().enumerate() {
             cells.push(
                 builder
-                    .add_expression(
+                    .fixture_root(
                         node,
                         integer.clone(),
                         crate::test_constants::i64(
@@ -968,6 +1030,8 @@ fn nested_union_package(layers: usize) -> (Arc<FragmentPackage>, Vec<NodeId>) {
                             number,
                             options().constants,
                         ),
+                        RootScope::AllPorts,
+                        EvaluationDemand::Value,
                     )
                     .unwrap(),
             );
@@ -990,6 +1054,7 @@ fn nested_union_package(layers: usize) -> (Arc<FragmentPackage>, Vec<NodeId>) {
                 values.clone().into_boxed_slice(),
             )
             .unwrap();
+        builder.finish_fixture_unit(node);
         values
     };
     let mut root = NodeId::new(u32::MAX);
@@ -1069,24 +1134,21 @@ fn union_all_nested_actual_tree_accepts_depth_sixty_three_and_refuses_sixty_five
         depths.push(depth);
     }
     assert_eq!(depths[program.graph().root().index()], 63);
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-    assert_eq!(snapshot.bindings().len(), 31 * 4);
-    assert_eq!(program.checked().slots().len(), 31 * 4);
-    assert!(
-        program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()
-            .is_empty()
-    );
+    let synthetic_roots: usize = program
+        .graph()
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.kind() {
+            ProgramNodeKind::Project {
+                exprs,
+                is_subordinate: true,
+                ..
+            } => Some(exprs.len()),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(synthetic_roots, 31 * 4);
+    assert!(program.resolved_calls().calls().is_empty());
     let mut all_uses = BTreeSet::new();
     let mut cost_owners = BTreeSet::new();
     for source_union in original_unions {
@@ -1147,41 +1209,24 @@ fn union_all_nested_actual_tree_accepts_depth_sixty_three_and_refuses_sixty_five
                 .output_layout()
                 .slots();
             for (ordinal, &definition) in exprs.iter().enumerate() {
-                assert!(
-                    matches!(program.graph().expressions().node(definition).unwrap().kind(),
-                    StaticExprKind::SlotId(slot) if *slot == child_slots[1-ordinal])
-                );
+                assert_eq!(input_ordinal(&program, definition), (1 - ordinal) as u32);
+                assert_eq!(child_slots.len(), 2);
                 assert_eq!(
-                    program
-                        .checked()
-                        .channels()
-                        .expressions()
-                        .definition_type(ProgramExpressionArena::Main, definition),
-                    Some(&FunctionArgumentType::Value(FunctionValueType::new(
-                        DataType::Int64,
-                        false
-                    )))
+                    root_type(&program, definition),
+                    &FunctionArgumentType::Value(FunctionValueType::new(DataType::Int64, false))
                 );
-                let site = ProgramExpressionRootSite::Node {
-                    node: normalizer,
-                    role: ProgramNodeExpressionRole::ProjectOutput {
-                        expression: ordinal as u32,
-                    },
-                };
-                let use_id = snapshot.bindings()[&site];
-                assert!(all_uses.insert(use_id));
-                assert_eq!(flow.uses()[&use_id].definition, definition);
+                let (unit, root) = compiled_root(&program, definition);
+                assert!(all_uses.insert((definition.unit, root.use_id)));
                 assert_eq!(
-                    program.checked().slots()[&ProgramUseRef {
-                        arena: ProgramExpressionArena::Main,
-                        use_id
-                    }],
-                    ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                        node: *input,
-                        role: ProgramChannelLayoutRole::NodeOutput,
-                        ordinal: (1 - ordinal) as u32
-                    })
+                    unit.control_flow().uses()[&root.use_id].definition,
+                    root.definition
                 );
+                assert!(Arc::ptr_eq(
+                    unit.scope(root.scope).unwrap().schema(),
+                    program.graph().nodes()[input.index()]
+                        .output_layout()
+                        .schema()
+                ));
             }
         }
     }
@@ -1202,4 +1247,11 @@ fn union_all_nested_actual_tree_accepts_depth_sixty_three_and_refuses_sixty_five
             CompileControlError::ResourceExhausted
         ))
     ));
+}
+
+pub(super) fn fixture_width(width: usize) -> Fixture {
+    fixture(Case {
+        width,
+        ..Case::ordinary()
+    })
 }

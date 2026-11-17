@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frozen exact-owner attachments to actual local expression/operator calls.
+//! Frozen exact-owner attachments to actual local relational calls.
 //!
-//! This constructor checks same-snapshot occurrence, ordered source channels
+//! This constructor checks exact call identity, ordered source channels
 //! and typed lifecycle correspondence. It is not complete expression typing,
 //! lexical capture closure or a proof that lowering preserved physical binding
 //! identity: the compiler owns that proof. Legacy function family/name tags
@@ -26,23 +26,19 @@
 
 use crate::creation::{ProgramCreation, ProgramCreationFailure};
 use crate::{
-    ProgramExpressionArena, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind, ProgramRootControlBindings, StaticAggregateCall, StaticExprKind, StaticLayout,
-    StaticWindowFunction, WindowBoundary, WindowFrame, WindowFunctionKind, WindowType,
+    ProgramNodeId, ProgramNodeKind, StaticAggregateCall, StaticLayout, StaticWindowFunction,
+    WindowBoundary, WindowFrame, WindowFunctionKind, WindowType,
 };
 use novarocks_functions::{
-    AggregateCallContract, AggregateKernelPhase, FunctionArgumentType, FunctionCallContract,
-    FunctionResultType, PreparedAggregateHandle, PreparedHigherOrderKernel, PreparedPureKernel,
-    PreparedScalarKernel, PreparedTableKernel, PreparedWindowKernel, PureCallSpecialization,
+    AggregateCallContract, AggregateKernelPhase, FunctionCallContract, PreparedAggregateHandle,
+    PreparedPureKernel, PreparedTableKernel, PreparedWindowKernel, PureCallSpecialization,
     PureImplementationDeclaration, PurePreparationSource, ScopedCallEffects,
 };
-#[cfg(test)]
-use novarocks_type_contract::ValueSchemaCreation;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
-    ExpressionUseId, FunctionValueType, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
-    ValueSchemaCreationScope, ValueTypeError, ValueTypeStorageLifetime, WindowBound,
-    WindowFrameExclusion, WindowFrameUnits, arrow_data_types_exact_with_profile_observed,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType,
+    MAX_CONTROL_USE_REFERENCES, PureCompileControl, ValueSchemaCreationScope, ValueTypeError,
+    ValueTypeStorageLifetime, WindowBound, WindowFrameExclusion, WindowFrameUnits,
+    arrow_data_types_exact_with_profile_observed,
 };
 use novarocks_types::SlotId;
 use std::{
@@ -52,27 +48,13 @@ use std::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ProgramUseRef {
-    pub arena: ProgramExpressionArena,
-    pub use_id: ExpressionUseId,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ProgramCallSite {
-    Expression(ProgramUseRef),
     Aggregate { node: ProgramNodeId, call: u32 },
     TopNState { node: ProgramNodeId, call: u32 },
     Window { node: ProgramNodeId, call: u32 },
     WriterPartial { node: ProgramNodeId, call: u32 },
     WriterFinal { node: ProgramNodeId, call: u32 },
     Table { node: ProgramNodeId },
-}
-
-/// A static ownership position, not an already created driver/body instance.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProgramExpressionCallScope {
-    pub root: ProgramExpressionRootSite,
-    pub occurrence: ProgramUseRef,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,18 +69,6 @@ pub enum ProgramAggregateCallScope {
 /// into another authority, and none is a host allocation authorization.
 #[derive(Debug)]
 pub enum ProgramStateTemplate<'a> {
-    Scalar {
-        scope: ProgramExpressionCallScope,
-        kernel: &'a Arc<dyn PreparedScalarKernel>,
-    },
-    ScalarInvocation {
-        scope: ProgramExpressionCallScope,
-        kernel: &'a Arc<dyn novarocks_functions::PreparedInvocationScalarKernel>,
-    },
-    HigherOrder {
-        scope: ProgramExpressionCallScope,
-        kernel: &'a Arc<dyn PreparedHigherOrderKernel>,
-    },
     Aggregate {
         scope: ProgramAggregateCallScope,
         kernel: &'a PreparedAggregateHandle,
@@ -113,15 +83,10 @@ pub enum ProgramStateTemplate<'a> {
         node: ProgramNodeId,
         kernel: &'a Arc<dyn PreparedTableKernel>,
     },
-    ControlIntrinsic {
-        scope: ProgramExpressionCallScope,
-        call: &'a FunctionCallContract,
-    },
 }
 
 #[derive(Clone, Copy, Debug)]
 enum CheckedScope {
-    Expression(ProgramExpressionCallScope),
     Aggregate(ProgramAggregateCallScope),
     Window { node: ProgramNodeId, call: u32 },
     Table { node: ProgramNodeId },
@@ -147,15 +112,6 @@ impl ProgramResolvedCall {
     }
     pub fn state_template(&self) -> ProgramStateTemplate<'_> {
         match (self.specialization.prepared(), self.scope) {
-            (PreparedPureKernel::Scalar(kernel), CheckedScope::Expression(scope)) => {
-                ProgramStateTemplate::Scalar { scope, kernel }
-            }
-            (PreparedPureKernel::ScalarInvocation(kernel), CheckedScope::Expression(scope)) => {
-                ProgramStateTemplate::ScalarInvocation { scope, kernel }
-            }
-            (PreparedPureKernel::HigherOrder(kernel), CheckedScope::Expression(scope)) => {
-                ProgramStateTemplate::HigherOrder { scope, kernel }
-            }
             (PreparedPureKernel::Aggregate(kernel), CheckedScope::Aggregate(scope)) => {
                 ProgramStateTemplate::Aggregate { scope, kernel }
             }
@@ -165,9 +121,6 @@ impl ProgramResolvedCall {
             (PreparedPureKernel::Table(kernel), CheckedScope::Table { node }) => {
                 ProgramStateTemplate::TableCursor { node, kernel }
             }
-            (PreparedPureKernel::ControlIntrinsic(call), CheckedScope::Expression(scope)) => {
-                ProgramStateTemplate::ControlIntrinsic { scope, call }
-            }
             _ => unreachable!("checked factory pairs each site with its actual lifecycle"),
         }
     }
@@ -175,7 +128,6 @@ impl ProgramResolvedCall {
 
 #[derive(Clone, Debug)]
 pub struct ProgramResolvedCalls {
-    snapshot: ProgramRootControlBindings,
     calls: Arc<BTreeMap<ProgramCallSite, ProgramResolvedCall>>,
     _storage: ValueTypeStorageLifetime,
 }
@@ -189,12 +141,8 @@ pub enum ProgramResolvedCallsError {
     MissingSite(ProgramCallSite),
     WrongSource,
     WrongContext,
-    InvalidRegion,
-    SharedUse,
     DuplicateRelationCall,
-    WrongControl,
     WrongArguments,
-    WrongBody,
     WrongLifecycle,
     WrongPhase,
     WrongOrder,
@@ -230,11 +178,12 @@ impl<H> From<ProgramResolvedCallsError> for ProgramCreationFailure<ProgramResolv
 }
 impl ProgramResolvedCalls {
     pub fn try_new(
-        snapshot: ProgramRootControlBindings,
+        graph: &crate::LocalProgramGraph,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
         calls: Vec<(ProgramCallSite, PureCallSpecialization)>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramResolvedCallsError> {
-        Self::try_new_created::<std::convert::Infallible>(snapshot, calls, None, None, control)
+        Self::try_new_created::<std::convert::Infallible>(graph, units, calls, None, None, control)
             .map_err(|error| match error {
                 ProgramCreationFailure::Control(error) => ProgramResolvedCallsError::Control(error),
                 ProgramCreationFailure::Owner(error) => error,
@@ -245,16 +194,25 @@ impl ProgramResolvedCalls {
             })
     }
     pub fn try_new_with_creator_in<H>(
-        snapshot: ProgramRootControlBindings,
+        graph: &crate::LocalProgramGraph,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
         calls: Vec<(ProgramCallSite, PureCallSpecialization)>,
         temporary: &mut dyn ValueSchemaCreationScope<H>,
         retained: &mut dyn ValueSchemaCreationScope<H>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramCreationFailure<ProgramResolvedCallsError, H>> {
-        Self::try_new_created(snapshot, calls, Some(temporary), Some(retained), control)
+        Self::try_new_created(
+            graph,
+            units,
+            calls,
+            Some(temporary),
+            Some(retained),
+            control,
+        )
     }
     fn try_new_created<H>(
-        snapshot: ProgramRootControlBindings,
+        graph: &crate::LocalProgramGraph,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
         calls: Vec<(ProgramCallSite, PureCallSpecialization)>,
         temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
         retained: Option<&mut dyn ValueSchemaCreationScope<H>>,
@@ -283,7 +241,8 @@ impl ProgramResolvedCalls {
             }
         }
         let mut references = 0usize;
-        for flow in snapshot.flows().values() {
+        for unit in units {
+            let flow = unit.control_flow();
             references = references
                 .checked_add(flow.use_reference_count())
                 .filter(|n| *n <= MAX_CONTROL_USE_REFERENCES)
@@ -294,7 +253,7 @@ impl ProgramResolvedCalls {
         // borrowed layout is scanned once; schema width is not an invocation
         // count limit, and only requested ordinals are retained.
         let mut slots = RequestedSlots::default();
-        for node in snapshot.program().nodes() {
+        for node in graph.nodes() {
             work.step()?;
             match node.kind() {
                 ProgramNodeKind::TableWriter {
@@ -307,14 +266,12 @@ impl ProgramResolvedCalls {
                         slots.request(
                             &projection.layout,
                             call.input_slot_id,
-                            &mut references,
                             &mut temporary,
                             &mut work,
                         )?;
                         slots.request(
                             writer_multiplex_layout,
                             call.intermediate_slot_id,
-                            &mut references,
                             &mut temporary,
                             &mut work,
                         )?;
@@ -329,7 +286,6 @@ impl ProgramResolvedCalls {
                         slots.request(
                             writer_multiplex_layout,
                             call.intermediate_input_slot_id,
-                            &mut references,
                             &mut temporary,
                             &mut work,
                         )?;
@@ -338,88 +294,18 @@ impl ProgramResolvedCalls {
                 ProgramNodeKind::TableFunction {
                     input, param_slots, ..
                 } => {
-                    let layout = snapshot.program().nodes()[input.index()].output_layout();
+                    let layout = graph.nodes()[input.index()].output_layout();
                     for slot in param_slots {
-                        slots.request(layout, *slot, &mut references, &mut temporary, &mut work)?;
+                        slots.request(layout, *slot, &mut temporary, &mut work)?;
                     }
                 }
                 _ => {}
             }
         }
         slots.index(&mut work)?;
-        // Each graph is already an occurrence forest. Index ownership once;
-        // do not repeatedly walk all roots to locate each nested call.
-        let mut owners = BTreeMap::new();
-        for (root, use_id) in snapshot.bindings() {
-            let arena = root.arena();
-            let flow = &snapshot.flows()[&arena];
-            let mut stack =
-                temporary.reserve::<ProgramResolvedCallsError, ExpressionUseId>(1, &mut work)?;
-            stack.push(*use_id);
-            while let Some(use_id) = stack.pop() {
-                work.step()?;
-                let key = ProgramUseRef { arena, use_id };
-                if !owners.contains_key(&key) {
-                    temporary.before_tree_insert::<ProgramResolvedCallsError,
-                        ProgramUseRef, ProgramExpressionRootSite>(owners.len(), &mut work)?;
-                }
-                if owners
-                    .insert(ProgramUseRef { arena, use_id }, *root)
-                    .is_some()
-                {
-                    return Err(ProgramResolvedCallsError::SharedUse.into());
-                }
-                let invocation = &flow.uses()[&use_id];
-                for child in invocation.arguments.iter().rev() {
-                    work.step()?;
-                    before_stack_push(&mut temporary, &stack, &mut work)?;
-                    stack.push(*child);
-                }
-            }
-        }
         let mut checked = BTreeMap::new();
-        for (arena, flow) in snapshot.flows() {
-            let definitions = &snapshot.roots().arenas()[arena];
-            for (use_id, invocation) in flow.uses() {
-                work.step()?;
-                let definition = definitions
-                    .node(invocation.definition)
-                    .ok_or(ProgramResolvedCallsError::InvalidSite)?;
-                let args = match definition.kind() {
-                    StaticExprKind::BoundCall { args } => args,
-                    _ => continue,
-                };
-                let occurrence = ProgramUseRef {
-                    arena: *arena,
-                    use_id: *use_id,
-                };
-                let site = ProgramCallSite::Expression(occurrence);
-                let call = pending
-                    .remove(&site)
-                    .ok_or(ProgramResolvedCallsError::MissingSite(site))?;
-                validate_to_base64_source(
-                    &snapshot, occurrence, args, &call, &pending, &checked, &mut work,
-                )?;
-                validate_expression(&snapshot, occurrence, args, &call, &mut work)?;
-                let scope = ProgramExpressionCallScope {
-                    root: *owners
-                        .get(&occurrence)
-                        .ok_or(ProgramResolvedCallsError::InvalidSite)?,
-                    occurrence,
-                };
-                retained.before_tree_insert::<ProgramResolvedCallsError,
-                    ProgramCallSite, ProgramResolvedCall>(checked.len(), &mut work)?;
-                checked.insert(
-                    site,
-                    ProgramResolvedCall {
-                        specialization: call,
-                        scope: CheckedScope::Expression(scope),
-                    },
-                );
-            }
-        }
         let mut relational_ids = BTreeSet::new();
-        for (index, node) in snapshot.program().nodes().iter().enumerate() {
+        for (index, node) in graph.nodes().iter().enumerate() {
             work.step()?;
             let node_id = ProgramNodeId::new(index);
             let mut attach = |site,
@@ -474,7 +360,7 @@ impl ProgramResolvedCalls {
                             }),
                             &mut |token, work| {
                                 validate_aggregate(
-                                    &snapshot,
+                                    units,
                                     ProgramAggregateCallScope::Aggregate {
                                         node: node_id,
                                         call,
@@ -503,7 +389,7 @@ impl ProgramResolvedCalls {
                             },
                             CheckedScope::Aggregate(scope),
                             &mut |token, work| {
-                                validate_aggregate(&snapshot, scope, function, false, token, work)
+                                validate_aggregate(units, scope, function, false, token, work)
                             },
                         )?;
                     }
@@ -521,9 +407,7 @@ impl ProgramResolvedCalls {
                                 node: node_id,
                                 call,
                             },
-                            &mut |token, work| {
-                                validate_window(&snapshot, node_id, call, function, token, work)
-                            },
+                            &mut |token, work| validate_window(units, function, token, work),
                         )?;
                     }
                 }
@@ -648,7 +532,7 @@ impl ProgramResolvedCalls {
                             {
                                 return Err(ProgramResolvedCallsError::WrongArguments);
                             }
-                            let layout = snapshot.program().nodes()[input.index()].output_layout();
+                            let layout = graph.nodes()[input.index()].output_layout();
                             for ((slot, old_type), ty) in param_slots
                                 .iter()
                                 .zip(param_types)
@@ -675,180 +559,13 @@ impl ProgramResolvedCalls {
             BTreeMap<ProgramCallSite, ProgramResolvedCall>>(&mut work)?;
         work.finish()?;
         Ok(Self {
-            snapshot,
             calls: Arc::new(checked),
             _storage: storage,
         })
     }
-    pub const fn snapshot(&self) -> &ProgramRootControlBindings {
-        &self.snapshot
-    }
     pub fn calls(&self) -> &BTreeMap<ProgramCallSite, ProgramResolvedCall> {
         &self.calls
     }
-}
-
-fn validate_expression(
-    snapshot: &ProgramRootControlBindings,
-    occurrence: ProgramUseRef,
-    args: &[crate::ProgramExprId],
-    token: &PureCallSpecialization,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), ProgramResolvedCallsError> {
-    let flow = &snapshot.flows()[&occurrence.arena];
-    let invocation = &flow.uses()[&occurrence.use_id];
-    let call = token.call_contract();
-    if call.context() != invocation.context.into()
-        || token.effects().context() != invocation.context.into()
-    {
-        return Err(ProgramResolvedCallsError::WrongContext);
-    }
-    if !call
-        .effects()
-        .argument_control
-        .matches_scalar_shape(invocation.control)
-    {
-        return Err(ProgramResolvedCallsError::WrongControl);
-    }
-    if !matches!(
-        token.prepared(),
-        PreparedPureKernel::Scalar(_)
-            | PreparedPureKernel::ScalarInvocation(_)
-            | PreparedPureKernel::HigherOrder(_)
-            | PreparedPureKernel::ControlIntrinsic(_)
-    ) {
-        return Err(ProgramResolvedCallsError::WrongLifecycle);
-    }
-    if call.selected().argument_types.len() != args.len()
-        || call.logical_argument_count() != args.len()
-    {
-        return Err(ProgramResolvedCallsError::WrongArguments);
-    }
-    let definitions = &snapshot.roots().arenas()[&occurrence.arena];
-    if call.function_id().as_str() == "builtin.scalar/regexp_count/v1" {
-        if invocation.control != ControlShape::Eager || args.len() != 2 {
-            return Err(ProgramResolvedCallsError::WrongArguments);
-        }
-        let pattern = definitions
-            .node(args[1])
-            .ok_or(ProgramResolvedCallsError::InvalidSite)?;
-        let expected = if matches!(pattern.kind(), crate::StaticExprKind::Constant(_)) {
-            novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent
-        } else {
-            novarocks_type_contract::RegexpCountPatternSource::Dynamic
-        };
-        if call.regexp_count_pattern_source() != Some(expected) {
-            return Err(ProgramResolvedCallsError::WrongArguments);
-        }
-    } else if call.regexp_count_pattern_source().is_some() {
-        return Err(ProgramResolvedCallsError::WrongArguments);
-    }
-    if let ControlShape::TemporalSource(shape) = invocation.control {
-        let source = call
-            .temporal_source()
-            .ok_or(ProgramResolvedCallsError::WrongArguments)?;
-        source
-            .facts
-            .validate()
-            .map_err(|_| ProgramResolvedCallsError::WrongArguments)?;
-        if source.facts.shape() != shape || source.sources.len() != invocation.arguments.len() {
-            return Err(ProgramResolvedCallsError::WrongArguments);
-        }
-        let roles = shape.roles();
-        for (ordinal, (use_id, source)) in
-            invocation.arguments.iter().zip(&source.sources).enumerate()
-        {
-            work.step()?;
-            let child = &flow.uses()[use_id];
-            if Some(source.role) != roles[ordinal] || source.context != child.context {
-                return Err(ProgramResolvedCallsError::WrongArguments);
-            }
-            check_arrow(
-                definitions
-                    .node(child.definition)
-                    .ok_or(ProgramResolvedCallsError::InvalidSite)?
-                    .data_type(),
-                source.value_type.data_type(),
-                work,
-            )?;
-        }
-    } else if call.temporal_source().is_some() {
-        return Err(ProgramResolvedCallsError::WrongArguments);
-    } else if matches!(
-        invocation.control,
-        ControlShape::TypeOnly | ControlShape::NoArguments
-    ) {
-        if !invocation.arguments.is_empty() {
-            return Err(ProgramResolvedCallsError::WrongArguments);
-        }
-        if invocation.control == ControlShape::NoArguments {
-            // Demand-zero removes actual uses, never static definition/type
-            // validation. Retain every original full-N source association.
-            for (definition, ty) in args.iter().zip(&call.selected().argument_types) {
-                work.step()?;
-                let FunctionArgumentType::Value(ty) = ty else {
-                    return Err(ProgramResolvedCallsError::WrongArguments);
-                };
-                check_arrow(
-                    definitions
-                        .node(*definition)
-                        .ok_or(ProgramResolvedCallsError::InvalidSite)?
-                        .data_type(),
-                    ty.data_type(),
-                    work,
-                )?;
-            }
-        }
-    } else {
-        if invocation.arguments.len() != args.len() {
-            return Err(ProgramResolvedCallsError::WrongArguments);
-        }
-        for ((use_id, definition), ty) in invocation
-            .arguments
-            .iter()
-            .zip(args)
-            .zip(&call.selected().argument_types)
-        {
-            work.step()?;
-            let child = &flow.uses()[use_id];
-            if child.definition != *definition {
-                return Err(ProgramResolvedCallsError::WrongArguments);
-            }
-            match ty {
-                FunctionArgumentType::Value(ty) => check_arrow(
-                    definitions
-                        .node(*definition)
-                        .ok_or(ProgramResolvedCallsError::InvalidSite)?
-                        .data_type(),
-                    ty.data_type(),
-                    work,
-                )?,
-                FunctionArgumentType::Lambda { .. } => {
-                    return Err(ProgramResolvedCallsError::WrongBody);
-                }
-            }
-        }
-    }
-    if matches!(token.prepared(), PreparedPureKernel::HigherOrder(_)) {
-        return Err(ProgramResolvedCallsError::WrongBody);
-    }
-    let FunctionResultType::Scalar(result) = &call.selected().result_type else {
-        return Err(ProgramResolvedCallsError::WrongLifecycle);
-    };
-    if invocation.context.demand == EvaluationDemand::TruthOnly
-        && (!matches!(result.data_type(), arrow_schema::DataType::Boolean)
-            || result.logical_type() != novarocks_type_contract::ValueLogicalType::Physical)
-    {
-        return Err(ProgramResolvedCallsError::TypeMismatch);
-    }
-    check_arrow(
-        definitions
-            .node(invocation.definition)
-            .ok_or(ProgramResolvedCallsError::InvalidSite)?
-            .data_type(),
-        result.data_type(),
-        work,
-    )
 }
 
 fn validate_relational_context<H>(
@@ -887,30 +604,19 @@ fn aggregate_contract(
 }
 
 fn validate_aggregate(
-    snapshot: &ProgramRootControlBindings,
+    units: &[Arc<novarocks_expression::CompiledExprSet>],
     scope: ProgramAggregateCallScope,
     source: &StaticAggregateCall,
     finalize: bool,
     token: &PureCallSpecialization,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramResolvedCallsError> {
-    let (node, ordinal) = match scope {
-        ProgramAggregateCallScope::Aggregate { node, call }
-        | ProgramAggregateCallScope::TopNState { node, call } => (node, call),
-        _ => return Err(ProgramResolvedCallsError::InvalidSite),
-    };
-    let role = |argument| match scope {
-        ProgramAggregateCallScope::TopNState { .. } => {
-            ProgramNodeExpressionRole::TopNStateArgument {
-                call: ordinal,
-                argument,
-            }
-        }
-        _ => ProgramNodeExpressionRole::AggregateInput {
-            call: ordinal,
-            argument,
-        },
-    };
+    if !matches!(
+        scope,
+        ProgramAggregateCallScope::Aggregate { .. } | ProgramAggregateCallScope::TopNState { .. }
+    ) {
+        return Err(ProgramResolvedCallsError::InvalidSite);
+    }
     let contract = aggregate_contract(token)?;
     check_aggregate_source(source.frozen.as_deref(), &source.resolved, contract, work)?;
     let same_interpretation = match (
@@ -949,22 +655,15 @@ fn validate_aggregate(
             .chain(contract.order_argument_types())
             .enumerate()
         {
-            check_argument_root(
-                snapshot,
-                node,
-                role(u32::try_from(argument).map_err(|_| ProgramResolvedCallsError::TooManyItems)?),
-                ty,
-                work,
-            )?;
+            check_argument_root(units, source.inputs[argument], ty, work)?;
         }
     } else {
         if source.inputs.len() != 1 {
             return Err(ProgramResolvedCallsError::WrongArguments);
         }
         check_argument_root(
-            snapshot,
-            node,
-            role(0),
+            units,
+            source.inputs[0],
             contract
                 .state_input_type()
                 .ok_or(ProgramResolvedCallsError::WrongArguments)?,
@@ -1043,30 +742,35 @@ fn check_order(
 /// is its own: a relational call context never borrows an expression
 /// occurrence's domain, and the argument contributes only neutral effects.
 fn check_argument_root(
-    snapshot: &ProgramRootControlBindings,
-    node: ProgramNodeId,
-    role: ProgramNodeExpressionRole,
+    units: &[Arc<novarocks_expression::CompiledExprSet>],
+    reference: crate::ProgramRootRef,
     ty: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramResolvedCallsError> {
-    let site = ProgramExpressionRootSite::Node { node, role };
-    let use_id = snapshot
-        .bindings()
-        .get(&site)
+    let unit = units
+        .get(reference.unit.index())
+        .ok_or(ProgramResolvedCallsError::InvalidSite)?;
+    let root = unit
+        .root(reference.root)
         .ok_or(ProgramResolvedCallsError::WrongArguments)?;
-    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-    let invocation = &flow.uses()[use_id];
+    let flow = unit.control_flow();
+    let invocation = flow
+        .uses()
+        .get(&root.use_id)
+        .ok_or(ProgramResolvedCallsError::WrongArguments)?;
     let unguarded = flow
         .regions()
         .get(&invocation.context.region)
-        .is_some_and(|domain| domain.parent.is_none() && domain.guard.is_none());
+        .is_some_and(|region| region.parent.is_none() && region.guard.is_none());
     if !unguarded || invocation.context.demand != EvaluationDemand::Value {
         return Err(ProgramResolvedCallsError::WrongContext);
     }
-    let definition = snapshot.roots().arenas()[&ProgramExpressionArena::Main]
-        .node(invocation.definition)
-        .ok_or(ProgramResolvedCallsError::InvalidSite)?;
-    check_arrow(definition.data_type(), ty.data_type(), work)
+    let actual = crate::unit_refs::root_type(units, reference)
+        .ok_or(ProgramResolvedCallsError::TypeMismatch)?;
+    // Complete argument/nullability correspondence stays with the final
+    // channel author. This attachment preserves its original carrier gate
+    // and error precedence while borrowing the actual unit root.
+    check_arrow(actual.data_type(), ty.data_type(), work)
 }
 
 /// Each call carries its own frame and NULL treatment. A legacy call's frame
@@ -1076,9 +780,7 @@ fn check_argument_root(
 /// default derivation, which owns that proof. Such a default never has an
 /// offset, so an offset frame there is refused.
 fn validate_window(
-    snapshot: &ProgramRootControlBindings,
-    node: ProgramNodeId,
-    ordinal: u32,
+    units: &[Arc<novarocks_expression::CompiledExprSet>],
     source: &StaticWindowFunction,
     token: &PureCallSpecialization,
     work: &mut CompileCheckpoints<'_>,
@@ -1131,17 +833,7 @@ fn validate_window(
         .chain(contract.order_argument_types())
         .enumerate()
     {
-        check_argument_root(
-            snapshot,
-            node,
-            ProgramNodeExpressionRole::WindowInput {
-                call: ordinal,
-                argument: u32::try_from(argument)
-                    .map_err(|_| ProgramResolvedCallsError::TooManyItems)?,
-            },
-            ty,
-            work,
-        )?;
+        check_argument_root(units, source.args[argument], ty, work)?;
     }
     check_arrow(
         &source.return_type,
@@ -1186,23 +878,6 @@ fn convert_frame(
     })
 }
 
-fn before_stack_push<H>(
-    temporary: &mut ProgramCreation<'_, H>,
-    source: &Vec<ExpressionUseId>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), ProgramCreationFailure<ProgramResolvedCallsError, H>> {
-    let facts = novarocks_type_contract::owned_resources::vec::push_growth(source)
-        .map_err(|e| match e {
-            novarocks_type_contract::ControlResourceError::Control(e) => ProgramCreationFailure::Control(e),
-            novarocks_type_contract::ControlResourceError::SourceModel(_) =>
-                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
-        })?;
-    if let Some(layout) = facts.requested_backing {
-        temporary.request::<ProgramResolvedCallsError>(layout, work)?;
-    }
-    Ok(())
-}
-
 /// Keys identify the exact borrowed layout object, never a schema digest or
 /// equal-width surrogate. No pointer is dereferenced through an integer key.
 #[derive(Default)]
@@ -1214,15 +889,10 @@ impl<'a> RequestedSlots<'a> {
         &mut self,
         layout: &'a StaticLayout,
         slot: SlotId,
-        references: &mut usize,
         temporary: &mut ProgramCreation<'_, H>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), ProgramCreationFailure<ProgramResolvedCallsError, H>> {
         work.step()?;
-        *references = references
-            .checked_add(1)
-            .filter(|n| *n <= MAX_CONTROL_USE_REFERENCES)
-            .ok_or(ProgramResolvedCallsError::TooManyItems)?;
         let key = layout as *const StaticLayout as usize;
         if !self.layouts.contains_key(&key) {
             temporary.before_tree_insert::<ProgramResolvedCallsError, usize,
@@ -1300,72 +970,4 @@ fn check_arrow(
 }
 
 #[cfg(test)]
-pub(crate) mod tests;
-
-#[cfg(test)]
 pub(crate) mod relational_tests;
-
-fn validate_to_base64_source(
-    snapshot: &ProgramRootControlBindings,
-    occurrence: ProgramUseRef,
-    args: &[crate::ProgramExprId],
-    token: &PureCallSpecialization,
-    pending: &BTreeMap<ProgramCallSite, PureCallSpecialization>,
-    checked: &BTreeMap<ProgramCallSite, ProgramResolvedCall>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), ProgramResolvedCallsError> {
-    let call = token.call_contract();
-    if call.function_id().as_str() != "builtin.scalar/to_base64/v1" {
-        if call.to_base64_byte_source().is_some() {
-            return Err(ProgramResolvedCallsError::WrongArguments);
-        }
-        return Ok(());
-    }
-    let flow = &snapshot.flows()[&occurrence.arena];
-    let invocation = &flow.uses()[&occurrence.use_id];
-    if invocation.control != ControlShape::Eager
-        || args.len() != 1
-        || invocation.arguments.len() != 1
-    {
-        return Err(ProgramResolvedCallsError::WrongArguments);
-    }
-    let definitions = &snapshot.roots().arenas()[&occurrence.arena];
-    let source = definitions
-        .node(args[0])
-        .ok_or(ProgramResolvedCallsError::InvalidSite)?;
-    work.step()?;
-    let (name, emitted) = match source.kind() {
-        crate::StaticExprKind::BoundCall { .. } => {
-            let child = ProgramCallSite::Expression(ProgramUseRef {
-                arena: occurrence.arena,
-                use_id: invocation.arguments[0],
-            });
-            let child = pending
-                .get(&child)
-                .map(|t| t.call_contract())
-                .or_else(|| checked.get(&child).map(ProgramResolvedCall::call_contract))
-                .ok_or(ProgramResolvedCallsError::MissingSite(child))?;
-            (
-                Some(
-                    novarocks_type_contract::native_v1_function_name(child.function_id())
-                        .map_err(|_| ProgramResolvedCallsError::WrongArguments)?,
-                ),
-                true,
-            )
-        }
-        _ => (None, false),
-    };
-    let expected = if emitted {
-        work.flush()?;
-        let fact =
-            novarocks_type_contract::ToBase64ByteSource::from_immediate_native_function_name(name);
-        work.flush()?;
-        fact
-    } else {
-        novarocks_type_contract::ToBase64ByteSource::from_immediate_encryption_identity(name)
-    };
-    if call.to_base64_byte_source() != Some(expected) {
-        return Err(ProgramResolvedCallsError::WrongArguments);
-    }
-    Ok(())
-}

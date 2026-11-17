@@ -18,27 +18,14 @@
 // Public recipe checks reuse the actual frozen physical compiler fixture.
 // Reuse only its real physical authors, frozen package and compiler fixture.
 use super::*;
+use novarocks_expression::{
+    PrimitiveError as ProgramPrimitiveError, prepare_arithmetic_node, prepare_cast_node,
+    prepare_comparison_node, prepare_null_safe_comparison_node,
+};
 use novarocks_functions::{
     ArithmeticPrepareError, CastOperation, CastPrepareError, ComparisonPrepareError,
 };
-use novarocks_local_program::{
-    ExpressionProgram, ProgramPrimitiveError, prepare_arithmetic_node, prepare_cast_node,
-    prepare_comparison_node, prepare_null_safe_comparison_node,
-};
 use novarocks_type_contract::{ArithmeticOperator, ComparisonOperator};
-
-fn occurrence(program: &novarocks_local_program::LocalProgram) -> ProgramUseRef {
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    ProgramUseRef {
-        arena: ProgramExpressionArena::Main,
-        use_id: snapshot.bindings()[&root(Mode::Project)],
-    }
-}
 
 // The parent fixture authors only Boolean binary results. Arithmetic requires
 // its own honest physical result, plus the admitted ALLOW_THROW parameter.
@@ -46,7 +33,7 @@ fn occurrence(program: &novarocks_local_program::LocalProgram) -> ProgramUseRef 
 fn arithmetic_fixture(
     operator: BinaryOperator,
     result: FunctionValueType,
-) -> Result<Fixture, ValidationErrors> {
+) -> Result<Fixture, FixtureError> {
     let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(FragmentId::new(101));
     builder
@@ -60,7 +47,7 @@ fn arithmetic_fixture(
     let mut inputs = vec![];
     for value in [20, 22] {
         let literal = builder
-            .add_expression(
+            .fixture_value_root(
                 NodeId::new(44),
                 input.clone(),
                 crate::test_constants::i64(&mut constants, &input, value, options().constants),
@@ -71,7 +58,7 @@ fn arithmetic_fixture(
                 input.clone(),
                 ValueOrigin::Expr {
                     node: NodeId::new(44),
-                    expr: literal,
+                    root: literal,
                 },
             )
             .unwrap();
@@ -90,13 +77,13 @@ fn arithmetic_fixture(
         )
         .unwrap();
     let a = builder
-        .add_expression(NodeId::new(0), input.clone(), ExprKind::Value(inputs[0].1))
+        .fixture_definition(NodeId::new(0), input.clone(), ExprKind::Value(inputs[0].1))
         .unwrap();
     let b = builder
-        .add_expression(NodeId::new(0), input, ExprKind::Value(inputs[1].1))
+        .fixture_definition(NodeId::new(0), input, ExprKind::Value(inputs[1].1))
         .unwrap();
     let expression = builder
-        .add_expression(
+        .fixture_definition(
             NodeId::new(0),
             result.clone(),
             ExprKind::Binary {
@@ -112,12 +99,20 @@ fn arithmetic_fixture(
             },
         )
         .unwrap();
+    let root = builder
+        .fixture_occurrence(
+            NodeId::new(0),
+            expression,
+            EvaluationDemand::Value,
+            RootScope::Port(0),
+        )
+        .unwrap();
     let value = builder
         .add_value(
             result,
             ValueOrigin::Expr {
                 node: NodeId::new(0),
-                expr: expression,
+                root,
             },
         )
         .unwrap();
@@ -125,10 +120,18 @@ fn arithmetic_fixture(
         .add_project(
             NodeId::new(0),
             NodeId::new(44),
-            Box::from([(expression, value)]),
+            Box::from([(root, value)]),
             Box::from([value]),
         )
         .unwrap();
+    seal_units(
+        &mut builder,
+        &functions(),
+        None,
+        None,
+        &[],
+        options().constants,
+    )?;
     let fragment = builder.finish_definition(
         NodeId::new(0),
         FragmentSink::Result,
@@ -191,9 +194,9 @@ fn public_comparison_recipe_equals_frozen_program_recipe_for_all_ordinary_operat
             let direct = prepare_comparison_node(pure, &left, &right, &Control).unwrap();
             assert_eq!(
                 Some(&direct),
-                program
-                    .expressions()
-                    .comparison_recipe(ProgramComparisonSite::Binary(occurrence(&program)))
+                unit(&program)
+                    .recipes()
+                    .comparison(ProgramComparisonSite::Binary(occurrence(&program)))
             );
         }
     }
@@ -229,12 +232,12 @@ fn public_null_safe_recipe_equals_its_separate_frozen_program_recipe() {
         let site = occurrence(&program);
         assert_eq!(
             Some(&direct),
-            program.expressions().null_safe_comparison_recipe(site)
+            unit(&program).recipes().null_safe_comparison(site)
         );
         assert!(
-            program
-                .expressions()
-                .comparison_recipe(ProgramComparisonSite::Binary(site))
+            unit(&program)
+                .recipes()
+                .comparison(ProgramComparisonSite::Binary(site))
                 .is_none()
         );
     }
@@ -274,7 +277,7 @@ fn public_cast_recipe_equals_frozen_program_recipe_including_policy_and_allow() 
     .unwrap();
     assert_eq!(
         Some(&direct),
-        program.expressions().cast_recipe(occurrence(&program))
+        unit(&program).recipes().cast(occurrence(&program))
     );
 }
 
@@ -333,9 +336,7 @@ fn public_arithmetic_recipe_equals_frozen_program_recipe_for_every_operator() {
         .unwrap();
         assert_eq!(
             Some(&direct),
-            program
-                .expressions()
-                .arithmetic_recipe(occurrence(&program))
+            unit(&program).recipes().arithmetic(occurrence(&program))
         );
     }
 }
@@ -432,9 +433,15 @@ fn lowering_primitive(error: &FragmentCompileError) -> ProgramPrimitiveError {
         .downcast_ref::<crate::expressions::ExpressionLoweringError>()
         .expect("exact expression lowering error")
     {
-        crate::expressions::ExpressionLoweringError::Arithmetic(e) => e.clone().into(),
-        crate::expressions::ExpressionLoweringError::Cast(e) => e.clone().into(),
-        crate::expressions::ExpressionLoweringError::Comparison(e) => e.clone().into(),
+        crate::expressions::ExpressionLoweringError::Unit(
+            novarocks_expression::ExprCompileError::Arithmetic(e),
+        ) => e.clone().into(),
+        crate::expressions::ExpressionLoweringError::Unit(
+            novarocks_expression::ExprCompileError::Cast(e),
+        ) => e.clone().into(),
+        crate::expressions::ExpressionLoweringError::Unit(
+            novarocks_expression::ExprCompileError::Comparison(e),
+        ) => e.clone().into(),
         other => panic!("not a primitive refusal: {other:?}"),
     }
 }
@@ -510,12 +517,12 @@ fn frozen_program_refusals_keep_the_exact_public_wrapper_refusal() {
     );
     // Boolean arithmetic is illegal before recipe preparation in a frozen
     // Fragment. Its direct Unsupported is covered above, without pretending
-    // an invalid physical fragment can become a checked ExpressionProgram.
+    // an invalid source can reach the compiled unit author.
 }
 
 #[test]
 fn malformed_frozen_claims_fail_at_the_real_author_before_a_program_exists() {
-    fn author_error(result: Result<Fixture, ValidationErrors>) -> ValidationErrors {
+    fn author_error(result: Result<Fixture, FixtureError>) -> FixtureError {
         match result {
             Err(error) => error,
             Ok(_) => panic!("invalid result was accepted by the physical author"),
@@ -610,7 +617,7 @@ fn each_public_family_and_checked_expression_program_keep_original_control_cause
             c,
         )
     });
-    let mut programs = vec![];
+    let mut sources = vec![];
     for shape in [
         Shape::Binary(BinaryOperator::Eq),
         Shape::Binary(BinaryOperator::EqForNull),
@@ -621,42 +628,42 @@ fn each_public_family_and_checked_expression_program_keep_original_control_cause
         } else {
             input.clone()
         };
-        programs.push(
-            compile(
-                package(
-                    &functions,
-                    fixture(
-                        &functions,
-                        shape,
-                        Mode::Project,
-                        input.clone(),
-                        right,
-                        OutputClaim::Accurate,
-                        None,
-                    )
-                    .unwrap(),
-                ),
+        sources.push(package(
+            &functions,
+            fixture(
                 &functions,
-                &Control,
+                shape,
+                Mode::Project,
+                input.clone(),
+                right,
+                OutputClaim::Accurate,
+                None,
             )
             .unwrap(),
-        );
+        ));
     }
-    programs.push(
-        compile(
-            package(
-                &functions,
-                arithmetic_fixture(BinaryOperator::Add, output).unwrap(),
-            ),
-            &functions,
-            &Control,
-        )
-        .unwrap(),
-    );
-    for program in programs {
-        // This is a genuine checked chain returned by compile_fragment, not
-        // hand-authored type, slot, channel or lexical side tables.
-        check_refusals(|c| ExpressionProgram::try_new(program.checked().clone(), c));
+    sources.push(package(
+        &functions,
+        arithmetic_fixture(BinaryOperator::Add, output).unwrap(),
+    ));
+    for source in sources {
+        let recorder = RefusingControl::new(CompileControlError::Cancelled, usize::MAX);
+        compile(source.clone(), &functions, &recorder).unwrap();
+        let trace = recorder.trace.lock().unwrap().clone();
+        assert!(!trace.is_empty());
+        for stop_at in 1..=trace.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = RefusingControl::new(cause.clone(), stop_at);
+                assert!(
+                    matches!(compile(source.clone(),&functions,&control),Err(FragmentCompileError::Control(actual)) if actual==cause)
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..stop_at]);
+            }
+        }
     }
 }
 

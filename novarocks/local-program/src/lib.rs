@@ -29,30 +29,26 @@
 //! or async runtime dependency. A program's static representation moves here
 //! as its node and expression types are separated from task-owned bindings.
 
+mod ordinal;
+pub use ordinal::{ProgramOrdinalFailure, checked_program_ordinal};
+mod unit_inputs;
+mod unit_refs;
+pub use unit_refs::{ProgramRootRef, ProgramUnitId};
+mod batch_sequence;
 mod compiled;
 mod compiled_origins;
 mod contract;
-mod control_flow;
 mod creation;
-mod expression_program;
-mod expression_roots;
-pub use expression_program::ExpressionProgram;
-mod batch_sequence;
-mod expressions;
 mod failure_projection;
 mod layout;
-mod lexical_bindings;
-mod primitives;
 mod program;
 mod provenance;
 mod provider_links;
 mod requirements;
 mod resolved_calls;
-mod root_attachment;
 mod runtime_filter;
 mod sink;
 mod typed_channels;
-mod typed_expressions;
 mod values;
 pub use batch_sequence::{BatchSequenceCreationFailure, StaticBatchSequence};
 mod writer_preparation;
@@ -67,16 +63,8 @@ pub use contract::{
     FragmentSinkAssignmentRequirement, KernelAbiVersion, LayoutIdentity, RuntimeFilterContract,
     RuntimeFilterId, ScanAssignmentKind, ScanSourceContract,
 };
-pub use control_flow::*;
 pub use creation::ProgramCreationFailure;
-pub use expression_roots::*;
-pub use expressions::{
-    ExpressionsCompileError, ImmutableExpressions, MAX_STATIC_EXPRESSION_DEPTH,
-    MAX_STATIC_EXPRESSION_DYNAMIC_BYTES, MAX_STATIC_EXPRESSIONS, ProgramExprId, StaticExprKind,
-    StaticExprNode, StaticExpressionError,
-};
 pub use layout::{LayoutCompileError, LayoutCreationFailure, LayoutError, StaticLayout};
-pub use lexical_bindings::*;
 pub use novarocks_connector_contract::{
     ScanColumnId, StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment,
     StaticScanDynamicFilter,
@@ -84,11 +72,6 @@ pub use novarocks_connector_contract::{
 // The partition vocabulary of `StaticStreamBranch`, re-exported so a compiler
 // can author a stream sink without a second execution-contract dependency.
 pub use novarocks_execution_contract::{DataStreamPartitionType, ExchangeDeliveryRequirement};
-pub use primitives::{
-    ProgramComparisonSite, ProgramPrimitiveError, prepare_arithmetic_node, prepare_cast_node,
-    prepare_comparison_node, prepare_native_bitnot_node, prepare_native_negate_node,
-    prepare_null_safe_comparison_node,
-};
 mod frozen_aggregate;
 pub use frozen_aggregate::{FrozenAggregateSelection, FrozenAggregateSelectionError};
 
@@ -114,10 +97,6 @@ pub use requirements::{
     BindingRequirementsError, ProgramNodeId, ScanSourceKind,
 };
 pub use resolved_calls::*;
-pub use root_attachment::{
-    RootAttachmentError, attach_typed_root_channels_created_in, attach_typed_root_channels_in,
-    attach_typed_root_channels_with_factory_in,
-};
 pub use runtime_filter::{
     AggregateTopNFilters, FilterConsumerActivation, FilterLateApplyGranularity,
     FilterMembershipSchema, FilterMembershipSchemaError, FilterNullOrder, FilterNullSemantics,
@@ -134,7 +113,6 @@ pub use sink::{
     StaticStreamRouting, StaticSummaryAuthor, StaticSummaryBranch, validate_summary_layout,
 };
 pub use typed_channels::*;
-pub use typed_expressions::*;
 pub use values::{
     MAX_STATIC_VALUES_BACKING_BYTES, StaticValueBatch, StaticValues, StaticValuesBacking,
     StaticValuesCell, StaticValuesError, ValuesCompileError, ValuesCreationFailure,
@@ -145,8 +123,6 @@ pub use writer_preparation::{
 
 // Shared semantic nodes retain their original creation responsibility.
 pub use novarocks_type_contract::ValueTypeRef;
-#[cfg(test)]
-mod test_value_types;
 
 pub use novarocks_result_contract::{
     DeleteVerificationCounts, FinishCountMode, FinishInputs, LogicalChangeCounts, PerKind,
@@ -155,3 +131,6 @@ pub use novarocks_result_contract::{
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod unit_properties;

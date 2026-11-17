@@ -26,6 +26,9 @@ use crate::writer::admit_writer_family;
 use arrow_schema::{DataType, Field};
 use bytes::Bytes;
 use novarocks_connector_contract::*;
+use novarocks_expression_contract::{
+    BoundFunction, ExprKind, PhysicalCallRequest, RootOrdinal, RootScope,
+};
 use novarocks_functions::{
     ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
     InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
@@ -33,14 +36,10 @@ use novarocks_functions::{
 };
 use novarocks_local_program::{
     BindingRequirement, KernelAbiVersion, LocalProgram, ProgramChannelLayoutRole,
-    ProgramChannelSite, ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeKind,
-    StaticExprKind, StaticSinkProgram,
+    ProgramChannelSite, ProgramNodeKind, ProgramRootRef, StaticSinkProgram,
 };
 use novarocks_physical_plan::*;
-use novarocks_type_contract::{
-    ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, control_argument_semantics,
-};
+use novarocks_type_contract::{RelationCallId, RelationEffectContext};
 use std::num::NonZeroUsize;
 
 const WRITER_FRAGMENT: FragmentId = FragmentId::new(1);
@@ -321,7 +320,7 @@ fn fixture_with_types(
     for (ordinal, (value_type, literal)) in cells.enumerate() {
         row.push(
             builder
-                .add_expression(source, value_type.clone(), literal)
+                .add_root(source, value_type.clone(), literal, RootScope::AllPorts)
                 .unwrap(),
         );
         values.push(
@@ -339,6 +338,7 @@ fn fixture_with_types(
     builder
         .insert_node_unchecked(PhysicalNode {
             id: source,
+            expressions: None,
             inputs: Box::default(),
             required_inputs: Box::default(),
             output_properties: property(Distribution::Singleton),
@@ -384,6 +384,7 @@ fn fixture_with_types(
     builder
         .insert_node_unchecked(PhysicalNode {
             id: writer,
+            expressions: None,
             inputs: Box::from([source]),
             required_inputs: Box::from([property(Distribution::Singleton)]),
             output_properties: property(Distribution::Unconstrained),
@@ -407,7 +408,7 @@ fn fixture_with_types(
             },
         })
         .unwrap();
-    let producer = builder.finish_definition(
+    let producer = builder.finish_fixture_definition(
         writer,
         FragmentSink::Stream { edge: EDGE },
         dop_domain(),
@@ -439,6 +440,7 @@ fn fixture_with_types(
     builder
         .insert_node_unchecked(PhysicalNode {
             id: exchange,
+            expressions: None,
             inputs: Box::default(),
             required_inputs: Box::default(),
             output_properties: property(Distribution::Singleton),
@@ -461,6 +463,7 @@ fn fixture_with_types(
     builder
         .insert_node_unchecked(PhysicalNode {
             id: finish,
+            expressions: None,
             inputs: Box::from([exchange]),
             required_inputs: Box::from([property(Distribution::Singleton)]),
             output_properties: property(Distribution::Singleton),
@@ -490,7 +493,7 @@ fn fixture_with_types(
         })
         .unwrap();
     let consumer = builder
-        .finish_definition(
+        .finish_fixture_definition(
             finish,
             FragmentSink::Result,
             dop_domain(),
@@ -498,7 +501,10 @@ fn fixture_with_types(
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([1; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([1; 16]).unwrap(),
+        options(1, None).constants,
+    );
     for (&id, pool) in constants.entries() {
         plan.insert_constant_pool(id, pool.clone())?;
     }
@@ -553,17 +559,9 @@ fn fixture_with_types(
     .unwrap();
     let plan = plan.finish_observed(&FixtureControl)?;
 
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let root_uses = root_uses(fragment);
-        calls.insert(
-            id,
-            FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &FixtureControl).unwrap(),
-        );
-        uses.insert(id, root_uses);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
@@ -574,8 +572,6 @@ fn fixture_with_types(
         &plan,
         &BTreeMap::new(),
         &BTreeMap::from([(ordinal, draft)]),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,
@@ -588,48 +584,110 @@ fn fixture_with_types(
     })
 }
 
-/// One complete eager use per literal or materialized-value root site in one domain.
-fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let mut uses = Vec::new();
-    let bindings = roots
-        .sites()
-        .iter()
-        .enumerate()
-        .map(|(index, (&site, root))| {
-            let id = ExpressionUseId::new(index as u32);
-            assert!(matches!(
-                fragment.expressions().get(root.expr).unwrap().kind,
-                ExprKind::Constant(_) | ExprKind::Value(_)
-            ));
-            // A literal has no argument, so its control shape is trivially eager.
-            let _ = control_argument_semantics(ControlShape::Eager, 0, 0, root.demand);
-            uses.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id: id,
-                    region: EvaluationRegionId::new(0),
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (site, id)
-        })
-        .collect();
-    let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: EvaluationRegionId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap()
+trait WriterRootFixture {
+    fn add_root(
+        &mut self,
+        node: NodeId,
+        ty: ValueType,
+        kind: ExprKind,
+        scope: RootScope,
+    ) -> Result<RootOrdinal, novarocks_expression_contract::UnitError>;
+    fn finish_fixture_definition(
+        self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop: PipelineDopDomain,
+        placement: StagePlacementPolicy,
+    ) -> Result<Fragment, ValidationErrors>;
+    fn finish_fixture_structure(
+        self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop: PipelineDopDomain,
+        placement: StagePlacementPolicy,
+    ) -> Fragment;
+}
+fn seal_fixture_units(builder: &mut FragmentBuilder) {
+    let nodes = builder
+        .construction_nodes()
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    for node in nodes {
+        if builder.construction_unit(node).is_none() {
+            continue;
+        }
+        let ports = builder.node_ports(node).unwrap();
+        let draft = builder.take_unit_builder(node).unwrap();
+        let mut work =
+            CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
+        let unit = draft
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        work.finish().unwrap();
+        builder.install_unit(node, Arc::new(unit)).unwrap();
+    }
+}
+impl WriterRootFixture for FragmentBuilder {
+    fn add_root(
+        &mut self,
+        node: NodeId,
+        ty: ValueType,
+        kind: ExprKind,
+        scope: RootScope,
+    ) -> Result<RootOrdinal, novarocks_expression_contract::UnitError> {
+        let draft = self.unit(node).expect("original node fixture unit draft");
+        let definition = draft.add(None, ty, kind)?;
+        draft.root(definition, EvaluationDemand::Value, scope)
+    }
+    fn finish_fixture_definition(
+        mut self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop: PipelineDopDomain,
+        placement: StagePlacementPolicy,
+    ) -> Result<Fragment, ValidationErrors> {
+        seal_fixture_units(&mut self);
+        self.finish_definition(root, sink, dop, placement)
+    }
+    fn finish_fixture_structure(
+        mut self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop: PipelineDopDomain,
+        placement: StagePlacementPolicy,
+    ) -> Fragment {
+        seal_fixture_units(&mut self);
+        self.finish_structure(
+            root,
+            sink,
+            dop,
+            PlanLimits::FROZEN,
+            &FixtureControl,
+            placement,
+        )
+        .unwrap()
+    }
+}
+/// Borrow the actual compiled root's input position in its original runtime schema.
+fn root_input_ordinal(program: &LocalProgram, reference: ProgramRootRef) -> u32 {
+    let unit = program.unit(reference.unit).unwrap();
+    let root = unit.root(reference.root).unwrap();
+    assert!(matches!(
+        unit.definitions().node(root.definition).unwrap().kind(),
+        novarocks_expression::StaticExprKind::Input
+    ));
+    unit.input(root.use_id)
+        .expect("actual input-read root")
+        .ordinal
+}
+fn root_input_slot(
+    program: &LocalProgram,
+    reference: ProgramRootRef,
+    layout: &novarocks_local_program::StaticLayout,
+) -> novarocks_types::SlotId {
+    layout.slots()[root_input_ordinal(program, reference) as usize]
 }
 
 // Conservative retained-source invoice and independent projection ceilings for
@@ -826,10 +884,14 @@ fn writer_fragment_compiles_a_positional_relation_over_synthetic_slot_reads() {
         // occurrence, never a slot the projection itself produces.
         let input_slots = graph.nodes()[input.index()].output_layout().slots();
         for (ordinal, expr) in projection.expressions.iter().enumerate() {
-            match projection.arena.node(*expr).unwrap().kind() {
-                StaticExprKind::SlotId(slot) => assert_eq!(*slot, input_slots[ordinal]),
-                other => panic!("writer projection {ordinal} is {other:?}"),
-            }
+            assert_eq!(
+                root_input_slot(
+                    &program,
+                    *expr,
+                    graph.nodes()[input.index()].output_layout()
+                ),
+                input_slots[ordinal]
+            );
             assert!(!projection.layout.slots().contains(&input_slots[ordinal]));
         }
         // The multiplex relation is named by its frozen fields with fresh slots.
@@ -859,48 +921,32 @@ fn writer_fragment_compiles_a_positional_relation_over_synthetic_slot_reads() {
             Some(StaticSinkProgram::DataStream { .. })
         ));
         // Every projected read is bound to the writer input's occurrence.
-        let channels = program.checked().channels();
+        let channels = program.channels();
         for ordinal in 0..2u32 {
-            let site = ProgramExpressionRootSite::WriterProjection {
-                node: root,
-                expression: ordinal,
-            };
-            assert_eq!(
-                site.arena(),
-                novarocks_local_program::ProgramExpressionArena::WriterProjection(root)
-            );
+            let reference = projection.expressions[ordinal as usize];
+            assert_eq!(root_input_ordinal(&program, reference), ordinal);
             assert!(
                 channels
                     .channel_type(ProgramChannelSite::Layout {
                         node: root,
                         role: ProgramChannelLayoutRole::WriterProjection,
-                        ordinal,
+                        ordinal
                     })
                     .is_some()
             );
         }
-        let bound = program
-            .checked()
-            .slots()
+        let bound = projection
+            .expressions
             .iter()
-            .filter(|(occurrence, _)| {
-                occurrence.arena
-                    == novarocks_local_program::ProgramExpressionArena::WriterProjection(root)
-            })
-            .map(|(_, source)| *source)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            bound,
-            (0..2u32)
-                .map(
-                    |ordinal| ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                        node: *input,
-                        role: ProgramChannelLayoutRole::NodeOutput,
-                        ordinal,
-                    })
+            .map(|reference| {
+                root_input_slot(
+                    &program,
+                    *reference,
+                    graph.nodes()[input.index()].output_layout(),
                 )
-                .collect::<Vec<_>>()
-        );
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bound, input_slots);
     }
 }
 
@@ -1097,11 +1143,10 @@ use novarocks_functions::{
     AggregateBindingSelection, AggregateKernelPhase, AggregatePreparationOptions,
     AggregateStateFormatIdentity, CallArgumentUses, CallEffectInput, FunctionBindingRequest,
     FunctionBindingSelection, FunctionBundleContributor, FunctionResultType, PureCallPreparation,
-    PurePreparationSource, ScopedExpressionEffects,
+    PurePreparationSource, ScopedRelationalEffects,
 };
 use novarocks_local_program::{
-    ProgramCallSite, ProgramNodeExpressionRole, ProgramStateTemplate,
-    UnpivotConstant as LocalConstant,
+    ProgramCallSite, ProgramStateTemplate, UnpivotConstant as LocalConstant,
 };
 use novarocks_type_contract::{
     CallProofScope, DecimalOverflowPolicy, EvaluationDemand, ExpressionEffects, SemanticParameters,
@@ -1363,7 +1408,7 @@ fn statistics_fixture() -> StatisticsFixture {
     for (ordinal, (value_type, literal)) in cells.into_iter().enumerate() {
         row.push(
             builder
-                .add_expression(source, value_type.clone(), literal)
+                .add_root(source, value_type.clone(), literal, RootScope::AllPorts)
                 .unwrap(),
         );
         values.push(
@@ -1381,6 +1426,7 @@ fn statistics_fixture() -> StatisticsFixture {
     builder
         .insert_node_unchecked(PhysicalNode {
             id: source,
+            expressions: None,
             inputs: Box::default(),
             required_inputs: Box::default(),
             output_properties: property(Distribution::Singleton),
@@ -1468,6 +1514,7 @@ fn statistics_fixture() -> StatisticsFixture {
     builder
         .insert_node_unchecked(PhysicalNode {
             id: writer,
+            expressions: None,
             inputs: Box::from([source]),
             required_inputs: Box::from([property(Distribution::Singleton)]),
             output_properties: property(Distribution::Unconstrained),
@@ -1492,14 +1539,13 @@ fn statistics_fixture() -> StatisticsFixture {
         })
         .unwrap();
     let producer = with_requests(
-        builder
-            .finish_definition(
-                writer,
-                FragmentSink::Stream { edge: EDGE },
-                dop_domain(),
-                novarocks_physical_plan::StagePlacementPolicy::Singleton,
-            )
-            .unwrap(),
+        &catalog,
+        builder.finish_fixture_structure(
+            writer,
+            FragmentSink::Stream { edge: EDGE },
+            dop_domain(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        ),
         partial_aggregates.iter().enumerate().map(|(call, item)| {
             (
                 PhysicalCallSite::WriterPartial {
@@ -1536,6 +1582,7 @@ fn statistics_fixture() -> StatisticsFixture {
     builder
         .insert_node_unchecked(PhysicalNode {
             id: exchange,
+            expressions: None,
             inputs: Box::default(),
             required_inputs: Box::default(),
             output_properties: property(Distribution::Singleton),
@@ -1589,7 +1636,7 @@ fn statistics_fixture() -> StatisticsFixture {
     let mappings = (0..2u32)
         .map(|channel| {
             let blob = builder
-                .add_expression(
+                .add_root(
                     finish,
                     ty(DataType::Utf8, false),
                     crate::test_constants::utf8(
@@ -1598,6 +1645,7 @@ fn statistics_fixture() -> StatisticsFixture {
                         BLOB_TYPE,
                         options(1, None).constants,
                     ),
+                    RootScope::Port(0),
                 )
                 .unwrap();
             WriterGroupedUnpivotMapping {
@@ -1620,6 +1668,7 @@ fn statistics_fixture() -> StatisticsFixture {
     builder
         .insert_node_unchecked(PhysicalNode {
             id: finish,
+            expressions: None,
             inputs: Box::from([exchange]),
             required_inputs: Box::from([property(Distribution::Singleton)]),
             output_properties: property(Distribution::Singleton),
@@ -1663,14 +1712,13 @@ fn statistics_fixture() -> StatisticsFixture {
         })
         .unwrap();
     let consumer = with_requests(
-        builder
-            .finish_definition(
-                finish,
-                FragmentSink::Result,
-                dop_domain(),
-                novarocks_physical_plan::StagePlacementPolicy::Singleton,
-            )
-            .unwrap(),
+        &catalog,
+        builder.finish_fixture_structure(
+            finish,
+            FragmentSink::Result,
+            dop_domain(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        ),
         final_aggregates.iter().enumerate().map(|(call, item)| {
             (
                 PhysicalCallSite::WriterFinal {
@@ -1682,7 +1730,10 @@ fn statistics_fixture() -> StatisticsFixture {
         }),
     );
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([2; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([2; 16]).unwrap(),
+        options(1, None).constants,
+    );
     for (&id, pool) in constants.entries() {
         plan.insert_constant_pool(id, pool.clone()).unwrap();
     }
@@ -1739,14 +1790,9 @@ fn statistics_fixture() -> StatisticsFixture {
         .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the statistics plan validates: {error:?}"));
 
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let (root_uses, frozen) = freeze_writer_calls(fragment, &catalog);
-        calls.insert(id, frozen);
-        uses.insert(id, root_uses);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
@@ -1757,8 +1803,6 @@ fn statistics_fixture() -> StatisticsFixture {
         &plan,
         &BTreeMap::new(),
         &BTreeMap::from([(ordinal, draft)]),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,
@@ -1775,6 +1819,7 @@ fn statistics_fixture() -> StatisticsFixture {
 
 /// Attach the original request of every writer call to its fragment.
 fn with_requests<'a>(
+    catalog: &PureEngineFunctionCatalog,
     fragment: Fragment,
     sites: impl Iterator<Item = (PhysicalCallSite, &'a AggregateBinding)>,
 ) -> Fragment {
@@ -1785,48 +1830,23 @@ fn with_requests<'a>(
         .map(|(definition, request)| (*definition, request.clone()))
         .collect::<Vec<_>>();
     for (site, binding) in sites {
-        entries.push((
-            PhysicalCallDefinition::Relational(site),
-            theta_request(binding),
-        ));
+        entries.push((site, theta_request(binding)));
     }
-    fragment
+    let fragment = fragment
         .with_call_requests_observed(entries, &FixtureControl)
+        .unwrap();
+    let calls = freeze_writer_calls(&fragment, catalog);
+    fragment
+        .with_calls_observed(calls, &FixtureControl)
         .unwrap()
 }
 
-/// Root uses and frozen writer calls of one fragment, numbered as the
-/// frontend numbers them: every expression root is a leaf use in domain 0;
-/// each writer call then takes its relational domain and use, followed by
-/// the domain and use the frontend mints for the call's materialized input.
-/// That input occurrence is a frontend loan only: it enters no flow use.
+/// The original relation author issues the call and materialized-input roles
+/// under one identity; neither role enters an expression unit's use space.
 fn freeze_writer_calls(
     fragment: &Fragment,
     catalog: &PureEngineFunctionCatalog,
-) -> (PhysicalRootUses, FrozenFragmentCalls) {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                region: EvaluationRegionId::new(0),
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, id));
-    }
-    let mut next_use = u32::try_from(uses.len()).unwrap();
-    let mut domains = vec![ExpressionEvaluationRegion {
-        id: EvaluationRegionId::new(0),
-        parent: None,
-        guard: None,
-    }];
+) -> Vec<FrozenPhysicalCall> {
     let mut sites = Vec::new();
     for node in fragment.nodes().values() {
         let (calls, partial): (&[WriterAggregateCall], bool) = match &node.kind {
@@ -1834,48 +1854,29 @@ fn freeze_writer_calls(
             NodeKind::TableFinish(spec) => (&spec.final_aggregates, false),
             _ => continue,
         };
-        for (call, item) in calls.iter().enumerate() {
+        for (ordinal, item) in calls.iter().enumerate() {
             let site = if partial {
                 PhysicalCallSite::WriterPartial {
                     node: node.id,
-                    call: call as u32,
+                    call: ordinal as u32,
                 }
             } else {
                 PhysicalCallSite::WriterFinal {
                     node: node.id,
-                    call: call as u32,
+                    call: ordinal as u32,
                 }
             };
-            let mut context = || {
-                let context = ExpressionEffectContext {
-                    use_id: ExpressionUseId::new(next_use),
-                    region: EvaluationRegionId::new(domains.len() as u32),
-                    demand: EvaluationDemand::Value,
-                };
-                domains.push(ExpressionEvaluationRegion {
-                    id: context.region,
-                    parent: None,
-                    guard: None,
-                });
-                next_use += 1;
-                context
-            };
-            let relational = context();
-            let input = context();
-            sites.push((site, item, relational, input));
+            let identity = RelationCallId::new(sites.len() as u32);
+            sites.push((
+                site,
+                item,
+                RelationEffectContext::call(identity),
+                RelationEffectContext::materialized_input(identity),
+            ));
         }
     }
-    let flow = ExpressionControlFlow::try_new(
-        domains,
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let root_uses = PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap();
     let parameters = SemanticParameters::try_new([]).unwrap();
-    let frozen = sites
+    sites
         .into_iter()
         .map(|(site, item, context, input)| {
             let binding = &item.binding;
@@ -1890,7 +1891,6 @@ fn freeze_writer_calls(
                 constant: None,
             }];
             let state_type = fragment.values()[&item.input].ty.clone();
-            let argument_uses = [Some(input.use_id)];
             let partial = matches!(site, PhysicalCallSite::WriterPartial { .. });
             let phase = if partial {
                 AggregateKernelPhase::Partial
@@ -1900,13 +1900,16 @@ fn freeze_writer_calls(
             let token = catalog
                 .prepare_fresh(
                     CallEffectInput {
-                        context,
+                        context: context.into(),
                         argument_uses: if partial {
-                            CallArgumentUses::SelectedChannels(&argument_uses)
+                            CallArgumentUses::MaterializedInput {
+                                context: input,
+                                input_type: &state_type,
+                            }
                         } else {
                             CallArgumentUses::AggregateMerge {
                                 phase,
-                                state_context: input,
+                                state_context: input.into(),
                                 state_input_type: &state_type,
                             }
                         },
@@ -1921,11 +1924,11 @@ fn freeze_writer_calls(
                         environment: &[],
                         parameters: &parameters,
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Region(context.region),
+                        proof_scope: CallProofScope::Relation(context.identity),
                     },
                     Arc::clone(&selected),
                     PureCallPreparation::Aggregate {
-                        arguments: ScopedExpressionEffects::primitive(
+                        arguments: ScopedRelationalEffects::primitive(
                             context,
                             ExpressionEffects::PURE_VALUE,
                         ),
@@ -1942,19 +1945,13 @@ fn freeze_writer_calls(
                 .unwrap_or_else(|error| panic!("the frontend prepares {site:?}: {error}"));
             FrozenPhysicalCall {
                 materialized_writer_input: Some(input),
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
                 site,
                 context,
                 effects: token.call_contract().effects().clone(),
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             }
         })
-        .collect();
-    let calls = FrozenFragmentCalls::try_new(fragment, &root_uses, frozen, &FixtureControl)
-        .unwrap_or_else(|error| panic!("frozen writer calls validate: {error}"));
-    (root_uses, calls)
+        .collect()
 }
 
 fn compile_with(
@@ -2048,7 +2045,7 @@ fn a_writer_call_input_is_its_own_materialized_occurrence_and_the_frozen_prepara
             .map(|call| call.context)
             .collect::<Vec<_>>();
         assert_eq!(frozen.len(), 2);
-        let resolved = program.checked().channels().expressions().resolved_calls();
+        let resolved = program.resolved_calls();
         let mut prepared = 0;
         for (site, call) in resolved.calls() {
             if !matches!(
@@ -2060,7 +2057,7 @@ fn a_writer_call_input_is_its_own_materialized_occurrence_and_the_frozen_prepara
             prepared += 1;
             let context = call.call_contract().context();
             assert!(
-                frozen.contains(&context),
+                frozen.iter().any(|original| context == (*original).into()),
                 "{site:?} keeps its frozen context"
             );
             assert_eq!(
@@ -2071,24 +2068,16 @@ fn a_writer_call_input_is_its_own_materialized_occurrence_and_the_frozen_prepara
                 .calls()
                 .entries()
                 .values()
-                .find(|source| source.context == context)
+                .find(|source| context == source.context.into())
                 .unwrap();
             let input = original
                 .materialized_writer_input
                 .expect("actual writer Value receipt");
-            assert!(
-                package
-                    .expression_uses()
-                    .flow()
-                    .regions()
-                    .contains_key(&input.region)
-            );
-            assert_ne!(input.use_id, context.use_id);
-            assert_ne!(input.region, context.region);
+            assert!(input.is_materialized_input_of(original.context));
+            assert_eq!(input.identity.call, original.context.identity.call);
+            assert_ne!(input.identity.role, original.context.identity.role);
             assert_eq!(input.demand, EvaluationDemand::Value);
-            let flow = &resolved.snapshot().flows()
-                [&novarocks_local_program::ProgramExpressionArena::Main];
-            assert!(!flow.uses().contains_key(&context.use_id));
+            assert!(program.units().iter().all(|unit| unit.calls().is_empty()));
         }
         assert_eq!(prepared, 2);
     }
@@ -2139,7 +2128,6 @@ fn finish_final_calls_and_the_grouped_unpivot_lower_onto_their_relations() {
         assert_eq!(kernel.contract().phase(), AggregateKernelPhase::Final);
         // The final output is an internal typed channel of the call's result.
         let output = program
-            .checked()
             .channels()
             .channel_type(ProgramChannelSite::WriterFinalOutput {
                 node: root,
@@ -2170,12 +2158,6 @@ fn finish_final_calls_and_the_grouped_unpivot_lower_onto_their_relations() {
         (1024, 1 << 20)
     );
     assert_eq!(unpivot.mappings.len(), 2);
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
     for (mapping, lowered) in unpivot.mappings.iter().enumerate() {
         assert_eq!(lowered.grouping_key, 0);
         assert_eq!(
@@ -2193,17 +2175,16 @@ fn finish_final_calls_and_the_grouped_unpivot_lower_onto_their_relations() {
         assert_eq!(fields, &vec![mapping as i32 + 1]);
         assert!(properties.is_empty());
         assert!(!nullable);
-        // The blob type is the Main-arena literal its FinishUnpivotConstant
-        // root evaluates.
-        let site = ProgramExpressionRootSite::Node {
-            node: root,
-            role: ProgramNodeExpressionRole::FinishUnpivotConstant {
-                mapping: mapping as u32,
-                constant: 1,
-            },
+        // The blob type is the actual node-unit constant root, preserving its CV source.
+        let unit = program.unit(expr_id.unit).unwrap();
+        let root = unit.root(expr_id.root).unwrap();
+        assert!(unit.control_flow().root_use_ids().contains(&root.use_id));
+        let novarocks_expression::StaticExprKind::Constant(value) =
+            unit.definitions().node(root.definition).unwrap().kind()
+        else {
+            panic!("actual grouped Unpivot blob constant")
         };
-        assert!(snapshot.bindings().contains_key(&site));
-        assert_eq!(snapshot.roots().sites()[&site].definition, *expr_id);
+        assert_eq!(value.try_utf8().unwrap(), Some(BLOB_TYPE));
     }
 }
 
@@ -2404,11 +2385,11 @@ fn actual_writer_compilation_keeps_source_types_and_checks_only_null_differences
                 .unwrap(),
             "the published projection must satisfy the original target requirement",
         );
+        let reference = projection.expressions[1];
+        let unit = program.unit(reference.unit).unwrap();
+        let definition = unit.root(reference.root).unwrap().definition;
         let Some(novarocks_type_contract::FunctionArgumentType::Value(original)) =
-            program.checked().channels().expressions().definition_type(
-                novarocks_local_program::ProgramExpressionArena::WriterProjection(root),
-                novarocks_local_program::ProgramExprId::new(1),
-            )
+            unit.types().get(definition.index())
         else {
             panic!("the original projection expression remains typed")
         };

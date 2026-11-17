@@ -24,40 +24,39 @@ use super::*;
 use arrow_array::{ListArray, types::Int64Type};
 use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression_contract::LegacyBindingMetadata;
+use novarocks_expression_contract::{ExprKind, PhysicalCallRequest, RootOrdinal, RootScope};
 use novarocks_functions::{
     CallEffectInput, ConstantPolicy, ConstantPool, EngineFunctionCatalogBuilder, FunctionArgument,
     FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
     InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
+    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedRelationalEffects,
 };
 use novarocks_local_program::{
     KernelAbiVersion, LocalProgram, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind,
-    ProgramStateTemplate, StaticExprKind, TableFunctionOutputSlot,
+    ProgramNodeId, ProgramNodeKind, ProgramStateTemplate, TableFunctionOutputSlot,
 };
+use novarocks_physical_plan::StaticFunctionArgument;
 use novarocks_physical_plan::{
-    BoundTableFunction, ConstantPoolId, ConstantPools, ConstantReference, ExprId, ExprKind,
-    ExpressionRootRole, ExpressionRootSite, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
-    FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType,
-    LegacyBindingMetadata, NodeId, NodeKind, OutputPort, PhysicalCallDefinition,
-    PhysicalCallRequest, PhysicalCallSite, PhysicalExpressionRoots, PhysicalNode,
-    PhysicalProperties, PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
-    PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort,
-    StaticFunctionArgument, TableFunctionOutput, ValueId, ValueOrigin, passthrough_requirement,
+    BoundTableFunction, ConstantPoolId, ConstantPools, ConstantReference, Fragment,
+    FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
+    FragmentPackageInput, FragmentSink, FrozenFragmentPruning, FrozenPhysicalCall,
+    FunctionArgumentType, NodeId, NodeKind, OutputPort, PhysicalCallSite, PhysicalNode,
+    PhysicalProperties, PipelineDopDomain, PlanLimits, PlanVersionId,
+    PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort, TableFunctionOutput,
+    ValueId, ValueOrigin, passthrough_requirement,
 };
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects,
-    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
-    PureCompileControl, RegionGuard, SemanticParameters, control_argument_semantics,
+    CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
+    EvaluationDemand, ExpressionEffects, FunctionValueType, PureCompileControl, RelationCallId,
+    RelationEffectContext, SemanticParameters,
 };
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
 const VALUES: NodeId = NodeId::new(1);
 const TABLE: NodeId = NodeId::new(2);
-/// Relational use IDs start far above every expression use of a fixture.
-const RELATIONAL_USE: u32 = 1_000_000;
+/// The fixture relation author assigns one real fragment-local call identity.
+const RELATIONAL_CALL: u32 = 1_000_000;
 const POLICY: DecimalOverflowPolicy = DecimalOverflowPolicy::ReportError;
 
 struct Control;
@@ -208,66 +207,44 @@ impl Shape {
     }
 }
 
-/// One eager use per actual occurrence; a control child gets its own guarded
-/// domain exactly as the shape's argument semantics require.
-struct Author<'a> {
-    fragment: &'a Fragment,
-    next_use: u32,
-    next_region: u32,
-    uses: Vec<ExpressionInvocation<ExprId>>,
-    domains: Vec<ExpressionEvaluationRegion>,
-}
-impl Author<'_> {
-    fn visit(
+trait RootFixture {
+    fn add_root(
         &mut self,
-        expr: ExprId,
-        domain: EvaluationRegionId,
-        demand: EvaluationDemand,
-    ) -> ExpressionUseId {
-        let id = ExpressionUseId::new(self.next_use);
-        self.next_use += 1;
-        let kind = &self.fragment.expressions().get(expr).unwrap().kind;
-        let shape = kind
-            .intrinsic_control_shape()
-            .unwrap()
-            .expect("fixture authors no function call");
-        let mut children = Vec::new();
-        kind.expression_references_observed::<std::convert::Infallible>(|child| {
-            children.push(child);
-            Ok(())
-        })
-        .unwrap();
-        let mut arguments = Vec::new();
-        for (ordinal, child) in children.iter().enumerate() {
-            let (child_demand, guard) =
-                control_argument_semantics(shape, children.len(), ordinal, demand).unwrap();
-            let child_region = match guard {
-                Some(kind) => {
-                    let child_region = EvaluationRegionId::new(self.next_region);
-                    self.next_region += 1;
-                    self.domains.push(ExpressionEvaluationRegion {
-                        id: child_region,
-                        parent: Some(domain),
-                        guard: Some(RegionGuard { owner: id, kind }),
-                    });
-                    child_region
-                }
-                None => domain,
-            };
-            arguments.push(self.visit(*child, child_region, child_demand));
-        }
-        self.uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                region: domain,
-                demand,
-            },
-            definition: expr,
-            control: shape,
-            arguments: arguments.into_boxed_slice(),
-        });
-        id
+        node: NodeId,
+        ty: FunctionValueType,
+        kind: ExprKind,
+        scope: RootScope,
+    ) -> Result<RootOrdinal, novarocks_expression_contract::UnitError>;
+}
+impl RootFixture for FragmentBuilder {
+    fn add_root(
+        &mut self,
+        node: NodeId,
+        ty: FunctionValueType,
+        kind: ExprKind,
+        scope: RootScope,
+    ) -> Result<RootOrdinal, novarocks_expression_contract::UnitError> {
+        let draft = self
+            .unit(node)
+            .expect("fixture node keeps its original unit draft");
+        let definition = draft.add(None, ty, kind)?;
+        draft.root(definition, EvaluationDemand::Value, scope)
     }
+}
+fn install_pure_unit(builder: &mut FragmentBuilder, node: NodeId) {
+    if builder.construction_unit(node).is_none() {
+        return;
+    }
+    let ports = builder.node_ports(node).unwrap();
+    let draft = builder.take_unit_builder(node).unwrap();
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    let unit = draft
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    builder.install_unit(node, Arc::new(unit)).unwrap();
 }
 
 struct Fixture {
@@ -332,7 +309,7 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
         for (row, (k, _)) in rows.iter().enumerate() {
             let mut cell = vec![
                 builder
-                    .add_expression(
+                    .add_root(
                         VALUES,
                         int64(false),
                         crate::test_constants::i64(
@@ -341,19 +318,21 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
                             *k,
                             options().constants,
                         ),
+                        RootScope::AllPorts,
                     )
                     .unwrap(),
             ];
             for list in 0..shape.lists {
                 cell.push(
                     builder
-                        .add_expression(
+                        .add_root(
                             VALUES,
                             list_type(),
                             ExprKind::Constant(ConstantReference {
                                 pool: ConstantPoolId::new(u32::try_from(list).unwrap()),
                                 ordinal: u32::try_from(row).unwrap(),
                             }),
+                            RootScope::AllPorts,
                         )
                         .unwrap(),
                 );
@@ -412,7 +391,18 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
                     ordinal: 0,
                 }),
             };
-            builder.add_expression(TABLE, list_type(), kind).unwrap()
+            builder
+                .add_root(
+                    TABLE,
+                    list_type(),
+                    kind,
+                    if shape.standalone {
+                        RootScope::AllPorts
+                    } else {
+                        RootScope::Port(0)
+                    },
+                )
+                .unwrap()
         })
         .collect::<Vec<_>>();
     let mut outputs = Vec::new();
@@ -466,6 +456,7 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
     builder
         .insert_node_unchecked(PhysicalNode {
             id: TABLE,
+            expressions: None,
             inputs,
             required_inputs,
             output_properties,
@@ -481,8 +472,11 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
             },
         })
         .unwrap();
+    for node in [VALUES, TABLE] {
+        install_pure_unit(&mut builder, node);
+    }
     let fragment = builder
-        .finish_definition(
+        .finish_structure(
             TABLE,
             FragmentSink::Result,
             PipelineDopDomain {
@@ -490,6 +484,8 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
                 max: 1,
                 requires_power_of_two: false,
             },
+            PlanLimits::FROZEN,
+            &Control,
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
@@ -501,7 +497,7 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
         .map(|(definition, request)| (*definition, request.clone()))
         .collect::<Vec<_>>();
     entries.push((
-        PhysicalCallDefinition::Relational(PhysicalCallSite::Table { node: TABLE }),
+        PhysicalCallSite::Table { node: TABLE },
         PhysicalCallRequest {
             arguments: function
                 .argument_types
@@ -535,57 +531,20 @@ fn package(
     function: &BoundTableFunction,
     request: &[FunctionArgument],
 ) -> Arc<FragmentPackage> {
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationRegionId::new(0);
-    let mut author = Author {
-        fragment: &fragment,
-        next_use: 0,
-        next_region: 2,
-        uses: Vec::new(),
-        domains: vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-    };
-    let mut bindings = Vec::new();
-    for (site, root) in roots.sites() {
-        bindings.push((*site, author.visit(root.expr, domain, root.demand)));
-    }
-    // The table call owns its own relational use and unguarded domain.
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(RELATIONAL_USE),
-        region: EvaluationRegionId::new(1),
-        demand: EvaluationDemand::Value,
-    };
-    let Author { uses, domains, .. } = author;
-    let mut domains = domains;
-    domains.push(ExpressionEvaluationRegion {
-        id: context.region,
-        parent: None,
-        guard: None,
-    });
-    let flow = ExpressionControlFlow::try_new(
-        domains,
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let root_uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
+    let context = RelationEffectContext::call(RelationCallId::new(RELATIONAL_CALL));
     let NodeKind::TableFunction { arguments, .. } = &fragment.nodes()[&TABLE].kind else {
         unreachable!()
     };
-    let argument_uses = (0..arguments.len())
-        .map(|argument| {
+    let argument_uses = arguments
+        .iter()
+        .map(|root| {
             Some(
-                root_uses.bindings()[&ExpressionRootSite {
-                    node: TABLE,
-                    role: ExpressionRootRole::TableFunctionArgument {
-                        argument: u32::try_from(argument).unwrap(),
-                    },
-                }],
+                fragment.nodes()[&TABLE]
+                    .expressions
+                    .as_ref()
+                    .unwrap()
+                    .root_use(*root)
+                    .unwrap(),
             )
         })
         .collect::<Vec<_>>();
@@ -599,7 +558,7 @@ fn package(
     let token = unnest_catalog()
         .prepare_fresh(
             CallEffectInput {
-                context,
+                context: context.into(),
                 argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
                     &argument_uses,
                 ),
@@ -614,11 +573,11 @@ fn package(
                 environment: &[],
                 parameters: &parameters,
                 decimal_overflow_policy: POLICY,
-                proof_scope: CallProofScope::Region(context.region),
+                proof_scope: CallProofScope::Relation(context.identity),
             },
             Arc::clone(&selection),
             PureCallPreparation::Table {
-                arguments: ScopedExpressionEffects::primitive(
+                arguments: ScopedRelationalEffects::primitive(
                     context,
                     ExpressionEffects::PURE_VALUE,
                 ),
@@ -626,22 +585,18 @@ fn package(
             &Control,
         )
         .unwrap_or_else(|error| panic!("fixture table call prepares: {error}"));
-    let calls = FrozenFragmentCalls::try_new(
-        &fragment,
-        &root_uses,
-        vec![FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: PhysicalCallSite::Table { node: TABLE },
-            context,
-            effects: token.call_contract().effects().clone(),
-            decimal_overflow_policy: POLICY,
-        }],
-        &Control,
-    )
-    .unwrap();
+    let fragment = fragment
+        .with_calls_observed(
+            vec![FrozenPhysicalCall {
+                materialized_writer_input: None,
+                site: PhysicalCallSite::Table { node: TABLE },
+                context,
+                effects: token.call_contract().effects().clone(),
+                decimal_overflow_policy: POLICY,
+            }],
+            &Control,
+        )
+        .unwrap();
     let output = fragment.nodes()[&fragment.root()].output.clone();
     let result = ResultPort {
         scalar_schema: None,
@@ -666,11 +621,10 @@ fn package(
         FragmentPackage::try_new(
             FragmentPackageInput {
                 constants,
+                statement_constant_policy: constant_policy(),
                 version: PlanVersionId::try_new([83; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                expression_uses: root_uses,
-                calls,
                 pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
@@ -732,22 +686,26 @@ fn root_slot(
     node: ProgramNodeId,
     expression: u32,
 ) -> Option<novarocks_types::SlotId> {
-    let site = ProgramExpressionRootSite::Node {
-        node,
-        role: ProgramNodeExpressionRole::ProjectOutput { expression },
+    let ProgramNodeKind::Project { input, exprs, .. } =
+        program.graph().nodes()[node.index()].kind()
+    else {
+        return None;
     };
-    let expressions = program.checked().channels().expressions();
-    let root = &expressions.resolved_calls().snapshot().roots().sites()[&site];
-    match program
-        .graph()
-        .expressions()
-        .node(root.definition)
-        .unwrap()
-        .kind()
-    {
-        StaticExprKind::SlotId(slot) => Some(*slot),
-        _ => None,
+    let reference = exprs.get(expression as usize)?;
+    let unit = program.unit(reference.unit)?;
+    let root = unit.root(reference.root)?;
+    if !matches!(
+        unit.definitions().node(root.definition)?.kind(),
+        novarocks_expression::StaticExprKind::Input
+    ) {
+        return None;
     }
+    let binding = unit.input(root.use_id)?;
+    program.graph().nodes()[input.index()]
+        .output_layout()
+        .slots()
+        .get(binding.ordinal as usize)
+        .copied()
 }
 
 #[test]
@@ -815,20 +773,8 @@ fn table_function_lowers_to_an_argument_project_and_a_local_table_function() {
         root_slot(&program, lowered.project, 1),
         Some(values_slots[1])
     );
-    // No expression root belongs to the table function itself.
-    let expressions = program.checked().channels().expressions();
-    assert!(
-        expressions
-            .resolved_calls()
-            .snapshot()
-            .roots()
-            .sites()
-            .keys()
-            .all(|site| !matches!(
-                site,
-                ProgramExpressionRootSite::Node { node, .. } if *node == lowered.table
-            ))
-    );
+    // Only the argument Project references scalar roots; the relation owns its cursor call.
+    assert!(program.units().iter().all(|unit| unit.calls().is_empty()));
     // The prepared call is the table function's own cursor lifecycle.
     let Some(ProgramStateTemplate::TableCursor { node, kernel }) =
         program.state_template(ProgramCallSite::Table {
@@ -840,7 +786,7 @@ fn table_function_lowers_to_an_argument_project_and_a_local_table_function() {
     assert_eq!(node, lowered.table);
     assert_eq!(kernel.contract().argument_types().len(), 1);
     assert_eq!(kernel.contract().result_types(), &[int64(true)]);
-    let channels = program.checked().channels();
+    let channels = program.channels();
     assert_eq!(
         channels.channel_type(ProgramChannelSite::TableResult {
             node: lowered.table,
@@ -889,7 +835,7 @@ fn left_outer_table_function_publishes_nullable_results_over_exact_relation_chan
             },
         ]
     );
-    let channels = program.checked().channels();
+    let channels = program.channels();
     let output = |ordinal| {
         channels
             .channel_type(ProgramChannelSite::Layout {
@@ -968,7 +914,7 @@ fn zipped_arguments_share_one_pass_through_read_and_map_reordered_results() {
         4,
         "each published occurrence is its own channel"
     );
-    let channels = program.checked().channels();
+    let channels = program.channels();
     for result in 0..2 {
         assert_eq!(
             channels.channel_type(ProgramChannelSite::TableResult {

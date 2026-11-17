@@ -39,29 +39,26 @@ use crate::{
     channels::{ChannelLoweringError, NodeChannels, ResolvedInput, UnionChannelBranch},
     expressions::ExpressionLoweringError,
     lowering::FragmentCompileError,
-    union_flow::UnionRoot,
 };
 use arrow_schema::DataType;
 use novarocks_functions::{
     CallEffectInput, EngineFunctionCatalog, FunctionBindingSelection, FunctionResultType,
     PureCallPreparation, PureCallSpecialization, PureEngineFunctionCatalog, PureKernelAbi,
-    ScopedExpressionEffects,
+    ScopedRelationalEffects,
 };
 use novarocks_local_program::{
     DiagnosticSourceNodeId, LocalOperatorId, LocalOperatorOrigin, LocalOperatorProvenance,
     MetricAggregation, OperatorMetricAggregation, ProgramCallSite, ProgramChannelLayoutRole,
-    ProgramChannelSite, ProgramExprId, ProgramExpressionRootSite, ProgramNode,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, ProgramRootUseBinding, StaticLayout,
+    ProgramChannelSite, ProgramNode, ProgramNodeId, ProgramNodeKind, ProgramRootRef, StaticLayout,
     TableFunctionOutputSlot,
 };
 use novarocks_physical_plan::{
-    BoundTableFunction, ExprId, ExpressionRootRole, ExpressionRootSite, Fragment, FragmentPackage,
-    FunctionArgumentType, NodeId, NodeKind, PhysicalCallDefinition, PhysicalCallSite, PhysicalNode,
-    TableFunctionOutput, ValueId,
+    BoundTableFunction, Fragment, FragmentPackage, FunctionArgumentType, NodeId, NodeKind,
+    PhysicalCallSite, PhysicalNode, TableFunctionOutput, ValueId,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, ExpressionEffects,
-    ExpressionUseId, FunctionKind, FunctionValueType, PureCompileControl,
+    FunctionKind, FunctionValueType, PureCompileControl,
 };
 use novarocks_types::SlotId;
 use std::{collections::BTreeMap, sync::Arc};
@@ -313,7 +310,6 @@ pub(crate) struct LoweredTableFunction {
     pub nodes: Vec<ProgramNode>,
     pub channels: Vec<(ProgramChannelSite, FunctionValueType)>,
     pub operators: Vec<LocalOperatorProvenance>,
-    pub pass_through_roots: Vec<UnionRoot>,
 }
 
 /// Lower one planned table function into its argument Project and the local
@@ -325,8 +321,8 @@ pub(crate) fn lower_table_function_with_creation<H>(
     planned: &PlannedTableFunction,
     published: &[SlotId],
     child: ProgramNodeId,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
-    pass_through_definitions: &[ProgramExprId],
+    expressions: &crate::expressions::RootMap,
+    pass_through_definitions: &[ProgramRootRef],
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<LoweredTableFunction, crate::FragmentCreationError<H>> {
@@ -351,8 +347,8 @@ fn lower_core_with_creation<H>(
     planned: &PlannedTableFunction,
     published: &[SlotId],
     child: ProgramNodeId,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
-    pass_through_definitions: &[ProgramExprId],
+    expressions: &crate::expressions::RootMap,
+    pass_through_definitions: &[ProgramRootRef],
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<LoweredTableFunction, crate::FragmentCreationError<H>> {
@@ -387,13 +383,7 @@ fn lower_core_with_creation<H>(
     let mut project_types = Vec::new();
     reserve_vec(&mut exprs, planned.project_slots.len(), work)?;
     reserve_vec(&mut project_types, planned.project_slots.len(), work)?;
-    let mut pass_through_roots = Vec::new();
-    reserve_vec(&mut pass_through_roots, pass, work)?;
-    for (ordinal, ((value, input), &definition)) in planned
-        .pass_through
-        .iter()
-        .zip(pass_through_definitions)
-        .enumerate()
+    for ((value, _input), &definition) in planned.pass_through.iter().zip(pass_through_definitions)
     {
         let ty = fragment
             .values()
@@ -405,24 +395,12 @@ fn lower_core_with_creation<H>(
             .clone();
         exprs.push(definition);
         project_types.push(ty);
-        pass_through_roots.push(UnionRoot {
-            node: planned.project,
-            ordinal: u32::try_from(ordinal).map_err(|_| CompileControlError::ResourceExhausted)?,
-            definition,
-            source: input.source,
-        });
         work.step()?;
     }
     let mut param_types = Vec::new();
     reserve_vec(&mut param_types, arguments.len(), work)?;
     for (argument, bound) in arguments.iter().zip(function.argument_types.iter()) {
-        let definition =
-            fragment
-                .expressions()
-                .get(*argument)
-                .ok_or(FragmentCompileError::Invalid(
-                    "missing table function argument definition",
-                ))?;
+        let definition = crate::expressions::bound_root(package, node.id, *argument)?;
         let FunctionArgumentType::Value(bound) = bound else {
             return Err((FragmentCompileError::Unsupported {
                 node: Some(node.id),
@@ -614,7 +592,6 @@ fn lower_core_with_creation<H>(
         nodes,
         channels,
         operators,
-        pass_through_roots,
     })
 }
 
@@ -676,28 +653,6 @@ fn layout_with_creation<H>(
 
 /// A `TableFunctionArgument` root belongs to the argument Project, after the
 /// pass-through reads.
-pub(crate) fn argument_root(
-    planned: &BTreeMap<NodeId, PlannedTableFunction>,
-    node: NodeId,
-    argument: u32,
-    use_id: ExpressionUseId,
-) -> Result<ProgramRootUseBinding, FragmentCompileError> {
-    let planned = planned.get(&node).ok_or(FragmentCompileError::Invalid(
-        "table function argument root outside a table function",
-    ))?;
-    let expression = u32::try_from(planned.pass_through.len())
-        .ok()
-        .and_then(|pass| pass.checked_add(argument))
-        .ok_or(CompileControlError::ResourceExhausted)?;
-    Ok(ProgramRootUseBinding {
-        site: ProgramExpressionRootSite::Node {
-            node: planned.project,
-            role: ProgramNodeExpressionRole::ProjectOutput { expression },
-        },
-        use_id,
-    })
-}
-
 /// Prepare every frozen table call of the fragment through its exact
 /// installed owner. `effects` holds the prepared effects of every expression
 /// occurrence, so each argument root contributes its actual effects; `nodes`
@@ -705,7 +660,7 @@ pub(crate) fn argument_root(
 pub(crate) fn prepare_table_calls<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
-    effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    effects: &crate::expressions::LoweredExpressions,
     nodes: &BTreeMap<NodeId, ProgramNodeId>,
     tokens: &mut BTreeMap<ProgramCallSite, PureCallSpecialization>,
     work: &mut CompileCheckpoints<'_>,
@@ -752,7 +707,7 @@ pub(crate) fn prepare_table_calls<H, F: novarocks_type_contract::ValueSchemaCrea
 fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
-    effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    effects: &crate::expressions::LoweredExpressions,
     node: &PhysicalNode,
     work: &mut CompileCheckpoints<'_>,
     creation: crate::expressions::CallCreation<'_, F>,
@@ -776,10 +731,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         .ok_or(ExpressionLoweringError::Invalid(
             "missing frozen table call",
         ))?;
-    let source_request = package
-        .fragment()
-        .call_requests()
-        .get(PhysicalCallDefinition::Relational(site));
+    let source_request = package.fragment().call_requests().get(site);
     work.step()?;
     let source_request = source_request.ok_or(ExpressionLoweringError::Invalid(
         "missing original table call request",
@@ -809,25 +761,30 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         creation,
     )?;
     work.flush()?;
-    let roots = package.expression_uses();
-    let flow = roots.flow();
     // Each argument root is an independent unguarded Value occurrence whose
     // definition is the call's ordered argument.
     let mut argument_uses = Vec::new();
     reserve_vec(&mut argument_uses, arguments.len(), work)?;
     let mut children = ExpressionEffects::PURE_VALUE;
-    for (argument, &definition) in arguments.iter().enumerate() {
-        let argument = u32::try_from(argument)
-            .map_err(|_| ExpressionLoweringError::Invalid("table argument ordinal exhausted"))?;
-        let root = ExpressionRootSite {
-            node: node.id,
-            role: ExpressionRootRole::TableFunctionArgument { argument },
-        };
-        let use_id = *roots
-            .bindings()
-            .get(&root)
+    for &definition in arguments.iter() {
+        let unit = node
+            .expressions
+            .as_ref()
+            .ok_or(ExpressionLoweringError::Invalid(
+                "table node has no expression unit",
+            ))?;
+        let compiled = effects.unit(node.id)?;
+        let flow = unit.control_flow();
+
+        let use_id = unit
+            .root_use(definition)
             .ok_or(ExpressionLoweringError::Invalid(
                 "table argument root has no actual use",
+            ))?;
+        let root = unit
+            .root(definition)
+            .ok_or(ExpressionLoweringError::Invalid(
+                "table argument root is absent",
             ))?;
         let invocation = flow
             .uses()
@@ -837,7 +794,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             ))?;
         let domain = flow.regions().get(&invocation.context.region);
         work.step()?;
-        let exact = invocation.definition == definition
+        let exact = invocation.definition == root.definition
             && invocation.context.use_id == use_id
             && invocation.context.demand == EvaluationDemand::Value
             && domain.is_some_and(|domain| domain.parent.is_none() && domain.guard.is_none());
@@ -847,7 +804,8 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             )
             .into());
         }
-        let summary = effects
+        let summary = compiled
+            .effects()
             .get(&use_id)
             .ok_or(ExpressionLoweringError::Invalid(
                 "table argument effects were not prepared",
@@ -858,7 +816,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     }
     work.flush()?;
     let input = CallEffectInput {
-        context: frozen.context,
+        context: frozen.context.into(),
         argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
         function_id: &function.function_id,
         kind: FunctionKind::Table,
@@ -875,7 +833,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         Arc::clone(&selection),
         &frozen.effects,
         PureCallPreparation::Table {
-            arguments: ScopedExpressionEffects::primitive(frozen.context, children),
+            arguments: ScopedRelationalEffects::primitive(frozen.context, children),
         },
         work.control(),
         creation,

@@ -28,7 +28,8 @@ use novarocks_type_contract::{
 };
 use novarocks_types::SlotId;
 
-use crate::{ImmutableExpressions, ProgramExprId, StaticLayout};
+use crate::{ProgramRootRef, StaticLayout};
+use novarocks_expression::CompiledExprSet;
 
 /// Output semantics survive local compilation independently of destination
 /// addresses and provider execution capabilities.
@@ -166,7 +167,7 @@ pub(crate) fn validate_summary_layout_core<E: From<StaticSinkError>>(
 pub enum StaticStreamRouting {
     Ordinary,
     HierarchicalHashV1,
-    ConditionalKeyV1 { applies: ProgramExprId },
+    ConditionalKeyV1 { applies: ProgramRootRef },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,7 +244,7 @@ pub struct StaticStreamBranch {
     contract: StaticStreamContract,
     dest_node_id: i32,
     partition_type: DataStreamPartitionType,
-    partition_exprs: Arc<[ProgramExprId]>,
+    partition_exprs: Arc<[ProgramRootRef]>,
     output_columns: Arc<[SlotId]>,
     limit: Option<i64>,
 }
@@ -252,7 +253,7 @@ impl StaticStreamBranch {
     pub fn try_new(
         dest_node_id: i32,
         partition_type: DataStreamPartitionType,
-        partition_exprs: Vec<ProgramExprId>,
+        partition_exprs: Vec<ProgramRootRef>,
         output_columns: Vec<SlotId>,
         limit: Option<i64>,
         contract: StaticStreamContract,
@@ -314,7 +315,7 @@ impl StaticStreamBranch {
     pub const fn partition_type(&self) -> DataStreamPartitionType {
         self.partition_type
     }
-    pub fn partition_exprs(&self) -> &[ProgramExprId] {
+    pub fn partition_exprs(&self) -> &[ProgramRootRef] {
         &self.partition_exprs
     }
     pub fn output_columns(&self) -> &[SlotId] {
@@ -325,8 +326,7 @@ impl StaticStreamBranch {
     }
 }
 
-/// One immutable arena per stream sink. Multicast and split branches share
-/// that arena, preserving exact expression IDs without per-branch duplication.
+/// Frozen provider layout preference, independent of expression compilation.
 #[derive(Clone, Debug)]
 pub enum ProgramWriteLayoutPreference {
     None,
@@ -348,29 +348,25 @@ pub enum StaticSinkProgram {
     Noop,
     DataStream {
         branch: StaticStreamBranch,
-        arena: Arc<ImmutableExpressions>,
     },
     MultiCastDataStream {
         branches: Arc<[StaticStreamBranch]>,
-        arena: Arc<ImmutableExpressions>,
     },
     ChangeStreamRouter {
         branches: Arc<[StaticStreamBranch]>,
-        arena: Arc<ImmutableExpressions>,
         effect_slot: SlotId,
         routes: Arc<[StaticRouterRoute]>,
     },
     SplitDataStream {
         branches: Arc<[StaticStreamBranch]>,
-        split_exprs: Arc<[ProgramExprId]>,
-        arena: Arc<ImmutableExpressions>,
+        split_exprs: Arc<[ProgramRootRef]>,
         fanout: bool,
     },
 }
 
 impl StaticSinkProgram {
-    pub fn validate(&self) -> Result<(), StaticSinkError> {
-        self.validate_core(&mut || Ok::<(), StaticSinkError>(()))
+    pub fn validate(&self, units: &[Arc<CompiledExprSet>]) -> Result<(), StaticSinkError> {
+        self.validate_core(units, &mut || Ok::<(), StaticSinkError>(()))
     }
 
     /// Observe the actual branch/reference validation with the original request
@@ -378,10 +374,13 @@ impl StaticSinkProgram {
     /// establish allocation authorization or cooperative library expansion.
     pub fn validate_for_compile(
         &self,
+        units: &[Arc<CompiledExprSet>],
         control: &dyn PureCompileControl,
     ) -> Result<(), SinkCompileError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-        let result = self.validate_core(&mut || work.step().map_err(SinkCompileError::Control));
+        let result = self.validate_core(units, &mut || {
+            work.step().map_err(SinkCompileError::Control)
+        });
         if matches!(&result, Err(SinkCompileError::Control(_))) {
             return result;
         }
@@ -389,79 +388,73 @@ impl StaticSinkProgram {
         result
     }
 
-    fn validate_core<E: From<StaticSinkError>>(
+    pub(crate) fn validate_core<E: From<StaticSinkError>>(
         &self,
+        units: &[Arc<CompiledExprSet>],
         observe: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<(), E> {
         match self {
             Self::Result | Self::RootResult(_) | Self::Noop => Ok(()),
-            Self::DataStream { branch, arena } => validate_branch_core(branch, arena, observe),
-            Self::MultiCastDataStream { branches, arena } => {
-                validate_branches_core(branches, arena, observe)
+            Self::DataStream { branch } => validate_branch_core(branch, units, observe),
+            Self::MultiCastDataStream { branches } => {
+                validate_branches_core(branches, units, observe)
             }
             Self::ChangeStreamRouter {
-                branches,
-                arena,
-                routes,
-                ..
-            } => validate_router_core(branches, arena, routes, observe),
+                branches, routes, ..
+            } => validate_router_core(branches, units, routes, observe),
             Self::SplitDataStream {
                 branches,
                 split_exprs,
-                arena,
                 ..
-            } => validate_split_core(branches, split_exprs, arena, observe),
+            } => validate_split_core(branches, split_exprs, units, observe),
         }
     }
 
     pub fn try_data_stream(
         branch: StaticStreamBranch,
-        arena: Arc<ImmutableExpressions>,
+        units: &[Arc<CompiledExprSet>],
     ) -> Result<Self, StaticSinkError> {
-        validate_branch(&branch, &arena)?;
-        Ok(Self::DataStream { branch, arena })
+        validate_branch(&branch, units)?;
+        Ok(Self::DataStream { branch })
     }
 
     pub fn try_multicast(
         branches: Vec<StaticStreamBranch>,
-        arena: Arc<ImmutableExpressions>,
+        units: &[Arc<CompiledExprSet>],
     ) -> Result<Self, StaticSinkError> {
-        validate_branches(&branches, &arena)?;
+        validate_branches(&branches, units)?;
         Ok(Self::MultiCastDataStream {
             branches: Arc::from(branches),
-            arena,
         })
     }
 
     pub fn try_split(
         branches: Vec<StaticStreamBranch>,
-        split_exprs: Vec<ProgramExprId>,
-        arena: Arc<ImmutableExpressions>,
+        split_exprs: Vec<ProgramRootRef>,
+        units: &[Arc<CompiledExprSet>],
         fanout: bool,
     ) -> Result<Self, StaticSinkError> {
-        validate_split_core(&branches, &split_exprs, &arena, &mut || {
+        validate_split_core(&branches, &split_exprs, units, &mut || {
             Ok::<(), StaticSinkError>(())
         })?;
         Ok(Self::SplitDataStream {
             branches: Arc::from(branches),
             split_exprs: Arc::from(split_exprs),
-            arena,
             fanout,
         })
     }
 
     pub fn try_change_stream_router(
         branches: Vec<StaticStreamBranch>,
-        arena: Arc<ImmutableExpressions>,
+        units: &[Arc<CompiledExprSet>],
         effect_slot: SlotId,
         routes: Vec<StaticRouterRoute>,
     ) -> Result<Self, StaticSinkError> {
-        validate_router_core(&branches, &arena, &routes, &mut || {
+        validate_router_core(&branches, units, &routes, &mut || {
             Ok::<(), StaticSinkError>(())
         })?;
         Ok(Self::ChangeStreamRouter {
             branches: Arc::from(branches),
-            arena,
             effect_slot,
             routes: Arc::from(routes),
         })
@@ -477,17 +470,7 @@ impl StaticSinkProgram {
         }
     }
 
-    pub fn arena(&self) -> Option<&Arc<ImmutableExpressions>> {
-        match self {
-            Self::DataStream { arena, .. }
-            | Self::MultiCastDataStream { arena, .. }
-            | Self::SplitDataStream { arena, .. }
-            | Self::ChangeStreamRouter { arena, .. } => Some(arena),
-            Self::Result | Self::RootResult(_) | Self::Noop => None,
-        }
-    }
-
-    pub fn split_exprs(&self) -> &[ProgramExprId] {
+    pub fn split_exprs(&self) -> &[ProgramRootRef] {
         match self {
             Self::SplitDataStream { split_exprs, .. } => split_exprs,
             _ => &[],
@@ -501,11 +484,11 @@ impl StaticSinkProgram {
 
 fn validate_router_core<E: From<StaticSinkError>>(
     branches: &[StaticStreamBranch],
-    arena: &ImmutableExpressions,
+    units: &[Arc<CompiledExprSet>],
     routes: &[StaticRouterRoute],
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
-    validate_branches_core(branches, arena, observe)?;
+    validate_branches_core(branches, units, observe)?;
     observe()?;
     if routes.is_empty() || routes.len() != branches.len() {
         return Err(StaticSinkError::InvalidRouter.into());
@@ -576,13 +559,13 @@ fn validate_router_core<E: From<StaticSinkError>>(
 
 fn validate_branches(
     branches: &[StaticStreamBranch],
-    arena: &ImmutableExpressions,
+    units: &[Arc<CompiledExprSet>],
 ) -> Result<(), StaticSinkError> {
-    validate_branches_core(branches, arena, &mut || Ok::<(), StaticSinkError>(()))
+    validate_branches_core(branches, units, &mut || Ok::<(), StaticSinkError>(()))
 }
 fn validate_branches_core<E: From<StaticSinkError>>(
     branches: &[StaticStreamBranch],
-    arena: &ImmutableExpressions,
+    units: &[Arc<CompiledExprSet>],
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
     let empty = branches.is_empty();
@@ -596,7 +579,7 @@ fn validate_branches_core<E: From<StaticSinkError>>(
         return Err(StaticSinkError::TooManyBranches.into());
     }
     for branch in branches {
-        validate_branch_core(branch, arena, observe)?;
+        validate_branch_core(branch, units, observe)?;
         // The branch's checked reference walk is now complete.
         observe()?;
     }
@@ -604,26 +587,34 @@ fn validate_branches_core<E: From<StaticSinkError>>(
 }
 fn validate_branch(
     branch: &StaticStreamBranch,
-    arena: &ImmutableExpressions,
+    units: &[Arc<CompiledExprSet>],
 ) -> Result<(), StaticSinkError> {
-    validate_branch_core(branch, arena, &mut || Ok::<(), StaticSinkError>(()))
+    validate_branch_core(branch, units, &mut || Ok::<(), StaticSinkError>(()))
 }
 fn validate_branch_core<E: From<StaticSinkError>>(
     branch: &StaticStreamBranch,
-    arena: &ImmutableExpressions,
+    units: &[Arc<CompiledExprSet>],
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
     if let StaticStreamRouting::ConditionalKeyV1 { applies } = branch.contract.routing {
-        let valid = arena
-            .node(applies)
-            .is_some_and(|node| node.data_type() == &arrow_schema::DataType::Boolean);
+        let valid = crate::unit_refs::root_type(units, applies)
+            .is_some_and(|node| node.data_type() == &arrow_schema::DataType::Boolean)
+            && crate::unit_refs::root_has_demand(
+                units,
+                applies,
+                novarocks_type_contract::EvaluationDemand::TruthOnly,
+            );
         observe()?;
         if !valid {
             return Err(StaticSinkError::InvalidExpression.into());
         }
     }
     for id in branch.partition_exprs.iter() {
-        let valid = arena.node(*id).is_some_and(|node| {
+        let valid = crate::unit_refs::root_has_demand(
+            units,
+            *id,
+            novarocks_type_contract::EvaluationDemand::Value,
+        ) && crate::unit_refs::root_type(units, *id).is_some_and(|node| {
             matches!(branch.contract.routing, StaticStreamRouting::Ordinary)
                 || novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
                     .supports_partition_key(node.data_type())
@@ -637,18 +628,18 @@ fn validate_branch_core<E: From<StaticSinkError>>(
 }
 fn validate_split_core<E: From<StaticSinkError>>(
     branches: &[StaticStreamBranch],
-    split_exprs: &[ProgramExprId],
-    arena: &ImmutableExpressions,
+    split_exprs: &[ProgramRootRef],
+    units: &[Arc<CompiledExprSet>],
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
-    validate_branches_core(branches, arena, observe)?;
+    validate_branches_core(branches, units, observe)?;
     let arity_matches = branches.len() == split_exprs.len();
     observe()?;
     if !arity_matches {
         return Err(StaticSinkError::SplitArityMismatch.into());
     }
     for id in split_exprs {
-        let valid = arena.node(*id).is_some();
+        let valid = crate::unit_refs::root_type(units, *id).is_some();
         observe()?;
         if !valid {
             return Err(StaticSinkError::InvalidExpression.into());
@@ -663,25 +654,35 @@ mod tests {
     use arrow_schema::DataType;
 
     use super::*;
-    use crate::{StaticExprKind, StaticExprNode};
+    use novarocks_type_contract::EvaluationDemand;
 
-    fn arena() -> Arc<ImmutableExpressions> {
-        Arc::new(
-            crate::test_support::arena(vec![StaticExprNode::new_value_typed(
-                StaticExprKind::SlotId(SlotId::new(1)),
-                novarocks_functions::FunctionValueType::new(DataType::Int64, false),
-            )])
-            .unwrap(),
+    fn fixture_units() -> Vec<Arc<CompiledExprSet>> {
+        let layout = StaticLayout::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "v",
+                DataType::Int64,
+                false,
+            )])),
+            Arc::from([SlotId::new(1)]),
         )
+        .unwrap();
+        vec![crate::test_support::read_unit(
+            &layout,
+            &[(
+                novarocks_expression_contract::ValueId::new(1),
+                novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+            )],
+            &[(0, EvaluationDemand::Value)],
+        )]
     }
 
     #[test]
     fn exact_stream_and_split_semantics_share_one_pure_arena() {
-        let arena = arena();
+        let units = fixture_units();
         let branch = StaticStreamBranch::try_new(
             9,
             DataStreamPartitionType::HashPartitioned,
-            vec![ProgramExprId::new(0)],
+            vec![crate::test_support::root(0, 0)],
             vec![SlotId::new(1)],
             Some(7),
             crate::StaticStreamContract {
@@ -693,12 +694,12 @@ mod tests {
         .unwrap();
         let split = StaticSinkProgram::try_split(
             vec![branch.clone(), branch],
-            vec![ProgramExprId::new(0); 2],
-            Arc::clone(&arena),
+            vec![crate::test_support::root(0, 0); 2],
+            &units,
             true,
         )
         .unwrap();
-        assert!(Arc::ptr_eq(split.arena().unwrap(), &arena));
+        assert_eq!(split.split_exprs(), &[crate::test_support::root(0, 0); 2]);
         assert_eq!(split.branches().len(), 2);
         assert_eq!(split.branches()[0].limit(), Some(7));
         assert!(split.fanout());
@@ -706,7 +707,7 @@ mod tests {
 
     #[test]
     fn invalid_branch_and_split_fail_before_runtime_binding() {
-        let arena = arena();
+        let units = fixture_units();
         let duplicate = StaticStreamBranch::try_new(
             9,
             DataStreamPartitionType::Random,
@@ -726,7 +727,7 @@ mod tests {
         let branch = StaticStreamBranch::try_new(
             9,
             DataStreamPartitionType::HashPartitioned,
-            vec![ProgramExprId::new(0)],
+            vec![crate::test_support::root(0, 0)],
             vec![SlotId::new(1)],
             None,
             crate::StaticStreamContract {
@@ -737,11 +738,11 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            StaticSinkProgram::try_split(vec![branch.clone()], vec![], Arc::clone(&arena), false),
+            StaticSinkProgram::try_split(vec![branch.clone()], vec![], &units, false),
             Err(StaticSinkError::SplitArityMismatch)
         ));
         assert!(matches!(
-            StaticSinkProgram::try_multicast(vec![], Arc::clone(&arena)),
+            StaticSinkProgram::try_multicast(vec![], &units),
             Err(StaticSinkError::EmptyBranches)
         ));
         assert!(matches!(
@@ -749,7 +750,7 @@ mod tests {
                 StaticStreamBranch::try_new(
                     9,
                     DataStreamPartitionType::HashPartitioned,
-                    vec![ProgramExprId::new(2)],
+                    vec![crate::test_support::root(0, 2)],
                     vec![],
                     None,
                     crate::StaticStreamContract {
@@ -760,7 +761,7 @@ mod tests {
                     }
                 )
                 .unwrap(),
-                arena
+                &units
             ),
             Err(StaticSinkError::InvalidExpression)
         ));
@@ -795,7 +796,7 @@ mod tests {
             Ok(())
         }
     }
-    fn branch(expressions: Vec<ProgramExprId>) -> StaticStreamBranch {
+    fn branch(expressions: Vec<ProgramRootRef>) -> StaticStreamBranch {
         StaticStreamBranch::try_new(
             9,
             DataStreamPartitionType::HashPartitioned,
@@ -819,13 +820,14 @@ mod tests {
     }
     fn assert_refusal_at_each_checkpoint(sink: &StaticSinkProgram) -> Vec<u32> {
         let baseline = Control::new(None);
-        sink.validate_for_compile(&baseline).unwrap();
+        sink.validate_for_compile(&fixture_units(), &baseline)
+            .unwrap();
         let trace = baseline.trace();
         for at in 0..trace.len() {
             for cause in all_causes() {
                 let control = Control::new(Some((at, cause.clone())));
                 assert_eq!(
-                    sink.validate_for_compile(&control),
+                    sink.validate_for_compile(&fixture_units(), &control),
                     Err(SinkCompileError::Control(cause))
                 );
                 assert_eq!(
@@ -840,20 +842,22 @@ mod tests {
 
     #[test]
     fn compile_partition_reference_walk_observes_actual_quantum_and_tail() {
-        let sink =
-            StaticSinkProgram::try_data_stream(branch(vec![ProgramExprId::new(0); 320]), arena())
-                .unwrap();
+        let sink = StaticSinkProgram::try_data_stream(
+            branch(vec![crate::test_support::root(0, 0); 320]),
+            &fixture_units(),
+        )
+        .unwrap();
         let trace = assert_refusal_at_each_checkpoint(&sink);
         assert_eq!(trace, [0, 256, 64]);
-        sink.validate().unwrap();
+        sink.validate(&fixture_units()).unwrap();
     }
 
     #[test]
     fn compile_branch_and_split_walks_use_one_original_control_scope() {
         let sink = StaticSinkProgram::try_split(
             vec![branch(Vec::new()); 320],
-            vec![ProgramExprId::new(0); 320],
-            arena(),
+            vec![crate::test_support::root(0, 0); 320],
+            &fixture_units(),
             true,
         )
         .unwrap();
@@ -872,12 +876,13 @@ mod tests {
     #[test]
     fn compile_noop_and_result_keep_empty_success_and_observe_entry_finish() {
         for sink in [StaticSinkProgram::Noop, StaticSinkProgram::Result] {
-            sink.validate().unwrap();
+            sink.validate(&fixture_units()).unwrap();
             assert_eq!(assert_refusal_at_each_checkpoint(&sink), [0, 0]);
-            assert!(sink.arena().is_none());
+            assert!(sink.split_exprs().is_empty());
             assert!(sink.branches().is_empty());
         }
-        let sink = StaticSinkProgram::try_data_stream(branch(Vec::new()), arena()).unwrap();
+        let sink =
+            StaticSinkProgram::try_data_stream(branch(Vec::new()), &fixture_units()).unwrap();
         assert_eq!(assert_refusal_at_each_checkpoint(&sink), [0, 0]);
     }
 
@@ -887,7 +892,6 @@ mod tests {
             (
                 StaticSinkProgram::MultiCastDataStream {
                     branches: Arc::from([]),
-                    arena: arena(),
                 },
                 StaticSinkError::EmptyBranches,
                 1,
@@ -896,7 +900,6 @@ mod tests {
                 StaticSinkProgram::SplitDataStream {
                     branches: Arc::from([branch(Vec::new())]),
                     split_exprs: Arc::from([]),
-                    arena: arena(),
                     fanout: false,
                 },
                 StaticSinkError::SplitArityMismatch,
@@ -904,25 +907,24 @@ mod tests {
             ),
             (
                 StaticSinkProgram::DataStream {
-                    branch: branch(vec![ProgramExprId::new(1)]),
-                    arena: arena(),
+                    branch: branch(vec![crate::test_support::root(0, 1)]),
                 },
                 StaticSinkError::InvalidExpression,
                 1,
             ),
         ];
         for (sink, expected, units) in cases {
-            assert_eq!(sink.validate(), Err(expected));
+            assert_eq!(sink.validate(&fixture_units()), Err(expected));
             let control = Control::new(None);
             assert_eq!(
-                sink.validate_for_compile(&control),
+                sink.validate_for_compile(&fixture_units(), &control),
                 Err(SinkCompileError::Sink(expected))
             );
             assert_eq!(control.trace(), [0, units]);
             for cause in all_causes() {
                 let control = Control::new(Some((1, cause.clone())));
                 assert_eq!(
-                    sink.validate_for_compile(&control),
+                    sink.validate_for_compile(&fixture_units(), &control),
                     Err(SinkCompileError::Control(cause))
                 );
                 assert_eq!(control.trace(), [0, units]);
@@ -932,11 +934,11 @@ mod tests {
 
     #[test]
     fn compile_preserves_original_branch_limit_and_shared_arena_contract() {
-        let source = arena();
+        let source = fixture_units();
         let branch = StaticStreamBranch::try_new(
             7,
             DataStreamPartitionType::HashPartitioned,
-            vec![ProgramExprId::new(0)],
+            vec![crate::test_support::root(0, 0)],
             vec![SlotId::new(9), SlotId::new(3)],
             Some(-1),
             crate::StaticStreamContract {
@@ -946,11 +948,17 @@ mod tests {
             },
         )
         .unwrap();
-        let sink =
-            StaticSinkProgram::try_multicast(vec![branch.clone(), branch], source.clone()).unwrap();
-        sink.validate_for_compile(&Control::new(None)).unwrap();
-        sink.validate().unwrap();
-        assert!(Arc::ptr_eq(sink.arena().unwrap(), &source));
+        let sink = StaticSinkProgram::try_multicast(vec![branch.clone(), branch], &source).unwrap();
+        sink.validate_for_compile(&fixture_units(), &Control::new(None))
+            .unwrap();
+        sink.validate(&fixture_units()).unwrap();
+        assert!(
+            sink.branches()
+                .iter()
+                .flat_map(|branch| branch.partition_exprs())
+                .all(|reference| reference.unit == crate::ProgramUnitId::new(0))
+        );
+        assert_eq!(source.len(), 1);
         assert_eq!(
             sink.branches()[0].output_columns(),
             [SlotId::new(9), SlotId::new(3)]
@@ -958,16 +966,18 @@ mod tests {
         assert_eq!(sink.branches()[0].limit(), Some(-1));
         let max = StaticSinkProgram::MultiCastDataStream {
             branches: vec![branch_empty(); MAX_STATIC_SINK_BRANCHES].into(),
-            arena: source.clone(),
         };
-        max.validate_for_compile(&Control::new(None)).unwrap();
+        max.validate_for_compile(&source, &Control::new(None))
+            .unwrap();
         let over = StaticSinkProgram::MultiCastDataStream {
             branches: vec![branch_empty(); MAX_STATIC_SINK_BRANCHES + 1].into(),
-            arena: source,
         };
-        assert_eq!(over.validate(), Err(StaticSinkError::TooManyBranches));
         assert_eq!(
-            over.validate_for_compile(&Control::new(None)),
+            over.validate(&source),
+            Err(StaticSinkError::TooManyBranches)
+        );
+        assert_eq!(
+            over.validate_for_compile(&source, &Control::new(None)),
             Err(SinkCompileError::Sink(StaticSinkError::TooManyBranches))
         );
     }
@@ -1063,7 +1073,7 @@ mod router_contract_tests {
     }
     fn fixture() -> (
         Vec<StaticStreamBranch>,
-        Arc<ImmutableExpressions>,
+        Vec<Arc<CompiledExprSet>>,
         Vec<StaticRouterRoute>,
     ) {
         let branches = vec![branch(
@@ -1073,20 +1083,20 @@ mod router_contract_tests {
                 target: WriteTargetOrdinal::try_new(0).unwrap(),
             },
         )];
-        let arena = Arc::new(crate::test_support::arena(vec![]).unwrap());
+        let units: Vec<Arc<CompiledExprSet>> = Vec::new();
         let routes = vec![StaticRouterRoute {
             layout: crate::ProgramWriteLayoutPreference::None,
             branch: 0,
             accepted_effects: Arc::from([ConnectorRowMutationEffect::Insert]),
         }];
-        (branches, arena, routes)
+        (branches, units, routes)
     }
     #[test]
     fn router_owns_only_provider_branches_and_does_not_imply_a_summary() {
-        let (branches, arena, routes) = fixture();
+        let (branches, units, routes) = fixture();
         let sink = StaticSinkProgram::try_change_stream_router(
             branches.clone(),
-            arena.clone(),
+            &units,
             SlotId::new(1),
             routes.clone(),
         )
@@ -1095,15 +1105,20 @@ mod router_contract_tests {
         let mut duplicate = routes;
         duplicate.push(duplicate[0].clone());
         assert!(
-            StaticSinkProgram::try_change_stream_router(branches, arena, SlotId::new(1), duplicate)
-                .is_err()
+            StaticSinkProgram::try_change_stream_router(
+                branches,
+                &units,
+                SlotId::new(1),
+                duplicate
+            )
+            .is_err()
         );
     }
     #[test]
     fn repeated_router_target_requires_the_same_position_contribution_group() {
         use novarocks_connector_contract::ConnectorMutationContributionGroupId;
 
-        let (_, arena, mut routes) = fixture();
+        let (_, units, mut routes) = fixture();
         routes.push(StaticRouterRoute {
             layout: crate::ProgramWriteLayoutPreference::None,
             branch: 1,
@@ -1130,7 +1145,7 @@ mod router_contract_tests {
             assert_eq!(
                 StaticSinkProgram::try_change_stream_router(
                     branches,
-                    arena.clone(),
+                    &units,
                     SlotId::new(1),
                     routes.clone(),
                 )
@@ -1150,12 +1165,12 @@ mod router_contract_tests {
             vec![SlotId::new(10)],
         ] {
             let valid = keys == vec![SlotId::new(2)];
-            let (branches, arena, mut routes) = fixture();
+            let (branches, units, mut routes) = fixture();
             routes[0].layout = ProgramWriteLayoutPreference::ClusterBy(Arc::from(keys));
             assert_eq!(
                 StaticSinkProgram::try_change_stream_router(
                     branches,
-                    arena,
+                    &units,
                     SlotId::new(1),
                     routes
                 )

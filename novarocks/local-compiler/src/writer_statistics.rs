@@ -42,13 +42,13 @@ use novarocks_functions::{
     PureEngineFunctionCatalog, ResolvedAggregateSignature,
 };
 use novarocks_local_program::{
-    ProgramCallSite, ProgramChannelSite, ProgramExprId, ProgramNodeId, UnpivotConstant,
-    WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
-    WriterGroupedUnpivotPlan, WriterPartialAggregateCall,
+    ProgramCallSite, ProgramChannelSite, ProgramNodeId, UnpivotConstant, WriterFinalAggregateCall,
+    WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
+    WriterPartialAggregateCall,
 };
 use novarocks_physical_plan::{
-    AggregateBinding, AggregatePhase, ConstantReferenceError, ExprId, ExprKind, FragmentPackage,
-    FunctionArgumentType, NodeId, NodeKind, PhysicalCallDefinition, PhysicalCallSite, PhysicalNode,
+    AggregateBinding, AggregatePhase, ConstantReferenceError, FragmentPackage,
+    FunctionArgumentType, NodeId, NodeKind, PhysicalCallSite, PhysicalNode,
     UnpivotConstant as SourceConstant, ValueId, WriterAggregateCall, WriterFinishSpec,
     WriterRelationFieldRole, WriterRelationSchema, WriterTarget,
 };
@@ -371,10 +371,11 @@ pub(crate) fn lower_partial_calls<H>(
 /// output followed by one final output per call.
 pub(crate) struct FinishStatisticsChannels<'a> {
     pub node: ProgramNodeId,
+    pub physical: NodeId,
     pub input_slots: &'a [SlotId],
     pub root_slots: &'a [SlotId],
     pub statistics_slots: &'a [SlotId],
-    pub expressions: &'a BTreeMap<ExprId, ProgramExprId>,
+    pub expressions: &'a crate::expressions::RootMap,
 }
 
 pub(crate) struct LoweredFinishStatistics {
@@ -544,6 +545,7 @@ pub(crate) fn lower_finish_statistics<H>(
         for (constant, output) in mapping.constants.iter().zip(unpivot.literal_outputs.iter()) {
             constants.push(lower_constant(
                 package,
+                channels.physical,
                 constant,
                 value_type(*output)?,
                 channels.expressions,
@@ -633,23 +635,20 @@ fn collection_domain(
 /// constant pools.
 fn lower_constant(
     package: &FragmentPackage,
+    node: NodeId,
     constant: &SourceConstant,
     output: &FunctionValueType,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<UnpivotConstant, FragmentCompileError> {
     match constant {
         SourceConstant::Scalar(id) => {
-            let definition =
-                package
-                    .fragment()
-                    .expressions()
-                    .get(*id)
-                    .ok_or(FragmentCompileError::Invalid(
-                        "missing writer grouped Unpivot scalar constant",
-                    ))?;
+            let definition = crate::expressions::bound_root(package, node, *id)?;
             work.step()?;
-            if !matches!(definition.kind, ExprKind::Constant(_)) {
+            if !matches!(
+                definition.kind,
+                novarocks_expression_contract::ExprKind::Constant(_)
+            ) {
                 return Err(FragmentCompileError::Invalid(
                     "writer grouped Unpivot scalar source is not a static constant",
                 ));
@@ -847,10 +846,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         .ok_or(ExpressionLoweringError::Invalid(
             "missing frozen writer aggregate call",
         ))?;
-    let source_request = package
-        .fragment()
-        .call_requests()
-        .get(PhysicalCallDefinition::Relational(site));
+    let source_request = package.fragment().call_requests().get(site);
     work.step()?;
     let source_request = source_request.ok_or(ExpressionLoweringError::Invalid(
         "missing original writer aggregate call request",

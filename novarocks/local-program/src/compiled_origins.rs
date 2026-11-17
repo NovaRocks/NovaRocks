@@ -235,7 +235,7 @@ mod tests {
         LocalProgramGraph::try_new(
             nodes,
             root,
-            Arc::new(crate::test_support::arena(vec![]).unwrap()),
+            &[],
             CompileProfile::new(
                 NonZeroUsize::new(1).unwrap(),
                 None,

@@ -33,7 +33,7 @@ use std::num::NonZeroU32;
 pub(super) struct PlannedAggregateProducer {
     requirement: i32,
     key_ordinal: usize,
-    key: novarocks_physical_plan::ExprId,
+    key: novarocks_expression_contract::RootOrdinal,
     limit: NonZeroU32,
     producer: StaticFilterProducer,
 }
@@ -207,13 +207,7 @@ fn route<H>(
     let (key, _) = group_by.get(ordinal).ok_or(FragmentCompileError::Invalid(
         "missing Aggregate TopN group key",
     ))?;
-    let key_type = &fragment
-        .expressions()
-        .get(*key)
-        .ok_or(FragmentCompileError::Invalid(
-            "missing Aggregate TopN key definition",
-        ))?
-        .ty;
+    let key_type = &crate::expressions::bound_root(package, node, *key)?.ty;
     if !is_aggregate_topn_key_type(key_type) {
         return Err(unsupported(node, "Aggregate TopN runtime-filter order key type").into());
     }
@@ -257,7 +251,7 @@ pub(super) fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
     if !keys[0]
         .value_type
         .same_value_domain_observed::<FragmentCreationError<H>>(
-            &package.fragment().expressions().get(key).unwrap().ty,
+            &crate::expressions::bound_root(package, node, key)?.ty,
             || work.step().map_err(Into::into),
         )?
     {
@@ -434,7 +428,7 @@ impl PlannedRuntimeFilters {
     pub(crate) fn take_aggregate<H, F: ValueSchemaCreationFactory<H>>(
         &mut self,
         node: NodeId,
-        definitions: &BTreeMap<novarocks_physical_plan::ExprId, ProgramExprId>,
+        definitions: &crate::expressions::RootMap,
         factory: Option<&F>,
         mut temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
         work: &mut CompileCheckpoints<'_>,

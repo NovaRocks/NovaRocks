@@ -22,17 +22,14 @@ use crate::*;
 use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder,
-    EvaluatedArgument, FunctionArgument, FunctionArgumentType, FunctionBindingRequest, FunctionId,
-    FunctionKind, FunctionOverloadId, FunctionResultType, FunctionValueType, InstalledPureKernel,
+    CallEffectInput, ConstantPolicy, ConstantValue, EvaluatedArgument, FunctionArgument,
+    FunctionBindingRequest, FunctionKind, FunctionResultType, FunctionValueType,
     KernelEvaluationControl, KernelFailure, PreparedPureKernel, PureCallPreparation,
-    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
     ScalarEvaluationInstance, ScopedExpressionEffects, Selection,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
-    PureCompileControl, SemanticParameters,
+    FunctionInstanceState, PureCompileControl, SemanticParameters,
 };
 use novarocks_types::SlotId;
 use std::{
@@ -62,46 +59,23 @@ impl KernelEvaluationControl for Evaluation {
     }
 }
 
-fn actual_rng_catalogue() -> PureEngineFunctionCatalog {
-    let actual =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let definition = actual
-        .definition("rand", FunctionKind::Scalar)
-        .unwrap()
-        .clone();
-    // Retain the actual owner/resolver from production registration. These two
-    // independent installed records describe the real RNG CPU implementation,
-    // not declaration iteration masquerading as a Server installation seal.
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    builder.register(definition).unwrap();
-    let function = FunctionId::try_new("builtin.scalar/rand/v1").unwrap();
-    let implementation = PureImplementationId::try_new("builtin.scalar/rand/selected-v1").unwrap();
-    builder
-        .seal_pure(
-            [
-                "builtin.scalar/rand/()->f64;strict;legacy",
-                "builtin.scalar/rand/(i64)->f64;strict;legacy",
-            ]
-            .into_iter()
-            .map(|overload| InstalledPureKernel {
-                function: function.clone(),
-                kind: FunctionKind::Scalar,
-                implementation: PureImplementationDeclaration {
-                    overload: FunctionOverloadId::try_new(overload).unwrap(),
-                    implementation: implementation.clone(),
-                    abi: PureKernelAbi::ScalarV1,
-                },
-                aggregate_state_format: None,
-            }),
-        )
-        .unwrap()
-}
-
 #[test]
 fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
     let control = OriginalCompileControl::default();
-    let catalogue = actual_rng_catalogue();
+    let catalogue = crate::test_support::actual_rng_catalogue();
     let seed_type = FunctionValueType::new(DataType::Int64, false);
+    let policy = ConstantPolicy {
+        max_rows: 1,
+        max_array_nodes: 1,
+        max_logical_elements: 1,
+        max_retained_buffer_bytes: 4096,
+        max_type_depth: 1,
+        max_type_nodes: 1,
+        max_dictionary_depth: 0,
+        max_metadata_bytes: 4096,
+        max_library_validation_work: 65536,
+        max_library_validation_bytes: 65536,
+    };
     let arguments = [FunctionArgument::Value {
         value_type: seed_type.clone(),
         constant: Some(
@@ -109,18 +83,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
                 Arc::new(seed_type.try_to_field("fixture").unwrap()),
                 seed_type.clone(),
                 42,
-                ConstantPolicy {
-                    max_rows: 1,
-                    max_array_nodes: 1,
-                    max_logical_elements: 1,
-                    max_retained_buffer_bytes: 4096,
-                    max_type_depth: 1,
-                    max_type_nodes: 1,
-                    max_dictionary_depth: 0,
-                    max_metadata_bytes: 4096,
-                    max_library_validation_work: 65536,
-                    max_library_validation_bytes: 65536,
-                },
+                policy,
                 CompilePhase::FunctionSpecialization,
                 &control,
             )
@@ -142,72 +105,168 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
     };
     let result_type = result_type.clone();
     assert_eq!(result_type.data_type(), &DataType::Float64);
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(0),
-        region: EvaluationRegionId::new(u32::MAX),
-        demand: EvaluationDemand::Value,
+    use novarocks_constant_contract::{ConstantPoolId, ConstantPools, ConstantReference};
+    use novarocks_expression::{EvaluationEnvironment, ScopeLayouts, compile_expr_set_pure};
+    use novarocks_expression_contract::{
+        BoundExprSetBuilder, BoundFunction, DefinitionControl, ExprKind, ExpressionCallClaim,
+        PhysicalCallRequest, RootOrdinal, RootScope, UnitLimits,
     };
+    use novarocks_type_contract::{CompileCheckpoints, ControlShape, MAX_CONTROL_DEPTH};
     let parameters = SemanticParameters::try_new([]).unwrap();
-    let uses = [Some(ExpressionUseId::new(u32::MAX))];
-    let input = CallEffectInput {
-        context,
-        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&uses),
-        function_id: &bound.function_id,
-        kind: FunctionKind::Scalar,
-        selected: &selected,
-        request,
-        environment: &[],
-        parameters: &parameters,
-        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Region(context.region),
-    };
-    let options = || PureCallPreparation::Scalar {
-        arguments: ScopedExpressionEffects::pure_value(context),
-    };
-    let authored = catalogue
-        .prepare_fresh(input, selected.clone(), options(), &control)
-        .unwrap();
-    let frozen_facts = authored.call_contract().effects().clone();
-    let frozen = catalogue
-        .prepare_frozen(input, selected.clone(), &frozen_facts, options(), &control)
-        .unwrap();
-    let PreparedPureKernel::Scalar(expected_kernel) = frozen.prepared() else {
-        panic!("RNG scalar lifecycle");
-    };
-    let expected_kernel = expected_kernel.clone();
-    assert_eq!(
-        expected_kernel.contract().effects().instance_state,
-        FunctionInstanceState::ScalarInstance
-    );
-
-    let arena = Arc::new(
-        ImmutableExpressions::try_new_for_compile(
-            vec![
-                StaticExprNode::new_value_typed(
-                    crate::test_support::integer(42),
-                    novarocks_functions::FunctionValueType::new(DataType::Int64, false),
-                ),
-                StaticExprNode::new_value_typed(
-                    StaticExprKind::BoundCall {
-                        args: vec![ProgramExprId::new(0)],
-                    },
-                    result_type.clone(),
-                ),
-            ],
-            &control,
-        )
-        .unwrap(),
-    );
-    let source_layout = StaticLayout::try_new_for_compile(
+    let source_layout = StaticLayout::try_new_typed_for_compile(
         Arc::new(Schema::new(vec![Field::new(
             "source",
             DataType::Int64,
             false,
         )])),
         Arc::from([SlotId::new(77)]),
+        vec![(seed_type.typed_binding().clone(), None)],
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        |_| Ok(()),
         &control,
     )
     .unwrap();
+    let FunctionArgument::Value {
+        constant: Some(value),
+        ..
+    } = &arguments[0]
+    else {
+        panic!("actual admitted seed constant")
+    };
+    let value = value.clone();
+    let reference = ConstantReference {
+        pool: ConstantPoolId::new(17),
+        ordinal: value.ordinal(),
+    };
+    let mut pools = ConstantPools::empty();
+    pools.insert(reference.pool, value.pool().clone()).unwrap();
+    let mut builder = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: MAX_CONTROL_DEPTH,
+    });
+    let seed = builder
+        .add(None, seed_type.clone(), ExprKind::Constant(reference))
+        .unwrap();
+    let call = builder
+        .add(
+            None,
+            result_type.clone(),
+            ExprKind::FunctionCall {
+                function: BoundFunction::from_exact_signature(
+                    bound.function_id.clone(),
+                    selected.overload.clone(),
+                    FunctionKind::Scalar,
+                    selected.argument_types.clone(),
+                    result_type.clone(),
+                ),
+                args: Box::from([seed]),
+            },
+        )
+        .unwrap();
+    builder
+        .request(
+            call,
+            PhysicalCallRequest {
+                arguments: Box::from([novarocks_function_contract::FunctionArgument::Value {
+                    value_type: seed_type.clone(),
+                    constant: Some(reference),
+                }]),
+                logical_argument_count: 1,
+                expected_result_type: None,
+                constant_policy: policy,
+            },
+        )
+        .unwrap();
+    builder
+        .definition_control(
+            call,
+            DefinitionControl {
+                shape: ControlShape::Eager,
+                temporal_sources: None,
+            },
+        )
+        .unwrap();
+    builder
+        .root(call, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+    let sealed = builder.seal(vec![], &mut work).unwrap();
+    let (use_id, invocation) = sealed
+        .uses()
+        .iter()
+        .find(|(_, u)| u.definition == call)
+        .unwrap();
+    let uses = invocation
+        .arguments
+        .iter()
+        .copied()
+        .map(Some)
+        .collect::<Vec<_>>();
+    let child = &sealed.control_flow().uses()[&invocation.arguments[0]];
+    let argument_effects = ScopedExpressionEffects::pure_value(invocation.context)
+        .join_control_argument(
+            ScopedExpressionEffects::pure_value(child.context),
+            sealed.control_flow(),
+            0,
+        )
+        .unwrap();
+    let authored = catalogue
+        .prepare_fresh(
+            CallEffectInput {
+                context: invocation.context.into(),
+                argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&uses),
+                function_id: &bound.function_id,
+                kind: FunctionKind::Scalar,
+                selected: &selected,
+                request,
+                environment: &[],
+                parameters: &parameters,
+                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                proof_scope: CallProofScope::Region(invocation.context.region),
+            },
+            selected.clone(),
+            PureCallPreparation::Scalar {
+                arguments: argument_effects,
+            },
+            &control,
+        )
+        .unwrap();
+    let call_use = *use_id;
+    let claims = BTreeMap::from([(
+        *use_id,
+        ExpressionCallClaim {
+            context: invocation.context,
+            effects: authored.call_contract().effects().clone(),
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            temporal_source: None,
+            regexp_count_pattern_source: None,
+            to_base64_byte_source: None,
+        },
+    )]);
+    let bound_unit = sealed.finish(claims, &mut work).unwrap();
+    let unit = compile_expr_set_pure(
+        &bound_unit,
+        EvaluationEnvironment {
+            constants: &pools,
+            parameters: &parameters,
+        },
+        ScopeLayouts {
+            ports: &[],
+            all_ports: None,
+        },
+        policy,
+        &catalogue,
+        &mut work,
+    )
+    .unwrap();
+    let PreparedPureKernel::Scalar(expected_kernel) = unit.calls()[&call_use].prepared() else {
+        panic!("RNG scalar lifecycle")
+    };
+    let expected_kernel = expected_kernel.clone();
+    let selected = expected_kernel.contract().call().selected_owner().clone();
+    assert_eq!(
+        expected_kernel.contract().effects().instance_state,
+        FunctionInstanceState::ScalarInstance
+    );
     let values = StaticValues::try_new_for_compile(
         RecordBatch::try_new(
             source_layout.schema().clone(),
@@ -239,6 +298,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         output_layout.identity_for_compile(&control).unwrap(),
         KernelAbiVersion::CURRENT,
     );
+    let units = vec![unit.clone()];
     let graph = LocalProgramGraph::try_new_with_sink_for_compile(
         vec![
             ProgramNode::new_local(
@@ -254,7 +314,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
                     input: ProgramNodeId::new(0),
                     is_subordinate: false,
                     validate_final_result_input: false,
-                    exprs: vec![ProgramExprId::new(1)],
+                    exprs: vec![crate::test_support::root(0, 0)],
                     expr_slot_ids: output_layout.slots().to_vec(),
                     expr_slot_schemas: None,
                     output_indices: None,
@@ -263,96 +323,31 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
             ),
         ],
         ProgramNodeId::new(1),
-        arena.clone(),
+        &units,
         profile,
         requirements,
         Some(StaticSinkProgram::Result),
         &control,
     )
     .unwrap();
-    let root_site = ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(1),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-    };
-    let flow = ProgramControlFlow::try_new(
-        vec![ProgramEvaluationRegion {
-            id: context.region,
-            parent: None,
-            guard: None,
-        }],
-        vec![
-            ProgramExpressionUse {
-                context,
-                definition: ProgramExprId::new(1),
-                control: ControlShape::Eager,
-                arguments: Box::from([ExpressionUseId::new(u32::MAX)]),
+    let channels = vec![
+        (
+            ProgramChannelSite::Layout {
+                node: ProgramNodeId::new(0),
+                role: ProgramChannelLayoutRole::NodeOutput,
+                ordinal: 0,
             },
-            ProgramExpressionUse {
-                context: ExpressionEffectContext {
-                    use_id: ExpressionUseId::new(u32::MAX),
-                    ..context
-                },
-                definition: ProgramExprId::new(0),
-                control: ControlShape::Eager,
-                arguments: Box::default(),
+            seed_type,
+        ),
+        (
+            ProgramChannelSite::Layout {
+                node: ProgramNodeId::new(1),
+                role: ProgramChannelLayoutRole::NodeOutput,
+                ordinal: 0,
             },
-        ],
-        2,
-        &control,
-    )
-    .unwrap();
-    let snapshot = ProgramRootControlBindings::try_new(
-        graph,
-        BTreeMap::from([(ProgramExpressionArena::Main, flow)]),
-        vec![ProgramRootUseBinding {
-            site: root_site,
-            use_id: context.use_id,
-        }],
-        &control,
-    )
-    .unwrap();
-    let call_site = ProgramCallSite::Expression(ProgramUseRef {
-        arena: ProgramExpressionArena::Main,
-        use_id: context.use_id,
-    });
-    let calls =
-        ProgramResolvedCalls::try_new(snapshot, vec![(call_site, frozen)], &control).unwrap();
-    let expressions = ProgramTypedExpressions::try_new(
-        calls,
-        BTreeMap::from([(
-            ProgramExpressionArena::Main,
-            vec![
-                FunctionArgumentType::Value(seed_type.clone()),
-                FunctionArgumentType::Value(result_type.clone()),
-            ],
-        )]),
-        &control,
-    )
-    .unwrap();
-    let channels = ProgramTypedChannels::try_new(
-        expressions,
-        vec![
-            (
-                ProgramChannelSite::Layout {
-                    node: ProgramNodeId::new(0),
-                    role: ProgramChannelLayoutRole::NodeOutput,
-                    ordinal: 0,
-                },
-                seed_type,
-            ),
-            (
-                ProgramChannelSite::Layout {
-                    node: ProgramNodeId::new(1),
-                    role: ProgramChannelLayoutRole::NodeOutput,
-                    ordinal: 0,
-                },
-                result_type,
-            ),
-        ],
-        &control,
-    )
-    .unwrap();
-    let lexical = ProgramLexicalBindings::try_new(channels, vec![], vec![], &control).unwrap();
+            result_type,
+        ),
+    ];
     let metrics = OperatorMetricAggregation {
         cpu_time: MetricAggregation::Sum,
         wall_time: MetricAggregation::Maximum,
@@ -377,19 +372,20 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         DiagnosticSourceNodeId::new(u32::MAX),
     ]);
     let program = LocalProgram::try_new(
-        lexical,
+        graph,
+        units,
+        vec![],
+        channels,
         operators,
         &allowed,
-        CompiledProgramFacts {
-            writes: BTreeMap::new(),
-            exchange_inputs: BTreeMap::new(),
-            scan_inputs: BTreeMap::new(),
-            aggregates: BTreeMap::new(),
-        },
+        CompiledProgramFacts::default(),
         &control,
     )
     .unwrap();
-    assert!(Arc::ptr_eq(program.graph().expressions(), &arena));
+    assert!(Arc::ptr_eq(
+        program.unit(ProgramUnitId::new(0)).unwrap(),
+        &unit
+    ));
     assert_eq!(program.graph().profile().pipeline_dop().get(), 2);
     assert_eq!(
         program
@@ -400,18 +396,22 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
             .collect::<Vec<_>>(),
         vec![LocalOperatorId::new(37), LocalOperatorId::new(u32::MAX)]
     );
-    let ProgramStateTemplate::Scalar { scope, kernel } = program.state_template(call_site).unwrap()
+    let novarocks_expression::evaluator_view::UnitStateTemplate::Scalar { scope, kernel } =
+        novarocks_expression::evaluator_view::state_template(
+            program.unit(ProgramUnitId::new(0)).unwrap(),
+            call_use,
+        )
+        .unwrap()
     else {
-        panic!("actual scalar state template");
+        panic!("actual scalar state template")
     };
-    assert_eq!(scope.root, root_site);
-    assert_eq!(scope.occurrence.use_id, context.use_id);
+    assert_eq!(scope.root, RootOrdinal::new(0));
+    assert_eq!(scope.occurrence, call_use);
     assert!(Arc::ptr_eq(kernel, &expected_kernel));
     assert!(Arc::ptr_eq(
         kernel.contract().call().selected_owner(),
         &selected
     ));
-
     // Independent seed-42 bits captured from official rand 0.8.5 StdRng.
     // Advancing A does not consume B; both borrow the same immutable recipe.
     let mut a = ScalarEvaluationInstance::instantiate(kernel.clone()).unwrap();

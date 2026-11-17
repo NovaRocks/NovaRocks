@@ -32,20 +32,19 @@ use novarocks_functions::{
     AggregateBindingSelection, AggregateKernelPhase, AggregateOverloadIdentity,
     AggregatePreparationOptions, CallEffectInput, FunctionBindingSelection, FunctionResultType,
     PureCallPreparation, PureCallSpecialization, PureEngineFunctionCatalog,
-    ResolvedAggregateSignature, ScopedExpressionEffects,
+    ResolvedAggregateSignature, ScopedRelationalEffects,
 };
 use novarocks_local_program::{
-    CompiledAggregate, CompiledAggregateGrouping, ProgramCallSite, ProgramExprId, ProgramNodeId,
-    ProgramNodeKind, StaticAggregateCall, StaticAggregateOrder, StaticLayout,
+    CompiledAggregate, CompiledAggregateGrouping, ProgramCallSite, ProgramNodeId, ProgramNodeKind,
+    StaticAggregateCall, StaticAggregateOrder, StaticLayout,
 };
 use novarocks_physical_plan::{
-    AggregateCall, AggregateGrouping, AggregatePhase, ExprId, ExpressionRootRole,
-    ExpressionRootSite, FragmentPackage, FunctionArgumentType, NodeId, NodeKind,
-    PhysicalCallDefinition, PhysicalCallSite, PhysicalNode,
+    AggregateCall, AggregateGrouping, AggregatePhase, FragmentPackage, FunctionArgumentType,
+    NodeId, NodeKind, PhysicalCallSite, PhysicalNode,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, EvaluationDemand, ExpressionEffects, ExpressionUseId,
-    FunctionKind, PureCompileControl,
+    CompileCheckpoints, CompilePhase, EvaluationDemand, ExpressionEffects, FunctionKind,
+    PureCompileControl,
 };
 use novarocks_types::SlotId;
 use std::{collections::BTreeMap, sync::Arc};
@@ -74,7 +73,7 @@ pub(crate) fn lower_aggregate_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     input: ProgramNodeId,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     slots: &[SlotId],
     topn_filters: novarocks_local_program::AggregateTopNFilters,
     control: &dyn PureCompileControl,
@@ -98,7 +97,7 @@ fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     input: ProgramNodeId,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     slots: &[SlotId],
     topn_filters: novarocks_local_program::AggregateTopNFilters,
     work: &mut CompileCheckpoints<'_>,
@@ -137,13 +136,11 @@ fn lower_core_with_creation<H>(
         }
     }
     let values = package.fragment().values();
-    let definitions = package.fragment().expressions();
+
     let mut keys = Vec::new();
     reserve_vec(&mut keys, group_by.len(), work)?;
     for (expression, value) in group_by.iter() {
-        let definition = definitions
-            .get(*expression)
-            .ok_or(FragmentCompileError::Invalid("missing group definition"))?;
+        let definition = crate::expressions::bound_root(package, node.id, *expression)?;
         let output = values
             .get(value)
             .ok_or(FragmentCompileError::Invalid("missing group value"))?;
@@ -347,7 +344,7 @@ pub(crate) fn freeze_binding_with_creation<H>(
 
 pub(crate) fn lower_call<H>(
     call: &AggregateCall,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<StaticAggregateCall, crate::FragmentCreationError<H>> {
@@ -449,7 +446,7 @@ pub(crate) fn prepare_aggregate_calls<
 >(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
-    effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    effects: &crate::expressions::LoweredExpressions,
     nodes: &BTreeMap<NodeId, ProgramNodeId>,
     tokens: &mut BTreeMap<ProgramCallSite, PureCallSpecialization>,
     work: &mut CompileCheckpoints<'_>,
@@ -531,7 +528,7 @@ impl AggregateCallFamily {
 fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
-    effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    effects: &crate::expressions::LoweredExpressions,
     node: &PhysicalNode,
     family: AggregateCallFamily,
     ordinal: u32,
@@ -575,10 +572,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         .ok_or(ExpressionLoweringError::Invalid(
             "missing frozen aggregate call",
         ))?;
-    let source_request = package
-        .fragment()
-        .call_requests()
-        .get(PhysicalCallDefinition::Relational(site));
+    let source_request = package.fragment().call_requests().get(site);
     work.step()?;
     let source_request = source_request.ok_or(ExpressionLoweringError::Invalid(
         "missing original aggregate call request",
@@ -613,8 +607,6 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     )?;
     work.flush()?;
     let phase = kernel_phase(binding.phase);
-    let roots = package.expression_uses();
-    let flow = roots.flow();
     // Each argument root is an independent unguarded Value occurrence whose
     // definition is the call's ordered argument.
     let mut argument_uses = Vec::new();
@@ -629,42 +621,28 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     let mut contexts = Vec::new();
     reserve_vec(&mut contexts, channel_count, work)?;
     let mut children = ExpressionEffects::PURE_VALUE;
-    for (argument, &definition) in call
+    for &definition in call
         .arguments
         .iter()
         .chain(call.order_by.iter().map(|key| &key.expr))
-        .enumerate()
     {
-        let argument = u32::try_from(argument).map_err(|_| {
-            ExpressionLoweringError::Invalid("aggregate argument ordinal exhausted")
-        })?;
-        let root = ExpressionRootSite {
-            node: node.id,
-            role: if matches!(family, AggregateCallFamily::TopNState) {
-                ExpressionRootRole::TopNStateArgument {
-                    call: ordinal,
-                    argument,
-                }
-            } else if (argument as usize) < call.arguments.len() {
-                ExpressionRootRole::AggregateArgument {
-                    call: ordinal,
-                    argument,
-                }
-            } else {
-                ExpressionRootRole::AggregateOrder {
-                    call: ordinal,
-                    key: argument
-                        - u32::try_from(call.arguments.len()).map_err(|_| {
-                            ExpressionLoweringError::Invalid("aggregate argument ordinal exhausted")
-                        })?,
-                }
-            },
-        };
-        let use_id = *roots
-            .bindings()
-            .get(&root)
+        let unit = node
+            .expressions
+            .as_ref()
+            .ok_or(ExpressionLoweringError::Invalid(
+                "aggregate node has no expression unit",
+            ))?;
+        let compiled = effects.unit(node.id)?;
+        let flow = unit.control_flow();
+        let use_id = unit
+            .root_use(definition)
             .ok_or(ExpressionLoweringError::Invalid(
                 "aggregate argument root has no actual use",
+            ))?;
+        let root = unit
+            .root(definition)
+            .ok_or(ExpressionLoweringError::Invalid(
+                "aggregate argument root is absent",
             ))?;
         let invocation = flow
             .uses()
@@ -674,7 +652,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             ))?;
         let domain = flow.regions().get(&invocation.context.region);
         work.step()?;
-        let exact = invocation.definition == definition
+        let exact = invocation.definition == root.definition
             && invocation.context.use_id == use_id
             && invocation.context.demand == EvaluationDemand::Value
             && domain.is_some_and(|domain| domain.parent.is_none() && domain.guard.is_none());
@@ -684,7 +662,8 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             )
             .into());
         }
-        let summary = effects
+        let summary = compiled
+            .effects()
             .get(&use_id)
             .ok_or(ExpressionLoweringError::Invalid(
                 "aggregate argument effects were not prepared",
@@ -733,19 +712,12 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             )
             .into());
         }
-        let state_type = &package
-            .fragment()
-            .expressions()
-            .get(*state)
-            .ok_or(ExpressionLoweringError::Invalid(
-                "missing aggregate state definition",
-            ))?
-            .ty;
+        let state_type = &crate::expressions::bound_root(package, node.id, *state)?.ty;
         work.flush()?;
         (
             novarocks_functions::CallArgumentUses::AggregateMerge {
                 phase,
-                state_context: *context,
+                state_context: (*context).into(),
                 state_input_type: state_type,
             },
             AggregatePreparationOptions {
@@ -759,7 +731,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     };
     work.flush()?;
     let input = CallEffectInput {
-        context: frozen.context,
+        context: frozen.context.into(),
         argument_uses: argument_uses_shape,
         function_id: &function.function_id,
         kind: FunctionKind::Aggregate,
@@ -776,7 +748,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         Arc::clone(&selection),
         &frozen.effects,
         PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::primitive(frozen.context, children),
+            arguments: ScopedRelationalEffects::primitive(frozen.context, children),
             options,
         },
         work.control(),

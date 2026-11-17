@@ -24,9 +24,8 @@
 //! types, with compiler-allocated slots; nothing is keyed by the SPI's
 //! reserved relation slot IDs.
 //!
-//! The writer projection is a separate `WriterProjection` arena of synthetic
-//! slot reads, one per target input value, read from the writer's actual
-//! input occurrence. Its layout is the provider recipe's own input fields, so
+//! The writer projection is a compiled expression unit of input reads, one
+//! root per target input value, read from the writer's actual input occurrence. Its layout is the provider recipe's own input fields, so
 //! the provider names and field metadata are kept exactly. Source expression
 //! declarations remain unchanged; the published projection satisfies the
 //! provider's nested requirements, while retaining the source root NULL flag.
@@ -43,23 +42,19 @@
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use novarocks_connector_contract::ConnectorWriteRecipe;
 use novarocks_local_program::{
-    BindingRequirement, ExpressionsCompileError, ImmutableExpressions, ProgramChannelLayoutRole,
-    ProgramChannelSite, ProgramControlFlow, ProgramEvaluationRegion, ProgramExprId,
-    ProgramExpressionArena, ProgramExpressionRootSite, ProgramExpressionUse, ProgramLexicalSource,
-    ProgramNodeId, ProgramNodeKind, ProgramRootUseBinding, ProgramSlotBinding, ProgramUseRef,
-    StaticExprKind, StaticExprNode, StaticLayout, StaticWriterProjection,
+    BindingRequirement, ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId,
+    ProgramNodeKind, StaticLayout, StaticWriterProjection,
 };
 use novarocks_physical_plan::{
-    Distribution, EdgeKind, ExprId, FragmentPackage, FragmentSink, NodeKind, OutboundFragmentCut,
+    Distribution, EdgeKind, FragmentPackage, FragmentSink, NodeKind, OutboundFragmentCut,
     PhysicalNode, ValueId, WriterRelationSchema,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
-    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionArgumentType,
-    FunctionValueType, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType,
+    PureCompileControl,
 };
 use novarocks_types::SlotId;
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
+use std::num::NonZeroUsize;
 
 /// Additional typed channels one writer-family node owns beyond its output
 /// occurrences: the writer's projection and multiplex roles, or the finish's
@@ -374,17 +369,6 @@ pub(crate) fn finish_input_layout_with_creation<H>(
         .map(Some)
 }
 
-/// The complete WriterProjection-arena scope of one writer: its flow and
-/// types, the root binding of each projected field and each read's exact
-/// input occurrence.
-pub(crate) struct WriterFlow {
-    pub arena: ProgramExpressionArena,
-    pub flow: ProgramControlFlow,
-    pub types: novarocks_type_contract::FunctionArgumentTypes,
-    pub roots: Vec<ProgramRootUseBinding>,
-    pub slots: Vec<ProgramSlotBinding>,
-}
-
 pub(crate) struct LoweredWriter {
     pub kind: ProgramNodeKind,
     pub layout: StaticLayout,
@@ -392,7 +376,6 @@ pub(crate) struct LoweredWriter {
     /// Typed channels of the writer's projection and multiplex roles; the
     /// node-output channels are pushed by the caller as for every node.
     pub channels: Vec<(ProgramChannelSite, FunctionValueType)>,
-    pub flow: WriterFlow,
 }
 
 /// The writer's actual input and the slots its relations own.
@@ -406,6 +389,10 @@ pub(crate) struct WriterLoweringInput<'a> {
     pub projection_slots: &'a [SlotId],
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Writer source, immutable facts and original creator ports retain separate responsibilities"
+)]
 pub(crate) fn lower_writer_with_creation<
     H,
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
@@ -415,6 +402,9 @@ pub(crate) fn lower_writer_with_creation<
     id: ProgramNodeId,
     recipe: &ConnectorWriteRecipe,
     input: WriterLoweringInput<'_>,
+    expressions: &mut crate::expressions::LoweredExpressions,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
+    policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
@@ -427,6 +417,9 @@ pub(crate) fn lower_writer_with_creation<
         id,
         recipe,
         input,
+        expressions,
+        functions,
+        policy,
         &mut work,
         creation,
         crate::creation::borrow_scope(&mut temporary),
@@ -435,12 +428,19 @@ pub(crate) fn lower_writer_with_creation<
     crate::creation::finish_attempt(result, work)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Writer source, immutable facts and original creator ports retain separate responsibilities"
+)]
 fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     id: ProgramNodeId,
     recipe: &ConnectorWriteRecipe,
     input: WriterLoweringInput<'_>,
+    expressions: &mut crate::expressions::LoweredExpressions,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
+    policy: novarocks_constant_contract::ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
@@ -462,28 +462,11 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
         ))
         .into());
     }
-    let mut nodes = Vec::new();
-    let mut type_scope = match factory {
-        Some(f) => {
-            work.flush()?;
-            Some(
-                f.begin_scope()
-                    .map_err(crate::FragmentCreationError::Creator)?,
-            )
-        }
-        None => None,
-    };
-    let mut types = Vec::new();
     let mut typed_layout =
         crate::typed_layout::TypedLayoutBuilder::new_with_creation(width, work, creation)?;
     let mut ordinals = Vec::new();
     let mut storage_types = Vec::new();
     let mut channels = Vec::new();
-    reserve_vec(&mut nodes, width, work)?;
-    match type_scope.as_mut() {
-        Some(scope) => crate::creation::reserve_vec(&mut types, width, Some(scope), work)?,
-        None => reserve_vec(&mut types, width, work)?,
-    }
     reserve_vec(&mut ordinals, width, work)?;
     reserve_vec(&mut storage_types, width, work)?;
     reserve_vec(
@@ -541,13 +524,6 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
                 .transpose()?,
         );
         work.flush()?;
-        nodes.push(StaticExprNode::new_value_typed(
-            StaticExprKind::SlotId(input.child_layout.slots()[source]),
-            ty.clone_observed(|| work.step())?,
-        ));
-        types.push(FunctionArgumentType::Value(
-            ty.clone_observed(|| work.step())?,
-        ));
         // Provider attributes stay on the write recipe. The value obligation
         // is fulfilled before this target projection is published.
         typed_layout.push_with_creation(
@@ -565,34 +541,46 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
             },
             output_ty,
         ));
-        ordinals.push(u32::try_from(source).map_err(|_| CompileControlError::ResourceExhausted)?);
+        ordinals.push((source, EvaluationDemand::Value));
         work.step()?;
     }
     work.flush()?;
     let projection_layout =
         typed_layout.finish_with_creation(input.projection_slots, work, creation)?;
     work.flush()?;
-    // A slot read needs no exception, dictionary or session-timezone
-    // capability; the arena is distinct from the Main arena by design.
-    let types = crate::creation::publish_argument_types(
-        types,
-        type_scope
-            .as_mut()
-            .map(|s| s as &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>),
+    let mut source_columns = Vec::new();
+    reserve_vec(
+        &mut source_columns,
+        input.child_node.output.columns.len(),
         work,
-    )
-    .map_err(crate::creation::argument_types_failure)?;
-    let arena =
-        ImmutableExpressions::try_new_for_compile(nodes, work.control()).map_err(|error| {
-            match error {
-                ExpressionsCompileError::Control(cause) => FragmentCompileError::Control(cause),
-                error => FragmentCompileError::Owner {
-                    phase: "writer projection expressions",
-                    error: novarocks_failure_contract::SharedFailureCause::new(error),
-                },
-            }
-        })?;
-    let arena = Arc::new(arena);
+    )?;
+    for value in input.child_node.output.columns.iter().copied() {
+        let ty = &values
+            .get(&value)
+            .ok_or(FragmentCompileError::Invalid(
+                "missing writer source column type",
+            ))?
+            .ty;
+        source_columns.push((value, ty.clone_observed(|| work.step())?));
+        work.step()?;
+    }
+    let projection_roots = if ordinals.is_empty() {
+        Vec::new()
+    } else {
+        crate::union_flow::compile_reads(
+            package,
+            expressions,
+            functions,
+            policy,
+            input.child_layout,
+            &source_columns,
+            &ordinals,
+            creation,
+            crate::creation::borrow_scope(&mut temporary),
+            factory,
+            work,
+        )?
+    };
     work.flush()?;
     let multiplex = relation_layout_inner_with_creation(
         &target.output_schema,
@@ -619,17 +607,6 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
         work,
         creation,
     )?;
-    let arena_id = ProgramExpressionArena::WriterProjection(id);
-    let flow = projection_flow(
-        id,
-        input.child,
-        arena_id,
-        &ordinals,
-        work,
-        crate::creation::borrow_scope(&mut temporary),
-        creation,
-        factory,
-    )?;
     work.flush()?;
     Ok(LoweredWriter {
         kind: ProgramNodeKind::TableWriter {
@@ -638,8 +615,7 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
             expected_layout: projection_layout.clone(),
             projection: StaticWriterProjection {
                 storage_types,
-                arena,
-                expressions: (0..width).map(ProgramExprId::new).collect(),
+                expressions: projection_roots,
                 layout: projection_layout,
             },
             writer_multiplex_layout: multiplex.clone(),
@@ -654,121 +630,7 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
         },
         layout: multiplex,
         channels,
-        flow: WriterFlow {
-            arena: arena_id,
-            flow: flow.0,
-            types,
-            roots: flow.1,
-            slots: flow.2,
-        },
     })
-}
-
-type ProjectionFlow = (
-    ProgramControlFlow,
-    Vec<ProgramRootUseBinding>,
-    Vec<ProgramSlotBinding>,
-);
-
-/// One root domain and one eager Value occurrence per projected field `i`,
-/// bound to `WriterProjection { node, expression: i }` and read from the
-/// writer input's actual output occurrence. Identities are dense in this
-/// fresh arena scope.
-fn projection_flow<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
-    writer: ProgramNodeId,
-    input: ProgramNodeId,
-    arena: ProgramExpressionArena,
-    ordinals: &[u32],
-    work: &mut CompileCheckpoints<'_>,
-    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
-    _creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
-    factory: Option<&F>,
-) -> Result<ProjectionFlow, crate::FragmentCreationError<H>> {
-    let mut domains = Vec::new();
-    let mut uses = Vec::new();
-    let mut roots = Vec::new();
-    let mut slots = Vec::new();
-    crate::creation::reserve_vec(
-        &mut domains,
-        ordinals.len(),
-        crate::creation::borrow_scope(&mut temporary),
-        work,
-    )?;
-    crate::creation::reserve_vec(
-        &mut uses,
-        ordinals.len(),
-        crate::creation::borrow_scope(&mut temporary),
-        work,
-    )?;
-    crate::creation::reserve_vec(
-        &mut roots,
-        ordinals.len(),
-        crate::creation::borrow_scope(&mut temporary),
-        work,
-    )?;
-    crate::creation::reserve_vec(
-        &mut slots,
-        ordinals.len(),
-        crate::creation::borrow_scope(&mut temporary),
-        work,
-    )?;
-    for (expression, &ordinal) in ordinals.iter().enumerate() {
-        let identity =
-            u32::try_from(expression).map_err(|_| CompileControlError::ResourceExhausted)?;
-        let domain = EvaluationRegionId::new(identity);
-        let use_id = ExpressionUseId::new(identity);
-        domains.push(ProgramEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        });
-        uses.push(ProgramExpressionUse {
-            context: ExpressionEffectContext {
-                use_id,
-                region: domain,
-                demand: EvaluationDemand::Value,
-            },
-            definition: ProgramExprId::new(expression),
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        roots.push(ProgramRootUseBinding {
-            site: ProgramExpressionRootSite::WriterProjection {
-                node: writer,
-                expression: identity,
-            },
-            use_id,
-        });
-        slots.push(ProgramSlotBinding {
-            occurrence: ProgramUseRef { arena, use_id },
-            source: ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                node: input,
-                role: ProgramChannelLayoutRole::NodeOutput,
-                ordinal,
-            }),
-        });
-        work.step()?;
-    }
-    work.flush()?;
-    let flow = match factory {
-        Some(f) => {
-            let mut retained = f
-                .begin_scope()
-                .map_err(crate::FragmentCreationError::Creator)?;
-            ProgramControlFlow::try_new_with_creator_in(
-                domains,
-                uses,
-                ordinals.len(),
-                crate::creation::borrow_scope(&mut temporary)
-                    .expect("strong entry supplies temporary scope"),
-                &mut retained,
-                work.control(),
-            )?
-        }
-        None => ProgramControlFlow::try_new(domains, uses, ordinals.len(), work.control())?,
-    };
-    work.flush()?;
-    Ok((flow, roots, slots))
 }
 
 pub(crate) struct LoweredFinish {
@@ -791,9 +653,8 @@ pub(crate) struct FinishLoweringInput<'a> {
     /// grouping output followed by one final output per call; empty without
     /// statistics.
     pub statistics_slots: &'a [SlotId],
-    /// The Main-arena definition of each physical expression, read by the
-    /// grouped Unpivot's scalar constants.
-    pub expressions: &'a BTreeMap<ExprId, ProgramExprId>,
+    /// The owning node's unit roots, read by the grouped Unpivot's scalar constants.
+    pub expressions: &'a crate::expressions::RootMap,
 }
 
 /// Lower one admitted finish over its writer multiplex and optional summary. The finish
@@ -831,6 +692,7 @@ pub(crate) fn lower_finish_with_creation<H>(
             spec,
             crate::writer_statistics::FinishStatisticsChannels {
                 node: id,
+                physical: node.id,
                 input_slots: child_layout.slots(),
                 root_slots: slots,
                 statistics_slots: input.statistics_slots,

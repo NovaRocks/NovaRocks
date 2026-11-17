@@ -18,30 +18,41 @@
 //! The sender must accept precisely the declared hierarchical key domain.
 
 use super::*;
-use crate::{StaticExprKind, StaticExprNode};
 use arrow_schema::DataType;
 
 fn stream(key_type: DataType, conditional: bool) -> Result<StaticSinkProgram, StaticSinkError> {
-    let mut nodes = vec![StaticExprNode::new_value_typed(
-        StaticExprKind::SlotId(SlotId::new(1)),
-        novarocks_functions::FunctionValueType::new(key_type, false),
-    )];
+    use novarocks_expression_contract::ValueId;
+    use novarocks_type_contract::{EvaluationDemand, FunctionValueType};
+    let mut fields = vec![arrow_schema::Field::new("key", key_type.clone(), false)];
+    let mut values = vec![(ValueId::new(1), FunctionValueType::new(key_type, false))];
+    let mut roots = vec![(0, EvaluationDemand::Value)];
     let routing = if conditional {
-        nodes.push(StaticExprNode::new_value_typed(
-            StaticExprKind::SlotId(SlotId::new(2)),
-            novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
+        fields.push(arrow_schema::Field::new(
+            "applies",
+            DataType::Boolean,
+            false,
         ));
+        values.push((
+            ValueId::new(2),
+            FunctionValueType::new(DataType::Boolean, false),
+        ));
+        roots.push((1, EvaluationDemand::TruthOnly));
         StaticStreamRouting::ConditionalKeyV1 {
-            applies: ProgramExprId::new(1),
+            applies: crate::test_support::root(0, 1),
         }
     } else {
         StaticStreamRouting::HierarchicalHashV1
     };
-    let arena = Arc::new(crate::test_support::arena(nodes).unwrap());
+    let layout = StaticLayout::try_new(
+        Arc::new(arrow_schema::Schema::new(fields)),
+        (1..=values.len()).map(|i| SlotId::new(i as u32)).collect(),
+    )
+    .unwrap();
+    let units = vec![crate::test_support::read_unit(&layout, &values, &roots)];
     let branch = StaticStreamBranch::try_new(
         1,
         DataStreamPartitionType::HashPartitioned,
-        vec![ProgramExprId::new(0)],
+        vec![crate::test_support::root(0, 0)],
         vec![SlotId::new(1)],
         None,
         StaticStreamContract {
@@ -51,7 +62,7 @@ fn stream(key_type: DataType, conditional: bool) -> Result<StaticSinkProgram, St
         },
     )
     .unwrap();
-    StaticSinkProgram::try_data_stream(branch, arena)
+    StaticSinkProgram::try_data_stream(branch, &units)
 }
 
 #[test]

@@ -19,13 +19,14 @@
 //! Input representatives are supplied by the sole channel author. No runtime
 //! capability, constant re-admission, or formal allocation grant is created.
 
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::ConstantError;
 use novarocks_local_program::{
-    LayoutCompileError, ProgramExprId, ProgramNodeId, ProgramNodeKind, StaticLayout,
-    UnpivotConstant, UnpivotMapping, UnpivotPassthrough,
+    LayoutCompileError, ProgramNodeId, ProgramNodeKind, StaticLayout, UnpivotConstant,
+    UnpivotMapping, UnpivotPassthrough,
 };
 use novarocks_physical_plan::{
-    ConstantReferenceError, ExprId, ExprKind, Fragment, FragmentPackage, NodeKind, PhysicalNode,
+    ConstantReferenceError, Fragment, FragmentPackage, NodeKind, PhysicalNode,
     UnpivotConstant as SourceConstant, ValueId,
 };
 use novarocks_type_contract::{
@@ -111,7 +112,7 @@ pub(crate) struct UnpivotLoweringInput<'a> {
     pub node: ProgramNodeId,
     pub layout: &'a StaticLayout,
     pub sources: &'a BTreeMap<ValueId, SlotId>,
-    pub expressions: &'a BTreeMap<ExprId, ProgramExprId>,
+    pub expressions: &'a crate::expressions::RootMap,
 }
 
 fn exact_type(
@@ -411,13 +412,18 @@ fn lower_core_with_creation<H>(
         for (constant, &output) in mapping.constants.iter().zip(&spec.literal_outputs) {
             let lowered = match constant {
                 SourceConstant::Scalar(id) => {
-                    let definition =
-                        fragment
-                            .expressions()
-                            .get(*id)
-                            .ok_or(UnpivotLoweringError::Invalid(
-                                "missing Unpivot scalar constant",
-                            ))?;
+                    let unit = node
+                        .expressions
+                        .as_ref()
+                        .ok_or(UnpivotLoweringError::Invalid(
+                            "missing Unpivot expression unit",
+                        ))?;
+                    let definition = unit
+                        .root(*id)
+                        .and_then(|root| unit.definition(root.definition))
+                        .ok_or(UnpivotLoweringError::Invalid(
+                            "missing Unpivot scalar constant",
+                        ))?;
                     let valid = matches!(definition.kind, ExprKind::Constant(_));
                     let expr_id = input.expressions.get(id).copied();
                     work.step()?;

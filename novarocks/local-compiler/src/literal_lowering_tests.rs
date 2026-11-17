@@ -17,8 +17,8 @@
 
 use super::*;
 use arrow_schema::TimeUnit;
+use novarocks_expression::StaticExprKind;
 use novarocks_functions::ConstantValue;
-use novarocks_physical_plan::ExprId;
 use novarocks_type_contract::ValueLogicalType;
 
 fn literal_package(value: ConstantValue) -> Arc<FragmentPackage> {
@@ -31,9 +31,12 @@ fn literal_package(value: ConstantValue) -> Arc<FragmentPackage> {
     builder
         .add_values(NodeId::new(99), Box::from([Box::default()]), Box::default())
         .unwrap();
-    let expression = builder
-        .add_expression(
-            NodeId::new(8),
+    let node = NodeId::new(8);
+    let definition = builder
+        .unit(node)
+        .unwrap()
+        .add(
+            None,
             ty.clone(),
             ExprKind::Constant(ConstantReference {
                 pool,
@@ -41,26 +44,43 @@ fn literal_package(value: ConstantValue) -> Arc<FragmentPackage> {
             }),
         )
         .unwrap();
-    let value = builder
-        .add_value(
-            ty.clone(),
-            ValueOrigin::Expr {
-                node: NodeId::new(8),
-                expr: expression,
-            },
+    let root = builder
+        .unit(node)
+        .unwrap()
+        .root(
+            definition,
+            EvaluationDemand::Value,
+            novarocks_expression_contract::RootScope::Port(0),
         )
+        .unwrap();
+    let value = builder
+        .add_value(ty.clone(), ValueOrigin::Expr { node, root })
         .unwrap();
     builder
         .add_project(
-            NodeId::new(8),
+            node,
             NodeId::new(99),
-            Box::from([(expression, value)]),
+            Box::from([(root, value)]),
             Box::from([value]),
         )
         .unwrap();
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        &FixtureControl,
+        CompilePhase::Validate,
+    )
+    .unwrap();
+    let ports = builder.node_ports(node).unwrap();
+    let unit = builder
+        .take_unit_builder(node)
+        .unwrap()
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    builder.install_unit(node, Arc::new(unit)).unwrap();
     let fragment = builder
         .finish_definition(
-            NodeId::new(8),
+            node,
             FragmentSink::Result,
             PipelineDopDomain {
                 min: 1,
@@ -69,45 +89,9 @@ fn literal_package(value: ConstantValue) -> Arc<FragmentPackage> {
             },
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
+        .unwrap()
+        .with_calls_observed(vec![], &FixtureControl)
         .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let domain = EvaluationRegionId::new(17);
-    let mut invocations = vec![];
-    let bindings = roots
-        .sites()
-        .iter()
-        .enumerate()
-        .map(|(ordinal, (&site, root))| {
-            let use_id = ExpressionUseId::new(ordinal as u32 + 42);
-            invocations.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    region: domain,
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (site, use_id)
-        })
-        .collect();
-    let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let expression_uses =
-        PhysicalRootUses::try_new(&fragment, flow, bindings, &FixtureControl).unwrap();
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &FixtureControl).unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment.id(),
@@ -128,8 +112,7 @@ fn literal_package(value: ConstantValue) -> Arc<FragmentPackage> {
                 required: RequiredContracts::default(),
                 constants,
                 fragment,
-                expression_uses,
-                calls,
+                statement_constant_policy: options(1).constants,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::try_new([]).unwrap(),
@@ -343,16 +326,10 @@ fn exact_scalar_literals_compile_through_the_complete_package_owner() {
         for case in cases(nullable) {
             let ty = case.value.value_type().clone();
             let program = compile_literal(literal_package(case.value), &FixtureControl).unwrap();
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-            let constants = arena
-                .nodes()
+            let constants = program
+                .units()
                 .iter()
+                .flat_map(|unit| unit.definitions().nodes().iter())
                 .filter_map(|node| match node.kind() {
                     StaticExprKind::Constant(value) => Some(value),
                     _ => None,
@@ -381,16 +358,10 @@ fn null_literals_preserve_the_declared_complete_type() {
         )
         .unwrap();
         let program = compile_literal(literal_package(null), &FixtureControl).unwrap();
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-        let value = arena
-            .nodes()
+        let value = program
+            .units()
             .iter()
+            .flat_map(|unit| unit.definitions().nodes().iter())
             .find_map(|node| match node.kind() {
                 StaticExprKind::Constant(value) => Some(value),
                 _ => None,
@@ -425,20 +396,16 @@ fn explicit_interval_components_reach_the_actual_project_root_without_packed_int
         &FixtureControl,
     )
     .unwrap();
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let site = ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(1),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+    let novarocks_local_program::ProgramNodeKind::Project { exprs, .. } =
+        program.graph().nodes()[1].kind()
+    else {
+        panic!("actual interval Project")
     };
-    let root = snapshot.roots().sites().get(&site).unwrap();
+    let reference = exprs[0];
+    let unit = &program.units()[reference.unit.index()];
+    let root = unit.root(reference.root).unwrap();
     assert_eq!(root.demand, EvaluationDemand::Value);
-    let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-    let node = arena.node(root.definition).unwrap();
+    let node = unit.definitions().node(root.definition).unwrap();
     let StaticExprKind::Constant(value) = node.kind() else {
         panic!("actual interval root must retain its authored ConstantValue");
     };
@@ -447,8 +414,8 @@ fn explicit_interval_components_reach_the_actual_project_root_without_packed_int
         value.try_interval_month_day_nano().unwrap(),
         Some((-7, 23, i64::MIN))
     );
-    let root_use = snapshot.bindings().get(&site).unwrap();
-    let invocation = &snapshot.flows()[&ProgramExpressionArena::Main].uses()[root_use];
+    let root_use = root.use_id;
+    let invocation = &unit.control_flow().uses()[&root_use];
     assert_eq!(invocation.definition, root.definition);
     assert!(invocation.arguments.is_empty());
 }

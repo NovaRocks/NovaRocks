@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::ExprKind;
+
 use super::*;
+use crate::test_units::{PureUnitFixture, compiled_root, input_ordinal, kind};
 use arrow_array::{Array, ListArray, MapArray, StringArray, StructArray};
 use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::PureProviderProgramCatalog;
@@ -26,23 +30,19 @@ use novarocks_functions::{
 };
 use novarocks_local_program::{
     KernelAbiVersion, LocalOperatorId, LocalOperatorOrigin, ProgramChannelLayoutRole,
-    ProgramChannelSite, ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind, StaticExprKind, UnpivotConstant as LocalConstant,
+    ProgramChannelSite, ProgramNodeId, ProgramNodeKind, UnpivotConstant as LocalConstant,
 };
 use novarocks_physical_plan::{
-    ConstantPoolId, ConstantPools, ConstantReference, ConstantReferenceError, ExprKind,
-    FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
-    FragmentPackageError, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, NodeId, NodeKind, PhysicalExpressionRoots, PhysicalRootUses,
-    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
-    ResultField, ResultPort, UnpivotConstant, UnpivotSpec, UnpivotValueMapping, ValueId,
-    ValueOrigin,
+    ConstantPoolId, ConstantPools, ConstantReference, ConstantReferenceError, FragmentBuilder,
+    FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageError,
+    FragmentPackageInput, FragmentSink, FrozenFragmentPruning, NodeId, NodeKind, PipelineDopDomain,
+    PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts, ResultField,
+    ResultPort, UnpivotConstant, UnpivotSpec, UnpivotValueMapping, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    FunctionValueType, PureCompileControl, SemanticParameters,
+    CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, SemanticParameters,
 };
+use std::collections::BTreeSet;
 use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
@@ -159,9 +159,9 @@ fn project(
     let mut definitions = Vec::new();
     let mut output = Vec::new();
     for (kind, ty) in items {
-        let expr = builder.add_expression(node, ty.clone(), kind).unwrap();
+        let expr = builder.fixture_value_root(node, ty.clone(), kind).unwrap();
         let value = builder
-            .add_value(ty, ValueOrigin::Expr { node, expr })
+            .add_value(ty, ValueOrigin::Expr { node, root: expr })
             .unwrap();
         definitions.push((expr, value));
         output.push(value);
@@ -174,6 +174,7 @@ fn project(
             output.clone().into_boxed_slice(),
         )
         .unwrap();
+    builder.finish_fixture_unit(node, &Control).unwrap();
     output
 }
 fn list_type() -> DataType {
@@ -348,21 +349,22 @@ fn fixture(
     .enumerate()
     {
         let expr = builder
-            .add_expression(duplicate, ty.clone(), ExprKind::Value(source))
+            .fixture_value_root(duplicate, ty.clone(), ExprKind::Value(source))
             .unwrap();
         let value = builder
             .add_value(
                 ty,
                 ValueOrigin::Expr {
                     node: duplicate,
-                    expr,
+                    root: expr,
                 },
             )
             .unwrap();
         projected.push((expr, value));
         child.push(value);
         if index == 0 {
-            projected.push((expr, value));
+            let duplicate_root = builder.fixture_repeated_root(duplicate, expr).unwrap();
+            projected.push((duplicate_root, value));
             child.push(value);
         }
     }
@@ -374,6 +376,7 @@ fn fixture(
             child.clone().into_boxed_slice(),
         )
         .unwrap();
+    builder.finish_fixture_unit(duplicate, &Control)?;
     let pool_id = ConstantPoolId::new(u32::MAX);
     let scalar_type;
     let data;
@@ -441,33 +444,13 @@ fn fixture(
         pool: pool_id,
         ordinal: 2,
     };
-    let selected_expr = if matches!(shape, Shape::LiteralSource) {
-        builder
-            .add_expression(
-                unpivot,
-                FunctionValueType::new(DataType::Utf8, false),
-                crate::test_constants::utf8(
-                    &mut constants,
-                    &FunctionValueType::new(DataType::Utf8, false),
-                    "authored-literal",
-                    options().constants,
-                ),
-            )
-            .unwrap()
-    } else {
-        builder
-            .add_expression(unpivot, scalar_type.clone(), ExprKind::Constant(selected))
-            .unwrap()
-    };
-    let null_expr = builder
-        .add_expression(unpivot, scalar_type.clone(), ExprKind::Constant(null))
-        .unwrap();
-    let bad_expr = if matches!(shape, Shape::BadScalar) {
-        Some(
-            builder
-                .add_expression(unpivot, scalar_type.clone(), ExprKind::Value(child[3]))
-                .unwrap(),
-        )
+    let literal = if matches!(shape, Shape::LiteralSource) {
+        Some(crate::test_constants::utf8(
+            &mut constants,
+            &FunctionValueType::new(DataType::Utf8, false),
+            "authored-literal",
+            options().constants,
+        ))
     } else {
         None
     };
@@ -559,16 +542,36 @@ fn fixture(
                 1 + (index % 2) as u32
             },
         };
+        let scalar_kind = if matches!(shape, Shape::BadScalar) {
+            ExprKind::Value(child[3])
+        } else if index % 2 == 0 {
+            literal.clone().unwrap_or(ExprKind::Constant(selected))
+        } else {
+            ExprKind::Constant(null)
+        };
+        let scalar_ty =
+            if matches!(shape, Shape::BadScalar) || (index % 2 == 0 && literal.is_some()) {
+                FunctionValueType::new(DataType::Utf8, false)
+            } else {
+                scalar_type.clone()
+            };
+        let scalar_root = builder
+            .fixture_value_root(unpivot, scalar_ty, scalar_kind)
+            .unwrap();
         items.push(UnpivotValueMapping {
             input: if index % 2 == 0 { child[0] } else { child[2] },
             constants: vec![
-                UnpivotConstant::Scalar(bad_expr.unwrap_or(if index % 2 == 0 {
-                    selected_expr
-                } else {
-                    null_expr
-                })),
+                UnpivotConstant::Scalar(scalar_root),
                 if matches!(shape, Shape::JoinedCollectionNullable) && index % 2 == 1 {
-                    UnpivotConstant::Scalar(null_expr)
+                    UnpivotConstant::Scalar(
+                        builder
+                            .fixture_value_root(
+                                unpivot,
+                                scalar_type.clone(),
+                                ExprKind::Constant(null),
+                            )
+                            .unwrap(),
+                    )
                 } else {
                     UnpivotConstant::Int32List(list_reference)
                 },
@@ -602,6 +605,9 @@ fn fixture(
             NodeKind::Unpivot { spec },
         )
         .unwrap();
+    if actual_mappings != 0 {
+        builder.finish_fixture_unit(unpivot, &Control)?;
+    }
     let (root, result_values) = if downstream {
         let root = NodeId::new(7);
         let values = project(
@@ -632,37 +638,6 @@ fn fixture(
         &Control,
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control)?;
-    let domain = EvaluationRegionId::new(u32::MAX);
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = ExpressionUseId::new(u32::MAX - ordinal as u32);
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                region: domain,
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )?;
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control)?;
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control)?;
     let result = ResultPort {
         scalar_schema: None,
         fragment: fid,
@@ -686,8 +661,7 @@ fn fixture(
             version: PlanVersionId::try_new([79; 16]).unwrap(),
             required: RequiredContracts::default(),
             fragment,
-            expression_uses: uses,
-            calls,
+            statement_constant_policy: options().constants,
             pruning: FrozenFragmentPruning::try_new(fid, vec![], &Control)?,
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -790,8 +764,7 @@ fn unpivot_complete_lowering_preserves_ordered_roles_repeated_sources_constants_
             panic!("actual Scalar constant");
         };
         assert!(*nullable);
-        let StaticExprKind::Constant(value) = graph.expressions().node(*expr_id).unwrap().kind()
-        else {
+        let StaticExprKind::Constant(value) = kind(&program, *expr_id) else {
             panic!("original checked CV");
         };
         assert_eq!(value.ordinal(), if index == 0 { 1 } else { 2 });
@@ -843,22 +816,19 @@ fn unpivot_complete_lowering_preserves_ordered_roles_repeated_sources_constants_
     let provenance = program.provenance().get(LocalOperatorId::new(3)).unwrap();
     assert!(matches!(provenance.origin, LocalOperatorOrigin::Direct));
     assert_eq!(provenance.cost_owner, LocalOperatorId::new(3));
-    let bindings = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot()
-        .bindings();
-    for mapping in 0..2 {
-        assert!(bindings.contains_key(&ProgramExpressionRootSite::Node {
-            node: ProgramNodeId::new(3),
-            role: ProgramNodeExpressionRole::UnpivotConstant {
-                mapping,
-                constant: 0
-            }
-        }));
+    let mut roots = BTreeSet::new();
+    for mapping in value_mappings {
+        let LocalConstant::Scalar { expr_id, .. } = mapping.constants[0] else {
+            unreachable!()
+        };
+        let (unit, root) = compiled_root(&program, expr_id);
+        assert!(roots.insert((expr_id.unit, root.use_id)));
+        assert_eq!(
+            unit.control_flow().uses()[&root.use_id].definition,
+            root.definition
+        );
     }
+    assert_eq!(roots.len(), 2);
     assert_eq!(graph.profile().pipeline_dop().get(), 1);
 }
 #[test]
@@ -874,8 +844,7 @@ fn unpivot_selected_nested_constant_keeps_original_ordinal_complete_field_and_su
         let LocalConstant::Scalar { expr_id, .. } = &mapping.constants[0] else {
             panic!("scalar");
         };
-        let StaticExprKind::Constant(value) = graph.expressions().node(*expr_id).unwrap().kind()
-        else {
+        let StaticExprKind::Constant(value) = kind(&program, *expr_id) else {
             panic!("CV");
         };
         assert_eq!(value.ordinal(), if index == 0 { 1 } else { 2 });
@@ -908,7 +877,6 @@ fn unpivot_selected_nested_constant_keeps_original_ordinal_complete_field_and_su
         .columns[3]]
         .ty;
     let actual = program
-        .checked()
         .channels()
         .channel_type(ProgramChannelSite::Layout {
             node: ProgramNodeId::new(3),
@@ -939,19 +907,14 @@ fn unpivot_downstream_value_uses_actual_output_ordinal_and_keeps_independent_pas
     let ProgramNodeKind::Project { exprs, .. } = final_node.kind() else {
         panic!("actual downstream Project");
     };
-    assert!(
-        matches!(graph.expressions().node(exprs[0]).unwrap().kind(),StaticExprKind::SlotId(slot)if *slot==node.output_layout().slots()[0])
-    );
-    assert!(
-        matches!(graph.expressions().node(exprs[1]).unwrap().kind(),StaticExprKind::SlotId(slot)if *slot==node.output_layout().slots()[2])
-    );
-    for ordinal in [0, 2] {
-        assert!(program.checked().slots().values().any(|source| *source
-            == ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                node: ProgramNodeId::new(3),
-                role: ProgramChannelLayoutRole::NodeOutput,
-                ordinal
-            })));
+    assert_eq!(input_ordinal(&program, exprs[0]), 0);
+    assert_eq!(input_ordinal(&program, exprs[1]), 2);
+    for reference in exprs {
+        let (unit, root) = compiled_root(&program, *reference);
+        assert!(Arc::ptr_eq(
+            unit.scope(root.scope).unwrap().schema(),
+            node.output_layout().schema()
+        ));
     }
     assert_ne!(
         node.output_layout().slots()[0],
@@ -982,7 +945,7 @@ fn unpivot_real_static_author_refuses_nonliteral_constant_domain_nullability_map
             Shape::EmptyMappings => "unpivot requires mappings",
             Shape::BadPassthrough => "unpivot passthrough changes the value type",
             Shape::BadValueNullability => "unpivot value output nullability differs",
-            Shape::BadScalar => "unpivot constant type differs",
+            Shape::BadScalar => "Unpivot scalar root must name a checked constant definition",
             Shape::BadMapOrder => "unpivot map keys must be non-empty and strictly increasing",
             Shape::ZeroBounds => "unpivot row/byte bounds are zero",
             _ => unreachable!(),
@@ -1034,7 +997,7 @@ fn unpivot_special_reference_borrows_nonnullable_source_under_nullable_joined_ou
         panic!("individual Scalar NULL")
     };
     assert!(*nullable);
-    let StaticExprKind::Constant(value) = graph.expressions().node(*expr_id).unwrap().kind() else {
+    let StaticExprKind::Constant(value) = kind(&program, *expr_id) else {
         panic!("original CV")
     };
     assert_eq!(value.ordinal(), 2);
@@ -1222,7 +1185,7 @@ fn unpivot_literal_source_keeps_individual_nullability_under_joined_nullable_out
         panic!("literal");
     };
     assert!(!*nullable);
-    let StaticExprKind::Constant(value) = graph.expressions().node(*expr_id).unwrap().kind() else {
+    let StaticExprKind::Constant(value) = kind(&program, *expr_id) else {
         panic!("shared literal admission owner");
     };
     assert_eq!(value.try_utf8().unwrap(), Some("authored-literal"));
@@ -1231,7 +1194,7 @@ fn unpivot_literal_source_keeps_individual_nullability_under_joined_nullable_out
         panic!("CV NULL");
     };
     assert!(*nullable);
-    let StaticExprKind::Constant(value) = graph.expressions().node(*expr_id).unwrap().kind() else {
+    let StaticExprKind::Constant(value) = kind(&program, *expr_id) else {
         panic!("original CV");
     };
     assert_eq!(value.ordinal(), 2);

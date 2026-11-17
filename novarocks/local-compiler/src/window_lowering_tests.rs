@@ -16,8 +16,8 @@
 // under the License.
 
 //! Window lowering: the analytic Sort, the local Analytic with one prepared
-//! call per physical window call, retired call and frame-offset occurrences,
-//! re-rooted argument occurrences, per-call frames and refusals. Every binding
+//! call per physical relation call, unchanged unit-local argument occurrences,
+//! constant-only frame offsets, per-call frames and refusals. Every binding
 //! comes from the real builtin resolver over a sealed subset of the real
 //! catalogue, and each call's frozen effects from a fresh preparation by its
 //! installed owner, as the FE freezes them.
@@ -26,34 +26,35 @@ use super::*;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression_contract::{
+    BoundFunction, ExprKind, PhysicalCallRequest, RootOrdinal, RootScope,
+};
 use novarocks_functions::{
-    AggregateKernelPhase, AggregatePreparationOptions, CallEffectInput, ConstantPolicy,
-    ConstantPool, EngineFunctionCatalogBuilder, FunctionArgument, FunctionBindingRequest,
-    FunctionKind, FunctionResultType, InstalledPureKernel, PreparedPureKernel, PureCallPreparation,
-    PureEngineFunctionCatalog, ScopedExpressionEffects, WindowCallOptions,
+    AggregateKernelPhase, AggregatePreparationOptions, AggregateWindowPreparationOptions,
+    CallEffectInput, ConstantPolicy, ConstantPool, EngineFunctionCatalogBuilder, FunctionArgument,
+    FunctionBindingRequest, FunctionKind, FunctionResultType, InstalledPureKernel,
+    PreparedPureKernel, PureCallPreparation, PureEngineFunctionCatalog, ScopedRelationalEffects,
+    WindowCallOptions,
 };
 use novarocks_local_program::{
-    AnalyticOutputColumn, KernelAbiVersion, LocalProgram, ProgramCallSite, ProgramExpressionArena,
-    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind,
-    ProgramStateTemplate, WindowBoundary, WindowFrame as ProgramFrame, WindowFunctionKind,
-    WindowType,
+    AnalyticOutputColumn, KernelAbiVersion, LocalProgram, ProgramCallSite, ProgramNodeId,
+    ProgramNodeKind, ProgramStateTemplate, WindowBoundary, WindowFrame as ProgramFrame,
+    WindowFunctionKind, WindowType,
 };
+use novarocks_physical_plan::StaticFunctionArgument;
 use novarocks_physical_plan::{
-    AggregateBinding, AggregatePhase, BoundFunction, ConstantPoolId, ConstantPools,
-    ConstantReference, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
-    FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType, NodeId,
-    NodeKind, NullOrdering, PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
-    PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort, SortDirection,
-    SortExpr, SortMode, StaticFunctionArgument, ValueOrigin, WindowExpression, WindowSpec,
+    AggregateBinding, AggregatePhase, ConstantPoolId, ConstantPools, ConstantReference,
+    FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
+    FragmentPackageInput, FragmentSink, FrozenFragmentPruning, FrozenPhysicalCall,
+    FunctionArgumentType, NodeId, NodeKind, NullOrdering, PhysicalCallSite, PipelineDopDomain,
+    PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts, ResultField,
+    ResultPort, SortDirection, SortExpr, SortMode, ValueOrigin, WindowCallSpec, WindowSpec,
 };
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEffects, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    FunctionValueType, PureCompileControl, SemanticParameters, WindowBound, WindowFrame,
-    WindowFrameExclusion, WindowFrameUnits,
+    CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
+    EvaluationDemand, ExpressionEffects, FunctionValueType, PureCompileControl, RelationCallId,
+    RelationEffectContext, SemanticParameters, WindowBound, WindowFrame, WindowFrameExclusion,
+    WindowFrameUnits,
 };
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
@@ -61,7 +62,6 @@ const VALUES: NodeId = NodeId::new(0);
 const SORT: NodeId = NodeId::new(1);
 const WINDOW: NodeId = NodeId::new(2);
 const POLICY: DecimalOverflowPolicy = DecimalOverflowPolicy::ReportError;
-const CHILD_USE_BASE: u32 = 1_000_000;
 const CONSTANT_POOL: u32 = 7;
 const P: usize = 0;
 const O: usize = 1;
@@ -211,7 +211,7 @@ fn int64(nullable: bool) -> FunctionValueType {
     FunctionValueType::new(DataType::Int64, nullable)
 }
 
-fn ascending(expr: ExprId) -> SortExpr {
+fn ascending(expr: RootOrdinal) -> SortExpr {
     SortExpr {
         expr,
         direction: SortDirection::Ascending,
@@ -219,22 +219,46 @@ fn ascending(expr: ExprId) -> SortExpr {
     }
 }
 
-fn references(fragment: &Fragment, definition: ExprId) -> Vec<ExprId> {
-    let mut references = Vec::new();
-    fragment
-        .expressions()
-        .get(definition)
+trait RootFixture {
+    fn add_root(
+        &mut self,
+        node: NodeId,
+        ty: FunctionValueType,
+        kind: ExprKind,
+        scope: RootScope,
+    ) -> Result<RootOrdinal, novarocks_expression_contract::UnitError>;
+}
+impl RootFixture for FragmentBuilder {
+    fn add_root(
+        &mut self,
+        node: NodeId,
+        ty: FunctionValueType,
+        kind: ExprKind,
+        scope: RootScope,
+    ) -> Result<RootOrdinal, novarocks_expression_contract::UnitError> {
+        let draft = self
+            .unit(node)
+            .expect("fixture node must keep its original draft");
+        let definition = draft.add(None, ty, kind)?;
+        draft.root(definition, EvaluationDemand::Value, scope)
+    }
+}
+fn install_pure_unit(builder: &mut FragmentBuilder, node: NodeId) {
+    if builder.construction_unit(node).is_none() {
+        return;
+    }
+    let ports = builder.node_ports(node).unwrap();
+    let draft = builder.take_unit_builder(node).unwrap();
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    let unit = draft
+        .seal(ports, &mut work)
         .unwrap()
-        .kind
-        .expression_references_observed::<std::convert::Infallible>(|id| {
-            references.push(id);
-            Ok(())
-        })
+        .finish(BTreeMap::new(), &mut work)
         .unwrap();
-    references
+    work.finish().unwrap();
+    builder.install_unit(node, Arc::new(unit)).unwrap();
 }
 
-/// `Values(p, o, x) -> Sort -> Window(shape) -> Result`.
 fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPackage> {
     let complete =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
@@ -259,7 +283,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             row.iter()
                 .map(|cell| {
                     builder
-                        .add_expression(
+                        .add_root(
                             VALUES,
                             int64(true),
                             match cell {
@@ -275,6 +299,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                                     constant_policy(),
                                 ),
                             },
+                            RootScope::AllPorts,
                         )
                         .unwrap()
                 })
@@ -313,7 +338,12 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
     let key = |builder: &mut FragmentBuilder, owner, column: usize| {
         ascending(
             builder
-                .add_expression(owner, int64(true), ExprKind::Value(columns[column]))
+                .add_root(
+                    owner,
+                    int64(true),
+                    ExprKind::Value(columns[column]),
+                    RootScope::Port(0),
+                )
                 .unwrap(),
         )
     };
@@ -353,7 +383,12 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                 Arg::Column(column) => {
                     arguments.push(
                         builder
-                            .add_expression(WINDOW, int64(true), ExprKind::Value(columns[*column]))
+                            .add_root(
+                                WINDOW,
+                                int64(true),
+                                ExprKind::Value(columns[*column]),
+                                RootScope::Port(0),
+                            )
                             .unwrap(),
                     );
                     request.push(FunctionArgument::Value {
@@ -369,7 +404,12 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                     };
                     arguments.push(
                         builder
-                            .add_expression(WINDOW, int64(false), ExprKind::Constant(reference))
+                            .add_root(
+                                WINDOW,
+                                int64(false),
+                                ExprKind::Constant(reference),
+                                RootScope::Port(0),
+                            )
                             .unwrap(),
                     );
                     request.push(FunctionArgument::Value {
@@ -417,7 +457,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             ),
             result_type.clone(),
         );
-        function.legacy_metadata = Some(novarocks_physical_plan::LegacyBindingMetadata {
+        function.legacy_metadata = Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: bound.semantics.volatility,
             argument_evaluation: bound.semantics.argument_evaluation,
             failure_behavior: bound.semantics.failure_behavior,
@@ -442,18 +482,14 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                 WindowBound::CurrentRow => WindowBound::CurrentRow,
                 WindowBound::UnboundedFollowing => WindowBound::UnboundedFollowing,
                 WindowBound::Preceding(offset) | WindowBound::Following(offset) => {
-                    let literal = builder
-                        .add_expression(
-                            WINDOW,
-                            int64(false),
-                            crate::test_constants::i64(
-                                &mut pools,
-                                &int64(false),
-                                i64::try_from(offset).unwrap(),
-                                constant_policy(),
-                            ),
-                        )
-                        .unwrap();
+                    let ExprKind::Constant(literal) = crate::test_constants::i64(
+                        &mut pools,
+                        &int64(false),
+                        i64::try_from(offset).unwrap(),
+                        constant_policy(),
+                    ) else {
+                        panic!("actual window offset constant");
+                    };
                     if matches!(bound, WindowBound::Preceding(_)) {
                         WindowBound::Preceding(literal)
                     } else {
@@ -469,37 +505,32 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             }
         });
         let request_types = function.argument_types.clone();
-        let expression = builder
-            .add_expression(
-                WINDOW,
-                result_type.clone(),
-                ExprKind::WindowCall {
-                    function,
-                    distinct: call.distinct,
-                    args: arguments.into_boxed_slice(),
-                    function_order_by: function_order_by.into_boxed_slice(),
-                    frame,
-                    ignore_nulls: call.ignore_nulls,
-                    aggregate_binding,
-                },
-            )
-            .unwrap();
         let value = builder
             .add_value(
                 result_type,
-                ValueOrigin::Expr {
+                ValueOrigin::NodeOutput {
                     node: WINDOW,
-                    expr: expression,
+                    output_ordinal: u32::try_from(output.len()).unwrap(),
                 },
             )
             .unwrap();
         output.push(value);
-        expressions.push(WindowExpression {
-            expression,
+        let call_ordinal = u32::try_from(expressions.len()).unwrap();
+        expressions.push(WindowCallSpec {
+            binding: function,
+            distinct: call.distinct,
+            arguments: arguments.into_boxed_slice(),
+            order_by: function_order_by.into_boxed_slice(),
+            frame,
+            ignore_nulls: call.ignore_nulls,
+            aggregate_binding,
             output: value,
         });
         requests.push((
-            PhysicalCallDefinition::Expression(expression),
+            PhysicalCallSite::Window {
+                node: WINDOW,
+                call: call_ordinal,
+            },
             PhysicalCallRequest {
                 arguments: request_types
                     .iter()
@@ -526,12 +557,15 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             NodeKind::Window(WindowSpec {
                 partition_by,
                 order_by,
-                expressions: expressions.into_boxed_slice(),
+                calls: expressions.into_boxed_slice(),
             }),
         )
         .unwrap();
+    for node in [VALUES, SORT, WINDOW] {
+        install_pure_unit(&mut builder, node);
+    }
     let fragment = builder
-        .finish_definition(
+        .finish_structure(
             WINDOW,
             FragmentSink::Result,
             PipelineDopDomain {
@@ -539,86 +573,32 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                 max: 1,
                 requires_power_of_two: false,
             },
+            PlanLimits::FROZEN,
+            &Control,
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap()
         .with_call_requests_observed(requests, &Control)
         .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationRegionId::new(0);
-    let context = |id: u32| ExpressionEffectContext {
-        use_id: ExpressionUseId::new(id),
-        region: domain,
-        demand: EvaluationDemand::Value,
-    };
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    let mut window_uses = Vec::new();
-    let mut next_child = CHILD_USE_BASE;
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = u32::try_from(ordinal).unwrap();
-        let mut children = Vec::new();
-        if matches!(
-            fragment.expressions().get(root.expr).unwrap().kind,
-            ExprKind::WindowCall { .. }
-        ) {
-            for reference in references(&fragment, root.expr) {
-                uses.push(ExpressionInvocation {
-                    context: context(next_child),
-                    definition: reference,
-                    control: ControlShape::Eager,
-                    arguments: Box::default(),
-                });
-                children.push(ExpressionUseId::new(next_child));
-                next_child += 1;
-            }
-            window_uses.push((ExpressionUseId::new(id), root.expr, children.clone()));
-        }
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                demand: root.demand,
-                ..context(id)
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: children.into_boxed_slice(),
-        });
-        bindings.push((*site, ExpressionUseId::new(id)));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let root_uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut frozen = Vec::new();
-    for ((use_id, expression, children), call) in window_uses.into_iter().zip(&shape.calls) {
-        let ExprKind::WindowCall {
-            function,
-            args,
-            ignore_nulls,
-            aggregate_binding,
-            ..
-        } = &fragment.expressions().get(expression).unwrap().kind
-        else {
-            unreachable!()
+    let NodeKind::Window(spec) = &fragment.nodes()[&WINDOW].kind else {
+        panic!("fixture Window");
+    };
+    for (ordinal, (item, call)) in spec.calls.iter().zip(&shape.calls).enumerate() {
+        let function = &item.binding;
+        let args = &item.arguments;
+        let ignore_nulls = item.ignore_nulls;
+        let aggregate_binding = &item.aggregate_binding;
+        let site = PhysicalCallSite::Window {
+            node: WINDOW,
+            call: ordinal as u32,
         };
+        let call_context = RelationEffectContext::call(RelationCallId::new(ordinal as u32));
         // The fresh preparation sees only the logical channels; a refused
         // function ORDER BY channel has no preparation of its own.
         let logical = args.len();
-        let request = fragment
-            .call_requests()
-            .get(PhysicalCallDefinition::Expression(expression))
-            .unwrap()
-            .arguments[..logical]
+        let request = fragment.call_requests().get(site).unwrap().arguments[..logical]
             .iter()
             .map(|argument| match argument {
                 StaticFunctionArgument::Value {
@@ -647,35 +627,55 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                 }
             }),
         });
-        let argument_uses = children[..logical]
+        let argument_uses = args
             .iter()
-            .map(|child| Some(*child))
+            .map(|root| {
+                Some(
+                    fragment.nodes()[&WINDOW]
+                        .expressions
+                        .as_ref()
+                        .unwrap()
+                        .root_use(*root)
+                        .unwrap(),
+                )
+            })
             .collect::<Vec<_>>();
-        let call_context = context(use_id.get());
         if call.uninstalled {
             frozen.push(FrozenPhysicalCall {
                 materialized_writer_input: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                site: PhysicalCallSite::Expression(use_id),
+                site,
                 context: call_context,
-                effects: declared_aggregate_effects(CallProofScope::Region(domain)),
+                effects: declared_aggregate_effects(CallProofScope::Relation(
+                    call_context.identity,
+                )),
                 decimal_overflow_policy: POLICY,
             });
             continue;
         }
         let arguments =
-            ScopedExpressionEffects::primitive(call_context, ExpressionEffects::PURE_VALUE);
+            ScopedRelationalEffects::primitive(call_context, ExpressionEffects::PURE_VALUE);
         let options = if aggregate_binding.is_some() {
-            PureCallPreparation::Aggregate {
+            PureCallPreparation::AggregateWindow {
                 arguments,
-                options: AggregatePreparationOptions {
-                    state_interpretation: None,
-                    phase: AggregateKernelPhase::Single,
-                    distinct: false,
-                    order_keys: Arc::from([]),
-                    state_input_type: None,
+                options: AggregateWindowPreparationOptions {
+                    aggregate: AggregatePreparationOptions {
+                        state_interpretation: None,
+                        phase: AggregateKernelPhase::Single,
+                        distinct: false,
+                        order_keys: Arc::from([]),
+                        state_input_type: None,
+                    },
+                    window: WindowCallOptions::try_new(
+                        call.frame.map(|(units, start, end)| WindowFrame {
+                            units,
+                            start,
+                            end,
+                            exclusion: WindowFrameExclusion::NoOthers,
+                        }),
+                        ignore_nulls,
+                        &Control,
+                    )
+                    .unwrap(),
                 },
             }
         } else {
@@ -687,13 +687,13 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             });
             PureCallPreparation::Window {
                 arguments,
-                options: WindowCallOptions::try_new(frame, *ignore_nulls, &Control).unwrap(),
+                options: WindowCallOptions::try_new(frame, ignore_nulls, &Control).unwrap(),
             }
         };
         let token = catalog
             .prepare_fresh(
                 CallEffectInput {
-                    context: call_context,
+                    context: call_context.into(),
                     argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
                         &argument_uses,
                     ),
@@ -708,7 +708,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: POLICY,
-                    proof_scope: CallProofScope::Region(domain),
+                    proof_scope: CallProofScope::Relation(call_context.identity),
                 },
                 Arc::clone(&selection),
                 options,
@@ -717,16 +717,13 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             .unwrap_or_else(|error| panic!("fixture window call prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
             materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: PhysicalCallSite::Expression(use_id),
+            site,
             context: call_context,
             effects: token.call_contract().effects().clone(),
             decimal_overflow_policy: POLICY,
         });
     }
-    let calls = FrozenFragmentCalls::try_new(&fragment, &root_uses, frozen, &Control).unwrap();
+    let fragment = fragment.with_calls_observed(frozen, &Control).unwrap();
     let output = fragment.nodes()[&WINDOW].output.clone();
     let result = ResultPort {
         scalar_schema: None,
@@ -751,11 +748,10 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
         FragmentPackage::try_new(
             FragmentPackageInput {
                 constants: pools,
+                statement_constant_policy: constant_policy(),
                 version: PlanVersionId::try_new([97; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                expression_uses: root_uses,
-                calls,
                 pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
@@ -937,50 +933,55 @@ fn window_call_occurrences_retire_and_their_arguments_become_window_input_roots(
     let source = package(&shape, &catalog);
     let program = try_compile(&shape).unwrap();
     let (node, _) = analytic(&program);
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-    let bindings = snapshot.bindings();
-    let physical = source.expression_uses();
+    let ProgramNodeKind::Analytic {
+        functions,
+        partition_exprs,
+        order_by_exprs,
+        ..
+    } = analytic(&program).1
+    else {
+        panic!("compiled Window");
+    };
+    let source_unit = source.fragment().nodes()[&WINDOW]
+        .expressions
+        .as_ref()
+        .unwrap();
     let mut calls = 0;
-    for (site, use_id) in physical.bindings() {
-        let novarocks_physical_plan::ExpressionRootRole::WindowCall { call } = site.role else {
-            continue;
-        };
+    for (call, function) in functions.iter().enumerate() {
         calls += 1;
-        let invocation = &physical.flow().uses()[use_id];
-        // The call's own occurrence is the frozen relational context: it
-        // leaves the flow, and so does every frame-offset occurrence.
-        assert!(!flow.uses().contains_key(use_id));
-        let channels = shape.calls[call as usize].args.len();
-        for offset in &invocation.arguments[channels..] {
-            assert!(!flow.uses().contains_key(offset));
-        }
-        // Each argument occurrence is now an independent WindowInput root.
-        for (argument, child) in invocation.arguments[..channels].iter().enumerate() {
-            let site = ProgramExpressionRootSite::Node {
-                node,
-                role: ProgramNodeExpressionRole::WindowInput {
-                    call,
-                    argument: argument as u32,
-                },
+        let site = PhysicalCallSite::Window {
+            node: WINDOW,
+            call: call as u32,
+        };
+        let frozen = source.calls().entries()[&site].context;
+        let resolved = &program.resolved_calls().calls()[&ProgramCallSite::Window {
+            node,
+            call: call as u32,
+        }];
+        assert_eq!(resolved.call_contract().context(), frozen.into());
+        for (argument, reference) in function.args.iter().enumerate() {
+            let unit = program.unit(reference.unit).unwrap();
+            let compiled_root = unit.root(reference.root).unwrap();
+            let source_call = match &source.fragment().nodes()[&WINDOW].kind {
+                NodeKind::Window(spec) => &spec.calls[call],
+                _ => unreachable!(),
             };
-            assert_eq!(bindings.get(&site), Some(child));
-            assert!(flow.root_use_ids().contains(child));
+            let original = source_call.arguments[argument];
+            assert_eq!(
+                compiled_root.use_id,
+                source_unit.root_use(original).unwrap()
+            );
+            assert_eq!(compiled_root.demand, EvaluationDemand::Value);
+            assert!(
+                unit.control_flow()
+                    .root_use_ids()
+                    .contains(&compiled_root.use_id)
+            );
+            assert_eq!(
+                unit.control_flow().uses()[&compiled_root.use_id].context,
+                source_unit.control_flow().uses()[&compiled_root.use_id].context
+            );
         }
-        // The prepared call sits at its Window site with the frozen context.
-        let frozen = source.calls().entries()[&PhysicalCallSite::Expression(*use_id)].context;
-        let resolved = &program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()[&ProgramCallSite::Window { node, call }];
-        assert_eq!(resolved.call_contract().context(), frozen);
         let ProgramStateTemplate::WindowPartition {
             node: owner,
             call: ordinal,
@@ -989,22 +990,33 @@ fn window_call_occurrences_retire_and_their_arguments_become_window_input_roots(
         else {
             panic!("a window call owns a partition lifecycle");
         };
-        assert_eq!((owner, ordinal), (node, call));
+        assert_eq!((owner, ordinal), (node, call as u32));
         let PreparedPureKernel::Window(actual) = resolved.specialization().prepared() else {
             panic!("an exact window kernel");
         };
         assert!(Arc::ptr_eq(kernel, actual));
-        // The prepared options keep the frozen absence of a frame.
-        let explicit = shape.calls[call as usize].frame.is_some();
+        let explicit = shape.calls[call].frame.is_some();
         assert_eq!(kernel.contract().options().frame().is_some(), explicit);
     }
     assert_eq!(calls, 5);
-    for role in [
-        ProgramNodeExpressionRole::WindowPartition { key: 0 },
-        ProgramNodeExpressionRole::WindowOrder { key: 0 },
-    ] {
-        assert!(bindings.contains_key(&ProgramExpressionRootSite::Node { node, role }));
+    assert_eq!((partition_exprs.len(), order_by_exprs.len()), (1, 1));
+    for reference in partition_exprs.iter().chain(order_by_exprs) {
+        let unit = program.unit(reference.unit).unwrap();
+        assert!(unit.root(reference.root).is_some());
     }
+    // Relational calls and frame offsets have no scalar definitions or uses.
+    assert!(program.units().iter().all(|unit| unit.calls().is_empty()));
+    let NodeKind::Window(spec) = &source.fragment().nodes()[&WINDOW].kind else {
+        unreachable!()
+    };
+    let logical_roots = spec.partition_by.len()
+        + spec.order_by.len()
+        + spec
+            .calls
+            .iter()
+            .map(|call| call.arguments.len() + call.order_by.len())
+            .sum::<usize>();
+    assert_eq!(source_unit.roots().len(), logical_roots);
 }
 
 #[test]
@@ -1094,15 +1106,7 @@ fn window_metadata_without_pure_owner_remains_a_capability_refusal() {
     let NodeKind::Window(spec) = &source.fragment().nodes()[&WINDOW].kind else {
         panic!("expected the fixture window")
     };
-    let ExprKind::WindowCall { function, .. } = &source
-        .fragment()
-        .expressions()
-        .get(spec.expressions[0].expression)
-        .unwrap()
-        .kind
-    else {
-        panic!("expected the fixture window call")
-    };
+    let function = &spec.calls[0].binding;
     let original = catalog
         .metadata()
         .definition("row_number", FunctionKind::Window)
@@ -1162,12 +1166,7 @@ fn sum_min_max_over_prepare_through_their_installed_window_kernels() {
             frame(WindowType::Rows, Some(Current), Some(After(2))),
         ]
     );
-    let calls = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .calls();
+    let calls = program.resolved_calls().calls();
     for (call, name) in ["sum", "min", "max", "sum"].into_iter().enumerate() {
         let function = &functions[call];
         assert!(matches!(function.kind, WindowFunctionKind::Prepared));

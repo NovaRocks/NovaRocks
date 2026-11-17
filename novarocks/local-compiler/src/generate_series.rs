@@ -26,18 +26,16 @@ use arrow_schema::DataType;
 use novarocks_local_program::{
     DiagnosticSourceNodeId, LocalOperatorId, LocalOperatorOrigin, LocalOperatorProvenance,
     MetricAggregation, OperatorMetricAggregation, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramExprId, ProgramExpressionRootSite, ProgramNode, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind, ProgramRootUseBinding, StaticValues, StaticValuesCell,
+    ProgramNode, ProgramNodeId, ProgramNodeKind, StaticValues, StaticValuesCell,
 };
 use novarocks_physical_plan::{
-    Distribution, ExprId, ExpressionRootRole, FragmentPackage, NodeId, NodeKind, PhysicalNode,
-    RowMultiplicity,
+    Distribution, FragmentPackage, NodeKind, PhysicalNode, RowMultiplicity,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, ExpressionUseId, FunctionValueType, ValueLogicalType,
+    CompileCheckpoints, CompileControlError, FunctionValueType, ValueLogicalType,
 };
 use novarocks_types::SlotId;
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 pub(crate) struct PlannedGenerateSeries {
     pub bounds: ProgramNodeId,
@@ -47,7 +45,7 @@ pub(crate) struct PlannedGenerateSeries {
 
 pub(crate) fn parameter_ids(
     node: &PhysicalNode,
-) -> Result<[Option<ExprId>; 3], FragmentCompileError> {
+) -> Result<[Option<novarocks_expression_contract::RootOrdinal>; 3], FragmentCompileError> {
     let NodeKind::GenerateSeries { start, stop, step } = node.kind else {
         return Err(FragmentCompileError::Invalid(
             "series lowering for another node family",
@@ -114,15 +112,8 @@ pub(crate) fn admit(
         });
     }
     for id in parameter_ids(node)?.into_iter().flatten() {
-        let expression =
-            package
-                .fragment()
-                .expressions()
-                .get(id)
-                .ok_or(FragmentCompileError::Invalid(
-                    "missing series parameter definition",
-                ))?;
-        let same = expression.owner == node.id && expression.ty == *ty;
+        let expression = crate::expressions::bound_root(package, node.id, id)?;
+        let same = expression.ty == *ty;
         work.step()?;
         if !same {
             return Err(FragmentCompileError::Invalid(
@@ -144,7 +135,7 @@ pub(crate) fn lower_with_creation<H>(
     physical: &PhysicalNode,
     planned: &PlannedGenerateSeries,
     output_slots: &[SlotId],
-    definitions: &BTreeMap<ExprId, ProgramExprId>,
+    definitions: &crate::expressions::RootMap,
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<LoweredGenerateSeries, crate::FragmentCreationError<H>> {
@@ -162,14 +153,7 @@ pub(crate) fn lower_with_creation<H>(
     let mut nodes = Vec::new();
     let mut operators = Vec::new();
     for (column, id) in ids.into_iter().flatten().enumerate() {
-        let source =
-            package
-                .fragment()
-                .expressions()
-                .get(id)
-                .ok_or(FragmentCompileError::Invalid(
-                    "missing series parameter definition",
-                ))?;
+        let source = crate::expressions::bound_root(package, physical.id, id)?;
         let definition = *definitions.get(&id).ok_or(FragmentCompileError::Invalid(
             "series bound definition was not lowered",
         ))?;
@@ -296,33 +280,4 @@ pub(crate) fn lower_with_creation<H>(
         channels,
         operators,
     })
-}
-
-pub(crate) fn argument_root(
-    plans: &BTreeMap<NodeId, PlannedGenerateSeries>,
-    node: NodeId,
-    role: ExpressionRootRole,
-    use_id: ExpressionUseId,
-) -> Result<Option<ProgramRootUseBinding>, FragmentCompileError> {
-    let column = match role {
-        ExpressionRootRole::SeriesStart => 0,
-        ExpressionRootRole::SeriesStop => 1,
-        ExpressionRootRole::SeriesStep => 2,
-        _ => return Ok(None),
-    };
-    let plan = plans.get(&node).ok_or(FragmentCompileError::Invalid(
-        "series root has no original source owner",
-    ))?;
-    if column as usize >= plan.parameter_slots.len() {
-        return Err(FragmentCompileError::Invalid(
-            "series step root has no explicit parameter",
-        ));
-    }
-    Ok(Some(ProgramRootUseBinding {
-        site: ProgramExpressionRootSite::Node {
-            node: plan.bounds,
-            role: ProgramNodeExpressionRole::ValuesCell { row: 0, column },
-        },
-        use_id,
-    }))
 }

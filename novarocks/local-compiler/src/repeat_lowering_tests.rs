@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_expression_contract::ExprKind;
+
 use super::*;
+use crate::test_units::{PureUnitFixture, compiled_root, input_ordinal};
 use arrow_schema::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
@@ -25,20 +28,16 @@ use novarocks_functions::{
 };
 use novarocks_local_program::{
     KernelAbiVersion, LocalOperatorId, LocalOperatorOrigin, ProgramChannelLayoutRole,
-    ProgramChannelSite, ProgramLexicalSource, ProgramNodeId, ProgramNodeKind, StaticExprKind,
-    StaticSinkProgram,
+    ProgramChannelSite, ProgramNodeId, ProgramNodeKind, StaticSinkProgram,
 };
 use novarocks_physical_plan::{
-    ExprKind, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
-    FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, GroupingOutput,
-    NodeId, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits,
-    PlanVersionId, PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort,
-    ValueId, ValueOrigin,
+    FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
+    FragmentPackageInput, FragmentSink, FrozenFragmentPruning, GroupingOutput, NodeId,
+    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
+    ResultField, ResultPort, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    FunctionValueType, PureCompileControl, SemanticParameters,
+    CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, SemanticParameters,
 };
 use std::{
     collections::BTreeMap,
@@ -152,14 +151,14 @@ fn add_projection(
     let mut values = Vec::new();
     for (kind, ty) in items {
         let expression = builder
-            .add_expression(node, ty.clone(), kind.clone())
+            .fixture_value_root(node, ty.clone(), kind.clone())
             .unwrap();
         let value = builder
             .add_value(
                 ty.clone(),
                 ValueOrigin::Expr {
                     node,
-                    expr: expression,
+                    root: expression,
                 },
             )
             .unwrap();
@@ -174,6 +173,7 @@ fn add_projection(
             values.clone().into_boxed_slice(),
         )
         .unwrap();
+    builder.finish_fixture_unit(node, &Control).unwrap();
     values
 }
 
@@ -228,14 +228,14 @@ fn fixture(
     let mut output = Vec::new();
     for (index, source) in initial_values.iter().enumerate() {
         let expression = builder
-            .add_expression(duplicate, items[index].1.clone(), ExprKind::Value(*source))
+            .fixture_value_root(duplicate, items[index].1.clone(), ExprKind::Value(*source))
             .unwrap();
         let value = builder
             .add_value(
                 items[index].1.clone(),
                 ValueOrigin::Expr {
                     node: duplicate,
-                    expr: expression,
+                    root: expression,
                 },
             )
             .unwrap();
@@ -245,7 +245,10 @@ fn fixture(
         if index == 0 {
             // One authored definition can appear twice in the output port;
             // its origin still names its one exact defining expression.
-            projection.push((expression, value));
+            let duplicate_root = builder
+                .fixture_repeated_root(duplicate, expression)
+                .unwrap();
+            projection.push((duplicate_root, value));
             output.push(value);
         }
     }
@@ -257,6 +260,7 @@ fn fixture(
             output.clone().into_boxed_slice(),
         )
         .unwrap();
+    builder.finish_fixture_unit(duplicate, &Control)?;
     let rollup = &published[..keys];
     let sets = if matches!(case, Case::EmptySets) {
         Vec::new()
@@ -369,41 +373,6 @@ fn fixture(
         &Control,
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control)?;
-    let domain = EvaluationRegionId::new(u32::MAX);
-    let mut invocations = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        assert!(matches!(
-            fragment.expressions().get(root.expr).unwrap().kind,
-            ExprKind::Value(_) | ExprKind::Constant(_)
-        ));
-        let use_id = ExpressionUseId::new(u32::MAX - ordinal as u32);
-        invocations.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id,
-                region: domain,
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, use_id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )?;
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control)?;
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control)?;
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
@@ -427,8 +396,7 @@ fn fixture(
             version: PlanVersionId::try_new([73; 16]).unwrap(),
             required: RequiredContracts::default(),
             fragment,
-            expression_uses: uses,
-            calls,
+            statement_constant_policy: options().constants,
             pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &Control)?,
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -469,7 +437,6 @@ fn repeat_nullable_replacement_preserves_nested_field_metadata_and_complete_chan
             .columns[ordinal]]
             .ty;
         let actual = program
-            .checked()
             .channels()
             .channel_type(ProgramChannelSite::Layout {
                 node: node.local_id().expect("compiled local identity"),
@@ -541,7 +508,6 @@ fn repeat_complete_lowering_preserves_every_occurrence_ordered_bits_headers_and_
         assert_eq!(field.data_type(), &DataType::Int64);
         assert_eq!(field.is_nullable(), ordinal < 3);
         let complete = program
-            .checked()
             .channels()
             .channel_type(ProgramChannelSite::Layout {
                 node: node.local_id().expect("compiled local identity"),
@@ -561,15 +527,7 @@ fn repeat_complete_lowering_preserves_every_occurrence_ordered_bits_headers_and_
     let provenance = program.provenance().get(LocalOperatorId::new(3)).unwrap();
     assert!(matches!(provenance.origin, LocalOperatorOrigin::Direct));
     assert_eq!(provenance.cost_owner, LocalOperatorId::new(3));
-    assert!(
-        program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()
-            .is_empty()
-    );
+    assert!(program.resolved_calls().calls().is_empty());
 }
 
 #[test]
@@ -586,35 +544,23 @@ fn repeat_downstream_value_uses_proved_replacement_representative_and_keeps_root
     let ProgramNodeKind::Project { exprs, .. } = final_node.kind() else {
         panic!("actual downstream Project");
     };
-    assert!(
-        matches!(graph.expressions().node(exprs[0]).unwrap().kind(), StaticExprKind::SlotId(slot) if *slot == repeat.output_layout().slots()[0])
-    );
-    assert!(program.checked().slots().values().any(|source| *source
-        == ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-            node: repeat.local_id().expect("compiled local identity"),
-            role: ProgramChannelLayoutRole::NodeOutput,
-            ordinal: 0
-        })));
+    assert_eq!(input_ordinal(&program, exprs[0]), 0);
+    let (unit, root) = compiled_root(&program, exprs[0]);
+    assert!(Arc::ptr_eq(
+        unit.scope(root.scope).unwrap().schema(),
+        repeat.output_layout().schema()
+    ));
     assert_eq!(
         final_node.output_layout().schema().field(0).name(),
         "selected_0"
     );
     assert!(final_node.output_layout().schema().field(0).is_nullable());
     assert!(
-        program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot()
-            .bindings()
-            .keys()
-            .all(|site| match site {
-                novarocks_local_program::ProgramExpressionRootSite::Node { node, .. } =>
-                    *node != repeat.local_id().expect("compiled local identity"),
-                _ => true,
-            })
+        fixture.package.fragment().nodes()[&fixture.repeat]
+            .expressions
+            .is_none()
     );
+    assert!(matches!(repeat.kind(), ProgramNodeKind::Repeat { .. }));
 }
 
 #[test]

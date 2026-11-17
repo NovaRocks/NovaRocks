@@ -26,9 +26,9 @@ use arrow_schema::{DataType, Field, Schema};
 use novarocks_connector_contract::WriteTargetOrdinal;
 use novarocks_functions::*;
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CallProofScope, DecimalOverflowPolicy, EvaluationRegionId,
-    ExpressionEffectContext, FunctionEffectDeclaration, FunctionInstanceState,
-    FunctionNullBehavior, ObservableEffects, SemanticParameters, WindowFrame as CommonWindowFrame,
+    ArgumentControl, CallEffects, CallProofScope, DecimalOverflowPolicy, ExpressionUseId,
+    FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior, ObservableEffects,
+    RelationCallId, RelationEffectContext, SemanticParameters, WindowFrame as CommonWindowFrame,
 };
 use std::{
     mem::MaybeUninit,
@@ -315,7 +315,8 @@ pub(crate) struct Call<'owner> {
     owner: &'owner Owner,
     pub(crate) selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
-    uses: [Option<ExpressionUseId>; 1],
+    uses: Vec<Option<ExpressionUseId>>,
+    _argument_unit: Arc<novarocks_expression::CompiledExprSet>,
     parameters: SemanticParameters,
     pub(crate) context_id: u32,
     state_input_type: FunctionValueType,
@@ -334,23 +335,41 @@ impl<'owner> Call<'owner> {
                 FunctionArgumentType::Lambda { .. } => unreachable!("typed fixture uses values"),
             })
             .collect();
+        let types: Vec<_> = selected
+            .argument_types
+            .iter()
+            .map(|ty| match ty {
+                FunctionArgumentType::Value(ty) => ty.clone(),
+                FunctionArgumentType::Lambda { .. } => unreachable!("typed fixture uses values"),
+            })
+            .collect();
+        let argument_unit = crate::test_support::argument_unit(&types);
+        let uses = (0..types.len())
+            .map(|ordinal| {
+                Some(
+                    argument_unit
+                        .root(novarocks_expression_contract::RootOrdinal::new(
+                            ordinal as u32,
+                        ))
+                        .unwrap()
+                        .use_id,
+                )
+            })
+            .collect();
         Self {
             owner,
             selected,
             arguments,
-            uses: [Some(ExpressionUseId::new(1))],
-            parameters: SemanticParameters::default(),
+            uses,
+            _argument_unit: argument_unit,
+            parameters: SemanticParameters::try_new([]).unwrap(),
             context_id: u32::MAX,
             state_input_type: value_type(DataType::Int64),
         }
     }
     pub(crate) fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
-                use_id: ExpressionUseId::new(self.context_id),
-                region: EvaluationRegionId::new(1),
-                demand: EvaluationDemand::Value,
-            },
+            context: self.context().into(),
             argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: self.owner.declaration.function_id(),
             kind: self.owner.declaration.kind(),
@@ -371,18 +390,20 @@ impl<'owner> Call<'owner> {
         if !phase.consumes_logical_arguments() {
             input.argument_uses = novarocks_functions::CallArgumentUses::AggregateMerge {
                 phase,
-                state_context: ExpressionEffectContext {
-                    use_id: ExpressionUseId::new(0),
-                    region: EvaluationRegionId::new(2),
-                    demand: EvaluationDemand::Value,
-                },
+                state_context: RelationEffectContext::materialized_input(RelationCallId::new(
+                    self.context_id,
+                ))
+                .into(),
                 state_input_type: &self.state_input_type,
             };
         }
         input
     }
-    pub(crate) fn children(&self) -> ScopedExpressionEffects {
-        ScopedExpressionEffects::pure_value(self.input().context)
+    fn context(&self) -> RelationEffectContext {
+        RelationEffectContext::call(RelationCallId::new(self.context_id))
+    }
+    pub(crate) fn children(&self) -> ScopedRelationalEffects {
+        ScopedRelationalEffects::pure_value(self.context())
     }
 }
 fn aggregate_options(phase: AggregateKernelPhase) -> AggregatePreparationOptions {
@@ -822,14 +843,8 @@ pub(crate) fn aggregate_catalog(owner: Arc<Owner>) -> PureEngineFunctionCatalog 
     .unwrap()
 }
 
-fn literal_arena(ty: DataType) -> Arc<ImmutableExpressions> {
-    Arc::new(
-        crate::test_support::arena(vec![StaticExprNode::new_value_typed(
-            crate::test_support::integer(7),
-            novarocks_functions::FunctionValueType::new(ty, false),
-        )])
-        .unwrap(),
-    )
+fn literal_source(ty: DataType) -> ConstantValue {
+    crate::test_support::integer_typed(7, FunctionValueType::new(ty, false))
 }
 fn layout(slot: u32, ty: DataType) -> StaticLayout {
     StaticLayout::try_new(
@@ -853,71 +868,123 @@ fn source(layout: &StaticLayout) -> ProgramNode {
         layout.clone(),
     )
 }
+#[derive(Clone, Debug)]
+pub(crate) struct Fixture {
+    pub(crate) graph: LocalProgramGraph,
+    pub(crate) units: Vec<Arc<novarocks_expression::CompiledExprSet>>,
+}
+impl std::ops::Deref for Fixture {
+    type Target = LocalProgramGraph;
+    fn deref(&self) -> &Self::Target {
+        &self.graph
+    }
+}
 fn program(
     nodes: Vec<ProgramNode>,
-    arena: Arc<ImmutableExpressions>,
+    value: ConstantValue,
     requirements: Vec<BindingRequirement>,
-) -> LocalProgramGraph {
+) -> Fixture {
+    program_result(nodes, value, requirements).unwrap()
+}
+fn program_result(
+    nodes: Vec<ProgramNode>,
+    value: ConstantValue,
+    requirements: Vec<BindingRequirement>,
+) -> Result<Fixture, LocalProgramError> {
+    let mut roots = Vec::new();
+    let mut next = || {
+        let ordinal = roots.len();
+        roots.push((0, EvaluationDemand::Value));
+        crate::test_support::root(0, ordinal as u32)
+    };
+    let nodes = nodes
+        .into_iter()
+        .map(|node| {
+            let mut kind = node.kind().clone();
+            match &mut kind {
+                ProgramNodeKind::Aggregate {
+                    group_by,
+                    functions,
+                    ..
+                }
+                | ProgramNodeKind::GroupedTopN {
+                    group_by,
+                    functions,
+                    ..
+                } => {
+                    for root in group_by {
+                        *root = next();
+                    }
+                    for function in functions {
+                        for root in &mut function.inputs {
+                            *root = next();
+                        }
+                    }
+                }
+                ProgramNodeKind::Analytic {
+                    partition_exprs,
+                    order_by_exprs,
+                    functions,
+                    ..
+                } => {
+                    for root in partition_exprs.iter_mut().chain(order_by_exprs) {
+                        *root = next();
+                    }
+                    for function in functions {
+                        for root in &mut function.args {
+                            *root = next();
+                        }
+                    }
+                }
+                ProgramNodeKind::TableWriter { projection, .. } => {
+                    for root in &mut projection.expressions {
+                        *root = next();
+                    }
+                }
+                _ => {}
+            }
+            match node.local_id() {
+                Some(id) => ProgramNode::new_local(
+                    id,
+                    node.physical_sources().to_vec(),
+                    kind,
+                    node.output_layout().clone(),
+                ),
+                None => ProgramNode::new(
+                    node.legacy_native_node_id().unwrap(),
+                    kind,
+                    node.output_layout().clone(),
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    let units = if roots.is_empty() {
+        vec![]
+    } else {
+        vec![crate::test_support::constant_unit(&[value], &roots)]
+    };
     let root = ProgramNodeId::new(nodes.len() - 1);
-    let output = nodes[root.index()].output_layout();
     let profile = CompileProfile::new(
         NonZeroUsize::new(1).unwrap(),
         None,
-        output.identity().unwrap(),
+        nodes[root.index()].output_layout().identity().unwrap(),
         KernelAbiVersion::CURRENT,
     );
-    LocalProgramGraph::try_new(
+    let graph = LocalProgramGraph::try_new(
         nodes,
         root,
-        arena,
+        &units,
         profile,
         BindingRequirements::try_new(requirements).unwrap(),
-    )
-    .unwrap()
+    )?;
+    Ok(Fixture { graph, units })
 }
-pub(crate) fn snapshot(program: LocalProgramGraph) -> ProgramRootControlBindings {
-    let roots = ProgramExpressionRoots::collect(&program, &COMPILE).unwrap();
-    let mut flows = BTreeMap::new();
-    let mut bindings = Vec::new();
-    for (arena, definitions) in roots.arenas() {
-        let mut uses = Vec::new();
-        for (site, root) in roots
-            .sites()
-            .iter()
-            .filter(|(site, _)| site.arena() == *arena)
-        {
-            let use_id = ExpressionUseId::new(u32::try_from(uses.len()).unwrap());
-            uses.push(ProgramExpressionUse {
-                context: ExpressionEffectContext {
-                    use_id,
-                    region: EvaluationRegionId::new(1),
-                    demand: root.demand,
-                },
-                definition: root.definition,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            bindings.push(ProgramRootUseBinding {
-                site: *site,
-                use_id,
-            });
-        }
-        flows.insert(
-            *arena,
-            ProgramControlFlow::try_new(
-                vec![ProgramEvaluationRegion {
-                    id: EvaluationRegionId::new(1),
-                    parent: None,
-                    guard: None,
-                }],
-                uses,
-                definitions.nodes().len(),
-                &COMPILE,
-            )
-            .unwrap(),
-        );
-    }
-    ProgramRootControlBindings::try_new(program, flows, bindings, &COMPILE).unwrap()
+fn resolve(
+    fixture: Fixture,
+    calls: Vec<(ProgramCallSite, PureCallSpecialization)>,
+    control: &dyn PureCompileControl,
+) -> Result<ProgramResolvedCalls, ProgramResolvedCallsError> {
+    ProgramResolvedCalls::try_new(&fixture.graph, &fixture.units, calls, control)
 }
 fn resolved_signature(owner: &Owner) -> ResolvedAggregateSignature {
     let selected = &owner.selections[0];
@@ -957,7 +1024,7 @@ pub(crate) fn aggregate_node(
     finalize: bool,
     order: StaticAggregateOrder,
     group_roots: usize,
-) -> LocalProgramGraph {
+) -> Fixture {
     let output = layout(1, DataType::Int64);
     program(
         vec![
@@ -966,13 +1033,13 @@ pub(crate) fn aggregate_node(
                 20,
                 ProgramNodeKind::Aggregate {
                     input: ProgramNodeId::new(0),
-                    group_by: vec![ProgramExprId::new(0); group_roots],
+                    group_by: vec![crate::test_support::root(0, 0); group_roots],
                     functions: vec![StaticAggregateCall {
                         frozen: Some(frozen_selection(owner)),
                         state_interpretation: None,
                         // Deliberately unrelated display text: it is never implementation authority.
                         name: "display_alias_without_catalogue_entry".into(),
-                        inputs: vec![ProgramExprId::new(0)],
+                        inputs: vec![crate::test_support::root(0, 0)],
                         input_is_intermediate: intermediate,
                         types: None,
                         order,
@@ -986,7 +1053,7 @@ pub(crate) fn aggregate_node(
                 output,
             ),
         ],
-        literal_arena(DataType::Int64),
+        literal_source(DataType::Int64),
         vec![],
     )
 }
@@ -1082,14 +1149,14 @@ fn four_aggregate_phases_borrow_the_actual_frozen_handle_and_run_its_state() {
     ] {
         let token = prepare_aggregate_token(&catalog, &call, phase);
         let original_call = token.call_contract() as *const FunctionCallContract;
-        let resolved = ProgramResolvedCalls::try_new(
-            snapshot(aggregate_node(
+        let resolved = resolve(
+            aggregate_node(
                 &owner,
                 intermediate,
                 finalize,
                 StaticAggregateOrder::default(),
                 0,
-            )),
+            ),
             vec![(aggregate_site(), token)],
             &COMPILE,
         )
@@ -1131,7 +1198,7 @@ pub(crate) fn window_program(
     aggregate: bool,
     frame: Option<WindowFrame>,
     ignore_nulls: bool,
-) -> LocalProgramGraph {
+) -> Fixture {
     let output = layout(1, DataType::Int64);
     program(
         vec![
@@ -1149,7 +1216,7 @@ pub(crate) fn window_program(
                         } else {
                             WindowFunctionKind::FirstValue
                         },
-                        args: vec![ProgramExprId::new(0)],
+                        args: vec![crate::test_support::root(0, 0)],
                         return_type: DataType::Int64,
                         aggregate_binding: aggregate
                             .then(|| (Arc::from("alias"), resolved_signature(owner))),
@@ -1161,14 +1228,12 @@ pub(crate) fn window_program(
                 output,
             ),
         ],
-        literal_arena(DataType::Int64),
+        literal_source(DataType::Int64),
         vec![],
     )
 }
 /// One compiled-only prepared call over the fixture source, with `frame`.
-fn prepared_window_graph(
-    frame: Option<WindowFrame>,
-) -> Result<LocalProgramGraph, LocalProgramError> {
+fn prepared_window_graph(frame: Option<WindowFrame>) -> Result<Fixture, LocalProgramError> {
     let output = layout(1, DataType::Int64);
     let nodes = vec![
         source(&output),
@@ -1182,7 +1247,7 @@ fn prepared_window_graph(
                     // This fixture declares a window-only prepared call.
                     frozen_aggregate: None,
                     kind: WindowFunctionKind::Prepared,
-                    args: vec![ProgramExprId::new(0)],
+                    args: vec![crate::test_support::root(0, 0)],
                     return_type: DataType::Int64,
                     aggregate_binding: None,
                     frame,
@@ -1193,19 +1258,7 @@ fn prepared_window_graph(
             output.clone(),
         ),
     ];
-    let profile = CompileProfile::new(
-        NonZeroUsize::new(1).unwrap(),
-        None,
-        output.identity().unwrap(),
-        KernelAbiVersion::CURRENT,
-    );
-    LocalProgramGraph::try_new(
-        nodes,
-        ProgramNodeId::new(1),
-        literal_arena(DataType::Int64),
-        profile,
-        BindingRequirements::try_new(vec![]).unwrap(),
-    )
+    program_result(nodes, literal_source(DataType::Int64), vec![])
 }
 pub(crate) fn local_frame() -> WindowFrame {
     WindowFrame {
@@ -1288,13 +1341,8 @@ fn window_and_aggregate_over_keep_different_identity_with_the_same_partition_lif
                 &COMPILE,
             )
             .unwrap();
-        let resolved = ProgramResolvedCalls::try_new(
-            snapshot(window_program(
-                &owner,
-                aggregate,
-                Some(local_frame()),
-                false,
-            )),
+        let resolved = resolve(
+            window_program(&owner, aggregate, Some(local_frame()), false),
             vec![(window_site(), token)],
             &COMPILE,
         )
@@ -1327,7 +1375,7 @@ pub(crate) fn table_program(
     param_type: DataType,
     result_type: DataType,
     param_slot: u32,
-) -> LocalProgramGraph {
+) -> Fixture {
     let input = layout(1, DataType::Int64);
     let output = layout(2, result_type.clone());
     program(
@@ -1350,7 +1398,7 @@ pub(crate) fn table_program(
                 output,
             ),
         ],
-        literal_arena(DataType::Int64),
+        literal_source(DataType::Int64),
         vec![],
     )
 }
@@ -1394,15 +1442,15 @@ fn table_scope_borrows_the_exact_frozen_cursor_and_samples_only_selected_parent_
     let (owner, catalog) = table_fixture();
     let call = Call::new(&owner, 0);
     let token = prepare_table_token(&catalog, &call);
-    let resolved = ProgramResolvedCalls::try_new(
-        snapshot(table_program(DataType::Int64, DataType::Int64, 1)),
+    let resolved = resolve(
+        table_program(DataType::Int64, DataType::Int64, 1),
         vec![(table_site(), token)],
         &COMPILE,
     )
     .unwrap();
     assert!(
-        resolved.snapshot().flows()[&ProgramExpressionArena::Main]
-            .uses()
+        table_program(DataType::Int64, DataType::Int64, 1)
+            .units
             .is_empty()
     );
     let entry = &resolved.calls()[&table_site()];
@@ -1454,11 +1502,11 @@ pub(crate) fn writer_program(
     owner: &Owner,
     partial_input_slot: u32,
     final_input_slot: u32,
-) -> LocalProgramGraph {
+) -> Fixture {
     let data = layout(1, DataType::Int64);
     let intermediate = layout(2, DataType::Int64);
     let final_layout = layout(999, DataType::Int64);
-    let arena = literal_arena(DataType::Int64);
+    let value = literal_source(DataType::Int64);
     let target = WriteTargetOrdinal::try_new(0).unwrap();
     let nodes = vec![
         source(&data),
@@ -1470,8 +1518,7 @@ pub(crate) fn writer_program(
                 expected_layout: data.clone(),
                 projection: StaticWriterProjection {
                     storage_types: vec![None],
-                    arena: arena.clone(),
-                    expressions: vec![ProgramExprId::new(0)],
+                    expressions: vec![crate::test_support::root(0, 0)],
                     layout: data,
                 },
                 writer_multiplex_layout: intermediate.clone(),
@@ -1516,7 +1563,7 @@ pub(crate) fn writer_program(
     ];
     program(
         nodes,
-        arena,
+        value,
         vec![
             BindingRequirement::TableWriter {
                 node: ProgramNodeId::new(1),
@@ -1581,9 +1628,7 @@ fn writer_partial_and_final_keep_exact_state_scopes_without_requiring_internal_f
         SlotId::new(999)
     );
     assert!(!writer_multiplex_layout.slots().contains(&SlotId::new(999)));
-    let resolved =
-        ProgramResolvedCalls::try_new(snapshot(program), writer_tokens(&catalog, &owner), &COMPILE)
-            .unwrap();
+    let resolved = resolve(program, writer_tokens(&catalog, &owner), &COMPILE).unwrap();
     for (site, expected_scope, phase) in [
         (
             partial_site(),
@@ -1625,24 +1670,15 @@ fn relational_sites_reject_wrong_phase_ordinal_order_coverage_and_lifecycle() {
     ));
     let catalog = aggregate_catalog(owner.clone());
     let call = Call::new(&owner, 0);
-    let make = || {
-        snapshot(aggregate_node(
-            &owner,
-            false,
-            false,
-            StaticAggregateOrder::default(),
-            0,
-        ))
-    };
+    let make = || aggregate_node(&owner, false, false, StaticAggregateOrder::default(), 0);
     let single = prepare_aggregate_token(&catalog, &call, AggregateKernelPhase::Single);
     assert_eq!(
-        ProgramResolvedCalls::try_new(make(), vec![(aggregate_site(), single)], &COMPILE)
-            .unwrap_err(),
+        resolve(make(), vec![(aggregate_site(), single)], &COMPILE).unwrap_err(),
         ProgramResolvedCallsError::WrongPhase
     );
     let partial = prepare_aggregate_token(&catalog, &call, AggregateKernelPhase::Partial);
     assert_eq!(
-        ProgramResolvedCalls::try_new(
+        resolve(
             make(),
             vec![(
                 ProgramCallSite::Aggregate {
@@ -1657,11 +1693,11 @@ fn relational_sites_reject_wrong_phase_ordinal_order_coverage_and_lifecycle() {
         ProgramResolvedCallsError::MissingSite(aggregate_site())
     );
     assert_eq!(
-        ProgramResolvedCalls::try_new(make(), vec![], &COMPILE).unwrap_err(),
+        resolve(make(), vec![], &COMPILE).unwrap_err(),
         ProgramResolvedCallsError::MissingSite(aggregate_site())
     );
     assert_eq!(
-        ProgramResolvedCalls::try_new(
+        resolve(
             make(),
             vec![
                 (aggregate_site(), partial.clone()),
@@ -1678,8 +1714,8 @@ fn relational_sites_reject_wrong_phase_ordinal_order_coverage_and_lifecycle() {
         ..Default::default()
     };
     assert_eq!(
-        ProgramResolvedCalls::try_new(
-            snapshot(aggregate_node(&owner, false, false, order, 0)),
+        resolve(
+            aggregate_node(&owner, false, false, order, 0),
             vec![(aggregate_site(), partial.clone())],
             &COMPILE
         )
@@ -1696,13 +1732,12 @@ fn relational_sites_reject_wrong_phase_ordinal_order_coverage_and_lifecycle() {
         )
         .unwrap();
     assert_eq!(
-        ProgramResolvedCalls::try_new(make(), vec![(aggregate_site(), over)], &COMPILE)
-            .unwrap_err(),
+        resolve(make(), vec![(aggregate_site(), over)], &COMPILE).unwrap_err(),
         ProgramResolvedCallsError::WrongLifecycle
     );
     assert_eq!(
-        ProgramResolvedCalls::try_new(
-            snapshot(window_program(&owner, true, Some(local_frame()), false)),
+        resolve(
+            window_program(&owner, true, Some(local_frame()), false),
             vec![(window_site(), partial)],
             &COMPILE
         )
@@ -1741,12 +1776,7 @@ fn wrong_window_geometry_and_table_ordered_carriers_are_rejected() {
         window_program(&owner, false, Some(local_frame()), true),
     ] {
         assert_eq!(
-            ProgramResolvedCalls::try_new(
-                snapshot(p),
-                vec![(window_site(), token.clone())],
-                &COMPILE
-            )
-            .unwrap_err(),
+            resolve(p, vec![(window_site(), token.clone())], &COMPILE).unwrap_err(),
             ProgramResolvedCallsError::WrongWindow
         );
     }
@@ -1768,12 +1798,7 @@ fn wrong_window_geometry_and_table_ordered_carriers_are_rejected() {
         ),
     ] {
         assert_eq!(
-            ProgramResolvedCalls::try_new(
-                snapshot(p),
-                vec![(table_site(), token.clone())],
-                &COMPILE
-            )
-            .unwrap_err(),
+            resolve(p, vec![(table_site(), token.clone())], &COMPILE).unwrap_err(),
             error
         );
     }
@@ -1787,8 +1812,7 @@ fn writer_wrong_phase_and_absent_actual_input_slot_fail_while_internal_output_is
     let catalog = aggregate_catalog(owner.clone());
     for p in [writer_program(&owner, 99, 2), writer_program(&owner, 1, 99)] {
         assert_eq!(
-            ProgramResolvedCalls::try_new(snapshot(p), writer_tokens(&catalog, &owner), &COMPILE)
-                .unwrap_err(),
+            resolve(p, writer_tokens(&catalog, &owner), &COMPILE).unwrap_err(),
             ProgramResolvedCallsError::WrongArguments
         );
     }
@@ -1797,8 +1821,7 @@ fn writer_wrong_phase_and_absent_actual_input_slot_fail_while_internal_output_is
     call.context_id = u32::MAX - 1;
     tokens[0].1 = prepare_aggregate_token(&catalog, &call, AggregateKernelPhase::Single);
     assert_eq!(
-        ProgramResolvedCalls::try_new(snapshot(writer_program(&owner, 1, 2)), tokens, &COMPILE)
-            .unwrap_err(),
+        resolve(writer_program(&owner, 1, 2), tokens, &COMPILE).unwrap_err(),
         ProgramResolvedCallsError::WrongPhase
     );
     let mut tokens = writer_tokens(&catalog, &owner);
@@ -1808,8 +1831,7 @@ fn writer_wrong_phase_and_absent_actual_input_slot_fail_while_internal_output_is
         AggregateKernelPhase::Intermediate,
     );
     assert_eq!(
-        ProgramResolvedCalls::try_new(snapshot(writer_program(&owner, 1, 2)), tokens, &COMPILE)
-            .unwrap_err(),
+        resolve(writer_program(&owner, 1, 2), tokens, &COMPILE).unwrap_err(),
         ProgramResolvedCallsError::WrongPhase
     );
     let call = Call::new(&owner, 0);
@@ -1824,14 +1846,13 @@ fn writer_wrong_phase_and_absent_actual_input_slot_fail_while_internal_output_is
         ),
     ];
     assert_eq!(
-        ProgramResolvedCalls::try_new(snapshot(writer_program(&owner, 1, 2)), shared, &COMPILE)
-            .unwrap_err(),
-        ProgramResolvedCallsError::SharedUse
+        resolve(writer_program(&owner, 1, 2), shared, &COMPILE).unwrap_err(),
+        ProgramResolvedCallsError::DuplicateRelationCall
     );
 }
 
 struct Stop {
-    at: u32,
+    at: usize,
     error: CompileControlError,
     observed: Mutex<Vec<u32>>,
 }
@@ -1839,8 +1860,10 @@ impl PureCompileControl for Stop {
     fn checkpoint(&self, phase: CompilePhase, work: u32) -> Result<(), CompileControlError> {
         assert_eq!(phase, CompilePhase::LowerProgram);
         assert!(work <= 256);
-        self.observed.lock().unwrap().push(work);
-        if work == self.at {
+        let mut observed = self.observed.lock().unwrap();
+        let ordinal = observed.len();
+        observed.push(work);
+        if ordinal == self.at {
             Err(self.error.clone())
         } else {
             Ok(())
@@ -1854,35 +1877,93 @@ fn resolved_relational_entry_and_positive_quantum_keep_all_three_typed_controls(
         &[PureKernelAbi::AggregateWindowV1],
     ));
     let catalog = aggregate_catalog(owner.clone());
-    let call = Call::new(&owner, 0);
-    let token = prepare_aggregate_token(&catalog, &call, AggregateKernelPhase::Partial);
-    for error in [
-        CompileControlError::Cancelled,
-        CompileControlError::DeadlineExceeded,
-        CompileControlError::ResourceExhausted,
-    ] {
-        for at in [0, 256] {
+    let input = layout(1, DataType::Int64);
+    let count = 300;
+    let output = StaticLayout::try_new(
+        Arc::new(Schema::new(
+            (0..count)
+                .map(|ordinal| Field::new(format!("aggregate_{ordinal}"), DataType::Int64, false))
+                .collect::<Vec<_>>(),
+        )),
+        (0..count)
+            .map(|ordinal| SlotId::new(ordinal as u32))
+            .collect::<Vec<_>>()
+            .into(),
+    )
+    .unwrap();
+    let fixture = program(
+        vec![
+            source(&input),
+            ProgramNode::new(
+                20,
+                ProgramNodeKind::Aggregate {
+                    input: ProgramNodeId::new(0),
+                    group_by: vec![],
+                    functions: (0..count)
+                        .map(|_| StaticAggregateCall {
+                            frozen: Some(frozen_selection(&owner)),
+                            state_interpretation: None,
+                            name: "display_alias_without_catalogue_entry".into(),
+                            inputs: vec![crate::test_support::root(0, 0)],
+                            input_is_intermediate: false,
+                            types: None,
+                            order: StaticAggregateOrder::default(),
+                            resolved: resolved_signature(&owner),
+                        })
+                        .collect(),
+                    need_finalize: false,
+                    input_is_intermediate: false,
+                    topn_filters: vec![].into(),
+                    streaming_preaggregation_mode: None,
+                },
+                output,
+            ),
+        ],
+        literal_source(DataType::Int64),
+        vec![],
+    );
+    let tokens: Vec<_> = (0..count)
+        .map(|ordinal| {
+            let mut call = Call::new(&owner, 0);
+            call.context_id = u32::MAX - ordinal as u32;
+            (
+                ProgramCallSite::Aggregate {
+                    node: ProgramNodeId::new(1),
+                    call: ordinal as u32,
+                },
+                prepare_aggregate_token(&catalog, &call, AggregateKernelPhase::Partial),
+            )
+        })
+        .collect();
+    // Traversing sealed scalar roots belongs to the unit/final author. This
+    // fixture supplies actual relation work to this original relation author.
+    let baseline = Stop {
+        at: usize::MAX,
+        error: CompileControlError::Cancelled,
+        observed: Mutex::default(),
+    };
+    resolve(fixture.clone(), tokens.clone(), &baseline).unwrap();
+    let trace = baseline.observed.into_inner().unwrap();
+    assert_eq!(trace.first(), Some(&0));
+    assert!(trace.iter().sum::<u32>() >= 256);
+    assert!(trace.iter().any(|&work| work > 0));
+    for at in 0..trace.len() {
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
             let stop = Stop {
                 at,
                 error: error.clone(),
                 observed: Mutex::default(),
             };
-            let result = ProgramResolvedCalls::try_new(
-                snapshot(aggregate_node(
-                    &owner,
-                    false,
-                    false,
-                    StaticAggregateOrder::default(),
-                    300,
-                )),
-                vec![(aggregate_site(), token.clone())],
-                &stop,
-            );
-            assert_eq!(
-                result.unwrap_err(),
-                ProgramResolvedCallsError::Control(error.clone())
-            );
-            assert!(stop.observed.lock().unwrap().contains(&at));
+            let actual = match resolve(fixture.clone(), tokens.clone(), &stop) {
+                Ok(_) => panic!("relation author ignored the original control refusal"),
+                Err(error) => error,
+            };
+            assert_eq!(actual, ProgramResolvedCallsError::Control(error));
+            assert_eq!(*stop.observed.lock().unwrap(), trace[..=at]);
         }
     }
 }
@@ -1896,31 +1977,31 @@ fn graph_reference_and_actual_relational_call_share_one_combined_near_over_budge
     let call = Call::new(&owner, 0);
     let token = prepare_aggregate_token(&catalog, &call, AggregateKernelPhase::Partial);
     // One actual argument root plus group occurrences, then one actual call.
-    let near = snapshot(aggregate_node(
+    let near = aggregate_node(
         &owner,
         false,
         false,
         StaticAggregateOrder::default(),
         MAX_CONTROL_USE_REFERENCES - 2,
-    ));
+    );
     assert_eq!(
-        near.flows()[&ProgramExpressionArena::Main].use_reference_count(),
+        near.units[0].control_flow().use_reference_count(),
         MAX_CONTROL_USE_REFERENCES - 1
     );
-    ProgramResolvedCalls::try_new(near, vec![(aggregate_site(), token.clone())], &COMPILE).unwrap();
-    let over = snapshot(aggregate_node(
+    resolve(near, vec![(aggregate_site(), token.clone())], &COMPILE).unwrap();
+    let over = aggregate_node(
         &owner,
         false,
         false,
         StaticAggregateOrder::default(),
         MAX_CONTROL_USE_REFERENCES - 1,
-    ));
+    );
     assert_eq!(
-        over.flows()[&ProgramExpressionArena::Main].use_reference_count(),
+        over.units[0].control_flow().use_reference_count(),
         MAX_CONTROL_USE_REFERENCES
     );
     assert_eq!(
-        ProgramResolvedCalls::try_new(over, vec![(aggregate_site(), token)], &COMPILE).unwrap_err(),
+        resolve(over, vec![(aggregate_site(), token)], &COMPILE).unwrap_err(),
         ProgramResolvedCallsError::TooManyItems
     );
 }
@@ -1966,28 +2047,28 @@ fn prepared_window_calls_carry_their_own_explicit_frame() {
         end: Some(WindowBoundary::CurrentRow),
         window_type: WindowType::Rows,
     };
-    let resolve = |frame, token: &PureCallSpecialization| {
-        ProgramResolvedCalls::try_new(
-            snapshot(prepared_window_graph(Some(frame)).unwrap()),
+    let resolve_frame = |frame, token: &PureCallSpecialization| {
+        resolve(
+            prepared_window_graph(Some(frame)).unwrap(),
             vec![(window_site(), token.clone())],
             &COMPILE,
         )
     };
     // An explicit prepared frame is the call's frame exactly; an absent one
     // stands for the compiler's offset-free default derivation.
-    resolve(local_frame(), &explicit).unwrap();
-    resolve(running, &absent).unwrap();
+    resolve_frame(local_frame(), &explicit).unwrap();
+    resolve_frame(running, &absent).unwrap();
     for (frame, token) in [(running, &explicit), (offset, &absent)] {
         assert_eq!(
-            resolve(frame, token).unwrap_err(),
+            resolve_frame(frame, token).unwrap_err(),
             ProgramResolvedCallsError::WrongWindow
         );
     }
     // A legacy call keeps exact equality: its explicit frame never stands for
     // an absent prepared one.
     assert_eq!(
-        ProgramResolvedCalls::try_new(
-            snapshot(window_program(&owner, false, Some(local_frame()), false)),
+        resolve(
+            window_program(&owner, false, Some(local_frame()), false),
             vec![(window_site(), absent.clone())],
             &COMPILE,
         )

@@ -22,10 +22,11 @@
 //! not a host allocation grant or a model of Arrow's internal copy behavior.
 
 use crate::{FragmentCompileError, assert_rows::reserve_vec, channels::UnionChannelBranch};
+use novarocks_expression::MAX_STATIC_EXPRESSIONS;
 use novarocks_local_program::{
-    DiagnosticSourceNodeId, MAX_PROGRAM_NODES, MAX_PROGRAM_TYPED_CHANNELS, MAX_STATIC_EXPRESSIONS,
-    ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId, ProgramNode, ProgramNodeId,
-    ProgramNodeKind, StaticLayout,
+    DiagnosticSourceNodeId, MAX_PROGRAM_NODES, MAX_PROGRAM_TYPED_CHANNELS,
+    ProgramChannelLayoutRole, ProgramChannelSite, ProgramNode, ProgramNodeId, ProgramNodeKind,
+    ProgramRootRef, StaticLayout,
 };
 use novarocks_physical_plan::{FragmentPackage, NodeKind, PhysicalNode, SetOperationKind};
 use novarocks_type_contract::{
@@ -44,7 +45,7 @@ pub(crate) fn lower_union_with_creation<H>(
     node: &PhysicalNode,
     local: ProgramNodeId,
     branches: &[UnionChannelBranch],
-    definitions: &[Vec<ProgramExprId>],
+    definitions: &[Vec<ProgramRootRef>],
     slots: &[SlotId],
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
@@ -68,7 +69,7 @@ fn lower_core_with_creation<H>(
     node: &PhysicalNode,
     local: ProgramNodeId,
     branches: &[UnionChannelBranch],
-    definitions: &[Vec<ProgramExprId>],
+    definitions: &[Vec<ProgramRootRef>],
     slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
@@ -120,7 +121,7 @@ fn lower_core_with_creation<H>(
         .filter(|&count| count <= MAX_PROGRAM_TYPED_CHANNELS)
         .ok_or(CompileControlError::ResourceExhausted)?;
     Layout::array::<ProgramNode>(node_count).map_err(|_| CompileControlError::ResourceExhausted)?;
-    Layout::array::<ProgramExprId>(expression_count)
+    Layout::array::<ProgramRootRef>(expression_count)
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     Layout::array::<SlotId>(channel_count).map_err(|_| CompileControlError::ResourceExhausted)?;
     work.step()?;

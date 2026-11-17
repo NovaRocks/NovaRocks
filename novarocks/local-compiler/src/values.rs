@@ -29,60 +29,56 @@ use arrow_select::{
     interleave::interleave,
     take::{TakeOptions, take},
 };
+use novarocks_expression_contract::{ExprKind, RootOrdinal};
 use novarocks_functions::{
     ConstantError, ConstantValue, KernelDiagnostic, KernelEvaluationControl, KernelFailure,
     selected_copy::{self, CopyConstructionError, CopyError, CopyIndexView},
 };
 use novarocks_local_program::{
-    ProgramExprId, ProgramNodeKind, StaticExprKind, StaticLayout, StaticValues, StaticValuesCell,
+    ProgramNodeKind, ProgramRootRef, StaticLayout, StaticValues, StaticValuesCell,
 };
-use novarocks_physical_plan::{
-    ExprId, ExprKind, ExpressionRootRole, FragmentPackage, PhysicalNode,
-};
+use novarocks_physical_plan::{FragmentPackage, PhysicalNode};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, ExpressionUseId, PureCompileControl,
-    ValueTypeVisit, validate_arrow_carrier_parameters_observed,
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueTypeVisit,
+    validate_arrow_carrier_parameters_observed,
     validate_value_type_structure_with_profile_observed,
 };
 use novarocks_types::SlotId;
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
 /// One admitted Values cell: a compile-time constant materialized into the
 /// backing, or a dynamic cell kept as its own runtime root.
 #[derive(Clone, Copy)]
 enum Cell<'a> {
     Constant(&'a ConstantValue),
-    Dynamic(ProgramExprId),
+    Dynamic(ProgramRootRef),
 }
 
 fn cell<'a>(
     package: &FragmentPackage,
     expressions: &'a LoweredExpressions,
-    id: ExprId,
+    node: novarocks_physical_plan::NodeId,
+    id: RootOrdinal,
 ) -> Result<Cell<'a>, FragmentCompileError> {
-    let source = package
-        .fragment()
-        .expressions()
-        .get(id)
-        .ok_or(FragmentCompileError::Invalid(
-            "missing Values cell definition",
-        ))?;
-    let local = *expressions
-        .ids
-        .get(&id)
-        .ok_or(FragmentCompileError::Invalid("Values cell was not lowered"))?;
+    let source = crate::expressions::bound_root(package, node, id)?;
+    let local = expressions.root(node, id)?;
     if !matches!(source.kind, ExprKind::Constant(_)) {
-        // The compiled evaluator runs it once, over an empty port, with the
-        // same value, NULL and row-error effects as any other root.
         return Ok(Cell::Dynamic(local));
     }
-    let lowered = expressions
-        .arena
-        .node(local)
+    let unit = expressions.unit(node)?;
+    let definition = unit
+        .root(id)
         .ok_or(FragmentCompileError::Invalid(
-            "missing lowered Values definition",
+            "missing compiled Values root",
+        ))?
+        .definition;
+    let lowered = unit
+        .definitions()
+        .node(definition)
+        .ok_or(FragmentCompileError::Invalid(
+            "missing compiled Values definition",
         ))?;
-    let StaticExprKind::Constant(value) = lowered.kind() else {
+    let novarocks_expression::StaticExprKind::Constant(value) = lowered.kind() else {
         return Err(FragmentCompileError::Invalid(
             "Values constant source changed",
         ));
@@ -92,9 +88,10 @@ fn cell<'a>(
 fn constant<'a>(
     package: &FragmentPackage,
     expressions: &'a LoweredExpressions,
-    id: ExprId,
+    node: novarocks_physical_plan::NodeId,
+    id: RootOrdinal,
 ) -> Result<Option<&'a ConstantValue>, FragmentCompileError> {
-    Ok(match cell(package, expressions, id)? {
+    Ok(match cell(package, expressions, node, id)? {
         Cell::Constant(value) => Some(value),
         Cell::Dynamic(_) => None,
     })
@@ -263,22 +260,15 @@ fn lower_core_with_creation<H>(
     let mut dynamic = Vec::new();
     for (row_index, row) in rows.iter().enumerate() {
         for (ordinal, &id) in row.iter().enumerate() {
-            let value = cell(package, expressions, id);
+            let value = cell(package, expressions, node.id, id);
             work.step()?;
             let value = value?;
-            let source = package
-                .fragment()
-                .expressions()
-                .get(id)
-                .ok_or(FragmentCompileError::Invalid("missing Values source"))?;
+            let source = crate::expressions::bound_root(package, node.id, id)?;
             let output = package
                 .fragment()
                 .values()
                 .get(&node.output.columns[ordinal])
                 .ok_or(FragmentCompileError::Invalid("missing Values output"))?;
-            if source.owner != node.id {
-                return Err((FragmentCompileError::Invalid("foreign Values cell owner")).into());
-            }
             let ty = match value {
                 Cell::Constant(value) => value.value_type(),
                 Cell::Dynamic(_) => &source.ty,
@@ -416,7 +406,7 @@ fn lower_core_with_creation<H>(
             let mut first: Option<&ConstantValue> = None;
             let mut same_backing = true;
             for row in rows {
-                let value = constant(package, expressions, row[ordinal]);
+                let value = constant(package, expressions, node.id, row[ordinal]);
                 work.step()?;
                 let Some(value) = value? else {
                     continue;
@@ -551,34 +541,6 @@ fn lower_core_with_creation<H>(
     )?;
     work.flush()?;
     Ok((ProgramNodeKind::Values { values }, layout))
-}
-
-pub(crate) fn retired_values_uses(
-    package: &FragmentPackage,
-    expressions: &LoweredExpressions,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<BTreeSet<ExpressionUseId>, FragmentCompileError> {
-    let mut retired = BTreeSet::new();
-    for (site, id) in package.expression_uses().bindings() {
-        if let ExpressionRootRole::ValuesCell { .. } = site.role {
-            let invocation = package.expression_uses().flow().uses().get(id).ok_or(
-                FragmentCompileError::Invalid("missing Values root invocation"),
-            )?;
-            let cell = constant(package, expressions, invocation.definition);
-            work.step()?;
-            // A dynamic cell keeps its root use and every argument use.
-            if cell?.is_some() {
-                if !invocation.arguments.is_empty() {
-                    return Err(FragmentCompileError::Invalid(
-                        "constant Values root has arguments",
-                    ));
-                }
-                retired.insert(*id);
-            }
-        }
-        work.step()?;
-    }
-    Ok(retired)
 }
 
 #[cfg(test)]

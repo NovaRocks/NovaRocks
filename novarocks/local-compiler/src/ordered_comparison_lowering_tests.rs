@@ -16,8 +16,8 @@
 // under the License.
 
 use super::*;
+use novarocks_expression::ComparisonSite;
 use novarocks_functions::ComparisonOperator;
-use novarocks_local_program::ProgramComparisonSite;
 
 const OPERATORS: [(BinaryOperator, ComparisonOperator); 4] = [
     (BinaryOperator::Lt, ComparisonOperator::Lt),
@@ -48,11 +48,11 @@ fn four_ordered_operators_keep_exact_types_order_domain_and_consumer_demand() {
                     let ordered = fixture.ordered.clone();
                     let source = package(&functions, fixture);
                     let program = compile(source.clone(), &functions, &Control).unwrap();
-                    let calls = program.checked().channels().expressions().resolved_calls();
-                    let snapshot = calls.snapshot();
-                    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-                    let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-                    let use_id = snapshot.bindings()[&root(mode)];
+                    let compiled = unit(&program);
+                    let calls = compiled;
+                    let flow = compiled.control_flow();
+                    let arena = compiled.definitions();
+                    let use_id = occurrence(&program);
                     let use_ = &flow.uses()[&use_id];
                     assert_eq!(use_.control, ControlShape::Eager);
                     assert_eq!(
@@ -78,32 +78,28 @@ fn four_ordered_operators_keep_exact_types_order_domain_and_consumer_demand() {
                         assert_eq!(child.context.region, use_.context.region);
                         assert_eq!(child.context.demand, EvaluationDemand::Value);
                         assert_eq!(
-                            source.expression_uses().flow().uses()[&child.context.use_id]
+                            source_unit(&source).control_flow().uses()[&child.context.use_id]
                                 .definition,
                             ordered[ordinal]
                         );
                     }
-                    let occurrence = ProgramUseRef {
-                        arena: ProgramExpressionArena::Main,
-                        use_id,
-                    };
-                    let recipe = program
-                        .comparison_recipe(ProgramComparisonSite::Binary(occurrence))
+                    let occurrence = use_id;
+                    let recipe = unit(&program)
+                        .recipes()
+                        .comparison(ComparisonSite::Binary(occurrence))
                         .unwrap();
                     assert_eq!(recipe.operator(), expected);
                     assert_eq!(recipe.left_type(), &left);
                     assert_eq!(recipe.right_type(), &right);
                     assert_eq!(recipe.nullable_result(), ln || rn);
                     assert!(
-                        program
-                            .comparison_recipe(ProgramComparisonSite::CaseWhen {
-                                occurrence,
-                                arm: 0
-                            })
+                        unit(&program)
+                            .recipes()
+                            .comparison(ComparisonSite::CaseWhen { occurrence, arm: 0 })
                             .is_none()
                     );
                     assert!(calls.calls().is_empty());
-                    assert!(source.calls().entries().is_empty());
+                    assert!(source_unit(&source).claims().is_empty());
                 }
             }
         }
@@ -133,27 +129,19 @@ fn ordered_float_sources_keep_nan_payload_and_signed_zero_bits() {
                 .unwrap(),
             );
             let program = compile(source, &functions, &Control).unwrap();
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-            let values = arena
-                .nodes()
+            let values = program
+                .units()
                 .iter()
+                .flat_map(|unit| unit.definitions().nodes().iter())
                 .filter_map(|node| match node.kind() {
                     StaticExprKind::Constant(value) => Some(value.try_f64_bits().unwrap().unwrap()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
             assert_eq!(values, bits);
-            let recipe = program
-                .comparison_recipe(ProgramComparisonSite::Binary(ProgramUseRef {
-                    arena: ProgramExpressionArena::Main,
-                    use_id: snapshot.bindings()[&root(Mode::Project)],
-                }))
+            let recipe = unit(&program)
+                .recipes()
+                .comparison(ComparisonSite::Binary(occurrence(&program)))
                 .unwrap();
             assert_eq!(recipe.operator(), expected);
             assert_eq!(recipe.left_type(), &ty);
@@ -237,18 +225,11 @@ fn exact_uuid_and_successful_null_sources_keep_ordered_recipe_identity() {
                 .unwrap(),
             );
             let program = compile(source, &functions, &Control).unwrap();
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            let occurrence = ProgramUseRef {
-                arena: ProgramExpressionArena::Main,
-                use_id: snapshot.bindings()[&root(Mode::Project)],
-            };
-            let recipe = program
-                .comparison_recipe(ProgramComparisonSite::Binary(occurrence))
+            let _compiled = unit(&program);
+            let occurrence = occurrence(&program);
+            let recipe = unit(&program)
+                .recipes()
+                .comparison(ComparisonSite::Binary(occurrence))
                 .unwrap();
             assert_eq!(recipe.operator(), expected);
             assert_eq!(recipe.left_type(), &ty);
@@ -271,20 +252,13 @@ fn exact_uuid_and_successful_null_sources_keep_ordered_recipe_identity() {
         .unwrap(),
     );
     let program = compile(source, &functions, &Control).unwrap();
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let occurrence = ProgramUseRef {
-        arena: ProgramExpressionArena::Main,
-        use_id: snapshot.bindings()[&root(Mode::Project)],
-    };
+    let _compiled = unit(&program);
+    let occurrence = occurrence(&program);
     for arm in 0..2 {
         assert_eq!(
-            program
-                .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm })
+            unit(&program)
+                .recipes()
+                .comparison(ComparisonSite::CaseWhen { occurrence, arm })
                 .unwrap()
                 .operator(),
             ComparisonOperator::Eq
@@ -360,7 +334,7 @@ fn rand_operand_fixture(
     };
     let ty = ty.clone();
     let literal = builder
-        .add_expression(
+        .fixture_value_root(
             NodeId::new(44),
             ty.clone(),
             crate::test_constants::f64_bits(
@@ -376,7 +350,7 @@ fn rand_operand_fixture(
             ty.clone(),
             ValueOrigin::Expr {
                 node: NodeId::new(44),
-                expr: literal,
+                root: literal,
             },
         )
         .unwrap();
@@ -389,7 +363,7 @@ fn rand_operand_fixture(
         )
         .unwrap();
     let call = builder
-        .add_expression(
+        .fixture_definition(
             NodeId::new(0),
             ty.clone(),
             ExprKind::FunctionCall {
@@ -399,7 +373,7 @@ fn rand_operand_fixture(
                     kind: bound.kind,
                     argument_types: selected.argument_types.clone(),
                     result_type: ty.clone(),
-                    legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+                    legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
                         volatility: bound.semantics.volatility,
                         argument_evaluation: bound.semantics.argument_evaluation,
                         failure_behavior: bound.semantics.failure_behavior,
@@ -412,11 +386,11 @@ fn rand_operand_fixture(
         )
         .unwrap();
     let value = builder
-        .add_expression(NodeId::new(0), ty, ExprKind::Value(input))
+        .fixture_definition(NodeId::new(0), ty, ExprKind::Value(input))
         .unwrap();
     let result = FunctionValueType::new(DataType::Boolean, true);
     let expression = builder
-        .add_expression(
+        .fixture_definition(
             NodeId::new(0),
             result.clone(),
             ExprKind::Binary {
@@ -428,6 +402,18 @@ fn rand_operand_fixture(
             },
         )
         .unwrap();
+    let root = builder
+        .fixture_occurrence(
+            NodeId::new(0),
+            expression,
+            if matches!(mode, Mode::Filter) {
+                EvaluationDemand::TruthOnly
+            } else {
+                EvaluationDemand::Value
+            },
+            RootScope::Port(0),
+        )
+        .unwrap();
     match mode {
         Mode::Project => {
             let output = builder
@@ -435,7 +421,7 @@ fn rand_operand_fixture(
                     result,
                     ValueOrigin::Expr {
                         node: NodeId::new(0),
-                        expr: expression,
+                        root,
                     },
                 )
                 .unwrap();
@@ -443,17 +429,26 @@ fn rand_operand_fixture(
                 .add_project(
                     NodeId::new(0),
                     NodeId::new(44),
-                    Box::from([(expression, output)]),
+                    Box::from([(root, output)]),
                     Box::from([output]),
                 )
                 .unwrap();
         }
         Mode::Filter => {
             builder
-                .add_filter(NodeId::new(0), NodeId::new(44), Box::from([expression]))
+                .add_filter(NodeId::new(0), NodeId::new(44), Box::from([root]))
                 .unwrap();
         }
     }
+    seal_units(
+        &mut builder,
+        functions,
+        Some(&selected),
+        Some(request),
+        &[call],
+        options().constants,
+    )
+    .unwrap();
     Fixture {
         constants,
         fragment: builder
@@ -485,16 +480,16 @@ fn real_rand_operand_keeps_volatile_state_and_exact_frozen_effects_under_compari
         for mode in [Mode::Project, Mode::Filter] {
             let source = package(&functions, rand_operand_fixture(&functions, physical, mode));
             let program = compile(source.clone(), &functions, &Control).unwrap();
-            let calls = program.checked().channels().expressions().resolved_calls();
-            let snapshot = calls.snapshot();
-            let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-            let use_id = snapshot.bindings()[&root(mode)];
+            let compiled = unit(&program);
+            let calls = compiled;
+            let flow = compiled.control_flow();
+            let use_id = occurrence(&program);
             let invocation = &flow.uses()[&use_id];
             assert_eq!(invocation.arguments.len(), 2);
             assert_eq!(calls.calls().len(), 1);
-            assert_eq!(source.calls().entries().len(), 1);
+            assert_eq!(source_unit(&source).claims().len(), 1);
             let call = calls.calls().values().next().unwrap();
-            let context = call.call_contract().context();
+            let context = call.call_contract().context().expression().unwrap();
             assert_eq!(context.use_id, invocation.arguments[0]);
             assert_eq!(context.region, invocation.context.region);
             assert_eq!(context.demand, EvaluationDemand::Value);
@@ -502,20 +497,13 @@ fn real_rand_operand_keeps_volatile_state_and_exact_frozen_effects_under_compari
             assert_eq!(summary.value_stability, FunctionVolatility::Volatile);
             assert!(summary.has_instance_state);
             assert!(summary.observable_effects.rng_sampling);
-            let frozen = &source.calls().entries()[&PhysicalCallSite::Expression(context.use_id)];
+            let frozen = &source_unit(&source).claims()[&context.use_id];
             assert_eq!(call.call_contract().effects(), &frozen.effects);
             assert_eq!(frozen.context, context);
-            assert!(
-                !source
-                    .calls()
-                    .entries()
-                    .contains_key(&PhysicalCallSite::Expression(use_id))
-            );
-            let recipe = program
-                .comparison_recipe(ProgramComparisonSite::Binary(ProgramUseRef {
-                    arena: ProgramExpressionArena::Main,
-                    use_id,
-                }))
+            assert!(!source_unit(&source).claims().contains_key(&use_id));
+            let recipe = unit(&program)
+                .recipes()
+                .comparison(ComparisonSite::Binary(use_id))
                 .unwrap();
             assert_eq!(recipe.operator(), expected);
         }
@@ -555,17 +543,10 @@ fn explicitly_authored_largeint_sources_preserve_their_domain_without_retagging_
                 .unwrap(),
             );
             let program = compile(source, &functions, &Control).unwrap();
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            let recipe = program
-                .comparison_recipe(ProgramComparisonSite::Binary(ProgramUseRef {
-                    arena: ProgramExpressionArena::Main,
-                    use_id: snapshot.bindings()[&root(Mode::Project)],
-                }))
+            let _compiled = unit(&program);
+            let recipe = unit(&program)
+                .recipes()
+                .comparison(ComparisonSite::Binary(occurrence(&program)))
                 .unwrap();
             assert_eq!(recipe.operator(), expected);
             assert_eq!(recipe.left_type(), ty);

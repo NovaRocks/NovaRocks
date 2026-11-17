@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::test_units::PureUnitFixture;
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::{BoundFunction, ExprKind, ExpressionCallClaim, RootScope};
+
 use super::*;
 use arrow_array::{ArrayRef, Float64Array, Int64Array};
 use arrow_schema::DataType;
@@ -27,22 +31,16 @@ use novarocks_functions::{
     SelectedValues, Selection,
 };
 use novarocks_local_program::{
-    KernelAbiVersion, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramExpressionArena, ProgramLexicalSource, ProgramNodeId, ProgramNodeKind,
-    ProgramStateTemplate, ProgramUseRef, StaticExprKind,
+    KernelAbiVersion, ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId, ProgramNodeKind,
 };
 use novarocks_physical_plan::{
-    BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
-    FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning,
-    FrozenPhysicalCall, NodeId, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
-    PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort, ValueDef,
-    ValueId, ValueOrigin,
+    FragmentBuilder, FragmentCuts, FragmentId, FragmentPackageInput, FragmentSink,
+    FrozenFragmentPruning, NodeId, PipelineDopDomain, PlanVersionId, RequiredContracts,
+    ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
-    ExpressionInvocation, ExpressionUseId, FunctionValueType, PureCompileControl,
-    SemanticParameters,
+    CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType,
+    PureCompileControl, SemanticParameters,
 };
 use std::{
     collections::BTreeMap,
@@ -120,40 +118,6 @@ enum SeedMode {
     LiteralWithoutConstant,
 }
 
-fn invocation(
-    fragment: &Fragment,
-    expression: ExprId,
-    demand: EvaluationDemand,
-    next: &mut u32,
-    uses: &mut Vec<ExpressionInvocation<ExprId>>,
-) -> ExpressionUseId {
-    let id = ExpressionUseId::new(*next);
-    *next += 17;
-    let definition = fragment.expressions().get(expression).unwrap();
-    let children = match &definition.kind {
-        ExprKind::FunctionCall { function, args } => {
-            assert_eq!(function.function_id.as_str(), "builtin.scalar/rand/v1");
-            assert_eq!(args.len(), 1);
-            args.iter()
-                .map(|child| invocation(fragment, *child, EvaluationDemand::Value, next, uses))
-                .collect::<Vec<_>>()
-        }
-        ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
-        other => panic!("fixture has no exact control protocol for {other:?}"),
-    };
-    uses.push(ExpressionInvocation {
-        context: ExpressionEffectContext {
-            use_id: id,
-            region: EvaluationRegionId::new(u32::MAX),
-            demand,
-        },
-        definition: expression,
-        control: ControlShape::Eager,
-        arguments: children.into_boxed_slice(),
-    });
-    id
-}
-
 fn package(functions: &PureEngineFunctionCatalog, mode: SeedMode) -> Arc<FragmentPackage> {
     package_with_outputs(functions, mode, false, false)
 }
@@ -221,7 +185,7 @@ fn package_with_outputs(
             }
         })
         .collect::<Box<[_]>>();
-    let original_request = novarocks_physical_plan::PhysicalCallRequest {
+    let original_request = novarocks_expression_contract::PhysicalCallRequest {
         arguments: original_arguments,
         logical_argument_count: request.logical_argument_count,
         expected_result_type: request.expected_result_type.cloned(),
@@ -250,14 +214,14 @@ fn package_with_outputs(
         .unwrap();
     let extra_type = FunctionValueType::new(DataType::Int64, false);
     let extra_expr = builder
-        .add_expression(
+        .fixture_value_root(
             first_project,
             extra_type.clone(),
             crate::test_constants::i64(&mut constants, &extra_type, 999, options(1).constants),
         )
         .unwrap();
     let seed_expr = builder
-        .add_expression(
+        .fixture_value_root(
             first_project,
             seed_type.clone(),
             crate::test_constants::i64(&mut constants, &seed_type, 42, options(1).constants),
@@ -265,7 +229,7 @@ fn package_with_outputs(
         .unwrap();
     let bool_type = FunctionValueType::new(DataType::Boolean, false);
     let bool_expr = builder
-        .add_expression(
+        .fixture_value_root(
             first_project,
             bool_type.clone(),
             crate::test_constants::boolean(&mut constants, &bool_type, true, options(1).constants),
@@ -282,7 +246,7 @@ fn package_with_outputs(
                 ty,
                 origin: ValueOrigin::Expr {
                     node: first_project,
-                    expr,
+                    root: expr,
                 },
             })
             .unwrap();
@@ -301,14 +265,22 @@ fn package_with_outputs(
             Box::from([extra_value, seed_value, bool_value]),
         )
         .unwrap();
+    let predicate_definition = builder
+        .fixture_definition(filter, bool_type, ExprKind::Value(bool_value))
+        .unwrap();
     let predicate = builder
-        .add_expression(filter, bool_type, ExprKind::Value(bool_value))
+        .fixture_occurrence(
+            filter,
+            predicate_definition,
+            EvaluationDemand::TruthOnly,
+            RootScope::Port(0),
+        )
         .unwrap();
     builder
         .add_filter(filter, first_project, Box::from([predicate]))
         .unwrap();
     let call_argument = builder
-        .add_expression(
+        .fixture_definition(
             second_project,
             seed_type.clone(),
             match mode {
@@ -325,7 +297,7 @@ fn package_with_outputs(
         kind: bound.kind,
         argument_types: selected.argument_types.clone(),
         result_type: result_type.clone(),
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: bound.semantics.volatility,
             argument_evaluation: bound.semantics.argument_evaluation,
             failure_behavior: bound.semantics.failure_behavior,
@@ -333,8 +305,8 @@ fn package_with_outputs(
             semantic_parameters: Box::default(),
         }),
     };
-    let call = builder
-        .add_expression(
+    let call_definition = builder
+        .fixture_definition(
             second_project,
             result_type.clone(),
             ExprKind::FunctionCall {
@@ -343,25 +315,62 @@ fn package_with_outputs(
             },
         )
         .unwrap();
+    let declaration = functions
+        .metadata()
+        .definition("rand", FunctionKind::Scalar)
+        .unwrap();
+    let effects = declaration
+        .binding_declaration()
+        .unwrap()
+        .effect_declaration(&selected.overload)
+        .unwrap();
+    assert_eq!(
+        effects.argument_control,
+        novarocks_type_contract::ArgumentControl::Eager
+    );
+    builder
+        .unit(second_project)
+        .unwrap()
+        .definition_control(
+            call_definition,
+            novarocks_expression_contract::DefinitionControl {
+                shape: novarocks_type_contract::ControlShape::Eager,
+                temporal_sources: None,
+            },
+        )
+        .unwrap();
+    builder
+        .unit(second_project)
+        .unwrap()
+        .request(call_definition, original_request)
+        .unwrap();
+    let call = builder
+        .fixture_occurrence(
+            second_project,
+            call_definition,
+            EvaluationDemand::Value,
+            RootScope::Port(0),
+        )
+        .unwrap();
     builder
         .insert_value(ValueDef {
             id: sample_value,
             ty: result_type.clone(),
             origin: ValueOrigin::Expr {
                 node: second_project,
-                expr: call,
+                root: call,
             },
         })
         .unwrap();
     let identity_a = builder
-        .add_expression(
+        .fixture_value_root(
             second_project,
             seed_type.clone(),
             ExprKind::Value(seed_value),
         )
         .unwrap();
     let identity_b = builder
-        .add_expression(
+        .fixture_value_root(
             second_project,
             seed_type.clone(),
             ExprKind::Value(seed_value),
@@ -372,7 +381,8 @@ fn package_with_outputs(
     if repeated_rand {
         // The same definition still has two independently controlled root uses.
         // It cannot prove that two stateful evaluations publish one value.
-        project_expressions.push((call, sample_value));
+        let repeated = builder.fixture_repeated_root(second_project, call).unwrap();
+        project_expressions.push((repeated, sample_value));
         project_output.push(sample_value);
     }
     project_expressions.extend([(identity_a, seed_value), (identity_b, seed_value)]);
@@ -387,7 +397,7 @@ fn package_with_outputs(
         .unwrap();
     let limit_input = if downstream_consumer {
         let downstream_expr = builder
-            .add_expression(downstream, seed_type.clone(), ExprKind::Value(seed_value))
+            .fixture_value_root(downstream, seed_type.clone(), ExprKind::Value(seed_value))
             .unwrap();
         builder
             .add_project(
@@ -402,6 +412,67 @@ fn package_with_outputs(
         second_project
     };
     builder.add_limit(limit, limit_input, Some(1), 0).unwrap();
+    let nodes = builder
+        .construction_nodes()
+        .filter_map(|(&id, _)| builder.construction_unit(id).is_some().then_some(id))
+        .collect::<Vec<_>>();
+    for node in nodes {
+        let ports = builder.node_ports(node).unwrap();
+        let draft = builder.take_unit_builder(node).unwrap();
+        let mut work =
+            CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
+        let sealed = draft.seal(ports, &mut work).unwrap();
+        let mut claims = BTreeMap::new();
+        if node == second_project {
+            for (&call_use, invocation) in sealed
+                .uses()
+                .iter()
+                .filter(|(_, invocation)| invocation.definition == call_definition)
+            {
+                let argument_uses = [Some(invocation.arguments[0])];
+                let context = invocation.context;
+                let authored = functions
+                    .prepare_fresh(
+                        CallEffectInput {
+                            context: context.into(),
+                            argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
+                                &argument_uses,
+                            ),
+                            function_id: &bound.function_id,
+                            kind: bound.kind,
+                            selected: selected.as_ref(),
+                            request,
+                            environment: &[],
+                            parameters: &parameters,
+                            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                            proof_scope: novarocks_type_contract::CallProofScope::Region(
+                                context.region,
+                            ),
+                        },
+                        selected.clone(),
+                        PureCallPreparation::Scalar {
+                            arguments: ScopedExpressionEffects::pure_value(context),
+                        },
+                        &FixtureControl,
+                    )
+                    .unwrap();
+                claims.insert(
+                    call_use,
+                    ExpressionCallClaim {
+                        context,
+                        effects: authored.call_contract().effects().clone(),
+                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                        temporal_source: None,
+                        regexp_count_pattern_source: None,
+                        to_base64_byte_source: None,
+                    },
+                );
+            }
+        }
+        let unit = sealed.finish(claims, &mut work).unwrap();
+        work.finish().unwrap();
+        builder.install_unit(node, Arc::new(unit)).unwrap();
+    }
     let fragment = builder
         .finish_definition(
             limit,
@@ -413,87 +484,7 @@ fn package_with_outputs(
             },
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
-        .unwrap()
-        .with_call_requests_observed(
-            vec![(
-                novarocks_physical_plan::PhysicalCallDefinition::Expression(call),
-                original_request,
-            )],
-            &FixtureControl,
-        )
         .unwrap();
-    let actual_roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let mut next = 4096;
-    let mut uses = Vec::new();
-    let roots = actual_roots
-        .sites()
-        .iter()
-        .map(|(site, root)| {
-            (
-                *site,
-                invocation(&fragment, root.expr, root.demand, &mut next, &mut uses),
-            )
-        })
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: EvaluationRegionId::new(u32::MAX),
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let physical_uses = PhysicalRootUses::try_new(&fragment, flow, roots, &FixtureControl).unwrap();
-    let mut call_entries = Vec::new();
-    for (call_use, invocation) in physical_uses
-        .flow()
-        .uses()
-        .iter()
-        .filter(|(_, invocation)| invocation.definition == call)
-    {
-        let argument_uses = [Some(invocation.arguments[0])];
-        let context = invocation.context;
-        let authored = functions
-            .prepare_fresh(
-                CallEffectInput {
-                    context,
-                    argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
-                        &argument_uses,
-                    ),
-                    function_id: &bound.function_id,
-                    kind: bound.kind,
-                    selected: selected.as_ref(),
-                    request,
-                    environment: &[],
-                    parameters: &parameters,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    proof_scope: novarocks_type_contract::CallProofScope::Region(context.region),
-                },
-                selected.clone(),
-                PureCallPreparation::Scalar {
-                    arguments: ScopedExpressionEffects::pure_value(context),
-                },
-                &FixtureControl,
-            )
-            .unwrap();
-        call_entries.push(FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: PhysicalCallSite::Expression(*call_use),
-            context,
-            effects: authored.call_contract().effects().clone(),
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        });
-    }
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &physical_uses, call_entries, &FixtureControl)
-            .unwrap();
     let mut result_fields = if downstream_consumer {
         vec![ResultField {
             domain: novarocks_physical_plan::ResultValueDomain::Plain,
@@ -553,8 +544,7 @@ fn package_with_outputs(
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,
-                expression_uses: physical_uses,
-                calls,
+                statement_constant_policy: options(1).constants,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters,
@@ -581,6 +571,41 @@ fn compile(
     compile_fragment(validated, functions, options(1), &FixtureControl).unwrap()
 }
 
+fn compiled_unit_for(
+    program: &novarocks_local_program::LocalProgram,
+    physical: NodeId,
+) -> &novarocks_expression::CompiledExprSet {
+    let node = program
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| {
+            node.physical_sources()
+                .iter()
+                .any(|source| source.get() == physical.get())
+        })
+        .expect("actual physical node");
+    let reference = match node.kind() {
+        ProgramNodeKind::Project { exprs, .. } => exprs[0],
+        ProgramNodeKind::Filter { predicates, .. } => predicates[0],
+        _ => panic!("this fixture node owns actual roots"),
+    };
+    program.unit(reference.unit).unwrap()
+}
+fn input_count(program: &novarocks_local_program::LocalProgram) -> usize {
+    program
+        .units()
+        .iter()
+        .map(|unit| {
+            unit.control_flow()
+                .uses()
+                .keys()
+                .filter(|id| unit.input(**id).is_some())
+                .count()
+        })
+        .sum()
+}
+
 #[test]
 fn value_channels_keep_original_source_ordinals_and_each_occurrence_lexical_binding() {
     let functions = rng_subset();
@@ -595,59 +620,73 @@ fn value_channels_keep_original_source_ordinals_and_each_occurrence_lexical_bind
         panic!("Values")
     };
     assert_eq!(values.batch().unwrap().num_rows(), 1);
-    let checked = program.checked();
-    let channels = checked.channels();
-    let resolved = channels.expressions().resolved_calls();
-    assert_eq!(resolved.calls().len(), 1);
-    let local_flow = &resolved.snapshot().flows()[&ProgramExpressionArena::Main];
+    let channels = program.channels();
+    assert_eq!(
+        program
+            .units()
+            .iter()
+            .map(|unit| unit.calls().len())
+            .sum::<usize>(),
+        1
+    );
     let mut seen = 0;
-    for (physical_use, invocation) in source.expression_uses().flow().uses() {
-        let physical_expr = source
-            .fragment()
-            .expressions()
-            .get(invocation.definition)
-            .unwrap();
-        let ExprKind::Value(value) = physical_expr.kind else {
+    for physical in source.fragment().nodes().values() {
+        let Some(bound) = &physical.expressions else {
             continue;
         };
-        let expected = if physical_expr.owner == NodeId::new(3) {
-            assert_eq!(value, ValueId::new(7));
-            ProgramChannelSite::Layout {
-                node: ProgramNodeId::new(1),
-                role: ProgramChannelLayoutRole::NodeOutput,
-                ordinal: 2,
-            }
-        } else {
-            assert_eq!(value, ValueId::new(100));
-            ProgramChannelSite::Layout {
-                node: ProgramNodeId::new(2),
-                role: ProgramChannelLayoutRole::NodeOutput,
-                ordinal: 1,
-            }
-        };
-        let occurrence = ProgramUseRef {
-            arena: ProgramExpressionArena::Main,
-            use_id: *physical_use,
-        };
-        assert_eq!(
-            checked.slots().get(&occurrence),
-            Some(&ProgramLexicalSource::Input(expected))
-        );
-        let local_definition = local_flow.uses()[physical_use].definition;
-        let StaticExprKind::SlotId(slot) =
-            graph.expressions().node(local_definition).unwrap().kind()
-        else {
-            panic!("Value lowers to exact input slot")
-        };
-        assert_eq!(channels.channel_slot(expected), Some(*slot));
-        assert_ne!(slot.as_u32(), value.get());
-        assert_ne!(physical_use.get(), invocation.definition.get());
-        assert_eq!(local_flow.uses()[physical_use].context, invocation.context);
-        assert_eq!(channels.channel_type(expected), Some(&physical_expr.ty));
-        seen += 1;
+        let unit = compiled_unit_for(&program, physical.id);
+        for (&physical_use, invocation) in bound.control_flow().uses() {
+            let physical_expr = bound.definition(invocation.definition).unwrap();
+            let ExprKind::Value(value) = physical_expr.kind else {
+                continue;
+            };
+            let expected = if physical.id == NodeId::new(3) {
+                assert_eq!(value, ValueId::new(7));
+                ProgramChannelSite::Layout {
+                    node: ProgramNodeId::new(1),
+                    role: ProgramChannelLayoutRole::NodeOutput,
+                    ordinal: 2,
+                }
+            } else {
+                assert_eq!(value, ValueId::new(100));
+                ProgramChannelSite::Layout {
+                    node: ProgramNodeId::new(2),
+                    role: ProgramChannelLayoutRole::NodeOutput,
+                    ordinal: 1,
+                }
+            };
+            let local = &unit.control_flow().uses()[&physical_use];
+            let local_definition = unit.compiled_definition(invocation.definition).unwrap();
+            assert_eq!(local.definition, local_definition);
+            assert!(matches!(
+                unit.definitions().node(local_definition).unwrap().kind(),
+                StaticExprKind::Input
+            ));
+            let input = unit.input(physical_use).unwrap();
+            let ProgramChannelSite::Layout {
+                node,
+                ordinal,
+                role,
+            } = expected
+            else {
+                unreachable!()
+            };
+            assert_eq!(input.ordinal, ordinal);
+            let layout = channels.channel_layout(graph, node, role).unwrap();
+            assert_eq!(
+                unit.scope(input.scope).unwrap().schema().as_ref(),
+                layout.schema().as_ref()
+            );
+            let slot = layout.slots()[ordinal as usize];
+            assert_eq!(channels.channel_slot(graph, expected), Some(slot));
+            assert_ne!(slot.as_u32(), value.get());
+            assert_eq!(local.context, invocation.context);
+            assert_eq!(channels.channel_type(expected), Some(&physical_expr.ty));
+            seen += 1;
+        }
     }
     assert_eq!(seen, 4);
-    assert_eq!(checked.slots().len(), 4);
+    assert_eq!(input_count(&program), 4);
 }
 
 #[test]
@@ -678,7 +717,7 @@ fn transparent_repeated_value_outputs_preserve_all_three_positions_and_distinct_
     assert_eq!(exprs.len(), 3);
     assert_ne!(exprs[1], exprs[2]);
     assert_eq!(expr_slot_ids.as_slice(), layout.slots());
-    let channels = program.checked().channels();
+    let channels = program.channels();
     for node in [ProgramNodeId::new(3), ProgramNodeId::new(4)] {
         for ordinal in [1, 2] {
             assert_eq!(
@@ -734,56 +773,46 @@ fn downstream_value_uses_first_proven_repeated_child_output_without_collapsing_p
     assert_ne!(exprs[1], exprs[2]);
     assert_eq!(expr_slot_ids.as_slice(), repeated_layout.slots());
 
-    let (physical_use, invocation) = source
-        .expression_uses()
-        .flow()
-        .uses()
-        .iter()
-        .find(|(_, invocation)| {
-            source
-                .fragment()
-                .expressions()
-                .get(invocation.definition)
-                .unwrap()
-                .owner
-                == NodeId::new(13)
-        })
+    let bound = source.fragment().nodes()[&NodeId::new(13)]
+        .expressions
+        .as_ref()
         .unwrap();
-    let definition = source
-        .fragment()
-        .expressions()
-        .get(invocation.definition)
+    let physical_use = bound
+        .root_use(novarocks_expression_contract::RootOrdinal::new(0))
         .unwrap();
+    let invocation = &bound.control_flow().uses()[&physical_use];
+    let definition = bound.definition(invocation.definition).unwrap();
     assert!(matches!(definition.kind, ExprKind::Value(value) if value == ValueId::new(100)));
     let expected_source = ProgramChannelSite::Layout {
         node: ProgramNodeId::new(3),
         role: ProgramChannelLayoutRole::NodeOutput,
         ordinal: 1,
     };
-    let occurrence = ProgramUseRef {
-        arena: ProgramExpressionArena::Main,
-        use_id: *physical_use,
-    };
-    let checked = program.checked();
-    let channels = checked.channels();
+    let channels = program.channels();
+    let unit = compiled_unit_for(&program, NodeId::new(13));
+    let local = &unit.control_flow().uses()[&physical_use];
+    let local_definition = unit.compiled_definition(invocation.definition).unwrap();
+    assert_eq!(local.definition, local_definition);
+    assert!(matches!(
+        unit.definitions().node(local_definition).unwrap().kind(),
+        StaticExprKind::Input
+    ));
+    let input = unit.input(physical_use).unwrap();
+    assert_eq!(input.ordinal, 1);
     assert_eq!(
-        checked.slots().get(&occurrence),
-        Some(&ProgramLexicalSource::Input(expected_source))
+        unit.scope(input.scope).unwrap().schema().as_ref(),
+        repeated_layout.schema().as_ref()
+    );
+    let input_slot = repeated_layout.slots()[input.ordinal as usize];
+    assert_eq!(input_slot, repeated_layout.slots()[1]);
+    assert_ne!(input_slot, repeated_layout.slots()[2]);
+    assert_ne!(input_slot.as_u32(), ValueId::new(100).get());
+    assert_eq!(
+        channels.channel_slot(graph, expected_source),
+        Some(input_slot)
     );
     assert_eq!(channels.channel_type(expected_source), Some(&definition.ty));
-    let local_flow =
-        &channels.expressions().resolved_calls().snapshot().flows()[&ProgramExpressionArena::Main];
-    let local_definition = local_flow.uses()[physical_use].definition;
-    let StaticExprKind::SlotId(input_slot) =
-        graph.expressions().node(local_definition).unwrap().kind()
-    else {
-        panic!("downstream Value is an exact child slot")
-    };
-    assert_eq!(*input_slot, repeated_layout.slots()[1]);
-    assert_ne!(*input_slot, repeated_layout.slots()[2]);
-    assert_ne!(input_slot.as_u32(), ValueId::new(100).get());
-    assert_eq!(channels.channel_slot(expected_source), Some(*input_slot));
-    assert_eq!(local_flow.uses()[physical_use].context, invocation.context);
+    assert_eq!(local.context, invocation.context);
     for ordinal in [1, 2] {
         assert_eq!(
             channels.channel_type(ProgramChannelSite::Layout {
@@ -802,13 +831,23 @@ fn downstream_value_uses_first_proven_repeated_child_output_without_collapsing_p
     else {
         panic!("downstream Project")
     };
-    assert_eq!(exprs.as_slice(), &[local_definition]);
+    let reference = exprs[0];
+    assert_eq!(exprs.len(), 1);
+    assert_eq!(
+        program
+            .unit(reference.unit)
+            .unwrap()
+            .root(reference.root)
+            .unwrap()
+            .definition,
+        local_definition
+    );
     assert_eq!(
         expr_slot_ids.as_slice(),
         graph.nodes()[4].output_layout().slots()
     );
     assert_eq!(expr_slot_ids.len(), 1);
-    assert_ne!(expr_slot_ids[0], *input_slot);
+    assert_ne!(expr_slot_ids[0], input_slot);
     assert_eq!(
         graph.nodes()[5].output_layout().slots(),
         expr_slot_ids.as_slice()
@@ -817,7 +856,15 @@ fn downstream_value_uses_first_proven_repeated_child_output_without_collapsing_p
     // Complete frozen facts for both independently controlled RAND roots do
     // not make their repeated publication a transparent value read.
     let repeated_rand = package_with_outputs(&functions, SeedMode::Input, false, true);
-    assert_eq!(repeated_rand.calls().entries().len(), 2);
+    assert_eq!(
+        repeated_rand.fragment().nodes()[&NodeId::new(8)]
+            .expressions
+            .as_ref()
+            .unwrap()
+            .claims()
+            .len(),
+        2
+    );
     assert_eq!(
         repeated_rand.fragment().nodes()[&NodeId::new(8)]
             .output
@@ -888,7 +935,7 @@ fn every_actual_value_channel_callback_and_ordinary_tail_preserves_primary_contr
         || validate_fragment_providers(source.clone(), &providers, &FixtureControl).unwrap();
     let recorder = CallbackControl::new(CompileControlError::Cancelled, usize::MAX);
     let program = compile_fragment(validate(), &functions, options(1), &recorder).unwrap();
-    assert_eq!(program.checked().slots().len(), 5);
+    assert_eq!(input_count(&program), 5);
     let successful = recorder.trace.lock().unwrap().clone();
     assert!(successful.iter().any(|(_, units)| *units > 0));
     assert!(successful.iter().all(|(_, units)| *units <= 256));
@@ -952,21 +999,20 @@ impl KernelEvaluationControl for EvaluationControl {
     }
 }
 fn instance(program: &novarocks_local_program::LocalProgram) -> ScalarEvaluationInstance {
-    let calls = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .calls();
-    let (site, call) = calls.iter().next().unwrap();
-    let ProgramCallSite::Expression(occurrence) = site else {
-        panic!("scalar occurrence")
-    };
-    let ProgramStateTemplate::Scalar { scope, kernel } = program.state_template(*site).unwrap()
+    let unit = program
+        .units()
+        .iter()
+        .find(|unit| !unit.calls().is_empty())
+        .expect("actual RAND unit");
+    assert_eq!(unit.calls().len(), 1);
+    let (&occurrence, call) = unit.calls().iter().next().unwrap();
+    let novarocks_expression::evaluator_view::UnitStateTemplate::Scalar { scope, kernel } =
+        novarocks_expression::evaluator_view::state_template(unit, occurrence).unwrap()
     else {
         panic!("scalar state")
     };
-    assert_eq!(scope.occurrence, *occurrence);
+    assert_eq!(scope.occurrence, occurrence);
+    assert_eq!(scope.root.get(), 0);
     assert!(std::ptr::eq(kernel.contract().call(), call.call_contract()));
     ScalarEvaluationInstance::instantiate(kernel.clone()).unwrap()
 }
@@ -1040,28 +1086,21 @@ fn compiled_value_seed_rand_uses_actual_sparse_rows_and_is_invariant_across_batc
 fn original_nonconstant_seed_is_not_promoted_by_its_physical_literal() {
     let functions = rng_subset();
     let source = package(&functions, SeedMode::LiteralWithoutConstant);
-    let (&definition, request) = source
-        .fragment()
-        .call_requests()
-        .entries()
-        .iter()
-        .next()
+    let unit = source.fragment().nodes()[&NodeId::new(8)]
+        .expressions
+        .as_ref()
         .unwrap();
-    let novarocks_physical_plan::PhysicalCallDefinition::Expression(id) = definition else {
-        panic!("actual RAND definition");
-    };
+    let (&id, request) = unit.requests().iter().next().unwrap();
     assert!(request.expected_result_type.is_none());
     assert_eq!(request.logical_argument_count, 1);
     assert!(matches!(
         request.arguments[0],
         novarocks_physical_plan::StaticFunctionArgument::Value { constant: None, .. }
     ));
-    let ExprKind::FunctionCall { args, .. } =
-        &source.fragment().expressions().get(id).unwrap().kind
-    else {
+    let ExprKind::FunctionCall { args, .. } = &unit.definition(id).unwrap().kind else {
         panic!("actual RAND call");
     };
-    let child = source.fragment().expressions().get(args[0]).unwrap();
+    let child = unit.definition(args[0]).unwrap();
     let ExprKind::Constant(reference) = child.kind else {
         panic!("actual checked seed")
     };
