@@ -93,12 +93,10 @@ impl<'a> super::AnalyzerContext<'a> {
                     for col_obj in columns {
                         self.check_control()?;
                         let col_name = col_obj.value.clone();
-                        let (left_id, left_dt, left_nullable) = current_scope
-                            .resolve(None, &col_name)
-                            .unwrap_or((crate::column_id::ColumnId::UNSET, DataType::Utf8, true));
-                        let (right_id, right_dt, right_nullable) = right_scope
-                            .resolve(None, &col_name)
-                            .unwrap_or((crate::column_id::ColumnId::UNSET, DataType::Utf8, true));
+                        let (left_id, left_type) =
+                            current_scope.resolve_at(None, &col_name, col_obj.span)?;
+                        let (right_id, right_type) =
+                            right_scope.resolve_at(None, &col_name, col_obj.span)?;
                         // After a previous FULL OUTER USING the left side
                         // carries a synthetic COALESCE for this column —
                         // `coalesce(prev_left.id, prev_right.id)` — because
@@ -121,10 +119,7 @@ impl<'a> super::AnalyzerContext<'a> {
                                         qualifier: None,
                                         column: col_name.clone(),
                                     },
-                                    value_type: novarocks_type_contract::FunctionValueType::new(
-                                        left_dt,
-                                        left_nullable,
-                                    ),
+                                    value_type: left_type,
                                 }
                             };
                         let right_ref = TypedExpr {
@@ -133,10 +128,7 @@ impl<'a> super::AnalyzerContext<'a> {
                                 qualifier: None,
                                 column: col_name,
                             },
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                right_dt,
-                                right_nullable,
-                            ),
+                            value_type: right_type,
                         };
                         conds.push(TypedExpr {
                             value_type: novarocks_type_contract::FunctionValueType::new(

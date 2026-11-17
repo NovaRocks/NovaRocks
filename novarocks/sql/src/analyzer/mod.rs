@@ -4425,6 +4425,31 @@ mod tests {
     }
 
     #[test]
+    fn using_requires_a_real_column_binding_on_both_sides() {
+        for sql in [
+            "SELECT 1 FROM (VALUES (1)) l(other) JOIN (VALUES (2)) r(key) USING (key)",
+            "SELECT 1 FROM (VALUES (1)) l(key) JOIN (VALUES (2)) r(other) USING (key)",
+            "SELECT 1 FROM (VALUES (1)) l(a) JOIN (VALUES (2)) r(b) USING (key)",
+        ] {
+            let query = parse_native_query(sql).unwrap();
+            let error = match analyze(&query, &TestCatalog, "default") {
+                Err(error) => error,
+                Ok(_) => panic!("a missing USING key must not receive a fabricated binding: {sql}"),
+            };
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnknownColumn
+            );
+            assert!(error.message().contains("Column 'key' cannot be resolved."));
+            let start = sql.rfind("key").unwrap();
+            assert_eq!(
+                error.span(),
+                Some(novarocks_parser::Span::new(start, start + 3))
+            );
+        }
+    }
+
+    #[test]
     fn decimal_literal_over_decimal128_precision_infers_decimal256() {
         let resolved =
             parse_raw_and_analyze("select 123456789012345678901234567890.123456789 as d")
