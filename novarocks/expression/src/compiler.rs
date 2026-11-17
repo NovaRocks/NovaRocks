@@ -66,10 +66,11 @@ pub enum ExprCompileError {
     Invalid(&'static str),
 }
 impl ExprCompileError {
-    /// This new model source uses the existing Owner channel, but retains the
-    /// primary construction priority of the previous Resource envelope even
-    /// when SourceModel's neutral class is Invariant rather than Resource.
-    pub(crate) fn is_primary_construction(&self) -> bool {
+    /// Construction priority that cannot be inferred from the failure class.
+    /// In addition to normal resource/control precedence, enclosing compilers
+    /// return these refusals before an ordinary-error footer. In particular,
+    /// a SourceModel invariant retains its original construction priority.
+    pub fn is_primary_construction(&self) -> bool {
         matches!(self, Self::BTree(_))
     }
 
@@ -2488,3 +2489,10 @@ fn validate_prepared_call(
     token.effects().for_use(invocation.context)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "compiler/checked_reference_tests.rs"]
+mod checked_reference_tests;
+#[cfg(test)]
+#[path = "compiler/literal_metadata_tests.rs"]
+mod literal_metadata_tests;

@@ -256,3 +256,7 @@ pub(crate) fn borrow_scope<'borrow, H>(
         None => None,
     }
 }
+
+#[cfg(test)]
+#[path = "creation/argument_types_tests.rs"]
+mod argument_types_tests;
