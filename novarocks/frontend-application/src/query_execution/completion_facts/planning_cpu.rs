@@ -158,6 +158,7 @@ struct LogicalCatalogInput {
 }
 enum PlanningCpuInput {
     SessionProperties(Box<crate::query::session_property_computation::SessionPropertyCpuInput>),
+    CatalogProperties(Box<crate::query::catalog_property_computation::CatalogPropertyCpuInput>),
     SystemTableBatch,
     SystemTableFinish,
     Start(Box<SqlFinalPlanCompileRequest>),
@@ -179,6 +180,14 @@ enum PlanningCpuInput {
     LogicalFinish(Box<LogicalFinishInput>),
 }
 enum PlanningCpuOutput {
+    CatalogProperties(
+        Box<
+            Result<
+                novarocks_sql::semantic::command::CatalogCreateCommand,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
     SessionProperties(
         Box<
             Result<
@@ -260,6 +269,9 @@ impl PlanningCpuOriginal {
         let output = match input {
             PlanningCpuInput::SessionProperties(input) => {
                 PlanningCpuOutput::SessionProperties(Box::new(input.run()))
+            }
+            PlanningCpuInput::CatalogProperties(input) => {
+                PlanningCpuOutput::CatalogProperties(Box::new(input.run()))
             }
             PlanningCpuInput::SystemTableBatch => PlanningCpuOutput::SystemTableBatch(
                 body.system_snapshot
@@ -943,6 +955,22 @@ impl FrontendPlanningCpuSource {
             panic!("system table snapshot returned another CPU phase");
         };
         Ok(result)
+    }
+    pub(crate) async fn catalog_properties(
+        &self,
+        input: crate::query::catalog_property_computation::CatalogPropertyCpuInput,
+    ) -> Result<
+        Result<
+            novarocks_sql::semantic::command::CatalogCreateCommand,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::CatalogProperties(Box::new(input)));
+        let PlanningCpuOutput::CatalogProperties(result) = self.receive().await? else {
+            panic!("catalog properties returned another CPU phase")
+        };
+        Ok(*result)
     }
     pub(crate) async fn session_properties(
         &self,

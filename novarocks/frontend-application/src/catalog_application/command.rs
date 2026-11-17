@@ -43,11 +43,9 @@ use novarocks_catalog_application::{CatalogApplicationPort, CatalogCreateCommand
 use novarocks_query_application::api::{CommandError, build_utf8_query_result};
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
+use novarocks_sql::semantic::command::CatalogCreateCommand as SemanticCatalogCreateCommand;
 use novarocks_sql::semantic::command::{
     AlterIcebergTableSqlCommand, CreateTableSqlCommand, IcebergTableSqlAction,
-};
-use novarocks_sql::semantic::command::{
-    CatalogCreateCommand as SemanticCatalogCreateCommand, CommandLiteral,
 };
 use novarocks_sql::semantic::{CatalogSqlCommand, ObjectName, TableColumnDef};
 
@@ -295,16 +293,7 @@ impl CatalogCommandExecutor {
 pub(super) fn lower_semantic_create_catalog(
     command: &SemanticCatalogCreateCommand,
 ) -> Result<CatalogCreateCommand, String> {
-    let properties = command
-        .properties
-        .iter()
-        .map(|property| {
-            Ok((
-                catalog_command_literal_text(&property.key)?,
-                catalog_command_literal_text(&property.value)?,
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let properties = command.properties.clone();
     let instance_id = ConnectorInstanceId::parse(&normalize_identifier(&command.name)?)
         .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
     Ok(CatalogCreateCommand {
@@ -313,13 +302,6 @@ pub(super) fn lower_semantic_create_catalog(
         properties,
         if_not_exists: command.if_not_exists,
     })
-}
-
-fn catalog_command_literal_text(literal: &CommandLiteral) -> Result<String, String> {
-    match literal {
-        CommandLiteral::String(value) => Ok(value.clone()),
-        _ => Err("catalog properties require identifier or string values".to_string()),
-    }
 }
 
 fn execute_alter_iceberg_properties(
@@ -1202,20 +1184,9 @@ mod tests {
 
     #[test]
     fn typed_create_catalog_lowers_without_the_legacy_sql_facade() {
-        let statement = novarocks_query_application::sql::parse_single_statement(
+        let statement = crate::query::catalog_property_computation::prepare_legacy_catalog_for_test(
             "CREATE EXTERNAL CATALOG IF NOT EXISTS Warehouse PROPERTIES ('type'='iceberg')",
-        )
-        .expect("parse catalog statement");
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(boxed_command)) =
-            novarocks_query_application::sql::lower_product_sql_command(&statement)
-                .expect("lower catalog statement")
-        else {
-            panic!("expected semantic CREATE CATALOG");
-        };
-        let novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(statement) = *boxed_command
-        else {
-            panic!("expected semantic CREATE CATALOG");
-        };
+        );
 
         let command = lower_semantic_create_catalog(&statement).expect("lower catalog command");
         assert_eq!(command.instance_id.as_str(), "warehouse");

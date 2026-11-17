@@ -106,6 +106,8 @@ use novarocks_workload_control::{
 };
 use novarocks_workload_control::{WorkError, WorkOwner};
 
+mod catalog_action;
+pub(crate) mod catalog_property_computation;
 pub(crate) mod compiler;
 pub(crate) mod ctas_action;
 pub(crate) mod delete_action;
@@ -1687,6 +1689,21 @@ impl FrontendQuerySession {
                 }
             },
             None => command_context,
+        };
+        let parsed_statement = match parsed_statement {
+            ParsedStatement::Catalog(ast::CatalogStatement::CreateCatalog(create)) => {
+                return self
+                    .execute_observed_catalog_create(
+                        Arc::from(sql),
+                        create,
+                        context,
+                        command_context,
+                        deadline,
+                        statement,
+                    )
+                    .await;
+            }
+            other => other,
         };
         if let Ok(Some(ProductSqlCommand::Catalog(command))) =
             lower_product_sql_command(&parsed_statement)

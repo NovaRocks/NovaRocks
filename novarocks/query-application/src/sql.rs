@@ -21,8 +21,8 @@ use std::{fmt, sync::Arc};
 
 use novarocks_parser::{ParserError, ast::Statement};
 use novarocks_sql::semantic::command::{
-    AlterIcebergTableSqlCommand, CatalogCreateCommand, ColumnPositionSql, CommandLiteral,
-    CommandProperty, CreateTableSqlCommand, ExpireSnapshotsOptionSql, IcebergColumnSqlAction,
+    AlterIcebergTableSqlCommand, ColumnPositionSql, CommandLiteral, CommandProperty,
+    CreateTableSqlCommand, ExpireSnapshotsOptionSql, IcebergColumnSqlAction,
     IcebergPartitionSqlChange, IcebergPropertiesSqlAction, IcebergReferenceKindSql,
     IcebergReferenceSqlAction, IcebergSchemaSqlChange, IcebergTableSqlAction, MaintenanceValueSql,
     ProcedureArgumentModeSql, ProcedureArgumentSql, ReferenceAnchorSql, TableColumnSqlCommand,
@@ -253,27 +253,8 @@ fn lower_catalog_command(
             table: lower_object_name(&statement.name),
             target_ref: statement.target_ref.clone(),
         },
-        CatalogStatement::CreateCatalog(statement) => {
-            CatalogSqlCommand::CreateCatalog(CatalogCreateCommand {
-                external: statement.external,
-                if_not_exists: statement.if_not_exists,
-                name: statement.name.value.clone(),
-                comment: statement
-                    .comment
-                    .as_ref()
-                    .map(lower_command_literal)
-                    .transpose()?,
-                properties: statement
-                    .properties
-                    .iter()
-                    .map(|property| {
-                        Ok(CommandProperty {
-                            key: lower_command_literal(&property.key)?,
-                            value: lower_command_literal(&property.value)?,
-                        })
-                    })
-                    .collect::<Result<_, String>>()?,
-            })
+        CatalogStatement::CreateCatalog(_) => {
+            return Err("CREATE CATALOG requires evaluated property preparation".to_owned());
         }
         CatalogStatement::DropCatalog(statement) => CatalogSqlCommand::DropCatalog {
             name: statement.name.value.clone(),
@@ -1506,6 +1487,19 @@ mod tests {
 
         for (sql, expected) in cases {
             let statement = parse_single_statement(sql).expect("parse catalog command");
+            if matches!(
+                &statement,
+                novarocks_parser::ast::Statement::Catalog(
+                    novarocks_parser::ast::CatalogStatement::CreateCatalog(_)
+                )
+            ) {
+                assert_eq!(expected, "CREATE CATALOG");
+                assert_eq!(
+                    lower_product_sql_command(&statement).unwrap_err(),
+                    "CREATE CATALOG requires evaluated property preparation"
+                );
+                continue;
+            }
             let Some(ProductSqlCommand::Catalog(command)) =
                 lower_product_sql_command(&statement).expect("lower catalog command")
             else {

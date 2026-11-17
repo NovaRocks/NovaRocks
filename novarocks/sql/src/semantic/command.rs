@@ -61,11 +61,10 @@ pub enum CatalogSqlCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogCreateCommand {
-    pub external: bool,
     pub if_not_exists: bool,
     pub name: String,
-    pub comment: Option<CommandLiteral>,
-    pub properties: Vec<CommandProperty>,
+    /// Already evaluated VARCHAR configuration facts, retaining original keys.
+    pub properties: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

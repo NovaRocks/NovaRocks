@@ -828,3 +828,127 @@ fn ddl_property_control_refuses_before_port_and_after_actual_port_return() {
     assert_eq!(port.seen.len(), 1);
     port.exhausted();
 }
+
+#[test]
+fn legacy_catalog_preparation_uses_original_literal_facts_and_evaluated_strings() {
+    use novarocks_parser::ast::{
+        CatalogStatement, LiteralKind, Statement, legacy::CatalogProperty,
+    };
+    use novarocks_query_application::sql::{lower_product_sql_command, parse_single_statement};
+
+    struct LegacyPort<'a> {
+        properties: &'a [CatalogProperty],
+        results: VecDeque<ConstantValue>,
+        cursor: usize,
+    }
+    impl DdlPropertyConstantPort for LegacyPort<'_> {
+        fn evaluate(
+            &mut self,
+            expression: &Expr,
+            target: Target,
+        ) -> Result<ConstantValue, DdlPropertyConstantError> {
+            assert_eq!(target, Target::Varchar);
+            let Expr::Literal(literal) = expression else {
+                panic!("original literal bridge");
+            };
+            // The old tree has a Literal slot, not an Expr address. Compare its
+            // actual parsed value/range; do not claim a fabricated old Expr loan.
+            assert_eq!(literal, &self.properties[self.cursor].value);
+            self.cursor += 1;
+            let result = self
+                .results
+                .pop_front()
+                .expect("one result per requested literal");
+            assert_eq!(result.ordinal(), 1);
+            assert_eq!(result.field().metadata()["original-provider"], "retained");
+            Ok(result)
+        }
+    }
+    let source = "CREATE EXTERNAL CATALOG IF NOT EXISTS Warehouse COMMENT 'old admitted comment' PROPERTIES ('MixedCase'='iceberg', 'location'='s3://original/中')";
+    let statement = parse_single_statement(source).unwrap();
+    let Statement::Catalog(CatalogStatement::CreateCatalog(original)) = &statement else {
+        panic!("actual legacy CREATE CATALOG");
+    };
+    assert!(original.external);
+    assert!(
+        matches!(&original.comment.as_ref().unwrap().kind, LiteralKind::String(value) if value == "old admitted comment")
+    );
+    assert_eq!(
+        lower_product_sql_command(&statement).unwrap_err(),
+        "CREATE CATALOG requires evaluated property preparation"
+    );
+    let mut port = LegacyPort {
+        properties: &original.properties,
+        cursor: 0,
+        results: vec![
+            text(Some("evaluated-iceberg")),
+            text(Some("s3://evaluated/中")),
+        ]
+        .into(),
+    };
+    let command =
+        prepare_legacy_create_catalog(source, original, &mut port, &Control::default()).unwrap();
+    assert_eq!(port.cursor, 2);
+    assert!(port.results.is_empty());
+    assert_eq!(command.name, "Warehouse");
+    assert!(command.if_not_exists);
+    assert_eq!(
+        command.properties,
+        vec![
+            ("MixedCase".into(), "evaluated-iceberg".into()),
+            ("location".into(), "s3://evaluated/中".into())
+        ]
+    );
+    assert!(
+        matches!(&original.properties[0].value.kind, LiteralKind::String(value) if value == "iceberg")
+    );
+    assert_eq!(
+        &source[original.properties[1].value.span.start()..original.properties[1].value.span.end()],
+        "'s3://original/中'"
+    );
+
+    let source = "CREATE CATALOG Warehouse PROPERTIES (12='iceberg')";
+    let statement = parse_single_statement(source).unwrap();
+    let Statement::Catalog(CatalogStatement::CreateCatalog(original)) = &statement else {
+        panic!("actual legacy CREATE CATALOG");
+    };
+    let mut port = LegacyPort {
+        properties: &original.properties,
+        cursor: 0,
+        results: VecDeque::new(),
+    };
+    let error = prepare_legacy_create_catalog(source, original, &mut port, &Control::default())
+        .unwrap_err();
+    assert_eq!(port.cursor, 0);
+    assert_eq!(
+        error.user_error().unwrap(),
+        &DdlPropertyScope::Catalog.to_user_error(
+            source,
+            original.properties[0].key.span,
+            "Catalog property keys must be string values"
+        )
+    );
+
+    let source = "CREATE CATALOG Warehouse PROPERTIES ('same'='first', 'same'='second')";
+    let statement = parse_single_statement(source).unwrap();
+    let Statement::Catalog(CatalogStatement::CreateCatalog(original)) = &statement else {
+        panic!("actual legacy CREATE CATALOG");
+    };
+    let mut port = LegacyPort {
+        properties: &original.properties,
+        cursor: 0,
+        results: vec![text(Some("first evaluated"))].into(),
+    };
+    let error = prepare_legacy_create_catalog(source, original, &mut port, &Control::default())
+        .unwrap_err();
+    assert_eq!(port.cursor, 1);
+    assert!(port.results.is_empty());
+    assert_eq!(
+        error.user_error().unwrap(),
+        &DdlPropertyScope::Catalog.to_user_error(
+            source,
+            original.properties[1].key.span,
+            "Duplicate property 'same'"
+        )
+    );
+}

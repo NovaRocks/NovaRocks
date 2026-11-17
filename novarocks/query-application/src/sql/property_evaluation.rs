@@ -118,6 +118,95 @@ impl EvaluatedDdlProperties {
     }
 }
 
+/// Temporary old-parser bridge; remove with the legacy catalog entry at P12.
+/// The legacy value is a parsed Literal, not an Expr slot. Its real kind/span
+/// are retained in a temporary Expr::Literal for the original constant port.
+/// This new wrapper address is not represented as an old-tree Expr identity.
+pub fn prepare_legacy_create_catalog(
+    source: &str,
+    statement: &novarocks_parser::ast::legacy::CreateCatalog,
+    port: &mut dyn DdlPropertyConstantPort,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_sql::semantic::command::CatalogCreateCommand, QueryServiceError> {
+    use novarocks_parser::ast::LiteralKind;
+
+    checkpoint(control, 0)?;
+    // The original literal-admission check preceded property lowering. Neither
+    // EXTERNAL nor COMMENT has a product reader; no new comment policy is added.
+    if let Some(comment) = &statement.comment {
+        super::lower_command_literal(comment)
+            .map_err(|message| QueryServiceError::new(QueryServiceErrorKind::Internal, message))?;
+    }
+    let mut expressions = Vec::with_capacity(statement.properties.len());
+    for property in &statement.properties {
+        checkpoint(control, 1)?;
+        if !matches!(&property.key.kind, LiteralKind::String(_)) {
+            return Err(invalid(
+                DdlPropertyScope::Catalog,
+                source,
+                property.key.span,
+                "Catalog property keys must be string values",
+            ));
+        }
+        match &property.value.kind {
+            LiteralKind::String(value) | LiteralKind::Decimal(value) => {
+                observe_bytes(value, control)?
+            }
+            LiteralKind::Long { spelling, .. } => observe_bytes(spelling, control)?,
+            LiteralKind::Binary(value) => {
+                for chunk in value.chunks(256) {
+                    checkpoint(control, chunk.len() as u32)?;
+                }
+            }
+            _ => {}
+        }
+        expressions.push(Expr::Literal(property.value.clone()));
+        checkpoint(control, 0)?;
+    }
+    let assignments = statement
+        .properties
+        .iter()
+        .zip(&expressions)
+        .map(|(property, expression)| {
+            let LiteralKind::String(name) = &property.key.kind else {
+                unreachable!("keys checked above")
+            };
+            DdlPropertyAssignment {
+                name,
+                name_span: property.key.span,
+                span: property.span,
+                value: DdlPropertyAssignmentValue::Expression(expression),
+            }
+        })
+        .collect::<Vec<_>>();
+    let evaluated = evaluate_ddl_properties(
+        DdlPropertyScope::Catalog,
+        DdlPropertyEvaluationMode::Create,
+        source,
+        &[],
+        &assignments,
+        port,
+        control,
+    )?;
+    let mut properties = Vec::with_capacity(evaluated.properties().len());
+    for property in evaluated.into_properties() {
+        checkpoint(control, 1)?;
+        let DdlPropertyChange::Set(DdlPropertyValue::Varchar(value)) = property.change else {
+            return Err(invariant(
+                "Prepared catalog property lost its non-NULL VARCHAR value",
+            ));
+        };
+        properties.push((property.name, value));
+    }
+    let name = copy_string(&statement.name.value, control)?;
+    checkpoint(control, 0)?;
+    Ok(novarocks_sql::semantic::command::CatalogCreateCommand {
+        if_not_exists: statement.if_not_exists,
+        name,
+        properties,
+    })
+}
+
 /// Declaration order determines ordinary frozen output order. Catalog has no
 /// declaration lookup: its original case-sensitive names retain input order.
 /// No published Set value is whole SQL NULL. Reset(NULL) is an ALTER intention.

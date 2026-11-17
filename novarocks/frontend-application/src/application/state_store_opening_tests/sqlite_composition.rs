@@ -579,18 +579,14 @@ async fn close_sqlite(
     assert!(opening.original_failure().is_none());
 }
 fn catalog_create(if_not_exists: bool) -> novarocks_sql::semantic::CatalogSqlCommand {
-    use novarocks_sql::semantic::command::{CatalogCreateCommand, CommandLiteral, CommandProperty};
+    use novarocks_sql::semantic::command::CatalogCreateCommand;
     novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(CatalogCreateCommand {
-        external: true,
         if_not_exists,
         name: "catalog_original".into(),
-        comment: None,
-        properties: vec![CommandProperty {
-            key: CommandLiteral::String("type".into()),
-            value: CommandLiteral::String("iceberg".into()),
-        }],
+        properties: vec![("type".into(), "iceberg".into())],
     })
 }
+
 async fn run_catalog_action(
     control: &WorkloadControl,
     driver: &mut JointProgressDriver,

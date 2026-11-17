@@ -29,9 +29,9 @@ use novarocks_query_application::{
 use novarocks_sql::{
     analyze_error::AnalyzeErrorKind,
     compiler::{
-        RequiredConstantInput, RequiredConstantRequest, RequiredConstantTarget, SqlCatalogSnapshot,
-        SqlCompileControl, SqlCompileError, SqlConstantEvaluationError, SqlFunctionCatalog,
-        prepare_required_constant,
+        PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
+        RequiredConstantTarget, SqlCatalogSnapshot, SqlCompileControl, SqlCompileError,
+        SqlConstantEvaluationError, SqlFunctionCatalog, prepare_required_constant,
     },
     sql_mode::SqlSemanticSettings,
 };
@@ -51,13 +51,15 @@ pub(crate) struct DdlPropertyConstantEvaluator<'a> {
     pub(crate) window: &'a ResultWindowAlias,
 }
 
-impl DdlPropertyConstantPort for DdlPropertyConstantEvaluator<'_> {
-    fn evaluate(
-        &mut self,
+impl DdlPropertyConstantEvaluator<'_> {
+    /// Catalog snapshot borrowing ends with this pure preparation call. The
+    /// original caller may then release its catalog read guard before evaluate.
+    pub(crate) fn prepare(
+        &self,
         expression: &Expr,
         target: RequiredConstantTarget,
-    ) -> Result<ConstantValue, DdlPropertyConstantError> {
-        let prepared = prepare_required_constant(RequiredConstantRequest {
+    ) -> Result<PreparedRequiredConstant, DdlPropertyConstantError> {
+        prepare_required_constant(RequiredConstantRequest {
             input: RequiredConstantInput::Expression(expression),
             target,
             catalog: self.catalog,
@@ -68,7 +70,17 @@ impl DdlPropertyConstantPort for DdlPropertyConstantEvaluator<'_> {
             control: self.control,
             version: super::physical_encoding::mint_plan_version(),
         })
-        .map_err(compile_error)?;
+        .map_err(compile_error)
+    }
+}
+
+impl DdlPropertyConstantPort for DdlPropertyConstantEvaluator<'_> {
+    fn evaluate(
+        &mut self,
+        expression: &Expr,
+        target: RequiredConstantTarget,
+    ) -> Result<ConstantValue, DdlPropertyConstantError> {
+        let prepared = self.prepare(expression, target)?;
         self.interpreter
             .evaluate(prepared, self.scope, self.window)
             .map_err(evaluation_error)
@@ -114,7 +126,7 @@ fn compile_error(error: SqlCompileError) -> DdlPropertyConstantError {
     }
 }
 
-fn evaluation_error(error: SqlConstantEvaluationError) -> DdlPropertyConstantError {
+pub(crate) fn evaluation_error(error: SqlConstantEvaluationError) -> DdlPropertyConstantError {
     match error {
         SqlConstantEvaluationError::Control(error) => {
             QueryServiceError::from_compile_control(error).into()

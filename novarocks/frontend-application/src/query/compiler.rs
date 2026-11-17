@@ -220,6 +220,32 @@ impl FrontendQueryCompiler {
         }
     }
 
+    pub(crate) fn catalog_property_input(
+        &self,
+        source: Arc<str>,
+        statement: novarocks_parser::ast::legacy::CreateCatalog,
+        current_database: String,
+        sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+        interpreter: Arc<crate::RequiredConstantInterpreter>,
+        control: novarocks_sql::compiler::SqlCompileControl,
+        scope: novarocks_workload_control::WorkScope,
+        window: novarocks_workload_control::ResultWindowAlias,
+    ) -> super::catalog_property_computation::CatalogPropertyCpuInput {
+        super::catalog_property_computation::CatalogPropertyCpuInput {
+            source,
+            statement,
+            current_database,
+            sql_semantics,
+            interpreter,
+            control,
+            scope,
+            window,
+            catalog: Arc::clone(self.query.catalog_service().local()),
+            functions: self.functions.clone(),
+            policy: self.constant_policy,
+        }
+    }
+
     /// The owners in this process that can answer what completing a statement
     /// asks, and the lane their synchronous calls are admitted through.
     fn completion_fact_owners(
