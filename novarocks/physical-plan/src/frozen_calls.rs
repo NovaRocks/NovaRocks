@@ -1001,7 +1001,6 @@ fn visit_calls<'a, E: From<FrozenCallError>>(
             )?,
             ExprKind::Value(_)
             | ExprKind::LambdaParameter { .. }
-            | ExprKind::Literal(_)
             | ExprKind::Constant(_)
             | ExprKind::Unary { .. }
             | ExprKind::Binary { .. }

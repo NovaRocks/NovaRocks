@@ -649,10 +649,7 @@ fn lower_constant(
                         "missing writer grouped Unpivot scalar constant",
                     ))?;
             work.step()?;
-            if !matches!(
-                definition.kind,
-                ExprKind::Literal(_) | ExprKind::Constant(_)
-            ) {
+            if !matches!(definition.kind, ExprKind::Constant(_)) {
                 return Err(FragmentCompileError::Invalid(
                     "writer grouped Unpivot scalar source is not a static constant",
                 ));

@@ -28,6 +28,7 @@ use super::super::{
 };
 use super::*;
 use crate::functions::build_builtin_engine_function_catalog;
+use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
 use arrow::{
     array::{Array, Int64Array},
     datatypes::{DataType, Field},
@@ -39,10 +40,10 @@ use novarocks_functions::{
 use novarocks_physical_plan::{
     AggregateBinding, AggregateCallId, AggregateGrouping, AggregatePhase, AggregateSequenceId,
     BinaryOperator, BoundFunction, ConstantPoolId, ConstantPools, ConstantReference, Distribution,
-    ExprId, ExprKind, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, NodeId, NodeKind,
-    NullOrdering, OrderedComparisonAlgorithm, OutputPort, PhysicalProperties, PipelineDopDomain,
-    PlanLimits, RowMultiplicity, SortDirection, SortExpr, TopNPhase, TopNReduction, TopNSequenceId,
-    ValueId, ValueOrigin,
+    ExprId, ExprKind, FragmentId, FragmentSink, NodeId, NodeKind, NullOrdering,
+    OrderedComparisonAlgorithm, OutputPort, PhysicalProperties, PipelineDopDomain, PlanLimits,
+    RowMultiplicity, SortDirection, SortExpr, TopNPhase, TopNReduction, TopNSequenceId, ValueId,
+    ValueOrigin,
 };
 use novarocks_type_contract::{
     AggregateStateFormatId, CompilePhase, ExpressionEffectContext, FunctionInstanceState,
@@ -221,17 +222,15 @@ impl Fixture {
             .unwrap();
             None
         } else {
-            let seed = b
-                .add_expression(
-                    leaf,
-                    t.clone(),
-                    ExprKind::Literal(if t.nullable() {
-                        LiteralValue::Null
-                    } else {
-                        LiteralValue::Int64(11)
-                    }),
-                )
-                .unwrap();
+            let seed = b.constant(
+                leaf,
+                t.clone(),
+                if t.nullable() {
+                    checked::null()
+                } else {
+                    checked::i64(11)
+                },
+            );
             let v = b
                 .add_value(
                     t.clone(),
@@ -249,29 +248,17 @@ impl Fixture {
             Source::Star => None,
             Source::Value => Some(ExprKind::Value(v.unwrap())),
             Source::Literal => Some(if *t.data_type() == DataType::Utf8 {
-                ExprKind::Literal(LiteralValue::Utf8("中国".into()))
+                b.constant_kind(&t, checked::utf8("中国".into()))
             } else {
-                ExprKind::Literal(LiteralValue::Int64(7))
+                b.constant_kind(&t, checked::i64(7))
             }),
             Source::Pool => Some(ExprKind::Constant(ConstantReference {
                 pool: ConstantPoolId::new(u32::MAX),
                 ordinal: 1,
             })),
             Source::ChildError => {
-                let a = b
-                    .add_expression(
-                        owner,
-                        ty(DataType::Int64, false),
-                        ExprKind::Literal(LiteralValue::Int64(i64::MAX)),
-                    )
-                    .unwrap();
-                let c = b
-                    .add_expression(
-                        owner,
-                        ty(DataType::Int64, false),
-                        ExprKind::Literal(LiteralValue::Int64(1)),
-                    )
-                    .unwrap();
+                let a = b.constant(owner, ty(DataType::Int64, false), checked::i64(i64::MAX));
+                let c = b.constant(owner, ty(DataType::Int64, false), checked::i64(1));
                 let add = b
                     .add_expression(
                         owner,
@@ -295,12 +282,8 @@ impl Fixture {
                         },
                     )
                     .unwrap();
-                let yes = b
-                    .add_expression(owner, t.clone(), ExprKind::Literal(LiteralValue::Int64(1)))
-                    .unwrap();
-                let no = b
-                    .add_expression(owner, t.clone(), ExprKind::Literal(LiteralValue::Int64(2)))
-                    .unwrap();
+                let yes = b.constant(owner, t.clone(), checked::i64(1));
+                let no = b.constant(owner, t.clone(), checked::i64(2));
                 Some(ExprKind::Case {
                     operand: None,
                     when_then: Box::from([(test, yes)]),
@@ -395,8 +378,10 @@ impl Fixture {
             },
         })
         .unwrap();
+        let fragment = finish(b, owner);
+        checked::merge(&mut pools, fragment.constants());
         Self {
-            fragment: finish(b, owner),
+            fragment,
             pools,
             catalog,
             owner,
@@ -1151,13 +1136,7 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
     let partial = NodeId::new(17);
     let owner = NodeId::new(901);
     let key_type = ty(DataType::Int64, false);
-    let seed = b
-        .add_expression(
-            leaf,
-            key_type.clone(),
-            ExprKind::Literal(LiteralValue::Int64(3)),
-        )
-        .unwrap();
+    let seed = b.constant(leaf, key_type.clone(), checked::i64(3));
     let key = b
         .add_value(
             key_type.clone(),
@@ -1288,9 +1267,11 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
         kind,
     })
     .unwrap();
+    let fragment = finish(b, owner);
+    let pools = fragment.constants().clone();
     Fixture {
-        fragment: finish(b, owner),
-        pools: ConstantPools::empty(),
+        fragment,
+        pools,
         catalog,
         owner,
     }

@@ -216,35 +216,7 @@ impl ProgramTypedExpressions {
             for (definition, ty) in definitions.nodes().iter().zip(entries) {
                 work.step()?;
                 match (definition.kind(), ty) {
-                    (
-                        StaticExprKind::LambdaFunction {
-                            body, arg_slots, ..
-                        },
-                        FunctionArgumentType::Lambda {
-                            parameter_types,
-                            result_type,
-                        },
-                    ) => {
-                        if arg_slots.len() != parameter_types.len() {
-                            return Err(ProgramExpressionTypeError::WrongLambda.into());
-                        }
-                        validate(result_type, work)?;
-                        same_carrier(definition.data_type(), result_type.data_type(), work)?;
-                        if let Some(authored) = definition.value_type() {
-                            same_value(authored, result_type, false, work)?;
-                        }
-                        let Some(FunctionArgumentType::Value(body_type)) =
-                            entries.get(body.index())
-                        else {
-                            return Err(ProgramExpressionTypeError::WrongLambda.into());
-                        };
-                        same_value(body_type, result_type, false, work)?;
-                        for parameter in parameter_types {
-                            validate(parameter, work)?;
-                        }
-                    }
-                    (StaticExprKind::LambdaFunction { .. }, _)
-                    | (_, FunctionArgumentType::Lambda { .. }) => {
+                    (_, FunctionArgumentType::Lambda { .. }) => {
                         return Err(ProgramExpressionTypeError::WrongKind.into());
                     }
                     (_, FunctionArgumentType::Value(value)) => {
@@ -464,8 +436,7 @@ impl ProgramTypedExpressions {
                         if let Some((_, left, right)) = definition.kind().ordinary_comparison() {
                             validate_comparison_types(left, right, value, entries, work)?;
                         }
-                        if let StaticExprKind::EqForNull(left, right)
-                        | StaticExprKind::PreparedNullSafeComparison { left, right } =
+                        if let StaticExprKind::PreparedNullSafeComparison { left, right } =
                             definition.kind()
                         {
                             // This is a generic type obligation for every definition;
@@ -605,9 +576,7 @@ impl ProgramTypedExpressions {
                 .node(invocation.definition)
                 .expect("resolved occurrence was checked");
             let args = match definition.kind() {
-                StaticExprKind::FunctionCall { args, .. } | StaticExprKind::BoundCall { args } => {
-                    args
-                }
+                StaticExprKind::BoundCall { args } => args,
                 _ => unreachable!("checked call site"),
             };
             let call = resolved.call_contract();

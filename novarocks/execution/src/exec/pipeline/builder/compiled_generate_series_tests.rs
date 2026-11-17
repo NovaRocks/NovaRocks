@@ -30,8 +30,8 @@ use novarocks_local_program::{
     ProgramNodeKind,
 };
 use novarocks_physical_plan::{
-    ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder, FragmentId,
-    FragmentPackage, NodeId, ValueOrigin,
+    ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentId, FragmentPackage,
+    NodeId, ValueOrigin,
 };
 use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
 use std::sync::Arc;
@@ -43,7 +43,13 @@ pub(super) fn literal_source(
     explicit_step: bool,
     nullable: bool,
 ) -> Arc<FragmentPackage> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(61));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(61),
+            &fixture_sources,
+        );
     let ty = FunctionValueType::new(DataType::Int64, nullable);
     let output = builder
         .add_value(
@@ -54,17 +60,9 @@ pub(super) fn literal_source(
             },
         )
         .unwrap();
-    let start = builder
-        .add_expression(SOURCE, ty.clone(), ExprKind::Literal(cell(values[0])))
-        .unwrap();
-    let stop = builder
-        .add_expression(SOURCE, ty.clone(), ExprKind::Literal(cell(values[1])))
-        .unwrap();
-    let step = explicit_step.then(|| {
-        builder
-            .add_expression(SOURCE, ty, ExprKind::Literal(cell(values[2])))
-            .unwrap()
-    });
+    let start = builder.constant(SOURCE, ty.clone(), cell(values[0]));
+    let stop = builder.constant(SOURCE, ty.clone(), cell(values[1]));
+    let step = explicit_step.then(|| builder.constant(SOURCE, ty, cell(values[2])));
     builder
         .add_generate_series(SOURCE, start, stop, step, output)
         .unwrap();
@@ -76,6 +74,8 @@ pub(super) fn pooled_source(
     values: &[Option<i128>],
     explicit_step: bool,
 ) -> Arc<FragmentPackage> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     assert_eq!(values.len(), 3);
     macro_rules! ints {
         ($array:ty,$int:ty) => {
@@ -125,7 +125,11 @@ pub(super) fn pooled_source(
     let id = ConstantPoolId::new(0xf2345678);
     let mut constants = ConstantPools::empty();
     constants.insert(id, pool).unwrap();
-    let mut builder = FragmentBuilder::new(FragmentId::new(62));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(62),
+            &fixture_sources,
+        );
     let output = builder
         .add_value(
             ty.clone(),

@@ -535,8 +535,8 @@ fn primitive_own_effects(
     work.step()?;
     Ok(match &source.kind {
         ExprKind::Value(_) => materialized_value_effects(context),
-        ExprKind::Literal(_) | ExprKind::Constant(_) => {
-            // Resolve/construct the actual leaf even when it is not a function
+        ExprKind::Constant(_) => {
+            // Resolve the actual checked leaf even when it is not a function
             // argument. NULL remains a checked constant, never a missing fact.
             author_physical_argument_observed(
                 source,

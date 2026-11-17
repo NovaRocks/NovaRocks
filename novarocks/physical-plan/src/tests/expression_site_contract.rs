@@ -55,7 +55,10 @@ fn node() -> NodeId {
 }
 // This fixture isolates the root-field projection. Full relational validity
 // is exercised by the real FragmentBuilder and plan-contract suites.
-fn fragment(kind: NodeKind) -> Fragment {
+fn fragment(
+    kind: NodeKind,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fragment {
     let mut expressions = ExprArena::default();
     for id in [expr(), alternate()] {
         expressions.insert(ExprNode {
@@ -63,7 +66,7 @@ fn fragment(kind: NodeKind) -> Fragment {
             owner: node(),
             lambda_scope: None,
             ty: ty(DataType::Boolean, false),
-            kind: ExprKind::Literal(LiteralValue::Boolean(true)),
+            kind: fixture_constants.boolean(true, &ty(DataType::Boolean, false)),
         });
     }
     FragmentParts {
@@ -137,11 +140,15 @@ fn graph(
 
 #[test]
 fn exact_field_sites_keep_repeated_definitions_and_join_demands() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use EvaluationDemand::{TruthOnly, Value};
     use ExpressionRootRole::*;
-    let filter = fragment(NodeKind::Filter {
-        predicates: Box::from([expr(), expr()]),
-    });
+    let filter = fragment(
+        NodeKind::Filter {
+            predicates: Box::from([expr(), expr()]),
+        },
+        &mut fixture_constants,
+    );
     assert_eq!(
         uses(&filter).sites(),
         &BTreeMap::from([
@@ -161,9 +168,12 @@ fn exact_field_sites_keep_repeated_definitions_and_join_demands() {
             )
         ])
     );
-    let project = fragment(NodeKind::Project {
-        expressions: Box::from([(expr(), ValueId::new(0)), (expr(), ValueId::new(1))]),
-    });
+    let project = fragment(
+        NodeKind::Project {
+            expressions: Box::from([(expr(), ValueId::new(0)), (expr(), ValueId::new(1))]),
+        },
+        &mut fixture_constants,
+    );
     assert_eq!(uses(&project).sites().len(), 2);
     assert!(
         uses(&project)
@@ -175,32 +185,35 @@ fn exact_field_sites_keep_repeated_definitions_and_join_demands() {
         (JoinKind::Inner, TruthOnly),
         (JoinKind::NullAwareLeftAnti, Value),
     ] {
-        let join = fragment(NodeKind::HashJoin {
-            kind,
-            condition: if kind == crate::JoinKind::NullAwareLeftAnti {
-                crate::HashJoinCondition::NullAwareEqual {
-                    value_equal_keys: Box::from([crate::JoinKey {
-                        left: expr(),
-                        right: expr(),
-                        null_safe: false,
-                    }]),
-                    scope_keys: Box::default(),
-                    eligibility: Some(expr()),
-                }
-            } else {
-                crate::HashJoinCondition::Ordinary {
-                    keys: Box::from([crate::JoinKey {
-                        left: expr(),
-                        right: expr(),
-                        null_safe: false,
-                    }]),
-                    residual: Some(expr()),
-                }
+        let join = fragment(
+            NodeKind::HashJoin {
+                kind,
+                condition: if kind == crate::JoinKind::NullAwareLeftAnti {
+                    crate::HashJoinCondition::NullAwareEqual {
+                        value_equal_keys: Box::from([crate::JoinKey {
+                            left: expr(),
+                            right: expr(),
+                            null_safe: false,
+                        }]),
+                        scope_keys: Box::default(),
+                        eligibility: Some(expr()),
+                    }
+                } else {
+                    crate::HashJoinCondition::Ordinary {
+                        keys: Box::from([crate::JoinKey {
+                            left: expr(),
+                            right: expr(),
+                            null_safe: false,
+                        }]),
+                        residual: Some(expr()),
+                    }
+                },
+                build_side: JoinSide::Right,
+                distribution: JoinDistribution::BroadcastBuild,
+                null_extended: Box::default(),
             },
-            build_side: JoinSide::Right,
-            distribution: JoinDistribution::BroadcastBuild,
-            null_extended: Box::default(),
-        });
+            &mut fixture_constants,
+        );
         assert_eq!(
             uses(&join).sites(),
             &BTreeMap::from([
@@ -256,25 +269,29 @@ fn exact_field_sites_keep_repeated_definitions_and_join_demands() {
 
 #[test]
 fn optional_and_non_scalar_fields_keep_original_multidimensional_positions() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use ExpressionRootRole::*;
-    let changes = fragment(NodeKind::ChangeEventExpand {
-        events: Box::from([
-            ChangeEventSpec {
-                predicate: None,
-                effect: novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
-                assignments: Box::from([
-                    crate::ChangeAssignment::exact(ValueId::new(0), None),
-                    crate::ChangeAssignment::exact(ValueId::new(1), Some(expr())),
-                ]),
-            },
-            ChangeEventSpec {
-                predicate: Some(alternate()),
-                effect: novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
-                assignments: Box::default(),
-            },
-        ]),
-        effect_output: ValueId::new(9),
-    });
+    let changes = fragment(
+        NodeKind::ChangeEventExpand {
+            events: Box::from([
+                ChangeEventSpec {
+                    predicate: None,
+                    effect: novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
+                    assignments: Box::from([
+                        crate::ChangeAssignment::exact(ValueId::new(0), None),
+                        crate::ChangeAssignment::exact(ValueId::new(1), Some(expr())),
+                    ]),
+                },
+                ChangeEventSpec {
+                    predicate: Some(alternate()),
+                    effect: novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
+                    assignments: Box::default(),
+                },
+            ]),
+            effect_output: ValueId::new(9),
+        },
+        &mut fixture_constants,
+    );
     let roots = uses(&changes);
     assert_eq!(roots.sites().len(), 2);
     assert!(roots.sites().contains_key(&site(ChangeAssignment {
@@ -285,26 +302,29 @@ fn optional_and_non_scalar_fields_keep_original_multidimensional_positions() {
         roots.sites()[&site(ChangePredicate { event: 1 })].expr,
         alternate()
     );
-    let unpivot = fragment(NodeKind::Unpivot {
-        spec: UnpivotSpec {
-            passthrough: Box::default(),
-            value_output: ValueId::new(0),
-            literal_outputs: Box::default(),
-            mappings: Box::from([UnpivotValueMapping {
-                input: ValueId::new(1),
-                constants: Box::from([
-                    // Root-site extraction deliberately does not claim pool admission.
-                    crate::UnpivotConstant::Int32List(crate::ConstantReference {
-                        pool: crate::ConstantPoolId::new(u32::MAX),
-                        ordinal: 1,
-                    }),
-                    crate::UnpivotConstant::Scalar(expr()),
-                ]),
-            }]),
-            max_output_rows: 64,
-            max_output_bytes: 1024,
+    let unpivot = fragment(
+        NodeKind::Unpivot {
+            spec: UnpivotSpec {
+                passthrough: Box::default(),
+                value_output: ValueId::new(0),
+                literal_outputs: Box::default(),
+                mappings: Box::from([UnpivotValueMapping {
+                    input: ValueId::new(1),
+                    constants: Box::from([
+                        // Root-site extraction deliberately does not claim pool admission.
+                        crate::UnpivotConstant::Int32List(crate::ConstantReference {
+                            pool: crate::ConstantPoolId::new(u32::MAX),
+                            ordinal: 1,
+                        }),
+                        crate::UnpivotConstant::Scalar(expr()),
+                    ]),
+                }]),
+                max_output_rows: 64,
+                max_output_bytes: 1024,
+            },
         },
-    });
+        &mut fixture_constants,
+    );
     assert_eq!(
         uses(&unpivot).sites().keys().copied().collect::<Vec<_>>(),
         vec![site(UnpivotConstant {
@@ -312,9 +332,12 @@ fn optional_and_non_scalar_fields_keep_original_multidimensional_positions() {
             constant: 1
         })]
     );
-    let cells = fragment(NodeKind::Values {
-        rows: Box::from([Box::default(), Box::from([expr(), alternate()])]),
-    });
+    let cells = fragment(
+        NodeKind::Values {
+            rows: Box::from([Box::default(), Box::from([expr(), alternate()])]),
+        },
+        &mut fixture_constants,
+    );
     assert_eq!(
         uses(&cells).sites().keys().copied().collect::<Vec<_>>(),
         vec![
@@ -326,11 +349,15 @@ fn optional_and_non_scalar_fields_keep_original_multidimensional_positions() {
 
 #[test]
 fn root_binding_requires_exact_complete_coverage_definition_and_demand() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use EvaluationDemand::{TruthOnly, Value};
     use ExpressionRootRole::*;
-    let fragment = fragment(NodeKind::Filter {
-        predicates: Box::from([expr(), expr()]),
-    });
+    let fragment = fragment(
+        NodeKind::Filter {
+            predicates: Box::from([expr(), expr()]),
+        },
+        &mut fixture_constants,
+    );
     let bindings = vec![
         (
             site(FilterPredicate { predicate: 0 }),
@@ -401,14 +428,18 @@ fn root_binding_requires_exact_complete_coverage_definition_and_demand() {
 
 #[test]
 fn empty_fields_observe_typed_control_failure_before_unbounded_traversal() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for failure in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,
         CompileControlError::ResourceExhausted,
     ] {
-        let fragment = fragment(NodeKind::Values {
-            rows: vec![Box::default(); 1000].into_boxed_slice(),
-        });
+        let fragment = fragment(
+            NodeKind::Values {
+                rows: vec![Box::default(); 1000].into_boxed_slice(),
+            },
+            &mut fixture_constants,
+        );
         let owner = Control {
             observations: Mutex::default(),
             fail: Some(failure.clone()),
@@ -426,9 +457,14 @@ fn empty_fields_observe_typed_control_failure_before_unbounded_traversal() {
 
 #[test]
 fn scan_derived_roots_cover_real_value_origins_and_exclude_provider_proofs() {
-    let proof_only = finish_scan_predicate_contract(&[PredicateGuaranteeKind::Exact], 0).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let proof_only =
+        finish_scan_predicate_contract(&[PredicateGuaranteeKind::Exact], 0, &mut fixture_constants)
+            .unwrap();
     assert!(uses(&proof_only).sites().is_empty());
-    let rechecked = finish_scan_predicate_contract(&[PredicateGuaranteeKind::Exact], 1).unwrap();
+    let rechecked =
+        finish_scan_predicate_contract(&[PredicateGuaranteeKind::Exact], 1, &mut fixture_constants)
+            .unwrap();
     let roots = uses(&rechecked);
     assert_eq!(roots.sites().len(), 1);
     assert_eq!(
@@ -439,15 +475,18 @@ fn scan_derived_roots_cover_real_value_origins_and_exclude_provider_proofs() {
     let column = ProviderColumnReference {
         column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 9),
     };
-    let make = |origin: ValueOrigin| {
-        let source = fragment(NodeKind::Scan {
-            occurrence: ProviderReadOccurrenceId::new(1),
-            relation: Box::new(metadata_relation(&binding, column.clone())),
-            read_budget: scan_budget(),
-            provider_outputs: Box::default(),
-            residuals: Box::from([expr()]),
-            derived_values: Box::from([ValueId::new(5)]),
-        });
+    let mut make = |origin: ValueOrigin| {
+        let source = fragment(
+            NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(1),
+                relation: Box::new(metadata_relation(&binding, column.clone())),
+                read_budget: scan_budget(),
+                provider_outputs: Box::default(),
+                residuals: Box::from([expr()]),
+                derived_values: Box::from([ValueId::new(5)]),
+            },
+            &mut fixture_constants,
+        );
         Fragment::from(FragmentParts {
             summaries: Box::default(),
             stage_placement: crate::StagePlacementPolicy::Singleton,
@@ -509,14 +548,21 @@ fn scan_derived_roots_cover_real_value_origins_and_exclude_provider_proofs() {
 
 #[test]
 fn root_count_has_the_shared_near_and_over_occurrence_bounds() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let count = novarocks_type_contract::MAX_CONTROL_USE_REFERENCES;
-    let near = fragment(NodeKind::Values {
-        rows: Box::from([vec![expr(); count].into_boxed_slice()]),
-    });
+    let near = fragment(
+        NodeKind::Values {
+            rows: Box::from([vec![expr(); count].into_boxed_slice()]),
+        },
+        &mut fixture_constants,
+    );
     assert_eq!(uses(&near).sites().len(), count);
-    let over = fragment(NodeKind::Values {
-        rows: Box::from([vec![expr(); count + 1].into_boxed_slice()]),
-    });
+    let over = fragment(
+        NodeKind::Values {
+            rows: Box::from([vec![expr(); count + 1].into_boxed_slice()]),
+        },
+        &mut fixture_constants,
+    );
     assert_eq!(
         PhysicalExpressionRoots::try_new(&over, &control()).unwrap_err(),
         ExpressionRootError::TooManyRoots
@@ -525,9 +571,13 @@ fn root_count_has_the_shared_near_and_over_occurrence_bounds() {
 
 #[test]
 fn an_argument_use_cannot_replace_an_operator_root() {
-    let fragment = fragment(NodeKind::Filter {
-        predicates: Box::from([expr(), expr()]),
-    });
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fragment = fragment(
+        NodeKind::Filter {
+            predicates: Box::from([expr(), expr()]),
+        },
+        &mut fixture_constants,
+    );
     let domain = EvaluationRegionId::new(0);
     let invoke = |id, arguments| ExpressionInvocation {
         context: ExpressionEffectContext {
@@ -577,9 +627,13 @@ fn an_argument_use_cannot_replace_an_operator_root() {
 
 #[test]
 fn operator_roots_cannot_escape_from_a_lambda_lexical_scope() {
-    let source = fragment(NodeKind::Project {
-        expressions: Box::from([(expr(), ValueId::new(0))]),
-    });
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let source = fragment(
+        NodeKind::Project {
+            expressions: Box::from([(expr(), ValueId::new(0))]),
+        },
+        &mut fixture_constants,
+    );
     let mut definitions = source.expressions().clone();
     let mut nested = definitions.get(expr()).unwrap().clone();
     nested.lambda_scope = Some(alternate());
@@ -605,10 +659,14 @@ fn operator_roots_cannot_escape_from_a_lambda_lexical_scope() {
 
 #[test]
 fn a_guarded_disconnected_use_cannot_become_an_operator_root() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_type_contract::{GuardKind, RegionGuard};
-    let fragment = fragment(NodeKind::Filter {
-        predicates: Box::from([expr(), expr()]),
-    });
+    let fragment = fragment(
+        NodeKind::Filter {
+            predicates: Box::from([expr(), expr()]),
+        },
+        &mut fixture_constants,
+    );
     let domain = EvaluationRegionId::new(0);
     let branch = EvaluationRegionId::new(1);
     let otherwise = EvaluationRegionId::new(2);
@@ -675,10 +733,15 @@ fn a_guarded_disconnected_use_cannot_become_an_operator_root() {
     );
 }
 
-fn conjunct_fragment() -> Fragment {
-    let source = fragment(NodeKind::Filter {
-        predicates: Box::from([ExprId::new(5000)]),
-    });
+fn conjunct_fragment(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fragment {
+    let source = fragment(
+        NodeKind::Filter {
+            predicates: Box::from([ExprId::new(5000)]),
+        },
+        fixture_constants,
+    );
     let mut expressions = source.expressions().clone();
     for (id, args) in [
         (ExprId::new(5000), vec![alternate(), expr()]),
@@ -780,7 +843,8 @@ fn conjunct_uses(
 }
 #[test]
 fn positive_conjunct_sources_keep_actual_use_occurrences_and_nullable_truth_demand() {
-    let fragment = conjunct_fragment();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fragment = conjunct_fragment(&mut fixture_constants);
     let roots = conjunct_uses(&fragment, false, false).unwrap();
     let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
     let identity =
@@ -826,7 +890,8 @@ fn positive_conjunct_sources_keep_actual_use_occurrences_and_nullable_truth_dema
 }
 #[test]
 fn a_predicate_source_cannot_cross_forged_control_or_reordered_use_edges() {
-    let fragment = conjunct_fragment();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fragment = conjunct_fragment(&mut fixture_constants);
     // Intrinsic correspondence now rejects both before a predicate witness
     // can be constructed; an invalid graph is not a usable root authority.
     assert_eq!(
@@ -841,14 +906,18 @@ fn a_predicate_source_cannot_cross_forged_control_or_reordered_use_edges() {
 
 #[test]
 fn truth_only_change_condition_does_not_grant_relation_search_responsibility() {
-    let fragment = fragment(NodeKind::ChangeEventExpand {
-        events: Box::from([ChangeEventSpec {
-            predicate: Some(expr()),
-            effect: novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
-            assignments: Box::default(),
-        }]),
-        effect_output: ValueId::new(0),
-    });
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fragment = fragment(
+        NodeKind::ChangeEventExpand {
+            events: Box::from([ChangeEventSpec {
+                predicate: Some(expr()),
+                effect: novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
+                assignments: Box::default(),
+            }]),
+            effect_output: ValueId::new(0),
+        },
+        &mut fixture_constants,
+    );
     let site = site(ExpressionRootRole::ChangePredicate { event: 0 });
     let roots = PhysicalRootUses::try_new(
         &fragment,
@@ -865,7 +934,8 @@ fn truth_only_change_condition_does_not_grant_relation_search_responsibility() {
 
 #[test]
 fn source_responsibility_rechecks_the_actual_fragment_field_and_boolean_type() {
-    let source = conjunct_fragment();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let source = conjunct_fragment(&mut fixture_constants);
     let roots = conjunct_uses(&source, false, false).unwrap();
     let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
     let clone = |id, nodes, expressions| {
@@ -916,10 +986,14 @@ fn source_responsibility_rechecks_the_actual_fragment_field_and_boolean_type() {
 }
 #[test]
 fn positive_conjunct_paths_do_not_cross_not_or_null_testing() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for null_testing in [false, true] {
-        let source = fragment(NodeKind::Filter {
-            predicates: Box::from([alternate()]),
-        });
+        let source = fragment(
+            NodeKind::Filter {
+                predicates: Box::from([alternate()]),
+            },
+            &mut fixture_constants,
+        );
         let mut expressions = source.expressions().clone();
         let mut parent = expressions.get(alternate()).unwrap().clone();
         parent.kind = if null_testing {
@@ -996,9 +1070,13 @@ fn positive_conjunct_paths_do_not_cross_not_or_null_testing() {
 
 #[test]
 fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
-    let source = fragment(NodeKind::Filter {
-        predicates: Box::from([ExprId::new(0)]),
-    });
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let source = fragment(
+        NodeKind::Filter {
+            predicates: Box::from([ExprId::new(0)]),
+        },
+        &mut fixture_constants,
+    );
     let mut expressions = source.expressions().clone();
     let depth = novarocks_type_contract::MAX_CONTROL_DEPTH;
     for index in 0..depth as u32 {
@@ -1008,7 +1086,7 @@ fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
             lambda_scope: None,
             ty: ty(DataType::Boolean, true),
             kind: if index as usize + 1 == depth {
-                ExprKind::Literal(LiteralValue::Null)
+                fixture_constants.null(&ty(DataType::Boolean, true))
             } else {
                 ExprKind::Conjunction {
                     args: Box::from([ExprId::new(index + 1)]),
@@ -1117,26 +1195,30 @@ mod failure_tail_tests;
 
 #[test]
 fn naa_scope_and_value_roots_keep_separate_ordinals_and_original_value_demand() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use ExpressionRootRole::*;
-    let join = fragment(NodeKind::HashJoin {
-        kind: JoinKind::NullAwareLeftAnti,
-        condition: crate::HashJoinCondition::NullAwareEqual {
-            value_equal_keys: Box::from([crate::JoinKey {
-                left: expr(),
-                right: expr(),
-                null_safe: false,
-            }]),
-            scope_keys: Box::from([crate::JoinKey {
-                left: expr(),
-                right: expr(),
-                null_safe: true,
-            }]),
-            eligibility: Some(expr()),
+    let join = fragment(
+        NodeKind::HashJoin {
+            kind: JoinKind::NullAwareLeftAnti,
+            condition: crate::HashJoinCondition::NullAwareEqual {
+                value_equal_keys: Box::from([crate::JoinKey {
+                    left: expr(),
+                    right: expr(),
+                    null_safe: false,
+                }]),
+                scope_keys: Box::from([crate::JoinKey {
+                    left: expr(),
+                    right: expr(),
+                    null_safe: true,
+                }]),
+                eligibility: Some(expr()),
+            },
+            build_side: JoinSide::Right,
+            distribution: JoinDistribution::BroadcastBuild,
+            null_extended: Box::default(),
         },
-        build_side: JoinSide::Right,
-        distribution: JoinDistribution::BroadcastBuild,
-        null_extended: Box::default(),
-    });
+        &mut fixture_constants,
+    );
     let roots = uses(&join);
     for role in [
         NaaValueEqualKey {

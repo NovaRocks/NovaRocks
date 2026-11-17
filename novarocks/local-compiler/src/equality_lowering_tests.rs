@@ -30,7 +30,7 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     BinaryOperator, BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts,
     FragmentId, FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning,
-    FrozenPhysicalCall, LiteralValue, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
+    FrozenPhysicalCall, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
     PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort, ValidationErrors,
     ValueOrigin,
 };
@@ -122,6 +122,7 @@ enum OutputClaim {
     Narrow,
 }
 struct Fixture {
+    constants: novarocks_physical_plan::ConstantPools,
     fragment: Fragment,
     expression: ExprId,
     ordered: Vec<ExprId>,
@@ -131,15 +132,24 @@ struct Fixture {
     constant_policy: ConstantPolicy,
     carrier_cast: bool,
 }
-fn input_literal(ty: &FunctionValueType, floating_bits: Option<u64>) -> LiteralValue {
+fn input_constant(
+    pools: &mut novarocks_physical_plan::ConstantPools,
+    ty: &FunctionValueType,
+    floating_bits: Option<u64>,
+) -> ExprKind {
     if ty.nullable() {
-        return LiteralValue::Null;
+        return crate::test_constants::null(pools, ty, options().constants);
     }
     match ty.data_type() {
-        DataType::Boolean => LiteralValue::Boolean(true),
-        DataType::Int64 => LiteralValue::Int64(7),
-        DataType::Float64 => LiteralValue::Float64Bits(floating_bits.unwrap_or(1f64.to_bits())),
-        _ => panic!("a nonnullable fixture requires an exact supported literal"),
+        DataType::Boolean => crate::test_constants::boolean(pools, ty, true, options().constants),
+        DataType::Int64 => crate::test_constants::i64(pools, ty, 7, options().constants),
+        DataType::Float64 => crate::test_constants::f64_bits(
+            pools,
+            ty,
+            floating_bits.unwrap_or(1f64.to_bits()),
+            options().constants,
+        ),
+        _ => panic!("a nonnullable fixture requires an exact checked constant factory"),
     }
 }
 fn fixture(
@@ -151,6 +161,7 @@ fn fixture(
     output: OutputClaim,
     bits: Option<[u64; 2]>,
 ) -> Result<Fixture, ValidationErrors> {
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(FragmentId::new(101));
     builder
         .add_values(
@@ -165,7 +176,7 @@ fn fixture(
             .add_expression(
                 NodeId::new(44),
                 ty.clone(),
-                ExprKind::Literal(input_literal(ty, bits.map(|bits| bits[ordinal]))),
+                input_constant(&mut constants, ty, bits.map(|bits| bits[ordinal])),
             )
             .unwrap();
         let value = builder
@@ -296,7 +307,12 @@ fn fixture(
                 .add_expression(
                     NodeId::new(0),
                     result.clone(),
-                    ExprKind::Literal(LiteralValue::Float64Bits(0f64.to_bits())),
+                    crate::test_constants::f64_bits(
+                        &mut constants,
+                        &result,
+                        0f64.to_bits(),
+                        options().constants,
+                    ),
                 )
                 .unwrap();
             (
@@ -350,6 +366,7 @@ fn fixture(
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     Ok(Fixture {
+        constants,
         fragment,
         expression,
         ordered,
@@ -398,7 +415,7 @@ fn uses(fixture: &Fixture) -> PhysicalRootUses {
                         args,
                     )
                 }
-                ExprKind::Literal(_) | ExprKind::Value(_) | ExprKind::FunctionCall { .. } => {
+                ExprKind::Constant(_) | ExprKind::Value(_) | ExprKind::FunctionCall { .. } => {
                     (ControlShape::Eager, vec![])
                 }
                 _ => panic!("the complete fixture has only declared intrinsic/call kinds"),
@@ -469,6 +486,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
         PhysicalCallDefinition, PhysicalCallRequest, StaticFunctionArgument,
     };
     let Fixture {
+        constants,
         fragment,
         expression,
         ordered,
@@ -525,6 +543,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
         .with_call_requests_observed(entries, &Control)
         .unwrap();
     let fixture = Fixture {
+        constants: constants.clone(),
         fragment,
         expression,
         ordered,
@@ -617,7 +636,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
             FragmentPackageInput {
                 version: PlanVersionId::try_new([101; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 fragment: fixture.fragment,
                 expression_uses,
                 calls,

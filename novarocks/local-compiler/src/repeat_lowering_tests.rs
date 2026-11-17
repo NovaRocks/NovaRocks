@@ -31,7 +31,7 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     ExprKind, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
     FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, GroupingOutput,
-    LiteralValue, NodeId, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits,
+    NodeId, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits,
     PlanVersionId, PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort,
     ValueId, ValueOrigin,
 };
@@ -189,6 +189,7 @@ fn fixture(
     let initial = NodeId::new(41);
     let duplicate = NodeId::new(0);
     let repeat = NodeId::new(900);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fragment_id);
     builder
         .add_values(empty, Box::from([Box::default()]), Box::default())
@@ -202,13 +203,20 @@ fn fixture(
                         "source-fidelity".to_owned(),
                         "kept-exact".to_owned(),
                     )]));
+                let ty =
+                    FunctionValueType::new(DataType::Struct(vec![Arc::new(field)].into()), true);
                 (
-                    ExprKind::Literal(LiteralValue::Null),
-                    FunctionValueType::new(DataType::Struct(vec![Arc::new(field)].into()), true),
+                    crate::test_constants::null(&mut constants, &ty, options().constants),
+                    ty,
                 )
             } else {
                 (
-                    ExprKind::Literal(LiteralValue::Int64(11 + index as i64)),
+                    crate::test_constants::i64(
+                        &mut constants,
+                        &integer,
+                        11 + index as i64,
+                        options().constants,
+                    ),
                     integer.clone(),
                 )
             }
@@ -368,7 +376,7 @@ fn fixture(
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
         assert!(matches!(
             fragment.expressions().get(root.expr).unwrap().kind,
-            ExprKind::Value(_) | ExprKind::Literal(_)
+            ExprKind::Value(_) | ExprKind::Constant(_)
         ));
         let use_id = ExpressionUseId::new(u32::MAX - ordinal as u32);
         invocations.push(ExpressionInvocation {
@@ -415,7 +423,7 @@ fn fixture(
     };
     let package = FragmentPackage::try_new(
         FragmentPackageInput {
-            constants: novarocks_physical_plan::ConstantPools::empty(),
+            constants,
             version: PlanVersionId::try_new([73; 16]).unwrap(),
             required: RequiredContracts::default(),
             fragment,

@@ -16,6 +16,7 @@
 // under the License.
 //! Full PARSE_URL profiles through the actual checked Physical -> LocalCompiler -> controller route.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{ArrayRef, StringArray};
 fn functions() -> PureEngineFunctionCatalog {
     let actual =
@@ -53,6 +54,7 @@ fn functions() -> PureEngineFunctionCatalog {
         .unwrap()
 }
 fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = functions();
     let fragment_id = FragmentId::new(196);
     let source = NodeId::new(0);
@@ -67,7 +69,14 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
     let values: Vec<_> = (0..arity).map(|i| ValueId::new(91 + i as u32)).collect();
     for value in &values {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -108,11 +117,11 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
             .add_expression(
                 output,
                 ty.clone(),
-                if cv.is_some() {
-                    ExprKind::Constant(novarocks_physical_plan::ConstantReference {
-                        pool: novarocks_physical_plan::ConstantPoolId::new(0),
-                        ordinal: 0,
-                    })
+                if let Some(value) = &cv {
+                    ExprKind::Constant(crate::exec::expr::test_support::register_constant(
+                        &mut source_pools,
+                        value,
+                    ))
                 } else {
                     ExprKind::Value(*value)
                 },
@@ -175,7 +184,7 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
             ty,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
 }
 #[test]
 fn parse_url_actual_compiler_both_profiles_dynamic_and_native_constants_keep_key_null_semantics() {

@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{
     ArrayRef, FixedSizeBinaryArray, Float32Array, Int8Array, Int16Array, Int32Array,
     LargeBinaryArray, NullArray, StringArray, StructArray,
@@ -127,8 +128,10 @@ fn conversion_program(
         &mut FragmentBuilder,
         &mut BTreeMap<ExprId, Author>,
         &[ExprId],
+        &mut novarocks_physical_plan::ConstantPools,
     ) -> ExprId,
 ) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = conversion_catalogue();
     let id = FragmentId::new(229);
     let source = NodeId::new(u32::MAX);
@@ -143,7 +146,14 @@ fn conversion_program(
     for (ordinal, ty) in columns.iter().enumerate() {
         assert!(ty.nullable());
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         let value = ValueId::new(901 + u32::try_from(ordinal).unwrap() * 71);
         builder
@@ -174,7 +184,13 @@ fn conversion_program(
         })
         .collect::<Vec<_>>();
     let mut authors = BTreeMap::new();
-    let expression = build(&functions, &mut builder, &mut authors, &leaves);
+    let expression = build(
+        &functions,
+        &mut builder,
+        &mut authors,
+        &leaves,
+        &mut source_pools,
+    );
     let result_type = builder.expressions().get(expression).unwrap().ty.clone();
     let value = builder
         .add_value(
@@ -217,7 +233,7 @@ fn conversion_program(
             ty: result_type,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
 }
 
 fn converted(
@@ -244,7 +260,7 @@ fn converted(
 fn direct_program(source: FunctionValueType, target: FunctionValueType) -> Arc<LocalProgram> {
     conversion_program(
         std::slice::from_ref(&source),
-        |functions, builder, authors, leaves| {
+        |functions, builder, authors, leaves, _source_pools| {
             converted(
                 functions,
                 builder,
@@ -402,7 +418,7 @@ fn actual_compiled_value_conversion_signed_overflow_is_success_null_consumed_by_
                 } else {
                     vec![largeint_type(), target.clone()]
                 },
-                |functions, builder, authors, leaves| {
+                |functions, builder, authors, leaves, _source_pools| {
                     let narrowed = converted(
                         functions,
                         builder,
@@ -737,13 +753,16 @@ fn actual_compiled_value_conversion_round_child_error_is_terminal_not_success_nu
     let decimal = FunctionValueType::new(DataType::Decimal128(38, 0), true);
     let program = conversion_program(
         &[integer.clone(), decimal.clone()],
-        |functions, builder, authors, leaves| {
+        |functions, builder, authors, leaves, source_pools| {
             let scalar_integer = FunctionValueType::new(DataType::Int64, false);
             let digits = builder
                 .add_expression(
                     NodeId::new(0),
                     scalar_integer.clone(),
-                    ExprKind::Literal(LiteralValue::Int64(-1)),
+                    checked_constants::kind(
+                        source_pools,
+                        checked_constants::i64(&(scalar_integer.clone()), -1, options().constants),
+                    ),
                 )
                 .unwrap();
             let rounded = call(

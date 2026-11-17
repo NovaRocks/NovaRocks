@@ -387,7 +387,6 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
             )?,
             p::ExprKind::Value(_)
             | p::ExprKind::LambdaParameter { .. }
-            | p::ExprKind::Literal(_)
             | p::ExprKind::Constant(_)
             | p::ExprKind::Unary { .. }
             | p::ExprKind::Binary { .. }
@@ -767,10 +766,31 @@ mod tests {
         )
         .unwrap();
         work.finish().unwrap();
-        // This actual fixture has six Values (including the private writer projection), one literal, one target field,
-        // four Writer output fields, three ordered four-field cut copies,
-        // and one independent original recipe Field.
-        assert_eq!(roots.len(), 25);
+        // Six Values (including the private writer projection), one constant
+        // expression, one target field, four Writer output fields, three
+        // ordered four-field cut copies, the constant pool's original value
+        // type and Field, and one independent original recipe Field.
+        assert_eq!(roots.len(), 27);
+        assert_eq!(package.constants().entries().len(), 1);
+        let (&pool_id, pool) = package.constants().entries().iter().next().unwrap();
+        let constant_roots: Vec<_> = roots
+            .iter()
+            .filter(|(occurrence, _)| occurrence.owner == PackageTypeOwner::Constant(pool_id))
+            .collect();
+        assert_eq!(constant_roots.len(), 2);
+        assert_eq!(constant_roots[0].0.channel, PackageTypeChannel::Value);
+        let PackageTypeSource::Value(actual_type) = constant_roots[0].1 else {
+            panic!("constant complete value type loan");
+        };
+        assert!(std::ptr::eq(actual_type, pool.value_type()));
+        assert_eq!(
+            constant_roots[1].0.channel,
+            PackageTypeChannel::ConstantField
+        );
+        let PackageTypeSource::SourceField(actual_field) = constant_roots[1].1 else {
+            panic!("constant original Field loan");
+        };
+        assert!(std::ptr::eq(actual_field, pool.field_ref()));
         for ((id, value), (occurrence, source)) in package.fragment().values().iter().zip(&roots) {
             assert_eq!(occurrence.owner, PackageTypeOwner::Value(*id));
             let PackageTypeSource::Value(actual) = source else {

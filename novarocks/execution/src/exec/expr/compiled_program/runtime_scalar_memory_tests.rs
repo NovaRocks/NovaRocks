@@ -17,6 +17,7 @@
 
 use super::guarded_tests::{author, call, compile_checked_fragment_with_parameters};
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use crate::exec::expr::test_support::HarnessControl as Control;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::runtime::{
@@ -38,8 +39,8 @@ use novarocks_functions::{
 use novarocks_local_program::ProgramNodeExpressionRole;
 use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority};
 use novarocks_physical_plan::{
-    ExprKind, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, NodeId, ResultField,
-    ResultPort, ValueDef, ValueId, ValueOrigin,
+    ExprKind, FragmentBuilder, FragmentId, FragmentSink, NodeId, ResultField, ResultPort, ValueDef,
+    ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{ControlShape, FunctionValueType, SemanticParameters};
 use novarocks_types::{
@@ -109,6 +110,7 @@ fn fixture_family(
     source_type: DataType,
     bitwise: bool,
 ) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = functions();
     let source = NodeId::new(u32::MAX);
     let input = NodeId::new(41);
@@ -135,7 +137,17 @@ fn fixture_family(
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(
+                        &(ty.clone()),
+                        crate::exec::expr::test_support::constant_policy(),
+                    ),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -233,7 +245,14 @@ fn fixture_family(
                 .add_expression(
                     output,
                     integer.clone(),
-                    ExprKind::Literal(LiteralValue::Int64(0)),
+                    checked_constants::kind(
+                        &mut source_pools,
+                        checked_constants::i64(
+                            &(integer.clone()),
+                            0,
+                            crate::exec::expr::test_support::constant_policy(),
+                        ),
+                    ),
                 )
                 .unwrap()
         } else {
@@ -328,6 +347,7 @@ fn fixture_family(
         &authors,
         result_port,
         SemanticParameters::try_new([]).unwrap(),
+        source_pools,
     )
 }
 fn root() -> ProgramExpressionRootSite {

@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
 use arrow::datatypes::{DataType, Field};
 use novarocks_functions::{
     EngineFunctionCatalog, FunctionArgument, FunctionBindingError, FunctionKind,
@@ -24,10 +25,10 @@ use novarocks_functions::{
 };
 use novarocks_physical_plan::{
     AggregateBinding, AggregateCall, AggregateCallId, AggregateGrouping, AggregatePhase,
-    BoundFunction, BoundTableFunction, Distribution, ExprKind, FragmentBuilder, FragmentId,
-    FragmentSink, FrozenCallError, FrozenFragmentCalls, FrozenPhysicalCall, LiteralValue, NodeId,
-    NodeKind, OutputPort, PhysicalNode, PhysicalProperties, PipelineDopDomain, PlanLimits,
-    RowMultiplicity, TableFunctionOutput, ValueOrigin,
+    BoundFunction, BoundTableFunction, Distribution, ExprKind, FragmentId, FragmentSink,
+    FrozenCallError, FrozenFragmentCalls, FrozenPhysicalCall, NodeId, NodeKind, OutputPort,
+    PhysicalNode, PhysicalProperties, PipelineDopDomain, PlanLimits, RowMultiplicity,
+    TableFunctionOutput, ValueOrigin,
 };
 use novarocks_type_contract::{
     AggregateStateFormatId, CallEffects, CallProofScope, DecimalOverflowPolicy,
@@ -394,13 +395,7 @@ fn relational_count_value_and_scalar_argument_uses_stay_disjoint_and_frozen_coll
     let (mut builder, input) = empty();
     let owner = NodeId::new(901);
     let text = ty(DataType::Utf8, false);
-    let literal = builder
-        .add_expression(
-            owner,
-            text.clone(),
-            ExprKind::Literal(LiteralValue::Utf8("MiXeD".into())),
-        )
-        .unwrap();
+    let literal = builder.constant(owner, text.clone(), checked::utf8("MiXeD".into()));
     let args = [FunctionArgument::Value {
         value_type: text,
         constant: None,
@@ -494,9 +489,7 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
         unreachable!()
     };
     let original_layout = original_layout.clone();
-    let literal = builder
-        .add_expression(leaf, list.clone(), ExprKind::Literal(LiteralValue::Null))
-        .unwrap();
+    let literal = builder.constant(leaf, list.clone(), checked::null());
     let value = builder
         .add_value(
             list.clone(),

@@ -982,8 +982,8 @@ fn identity_slot_preserves_required_binding_and_null_parent_carrier() {
     use arrow::datatypes::Field;
     use novarocks_failure_contract::FailureProjection;
     use novarocks_physical_plan::{
-        ConstantPool, ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder,
-        FragmentId, NodeId, ValueOrigin,
+        ConstantPool, ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentId,
+        NodeId, ValueOrigin,
     };
     use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueTypeStorageLifetime};
 
@@ -1010,7 +1010,12 @@ fn identity_slot_preserves_required_binding_and_null_parent_carrier() {
     let pool_id = ConstantPoolId::new(904);
     let mut constants = ConstantPools::empty();
     constants.insert(pool_id, pool).unwrap();
-    let mut builder = FragmentBuilder::new(FragmentId::new(66));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(66),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let project = NodeId::new(1);
     let input = builder

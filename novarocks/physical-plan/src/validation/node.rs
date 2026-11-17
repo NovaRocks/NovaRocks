@@ -3136,7 +3136,7 @@ pub(crate) fn validate_writer_grouped_unpivot(
 }
 
 pub(crate) fn validate_unpivot_resource_limits<'a>(
-    fragment: &Fragment,
+    _fragment: &Fragment,
     mapping_count: usize,
     constants: impl IntoIterator<Item = &'a [crate::UnpivotConstant]>,
     max_output_rows: u64,
@@ -3164,8 +3164,6 @@ pub(crate) fn validate_unpivot_resource_limits<'a>(
     }
 
     let mut constant_count = 0_usize;
-    let mut collection_items = 0_usize;
-    let mut literal_bytes = 0_usize;
     for constants in constants {
         constant_count = match constant_count.checked_add(constants.len()) {
             Some(count) if count <= errors.limits().unpivot_constants => count,
@@ -3177,59 +3175,10 @@ pub(crate) fn validate_unpivot_resource_limits<'a>(
                 return false;
             }
         };
-        for constant in constants {
-            let (items, bytes) = match constant {
-                crate::UnpivotConstant::Scalar(expression) => {
-                    (0, unpivot_scalar_literal_bytes(fragment, *expression))
-                }
-                // Selected collections belong to the original checked pools.
-                // Their actual per-consumer item/byte and key-policy checks
-                // run at mandatory observed plan/package publication.
-                crate::UnpivotConstant::Int32List(_) | crate::UnpivotConstant::Utf8Map(_) => (0, 0),
-            };
-            collection_items = collection_items.saturating_add(items);
-            literal_bytes = literal_bytes.saturating_add(bytes);
-            if collection_items > errors.limits().unpivot_collection_items
-                || literal_bytes > MAX_UNPIVOT_LITERAL_BYTES
-            {
-                errors.push(ValidationError::resource_limit(
-                    path,
-                    "unpivot literal collections exceed the contract budget",
-                ));
-                return false;
-            }
-        }
+        // Scalar and collection payloads belong to the checked pools. Their
+        // actual item/byte checks run at mandatory observed publication.
     }
     true
-}
-
-pub(crate) fn unpivot_scalar_literal_bytes(fragment: &Fragment, expression: ExprId) -> usize {
-    let Some(ExprKind::Literal(literal)) = fragment
-        .expressions()
-        .get(expression)
-        .map(|expression| &expression.kind)
-    else {
-        return 0;
-    };
-    match literal {
-        crate::LiteralValue::Utf8(value) => value.len(),
-        crate::LiteralValue::Binary(value) => value.len(),
-        crate::LiteralValue::Null => 0,
-        crate::LiteralValue::Boolean(_) => std::mem::size_of::<bool>(),
-        crate::LiteralValue::Int64(_)
-        | crate::LiteralValue::UInt64(_)
-        | crate::LiteralValue::Float64Bits(_)
-        | crate::LiteralValue::Time64(_)
-        | crate::LiteralValue::Timestamp(_) => std::mem::size_of::<u64>(),
-        crate::LiteralValue::Date32(_) => std::mem::size_of::<u32>(),
-        crate::LiteralValue::LargeInt(_) | crate::LiteralValue::Decimal128(_) => {
-            std::mem::size_of::<u128>()
-        }
-        crate::LiteralValue::IntervalMonthDayNano { .. } => {
-            2 * std::mem::size_of::<i32>() + std::mem::size_of::<i64>()
-        }
-        crate::LiteralValue::Decimal256(value) => value.len(),
-    }
 }
 
 pub(crate) fn unpivot_collection_binding_matches(
@@ -3297,13 +3246,11 @@ pub(crate) fn validate_unpivot_constant(
         crate::UnpivotConstant::Scalar(expression) => match fragment.expressions().get(*expression)
         {
             Some(expression) => (
-                matches!(
-                    expression.kind,
-                    ExprKind::Literal(_) | ExprKind::Constant(_)
-                ) && super::value_bindings_match_ignoring_root_nullability(
-                    &expression.ty,
-                    output_type,
-                ),
+                matches!(expression.kind, ExprKind::Constant(_))
+                    && super::value_bindings_match_ignoring_root_nullability(
+                        &expression.ty,
+                        output_type,
+                    ),
                 expression.ty.nullable(),
             ),
             None => {

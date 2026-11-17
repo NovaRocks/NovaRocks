@@ -30,6 +30,8 @@ use crate::{
     validate_fragment_definition, validate_plan,
 };
 
+#[cfg(test)]
+pub(crate) mod fixture_constants;
 mod nullability_rebind;
 mod structure;
 pub use nullability_rebind::{NullabilityRebindError, UnpublishedNullabilityEditor};

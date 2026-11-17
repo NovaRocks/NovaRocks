@@ -385,8 +385,7 @@ impl ProgramResolvedCalls {
                     .node(invocation.definition)
                     .ok_or(ProgramResolvedCallsError::InvalidSite)?;
                 let args = match definition.kind() {
-                    StaticExprKind::FunctionCall { args, .. }
-                    | StaticExprKind::BoundCall { args } => args,
+                    StaticExprKind::BoundCall { args } => args,
                     _ => continue,
                 };
                 let occurrence = ProgramUseRef {
@@ -828,59 +827,13 @@ fn validate_expression(
                     work,
                 )?,
                 FunctionArgumentType::Lambda { .. } => {
-                    if !matches!(
-                        definitions.node(*definition).map(|node| node.kind()),
-                        Some(StaticExprKind::LambdaFunction { .. })
-                    ) {
-                        return Err(ProgramResolvedCallsError::WrongBody);
-                    }
+                    return Err(ProgramResolvedCallsError::WrongBody);
                 }
             }
         }
     }
-    if let PreparedPureKernel::HigherOrder(kernel) = token.prepared() {
-        let contract = kernel.contract();
-        if invocation.arguments.get(contract.body_ordinal()) != Some(&contract.body_edge_use()) {
-            return Err(ProgramResolvedCallsError::WrongBody);
-        }
-        let edge = &flow.uses()[&contract.body_edge_use()];
-        let Some(StaticExprKind::LambdaFunction {
-            body,
-            arg_slots,
-            common_sub_exprs,
-            ..
-        }) = definitions.node(edge.definition).map(|node| node.kind())
-        else {
-            return Err(ProgramResolvedCallsError::WrongBody);
-        };
-        if edge.control != ControlShape::LambdaBody
-            || edge.arguments.len() != common_sub_exprs.len().saturating_add(1)
-            || arg_slots.len() != contract.parameter_types().len()
-        {
-            return Err(ProgramResolvedCallsError::WrongBody);
-        }
-        for ((_, definition), use_id) in common_sub_exprs.iter().zip(&edge.arguments) {
-            work.step()?;
-            let common_use = &flow.uses()[use_id];
-            if common_use.definition != *definition
-                || common_use.context.region != edge.context.region
-                || common_use.context.demand != EvaluationDemand::Value
-            {
-                return Err(ProgramResolvedCallsError::WrongBody);
-            }
-        }
-        let body_use = &flow.uses()[edge.arguments.last().expect("checked lambda body arity")];
-        if body_use.definition != *body || body_use.context != kernel.body_contract().context() {
-            return Err(ProgramResolvedCallsError::WrongBody);
-        }
-        check_arrow(
-            definitions
-                .node(*body)
-                .ok_or(ProgramResolvedCallsError::InvalidSite)?
-                .data_type(),
-            contract.body_result_type().data_type(),
-            work,
-        )?;
+    if matches!(token.prepared(), PreparedPureKernel::HigherOrder(_)) {
+        return Err(ProgramResolvedCallsError::WrongBody);
     }
     let FunctionResultType::Scalar(result) = &call.selected().result_type else {
         return Err(ProgramResolvedCallsError::WrongLifecycle);
@@ -1390,7 +1343,6 @@ fn validate_to_base64_source(
         .ok_or(ProgramResolvedCallsError::InvalidSite)?;
     work.step()?;
     let (name, emitted) = match source.kind() {
-        crate::StaticExprKind::Literal(_) => return Err(ProgramResolvedCallsError::WrongArguments),
         crate::StaticExprKind::BoundCall { .. } => {
             let child = ProgramCallSite::Expression(ProgramUseRef {
                 arena: occurrence.arena,
@@ -1409,10 +1361,6 @@ fn validate_to_base64_source(
                 true,
             )
         }
-        crate::StaticExprKind::FunctionCall {
-            kind: crate::StaticFunctionKind::Encryption(name),
-            ..
-        } => (Some(*name), false),
         _ => (None, false),
     };
     let expected = if emitted {

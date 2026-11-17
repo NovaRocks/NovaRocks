@@ -23,8 +23,7 @@ use super::*;
 use crate::{
     BindingRequirement, BindingRequirements, CompileProfile, ControlShape, KernelAbiVersion,
     ProgramEvaluationRegion, ProgramExpressionUse, ProgramNode, StaticExprKind, StaticExprNode,
-    StaticLayout, StaticLiteral, StaticSinkProgram, StaticStreamBranch, StaticValues,
-    StaticWriterProjection,
+    StaticLayout, StaticSinkProgram, StaticStreamBranch, StaticValues, StaticWriterProjection,
 };
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -32,7 +31,7 @@ use novarocks_connector_contract::WriteTargetOrdinal;
 use novarocks_execution_contract::DataStreamPartitionType;
 use novarocks_type_contract::{EvaluationRegionId, ExpressionEffectContext};
 use novarocks_types::SlotId;
-use std::{collections::HashMap, num::NonZeroUsize, sync::Mutex};
+use std::{num::NonZeroUsize, sync::Mutex};
 
 #[derive(Default)]
 struct Control {
@@ -54,15 +53,17 @@ impl PureCompileControl for Control {
 fn expressions(kinds: Vec<StaticExprKind>, types: Vec<DataType>) -> Arc<ImmutableExpressions> {
     assert_eq!(kinds.len(), types.len());
     Arc::new(
-        ImmutableExpressions::try_new(
+        crate::test_support::arena(
             kinds
                 .into_iter()
                 .zip(types)
-                .map(|(kind, ty)| StaticExprNode::new(kind, ty, None))
+                .map(|(kind, ty)| {
+                    StaticExprNode::new_value_typed(
+                        kind,
+                        novarocks_functions::FunctionValueType::new(ty, false),
+                    )
+                })
                 .collect(),
-            false,
-            HashMap::new(),
-            None,
         )
         .unwrap(),
     )
@@ -70,8 +71,8 @@ fn expressions(kinds: Vec<StaticExprKind>, types: Vec<DataType>) -> Arc<Immutabl
 fn bool_arena() -> Arc<ImmutableExpressions> {
     expressions(
         vec![
-            StaticExprKind::Literal(StaticLiteral::Bool(true)),
-            StaticExprKind::Literal(StaticLiteral::Bool(false)),
+            crate::test_support::boolean(true),
+            crate::test_support::boolean(false),
         ],
         vec![DataType::Boolean; 2],
     )
@@ -443,8 +444,8 @@ fn orphan_flow_root_and_binding_to_nonroot_use_are_rejected() {
     let program = project_program(
         expressions(
             vec![
-                StaticExprKind::Literal(StaticLiteral::Bool(true)),
-                StaticExprKind::Clone(ProgramExprId::new(0)),
+                crate::test_support::boolean(true),
+                StaticExprKind::Not(ProgramExprId::new(0)),
             ],
             vec![DataType::Boolean; 2],
         ),
@@ -470,8 +471,8 @@ fn definition_membership_checks_child_uses_against_actual_arena() {
     let program = project_program(
         expressions(
             vec![
-                StaticExprKind::Literal(StaticLiteral::Bool(true)),
-                StaticExprKind::Clone(ProgramExprId::new(0)),
+                crate::test_support::boolean(true),
+                StaticExprKind::Not(ProgramExprId::new(0)),
             ],
             vec![DataType::Boolean; 2],
         ),
@@ -502,8 +503,8 @@ fn intrinsic_snapshot(
 ) -> Result<ProgramRootControlBindings, ProgramRootBindingError> {
     let arena = expressions(
         vec![
-            StaticExprKind::Literal(StaticLiteral::Bool(true)),
-            StaticExprKind::Literal(StaticLiteral::Bool(false)),
+            crate::test_support::boolean(true),
+            crate::test_support::boolean(false),
             kind,
         ],
         vec![DataType::Boolean; 3],
@@ -529,7 +530,7 @@ fn intrinsic_snapshot(
 #[test]
 fn actual_intrinsic_shape_and_zero_child_leaves_cannot_be_relabelled() {
     for kind in [
-        StaticExprKind::Literal(StaticLiteral::Bool(true)),
+        crate::test_support::boolean(true),
         StaticExprKind::SlotId(SlotId::new(1)),
     ] {
         intrinsic_snapshot(kind.clone(), ControlShape::Eager, &[]).unwrap();
@@ -544,11 +545,15 @@ fn actual_intrinsic_shape_and_zero_child_leaves_cannot_be_relabelled() {
     }
     for (kind, expected) in [
         (
-            StaticExprKind::And(ProgramExprId::new(0), ProgramExprId::new(1)),
+            StaticExprKind::NaryAnd {
+                args: vec![ProgramExprId::new(0), ProgramExprId::new(1)],
+            },
             ControlShape::Conjunction,
         ),
         (
-            StaticExprKind::Or(ProgramExprId::new(0), ProgramExprId::new(1)),
+            StaticExprKind::NaryOr {
+                args: vec![ProgramExprId::new(0), ProgramExprId::new(1)],
+            },
             ControlShape::Disjunction,
         ),
     ] {
@@ -561,7 +566,7 @@ fn actual_intrinsic_shape_and_zero_child_leaves_cannot_be_relabelled() {
     for kind in [
         StaticExprKind::Not(ProgramExprId::new(0)),
         StaticExprKind::IsNull(ProgramExprId::new(0)),
-        StaticExprKind::Clone(ProgramExprId::new(0)),
+        StaticExprKind::Not(ProgramExprId::new(0)),
     ] {
         intrinsic_snapshot(kind.clone(), ControlShape::Eager, &[0]).unwrap();
         assert_eq!(
@@ -572,45 +577,16 @@ fn actual_intrinsic_shape_and_zero_child_leaves_cannot_be_relabelled() {
 }
 
 #[test]
-fn actual_ordered_primitive_children_and_lambda_common_then_body_are_preserved() {
-    for kind in [
-        StaticExprKind::Eq(ProgramExprId::new(0), ProgramExprId::new(1)),
-        StaticExprKind::ArrayExpr {
-            elements: vec![ProgramExprId::new(0), ProgramExprId::new(1)],
-        },
-        StaticExprKind::StructExpr {
-            fields: vec![ProgramExprId::new(0), ProgramExprId::new(1)],
-        },
-        StaticExprKind::In {
-            child: ProgramExprId::new(0),
-            values: vec![ProgramExprId::new(1)],
-            is_not_in: false,
-        },
-    ] {
-        intrinsic_snapshot(kind.clone(), ControlShape::Eager, &[0, 1]).unwrap();
-        assert_eq!(
-            intrinsic_snapshot(kind.clone(), ControlShape::Eager, &[1, 0]).unwrap_err(),
-            ProgramRootBindingError::WrongArguments
-        );
-        assert_eq!(
-            intrinsic_snapshot(kind, ControlShape::Eager, &[0]).unwrap_err(),
-            ProgramRootBindingError::WrongArguments
-        );
-    }
-    let lambda = StaticExprKind::LambdaFunction {
-        body: ProgramExprId::new(1),
-        arg_slots: vec![SlotId::new(9)],
-        common_sub_exprs: vec![(SlotId::new(10), ProgramExprId::new(0))],
-        is_nondeterministic: false,
-    };
-    intrinsic_snapshot(lambda.clone(), ControlShape::LambdaBody, &[0, 1]).unwrap();
+fn actual_ordered_primitive_children_are_preserved() {
+    let kind = StaticExprKind::Eq(ProgramExprId::new(0), ProgramExprId::new(1));
+    intrinsic_snapshot(kind.clone(), ControlShape::Eager, &[0, 1]).unwrap();
     assert_eq!(
-        intrinsic_snapshot(lambda.clone(), ControlShape::LambdaBody, &[1, 0]).unwrap_err(),
+        intrinsic_snapshot(kind.clone(), ControlShape::Eager, &[1, 0]).unwrap_err(),
         ProgramRootBindingError::WrongArguments
     );
     assert_eq!(
-        intrinsic_snapshot(lambda, ControlShape::Eager, &[0, 1]).unwrap_err(),
-        ProgramRootBindingError::WrongControl
+        intrinsic_snapshot(kind, ControlShape::Eager, &[0]).unwrap_err(),
+        ProgramRootBindingError::WrongArguments
     );
 }
 
@@ -668,8 +644,8 @@ fn guarded_case_flags_and_source_order_match_actual_flat_children() {
                 .collect();
             let arena = expressions(
                 vec![
-                    StaticExprKind::Literal(StaticLiteral::Bool(true)),
-                    StaticExprKind::Literal(StaticLiteral::Bool(false)),
+                    crate::test_support::boolean(true),
+                    crate::test_support::boolean(false),
                     StaticExprKind::Case {
                         has_case_expr: simple,
                         has_else_expr: has_else,
@@ -943,12 +919,12 @@ fn shared_backing_does_not_share_entry_use_or_hide_foreign_writer_scope() {
 }
 
 fn array_arena(children: usize) -> (Arc<ImmutableExpressions>, DataType) {
-    let ty = DataType::List(Arc::new(Field::new("element", DataType::Boolean, false)));
+    let ty = DataType::Boolean;
     let arena = expressions(
         vec![
-            StaticExprKind::Literal(StaticLiteral::Bool(true)),
-            StaticExprKind::ArrayExpr {
-                elements: vec![ProgramExprId::new(0); children],
+            crate::test_support::boolean(true),
+            StaticExprKind::NaryAnd {
+                args: vec![ProgramExprId::new(0); children],
             },
         ],
         vec![DataType::Boolean, ty.clone()],
@@ -957,6 +933,7 @@ fn array_arena(children: usize) -> (Arc<ImmutableExpressions>, DataType) {
 }
 fn array_flow(children: usize) -> ProgramControlFlow {
     let mut root = invocation(u32::MAX, 1, EvaluationDemand::Value);
+    root.control = ControlShape::Conjunction;
     root.arguments = (0..children)
         .map(|id| ExpressionUseId::new(u32::try_from(id).unwrap()))
         .collect::<Vec<_>>()

@@ -39,10 +39,10 @@ use novarocks_physical_plan::{
     Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId,
     ExprKind, Fragment, FragmentBuilder, FragmentId, FragmentPackage, FragmentPackageAdmission,
     FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, HashDefinition, HashPartitionScheme,
-    LiteralValue, NodeId, OutputPort, PartitionCountDomain, PartitionCountParameter,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanBuilder, PlanLimits,
-    PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort, RowMultiplicity,
-    ValueOrigin, ValueType, extract_fragment_packages,
+    NodeId, OutputPort, PartitionCountDomain, PartitionCountParameter, PhysicalExpressionRoots,
+    PhysicalRootUses, PipelineDopDomain, PlanBuilder, PlanLimits, PlanVersionId,
+    PropertyProofProjectionLimits, ResultField, ResultPort, RowMultiplicity, ValueOrigin,
+    ValueType, extract_fragment_packages,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
@@ -130,17 +130,23 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     } else {
         b_type.clone()
     };
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut producer = FragmentBuilder::new(PRODUCER);
     let mut outputs = Vec::new();
     let mut cells = Vec::new();
     for (ordinal, literal) in [11, 22].into_iter().enumerate() {
         let field_type = if ordinal == 1 { &b_type } else { &ty };
         let literal = if conditional && ordinal == 1 {
-            LiteralValue::Null
+            crate::test_constants::null(&mut constants, field_type, options(None).constants)
         } else if widened && ordinal == 1 {
-            LiteralValue::Boolean(true)
+            crate::test_constants::boolean(
+                &mut constants,
+                field_type,
+                true,
+                options(None).constants,
+            )
         } else {
-            LiteralValue::Int64(literal)
+            crate::test_constants::i64(&mut constants, field_type, literal, options(None).constants)
         };
         outputs.push(
             producer
@@ -155,7 +161,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         );
         cells.push(
             producer
-                .add_expression(VALUES, field_type.clone(), ExprKind::Literal(literal))
+                .add_expression(VALUES, field_type.clone(), literal)
                 .unwrap(),
         );
     }
@@ -313,6 +319,9 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
@@ -380,7 +389,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         })
         .unwrap();
     }
-    let plan = plan.finish().unwrap();
+    let plan = plan.finish_observed(&FixtureControl).unwrap();
 
     let mut uses = BTreeMap::new();
     let mut calls = BTreeMap::new();
@@ -959,6 +968,7 @@ fn full_outer_exchange_input_packages(
     let ty = ValueType::new(DataType::Int64, false);
     let nullable = ValueType::new(DataType::Int64, true);
     let join = NodeId::new(30);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut consumer = FragmentBuilder::new(CONSUMER);
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap());
     let mut edges = Vec::new();
@@ -989,7 +999,12 @@ fn full_outer_exchange_input_packages(
                     .add_expression(
                         VALUES,
                         ty.clone(),
-                        ExprKind::Literal(LiteralValue::Int64(literal)),
+                        crate::test_constants::i64(
+                            &mut constants,
+                            &ty,
+                            literal,
+                            options(None).constants,
+                        ),
                     )
                     .unwrap(),
             );
@@ -1154,7 +1169,10 @@ fn full_outer_exchange_input_packages(
             .into_boxed_slice(),
     })
     .unwrap();
-    let plan = plan.finish().unwrap();
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
+    let plan = plan.finish_observed(&FixtureControl).unwrap();
     let mut uses = BTreeMap::new();
     let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();

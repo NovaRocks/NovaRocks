@@ -665,7 +665,11 @@ fn compiled_ordered_source_bind_refusal_never_claims_a_stream_and_refunds_its_pr
 
 #[test]
 fn compiled_ordered_source_actual_residual_finishes_before_live_key_evaluation() {
-    fn residual(builder: &mut FragmentBuilder, scan: NodeId, values: &[ValueId]) -> Box<[ExprId]> {
+    fn residual(
+        builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+        scan: NodeId,
+        values: &[ValueId],
+    ) -> Box<[ExprId]> {
         let input = builder
             .add_expression(
                 scan,
@@ -673,13 +677,11 @@ fn compiled_ordered_source_actual_residual_finishes_before_live_key_evaluation()
                 ExprKind::Value(values[1]),
             )
             .unwrap();
-        let seven = builder
-            .add_expression(
-                scan,
-                FunctionValueType::new(DataType::Int64, false),
-                ExprKind::Literal(LiteralValue::Int64(7)),
-            )
-            .unwrap();
+        let seven = builder.constant(
+            scan,
+            FunctionValueType::new(DataType::Int64, false),
+            crate::exec::operators::family_fixture::constant_sources::i64(7),
+        );
         Box::from([builder
             .add_expression(
                 scan,
@@ -742,14 +744,16 @@ fn compiled_ordered_source_actual_residual_finishes_before_live_key_evaluation()
 
 #[test]
 fn compiled_ordered_source_empty_actual_residual_never_polls_an_invalid_live_snapshot() {
-    fn residual(builder: &mut FragmentBuilder, scan: NodeId, _: &[ValueId]) -> Box<[ExprId]> {
-        Box::from([builder
-            .add_expression(
-                scan,
-                FunctionValueType::new(DataType::Boolean, false),
-                ExprKind::Literal(LiteralValue::Boolean(false)),
-            )
-            .unwrap()])
+    fn residual(
+        builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+        scan: NodeId,
+        _: &[ValueId],
+    ) -> Box<[ExprId]> {
+        Box::from([builder.constant(
+            scan,
+            FunctionValueType::new(DataType::Boolean, false),
+            crate::exec::operators::family_fixture::constant_sources::boolean(false),
+        )])
     }
     let consumer = Consumer::with_fixture(
         Bind::Live,
@@ -804,7 +808,11 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
             expected_key: SemanticParameterKey::AllowThrowException,
         }
     }
-    fn residual(builder: &mut FragmentBuilder, scan: NodeId, values: &[ValueId]) -> Box<[ExprId]> {
+    fn residual(
+        builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+        scan: NodeId,
+        values: &[ValueId],
+    ) -> Box<[ExprId]> {
         let input = builder
             .add_expression(
                 scan,
@@ -812,13 +820,11 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
                 ExprKind::Value(values[1]),
             )
             .unwrap();
-        let zero = builder
-            .add_expression(
-                scan,
-                FunctionValueType::new(DataType::Int64, false),
-                ExprKind::Literal(LiteralValue::Int64(0)),
-            )
-            .unwrap();
+        let zero = builder.constant(
+            scan,
+            FunctionValueType::new(DataType::Int64, false),
+            crate::exec::operators::family_fixture::constant_sources::i64(0),
+        );
         let modulo = builder
             .add_expression(
                 scan,

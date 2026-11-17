@@ -21,8 +21,9 @@
 //! expression list. Proof references do not create invocation sites.
 
 use super::*;
+use crate::tests::constant_fixture::ConstantFixture;
 use crate::{
-    Distribution, ExprKind, FragmentBuilder, FragmentSink, LiteralValue, OutputPort, PhysicalNode,
+    ConstantPools, Distribution, FragmentBuilder, FragmentSink, OutputPort, PhysicalNode,
     PhysicalProperties, PipelineDopDomain, RowMultiplicity, ValueType,
 };
 use arrow_schema::DataType;
@@ -47,12 +48,13 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn fixture(id: u32) -> Fragment {
+fn fixture(id: u32) -> (Fragment, ConstantPools) {
+    let mut constants = ConstantFixture::new();
     let mut b = FragmentBuilder::new(FragmentId::new(id));
     let node = b.reserve_node_id().unwrap();
     let ty = ValueType::new(DataType::Int64, false);
     let expr = b
-        .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(3)))
+        .add_expression(node, ty.clone(), constants.i64(3, &ty))
         .unwrap();
     let a = b
         .add_value(
@@ -90,17 +92,19 @@ fn fixture(id: u32) -> Fragment {
         },
     })
     .unwrap();
-    b.finish_definition(
-        node,
-        FragmentSink::Noop,
-        PipelineDopDomain {
-            min: 1,
-            max: 1,
-            requires_power_of_two: false,
-        },
-        crate::StagePlacementPolicy::Singleton,
-    )
-    .unwrap()
+    let fragment = b
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            crate::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
+    (fragment, constants.into_pools())
 }
 fn roots(f: &Fragment) -> PhysicalRootUses {
     let c = Control::default();
@@ -174,7 +178,7 @@ fn run(
 }
 #[test]
 fn actual_rebuilt_roots_keep_repeated_definition_sites_and_prefund_same_source_arc() {
-    let f = fixture(771);
+    let (f, _pools) = fixture(771);
     let r = roots(&f);
     let c = Control::default();
     let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();
@@ -198,9 +202,9 @@ fn actual_rebuilt_roots_keep_repeated_definition_sites_and_prefund_same_source_a
 }
 #[test]
 fn root_validation_actual_success_and_foreign_fragment_error_keep_all_original_prefixes() {
-    let f = fixture(772);
+    let (f, _pools) = fixture(772);
     let r = roots(&f);
-    let other = fixture(773);
+    let (other, _other_pools) = fixture(773);
     for source in [&f, &other] {
         let (out, trace) = run(source, &r, None);
         assert_eq!(out.is_ok(), source.id() == f.id());
@@ -222,7 +226,7 @@ fn root_validation_actual_success_and_foreign_fragment_error_keep_all_original_p
 }
 #[test]
 fn known_reconstruction_arc_is_admitted_before_late_controller() {
-    let f = fixture(774);
+    let (f, _pools) = fixture(774);
     let r = roots(&f);
     for pending in [0, 254, 255] {
         for cause in [

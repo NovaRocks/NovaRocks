@@ -22,7 +22,7 @@ use super::*;
 use crate::{
     BindingRequirements, CompileProfile, ImmutableExpressions, KernelAbiVersion, LocalProgramGraph,
     ProgramControlFlow, ProgramEvaluationRegion, ProgramExpressionUse, ProgramNode,
-    ProgramRootUseBinding, StaticExprNode, StaticFunctionKind, StaticLiteral, StaticValues,
+    ProgramRootUseBinding, StaticExprNode, StaticValues,
 };
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -34,7 +34,6 @@ use novarocks_type_contract::{
     FunctionVolatility, GuardKind, ObservableEffects, RegionGuard, SemanticParameters,
 };
 use std::{
-    collections::HashMap,
     num::NonZeroUsize,
     sync::{
         Mutex,
@@ -647,36 +646,34 @@ fn invocation(
 }
 fn arena(nodes: Vec<(StaticExprKind, DataType)>) -> Arc<ImmutableExpressions> {
     Arc::new(
-        ImmutableExpressions::try_new(
+        crate::test_support::arena(
             nodes
                 .into_iter()
-                .map(|(kind, ty)| StaticExprNode::new(kind, ty, None))
+                .map(|(kind, ty)| {
+                    StaticExprNode::new_value_typed(
+                        kind,
+                        novarocks_functions::FunctionValueType::new(ty, false),
+                    )
+                })
                 .collect(),
-            false,
-            HashMap::new(),
-            None,
         )
         .unwrap(),
     )
 }
 fn scalar_arena() -> Arc<ImmutableExpressions> {
-    arena(vec![
-        (
-            StaticExprKind::Literal(StaticLiteral::Int64(4)),
-            DataType::Int64,
-        ),
-        (
-            StaticExprKind::Literal(StaticLiteral::Int64(2)),
-            DataType::Int64,
-        ),
-        (
-            StaticExprKind::FunctionCall {
-                kind: StaticFunctionKind::Abs,
-                args: vec![crate::ProgramExprId::new(0), crate::ProgramExprId::new(1)],
-            },
-            DataType::Boolean,
-        ),
-    ])
+    Arc::new(
+        crate::test_support::arena(vec![
+            StaticExprNode::new_value_typed(crate::test_support::integer(4), input_type()),
+            StaticExprNode::new_value_typed(crate::test_support::integer(2), input_type()),
+            StaticExprNode::new_value_typed(
+                StaticExprKind::BoundCall {
+                    args: vec![crate::ProgramExprId::new(0), crate::ProgramExprId::new(1)],
+                },
+                result_type(),
+            ),
+        ])
+        .unwrap(),
+    )
 }
 fn project_program(arena: Arc<ImmutableExpressions>, definitions: &[usize]) -> LocalProgramGraph {
     let source_schema = Arc::new(Schema::new(vec![Field::new(
@@ -1035,20 +1032,15 @@ fn shared_definition_keeps_distinct_sparse_occurrences_and_host_root_scopes() {
 fn type_only_does_not_require_dead_child_call_attachments_and_cannot_be_eager() {
     let (catalog, owner, _) = catalogue();
     let arena = arena(vec![
+        (crate::test_support::integer(1), DataType::Int64),
         (
-            StaticExprKind::Literal(StaticLiteral::Int64(1)),
-            DataType::Int64,
-        ),
-        (
-            StaticExprKind::FunctionCall {
-                kind: StaticFunctionKind::Math("legacy_dead"),
+            StaticExprKind::BoundCall {
                 args: vec![crate::ProgramExprId::new(0)],
             },
             DataType::Int64,
         ),
         (
-            StaticExprKind::FunctionCall {
-                kind: StaticFunctionKind::Abs,
+            StaticExprKind::BoundCall {
                 args: vec![crate::ProgramExprId::new(0), crate::ProgramExprId::new(1)],
             },
             DataType::Boolean,
@@ -1087,263 +1079,14 @@ fn type_only_does_not_require_dead_child_call_attachments_and_cannot_be_eager() 
     );
 }
 
-fn higher_snapshot() -> ProgramRootControlBindings {
-    higher_snapshot_parameters(1)
-}
-fn higher_snapshot_parameters(count: usize) -> ProgramRootControlBindings {
-    higher_snapshot_locals(count, false, false)
-}
-fn higher_snapshot_locals(
-    count: usize,
-    has_common: bool,
-    wrong_order: bool,
-) -> ProgramRootControlBindings {
-    let mut nodes = vec![
-        (
-            StaticExprKind::Literal(StaticLiteral::Int64(2)),
-            DataType::Int64,
-        ),
-        (
-            StaticExprKind::Literal(StaticLiteral::Bool(true)),
-            DataType::Boolean,
-        ),
-        (
-            StaticExprKind::LambdaFunction {
-                body: crate::ProgramExprId::new(1),
-                arg_slots: (0..count).map(|i| SlotId::new(99 + i as u32)).collect(),
-                common_sub_exprs: if has_common {
-                    vec![(SlotId::new(200), crate::ProgramExprId::new(2))]
-                } else {
-                    vec![]
-                },
-                is_nondeterministic: false,
-            },
-            DataType::Boolean,
-        ),
-        (
-            StaticExprKind::FunctionCall {
-                kind: StaticFunctionKind::ArrayMap,
-                args: vec![crate::ProgramExprId::new(0), crate::ProgramExprId::new(2)],
-            },
-            DataType::Boolean,
-        ),
-    ];
-    if has_common {
-        nodes.insert(
-            2,
-            (
-                StaticExprKind::FunctionCall {
-                    kind: StaticFunctionKind::Abs,
-                    args: vec![crate::ProgramExprId::new(0), crate::ProgramExprId::new(0)],
-                },
-                DataType::Boolean,
-            ),
-        );
-        let StaticExprKind::FunctionCall { args, .. } = &mut nodes[4].0 else {
-            unreachable!()
-        };
-        args[1] = crate::ProgramExprId::new(3);
-    }
-    let arena = arena(nodes);
-    let edge_uses: &[u32] = if has_common {
-        if wrong_order { &[3, 4] } else { &[4, 3] }
-    } else {
-        &[3]
-    };
-    let mut edge = invocation(
-        2,
-        if has_common { 3 } else { 2 },
-        ControlShape::LambdaBody,
-        edge_uses,
-    );
-    edge.context.region = EvaluationRegionId::new(8);
-    let mut body = invocation(3, 1, ControlShape::Eager, &[]);
-    body.context.region = EvaluationRegionId::new(8);
-    let mut uses = vec![
-        invocation(
-            0,
-            if has_common { 4 } else { 3 },
-            ControlShape::HigherOrder {
-                body_ordinal: 1,
-                body_demand: EvaluationDemand::Value,
-            },
-            &[1, 2],
-        ),
-        invocation(1, 0, ControlShape::Eager, &[]),
-        edge,
-        body,
-    ];
-    if has_common {
-        for mut child in [
-            invocation(4, 2, ControlShape::Eager, &[5, 6]),
-            invocation(5, 0, ControlShape::Eager, &[]),
-            invocation(6, 0, ControlShape::Eager, &[]),
-        ] {
-            child.context.region = EvaluationRegionId::new(8);
-            uses.push(child);
-        }
-    }
-    snapshot(
-        project_program(arena, &[if has_common { 4 } else { 3 }]),
-        uses,
-        vec![(root(0), 0)],
-        vec![
-            root_region(),
-            ProgramEvaluationRegion {
-                id: EvaluationRegionId::new(8),
-                parent: Some(DOMAIN),
-                guard: Some(RegionGuard {
-                    owner: ExpressionUseId::new(0),
-                    kind: GuardKind::LambdaInvocation,
-                }),
-            },
-        ],
-    )
-}
-#[test]
-fn lambda_local_calls_require_exact_frozen_tokens_and_order_before_body() {
-    let (catalog, owner, _) = catalogue();
-    let higher = token(
-        &catalog,
-        &owner,
-        HIGHER,
-        context(0, DOMAIN, EvaluationDemand::Value),
-        &[Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))],
-        Some(context(
-            3,
-            EvaluationRegionId::new(8),
-            EvaluationDemand::Value,
-        )),
-        false,
-    );
-    let common = token(
-        &catalog,
-        &owner,
-        SCALAR,
-        context(4, EvaluationRegionId::new(8), EvaluationDemand::Value),
-        &[Some(ExpressionUseId::new(5)), Some(ExpressionUseId::new(6))],
-        None,
-        false,
-    );
-    let resolved = ProgramResolvedCalls::try_new(
-        higher_snapshot_locals(1, true, false),
-        vec![(scope(0), higher.clone()), (scope(4), common.clone())],
-        &Control::default(),
-    )
-    .unwrap();
-    assert_eq!(resolved.calls().len(), 2);
-    assert_eq!(
-        resolved.calls()[&scope(4)].call_contract().context().region,
-        EvaluationRegionId::new(8)
-    );
-    assert_eq!(
-        ProgramResolvedCalls::try_new(
-            higher_snapshot_locals(1, true, false),
-            vec![(scope(0), higher.clone())],
-            &Control::default(),
-        )
-        .unwrap_err(),
-        ProgramResolvedCallsError::MissingSite(scope(4)),
-    );
-    // Ordered intrinsic children are now checked before any call token is
-    // attached. Keep the actual sources/guards and change only edge order.
-    let snapshot = higher_snapshot_locals(1, true, false);
-    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-    let mut uses = flow.uses().values().cloned().collect::<Vec<_>>();
-    uses.iter_mut()
-        .find(|invocation| invocation.context.use_id == ExpressionUseId::new(2))
-        .unwrap()
-        .arguments
-        .reverse();
-    let wrong = ProgramControlFlow::try_new(
-        flow.regions().values().copied().collect(),
-        uses,
-        snapshot.program().expressions().nodes().len(),
-        &Control::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        ProgramRootControlBindings::try_new(
-            snapshot.program().clone(),
-            BTreeMap::from([(ProgramExpressionArena::Main, wrong)]),
-            snapshot
-                .bindings()
-                .iter()
-                .map(|(site, use_id)| ProgramRootUseBinding {
-                    site: *site,
-                    use_id: *use_id
-                })
-                .collect(),
-            &Control::default(),
-        )
-        .unwrap_err(),
-        crate::ProgramRootBindingError::WrongArguments,
-    );
-    assert_eq!(owner.instances.load(Ordering::Relaxed), 0);
-}
-
-#[test]
-fn higher_order_keeps_actual_body_edge_and_inner_root_but_does_not_claim_capture_closure() {
-    let (catalog, owner, _) = catalogue();
-    let body = context(3, EvaluationRegionId::new(8), EvaluationDemand::Value);
-    let prepare = |body| {
-        token(
-            &catalog,
-            &owner,
-            HIGHER,
-            context(0, DOMAIN, EvaluationDemand::Value),
-            &[Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))],
-            Some(body),
-            false,
-        )
-    };
-    let resolved = ProgramResolvedCalls::try_new(
-        higher_snapshot(),
-        vec![(scope(0), prepare(body))],
-        &Control::default(),
-    )
-    .unwrap();
-    let ProgramStateTemplate::HigherOrder {
-        scope: actual,
-        kernel,
-    } = resolved.calls()[&scope(0)].state_template()
-    else {
-        unreachable!()
-    };
-    assert_eq!(actual.root, root(0));
-    assert_eq!(kernel.body_contract().context(), body);
-    let wrong = context(
-        u32::MAX,
-        EvaluationRegionId::new(8),
-        EvaluationDemand::Value,
-    );
-    assert_eq!(
-        ProgramResolvedCalls::try_new(
-            higher_snapshot(),
-            vec![(scope(0), prepare(wrong))],
-            &Control::default()
-        )
-        .unwrap_err(),
-        ProgramResolvedCallsError::WrongBody
-    );
-    assert_eq!(owner.instances.load(Ordering::Relaxed), 0);
-}
-
 #[test]
 fn intrinsic_controller_attachment_retains_guards_without_scalar_instance() {
     let (catalog, _, owner) = catalogue();
     let arena = arena(vec![
+        (crate::test_support::boolean(true), DataType::Boolean),
+        (crate::test_support::boolean(false), DataType::Boolean),
         (
-            StaticExprKind::Literal(StaticLiteral::Bool(true)),
-            DataType::Boolean,
-        ),
-        (
-            StaticExprKind::Literal(StaticLiteral::Bool(false)),
-            DataType::Boolean,
-        ),
-        (
-            StaticExprKind::FunctionCall {
-                kind: StaticFunctionKind::If,
+            StaticExprKind::BoundCall {
                 args: vec![
                     crate::ProgramExprId::new(0),
                     crate::ProgramExprId::new(0),
@@ -1490,10 +1233,12 @@ fn entry_and_midwork_failures_are_typed_and_declaration_count_is_bounded() {
 pub(crate) enum TypedCallFixture {
     Scalar,
     TypeOnly,
-    HigherOrder,
-    HigherOrderTwoParameters,
     TruthOnly,
     TypedTypeOnly([FunctionValueType; 2]),
+    TypedTypeOnlyWithSources {
+        selected: [FunctionValueType; 2],
+        sources: [FunctionValueType; 2],
+    },
 }
 pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls {
     match kind {
@@ -1506,67 +1251,50 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
             )
             .unwrap()
         }
-        TypedCallFixture::HigherOrder | TypedCallFixture::HigherOrderTwoParameters => {
-            let count = if matches!(kind, TypedCallFixture::HigherOrderTwoParameters) {
-                2
-            } else {
-                1
-            };
-            let mut owner = Owner::new(false);
-            if count == 2 {
-                owner.explicit_higher_parameters = Some(Box::from([input_type(), result_type()]));
-            }
-            let (catalog, owner, _) = catalogue_with_owner(Arc::new(owner));
-            let call = token(
-                &catalog,
-                &owner,
-                HIGHER,
-                context(0, DOMAIN, EvaluationDemand::Value),
-                &[Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))],
-                Some(context(
-                    3,
-                    EvaluationRegionId::new(8),
-                    EvaluationDemand::Value,
-                )),
-                false,
-            );
-            ProgramResolvedCalls::try_new(
-                higher_snapshot_parameters(count),
-                vec![(scope(0), call)],
-                &Control::default(),
-            )
-            .unwrap()
-        }
         TypedCallFixture::TypeOnly
         | TypedCallFixture::TypedTypeOnly(_)
+        | TypedCallFixture::TypedTypeOnlyWithSources { .. }
         | TypedCallFixture::TruthOnly => {
-            let (types, truth) = match kind {
-                TypedCallFixture::TypedTypeOnly(types) => (types, false),
-                TypedCallFixture::TruthOnly => ([input_type(), input_type()], true),
-                _ => ([input_type(), input_type()], false),
+            let (types, source_types, truth) = match kind {
+                TypedCallFixture::TypedTypeOnly(types) => (types.clone(), types, false),
+                TypedCallFixture::TypedTypeOnlyWithSources { selected, sources } => {
+                    (selected, sources, false)
+                }
+                TypedCallFixture::TruthOnly => (
+                    [input_type(), input_type()],
+                    [input_type(), input_type()],
+                    true,
+                ),
+                _ => (
+                    [input_type(), input_type()],
+                    [input_type(), input_type()],
+                    false,
+                ),
             };
             let mut owner = Owner::new(false);
             owner.explicit_type_only = Some(types.clone());
             let (catalog, owner, _) = catalogue_with_owner(Arc::new(owner));
-            let definitions = arena(vec![
-                (
-                    StaticExprKind::SlotId(SlotId::new(1)),
-                    types[0].data_type().clone(),
-                ),
-                (
-                    StaticExprKind::SlotId(SlotId::new(2)),
-                    types[1].data_type().clone(),
-                ),
-                (
-                    StaticExprKind::FunctionCall {
-                        kind: StaticFunctionKind::Abs,
-                        args: vec![crate::ProgramExprId::new(0), crate::ProgramExprId::new(1)],
-                    },
-                    DataType::Boolean,
-                ),
-            ]);
+            let definitions = Arc::new(
+                crate::test_support::arena(vec![
+                    StaticExprNode::new_value_typed(
+                        StaticExprKind::SlotId(SlotId::new(1)),
+                        source_types[0].clone(),
+                    ),
+                    StaticExprNode::new_value_typed(
+                        StaticExprKind::SlotId(SlotId::new(2)),
+                        source_types[1].clone(),
+                    ),
+                    StaticExprNode::new_value_typed(
+                        StaticExprKind::BoundCall {
+                            args: vec![crate::ProgramExprId::new(0), crate::ProgramExprId::new(1)],
+                        },
+                        result_type(),
+                    ),
+                ])
+                .unwrap(),
+            );
             let source_schema = Arc::new(Schema::new(
-                types
+                source_types
                     .iter()
                     .enumerate()
                     .map(|(i, ty)| {
@@ -1584,7 +1312,7 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
             let values = StaticValues::try_new(
                 RecordBatch::try_new(
                     source_schema,
-                    types
+                    source_types
                         .iter()
                         .map(|ty| arrow_array::new_null_array(ty.data_type(), 0))
                         .collect(),

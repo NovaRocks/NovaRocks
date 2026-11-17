@@ -32,9 +32,9 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     BoundFunction, ExprId, ExprKind, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage,
     FragmentPackageInput, FragmentSink, FrozenCallError, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPhysicalCall, LiteralValue, NodeId, PhysicalCallSite,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts,
-    ResultField, ResultPort, ValueOrigin,
+    FrozenFragmentPruning, FrozenPhysicalCall, NodeId, PhysicalCallSite, PhysicalExpressionRoots,
+    PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
+    ValueOrigin,
 };
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileControlError, CompilePhase, ControlShape,
@@ -229,6 +229,7 @@ fn package(
     let fragment_id = FragmentId::new(u32::MAX);
     let source_node = NodeId::new(41);
     let project_node = NodeId::new(0);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fragment_id);
     builder
         .add_values(source_node, Box::from([Box::default()]), Box::default())
@@ -248,9 +249,14 @@ fn package(
             project_node,
             ty.clone(),
             if name == "if" {
-                ExprKind::Literal(LiteralValue::Float64Bits(9.5f64.to_bits()))
+                crate::test_constants::f64_bits(
+                    &mut constants,
+                    &ty,
+                    9.5f64.to_bits(),
+                    options().constants,
+                )
             } else {
-                ExprKind::Literal(LiteralValue::Null)
+                crate::test_constants::null(&mut constants, &ty, options().constants)
             },
         )
         .unwrap();
@@ -258,8 +264,13 @@ fn package(
         let condition = builder
             .add_expression(
                 project_node,
-                boolean,
-                ExprKind::Literal(LiteralValue::Boolean(false)),
+                boolean.clone(),
+                crate::test_constants::boolean(
+                    &mut constants,
+                    &boolean,
+                    false,
+                    options().constants,
+                ),
             )
             .unwrap();
         let contexts = vec![
@@ -539,7 +550,7 @@ fn package(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([17; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 fragment,
                 expression_uses,
                 calls,

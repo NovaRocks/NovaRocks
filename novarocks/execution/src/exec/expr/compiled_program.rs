@@ -528,7 +528,6 @@ impl CompiledExpressionInstance {
                         }
                         summary
                     }
-                    _ => return Err(invalid("expression has no admitted own-effect author")),
                 };
                 effects.insert(occurrence, summary);
                 continue;
@@ -1291,6 +1290,8 @@ fn gather(
     result
 }
 
+#[cfg(test)]
+mod checked_constants;
 #[cfg(test)]
 mod row_error_tests;
 #[cfg(test)]

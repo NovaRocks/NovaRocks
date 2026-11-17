@@ -36,10 +36,9 @@ fn ordered(
     let mut nodes = vec![
         slot(0, &left),
         slot(1, &right),
-        StaticExprNode::new(
+        StaticExprNode::new_value_typed(
             StaticExprKind::from_comparison(operator, ProgramExprId::new(0), ProgramExprId::new(1)),
-            result.data_type().clone(),
-            None,
+            result.clone(),
         ),
     ];
     let mut types = vec![
@@ -120,9 +119,12 @@ fn ordered_actual_and_dead_definitions_keep_value_domains_and_root_null_admissio
 #[test]
 fn ordered_static_identity_excludes_null_safe_and_rejects_cross_nominal_or_wrong_result() {
     assert!(
-        StaticExprKind::EqForNull(ProgramExprId::new(0), ProgramExprId::new(1))
-            .ordinary_comparison()
-            .is_none()
+        StaticExprKind::PreparedNullSafeComparison {
+            left: ProgramExprId::new(0),
+            right: ProgramExprId::new(1)
+        }
+        .ordinary_comparison()
+        .is_none()
     );
     for operator in OPERATORS {
         for dead in [false, true] {

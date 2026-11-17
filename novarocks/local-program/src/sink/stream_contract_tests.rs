@@ -20,19 +20,16 @@
 use super::*;
 use crate::{StaticExprKind, StaticExprNode};
 use arrow_schema::DataType;
-use std::collections::HashMap;
 
 fn stream(key_type: DataType, conditional: bool) -> Result<StaticSinkProgram, StaticSinkError> {
-    let mut nodes = vec![StaticExprNode::new(
+    let mut nodes = vec![StaticExprNode::new_value_typed(
         StaticExprKind::SlotId(SlotId::new(1)),
-        key_type,
-        None,
+        novarocks_functions::FunctionValueType::new(key_type, false),
     )];
     let routing = if conditional {
-        nodes.push(StaticExprNode::new(
+        nodes.push(StaticExprNode::new_value_typed(
             StaticExprKind::SlotId(SlotId::new(2)),
-            DataType::Boolean,
-            None,
+            novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
         ));
         StaticStreamRouting::ConditionalKeyV1 {
             applies: ProgramExprId::new(1),
@@ -40,8 +37,7 @@ fn stream(key_type: DataType, conditional: bool) -> Result<StaticSinkProgram, St
     } else {
         StaticStreamRouting::HierarchicalHashV1
     };
-    let arena =
-        Arc::new(ImmutableExpressions::try_new(nodes, false, HashMap::new(), None).unwrap());
+    let arena = Arc::new(crate::test_support::arena(nodes).unwrap());
     let branch = StaticStreamBranch::try_new(
         1,
         DataStreamPartitionType::HashPartitioned,
@@ -63,13 +59,10 @@ fn hierarchical_and_conditional_sender_refuse_keys_outside_their_signed_algorith
     for conditional in [false, true] {
         stream(DataType::Int64, conditional)
             .expect("a canonical native key is valid before fault injection");
-        for bad in [
-            DataType::UInt64,
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-        ] {
+        {
             assert!(
                 matches!(
-                    stream(bad, conditional),
+                    stream(DataType::UInt64, conditional),
                     Err(StaticSinkError::InvalidExpression)
                 ),
                 "a same-shaped expression is insufficient evidence of supported key semantics"

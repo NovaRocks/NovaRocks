@@ -284,7 +284,7 @@ fn checked_scans(
     let graph = LocalProgramGraph::try_new_with_sink(
         nodes,
         ProgramNodeId::new(count - 1),
-        Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+        Arc::new(crate::test_support::arena(vec![]).unwrap()),
         CompileProfile::new(
             NonZeroUsize::new(1).unwrap(),
             None,

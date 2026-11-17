@@ -76,8 +76,10 @@ fn with_nodes(fragment: &Fragment, nodes: BTreeMap<NodeId, PhysicalNode>) -> Fra
 // Use the original fixture's arena, roots and binding authors. Extra real node
 // payloads exercise representation traversal only; this is not a writer or
 // grouped-TopN fragment semantic-admission fixture.
-fn all_sites() -> (Fragment, PhysicalRootUses) {
-    let base = special_fixture();
+fn all_sites(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (Fragment, PhysicalRootUses) {
+    let base = special_fixture(fixture_constants);
     let mut definitions: Vec<_> = base
         .fragment
         .expressions()
@@ -86,7 +88,7 @@ fn all_sites() -> (Fragment, PhysicalRootUses) {
         .collect();
     for expression in &mut definitions {
         match &mut expression.kind {
-            ExprKind::Literal(_) => {
+            ExprKind::Constant(_) => {
                 expression.kind = ExprKind::FunctionCall {
                     function: function(FunctionKind::Scalar, expression.ty.clone()),
                     args: Box::default(),
@@ -291,7 +293,8 @@ fn check_prefixes(fragment: &Fragment, uses: &PhysicalRootUses, failure: Option<
 
 #[test]
 fn observed_visitor_preserves_every_real_site_order_and_source_binding_address() {
-    let (fragment, uses) = all_sites();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, uses) = all_sites(&mut fixture_constants);
     let control = TraceControl::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
     let mut sites = Vec::new();
@@ -453,7 +456,8 @@ fn observed_visitor_preserves_every_real_site_order_and_source_binding_address()
 
 #[test]
 fn observed_visitor_keeps_guarded_shared_definition_occurrences_independent() {
-    let fixture = case_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = case_fixture(&mut fixture_constants);
     let control = TraceControl::default();
     let sites = run(&fixture.fragment, &fixture.uses, &control, None).unwrap();
     assert_eq!(
@@ -477,7 +481,8 @@ fn observed_visitor_keeps_guarded_shared_definition_occurrences_independent() {
 
 #[test]
 fn observed_visitor_leaves_pending_tail_to_caller_and_preserves_attachment_error() {
-    let fixture = scalar_fixture(2, 91);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 91, &mut fixture_constants);
     let control = TraceControl::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
     visit_physical_calls_observed::<OwnerError>(
@@ -511,15 +516,17 @@ fn observed_visitor_leaves_pending_tail_to_caller_and_preserves_attachment_error
 
 #[test]
 fn observed_visitor_all_small_callback_prefixes_preserve_three_original_causes() {
-    let fixture = scalar_fixture(2, 92);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 92, &mut fixture_constants);
     check_prefixes(&fixture.fragment, &fixture.uses, None);
     check_prefixes(&fixture.fragment, &fixture.uses, Some(1));
 }
 
 #[test]
 fn observed_visitor_rejects_changed_roots_before_exposing_bindings_and_finishes_ordinary_tail() {
-    let fixture = scalar_fixture(2, 93);
-    let foreign = scalar_fixture(2, 94);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 93, &mut fixture_constants);
+    let foreign = scalar_fixture(2, 94, &mut fixture_constants);
     let control = TraceControl::default();
     assert_eq!(
         run(&fixture.fragment, &foreign.uses, &control, None),
@@ -589,7 +596,8 @@ fn observed_visitor_rejects_changed_roots_before_exposing_bindings_and_finishes_
 
 #[test]
 fn observed_visitor_wide_actual_occurrences_observe_quantum_without_definition_dedup() {
-    let fixture = scalar_fixture(320, 95);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(320, 95, &mut fixture_constants);
     let control = TraceControl::default();
     let sites = run(&fixture.fragment, &fixture.uses, &control, None).unwrap();
     assert_eq!(sites.len(), 320);
@@ -627,6 +635,7 @@ fn observed_visitor_wide_actual_occurrences_observe_quantum_without_definition_d
 
 #[test]
 fn observed_visitor_empty_occurrences_and_plain_window_keep_original_representation() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     // A true empty Values source has no unreachable scalar definition.
     let mut builder = FragmentBuilder::new(FragmentId::new(96));
     let node = builder.reserve_node_id().unwrap();
@@ -673,7 +682,7 @@ fn observed_visitor_empty_occurrences_and_plain_window_keep_original_representat
         Some(&(CompilePhase::LowerProgram, 1))
     );
     check_prefixes(&empty.fragment, &empty.uses, None);
-    let fixture = special_fixture();
+    let fixture = special_fixture(&mut fixture_constants);
     let control = TraceControl::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
     let mut windows = 0;

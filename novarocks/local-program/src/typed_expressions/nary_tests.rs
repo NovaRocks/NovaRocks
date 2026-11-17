@@ -77,7 +77,7 @@ fn boolean(value: Option<bool>, nullable: bool) -> (StaticExprNode, FunctionArgu
     }
     .unwrap();
     (
-        StaticExprNode::new(StaticExprKind::Constant(constant), DataType::Boolean, None),
+        StaticExprNode::new_value_typed(StaticExprKind::Constant(constant), ty.clone()),
         FunctionArgumentType::Value(ty),
     )
 }
@@ -110,11 +110,7 @@ fn non_boolean(json: bool) -> (StaticExprNode, FunctionArgumentType) {
     }
     .unwrap();
     (
-        StaticExprNode::new(
-            StaticExprKind::Constant(constant),
-            ty.data_type().clone(),
-            None,
-        ),
+        StaticExprNode::new_value_typed(StaticExprKind::Constant(constant), ty.clone()),
         FunctionArgumentType::Value(ty),
     )
 }
@@ -131,14 +127,13 @@ fn fixture(
     let (mut nodes, mut types): (Vec<_>, Vec<_>) = leaves.into_iter().unzip();
     let root = ProgramExprId::new(nodes.len());
     let args = (0..nodes.len()).map(ProgramExprId::new).collect();
-    nodes.push(StaticExprNode::new(
+    nodes.push(StaticExprNode::new_value_typed(
         if or {
             StaticExprKind::NaryOr { args }
         } else {
             StaticExprKind::NaryAnd { args }
         },
-        root_type.data_type().clone(),
-        None,
+        root_type.clone(),
     ));
     types.push(FunctionArgumentType::Value(root_type.clone()));
     assembled(nodes, types, root, root_type, demand)
@@ -153,8 +148,7 @@ fn assembled(
     ProgramResolvedCalls,
     BTreeMap<ProgramExpressionArena, Vec<FunctionArgumentType>>,
 ) {
-    let arena =
-        Arc::new(ImmutableExpressions::try_new(nodes, false, HashMap::new(), None).unwrap());
+    let arena = Arc::new(crate::test_support::arena(nodes).unwrap());
     let source_schema = Arc::new(Schema::new(vec![Field::new(
         "unused_input",
         DataType::Boolean,
@@ -256,7 +250,7 @@ fn add_use(
     let (control, arguments): (_, Vec<_>) = match arena.node(definition).unwrap().kind() {
         StaticExprKind::NaryAnd { args } => (ControlShape::Conjunction, args.clone()),
         StaticExprKind::NaryOr { args } => (ControlShape::Disjunction, args.clone()),
-        StaticExprKind::LambdaFunction { body, .. } => (ControlShape::LambdaBody, vec![*body]),
+
         StaticExprKind::Not(child)
         | StaticExprKind::IsNull(child)
         | StaticExprKind::IsNotNull(child) => (ControlShape::Eager, vec![*child]),
@@ -434,17 +428,11 @@ fn nary_boolean_rejects_lambda_operands_even_with_boolean_result_domain() {
             let (calls, types) = assembled(
                 vec![
                     body,
-                    StaticExprNode::new(
-                        StaticExprKind::LambdaFunction {
-                            body: ProgramExprId::new(0),
-                            arg_slots: vec![],
-                            common_sub_exprs: vec![],
-                            is_nondeterministic: false,
-                        },
-                        DataType::Boolean,
-                        None,
+                    StaticExprNode::new_value_typed(
+                        StaticExprKind::SlotId(SlotId::new(1)),
+                        novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
                     ),
-                    StaticExprNode::new(
+                    StaticExprNode::new_value_typed(
                         if or {
                             StaticExprKind::NaryOr {
                                 args: vec![ProgramExprId::new(1)],
@@ -454,8 +442,7 @@ fn nary_boolean_rejects_lambda_operands_even_with_boolean_result_domain() {
                                 args: vec![ProgramExprId::new(1)],
                             }
                         },
-                        DataType::Boolean,
-                        None,
+                        novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
                     ),
                 ],
                 vec![

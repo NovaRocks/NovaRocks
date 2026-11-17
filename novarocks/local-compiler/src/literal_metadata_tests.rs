@@ -71,15 +71,41 @@ fn source(ty: FunctionValueType, kind: ExprKind) -> ExprNode {
         kind,
     }
 }
+/// The expression and its actual checked backing travel together in this fixture.
+struct ConstantSource {
+    node: ExprNode,
+    _constants: novarocks_physical_plan::ConstantPools,
+}
+impl std::ops::Deref for ConstantSource {
+    type Target = ExprNode;
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
+}
+fn constant_source(value: &ConstantValue) -> ConstantSource {
+    use novarocks_physical_plan::{ConstantPoolId, ConstantPools, ConstantReference};
+    let pool = ConstantPoolId::new(17);
+    let mut constants = ConstantPools::empty();
+    constants.insert(pool, value.pool().clone()).unwrap();
+    ConstantSource {
+        node: source(
+            value.value_type().clone(),
+            ExprKind::Constant(ConstantReference {
+                pool,
+                ordinal: value.ordinal(),
+            }),
+        ),
+        _constants: constants,
+    }
+}
 fn project(
     value: &ConstantValue,
     source: &ExprNode,
     control: &dyn PureCompileControl,
 ) -> Result<Option<ConstantValue>, ExpressionLoweringError> {
-    let node = StaticExprNode::new(
+    let node = StaticExprNode::new_value_typed(
         StaticExprKind::Constant(value.clone()),
-        value.value_type().data_type().clone(),
-        None,
+        value.value_type().clone(),
     );
     literal_argument(source, &node, control)
 }
@@ -95,7 +121,7 @@ fn assert_shared(actual: &ConstantValue, original: &ConstantValue) {
 #[test]
 fn scalar_metadata_keeps_actual_payloads_instead_of_nonconstant_markers() {
     macro_rules! check {
-        ($ty:expr, $factory:ident, $payload:expr, $source:expr, $getter:ident, $expected:expr) => {{
+        ($ty:expr, $factory:ident, $payload:expr, $getter:ident, $expected:expr $(,)?) => {{
             let ty = $ty;
             let value = ConstantValue::$factory(
                 Arc::new(ty.try_to_field("literal").unwrap()),
@@ -106,13 +132,9 @@ fn scalar_metadata_keeps_actual_payloads_instead_of_nonconstant_markers() {
                 &Control::good(),
             )
             .unwrap();
-            let actual = project(
-                &value,
-                &source(ty, ExprKind::Literal($source)),
-                &Control::good(),
-            )
-            .unwrap()
-            .unwrap();
+            let actual = project(&value, &constant_source(&value), &Control::good())
+                .unwrap()
+                .unwrap();
             assert_shared(&actual, &value);
             assert_eq!(actual.$getter().unwrap(), Some($expected));
         }};
@@ -121,9 +143,8 @@ fn scalar_metadata_keeps_actual_payloads_instead_of_nonconstant_markers() {
         FunctionValueType::new(DataType::UInt64, false),
         from_u64,
         u64::MAX,
-        LiteralValue::UInt64(u64::MAX),
         try_u64,
-        u64::MAX
+        u64::MAX,
     );
     check!(
         FunctionValueType::try_with_logical_type(
@@ -134,41 +155,36 @@ fn scalar_metadata_keeps_actual_payloads_instead_of_nonconstant_markers() {
         .unwrap(),
         from_largeint,
         i128::MIN,
-        LiteralValue::LargeInt(i128::MIN),
         try_largeint,
-        i128::MIN
+        i128::MIN,
     );
     check!(
         FunctionValueType::new(DataType::Decimal128(38, -2), false),
         from_decimal128,
         -123,
-        LiteralValue::Decimal128(-123),
         try_decimal128,
-        -123
+        -123,
     );
     check!(
         FunctionValueType::new(DataType::Decimal256(76, 9), false),
         from_decimal256_be,
         [255; 32],
-        LiteralValue::Decimal256([255; 32]),
         try_decimal256_be,
-        [255; 32]
+        [255; 32],
     );
     check!(
         FunctionValueType::new(DataType::Date32, false),
         from_date32,
         -11,
-        LiteralValue::Date32(-11),
         try_date32,
-        -11
+        -11,
     );
     check!(
         FunctionValueType::new(DataType::Time64(TimeUnit::Nanosecond), false),
         from_time64,
         -99,
-        LiteralValue::Time64(-99),
         try_time64,
-        -99
+        -99,
     );
     check!(
         FunctionValueType::new(
@@ -177,9 +193,8 @@ fn scalar_metadata_keeps_actual_payloads_instead_of_nonconstant_markers() {
         ),
         from_timestamp,
         -99,
-        LiteralValue::Timestamp(-99),
         try_timestamp,
-        -99
+        -99,
     );
     check!(
         FunctionValueType::new(
@@ -188,13 +203,8 @@ fn scalar_metadata_keeps_actual_payloads_instead_of_nonconstant_markers() {
         ),
         from_interval_month_day_nano,
         (i32::MIN, i32::MAX, i64::MIN),
-        LiteralValue::IntervalMonthDayNano {
-            months: i32::MIN,
-            days: i32::MAX,
-            nanoseconds: i64::MIN
-        },
         try_interval_month_day_nano,
-        (i32::MIN, i32::MAX, i64::MIN)
+        (i32::MIN, i32::MAX, i64::MIN),
     );
 }
 fn text_value(carrier: DataType, payload: &str) -> ConstantValue {
@@ -215,16 +225,9 @@ fn byte_metadata_compares_every_selected_byte_and_keeps_empty_constants() {
     for carrier in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
         for text in [String::new(), "µ\0雪".repeat(100)] {
             let value = text_value(carrier.clone(), &text);
-            let actual = project(
-                &value,
-                &source(
-                    value.value_type().clone(),
-                    ExprKind::Literal(LiteralValue::Utf8(text.clone().into())),
-                ),
-                &Control::good(),
-            )
-            .unwrap()
-            .unwrap();
+            let actual = project(&value, &constant_source(&value), &Control::good())
+                .unwrap()
+                .unwrap();
             assert_shared(&actual, &value);
             assert_eq!(actual.try_utf8().unwrap(), Some(text.as_str()));
         }
@@ -239,16 +242,9 @@ fn byte_metadata_compares_every_selected_byte_and_keeps_empty_constants() {
         &Control::good(),
     )
     .unwrap();
-    let actual = project(
-        &value,
-        &source(
-            ty,
-            ExprKind::Literal(LiteralValue::Binary(vec![0, 255, 128].into())),
-        ),
-        &Control::good(),
-    )
-    .unwrap()
-    .unwrap();
+    let actual = project(&value, &constant_source(&value), &Control::good())
+        .unwrap()
+        .unwrap();
     assert_shared(&actual, &value);
     assert_eq!(actual.try_binary().unwrap(), Some(&[0, 255, 128][..]));
 }
@@ -269,29 +265,20 @@ fn literal_metadata_preserves_nonzero_pool_ordinal_and_null_vs_nonconstant() {
     )
     .unwrap();
     let value = pool.value(1).unwrap();
-    let actual = project(
-        &value,
-        &source(ty.clone(), ExprKind::Literal(LiteralValue::Int64(42))),
-        &Control::good(),
-    )
-    .unwrap()
-    .unwrap();
+    let actual = project(&value, &constant_source(&value), &Control::good())
+        .unwrap()
+        .unwrap();
     assert_shared(&actual, &value);
     assert_eq!(actual.try_i64().unwrap(), Some(42));
     let null = pool.value(2).unwrap();
-    let actual = project(
-        &null,
-        &source(ty.clone(), ExprKind::Literal(LiteralValue::Null)),
-        &Control::good(),
-    )
-    .unwrap()
-    .unwrap();
+    let actual = project(&null, &constant_source(&null), &Control::good())
+        .unwrap()
+        .unwrap();
     assert_shared(&actual, &null);
     assert_eq!(actual.try_i64().unwrap(), None);
-    let node = StaticExprNode::new(
+    let node = StaticExprNode::new_value_typed(
         StaticExprKind::SlotId(novarocks_types::SlotId::new(3)),
-        DataType::Int64,
-        None,
+        ty.clone(),
     );
     assert!(
         literal_argument(
@@ -331,7 +318,7 @@ fn long_literal_type_sharing_preserves_each_actual_handle_copy_control_prefix() 
         &Control::good(),
     )
     .unwrap();
-    let source = source(ty, ExprKind::Literal(LiteralValue::Null));
+    let source = constant_source(&value);
     let baseline = Control::good();
     project(&value, &source, &baseline).unwrap();
     let trace = baseline.trace.into_inner().unwrap();
@@ -359,7 +346,8 @@ fn completed_mismatch_tail_observes_control_before_returning_data_error() {
     let value = text_value(DataType::LargeUtf8, "abc");
     let mut ty = value.value_type().clone();
     ty = ty.with_nullable(true).unwrap();
-    let source = source(ty, ExprKind::Literal(LiteralValue::Utf8("abc".into())));
+    let mut source = constant_source(&value);
+    source.node.ty = ty;
     let baseline = Control::good();
     assert!(matches!(
         project(&value, &source, &baseline),

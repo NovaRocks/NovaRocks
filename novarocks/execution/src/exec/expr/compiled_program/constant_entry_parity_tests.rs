@@ -98,11 +98,8 @@ impl Family {
             Self::Arithmetic => matches!(kind, StaticExprKind::PreparedArithmetic { .. }),
             Self::Comparison => kind.ordinary_comparison().is_some(),
             Self::NullSafe => matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }),
-            Self::And => matches!(
-                kind,
-                StaticExprKind::And(..) | StaticExprKind::NaryAnd { .. }
-            ),
-            Self::Or => matches!(kind, StaticExprKind::Or(..) | StaticExprKind::NaryOr { .. }),
+            Self::And => matches!(kind, StaticExprKind::NaryAnd { .. }),
+            Self::Or => matches!(kind, StaticExprKind::NaryOr { .. }),
             Self::Not => matches!(kind, StaticExprKind::Not(_)),
             Self::Carrier => matches!(
                 kind,
@@ -313,8 +310,8 @@ impl Fixture {
                 left: ConstantConversion::Identity,
                 right: ConstantConversion::Identity,
             },
-            StaticExprKind::And(..) | StaticExprKind::NaryAnd { .. } => ConstantNode::Conjunction,
-            StaticExprKind::Or(..) | StaticExprKind::NaryOr { .. } => ConstantNode::Disjunction,
+            StaticExprKind::NaryAnd { .. } => ConstantNode::Conjunction,
+            StaticExprKind::NaryOr { .. } => ConstantNode::Disjunction,
             StaticExprKind::Not(_) => ConstantNode::Not,
             StaticExprKind::PreparedCast {
                 operation: CastOperation::Carrier,
@@ -639,10 +636,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         );
         for at in fixture.args(fixture.occurrence) {
             assert!(
-                matches!(
-                    fixture.kind(at),
-                    StaticExprKind::Constant(_) | StaticExprKind::Literal(_)
-                ),
+                matches!(fixture.kind(at), StaticExprKind::Constant(_)),
                 "T1 uses one actual node over constant leaves: {expression}"
             );
         }

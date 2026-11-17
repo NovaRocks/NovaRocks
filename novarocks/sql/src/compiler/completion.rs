@@ -4286,9 +4286,9 @@ mod tests {
     use arrow::datatypes::DataType;
     use bytes::Bytes;
     use novarocks_physical_plan::{
-        Distribution, ExactInputVersion, ExprKind, FragmentBuilder, FragmentId, FragmentSink,
-        LiteralValue, NodeKind, OutputPort, PhysicalNode, PhysicalProperties, PipelineDopDomain,
-        ResultField, ResultPort, RowMultiplicity, ValueOrigin,
+        Distribution, ExactInputVersion, FragmentBuilder, FragmentId, FragmentSink, NodeKind,
+        OutputPort, PhysicalNode, PhysicalProperties, PipelineDopDomain, ResultField, ResultPort,
+        RowMultiplicity, ValueOrigin,
     };
     use novarocks_spi::connector::read_stack::{
         ConnectorReadBinding, ConnectorValue, Domain, TupleDomain,
@@ -4311,9 +4311,10 @@ mod tests {
         let mut fragment = FragmentBuilder::new(FragmentId::new(1));
         let node = fragment.reserve_node_id().unwrap();
         let ty = ValueType::new(DataType::Int64, false);
-        let expression = fragment
-            .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(1)))
-            .unwrap();
+        let mut constants = novarocks_physical_plan::ConstantPools::empty();
+        let kind =
+            crate::test_constants::insert(&mut constants, crate::test_constants::i64(1)(&ty));
+        let expression = fragment.add_expression(node, ty.clone(), kind).unwrap();
         let output = fragment
             .add_value(
                 ty.clone(),
@@ -4354,7 +4355,7 @@ mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
-        let mut plan = PlanBuilder::new(version);
+        let mut plan = PlanBuilder::new(version).with_constant_pools(constants);
         plan.add_fragment(fragment).unwrap();
         plan.set_result_port(ResultPort {
             scalar_schema: None,

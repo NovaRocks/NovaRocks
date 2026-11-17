@@ -56,8 +56,80 @@ fn site(node: usize, role: ProgramChannelLayoutRole, ordinal: u32) -> ProgramCha
 fn output(node: usize) -> ProgramChannelSite {
     site(node, ProgramChannelLayoutRole::NodeOutput, 0)
 }
+// These fixtures vary the source declaration deliberately. Construct fresh checked
+// constants with that complete declaration before building the frozen type table.
+fn declared_expression_calls(
+    calls: ProgramResolvedCalls,
+    types: &[FunctionValueType],
+) -> ProgramResolvedCalls {
+    let snapshot = calls.snapshot();
+    let original = snapshot.program();
+    let nodes = original
+        .expressions()
+        .nodes()
+        .iter()
+        .zip(types)
+        .map(|(node, ty)| {
+            let kind = match node.kind() {
+                StaticExprKind::Constant(value) => match ty.data_type() {
+                    DataType::Int64 => crate::test_support::integer_typed(
+                        value.try_i64().unwrap().unwrap(),
+                        ty.clone(),
+                    ),
+                    DataType::Int32 => crate::test_support::int32_typed(
+                        value
+                            .pool()
+                            .array()
+                            .as_any()
+                            .downcast_ref::<arrow_array::Int32Array>()
+                            .unwrap()
+                            .value(value.ordinal() as usize),
+                        ty.clone(),
+                    ),
+                    _ => panic!("fixture constant has no declared integer factory"),
+                },
+                kind => kind.clone(),
+            };
+            StaticExprNode::new_value_typed(kind, ty.clone())
+        })
+        .collect();
+    let graph = LocalProgramGraph::try_new_with_outputs(
+        original.nodes().to_vec(),
+        original.root(),
+        Arc::new(crate::test_support::arena(nodes).unwrap()),
+        original.profile(),
+        original.requirements().clone(),
+        original.sink().cloned(),
+        original.summaries().to_vec(),
+    )
+    .unwrap();
+    let snapshot = ProgramRootControlBindings::try_new(
+        graph,
+        snapshot.flows().clone(),
+        snapshot
+            .bindings()
+            .iter()
+            .map(|(&site, &use_id)| ProgramRootUseBinding { site, use_id })
+            .collect(),
+        &Control::default(),
+    )
+    .unwrap();
+    ProgramResolvedCalls::try_new(
+        snapshot,
+        calls
+            .calls()
+            .iter()
+            .map(|(&site, call)| (site, call.specialization().clone()))
+            .collect(),
+        &Control::default(),
+    )
+    .unwrap()
+}
 fn expression_types(calls: ProgramResolvedCalls, nullable: bool) -> ProgramTypedExpressions {
-    // Every definition in these real relational fixtures is an Int64 literal.
+    let source_types =
+        vec![i64_type(nullable); calls.snapshot().program().expressions().nodes().len()];
+    let calls = declared_expression_calls(calls, &source_types);
+    // Every definition in these real relational fixtures is a checked Int64 constant.
     let types = calls
         .snapshot()
         .roots()
@@ -439,16 +511,10 @@ fn values_program(fields: Vec<Field>) -> ProgramTypedExpressions {
         KernelAbiVersion::CURRENT,
     );
     let arena = Arc::new(
-        ImmutableExpressions::try_new(
-            vec![StaticExprNode::new(
-                StaticExprKind::Literal(StaticLiteral::Int64(7)),
-                DataType::Int64,
-                None,
-            )],
-            false,
-            HashMap::new(),
-            None,
-        )
+        crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+            crate::test_support::integer(7),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+        )])
         .unwrap(),
     );
     let program = LocalProgramGraph::try_new(
@@ -755,16 +821,10 @@ fn actual_join_side_and_scope_layouts_keep_separate_explicit_logical_domains() {
         ),
     ];
     let arena = Arc::new(
-        ImmutableExpressions::try_new(
-            vec![StaticExprNode::new(
-                StaticExprKind::Literal(StaticLiteral::Int64(7)),
-                DataType::Int64,
-                None,
-            )],
-            false,
-            HashMap::new(),
-            None,
-        )
+        crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+            crate::test_support::integer(7),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+        )])
         .unwrap(),
     );
     let profile = CompileProfile::new(
@@ -1121,23 +1181,16 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
         ..Default::default()
     };
     let arena = Arc::new(
-        ImmutableExpressions::try_new(
-            vec![
-                StaticExprNode::new(
-                    StaticExprKind::Literal(StaticLiteral::Int64(7)),
-                    DataType::Int64,
-                    None,
-                ),
-                StaticExprNode::new(
-                    StaticExprKind::Literal(StaticLiteral::Int32(9)),
-                    DataType::Int32,
-                    None,
-                ),
-            ],
-            false,
-            HashMap::new(),
-            None,
-        )
+        crate::test_support::arena(vec![
+            StaticExprNode::new_value_typed(
+                crate::test_support::integer(7),
+                novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+            ),
+            StaticExprNode::new_value_typed(
+                crate::test_support::int32(9),
+                novarocks_functions::FunctionValueType::new(DataType::Int32, false),
+            ),
+        ])
         .unwrap(),
     );
     let program = LocalProgramGraph::try_new(
@@ -1227,7 +1280,18 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
     );
     assert_eq!(
         ProgramTypedChannels::try_new(
-            ProgramTypedExpressions::try_new(calls, types(true), &Control::default()).unwrap(),
+            ProgramTypedExpressions::try_new(
+                declared_expression_calls(
+                    calls,
+                    &[
+                        i64_type(false),
+                        FunctionValueType::new(DataType::Int32, true)
+                    ]
+                ),
+                types(true),
+                &Control::default()
+            )
+            .unwrap(),
             entries,
             &Control::default()
         )

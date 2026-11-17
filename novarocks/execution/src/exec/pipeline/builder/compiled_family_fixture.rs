@@ -21,6 +21,10 @@
 //! Every expression root in these fixtures is a leaf (literal or value read),
 //! so each root gets one eager use in one evaluation domain.
 
+#[path = "compiled_family_fixture/constant_sources.rs"]
+pub(crate) mod constant_sources;
+use constant_sources as cv;
+pub(crate) use constant_sources::FragmentBuilder;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -35,11 +39,11 @@ use novarocks_local_compiler::{
 };
 use novarocks_local_program::{KernelAbiVersion, LocalProgram};
 use novarocks_physical_plan::{
-    ConstantPools, ExprKind, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage,
-    FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots, PhysicalRootUses,
-    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
-    ResultField, ResultPort, ValueId, ValueOrigin,
+    ConstantPools, ExprKind, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
+    FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, NodeId,
+    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
+    PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort, ValueId,
+    ValueOrigin,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
@@ -118,8 +122,8 @@ pub(crate) fn boolean(nullable: bool) -> FunctionValueType {
 }
 
 /// One nullable or non-null Int64 literal cell.
-pub(crate) fn cell(value: Option<i64>) -> LiteralValue {
-    value.map_or(LiteralValue::Null, LiteralValue::Int64)
+pub(crate) fn cell(value: Option<i64>) -> novarocks_functions::ConstantValue {
+    value.map_or_else(cv::null, cv::i64)
 }
 
 /// A Values leaf at `node` whose columns have the given complete types and
@@ -128,7 +132,7 @@ pub(crate) fn values(
     builder: &mut FragmentBuilder,
     node: NodeId,
     types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
 ) -> Vec<ValueId> {
     let columns = types
         .iter()
@@ -151,11 +155,7 @@ pub(crate) fn values(
             assert_eq!(row.len(), types.len());
             row.iter()
                 .zip(types)
-                .map(|(literal, ty)| {
-                    builder
-                        .add_expression(node, ty.clone(), ExprKind::Literal(literal.clone()))
-                        .unwrap()
-                })
+                .map(|(literal, ty)| builder.constant(node, ty.clone(), literal.clone()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
         })
@@ -224,6 +224,9 @@ pub(crate) fn package_with_sink_and_names(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
+    let (fragment, sources) = fragment.into_parts();
+    let mut constants = constants;
+    cv::merge(&mut constants, &sources);
     let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
     let domain = EvaluationRegionId::new(0);
     let mut uses = Vec::new();
@@ -445,9 +448,11 @@ pub(crate) fn int64_rows(chunks: &[Chunk]) -> Vec<Vec<Option<i64>>> {
 /// Compile the fixture's complete declared columns as constant Values. This
 /// authors a checked package; lifecycle tests do not retain a decoder bridge.
 pub(crate) fn values_chunk_program(chunk: &Chunk, sink: FragmentSink) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     use novarocks_functions::ConstantPool;
     use novarocks_physical_plan::{ConstantPoolId, ConstantReference};
-    let mut builder = FragmentBuilder::new(FragmentId::new(19));
+    let mut builder = FragmentBuilder::new(FragmentId::new(19), &fixture_sources);
     let node = novarocks_physical_plan::NodeId::new(19);
     let mut constants = ConstantPools::empty();
     let types = chunk

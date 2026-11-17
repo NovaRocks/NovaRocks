@@ -160,7 +160,12 @@ pub(super) fn build_typed(
             .add_expression(
                 filter,
                 FunctionValueType::new(DataType::Boolean, false),
-                ExprKind::Literal(novarocks_physical_plan::LiteralValue::Boolean(true)),
+                crate::test_constants::boolean(
+                    &mut constants,
+                    &FunctionValueType::new(DataType::Boolean, false),
+                    true,
+                    policy(),
+                ),
             )
             .unwrap();
         builder

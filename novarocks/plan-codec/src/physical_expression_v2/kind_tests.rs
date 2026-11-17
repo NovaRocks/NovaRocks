@@ -17,7 +17,7 @@
 
 use super::*;
 use arrow::datatypes::DataType;
-use novarocks_physical_plan::{ConstantPoolId, ConstantReference, LiteralValue, NodeId, ValueType};
+use novarocks_physical_plan::{ConstantPoolId, ConstantReference, NodeId, ValueType};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, SemanticParameterId,
 };
@@ -254,17 +254,9 @@ fn ordered_ids_case_lambda_and_window_vocabulary_are_not_canonicalized() {
 }
 
 #[test]
-fn kind_refuses_legacy_literal_mismatched_lambda_and_wrong_parameter_key() {
+fn kind_refuses_mismatched_lambda_and_wrong_parameter_key() {
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
-    assert!(matches!(
-        encode_kind(
-            &node(ExprKind::Literal(LiteralValue::Int64(4))),
-            &ids(&[]),
-            &mut work
-        ),
-        Err(ExpressionCodecError::InvalidShape(_))
-    ));
     assert!(matches!(
         encode_kind(
             &node(ExprKind::Lambda {

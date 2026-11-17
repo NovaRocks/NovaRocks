@@ -247,7 +247,7 @@ fn typed_frozen_read_with_distribution(
 
 /// A real physical Scan under exactly the same frozen fixture provider facts.
 pub(crate) fn add_typed_scan(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     types: &[ValueType],
     dynamic_filters: Vec<StaticScanDynamicFilter>,
@@ -256,11 +256,14 @@ pub(crate) fn add_typed_scan(
 }
 
 pub(crate) fn add_typed_scan_with_residual(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     types: &[ValueType],
     dynamic_filters: Vec<StaticScanDynamicFilter>,
-    residual: impl FnOnce(&mut FragmentBuilder, &[ValueId]) -> Box<[ExprId]>,
+    residual: impl FnOnce(
+        &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+        &[ValueId],
+    ) -> Box<[ExprId]>,
 ) -> (Vec<ValueId>, FrozenConnectorRead) {
     // This scripted source declares one physical stream, as the original
     // ordered Scan compiler fixture does. Partial driver DOP stays explicit.
@@ -335,6 +338,8 @@ pub(crate) fn add_typed_scan_with_residual(
 /// Compile the fixture fragment for `dop` drivers, with or without the
 /// `v0 > 7` residual.
 pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let binding = binding();
     let relation_payload = ConnectorReadRelationPayload::new(
         ConnectorReadRelationKind::Table,
@@ -344,7 +349,11 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
     let columns = [b"c0" as &'static [u8], b"c1"].map(|bytes| ProviderColumnReference {
         column_payload: payload(&binding, ConnectorCodecCategory::ReadColumn, bytes),
     });
-    let mut builder = FragmentBuilder::new(FRAGMENT);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FRAGMENT,
+            &fixture_sources,
+        );
     let provider = columns
         .iter()
         .map(|column| {
@@ -364,9 +373,11 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
         let column = builder
             .add_expression(SCAN, int64(), ExprKind::Value(provider[0]))
             .unwrap();
-        let literal = builder
-            .add_expression(SCAN, int64(), ExprKind::Literal(LiteralValue::Int64(7)))
-            .unwrap();
+        let literal = builder.constant(
+            SCAN,
+            int64(),
+            crate::exec::operators::family_fixture::constant_sources::i64(7),
+        );
         residuals.push(
             builder
                 .add_expression(
@@ -477,7 +488,10 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
@@ -499,7 +513,9 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
             .collect(),
     })
     .unwrap();
-    let plan = plan.finish().unwrap();
+    let plan = plan
+        .finish_observed(&crate::exec::operators::family_fixture::constant_sources::control())
+        .unwrap();
 
     let scans = BTreeMap::from([(
         ProviderReadOccurrenceId::new(0),
@@ -556,7 +572,7 @@ pub(crate) fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             self.next += 1;
             let args = match &self.fragment.expressions().get(expr).unwrap().kind {
                 ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Literal(_) | ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
+                ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
                 _ => panic!(
                     "the scan fixture has only binary expressions, values, literals and constants"
                 ),

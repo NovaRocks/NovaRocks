@@ -31,8 +31,8 @@ use arrow::{
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
 use novarocks_physical_plan::{
     AggregateBinding, AggregatePhase, AggregateSequenceId, BoundFunction, ConstantPoolId,
-    ConstantReference, LiteralValue, NodeId, NullOrdering, PlanLimits, SortDirection, SortExpr,
-    UnaryOperator, ValueId, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
+    ConstantReference, NodeId, NullOrdering, PlanLimits, SortDirection, SortExpr, UnaryOperator,
+    ValueId, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
 };
 use novarocks_type_contract::{
     AggregateStateFormatId, CompileControlError, DecimalOverflowPolicy, FunctionArgumentEvaluation,
@@ -851,8 +851,6 @@ fn namespace_full_type_and_original_binding_tokens_refuse_substitution() {
     rejected(&f);
     let mut f = all_kinds();
     f.input[0].parameters = vec![0];
-    rejected(&f);
-    let f = Fixture::single(ExprKind::Literal(LiteralValue::Int64(71)));
     rejected(&f);
     for (left, right) in [
         (

@@ -273,6 +273,7 @@ fn fixture(spec: Spec) -> Fixture {
     let columns = [b"c0" as &'static [u8], b"c1"].map(|bytes| ProviderColumnReference {
         column_payload: payload(&binding, ConnectorCodecCategory::ReadColumn, bytes),
     });
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(PRODUCER);
     let provider = columns
         .iter()
@@ -297,7 +298,12 @@ fn fixture(spec: Spec) -> Fixture {
             .add_expression(
                 SCAN,
                 int64(),
-                ExprKind::Literal(LiteralValue::Int64(7 + ordinal as i64)),
+                crate::test_constants::i64(
+                    &mut constants,
+                    &int64(),
+                    7 + ordinal as i64,
+                    options(None).constants,
+                ),
             )
             .unwrap();
         residuals.push(
@@ -335,7 +341,11 @@ fn fixture(spec: Spec) -> Fixture {
     let mut derived_values = Vec::new();
     if spec.derived {
         let expr = builder
-            .add_expression(SCAN, int64(), ExprKind::Literal(LiteralValue::Int64(9)))
+            .add_expression(
+                SCAN,
+                int64(),
+                crate::test_constants::i64(&mut constants, &int64(), 9, options(None).constants),
+            )
             .unwrap();
         let value = builder
             .add_value(int64(), ValueOrigin::Expr { node: SCAN, expr })
@@ -409,7 +419,11 @@ fn fixture(spec: Spec) -> Fixture {
             .add_expression(FILTER, int64(), ExprKind::Value(provider[1]))
             .unwrap();
         let literal = builder
-            .add_expression(FILTER, int64(), ExprKind::Literal(LiteralValue::Int64(3)))
+            .add_expression(
+                FILTER,
+                int64(),
+                crate::test_constants::i64(&mut constants, &int64(), 3, options(None).constants),
+            )
             .unwrap();
         let predicate = builder
             .add_expression(
@@ -449,7 +463,11 @@ fn fixture(spec: Spec) -> Fixture {
             )
             .unwrap();
         let cell = build
-            .add_expression(VALUES, int64(), ExprKind::Literal(LiteralValue::Int64(7)))
+            .add_expression(
+                VALUES,
+                int64(),
+                crate::test_constants::i64(&mut constants, &int64(), 7, options(None).constants),
+            )
             .unwrap();
         build
             .add_values(VALUES, Box::from([Box::from([cell])]), Box::from([column]))
@@ -621,6 +639,9 @@ fn fixture(spec: Spec) -> Fixture {
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(producer).unwrap();
     if let Some((fragment, column, imported)) = build_fragment {
         plan.add_fragment(fragment).unwrap();
@@ -762,7 +783,7 @@ fn fixture(spec: Spec) -> Fixture {
             .unwrap();
         }
     }
-    let plan = plan.finish().unwrap();
+    let plan = plan.finish_observed(&FixtureControl).unwrap();
 
     let draft = ConnectorReadRelationRecipeDraft::try_new(
         binding,
@@ -853,7 +874,7 @@ pub(super) fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             self.next += 1;
             let args = match &self.fragment.expressions().get(expr).unwrap().kind {
                 ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+                ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
                 _ => panic!("the scan fixture has only comparisons, values and literals"),
             };
             let arguments = args

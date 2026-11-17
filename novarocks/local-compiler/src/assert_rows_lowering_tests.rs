@@ -32,10 +32,9 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder, FragmentCuts,
     FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots,
-    PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
-    RequiredContracts, ResultField, ResultPort, RowCountAssertion, RowCountAssertionSpec, ValueId,
-    ValueOrigin,
+    FrozenFragmentCalls, FrozenFragmentPruning, NodeId, PhysicalExpressionRoots, PhysicalRootUses,
+    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
+    ResultField, ResultPort, RowCountAssertion, RowCountAssertionSpec, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationRegionId,
@@ -180,6 +179,7 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
     let initial = NodeId::new(0);
     let duplicate = NodeId::new(43);
     let assertion = NodeId::new(901);
+    let mut constants = ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fid);
     builder
         .add_values(empty, Box::from([Box::default()]), Box::default())
@@ -236,9 +236,15 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
         initial,
         empty,
         vec![
-            (ExprKind::Literal(LiteralValue::Int64(11)), integer.clone()),
+            (
+                crate::test_constants::i64(&mut constants, &integer, 11, options().constants),
+                integer.clone(),
+            ),
             (ExprKind::Constant(selected), nested.clone()),
-            (ExprKind::Literal(LiteralValue::Null), text.clone()),
+            (
+                crate::test_constants::null(&mut constants, &text, options().constants),
+                text.clone(),
+            ),
         ],
     );
     let mut projected = Vec::new();
@@ -417,7 +423,6 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     };
-    let mut constants = ConstantPools::empty();
     constants.insert(pool_id, pool)?;
     let package = FragmentPackage::try_new(
         FragmentPackageInput {
@@ -542,13 +547,7 @@ fn assert_rows_complete_keyed_preserves_order_duplicate_occurrences_full_source_
     };
     assert_eq!(field.name(), "item");
     assert!(field.metadata().is_empty());
-    let source_pool = source
-        .package
-        .constants()
-        .entries()
-        .values()
-        .next()
-        .unwrap();
+    let source_pool = &source.package.constants().entries()[&source.selected.pool];
     let DataType::List(source_field) = source_pool.field_ref().data_type() else {
         panic!("original source List");
     };

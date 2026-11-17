@@ -21,6 +21,7 @@ use super::super::{
 };
 use super::*;
 use crate::functions::build_builtin_engine_function_catalog;
+use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
 use arrow::datatypes::{DataType, Field};
 use novarocks_functions::{
     ConstantPolicy, EngineFunctionCatalog, FunctionArgument, FunctionResolutionError,
@@ -28,8 +29,8 @@ use novarocks_functions::{
 };
 use novarocks_physical_plan::{
     BoundFunction, ChangeEventSpec, ConstantPools, ExprArena, ExpressionRootRole,
-    ExpressionRootSite, Fragment, FragmentBuilder, FragmentId, FragmentSink, FrozenFragmentCalls,
-    LiteralValue, NodeId, NodeKind, PhysicalRootUses, PipelineDopDomain, PlanLimits, ValueOrigin,
+    ExpressionRootSite, FragmentId, FragmentSink, FrozenFragmentCalls, NodeId, NodeKind,
+    PhysicalRootUses, PipelineDopDomain, PlanLimits, ValueOrigin,
 };
 use novarocks_type_contract::{
     CompilePhase, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, ExpressionEffects,
@@ -138,11 +139,9 @@ fn literal(
     builder: &mut FragmentBuilder,
     owner: NodeId,
     ty: FunctionValueType,
-    value: LiteralValue,
+    value: checked::Source,
 ) -> ExprId {
-    builder
-        .add_expression(owner, ty, ExprKind::Literal(value))
-        .unwrap()
+    builder.constant(owner, ty, value)
 }
 fn call(
     builder: &mut FragmentBuilder,
@@ -205,7 +204,7 @@ fn lower(catalog: &EngineFunctionCatalog) -> (Fragment, ExprId) {
         &mut builder,
         owner,
         ty(DataType::Utf8, false),
-        LiteralValue::Utf8("Straße".into()),
+        checked::utf8("Straße".into()),
     );
     let root = call(
         &mut builder,
@@ -219,17 +218,12 @@ fn lower(catalog: &EngineFunctionCatalog) -> (Fragment, ExprId) {
 fn shared_if(catalog: &EngineFunctionCatalog) -> (Fragment, ExprId) {
     let (mut builder, input, owner) = empty();
     let boolean = ty(DataType::Boolean, false);
-    let a = literal(
-        &mut builder,
-        owner,
-        boolean.clone(),
-        LiteralValue::Boolean(true),
-    );
+    let a = literal(&mut builder, owner, boolean.clone(), checked::boolean(true));
     let b = literal(
         &mut builder,
         owner,
         boolean.clone(),
-        LiteralValue::Boolean(false),
+        checked::boolean(false),
     );
     let mut function = binding(
         catalog,
@@ -315,19 +309,17 @@ fn uses(fragment: &Fragment, catalog: &EngineFunctionCatalog) -> PhysicalRootUse
         .root_uses
 }
 fn request<'a>(source: &'a ExprNode, fragment: &Fragment) -> AuthoredPhysicalScalarRequest<'a> {
-    request_from(source, fragment.expressions())
+    request_from(source, fragment.expressions(), fragment.constants())
 }
-fn request_from<'a>(source: &'a ExprNode, arena: &ExprArena) -> AuthoredPhysicalScalarRequest<'a> {
+fn request_from<'a>(
+    source: &'a ExprNode,
+    arena: &ExprArena,
+    pools: &ConstantPools,
+) -> AuthoredPhysicalScalarRequest<'a> {
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
-    let result = author_physical_scalar_request_observed(
-        source,
-        arena,
-        &ConstantPools::empty(),
-        policy(),
-        &mut work,
-    )
-    .unwrap();
+    let result =
+        author_physical_scalar_request_observed(source, arena, pools, policy(), &mut work).unwrap();
     work.finish().unwrap();
     result
 }
@@ -563,7 +555,7 @@ fn scalar_occurrences_actual_coalesce_preserves_rng_instance_and_decimal_row_err
         &mut builder,
         owner,
         decimal.clone(),
-        LiteralValue::Decimal128(12345),
+        checked::decimal128(12345),
     );
     let round = call(
         &mut builder,
@@ -1085,13 +1077,14 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
         }),
     };
     let owner = NodeId::new(901);
+    let mut pools = ConstantPools::empty();
     let nodes = vec![
         ExprNode {
             id: ExprId::new(1),
             owner,
             lambda_scope: None,
             ty: integer.clone(),
-            kind: ExprKind::Literal(LiteralValue::Int64(7)),
+            kind: checked::insert(&mut pools, checked::i64(7)(&integer)),
         },
         ExprNode {
             id: ExprId::new(2),
@@ -1137,7 +1130,7 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
     )
     .unwrap();
     let source = arena.get(ExprId::new(17)).unwrap();
-    let req = request_from(source, &arena);
+    let req = request_from(source, &arena, &pools);
     let domain = EvaluationRegionId::new(0);
     let context = |id| ExpressionEffectContext {
         use_id: ExpressionUseId::new(id),
@@ -1290,9 +1283,9 @@ fn scalar_occurrences_wide_coalesce_preserves_actual_order_and_samples_only_real
             owner,
             nullable.clone(),
             if at == 319 {
-                LiteralValue::Utf8("last".into())
+                checked::utf8("last".into())
             } else {
-                LiteralValue::Null
+                checked::null()
             },
         ));
     }

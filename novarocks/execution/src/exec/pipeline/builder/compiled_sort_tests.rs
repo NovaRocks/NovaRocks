@@ -27,8 +27,8 @@ use arrow::array::Int64Array;
 use arrow::record_batch::RecordBatch;
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
-    ConstantPools, ExprKind, FragmentBuilder, FragmentId, NodeId, NullOrdering, SortDirection,
-    SortExpr, SortMode, TopNPhase, TopNSequenceId,
+    ConstantPools, ExprKind, FragmentId, NodeId, NullOrdering, SortDirection, SortExpr, SortMode,
+    TopNPhase, TopNSequenceId,
 };
 
 use super::family_fixture::{cell, compile, int64, int64_rows, package, run, try_compile, values};
@@ -79,7 +79,13 @@ fn sort_expr(expr: novarocks_physical_plan::ExprId, key: Key) -> SortExpr {
 
 /// `Values(a, b) -> Sort|TopN(keys) -> Result`.
 fn program(keys: &[Key], shape: Shape) -> Arc<LocalProgram> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(31));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(31),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let sort = NodeId::new(1);
     let rows = ROWS
@@ -402,7 +408,13 @@ fn compiled_sort_retains_original_column_metadata_until_input_or_processor_exit(
 // a grouped-state partial is refused by the compiler.
 #[test]
 fn partial_topn_runs_as_its_instance_prefix() {
-    let mut builder = FragmentBuilder::new(FragmentId::new(32));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(32),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let topn = NodeId::new(1);
     let rows = ROWS

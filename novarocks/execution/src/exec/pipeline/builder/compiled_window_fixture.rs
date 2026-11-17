@@ -44,14 +44,13 @@ use novarocks_functions::{
 use novarocks_local_program::LocalProgram;
 use novarocks_physical_plan::{
     AggregateBinding, AggregatePhase, BoundFunction, ConstantPoolId, ConstantPools,
-    ConstantReference, ExprId, ExprKind, FragmentBuilder, FragmentCuts, FragmentId,
-    FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType,
-    LiteralValue, NodeId, NodeKind, NullOrdering, PhysicalCallDefinition, PhysicalCallRequest,
-    PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits,
-    PlanVersionId, PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort,
-    SortDirection, SortExpr, SortMode, StaticFunctionArgument, ValueOrigin, WindowExpression,
-    WindowSpec,
+    ConstantReference, ExprId, ExprKind, FragmentCuts, FragmentId, FragmentPackage,
+    FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
+    FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType, NodeId, NodeKind,
+    NullOrdering, PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite,
+    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
+    PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort, SortDirection,
+    SortExpr, SortMode, StaticFunctionArgument, ValueOrigin, WindowExpression, WindowSpec,
 };
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompilePhase, ControlShape,
@@ -259,12 +258,13 @@ fn int64(nullable: bool) -> FunctionValueType {
 /// cells as an exact Int64 literal followed by an explicit typed Cast. Keep
 /// the original Values author unchanged for every other fixture shape.
 fn typed_literal_values(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
 ) -> (Vec<novarocks_physical_plan::ValueId>, bool) {
-    let needs_cast = |literal: &LiteralValue, ty: &FunctionValueType| {
-        matches!(literal, LiteralValue::Int64(_))
+    let needs_cast = |literal: &novarocks_functions::ConstantValue, ty: &FunctionValueType| {
+        literal.value_type().data_type() == &DataType::Int64
+            && !super::family_fixture::constant_sources::is_null(literal)
             && matches!(
                 ty.data_type(),
                 DataType::Int8 | DataType::Int16 | DataType::Int32
@@ -305,13 +305,7 @@ fn typed_literal_values(
                 .zip(types)
                 .map(|(literal, ty)| {
                     if needs_cast(literal, ty) {
-                        let source = builder
-                            .add_expression(
-                                VALUES,
-                                int64(false),
-                                ExprKind::Literal(literal.clone()),
-                            )
-                            .unwrap();
+                        let source = builder.constant(VALUES, int64(false), literal.clone());
                         builder
                             .add_expression(
                                 VALUES,
@@ -325,9 +319,7 @@ fn typed_literal_values(
                             )
                             .unwrap()
                     } else {
-                        builder
-                            .add_expression(VALUES, ty.clone(), ExprKind::Literal(literal.clone()))
-                            .unwrap()
+                        builder.constant(VALUES, ty.clone(), literal.clone())
                     }
                 })
                 .collect::<Vec<_>>()
@@ -359,7 +351,12 @@ pub(super) fn package(
         .map(|row| {
             assert_eq!(row.len(), width);
             row.iter()
-                .map(|cell| cell.map_or(LiteralValue::Null, LiteralValue::Int64))
+                .map(|cell| {
+                    cell.map_or(
+                        crate::exec::operators::family_fixture::constant_sources::null(),
+                        crate::exec::operators::family_fixture::constant_sources::i64,
+                    )
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -370,15 +367,21 @@ pub(super) fn package(
 /// wrapper passes exactly its former types/values. Constant and overflowing
 /// test channels retain their original BIGINT contracts.
 pub(super) fn package_typed(
-    literal_rows: &[Vec<LiteralValue>],
+    literal_rows: &[Vec<novarocks_functions::ConstantValue>],
     types: &[FunctionValueType],
     shape: &Shape,
     catalog: &PureEngineFunctionCatalog,
     max_dop: u32,
 ) -> Arc<FragmentPackage> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let complete =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let mut builder = FragmentBuilder::new(FragmentId::new(43));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(43),
+            &fixture_sources,
+        );
     let (columns, integral_literal_cast) = typed_literal_values(&mut builder, types, literal_rows);
     // Constants: one non-null BIGINT pool, one ordinal per constant argument.
     let constants = shape
@@ -521,13 +524,11 @@ pub(super) fn package_typed(
                             ExprKind::Value(columns[*column]),
                         )
                         .unwrap();
-                    let max = builder
-                        .add_expression(
-                            WINDOW,
-                            int64(false),
-                            ExprKind::Literal(LiteralValue::Int64(i64::MAX)),
-                        )
-                        .unwrap();
+                    let max = builder.constant(
+                        WINDOW,
+                        int64(false),
+                        crate::exec::operators::family_fixture::constant_sources::i64(i64::MAX),
+                    );
                     arguments.push(
                         builder
                             .add_expression(
@@ -624,13 +625,13 @@ pub(super) fn package_typed(
                 WindowBound::CurrentRow => WindowBound::CurrentRow,
                 WindowBound::UnboundedFollowing => WindowBound::UnboundedFollowing,
                 WindowBound::Preceding(offset) | WindowBound::Following(offset) => {
-                    let literal = builder
-                        .add_expression(
-                            WINDOW,
-                            int64(false),
-                            ExprKind::Literal(LiteralValue::Int64(i64::try_from(offset).unwrap())),
-                        )
-                        .unwrap();
+                    let literal = builder.constant(
+                        WINDOW,
+                        int64(false),
+                        crate::exec::operators::family_fixture::constant_sources::i64(
+                            i64::try_from(offset).unwrap(),
+                        ),
+                    );
                     if matches!(bound, WindowBound::Preceding(_)) {
                         WindowBound::Preceding(literal)
                     } else {
@@ -722,6 +723,8 @@ pub(super) fn package_typed(
         .unwrap()
         .with_call_requests_observed(requests, &FixtureControl)
         .unwrap();
+    let (fragment, sources) = fragment.into_parts();
+    crate::exec::operators::family_fixture::constant_sources::merge(&mut pools, &sources);
     // Root occurrences, then one leaf child per WindowCall reference.
     let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
     let domain = EvaluationRegionId::new(0);
@@ -887,8 +890,16 @@ pub(super) fn package_typed(
         } else {
             let frame = frame.map(|frame| {
                 let offset = |id: ExprId| match fragment.expressions().get(id).unwrap().kind {
-                    ExprKind::Literal(LiteralValue::Int64(value)) => u64::try_from(value).unwrap(),
-                    _ => unreachable!("fixture offsets are literals"),
+                    ExprKind::Constant(reference) => u64::try_from(
+                        pools.entries()[&reference.pool]
+                            .value(reference.ordinal)
+                            .unwrap()
+                            .try_i64()
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                    _ => unreachable!("fixture offsets are checked constants"),
                 };
                 let bound = |bound: WindowBound<ExprId>| match bound {
                     WindowBound::UnboundedPreceding => WindowBound::UnboundedPreceding,

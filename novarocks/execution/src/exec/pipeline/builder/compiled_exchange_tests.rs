@@ -37,12 +37,12 @@ use novarocks_local_program::{
 };
 use novarocks_physical_plan::{
     Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprKind,
-    Fragment, FragmentBuilder, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, HashDefinition, HashPartitionScheme, LiteralValue,
-    NodeId, PartitionCountDomain, PartitionCountParameter, PartitionCountParameterId,
-    PartitionSpaceId, PhysicalExpressionRoots, PhysicalPlan, PhysicalRootUses, PipelineDopDomain,
-    PlanBuilder, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort,
-    RowMultiplicity, ValueId, ValueOrigin, extract_fragment_packages,
+    Fragment, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
+    FrozenFragmentCalls, FrozenFragmentPruning, HashDefinition, HashPartitionScheme, NodeId,
+    PartitionCountDomain, PartitionCountParameter, PartitionCountParameterId, PartitionSpaceId,
+    PhysicalExpressionRoots, PhysicalPlan, PhysicalRootUses, PipelineDopDomain, PlanLimits,
+    PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort, RowMultiplicity,
+    ValueId, ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
@@ -128,11 +128,17 @@ fn plan_with_local_nullability(
     reverse_keys: bool,
     local_nullable: bool,
 ) -> (PhysicalPlan, NodeId) {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let edge = EdgeId::new(5);
     let producer_id = FragmentId::new(1);
     let consumer_id = FragmentId::new(2);
 
-    let mut producer = FragmentBuilder::new(producer_id);
+    let mut producer =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            producer_id,
+            &fixture_sources,
+        );
     let values = producer.reserve_node_id().unwrap();
     let a = producer
         .add_value(
@@ -154,20 +160,16 @@ fn plan_with_local_nullability(
         .unwrap();
     let mut rows = Vec::new();
     for &(a_value, b_value) in values_rows {
-        let a_cell = producer
-            .add_expression(
-                values,
-                int64(),
-                ExprKind::Literal(LiteralValue::Int64(a_value)),
-            )
-            .unwrap();
-        let b_cell = producer
-            .add_expression(
-                values,
-                int64(),
-                ExprKind::Literal(LiteralValue::Int64(b_value)),
-            )
-            .unwrap();
+        let a_cell = producer.constant(
+            values,
+            int64(),
+            crate::exec::operators::family_fixture::constant_sources::i64(a_value),
+        );
+        let b_cell = producer.constant(
+            values,
+            int64(),
+            crate::exec::operators::family_fixture::constant_sources::i64(b_value),
+        );
         rows.push(vec![a_cell, b_cell].into_boxed_slice());
     }
     producer
@@ -183,7 +185,11 @@ fn plan_with_local_nullability(
         .unwrap();
 
     let local_type = FunctionValueType::new(DataType::Int64, local_nullable);
-    let mut consumer = FragmentBuilder::new(consumer_id);
+    let mut consumer =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            consumer_id,
+            &fixture_sources,
+        );
     let exchange = consumer.reserve_node_id().unwrap();
     let b_import = consumer
         .add_value(
@@ -243,7 +249,10 @@ fn plan_with_local_nullability(
     };
     let output = consumer.nodes()[&exchange].output.clone();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([73; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
@@ -292,7 +301,11 @@ fn plan_with_local_nullability(
         ]),
     })
     .unwrap();
-    (plan.finish().unwrap(), exchange)
+    (
+        plan.finish_observed(&crate::exec::operators::family_fixture::constant_sources::control())
+            .unwrap(),
+        exchange,
+    )
 }
 
 /// Literal cells are the only roots; each gets one eager use.
@@ -1114,11 +1127,17 @@ fn drop_distribution_key_project_plan(
     hashed: bool,
     values_rows: &[(i64, i64)],
 ) -> (PhysicalPlan, NodeId) {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let edge = EdgeId::new(5);
     let producer_id = FragmentId::new(1);
     let consumer_id = FragmentId::new(2);
 
-    let mut producer = FragmentBuilder::new(producer_id);
+    let mut producer =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            producer_id,
+            &fixture_sources,
+        );
     let values = producer.reserve_node_id().unwrap();
     let a = producer
         .add_value(
@@ -1140,20 +1159,16 @@ fn drop_distribution_key_project_plan(
         .unwrap();
     let mut rows = Vec::new();
     for &(a_value, b_value) in values_rows {
-        let a_cell = producer
-            .add_expression(
-                values,
-                int64(),
-                ExprKind::Literal(LiteralValue::Int64(a_value)),
-            )
-            .unwrap();
-        let b_cell = producer
-            .add_expression(
-                values,
-                int64(),
-                ExprKind::Literal(LiteralValue::Int64(b_value)),
-            )
-            .unwrap();
+        let a_cell = producer.constant(
+            values,
+            int64(),
+            crate::exec::operators::family_fixture::constant_sources::i64(a_value),
+        );
+        let b_cell = producer.constant(
+            values,
+            int64(),
+            crate::exec::operators::family_fixture::constant_sources::i64(b_value),
+        );
         rows.push(vec![a_cell, b_cell].into_boxed_slice());
     }
     producer
@@ -1168,7 +1183,11 @@ fn drop_distribution_key_project_plan(
         )
         .unwrap();
 
-    let mut consumer = FragmentBuilder::new(consumer_id);
+    let mut consumer =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            consumer_id,
+            &fixture_sources,
+        );
     let exchange = consumer.reserve_node_id().unwrap();
     let b_import = consumer
         .add_value(
@@ -1244,7 +1263,10 @@ fn drop_distribution_key_project_plan(
     };
     let output = consumer.nodes()[&project].output.clone();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([73; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
@@ -1284,7 +1306,11 @@ fn drop_distribution_key_project_plan(
         }]),
     })
     .unwrap();
-    (plan.finish().unwrap(), exchange)
+    (
+        plan.finish_observed(&crate::exec::operators::family_fixture::constant_sources::control())
+            .unwrap(),
+        exchange,
+    )
 }
 
 /// Literal cells are the only roots; each gets one eager use.

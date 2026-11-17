@@ -1066,6 +1066,7 @@ fn checked_writer_plan_packages_inner(
     // A real producer/stream/finisher plan, with original cut derivation and
     // full Package publication. There are no aggregate or function calls.
     let pool = p::ConstantPoolId::new(5);
+    let mut literal_sources = p::ConstantPools::empty();
     let ordinal = c::WriteTargetOrdinal::try_new(0).unwrap();
     let edge = p::EdgeId::new(7);
     let route_edge = p::EdgeId::new(8);
@@ -1112,7 +1113,13 @@ fn checked_writer_plan_packages_inner(
                 if constant_row {
                     p::ExprKind::Constant(p::ConstantReference { pool, ordinal: 0 })
                 } else {
-                    p::ExprKind::Literal(p::LiteralValue::Int64(42))
+                    crate::test_constants::insert(
+                        &mut literal_sources,
+                        crate::test_constants::i64(42)(&FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        )),
+                    )
                 },
             )
             .unwrap();
@@ -1335,6 +1342,9 @@ fn checked_writer_plan_packages_inner(
         )
         .unwrap();
     let mut plan = p::PlanBuilder::new(p::PlanVersionId::try_new([1; 16]).unwrap());
+    for (&id, pool) in literal_sources.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     if constant_row {
         plan.insert_constant_pool(
             pool,
@@ -1473,7 +1483,7 @@ fn checked_writer_plan_packages_inner(
             .map(|(ordinal, (_, root))| {
                 assert!(matches!(
                     fragment.expressions().get(root.expr).unwrap().kind,
-                    p::ExprKind::Literal(_) | p::ExprKind::Constant(_) | p::ExprKind::Value(_)
+                    p::ExprKind::Constant(_) | p::ExprKind::Value(_)
                 ));
                 ExpressionInvocation {
                     context: ExpressionEffectContext {

@@ -4805,15 +4805,14 @@ mod tests {
         use novarocks_physical_plan::{
             AggregateBinding, AggregatePhase, AggregateSequenceId, BoundFunction, ConstantPool,
             ConstantPoolId, ConstantReference, Distribution, Edge, EdgeDestination, EdgeId,
-            EdgeKind, EdgePartitioning, EdgeSource, ExprKind, Fragment, FragmentBuilder,
-            FragmentId, FragmentPackageAdmission, FragmentSink, FrozenFragmentCalls,
-            FrozenFragmentPruning, FrozenPhysicalCall, LiteralValue, NodeId, NodeKind, OutputPort,
-            PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite, PhysicalExpressionRoots,
-            PhysicalNode, PhysicalPlan, PhysicalProperties, PhysicalRootUses, PipelineDopDomain,
-            PlanBuilder, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
-            ROOT_WRITE_RESULT_SCHEMA_REVISION, ResultField, ResultPort, RowMultiplicity,
-            SetOperationKind, StaticFunctionArgument, UnpivotConstant, ValueOrigin,
-            WRITER_MULTIPLEX_SCHEMA_REVISION, WriterAggregateCall, WriterDerivedKind,
+            EdgeKind, EdgePartitioning, EdgeSource, Fragment, FragmentId, FragmentPackageAdmission,
+            FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, NodeId,
+            NodeKind, OutputPort, PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite,
+            PhysicalExpressionRoots, PhysicalNode, PhysicalPlan, PhysicalProperties,
+            PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
+            PropertyProofProjectionLimits, ROOT_WRITE_RESULT_SCHEMA_REVISION, ResultField,
+            ResultPort, RowMultiplicity, SetOperationKind, StaticFunctionArgument, UnpivotConstant,
+            ValueOrigin, WRITER_MULTIPLEX_SCHEMA_REVISION, WriterAggregateCall, WriterDerivedKind,
             WriterFinishSpec, WriterGroupedUnpivotMapping, WriterGroupedUnpivotSpec,
             WriterRelationField, WriterRelationFieldRole, WriterRelationSchema, WriterTarget,
             WriterTargetField, extract_fragment_packages,
@@ -4936,7 +4935,7 @@ mod tests {
             }
         }
         fn relation_fields(
-            builder: &mut FragmentBuilder,
+            builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
             owner: NodeId,
             root: bool,
         ) -> Box<[WriterRelationField]> {
@@ -5152,9 +5151,9 @@ mod tests {
         }
 
         fn with_requests<'a>(
-            fragment: Fragment,
+            fragment: crate::exec::operators::family_fixture::constant_sources::Fragment,
             sites: impl Iterator<Item = (PhysicalCallSite, &'a AggregateBinding)>,
-        ) -> Fragment {
+        ) -> crate::exec::operators::family_fixture::constant_sources::Fragment {
             let mut entries = fragment
                 .call_requests()
                 .entries()
@@ -5355,10 +5354,21 @@ mod tests {
             PhysicalPlan,
             BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
         ) {
+            let fixture_sources =
+                crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
             assert!(target_count > 0 && channel_count > 0);
             let catalog = catalog();
-            let mut plan = PlanBuilder::new(PlanVersionId::try_new([29; 16]).unwrap());
-            let mut consumer = FragmentBuilder::new(FragmentId::new(target_count as u32 + 1));
+            let mut plan =
+                crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+                    PlanVersionId::try_new([29; 16]).unwrap(),
+                    &fixture_sources,
+                );
+            let mut consumer =
+                crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                    FragmentId::new(target_count as u32 + 1),
+                    &fixture_sources,
+                );
             let mut receivers = Vec::new();
             let mut received_fields = Vec::<Box<[WriterRelationField]>>::new();
             let mut drafts = BTreeMap::new();
@@ -5367,7 +5377,11 @@ mod tests {
                 let ordinal = target(target_index as u32);
                 let edge = EdgeId::new(local_index as u32 + 1);
                 let fragment_id = FragmentId::new(local_index as u32 + 1);
-                let mut producer = FragmentBuilder::new(fragment_id);
+                let mut producer =
+                    crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                        fragment_id,
+                        &fixture_sources,
+                    );
                 let source = producer.reserve_node_id().unwrap();
                 let input = (0..channel_count)
                     .map(|output_ordinal| {
@@ -5669,13 +5683,13 @@ mod tests {
             let mut mappings = Vec::new();
             for target_index in first_target..first_target + target_count {
                 for channel in 0..channel_count {
-                    let blob = consumer
-                        .add_expression(
-                            finish,
-                            ty(DataType::Utf8, false),
-                            ExprKind::Literal(LiteralValue::Utf8(BLOB_TYPE.into())),
-                        )
-                        .unwrap();
+                    let blob = consumer.constant(
+                        finish,
+                        ty(DataType::Utf8, false),
+                        crate::exec::operators::family_fixture::constant_sources::utf8(
+                            BLOB_TYPE.into(),
+                        ),
+                    );
                     mappings.push(WriterGroupedUnpivotMapping {
                         write_target_ordinal: target(target_index as u32),
                         input: finals[channel].output,

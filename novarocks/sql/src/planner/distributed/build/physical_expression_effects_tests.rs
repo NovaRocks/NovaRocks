@@ -18,6 +18,7 @@
 use super::super::expression_occurrences::author_physical_occurrences_observed;
 use super::*;
 use crate::functions::build_builtin_engine_function_catalog;
+use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
 use arrow::{
     array::{Array, StringArray},
     datatypes::{DataType, Field, TimeUnit},
@@ -26,9 +27,9 @@ use novarocks_functions::{
     ConstantPool, EngineFunctionCatalog, FunctionArgument, FunctionResultType,
 };
 use novarocks_physical_plan::{
-    BoundFunction, ConstantPoolId, ConstantReference, FragmentBuilder, FragmentId, FragmentSink,
-    FrozenFragmentCalls, LiteralValue, NodeId, NodeKind, PhysicalCallSite, PipelineDopDomain,
-    PlanLimits, ValueOrigin, WindowExpression, WindowSpec,
+    BoundFunction, ConstantPoolId, ConstantReference, FragmentId, FragmentSink,
+    FrozenFragmentCalls, NodeId, NodeKind, PhysicalCallSite, PipelineDopDomain, PlanLimits,
+    ValueOrigin, WindowExpression, WindowSpec,
 };
 use novarocks_type_contract::{
     ControlShape, ExpressionEffectContext, ExpressionEffects, ExpressionEvaluationRegion,
@@ -138,11 +139,9 @@ fn literal(
     builder: &mut FragmentBuilder,
     owner: NodeId,
     ty: FunctionValueType,
-    value: LiteralValue,
+    value: checked::Source,
 ) -> ExprId {
-    builder
-        .add_expression(owner, ty, ExprKind::Literal(value))
-        .unwrap()
+    builder.constant(owner, ty, value)
 }
 
 fn call(
@@ -209,7 +208,7 @@ fn lower(catalog: &EngineFunctionCatalog) -> (Fragment, ExprId) {
         &mut builder,
         owner,
         ty(DataType::Utf8, false),
-        LiteralValue::Utf8("Straße".into()),
+        checked::utf8("Straße".into()),
     );
     let root = call(
         &mut builder,
@@ -258,12 +257,14 @@ fn run(
     catalog: &EngineFunctionCatalog,
     control: &Control,
 ) -> Result<AuthoredPhysicalExpressionEffects, PhysicalExpressionEffectsError> {
+    let mut sources = pools.clone();
+    checked::merge(&mut sources, fragment.constants());
     author_physical_expression_effects_observed(
         PhysicalExpressionEffectsInput {
             temporal_sources: None,
             fragment,
             roots,
-            constants: pools,
+            constants: &sources,
             parameters: params,
             literal_policy: policy(),
             call_scopes: scopes,
@@ -411,7 +412,7 @@ fn cast(
         builder,
         owner,
         ty(DataType::Timestamp(unit, None), false),
-        novarocks_physical_plan::LiteralValue::Timestamp(i64::MAX),
+        checked::timestamp(i64::MAX),
     );
     builder
         .add_expression(
@@ -436,7 +437,7 @@ fn expression_effects_actual_edges_schedule_reordered_sparse_uses_and_shared_def
         &mut builder,
         owner,
         ty(DataType::Utf8, false),
-        novarocks_physical_plan::LiteralValue::Utf8("Shared".into()),
+        checked::utf8("Shared".into()),
     );
     let lower = call(
         &mut builder,
@@ -517,13 +518,13 @@ fn expression_effects_primitive_cast_successful_null_and_errorful_cast_arithmeti
         &mut builder,
         owner,
         ty(DataType::Int64, false),
-        novarocks_physical_plan::LiteralValue::Int64(i64::MAX),
+        checked::i64(i64::MAX),
     );
     let b = literal(
         &mut builder,
         owner,
         ty(DataType::Int64, false),
-        novarocks_physical_plan::LiteralValue::Int64(1),
+        checked::i64(1),
     );
     let add = builder
         .add_expression(
@@ -582,17 +583,12 @@ fn expression_effects_case_and_boolean_guards_keep_rand_state_and_errorful_cast_
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let (mut builder, leaf, owner) = empty();
     let boolean = ty(DataType::Boolean, false);
-    let condition = literal(
-        &mut builder,
-        owner,
-        boolean.clone(),
-        novarocks_physical_plan::LiteralValue::Boolean(true),
-    );
+    let condition = literal(&mut builder, owner, boolean.clone(), checked::boolean(true));
     let false_ = literal(
         &mut builder,
         owner,
         boolean.clone(),
-        novarocks_physical_plan::LiteralValue::Boolean(false),
+        checked::boolean(false),
     );
     let errorful = cast(
         &mut builder,
@@ -617,7 +613,7 @@ fn expression_effects_case_and_boolean_guards_keep_rand_state_and_errorful_cast_
         &mut builder,
         owner,
         rand_ty.clone(),
-        novarocks_physical_plan::LiteralValue::Float64Bits(0.0f64.to_bits()),
+        checked::f64_bits(0.0f64.to_bits()),
     );
     let compare = builder
         .add_expression(
@@ -1153,7 +1149,7 @@ fn expression_effects_whole_success_prefixes_and_wide_actual_traversal_sampling(
             &mut builder,
             owner,
             boolean.clone(),
-            novarocks_physical_plan::LiteralValue::Boolean(true),
+            checked::boolean(true),
         ));
     }
     let root = builder
@@ -1195,82 +1191,4 @@ fn expression_effects_whole_success_prefixes_and_wide_actual_traversal_sampling(
         true,
     );
     assert!(trace.contains(&(PHASE, 256)));
-}
-
-#[test]
-fn actual_literal_limit_is_primary_before_the_expression_composer_footer() {
-    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
-    use novarocks_functions::ConstantError;
-    let catalog = build_builtin_engine_function_catalog().unwrap();
-    let (mut builder, input, owner) = empty();
-    let root = literal(
-        &mut builder,
-        owner,
-        ty(DataType::Int64, false),
-        LiteralValue::Int64(7),
-    );
-    project(&mut builder, input, owner, &[root]);
-    let fragment = finish(builder, owner);
-    let roots = uses(&fragment, &catalog);
-    let pools = ConstantPools::empty();
-    let parameters = SemanticParameters::try_new([]).unwrap();
-    let scopes = BTreeMap::new();
-    let run = |control: &Control| {
-        author_physical_expression_effects_observed(
-            PhysicalExpressionEffectsInput {
-                temporal_sources: None,
-                fragment: &fragment,
-                roots: &roots,
-                constants: &pools,
-                parameters: &parameters,
-                literal_policy: ConstantPolicy {
-                    max_rows: 0,
-                    ..policy()
-                },
-                call_scopes: &scopes,
-            },
-            &catalog,
-            control,
-        )
-    };
-    let baseline = Control::default();
-    let original = run(&baseline).unwrap_err();
-    let PhysicalExpressionEffectsError::Argument(PhysicalArgumentError::Constant(
-        source @ ConstantError::Limit(_),
-    )) = &original
-    else {
-        panic!("the actual literal author must retain its source: {original:?}");
-    };
-    let expected_source = source.clone();
-    let expected = source.failure_fact();
-    assert_eq!(expected.class(), FailureClass::Resource);
-    assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
-    assert_eq!(expected.reason().code(), 2);
-    let trace = baseline.trace();
-    assert!(!trace.is_empty());
-    for cause in CAUSES {
-        let late = Control {
-            refusal: Some((trace.len(), cause.clone())),
-            ..Default::default()
-        };
-        let actual = run(&late).unwrap_err();
-        let PhysicalExpressionEffectsError::Argument(PhysicalArgumentError::Constant(source)) =
-            actual
-        else {
-            panic!("a later footer must not replace the constant limit");
-        };
-        assert_eq!(source, expected_source);
-        assert_eq!(source.failure_fact(), expected);
-        assert_eq!(late.trace(), trace);
-        for at in 0..trace.len() {
-            let earlier = Control {
-                refusal: Some((at, cause.clone())),
-                ..Default::default()
-            };
-            assert!(
-                matches!(run(&earlier), Err(PhysicalExpressionEffectsError::Control(actual)) if actual == cause)
-            );
-            assert_eq!(earlier.trace(), trace[..=at]);
-        }
-    }
 }

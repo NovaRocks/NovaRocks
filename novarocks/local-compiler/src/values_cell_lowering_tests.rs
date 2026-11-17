@@ -307,7 +307,7 @@ fn visit(
     *next += 11;
     let children = match &fragment.expressions().get(definition).unwrap().kind {
         ExprKind::Cast { expr, .. } => vec![*expr],
-        ExprKind::Constant(_) | ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+        ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
         other => panic!("fixture authors no control for {other:?}"),
     };
     let arguments = children

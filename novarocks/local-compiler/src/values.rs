@@ -71,7 +71,7 @@ fn cell<'a>(
         .ids
         .get(&id)
         .ok_or(FragmentCompileError::Invalid("Values cell was not lowered"))?;
-    if !matches!(source.kind, ExprKind::Literal(_) | ExprKind::Constant(_)) {
+    if !matches!(source.kind, ExprKind::Constant(_)) {
         // The compiled evaluator runs it once, over an empty port, with the
         // same value, NULL and row-error effects as any other root.
         return Ok(Cell::Dynamic(local));

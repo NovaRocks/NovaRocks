@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 
 fn float_batch(program: &LocalProgram, values: &[Option<f64>]) -> RecordBatch {
     let schema = program.graph().nodes()[1].output_layout().schema().clone();
@@ -252,6 +253,7 @@ pub(super) fn inherited_round_fixture_with_target(
     allow: bool,
     target: DataType,
 ) -> (PureEngineFunctionCatalog, Arc<FragmentPackage>) {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let fid = FragmentId::new(214);
     let input_node = NodeId::new(41);
@@ -276,7 +278,10 @@ pub(super) fn inherited_round_fixture_with_target(
             .add_expression(
                 input_node,
                 ty.clone(),
-                ExprKind::Literal(LiteralValue::Null),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
             )
             .unwrap();
         builder
@@ -307,7 +312,10 @@ pub(super) fn inherited_round_fixture_with_target(
         .add_expression(
             output_node,
             digits_type.clone(),
-            ExprKind::Literal(LiteralValue::Int64(-1)),
+            checked_constants::kind(
+                &mut source_pools,
+                checked_constants::i64(&(digits_type.clone()), -1, options().constants),
+            ),
         )
         .unwrap();
     let mut authors = BTreeMap::new();
@@ -408,7 +416,7 @@ pub(super) fn inherited_round_fixture_with_target(
             ty: result_type,
         }]),
     };
-    let package = package(&functions, fragment, &authors, result, allow);
+    let package = package(&functions, fragment, &authors, result, allow, source_pools);
     (functions, package)
 }
 

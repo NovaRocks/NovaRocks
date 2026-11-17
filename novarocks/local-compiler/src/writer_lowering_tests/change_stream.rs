@@ -169,6 +169,7 @@ fn edge(
 }
 
 fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, FragmentPackage> {
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(ROUTER);
     let source = builder.reserve_node_id().unwrap();
     let source_type = ty(DataType::Int64, false);
@@ -185,7 +186,12 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
         .add_expression(
             source,
             source_type.clone(),
-            ExprKind::Literal(LiteralValue::Int64(17)),
+            crate::test_constants::i64(
+                &mut constants,
+                &source_type,
+                17,
+                options(1, None).constants,
+            ),
         )
         .unwrap();
     insert(
@@ -312,6 +318,9 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
         )
         .unwrap();
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([31; 16]).unwrap());
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(router).unwrap();
     let mut writer_fields = Vec::new();
     let mut edges = Vec::new();
@@ -586,7 +595,7 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             .collect(),
     })
     .unwrap();
-    let plan = plan.finish().unwrap();
+    let plan = plan.finish_observed(&FixtureControl).unwrap();
     let mut uses = BTreeMap::new();
     let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();

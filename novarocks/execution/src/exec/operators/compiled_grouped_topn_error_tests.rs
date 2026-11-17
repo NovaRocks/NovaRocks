@@ -59,8 +59,8 @@ fn text_fixture(keys: &[String], limit: usize) -> Fixture {
         .iter()
         .map(|key| {
             vec![
-                LiteralValue::Utf8(key.clone().into()),
-                LiteralValue::Int64(1),
+                crate::exec::operators::family_fixture::constant_sources::utf8(key.clone().into()),
+                crate::exec::operators::family_fixture::constant_sources::i64(1),
             ]
         })
         .collect::<Vec<_>>();
@@ -112,7 +112,12 @@ fn compiled_grouped_topn_actual_key_buffer_keeps_stock_after_parent_array_drop()
 fn sum_fixture(rows: &[(i64, i64)]) -> Fixture {
     let rows = rows
         .iter()
-        .map(|&(key, value)| vec![LiteralValue::Int64(key), LiteralValue::Int64(value)])
+        .map(|&(key, value)| {
+            vec![
+                crate::exec::operators::family_fixture::constant_sources::i64(key),
+                crate::exec::operators::family_fixture::constant_sources::i64(value),
+            ]
+        })
         .collect::<Vec<_>>();
     fixture_with_keys(&[int64(true)], &rows, &[(0, true, true)], 1)
 }
@@ -408,16 +413,16 @@ fn compiled_grouped_topn_second_call_merge_data_survives_state_drop_and_keeps_fi
     // producers author both Binary payloads; no malformed state is injected.
     let rows = [
         vec![
-            LiteralValue::Int64(1),
-            LiteralValue::LargeInt(2),
-            LiteralValue::Int64(2),
-            LiteralValue::Int64(2),
+            crate::exec::operators::family_fixture::constant_sources::i64(1),
+            crate::exec::operators::family_fixture::constant_sources::largeint(2),
+            crate::exec::operators::family_fixture::constant_sources::i64(2),
+            crate::exec::operators::family_fixture::constant_sources::i64(2),
         ],
         vec![
-            LiteralValue::Int64(1),
-            LiteralValue::LargeInt(3),
-            LiteralValue::Int64(2),
-            LiteralValue::Int64(3),
+            crate::exec::operators::family_fixture::constant_sources::i64(1),
+            crate::exec::operators::family_fixture::constant_sources::largeint(3),
+            crate::exec::operators::family_fixture::constant_sources::i64(2),
+            crate::exec::operators::family_fixture::constant_sources::i64(3),
         ],
     ];
     let f =

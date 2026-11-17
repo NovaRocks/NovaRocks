@@ -45,11 +45,11 @@ use novarocks_local_compiler::{
 use novarocks_local_program::{KernelAbiVersion, LocalProgram, ProgramNodeKind};
 use novarocks_physical_plan::{
     Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprKind,
-    Fragment, FragmentBuilder, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
+    Fragment, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
     FrozenFragmentCalls, FrozenFragmentPruning, HashDefinition, HashPartitionScheme, NodeId,
     NullOrdering, PartitionCountDomain, PartitionCountParameter, PartitionCountParameterId,
     PartitionSpaceId, PhysicalExpressionRoots, PhysicalPlan, PhysicalRootUses, PipelineDopDomain,
-    PlanBuilder, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort,
+    PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort,
     RowMultiplicity, SortDirection, SortExpr, TopNPhase, TopNSequenceId, ValueId, ValueOrigin,
     extract_fragment_packages,
 };
@@ -219,7 +219,7 @@ fn assert_window(actual: &[Row], input: &[Row], keys: &[Key], limit: usize, offs
 }
 
 fn sort_exprs(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     columns: [ValueId; 2],
     keys: &[Key],
@@ -276,7 +276,7 @@ fn hash(key: ValueId) -> Distribution {
 
 /// Imports `(a, b)` of `edge` into `builder` as an ExchangeSource at `node`.
 fn receive(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     edge: EdgeId,
     sources: [ValueId; 2],
@@ -341,7 +341,12 @@ fn edge(
 /// `Values(a, b) -> Stream(Hash[b])` | `ExchangeSource -> Partial TopN ->
 /// Stream(Gather)` | `ExchangeSource -> Final TopN -> Result`.
 fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
-    let mut source = FragmentBuilder::new(SOURCE);
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut source = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        SOURCE,
+        &fixture_sources,
+    );
     let values_node = source.reserve_node_id().unwrap();
     let rows = ROWS
         .iter()
@@ -363,7 +368,11 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         )
         .unwrap();
 
-    let mut partial = FragmentBuilder::new(PARTIAL);
+    let mut partial =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            PARTIAL,
+            &fixture_sources,
+        );
     let partial_receiver = partial.reserve_node_id().unwrap();
     let partial_columns = receive(&mut partial, partial_receiver, HASH_EDGE, columns, |c| {
         hash(c[1])
@@ -390,7 +399,10 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         )
         .unwrap();
 
-    let mut last = FragmentBuilder::new(FINAL);
+    let mut last = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        FINAL,
+        &fixture_sources,
+    );
     let final_receiver = last.reserve_node_id().unwrap();
     let final_columns = receive(
         &mut last,
@@ -420,7 +432,10 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         .unwrap();
     let output = last.nodes()[&final_topn].output.clone();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([83; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([83; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(source).unwrap();
     plan.add_fragment(partial).unwrap();
     plan.add_fragment(last).unwrap();
@@ -463,7 +478,7 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         ]),
     })
     .unwrap();
-    plan.finish()
+    plan.finish_observed(&crate::exec::operators::family_fixture::constant_sources::control())
         .unwrap_or_else(|error| panic!("the split TopN plan validates: {error:?}"))
 }
 

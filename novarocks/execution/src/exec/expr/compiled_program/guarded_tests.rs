@@ -18,6 +18,7 @@
 // Full checked compiler fixtures use actual builtin owners. They do not thaw
 // ExprArena or claim Server catalogue, host allocation, or native integration.
 use super::CompiledExpressionInstance;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::{
     array::{Array, BooleanArray, Decimal128Array, Float64Array, Int64Array},
     datatypes::DataType,
@@ -41,9 +42,9 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
     FragmentPackage, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPhysicalCall, LiteralValue, NodeId, PhysicalCallSite,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts,
-    ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
+    FrozenFragmentPruning, FrozenPhysicalCall, NodeId, PhysicalCallSite, PhysicalExpressionRoots,
+    PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
+    ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
@@ -181,13 +182,11 @@ impl Author {
 fn original_request_sources(
     fragment: Fragment,
     authors: &BTreeMap<ExprId, Author>,
+    mut pools: novarocks_physical_plan::ConstantPools,
 ) -> (Fragment, novarocks_physical_plan::ConstantPools) {
     use novarocks_physical_plan::{
-        ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallDefinition,
-        PhysicalCallRequest, StaticFunctionArgument,
+        PhysicalCallDefinition, PhysicalCallRequest, StaticFunctionArgument,
     };
-    let mut pools = ConstantPools::empty();
-    let mut backing_ids = BTreeMap::new();
     let mut entries = vec![];
     for (&definition, owner) in authors {
         let original = owner.request();
@@ -200,17 +199,7 @@ fn original_request_sources(
                     constant,
                 } => {
                     let constant = constant.as_ref().map(|value| {
-                        let identity = value.pool().backing_identity();
-                        let pool = *backing_ids.entry(identity).or_insert_with(|| {
-                            let id =
-                                ConstantPoolId::new(u32::try_from(pools.entries().len()).unwrap());
-                            pools.insert(id, value.pool().clone()).unwrap();
-                            id
-                        });
-                        ConstantReference {
-                            pool,
-                            ordinal: value.ordinal(),
-                        }
+                        crate::exec::expr::test_support::register_constant(&mut pools, value)
                     });
                     StaticFunctionArgument::Value {
                         value_type: value_type.clone(),
@@ -428,9 +417,7 @@ impl FlowAuthor {
                         )
                     })
             }
-            ExprKind::Value(_) | ExprKind::Literal(_) | ExprKind::Constant(_) => {
-                (ControlShape::Eager, &[][..])
-            }
+            ExprKind::Value(_) | ExprKind::Constant(_) => (ControlShape::Eager, &[][..]),
             ExprKind::Binary { left, right, .. } => {
                 case_args.extend([*left, *right]);
                 (ControlShape::Eager, case_args.as_slice())
@@ -501,6 +488,7 @@ impl FlowAuthor {
 }
 
 fn program(shape: Shape) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(shape);
     let fragment_id = FragmentId::new(193);
     let source = NodeId::new(u32::MAX);
@@ -532,7 +520,14 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         // Checked typed NULL source definitions establish the actual input
         // layout; evaluation receives the complete matching Arrow input port.
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -575,7 +570,10 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             .add_expression(
                 output,
                 floating.clone(),
-                ExprKind::Literal(LiteralValue::Null),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(floating.clone()), options().constants),
+                ),
             )
             .unwrap();
         let conditional = call(
@@ -597,7 +595,10 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             .add_expression(
                 output,
                 scalar_integer.clone(),
-                ExprKind::Literal(LiteralValue::Int64(42)),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::i64(&(scalar_integer.clone()), 42, options().constants),
+                ),
             )
             .unwrap();
         let from_constant = call(
@@ -633,7 +634,10 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             .add_expression(
                 output,
                 scalar_integer.clone(),
-                ExprKind::Literal(LiteralValue::Int64(-1)),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::i64(&(scalar_integer.clone()), -1, options().constants),
+                ),
             )
             .unwrap();
         let rounded = call(
@@ -722,7 +726,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             ty: result_type,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
 }
 
 fn compile_checked_fragment(
@@ -730,6 +734,7 @@ fn compile_checked_fragment(
     fragment: Fragment,
     authors: &BTreeMap<ExprId, Author>,
     result: ResultPort,
+    source_pools: novarocks_physical_plan::ConstantPools,
 ) -> Arc<LocalProgram> {
     compile_checked_fragment_with_parameters(
         functions,
@@ -737,6 +742,7 @@ fn compile_checked_fragment(
         authors,
         result,
         SemanticParameters::try_new([]).unwrap(),
+        source_pools,
     )
 }
 pub(crate) fn compile_checked_fragment_with_parameters(
@@ -745,8 +751,9 @@ pub(crate) fn compile_checked_fragment_with_parameters(
     authors: &BTreeMap<ExprId, Author>,
     result: ResultPort,
     parameters: SemanticParameters,
+    source_pools: novarocks_physical_plan::ConstantPools,
 ) -> Arc<LocalProgram> {
-    let (fragment, constants) = original_request_sources(fragment, authors);
+    let (fragment, constants) = original_request_sources(fragment, authors, source_pools);
     let fragment_id = fragment.id();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
     let mut flow_author = FlowAuthor::new();

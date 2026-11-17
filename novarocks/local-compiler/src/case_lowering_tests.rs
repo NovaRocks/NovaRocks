@@ -31,7 +31,7 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
     FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning,
-    FrozenPhysicalCall, LiteralValue, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
+    FrozenPhysicalCall, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
     PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
     RootUseBindingError, ValidationErrors, ValueOrigin,
 };
@@ -145,12 +145,12 @@ impl Author {
 fn original_request_sources(
     fragment: Fragment,
     authors: &BTreeMap<ExprId, Author>,
+    mut pools: novarocks_physical_plan::ConstantPools,
 ) -> (Fragment, novarocks_physical_plan::ConstantPools) {
     use novarocks_physical_plan::{
-        ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallDefinition,
-        PhysicalCallRequest, StaticFunctionArgument,
+        ConstantPoolId, ConstantReference, PhysicalCallDefinition, PhysicalCallRequest,
+        StaticFunctionArgument,
     };
-    let mut pools = ConstantPools::empty();
     let mut backing_ids = BTreeMap::new();
     let mut entries = vec![];
     for (&definition, owner) in authors {
@@ -311,6 +311,7 @@ enum Effects {
     Decimal,
 }
 struct Fixture {
+    constants: novarocks_physical_plan::ConstantPools,
     fragment: Fragment,
     authors: BTreeMap<ExprId, Author>,
     case: ExprId,
@@ -318,13 +319,14 @@ struct Fixture {
 }
 fn add_input(
     builder: &mut FragmentBuilder,
+    constants: &mut novarocks_physical_plan::ConstantPools,
     ty: FunctionValueType,
 ) -> (ExprId, novarocks_physical_plan::ValueId) {
     let expr = builder
         .add_expression(
             NodeId::new(44),
             ty.clone(),
-            ExprKind::Literal(LiteralValue::Null),
+            crate::test_constants::null(constants, &ty, options().constants),
         )
         .unwrap();
     let value = builder
@@ -338,10 +340,8 @@ fn add_input(
         .unwrap();
     (expr, value)
 }
-fn literal(builder: &mut FragmentBuilder, ty: FunctionValueType, value: LiteralValue) -> ExprId {
-    builder
-        .add_expression(NodeId::new(0), ty, ExprKind::Literal(value))
-        .unwrap()
+fn literal(builder: &mut FragmentBuilder, ty: FunctionValueType, value: ExprKind) -> ExprId {
+    builder.add_expression(NodeId::new(0), ty, value).unwrap()
 }
 fn fixture(
     functions: &PureEngineFunctionCatalog,
@@ -351,6 +351,7 @@ fn fixture(
     effects: Effects,
     narrow_no_else: bool,
 ) -> Result<Fixture, ValidationErrors> {
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(FragmentId::new(97));
     builder
         .add_values(
@@ -362,7 +363,7 @@ fn fixture(
     let boolean = FunctionValueType::new(DataType::Boolean, true);
     let fixed_boolean = FunctionValueType::new(DataType::Boolean, false);
     let mut inputs = vec![];
-    let (flag, flag_value) = add_input(&mut builder, boolean.clone());
+    let (flag, flag_value) = add_input(&mut builder, &mut constants, boolean.clone());
     inputs.push((flag, flag_value));
     let operand_type = match form {
         Form::Searched => None,
@@ -377,13 +378,13 @@ fn fixture(
         ),
     };
     let operand_value = operand_type.as_ref().map(|ty| {
-        let input = add_input(&mut builder, ty.clone());
+        let input = add_input(&mut builder, &mut constants, ty.clone());
         inputs.push(input);
         input.1
     });
     let decimal = FunctionValueType::new(DataType::Decimal128(38, 0), true);
     let decimal_value = if matches!(effects, Effects::Decimal) {
-        let input = add_input(&mut builder, decimal.clone());
+        let input = add_input(&mut builder, &mut constants, decimal.clone());
         inputs.push(input);
         Some(input.1)
     } else {
@@ -419,9 +420,15 @@ fn fixture(
             )
             .unwrap();
         let values = if matches!(form, Form::SimpleInteger) {
-            [LiteralValue::Int64(7), LiteralValue::Int64(9)]
+            [
+                crate::test_constants::i64(&mut constants, &ty, 7, options().constants),
+                crate::test_constants::i64(&mut constants, &ty, 9, options().constants),
+            ]
         } else {
-            [LiteralValue::Null, LiteralValue::Null]
+            [
+                crate::test_constants::null(&mut constants, &ty, options().constants),
+                crate::test_constants::null(&mut constants, &ty, options().constants),
+            ]
         };
         // The flag is a real source output; avoid authoring an unreferenced root definition.
         (
@@ -438,8 +445,13 @@ fn fixture(
                 flag_reference.unwrap(),
                 literal(
                     &mut builder,
-                    fixed_boolean.clone(),
-                    LiteralValue::Boolean(false),
+                    (fixed_boolean.clone()).clone(),
+                    crate::test_constants::boolean(
+                        &mut constants,
+                        &(fixed_boolean.clone()),
+                        false,
+                        options().constants,
+                    ),
                 ),
             ],
         )
@@ -449,19 +461,34 @@ fn fixture(
         Effects::Pure => {
             let first = literal(
                 &mut builder,
-                fixed_boolean.clone(),
-                LiteralValue::Boolean(true),
+                (fixed_boolean.clone()).clone(),
+                crate::test_constants::boolean(
+                    &mut constants,
+                    &(fixed_boolean.clone()),
+                    true,
+                    options().constants,
+                ),
             );
             let second = literal(
                 &mut builder,
-                fixed_boolean.clone(),
-                LiteralValue::Boolean(false),
+                (fixed_boolean.clone()).clone(),
+                crate::test_constants::boolean(
+                    &mut constants,
+                    &(fixed_boolean.clone()),
+                    false,
+                    options().constants,
+                ),
             );
             let otherwise = has_else.then(|| {
                 literal(
                     &mut builder,
-                    fixed_boolean.clone(),
-                    LiteralValue::Boolean(true),
+                    (fixed_boolean.clone()).clone(),
+                    crate::test_constants::boolean(
+                        &mut constants,
+                        &(fixed_boolean.clone()),
+                        true,
+                        options().constants,
+                    ),
                 )
             });
             (
@@ -487,8 +514,13 @@ fn fixture(
             let otherwise = has_else.then(|| {
                 literal(
                     &mut builder,
-                    ty.clone(),
-                    LiteralValue::Float64Bits(0f64.to_bits()),
+                    (ty.clone()).clone(),
+                    crate::test_constants::f64_bits(
+                        &mut constants,
+                        &(ty.clone()),
+                        0f64.to_bits(),
+                        options().constants,
+                    ),
                 )
             });
             ([first, second], otherwise, ty)
@@ -502,7 +534,16 @@ fn fixture(
                 )
                 .unwrap();
             let integer = FunctionValueType::new(DataType::Int64, false);
-            let digits = literal(&mut builder, integer.clone(), LiteralValue::Int64(-1));
+            let digits = literal(
+                &mut builder,
+                (integer.clone()).clone(),
+                crate::test_constants::i64(
+                    &mut constants,
+                    &(integer.clone()),
+                    -1,
+                    options().constants,
+                ),
+            );
             let round = author(
                 functions,
                 "round",
@@ -514,8 +555,17 @@ fn fixture(
             );
             let result_type = round.result();
             let rounded = call(&mut builder, &mut authors, round, vec![value, digits]);
-            let otherwise =
-                has_else.then(|| literal(&mut builder, result_type.clone(), LiteralValue::Null));
+            let otherwise = has_else.then(|| {
+                literal(
+                    &mut builder,
+                    (result_type.clone()).clone(),
+                    crate::test_constants::null(
+                        &mut constants,
+                        &(result_type.clone()),
+                        options().constants,
+                    ),
+                )
+            });
             ([rounded, rounded], otherwise, result_type)
         }
     };
@@ -597,6 +647,7 @@ fn fixture(
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     Ok(Fixture {
+        constants,
         fragment,
         authors,
         case,
@@ -657,7 +708,7 @@ fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<PhysicalRootUses, FlowErr
                     ExprKind::FunctionCall { args, .. } => {
                         (fixture.authors[&expr].shape, args.to_vec())
                     }
-                    ExprKind::Value(_) | ExprKind::Literal(_) => (ControlShape::Eager, vec![]),
+                    ExprKind::Value(_) | ExprKind::Constant(_) => (ControlShape::Eager, vec![]),
                     other => panic!("no exact fixture control for {other:?}"),
                 };
             if expr == fixture.case {
@@ -747,13 +798,15 @@ fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<PhysicalRootUses, FlowErr
 }
 fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<FragmentPackage> {
     let Fixture {
+        constants,
         fragment,
         authors,
         case,
         ordered,
     } = fixture;
-    let (fragment, constants) = original_request_sources(fragment, &authors);
+    let (fragment, constants) = original_request_sources(fragment, &authors, constants);
     let fixture = Fixture {
+        constants: constants.clone(),
         fragment,
         authors,
         case,

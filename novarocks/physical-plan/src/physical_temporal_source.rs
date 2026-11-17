@@ -254,11 +254,6 @@ pub fn regexp_count_pattern_source_observed(
             "regexp_count pattern definition is absent",
         ))?;
     work.step()?;
-    if matches!(pattern.kind, ExprKind::Literal(_)) {
-        return Err(TemporalSourceProjectionError::Invalid(
-            "regexp_count requires checked native-v1 source; unchecked Literal is not emitted",
-        ));
-    }
     novarocks_type_contract::RegexpCountPatternSource::from_native_v1_emitted_shape(
         &pattern.ty,
         native_v1_emitted_constant_reference(&pattern.kind).is_some(),
@@ -283,11 +278,6 @@ pub fn to_base64_byte_source_observed(
             "to_base64 source definition is absent",
         ))?;
     work.step()?;
-    if matches!(child.kind, ExprKind::Literal(_)) {
-        return Err(TemporalSourceProjectionError::Invalid(
-            "to_base64 requires checked native-v1 source; unchecked Literal is not emitted",
-        ));
-    }
     if child.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
         || *child.ty.data_type() != DataType::Utf8
     {

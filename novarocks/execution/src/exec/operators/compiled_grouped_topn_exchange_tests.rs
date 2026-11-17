@@ -81,7 +81,7 @@ fn sequence(ordinal: usize) -> AggregateSequenceId {
 /// predecessor's state and creates fresh Intermediate identities; all calls
 /// keep their original logical binding/sequence. No computation lives here.
 fn grouped_stage(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     input: NodeId,
     columns: &[ValueId],
     bounds: &[Bound],
@@ -162,7 +162,7 @@ fn grouped_stage(
     (node, output)
 }
 fn final_stage(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     input: NodeId,
     columns: &[ValueId],
     bounds: &[Bound],
@@ -238,6 +238,8 @@ fn plan(
     staged: bool,
     limit: usize,
 ) -> (PhysicalPlan, novarocks_functions::PureEngineFunctionCatalog) {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let catalog = aggregate_catalog(&[
         ("count", PureKernelAbi::AggregateWindowV1),
         ("sum", PureKernelAbi::AggregateWindowV1),
@@ -250,7 +252,10 @@ fn plan(
         bind(&catalog, "min", &[int64(true)]),
         bind(&catalog, "max", &[int64(true)]),
     ];
-    let mut source = FragmentBuilder::new(SOURCE);
+    let mut source = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        SOURCE,
+        &fixture_sources,
+    );
     let leaf = source.reserve_node_id().unwrap();
     let columns = values(
         &mut source,
@@ -262,7 +267,10 @@ fn plan(
             .collect::<Vec<_>>(),
     );
     let source = finish(source, leaf, FragmentSink::Stream { edge: TO_INNER }, 1);
-    let mut inner = FragmentBuilder::new(INNER);
+    let mut inner = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        INNER,
+        &fixture_sources,
+    );
     let receive_inner = inner.reserve_node_id().unwrap();
     let imports = receive(
         &mut inner,
@@ -302,7 +310,10 @@ fn plan(
         AggregateGrouping::Partial,
     );
     let (first, first_output) = grouped_stage(&mut inner, partial, &states, &bounds, limit, 20);
-    let mut result = PlanBuilder::new(PlanVersionId::try_new([123; 16]).unwrap());
+    let mut result = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([123; 16]).unwrap(),
+        &fixture_sources,
+    );
     result.add_fragment(source).unwrap();
     if staged {
         result
@@ -313,7 +324,11 @@ fn plan(
                 2,
             ))
             .unwrap();
-        let mut outer = FragmentBuilder::new(OUTER);
+        let mut outer =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                OUTER,
+                &fixture_sources,
+            );
         let receive_outer = outer.reserve_node_id().unwrap();
         let mut sent = vec![(first_output[0], int64(true))];
         sent.extend(

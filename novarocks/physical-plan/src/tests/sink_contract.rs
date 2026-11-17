@@ -41,21 +41,23 @@ fn add_router_summary(builder: &mut FragmentBuilder, edge: EdgeId) -> crate::Sum
     summary
 }
 
-fn literal_root() -> (FragmentBuilder, NodeId, ValueId, ValueId) {
+fn literal_root(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (FragmentBuilder, NodeId, ValueId, ValueId) {
     let mut builder = FragmentBuilder::new(FragmentId::new(721));
     let node = builder.reserve_node_id().unwrap();
     let effect_expression = builder
         .add_expression(
             node,
-            ty(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Int64(1)),
+            (ty(DataType::Int64, false)).clone(),
+            fixture_constants.i64(1, &(ty(DataType::Int64, false))),
         )
         .unwrap();
     let input_expression = builder
         .add_expression(
             node,
-            ty(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Int64(2)),
+            (ty(DataType::Int64, false)).clone(),
+            fixture_constants.i64(2, &(ty(DataType::Int64, false))),
         )
         .unwrap();
     let effect = builder
@@ -94,8 +96,10 @@ fn literal_root() -> (FragmentBuilder, NodeId, ValueId, ValueId) {
     (builder, node, effect, input)
 }
 
-fn change_event_root() -> (FragmentBuilder, NodeId, ValueId, ValueId) {
-    change_event_root_with_assignment(AssignmentShape::Valid)
+fn change_event_root(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (FragmentBuilder, NodeId, ValueId, ValueId) {
+    change_event_root_with_assignment(AssignmentShape::Valid, fixture_constants)
 }
 
 #[derive(Clone, Copy)]
@@ -108,8 +112,9 @@ enum AssignmentShape {
 
 fn change_event_root_with_assignment(
     shape: AssignmentShape,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> (FragmentBuilder, NodeId, ValueId, ValueId) {
-    let (mut builder, source, _, source_value) = literal_root();
+    let (mut builder, source, _, source_value) = literal_root(fixture_constants);
     let node = builder.reserve_node_id().unwrap();
     let assignment = builder
         .add_expression(
@@ -178,7 +183,9 @@ fn change_event_root_with_assignment(
 
 #[test]
 fn change_event_assignments_reject_the_generated_effect_output() {
-    let (builder, root, _, _) = change_event_root_with_assignment(AssignmentShape::EffectTarget);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (builder, root, _, _) =
+        change_event_root_with_assignment(AssignmentShape::EffectTarget, &mut fixture_constants);
     let errors = builder
         .finish_definition(
             root,
@@ -196,7 +203,9 @@ fn change_event_assignments_reject_the_generated_effect_output() {
 
 #[test]
 fn change_event_assignments_reject_outputs_absent_from_the_node_port() {
-    let (builder, root, _, _) = change_event_root_with_assignment(AssignmentShape::OffPortTarget);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (builder, root, _, _) =
+        change_event_root_with_assignment(AssignmentShape::OffPortTarget, &mut fixture_constants);
     let errors = builder
         .finish_definition(
             root,
@@ -214,7 +223,9 @@ fn change_event_assignments_reject_outputs_absent_from_the_node_port() {
 
 #[test]
 fn change_event_assignments_reject_duplicate_outputs() {
-    let (builder, root, _, _) = change_event_root_with_assignment(AssignmentShape::DuplicateTarget);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (builder, root, _, _) =
+        change_event_root_with_assignment(AssignmentShape::DuplicateTarget, &mut fixture_constants);
     let errors = builder
         .finish_definition(
             root,
@@ -262,17 +273,20 @@ pub(super) enum RouterWriterShape {
 
 pub(super) fn finish_router_writer_plan(
     shape: RouterWriterShape,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<PhysicalPlan, ValidationErrors> {
-    finish_router_writer_fixture(shape).1
+    finish_router_writer_fixture(shape, fixture_constants).1
 }
 
 fn finish_router_writer_fixture(
     shape: RouterWriterShape,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> (Fragment, Result<PhysicalPlan, ValidationErrors>) {
     let edge = EdgeId::new(901);
     let finish_edge = EdgeId::new(904);
     let summary_edge = EdgeId::new(906);
-    let (mut source_builder, source_root, effect, source_value) = change_event_root();
+    let (mut source_builder, source_root, effect, source_value) =
+        change_event_root(fixture_constants);
     let source_summary = add_router_summary(&mut source_builder, summary_edge);
     let route_token = ConnectorWriteFieldToken::from_bytes([3; 32]);
     let affinity = matches!(shape, RouterWriterShape::PartitionAffinity);
@@ -1160,7 +1174,10 @@ fn finish_router_writer_fixture(
     if let Some(edge) = union_writer_edge {
         plan.add_edge(edge).unwrap();
     }
-    (finish_fragment, plan.finish())
+    (
+        finish_fragment,
+        crate::tests::constant_fixture::publish_plan(plan, fixture_constants),
+    )
 }
 
 fn append_write_layout_key(
@@ -1230,7 +1247,10 @@ fn affinity_partitioning(source: ValueId, destination: ValueId) -> EdgePartition
 
 #[test]
 fn router_affinity_is_transport_only_and_does_not_satisfy_by_key() {
-    let plan = finish_router_writer_plan(RouterWriterShape::PartitionAffinity).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan =
+        finish_router_writer_plan(RouterWriterShape::PartitionAffinity, &mut fixture_constants)
+            .unwrap();
     let source = plan.fragments().get(&FragmentId::new(721)).unwrap();
     let cuts = crate::fragment_cuts(&plan, source.id()).unwrap();
     let cut = cuts
@@ -1259,7 +1279,10 @@ fn router_affinity_is_transport_only_and_does_not_satisfy_by_key() {
 
 #[test]
 fn stream_affinity_rejects_layout_key_leakage_and_nested_layout() {
-    let plan = finish_router_writer_plan(RouterWriterShape::PartitionAffinity).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan =
+        finish_router_writer_plan(RouterWriterShape::PartitionAffinity, &mut fixture_constants)
+            .unwrap();
     let writer = plan.fragments().get(&FragmentId::new(722)).unwrap();
     let mut cuts = crate::fragment_cuts(&plan, writer.id()).unwrap();
     let cut = &mut cuts.inbound[0];
@@ -1317,20 +1340,26 @@ fn stream_affinity_rejects_layout_key_leakage_and_nested_layout() {
 
 #[test]
 fn router_edge_closes_its_exact_destination_writer_contract() {
-    finish_router_writer_plan(RouterWriterShape::Valid)
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    finish_router_writer_plan(RouterWriterShape::Valid, &mut fixture_constants)
         .expect("the exact route, edge and writer contract must validate");
 }
 
 #[test]
 fn writer_union_preserves_each_finish_field_occurrence() {
-    finish_router_writer_plan(RouterWriterShape::UnionValid)
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    finish_router_writer_plan(RouterWriterShape::UnionValid, &mut fixture_constants)
         .expect("UnionAll may merge exact writer relation occurrences");
 }
 
 #[test]
 fn writer_union_rejects_same_typed_auxiliary_field_swaps() {
-    let errors = finish_router_writer_plan(RouterWriterShape::UnionAuxiliarySwap)
-        .expect_err("UnionAll cannot swap same-typed writer field roles");
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let errors = finish_router_writer_plan(
+        RouterWriterShape::UnionAuxiliarySwap,
+        &mut fixture_constants,
+    )
+    .expect_err("UnionAll cannot swap same-typed writer field roles");
     assert!(
         errors.errors().iter().any(|error| {
             error
@@ -1343,12 +1372,17 @@ fn writer_union_rejects_same_typed_auxiliary_field_swaps() {
 
 #[test]
 fn independent_finish_rechecks_writer_union_field_occurrences() {
-    let valid = finish_router_writer_plan(RouterWriterShape::UnionValid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let valid =
+        finish_router_writer_plan(RouterWriterShape::UnionValid, &mut fixture_constants).unwrap();
     let valid_finish = valid.fragments().get(&FragmentId::new(723)).unwrap();
     let cuts = fragment_cuts(&valid, valid_finish.id()).unwrap();
     validate_fragment(valid_finish, &cuts).expect("exact UnionAll writer lineage must validate");
 
-    let (swapped_finish, _) = finish_router_writer_fixture(RouterWriterShape::UnionAuxiliarySwap);
+    let (swapped_finish, _) = finish_router_writer_fixture(
+        RouterWriterShape::UnionAuxiliarySwap,
+        &mut fixture_constants,
+    );
     let errors = validate_fragment(&swapped_finish, &cuts)
         .expect_err("independent validation must reject a same-typed field swap");
     assert!(errors.errors().iter().any(|error| {
@@ -1360,7 +1394,8 @@ fn independent_finish_rechecks_writer_union_field_occurrences() {
 
 #[test]
 fn router_edge_rejects_a_destination_writer_ordinal_drift() {
-    let errors = finish_router_writer_plan(RouterWriterShape::OrdinalDrift)
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let errors = finish_router_writer_plan(RouterWriterShape::OrdinalDrift, &mut fixture_constants)
         .expect_err("a route cannot select another writer target ordinal");
     assert!(errors.errors().iter().any(|error| {
         error
@@ -1371,7 +1406,8 @@ fn router_edge_rejects_a_destination_writer_ordinal_drift() {
 
 #[test]
 fn router_edge_rejects_a_destination_writer_field_token_drift() {
-    let errors = finish_router_writer_plan(RouterWriterShape::TokenDrift)
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let errors = finish_router_writer_plan(RouterWriterShape::TokenDrift, &mut fixture_constants)
         .expect_err("a route field token must reach the same destination writer field");
     assert!(errors.errors().iter().any(|error| {
         error
@@ -1382,8 +1418,10 @@ fn router_edge_rejects_a_destination_writer_field_token_drift() {
 
 #[test]
 fn router_edge_rejects_partition_authority_drift() {
-    let errors = finish_router_writer_plan(RouterWriterShape::PartitionDrift)
-        .expect_err("an empty route partition must freeze one singleton edge");
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let errors =
+        finish_router_writer_plan(RouterWriterShape::PartitionDrift, &mut fixture_constants)
+            .expect_err("an empty route partition must freeze one singleton edge");
     assert!(errors.errors().iter().any(|error| {
         error
             .message()
@@ -1393,7 +1431,8 @@ fn router_edge_rejects_partition_authority_drift() {
 
 #[test]
 fn independent_router_source_rejects_a_drifted_destination_writer_proof() {
-    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid, &mut fixture_constants).unwrap();
     let source = plan.fragments().get(&FragmentId::new(721)).unwrap();
     let mut cuts = fragment_cuts(&plan, source.id()).unwrap();
     let crate::ExchangePayloadContract::ProviderRoute(proof) = &mut cuts.outbound[0].payload else {
@@ -1411,7 +1450,8 @@ fn independent_router_source_rejects_a_drifted_destination_writer_proof() {
 
 #[test]
 fn position_contribution_cannot_replace_a_direct_router_writer_proof() {
-    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid, &mut fixture_constants).unwrap();
     let writer = plan.fragments().get(&FragmentId::new(722)).unwrap();
     let mut cuts = fragment_cuts(&plan, writer.id()).unwrap();
     let crate::ExchangePayloadContract::ProviderRoute(route) = &cuts.inbound[0].payload else {
@@ -1434,7 +1474,8 @@ fn position_contribution_cannot_replace_a_direct_router_writer_proof() {
 
 #[test]
 fn position_shard_cut_requires_a_stream_and_exact_writer_input() {
-    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid, &mut fixture_constants).unwrap();
     let writer = plan.fragments().get(&FragmentId::new(722)).unwrap();
     let mut cuts = fragment_cuts(&plan, writer.id()).unwrap();
     cuts.inbound[0].payload = crate::ExchangePayloadContract::PositionShards {
@@ -1454,7 +1495,8 @@ fn position_shard_cut_requires_a_stream_and_exact_writer_input() {
 
 #[test]
 fn independent_router_writer_rejects_a_drifted_source_route_proof() {
-    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid, &mut fixture_constants).unwrap();
     let writer = plan.fragments().get(&FragmentId::new(722)).unwrap();
     let mut cuts = fragment_cuts(&plan, writer.id()).unwrap();
     let crate::ExchangePayloadContract::ProviderRoute(proof) = &mut cuts.inbound[0].payload else {
@@ -1472,7 +1514,8 @@ fn independent_router_writer_rejects_a_drifted_source_route_proof() {
 
 #[test]
 fn independent_writer_rejects_a_drifted_writer_result_proof() {
-    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid, &mut fixture_constants).unwrap();
     let writer = plan.fragments().get(&FragmentId::new(722)).unwrap();
     let mut cuts = fragment_cuts(&plan, writer.id()).unwrap();
     let crate::ExchangePayloadContract::WriterResults(proof) = &mut cuts.outbound[0].payload else {
@@ -1490,7 +1533,8 @@ fn independent_writer_rejects_a_drifted_writer_result_proof() {
 
 #[test]
 fn independent_finish_rejects_a_drifted_writer_result_proof() {
-    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid, &mut fixture_constants).unwrap();
     let finish = plan.fragments().get(&FragmentId::new(723)).unwrap();
     let mut cuts = fragment_cuts(&plan, finish.id()).unwrap();
     let crate::ExchangePayloadContract::WriterResults(proof) = &mut cuts.inbound[0].payload else {
@@ -1508,8 +1552,9 @@ fn independent_finish_rejects_a_drifted_writer_result_proof() {
 
 #[test]
 fn router_data_inputs_exclude_the_generated_effect_value() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let edge = EdgeId::new(902);
-    let (mut builder, root, effect, _) = change_event_root();
+    let (mut builder, root, effect, _) = change_event_root(&mut fixture_constants);
     add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
         .finish_definition(
@@ -1536,8 +1581,9 @@ fn router_data_inputs_exclude_the_generated_effect_value() {
 
 #[test]
 fn router_allows_two_target_fields_to_read_one_value_identity() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let edge = EdgeId::new(903);
-    let (mut builder, root, effect, input) = change_event_root();
+    let (mut builder, root, effect, input) = change_event_root(&mut fixture_constants);
     add_router_summary(&mut builder, EdgeId::new(907));
     builder
         .finish_definition(
@@ -1567,7 +1613,8 @@ fn router_allows_two_target_fields_to_read_one_value_identity() {
 
 #[test]
 fn independent_fragment_rejects_duplicate_multicast_destinations() {
-    let (builder, root, _, _) = literal_root();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (builder, root, _, _) = literal_root(&mut fixture_constants);
     let errors = builder
         .finish_definition(
             root,
@@ -1587,7 +1634,8 @@ fn independent_fragment_rejects_duplicate_multicast_destinations() {
 
 #[test]
 fn independent_fragment_rejects_invalid_router_identity_and_layout() {
-    let (mut builder, root, _, input) = literal_root();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (mut builder, root, _, input) = literal_root(&mut fixture_constants);
     add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
         .finish_definition(
@@ -1644,7 +1692,8 @@ fn independent_fragment_rejects_invalid_router_identity_and_layout() {
 
 #[test]
 fn independent_fragment_rejects_duplicate_router_identity() {
-    let (mut builder, root, effect, input) = change_event_root();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (mut builder, root, effect, input) = change_event_root(&mut fixture_constants);
     add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
         .finish_definition(
@@ -1679,7 +1728,8 @@ fn independent_fragment_rejects_duplicate_router_identity() {
 
 #[test]
 fn independent_fragment_rejects_router_cut_projection_drift() {
-    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid, &mut fixture_constants).unwrap();
     let fragment = plan.fragments().get(&FragmentId::new(721)).unwrap();
     let FragmentSink::Router { effect, .. } = fragment.sink() else {
         panic!("expected router")
@@ -1719,12 +1769,13 @@ fn independent_fragment_rejects_router_cut_projection_drift() {
 
 #[test]
 fn logical_summary_origin_requires_nonnull_int64_and_its_exact_counter_role() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for (data_type, nullable) in [
         (DataType::Int64, true),
         (DataType::UInt64, false),
         (DataType::Float64, false),
     ] {
-        let (mut builder, root, effect, input) = change_event_root();
+        let (mut builder, root, effect, input) = change_event_root(&mut fixture_constants);
         let inserted = builder
             .add_value(
                 ty(data_type, nullable),
@@ -1788,6 +1839,7 @@ fn logical_summary_origin_requires_nonnull_int64_and_its_exact_counter_role() {
 
 #[test]
 fn placement_rejects_absent_scan_and_ambiguous_source_sets_before_scheduling() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let self_id = FragmentId::new(721);
     for policy in [
         crate::StagePlacementPolicy::ScanWork,
@@ -1801,7 +1853,7 @@ fn placement_rejects_absent_scan_and_ambiguous_source_sets_before_scheduling() {
             sources: Box::from([FragmentId::new(2), FragmentId::new(2)]),
         },
     ] {
-        let (builder, root, _, _) = literal_root();
+        let (builder, root, _, _) = literal_root(&mut fixture_constants);
         let errors = builder
             .finish_definition(root, FragmentSink::Noop, dop(), policy)
             .unwrap_err();
@@ -1816,7 +1868,8 @@ fn placement_rejects_absent_scan_and_ambiguous_source_sets_before_scheduling() {
 
 #[test]
 fn independently_validated_router_cannot_replace_or_downgrade_its_summary_cut() {
-    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid, &mut fixture_constants).unwrap();
     let source = plan.fragments().get(&FragmentId::new(721)).unwrap();
     let summary = source
         .summaries()
@@ -1897,13 +1950,14 @@ fn independently_validated_router_cannot_replace_or_downgrade_its_summary_cut() 
 
 #[test]
 fn summary_authors_are_closed_facts_and_kinds_cannot_borrow_a_router() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for (kind, node_author, router_sink) in [
         (crate::SummaryKind::WriteCounts, true, true),
         (crate::SummaryKind::DeleteVerification, true, true),
         (crate::SummaryKind::DeleteVerification, false, true),
         (crate::SummaryKind::WriteCounts, false, false),
     ] {
-        let (mut builder, root, effect, input) = change_event_root();
+        let (mut builder, root, effect, input) = change_event_root(&mut fixture_constants);
         let mut values = Vec::new();
         for &field in kind.fields() {
             let data_type = match field.wire_type() {
@@ -1959,7 +2013,8 @@ fn summary_authors_are_closed_facts_and_kinds_cannot_borrow_a_router() {
 
 #[test]
 fn a_fragment_cannot_declare_two_outputs_of_the_same_summary_kind() {
-    let (mut builder, root, effect, input) = change_event_root();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (mut builder, root, effect, input) = change_event_root(&mut fixture_constants);
     let summary = add_router_summary(&mut builder, EdgeId::new(907));
     builder.set_summaries(Box::new([
         summary,
@@ -1994,7 +2049,8 @@ fn a_fragment_cannot_declare_two_outputs_of_the_same_summary_kind() {
 
 #[test]
 fn writer_projected_values_have_one_exact_private_owner_and_type() {
-    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid, &mut fixture_constants).unwrap();
     let original = &plan.fragments()[&FragmentId::new(722)];
     let writer = original.root();
     for corruption in 0..5 {
@@ -2057,7 +2113,8 @@ fn writer_projected_values_have_one_exact_private_owner_and_type() {
 
 #[test]
 fn writer_projected_values_cannot_be_transported_by_an_edge() {
-    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid, &mut fixture_constants).unwrap();
     let writer_fragment = FragmentId::new(722);
     let fragment = &plan.fragments()[&writer_fragment];
     let NodeKind::TableWriter { target } = &fragment.nodes()[&fragment.root()].kind else {

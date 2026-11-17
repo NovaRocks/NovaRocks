@@ -421,7 +421,8 @@ fn all_derivation_child_first_shared_union_hash_join_uses_stronger_actual_candid
 
 #[test]
 fn all_derivation_values_anchor_effect_authority_and_foreign_proof_stay_exact() {
-    let mut fixture = scalar_fixture(2, 53);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 53, &mut fixture_constants);
     replace_properties(&mut fixture, |parts| {
         parts.nodes.get_mut(&parts.root).unwrap().output_properties = broadcast();
         let definitions = parts

@@ -19,7 +19,7 @@ use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use arrow_schema::{DataType, IntervalUnit, TimeUnit};
+use arrow_schema::DataType;
 use novarocks_type_contract::{
     arithmetic_result_value_type_with_op, is_integer_value_type, is_numeric_value_type,
 };
@@ -184,7 +184,6 @@ pub(crate) fn validate_expression(
                 format!("value {} is not defined", value.get()),
             )),
         },
-        ExprKind::Literal(literal) => validate_literal_type(literal, &expression.ty, &path, errors),
         // Exact table/address/value checks are mandatory at plan/package publication.
         ExprKind::Constant(_) => {}
         ExprKind::LambdaParameter { lambda, ordinal } => {
@@ -588,90 +587,6 @@ pub(crate) fn validate_expression(
     }
 }
 
-/// A literal's declared type.
-///
-/// The value itself is exact and never null, so the type only has to name it:
-/// declaring it where null is admitted widens it, which is sound, and is how
-/// an exact value stands in a position the statement types conservatively.
-/// Declaring the null literal as non-nullable is the narrowing, and is the
-/// one refused here.
-pub(crate) fn validate_literal_type(
-    literal: &crate::LiteralValue,
-    ty: &ValueType,
-    path: &str,
-    errors: &mut ValidationContext,
-) {
-    let valid = match literal {
-        crate::LiteralValue::Null => ty.nullable(),
-        crate::LiteralValue::Boolean(_) => *ty.data_type() == DataType::Boolean,
-        crate::LiteralValue::Int64(_) => *ty.data_type() == DataType::Int64,
-        crate::LiteralValue::UInt64(_) => *ty.data_type() == DataType::UInt64,
-        crate::LiteralValue::Float64Bits(_) => *ty.data_type() == DataType::Float64,
-        crate::LiteralValue::LargeInt(_) => {
-            novarocks_type_contract::is_largeint_data_type(ty.data_type())
-                && is_numeric_value_type(ty)
-        }
-        crate::LiteralValue::Decimal128(_) => {
-            matches!(ty.data_type(), DataType::Decimal128(_, _))
-        }
-        crate::LiteralValue::Decimal256(_) => {
-            matches!(ty.data_type(), DataType::Decimal256(_, _))
-        }
-        crate::LiteralValue::Utf8(_) => is_utf8(ty.data_type()),
-        crate::LiteralValue::Binary(_) => {
-            matches!(
-                ty.data_type(),
-                DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-            )
-        }
-        crate::LiteralValue::Date32(_) => *ty.data_type() == DataType::Date32,
-        crate::LiteralValue::Time64(_) => {
-            matches!(
-                ty.data_type(),
-                DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
-            )
-        }
-        crate::LiteralValue::Timestamp(_) => {
-            matches!(ty.data_type(), DataType::Timestamp(_, _))
-        }
-        crate::LiteralValue::IntervalMonthDayNano { .. } => {
-            *ty.data_type() == DataType::Interval(IntervalUnit::MonthDayNano)
-        }
-    };
-    if !valid {
-        // Which literal and which type: the two together are the whole
-        // diagnosis, and a plan has many literals.
-        errors.push(ValidationError::new(
-            path,
-            format!(
-                "literal {} differs from its declared type {:?}",
-                literal_kind_name(literal),
-                ty.data_type()
-            ),
-        ));
-    }
-}
-
-/// What a literal says it is, for a message that names it.
-const fn literal_kind_name(literal: &crate::LiteralValue) -> &'static str {
-    match literal {
-        crate::LiteralValue::Null => "NULL",
-        crate::LiteralValue::Boolean(_) => "boolean",
-        crate::LiteralValue::Int64(_) => "int64",
-        crate::LiteralValue::UInt64(_) => "uint64",
-        crate::LiteralValue::Float64Bits(_) => "float64",
-        crate::LiteralValue::LargeInt(_) => "largeint",
-        crate::LiteralValue::Decimal128(_) => "decimal128",
-        crate::LiteralValue::Decimal256(_) => "decimal256",
-        crate::LiteralValue::Utf8(_) => "utf8",
-        crate::LiteralValue::Binary(_) => "binary",
-        crate::LiteralValue::Date32(_) => "date32",
-        crate::LiteralValue::Time64(_) => "time64",
-        crate::LiteralValue::Timestamp(_) => "timestamp",
-        crate::LiteralValue::IntervalMonthDayNano { .. } => "interval",
-    }
-}
-
 pub(crate) fn expression_reference_scope_allowed(
     fragment: &Fragment,
     parent: &crate::ExprNode,
@@ -934,12 +849,6 @@ pub(crate) fn validate_window_frame(
         let Some(expression) = expression else {
             continue;
         };
-        if window_row_offset(fragment, expression) == Some(0) {
-            errors.push(ValidationError::new(
-                path,
-                "zero window-frame offset must be canonicalized to CURRENT ROW",
-            ));
-        }
         let valid = fragment
             .expressions()
             .get(expression)
@@ -961,25 +870,6 @@ pub(crate) fn validate_window_frame(
             "RANGE window offsets require typed order-key arithmetic not represented by contract revision 1",
         ));
     }
-    let offsets_are_ordered = match (&frame.start, &frame.end) {
-        (crate::WindowBound::Preceding(start), crate::WindowBound::Preceding(end)) => {
-            window_row_offset(fragment, *start)
-                .zip(window_row_offset(fragment, *end))
-                .is_none_or(|(start, end)| start >= end)
-        }
-        (crate::WindowBound::Following(start), crate::WindowBound::Following(end)) => {
-            window_row_offset(fragment, *start)
-                .zip(window_row_offset(fragment, *end))
-                .is_none_or(|(start, end)| start <= end)
-        }
-        _ => true,
-    };
-    if !offsets_are_ordered {
-        errors.push(ValidationError::new(
-            path,
-            "window frame start follows its end after comparing exact offsets",
-        ));
-    }
 }
 
 pub(crate) fn frame_has_offset(frame: &crate::WindowFrame) -> bool {
@@ -991,21 +881,11 @@ pub(crate) fn frame_has_offset(frame: &crate::WindowFrame) -> bool {
     })
 }
 
-pub(crate) fn window_bound_position(fragment: &Fragment, bound: &crate::WindowBound) -> u8 {
+pub(crate) fn window_bound_position(_fragment: &Fragment, bound: &crate::WindowBound) -> u8 {
     match bound {
         crate::WindowBound::UnboundedPreceding => 0,
-        crate::WindowBound::Preceding(expression)
-            if window_row_offset(fragment, *expression) == Some(0) =>
-        {
-            2
-        }
         crate::WindowBound::Preceding(_) => 1,
         crate::WindowBound::CurrentRow => 2,
-        crate::WindowBound::Following(expression)
-            if window_row_offset(fragment, *expression) == Some(0) =>
-        {
-            2
-        }
         crate::WindowBound::Following(_) => 3,
         crate::WindowBound::UnboundedFollowing => 4,
     }
@@ -1015,29 +895,13 @@ pub(crate) fn window_offset_literal_is_valid(
     kind: &ExprKind,
     units: crate::WindowFrameUnits,
 ) -> bool {
-    match (units, kind) {
+    matches!(
+        (units, kind),
         (
             crate::WindowFrameUnits::Rows | crate::WindowFrameUnits::Groups,
             ExprKind::Constant(_),
-        ) => true,
-        (
-            crate::WindowFrameUnits::Rows | crate::WindowFrameUnits::Groups,
-            ExprKind::Literal(crate::LiteralValue::UInt64(_)),
-        ) => true,
-        (
-            crate::WindowFrameUnits::Rows | crate::WindowFrameUnits::Groups,
-            ExprKind::Literal(crate::LiteralValue::Int64(value)),
-        ) => *value >= 0,
-        _ => false,
-    }
-}
-
-pub(crate) fn window_row_offset(fragment: &Fragment, expression: ExprId) -> Option<u64> {
-    match &fragment.expressions().get(expression)?.kind {
-        ExprKind::Literal(crate::LiteralValue::UInt64(value)) => Some(*value),
-        ExprKind::Literal(crate::LiteralValue::Int64(value)) => u64::try_from(*value).ok(),
-        _ => None,
-    }
+        )
+    )
 }
 
 pub(crate) fn require_boolean_result(ty: &ValueType, path: &str, errors: &mut ValidationContext) {
@@ -1422,6 +1286,7 @@ pub(crate) fn validate_expression_values_on_port(
 #[cfg(test)]
 mod value_arithmetic_tests {
     use super::*;
+    use crate::tests::constant_fixture::ConstantFixture;
     use crate::{
         BinaryOperator, FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, UnaryOperator,
     };
@@ -1449,7 +1314,7 @@ mod value_arithmetic_tests {
             owner: NodeId::new(0),
             lambda_scope: None,
             ty,
-            kind: ExprKind::Literal(crate::LiteralValue::Null),
+            kind: ExprKind::Value(crate::ValueId::new(id)),
         };
         let mut errors = ValidationContext::new();
         validate_binary_types(
@@ -1559,15 +1424,12 @@ mod value_arithmetic_tests {
         output: ValueType,
         op: UnaryOperator,
         nonliteral_null_child: bool,
-    ) -> Result<Fragment, ValidationErrors> {
+    ) -> Result<(Fragment, crate::ConstantPools), ValidationErrors> {
+        let mut constants = ConstantFixture::new();
         let mut builder = FragmentBuilder::new(FragmentId::new(0));
         let node = builder.reserve_node_id().unwrap();
         let mut child = builder
-            .add_expression(
-                node,
-                input.clone(),
-                ExprKind::Literal(crate::LiteralValue::Null),
-            )
+            .add_expression(node, input.clone(), constants.null(&input))
             .unwrap();
         if nonliteral_null_child {
             child = builder
@@ -1600,7 +1462,7 @@ mod value_arithmetic_tests {
                 vec![value].into_boxed_slice(),
             )
             .unwrap();
-        builder.finish_definition(
+        let fragment = builder.finish_definition(
             node,
             FragmentSink::Noop,
             PipelineDopDomain {
@@ -1609,7 +1471,8 @@ mod value_arithmetic_tests {
                 requires_power_of_two: false,
             },
             crate::StagePlacementPolicy::Singleton,
-        )
+        )?;
+        Ok((fragment, constants.into_pools()))
     }
 
     #[test]
@@ -1638,7 +1501,7 @@ mod value_arithmetic_tests {
             UnaryOperator::BitwiseNot,
         ] {
             let ty = ValueType::new(DataType::Null, true);
-            let fragment = unary_fragment(ty.clone(), ty.clone(), op, true).unwrap();
+            let (fragment, _constants) = unary_fragment(ty.clone(), ty.clone(), op, true).unwrap();
             assert_eq!(fragment.expressions().len(), 3);
             assert!(fragment.expressions().iter().all(|(_, expr)| expr.ty == ty));
         }

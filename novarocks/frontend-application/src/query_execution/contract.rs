@@ -616,8 +616,8 @@ mod tests {
     ) -> novarocks_query_application::preparation::FrozenExecutionDescription {
         use arrow::datatypes::DataType;
         use novarocks_physical_plan::{
-            ExprKind, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, PipelineDopDomain,
-            PlanBuilder, PlanVersionId, ValueOrigin, ValueType,
+            ExprKind, FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, PlanBuilder,
+            PlanVersionId, ValueOrigin, ValueType,
         };
         use novarocks_query_application::preparation::{
             CompletedPhysicalPlanCandidate, ExecutionResourceRequirements, FrozenCostEstimate,
@@ -630,8 +630,35 @@ mod tests {
         let mut fragment = FragmentBuilder::new(FragmentId::new(13));
         let node = fragment.reserve_node_id().unwrap();
         let ty = ValueType::new(DataType::Int64, false);
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        let policy = novarocks_functions::ConstantPolicy {
+            max_rows: 8,
+            max_array_nodes: 32,
+            max_logical_elements: 4096,
+            max_retained_buffer_bytes: 4 << 20,
+            max_type_depth: 16,
+            max_type_nodes: 64,
+            max_dictionary_depth: 4,
+            max_metadata_bytes: 65536,
+            max_library_validation_work: 64 << 20,
+            max_library_validation_bytes: 64 << 20,
+        };
+        let source = novarocks_functions::ConstantValue::from_i64(
+            std::sync::Arc::new(ty.try_to_field("fixture").unwrap()),
+            ty.clone(),
+            4,
+            policy,
+            novarocks_type_contract::CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let pool = novarocks_physical_plan::ConstantPoolId::new(0);
+        let reference = novarocks_physical_plan::ConstantReference {
+            pool,
+            ordinal: source.ordinal(),
+        };
         let literal = fragment
-            .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(4)))
+            .add_expression(node, ty.clone(), ExprKind::Constant(reference))
             .unwrap();
         let cast = fragment
             .add_expression(
@@ -680,9 +707,12 @@ mod tests {
                 )])
                 .unwrap(),
             );
+        builder
+            .insert_constant_pool(pool, source.pool().clone())
+            .unwrap();
         builder.add_fragment(fragment).unwrap();
         let candidate = CompletedPhysicalPlanCandidate::for_program(
-            builder.finish().unwrap(),
+            builder.finish_observed(&control).unwrap(),
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();

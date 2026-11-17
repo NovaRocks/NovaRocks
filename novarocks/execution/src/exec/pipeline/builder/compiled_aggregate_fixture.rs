@@ -49,15 +49,15 @@ use novarocks_local_program::{KernelAbiVersion, LocalProgram};
 use novarocks_physical_plan::{
     AggregateBinding, AggregateCall, AggregateCallId, AggregateGrouping, AggregatePhase,
     BoundFunction, Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning,
-    EdgeSource, ExprKind, ExpressionRootRole, ExpressionRootSite, Fragment, FragmentBuilder,
-    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink, FrozenCallError,
-    FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType,
-    HashDefinition, HashPartitionScheme, LiteralValue, NodeId, NodeKind, OutputPort,
-    PartitionCountDomain, PartitionCountParameter, PartitionCountParameterId, PartitionSpaceId,
-    PhysicalCallBinding, PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite,
-    PhysicalNode, PhysicalPlan, PhysicalProperties, PhysicalRootUses, PipelineDopDomain,
-    PlanLimits, PropertyProofProjectionLimits, RowMultiplicity, StaticFunctionArgument, ValueId,
-    ValueOrigin, extract_fragment_packages,
+    EdgeSource, ExprKind, ExpressionRootRole, ExpressionRootSite, Fragment, FragmentId,
+    FragmentPackage, FragmentPackageAdmission, FragmentSink, FrozenCallError, FrozenFragmentCalls,
+    FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType, HashDefinition,
+    HashPartitionScheme, NodeId, NodeKind, OutputPort, PartitionCountDomain,
+    PartitionCountParameter, PartitionCountParameterId, PartitionSpaceId, PhysicalCallBinding,
+    PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite, PhysicalNode, PhysicalPlan,
+    PhysicalProperties, PhysicalRootUses, PipelineDopDomain, PlanLimits,
+    PropertyProofProjectionLimits, RowMultiplicity, StaticFunctionArgument, ValueId, ValueOrigin,
+    extract_fragment_packages,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
@@ -298,7 +298,7 @@ fn aggregate_distribution(input: &Distribution, output: &[ValueId]) -> Distribut
 /// Add an Aggregate over `input`: the group values pass through as outputs,
 /// followed by one output per call.
 pub(crate) fn add_aggregate(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     input: NodeId,
     groups: &[ValueId],
     calls: &[CallSpec<'_>],
@@ -378,10 +378,10 @@ pub(crate) fn add_aggregate(
 /// A Values leaf whose columns have the given complete types and whose rows
 /// are literal cells of exactly those types.
 pub(crate) fn values(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
 ) -> Vec<ValueId> {
     super::family_fixture::values(builder, node, types, rows)
 }
@@ -415,7 +415,7 @@ pub(crate) fn hash(keys: &[ValueId]) -> Distribution {
 
 /// Imports `sources` of `edge` as an ExchangeSource at `node`.
 pub(crate) fn receive(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     edge: EdgeId,
     sources: &[(ValueId, FunctionValueType)],
@@ -494,11 +494,11 @@ pub(crate) fn edge(
 /// Finish a fragment and attach one original request per relational call:
 /// its logical argument types, in every phase.
 pub(crate) fn finish(
-    builder: FragmentBuilder,
+    builder: crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     root: NodeId,
     sink: FragmentSink,
     max_dop: u32,
-) -> Fragment {
+) -> crate::exec::operators::family_fixture::constant_sources::Fragment {
     let fragment = builder
         .finish_definition(
             root,

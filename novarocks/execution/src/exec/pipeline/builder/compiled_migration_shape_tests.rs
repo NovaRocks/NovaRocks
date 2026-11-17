@@ -154,6 +154,8 @@ fn compiled_scan_root_override_gathers_the_parallel_consumers_to_one_terminal_dr
 }
 
 fn mixed_phase_program() -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let catalog = aggregate_catalog(&[
         ("count", PureKernelAbi::AggregateWindowV1),
         ("sum", PureKernelAbi::AggregateWindowV1),
@@ -163,7 +165,11 @@ fn mixed_phase_program() -> Arc<LocalProgram> {
     let count = bind(&catalog, "count", &[sum.intermediate_type()]);
     let sequence = AggregateSequenceId::new(71);
     let fragment = FragmentId::new(71);
-    let mut builder = FragmentBuilder::new(fragment);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            fragment,
+            &fixture_sources,
+        );
     let mut inputs = Vec::new();
     let mut mappings = Vec::new();
     // Each producer emits a real exact SUM state. The UnionAll preserves
@@ -174,7 +180,9 @@ fn mixed_phase_program() -> Arc<LocalProgram> {
             &mut builder,
             source,
             std::slice::from_ref(&logical),
-            &[vec![LiteralValue::Int64(value)]],
+            &[vec![
+                crate::exec::operators::family_fixture::constant_sources::i64(value),
+            ]],
         );
         let (partial, output) = add_aggregate(
             &mut builder,
@@ -237,7 +245,10 @@ fn mixed_phase_program() -> Arc<LocalProgram> {
         ],
         AggregateGrouping::Complete,
     );
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([71; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([71; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(finish(builder, root, FragmentSink::Result, 1))
         .unwrap();
     plan.set_result_port(ResultPort {

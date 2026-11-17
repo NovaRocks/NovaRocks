@@ -318,14 +318,6 @@ pub fn encode_fragment_package_with_creator<H>(
     })
 }
 
-#[cfg(test)]
-fn encode_fragment_package_in<'s>(
-    package: &'s p::FragmentPackage,
-    l: &PackageEncodeLimits,
-    work: &mut CompileCheckpoints<'s>,
-) -> Result<wire::FragmentPackage, PackageEncodeError> {
-    encode_fragment_package_structural_in(package, l, work, &mut |_| Ok(()))
-}
 fn encode_fragment_package_structural_in<'s>(
     package: &'s p::FragmentPackage,
     l: &PackageEncodeLimits,

@@ -25,22 +25,18 @@
 
 use crate::creation::{ProgramCreation, ProgramCreationFailure};
 use crate::{
-    LocalProgramGraph, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramExprId, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind, ProgramTypedChannels, ProgramUseRef, StaticExprKind,
+    LocalProgramGraph, ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId,
+    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind,
+    ProgramTypedChannels, ProgramUseRef, StaticExprKind,
 };
-use novarocks_functions::{FunctionArgumentType, FunctionValueType, PreparedPureKernel};
+use novarocks_functions::{FunctionArgumentType, FunctionValueType};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
     MAX_CONTROL_USE_REFERENCES, PureCompileControl, ValueSchemaCreationScope, ValueTypeError,
     ValueTypeStorageLifetime,
 };
 use novarocks_types::SlotId;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ProgramLexicalSource {
@@ -193,18 +189,6 @@ fn push_scratch<T, H>(
 struct Scope {
     root: ProgramExpressionRootSite,
     lambda: Option<ProgramUseRef>,
-    // A common expression sees parameters and only earlier common locals.
-    common_before: Option<usize>,
-}
-struct LambdaInfo {
-    definition: ProgramExprId,
-    enclosing: Scope,
-    locals: Arc<BTreeMap<SlotId, DeclaredLocal>>,
-}
-#[derive(Clone, Copy)]
-enum DeclaredLocal {
-    Parameter(u32),
-    Common(u32),
 }
 #[derive(Clone, Copy)]
 struct Fact<'a> {
@@ -295,40 +279,20 @@ impl ProgramLexicalBindings {
         let resolved = typed.resolved_calls();
         let snapshot = resolved.snapshot();
         let projected = ProjectedSources::try_new(&channels, &mut temporary, &mut work)?;
-        let mut kernels = BTreeMap::new();
-        for (site, call) in resolved.calls() {
-            work.step()?;
-            let (ProgramCallSite::Expression(occurrence), PreparedPureKernel::HigherOrder(kernel)) =
-                (site, call.specialization().prepared())
-            else {
-                continue;
-            };
-            let edge = ProgramUseRef {
-                arena: occurrence.arena,
-                use_id: kernel.contract().body_edge_use(),
-            };
-            before_scratch_insert(&kernels, &mut temporary, &mut work)?;
-            if kernels.insert(edge, kernel).is_some() {
-                return Err(ProgramLexicalBindingError::InvalidLambda.into());
-            }
+        if !lambdas.is_empty() {
+            return Err(ProgramLexicalBindingError::InvalidLambda.into());
         }
-        // Walk each real occurrence once, retaining its actual enclosing frame.
-        // Definitions can be reused under distinct frame occurrences.
+        // Walk each real occurrence once, retaining its actual input scope.
         let mut scopes = BTreeMap::new();
-        let mut infos = BTreeMap::new();
-        let mut order = Vec::new();
-        let mut declarations = BTreeMap::new();
         for (root, use_id) in snapshot.bindings() {
             work.step()?;
             let arena = root.arena();
             let flow = &snapshot.flows()[&arena];
-            let definitions = &snapshot.roots().arenas()[&arena];
             let first = (
                 *use_id,
                 Scope {
                     root: *root,
                     lambda: None,
-                    common_before: None,
                 },
             );
             let mut stack = if temporary.creator.is_none() {
@@ -346,151 +310,14 @@ impl ProgramLexicalBindings {
                     return Err(ProgramLexicalBindingError::InvalidOccurrence.into());
                 }
                 let invocation = &flow.uses()[&use_id];
-                if matches!(
-                    definitions
-                        .node(invocation.definition)
-                        .map(|node| node.kind()),
-                    Some(StaticExprKind::LambdaFunction { .. })
-                ) && invocation.control != ControlShape::LambdaBody
-                {
-                    return Err(ProgramLexicalBindingError::InvalidLambda.into());
-                }
                 if invocation.control == ControlShape::LambdaBody {
-                    let Some(StaticExprKind::LambdaFunction {
-                        body,
-                        arg_slots,
-                        common_sub_exprs,
-                        ..
-                    }) = definitions
-                        .node(invocation.definition)
-                        .map(|value| value.kind())
-                    else {
-                        return Err(ProgramLexicalBindingError::InvalidLambda.into());
-                    };
-                    let Some(FunctionArgumentType::Lambda {
-                        parameter_types, ..
-                    }) = typed.definition_type(arena, invocation.definition)
-                    else {
-                        return Err(ProgramLexicalBindingError::InvalidLambda.into());
-                    };
-                    if arg_slots.len() != parameter_types.len()
-                        || invocation.arguments.len() != common_sub_exprs.len() + 1
-                        || !kernels.contains_key(&occurrence)
-                        || !lambdas.contains_key(&occurrence)
-                    {
-                        return Err(ProgramLexicalBindingError::InvalidLambda.into());
-                    }
-                    let key = (arena, invocation.definition);
-                    let locals = if let Some(locals) = declarations.get(&key) {
-                        Arc::clone(locals)
-                    } else {
-                        let mut locals = BTreeMap::new();
-                        for (ordinal, slot) in arg_slots.iter().enumerate() {
-                            work.step()?;
-                            let ordinal = u32::try_from(ordinal)
-                                .map_err(|_| ProgramLexicalBindingError::TooManyItems)?;
-                            before_scratch_insert(&locals, &mut temporary, &mut work)?;
-                            if locals
-                                .insert(*slot, DeclaredLocal::Parameter(ordinal))
-                                .is_some()
-                            {
-                                return Err(ProgramLexicalBindingError::InvalidLambda.into());
-                            }
-                        }
-                        for (ordinal, (slot, _)) in common_sub_exprs.iter().enumerate() {
-                            work.step()?;
-                            let ordinal = u32::try_from(ordinal)
-                                .map_err(|_| ProgramLexicalBindingError::TooManyItems)?;
-                            before_scratch_insert(&locals, &mut temporary, &mut work)?;
-                            if locals
-                                .insert(*slot, DeclaredLocal::Common(ordinal))
-                                .is_some()
-                            {
-                                return Err(ProgramLexicalBindingError::InvalidLambda.into());
-                            }
-                        }
-                        temporary.before_arc::<ProgramLexicalBindingError, BTreeMap<SlotId, DeclaredLocal>>(&mut work)?;
-                        let locals = Arc::new(locals);
-                        before_scratch_insert(&declarations, &mut temporary, &mut work)?;
-                        declarations.insert(key, locals.clone());
-                        locals
-                    };
-                    for (ordinal, (_, definition)) in common_sub_exprs.iter().enumerate() {
-                        work.step()?;
-                        if flow.uses()[&invocation.arguments[ordinal]].definition != *definition {
-                            return Err(ProgramLexicalBindingError::InvalidLambda.into());
-                        }
-                    }
-                    if flow.uses()[invocation.arguments.last().unwrap()].definition != *body {
-                        return Err(ProgramLexicalBindingError::InvalidLambda.into());
-                    }
-                    before_scratch_insert(&infos, &mut temporary, &mut work)?;
-                    infos.insert(
-                        occurrence,
-                        LambdaInfo {
-                            definition: invocation.definition,
-                            enclosing: scope,
-                            locals,
-                        },
-                    );
-                    push_scratch(&mut order, occurrence, &mut temporary, &mut work)?;
-                    for (ordinal, child) in invocation.arguments.iter().enumerate().rev() {
-                        work.step()?;
-                        push_scratch(
-                            &mut stack,
-                            (
-                                *child,
-                                Scope {
-                                    root: *root,
-                                    lambda: Some(occurrence),
-                                    common_before: if ordinal == common_sub_exprs.len() {
-                                        None
-                                    } else {
-                                        Some(ordinal)
-                                    },
-                                },
-                            ),
-                            &mut temporary,
-                            &mut work,
-                        )?;
-                    }
+                    return Err(ProgramLexicalBindingError::InvalidLambda.into());
                 } else {
                     for child in invocation.arguments.iter().rev() {
                         work.step()?;
                         push_scratch(&mut stack, (*child, scope), &mut temporary, &mut work)?;
                     }
                 }
-            }
-        }
-        if infos.len() != lambdas.len() || infos.len() != kernels.len() {
-            return Err(ProgramLexicalBindingError::IncompleteCoverage.into());
-        }
-        // Outer frames precede their nested frames, so captures never require
-        // recursive source resolution or a forward reference to mutable state.
-        let mut capture_facts = BTreeMap::new();
-        let mut used = BTreeSet::new();
-        for edge in order {
-            work.step()?;
-            let info = &infos[&edge];
-            let binding = &lambdas[&edge];
-            let expected = kernels[&edge].body_contract().capture_types();
-            if binding.captures.len() != expected.len() {
-                return Err(ProgramLexicalBindingError::IncompleteCoverage.into());
-            }
-            for (ordinal, (source, expected)) in binding.captures.iter().zip(expected).enumerate() {
-                work.step()?;
-                let fact = SourceProof {
-                    channels: &channels,
-                    projected: &projected,
-                    infos: &infos,
-                    captures: &capture_facts,
-                    used: &mut used,
-                    temporary: &mut temporary,
-                }
-                .fact(*source, info.enclosing, &mut work)?;
-                exact_type(fact.ty, expected, &mut work)?;
-                before_scratch_insert(&capture_facts, &mut temporary, &mut work)?;
-                capture_facts.insert((edge, ordinal as u32), fact);
             }
         }
         let mut actual_slots = 0usize;
@@ -511,10 +338,6 @@ impl ProgramLexicalBindings {
             let fact = SourceProof {
                 channels: &channels,
                 projected: &projected,
-                infos: &infos,
-                captures: &capture_facts,
-                used: &mut used,
-                temporary: &mut temporary,
             }
             .fact(*source, *scope, &mut work)?;
             if fact.slot != *slot {
@@ -529,14 +352,6 @@ impl ProgramLexicalBindings {
         }
         if actual_slots != slots.len() {
             return Err(ProgramLexicalBindingError::IncompleteCoverage.into());
-        }
-        for (edge, binding) in &lambdas {
-            for ordinal in 0..binding.captures.len() {
-                work.step()?;
-                if !used.contains(&(*edge, ordinal as u32)) {
-                    return Err(ProgramLexicalBindingError::UnusedCapture.into());
-                }
-            }
         }
         retained.before_arc::<ProgramLexicalBindingError, LexicalMap<ProgramUseRef, ProgramLambdaBinding>>(&mut work)?;
         retained.before_arc::<ProgramLexicalBindingError, LexicalMap<ProgramUseRef, ProgramLexicalSource>>(&mut work)?;
@@ -725,114 +540,32 @@ impl ProjectedSources {
     }
 }
 
-struct SourceProof<'a, 'proof, 'creation, H> {
+struct SourceProof<'a, 'proof> {
     channels: &'a ProgramTypedChannels,
     projected: &'proof ProjectedSources,
-    infos: &'proof BTreeMap<ProgramUseRef, LambdaInfo>,
-    captures: &'proof BTreeMap<(ProgramUseRef, u32), Fact<'a>>,
-    used: &'proof mut BTreeSet<(ProgramUseRef, u32)>,
-    temporary: &'proof mut ProgramCreation<'creation, H>,
 }
-impl<'a, H> SourceProof<'a, '_, '_, H> {
+impl<'a> SourceProof<'a, '_> {
     fn fact(
         &mut self,
         source: ProgramLexicalSource,
         scope: Scope,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Fact<'a>, ProgramCreationFailure<ProgramLexicalBindingError, H>> {
+    ) -> Result<Fact<'a>, ProgramLexicalBindingError> {
         let channels = self.channels;
         let projected = self.projected;
-        let infos = self.infos;
-        let captures = self.captures;
-        let used = &mut *self.used;
         work.step()?;
-        let typed = channels.expressions();
-        let definitions = typed.resolved_calls().snapshot().roots().arenas();
         let fact = match source {
-            ProgramLexicalSource::Parameter { lambda, ordinal } => {
-                if scope.lambda != Some(lambda) {
-                    return Err(ProgramLexicalBindingError::WrongScope.into());
-                }
-                let info = infos
-                    .get(&lambda)
-                    .ok_or(ProgramLexicalBindingError::InvalidSource)?;
-                let StaticExprKind::LambdaFunction { arg_slots, .. } = definitions[&lambda.arena]
-                    .node(info.definition)
-                    .unwrap()
-                    .kind()
-                else {
-                    return Err(ProgramLexicalBindingError::InvalidLambda.into());
-                };
-                let Some(FunctionArgumentType::Lambda {
-                    parameter_types, ..
-                }) = typed.definition_type(lambda.arena, info.definition)
-                else {
-                    return Err(ProgramLexicalBindingError::InvalidLambda.into());
-                };
-                Fact {
-                    slot: *arg_slots
-                        .get(ordinal as usize)
-                        .ok_or(ProgramLexicalBindingError::InvalidSource)?,
-                    ty: parameter_types
-                        .get(ordinal as usize)
-                        .ok_or(ProgramLexicalBindingError::InvalidSource)?,
-                }
-            }
-            ProgramLexicalSource::Common { lambda, ordinal } => {
-                if scope.lambda != Some(lambda) {
-                    return Err(ProgramLexicalBindingError::WrongScope.into());
-                }
-                if scope
-                    .common_before
-                    .is_some_and(|limit| ordinal as usize >= limit)
-                {
-                    return Err(ProgramLexicalBindingError::ForwardCommon.into());
-                }
-                let info = infos
-                    .get(&lambda)
-                    .ok_or(ProgramLexicalBindingError::InvalidSource)?;
-                let StaticExprKind::LambdaFunction {
-                    common_sub_exprs, ..
-                } = definitions[&lambda.arena]
-                    .node(info.definition)
-                    .unwrap()
-                    .kind()
-                else {
-                    return Err(ProgramLexicalBindingError::InvalidLambda.into());
-                };
-                let (slot, definition) = common_sub_exprs
-                    .get(ordinal as usize)
-                    .ok_or(ProgramLexicalBindingError::InvalidSource)?;
-                let Some(FunctionArgumentType::Value(ty)) =
-                    typed.definition_type(lambda.arena, *definition)
-                else {
-                    return Err(ProgramLexicalBindingError::TypeMismatch.into());
-                };
-                Fact { slot: *slot, ty }
-            }
-            ProgramLexicalSource::Capture { lambda, ordinal } => {
-                if scope.lambda != Some(lambda) {
-                    return Err(ProgramLexicalBindingError::WrongScope.into());
-                }
-                let fact = *captures
-                    .get(&(lambda, ordinal))
-                    .ok_or(ProgramLexicalBindingError::InvalidSource)?;
-                if !used.contains(&(lambda, ordinal)) {
-                    self.temporary
-                        .before_tree_insert::<ProgramLexicalBindingError, (ProgramUseRef, u32), ()>(
-                            used.len(),
-                            work,
-                        )?;
-                }
-                used.insert((lambda, ordinal));
-                fact
+            ProgramLexicalSource::Parameter { .. }
+            | ProgramLexicalSource::Common { .. }
+            | ProgramLexicalSource::Capture { .. } => {
+                return Err(ProgramLexicalBindingError::InvalidLambda);
             }
             ProgramLexicalSource::Input(site) => {
                 if scope.lambda.is_some() {
-                    return Err(ProgramLexicalBindingError::WrongScope.into());
+                    return Err(ProgramLexicalBindingError::WrongScope);
                 }
                 if !input_scope(channels, scope.root, site)? {
-                    return Err(ProgramLexicalBindingError::WrongScope.into());
+                    return Err(ProgramLexicalBindingError::WrongScope);
                 }
                 Fact {
                     slot: channels
@@ -846,7 +579,7 @@ impl<'a, H> SourceProof<'a, '_, '_, H> {
             ProgramLexicalSource::Projected { .. }
             | ProgramLexicalSource::WriterProjected { .. } => {
                 if scope.lambda.is_some() {
-                    return Err(ProgramLexicalBindingError::WrongScope.into());
+                    return Err(ProgramLexicalBindingError::WrongScope);
                 }
                 projected.fact(source, scope.root, channels, work)?
             }
@@ -855,25 +588,7 @@ impl<'a, H> SourceProof<'a, '_, '_, H> {
             && let Some(latest) = projected.latest(scope.root, fact.slot, work)?
             && latest != source
         {
-            return Err(ProgramLexicalBindingError::ShadowedSource.into());
-        }
-        if let Some(lambda) = scope.lambda
-            && let Some(local) = infos[&lambda].locals.get(&fact.slot)
-        {
-            let (visible, nearest) = match *local {
-                DeclaredLocal::Parameter(ordinal) => {
-                    (true, ProgramLexicalSource::Parameter { lambda, ordinal })
-                }
-                DeclaredLocal::Common(ordinal) => (
-                    scope
-                        .common_before
-                        .is_none_or(|limit| (ordinal as usize) < limit),
-                    ProgramLexicalSource::Common { lambda, ordinal },
-                ),
-            };
-            if visible && nearest != source {
-                return Err(ProgramLexicalBindingError::ShadowedSource.into());
-            }
+            return Err(ProgramLexicalBindingError::ShadowedSource);
         }
         Ok(fact)
     }
@@ -936,8 +651,7 @@ pub fn root_input_layout(
             (*input, Layout::NodeOutput)
         }
         ProgramExpressionRootSite::SinkPartition { .. }
-        | ProgramExpressionRootSite::SinkApplicability { .. }
-        | ProgramExpressionRootSite::SinkSplitPredicate { .. } => {
+        | ProgramExpressionRootSite::SinkApplicability { .. } => {
             (program.root(), Layout::NodeOutput)
         }
         ProgramExpressionRootSite::Node {

@@ -28,6 +28,7 @@ use super::super::{
 };
 use super::*;
 use crate::functions::build_builtin_engine_function_catalog;
+use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
 use arrow::{
     array::{Array, Int64Array, ListArray},
     buffer::OffsetBuffer,
@@ -39,9 +40,9 @@ use novarocks_functions::{
 };
 use novarocks_physical_plan::{
     BinaryOperator, BoundTableFunction, ConstantPoolId, ConstantPools, ConstantReference,
-    Distribution, ExprId, ExprKind, ExpressionRootRole, ExpressionRootSite, Fragment,
-    FragmentBuilder, FragmentId, FragmentSink, LiteralValue, NodeId, NodeKind, PipelineDopDomain,
-    PlanLimits, TableFunctionOutput, ValueOrigin,
+    Distribution, ExprId, ExprKind, ExpressionRootRole, ExpressionRootSite, FragmentId,
+    FragmentSink, NodeId, NodeKind, PipelineDopDomain, PlanLimits, TableFunctionOutput,
+    ValueOrigin,
 };
 use novarocks_type_contract::{
     CompilePhase, ExpressionEffectContext, FunctionInstanceState, FunctionIntrinsicRowError,
@@ -149,13 +150,7 @@ impl Fixture {
         let leaf = NodeId::new(7);
         let owner = NodeId::new(901);
         let input_type = types[0].clone();
-        let initial = builder
-            .add_expression(
-                leaf,
-                input_type.clone(),
-                ExprKind::Literal(LiteralValue::Null),
-            )
-            .unwrap();
+        let initial = builder.constant(leaf, input_type.clone(), checked::null());
         let value = builder
             .add_value(
                 input_type,
@@ -176,27 +171,16 @@ impl Fixture {
                 continue;
             }
             let kind = match source {
-                Source::Literal => ExprKind::Literal(LiteralValue::Null),
+                Source::Literal => builder.constant_kind(value_type, checked::null()),
                 Source::Pool => ExprKind::Constant(ConstantReference {
                     pool: ConstantPoolId::new(u32::MAX),
                     ordinal: 1,
                 }),
                 Source::Value => ExprKind::Value(value),
                 Source::ChildError => {
-                    let a = builder
-                        .add_expression(
-                            owner,
-                            ty(DataType::Int64, false),
-                            ExprKind::Literal(LiteralValue::Int64(i64::MAX)),
-                        )
-                        .unwrap();
-                    let b = builder
-                        .add_expression(
-                            owner,
-                            ty(DataType::Int64, false),
-                            ExprKind::Literal(LiteralValue::Int64(1)),
-                        )
-                        .unwrap();
+                    let a =
+                        builder.constant(owner, ty(DataType::Int64, false), checked::i64(i64::MAX));
+                    let b = builder.constant(owner, ty(DataType::Int64, false), checked::i64(1));
                     let add = builder
                         .add_expression(
                             owner,
@@ -220,20 +204,8 @@ impl Fixture {
                             },
                         )
                         .unwrap();
-                    let then = builder
-                        .add_expression(
-                            owner,
-                            value_type.clone(),
-                            ExprKind::Literal(LiteralValue::Null),
-                        )
-                        .unwrap();
-                    let otherwise = builder
-                        .add_expression(
-                            owner,
-                            value_type.clone(),
-                            ExprKind::Literal(LiteralValue::Null),
-                        )
-                        .unwrap();
+                    let then = builder.constant(owner, value_type.clone(), checked::null());
+                    let otherwise = builder.constant(owner, value_type.clone(), checked::null());
                     ExprKind::Case {
                         operand: None,
                         when_then: Box::from([(test, then)]),
@@ -333,6 +305,7 @@ impl Fixture {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
+        checked::merge(&mut pools, fragment.constants());
         Self {
             fragment,
             pools,
@@ -1152,60 +1125,6 @@ fn table_fragment_composer_missing_extra_and_equal_foreign_source_scopes_refuse_
             "relational scope does not loan this actual source call"
         ))
     ));
-    fragment_prefixes(
-        |control| fragment_run(&fixture, &occurrences, &parameters, &scopes, control),
-        false,
-        false,
-    );
-}
-
-#[test]
-fn table_fragment_composer_source_literal_limits_remain_primary_without_partial_call_table() {
-    let fields: Vec<_> = (0..320)
-        .map(|at| {
-            Arc::new(
-                Field::new(format!("component-{at}"), DataType::Int64, true).with_metadata(
-                    std::collections::HashMap::from([("provider.id".into(), at.to_string())]),
-                ),
-            )
-        })
-        .collect();
-    let source_type = ty(
-        DataType::List(Arc::new(Field::new(
-            "item",
-            DataType::Struct(fields.into()),
-            true,
-        ))),
-        true,
-    );
-    let fixture = Fixture::new(&[source_type], &[Source::Value], false, false);
-    let occurrences = fixture.occurrences();
-    let parameters = SemanticParameters::try_new([]).unwrap();
-    let scopes = fragment_scopes(&fixture, &occurrences);
-    let error = fragment_run(
-        &fixture,
-        &occurrences,
-        &parameters,
-        &scopes,
-        &Control::default(),
-    )
-    .unwrap_err();
-    use super::super::physical_call_arguments::PhysicalArgumentError;
-    use super::super::physical_fragment_effects::PhysicalFragmentEffectsError;
-    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
-    use novarocks_functions::ConstantError;
-    let PhysicalFragmentEffectsError::Expressions(PhysicalExpressionEffectsError::Argument(
-        PhysicalArgumentError::Constant(source @ ConstantError::Limit(_)),
-    )) = &error
-    else {
-        panic!("the actual table argument must retain its original constant limit: {error:?}");
-    };
-    let expected = source.failure_fact();
-    assert_eq!(expected.class(), FailureClass::Resource);
-    assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
-    assert_eq!(expected.reason().code(), 2);
-    let package = super::super::package_semantics::PackageSemanticsError::from(error);
-    assert_eq!(package.failure_fact(), expected);
     fragment_prefixes(
         |control| fragment_run(&fixture, &occurrences, &parameters, &scopes, control),
         false,

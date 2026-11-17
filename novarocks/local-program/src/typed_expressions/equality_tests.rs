@@ -42,10 +42,9 @@ fn integer(nullable: bool) -> FunctionValueType {
     FunctionValueType::new(DataType::Int64, nullable)
 }
 fn slot(ordinal: usize, ty: &FunctionValueType) -> StaticExprNode {
-    StaticExprNode::new(
+    StaticExprNode::new_value_typed(
         StaticExprKind::SlotId(SlotId::new(ordinal as u32 + 1)),
-        ty.data_type().clone(),
-        None,
+        ty.clone(),
     )
 }
 fn fixture(
@@ -62,14 +61,13 @@ fn fixture(
     let mut nodes = vec![
         slot(0, &left),
         slot(1, &right),
-        StaticExprNode::new(
+        StaticExprNode::new_value_typed(
             if ne {
                 StaticExprKind::Ne(ProgramExprId::new(0), ProgramExprId::new(1))
             } else {
                 StaticExprKind::Eq(ProgramExprId::new(0), ProgramExprId::new(1))
             },
-            result.data_type().clone(),
-            None,
+            result.clone(),
         ),
     ];
     let mut types = vec![
@@ -98,8 +96,7 @@ fn assembled(
     ProgramResolvedCalls,
     BTreeMap<ProgramExpressionArena, Vec<FunctionArgumentType>>,
 ) {
-    let arena =
-        Arc::new(ImmutableExpressions::try_new(nodes, false, HashMap::new(), None).unwrap());
+    let arena = Arc::new(crate::test_support::arena(nodes).unwrap());
     let schema = Arc::new(Schema::new(vec![Field::new(
         "unused_input",
         DataType::Boolean,
@@ -165,7 +162,6 @@ fn assembled(
         let id = ExpressionUseId::new(uses.len() as u32);
         let (control, children) = match arena.node(definition).unwrap().kind() {
             StaticExprKind::Eq(left, right)
-            | StaticExprKind::EqForNull(left, right)
             | StaticExprKind::PreparedNullSafeComparison { left, right }
             | StaticExprKind::Ne(left, right)
             | StaticExprKind::Lt(left, right)
@@ -173,7 +169,7 @@ fn assembled(
             | StaticExprKind::Gt(left, right)
             | StaticExprKind::Ge(left, right) => (ControlShape::Eager, vec![*left, *right]),
             StaticExprKind::PreparedCast { child, .. } => (ControlShape::Eager, vec![*child]),
-            StaticExprKind::LambdaFunction { body, .. } => (ControlShape::LambdaBody, vec![*body]),
+
             _ => (ControlShape::Eager, vec![]),
         };
         uses.push(ProgramExpressionUse {
@@ -474,25 +470,18 @@ fn eq_ne_callable_inputs_reject_at_actual_scalar_type_author_even_when_definitio
             let ty = integer(false);
             let mut nodes = vec![
                 slot(0, &ty),
-                StaticExprNode::new(
-                    StaticExprKind::LambdaFunction {
-                        body: ProgramExprId::new(0),
-                        arg_slots: vec![],
-                        common_sub_exprs: vec![],
-                        is_nondeterministic: false,
-                    },
-                    DataType::Int64,
-                    None,
+                StaticExprNode::new_value_typed(
+                    StaticExprKind::SlotId(SlotId::new(1)),
+                    novarocks_functions::FunctionValueType::new(DataType::Int64, false),
                 ),
                 slot(2, &ty),
-                StaticExprNode::new(
+                StaticExprNode::new_value_typed(
                     if ne {
                         StaticExprKind::Ne(ProgramExprId::new(1), ProgramExprId::new(2))
                     } else {
                         StaticExprKind::Eq(ProgramExprId::new(1), ProgramExprId::new(2))
                     },
-                    DataType::Boolean,
-                    None,
+                    novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
                 ),
             ];
             let mut types = vec![
@@ -667,7 +656,7 @@ fn dead_arithmetic_definitions_require_shared_full_types_and_nullable_result() {
                 vec![
                     slot(0, &l),
                     slot(1, &right),
-                    StaticExprNode::new(
+                    StaticExprNode::new_value_typed(
                         StaticExprKind::PreparedArithmetic {
                             operator: op,
                             left: ProgramExprId::new(0),
@@ -675,8 +664,7 @@ fn dead_arithmetic_definitions_require_shared_full_types_and_nullable_result() {
                             decimal_overflow_policy: P::ReportError,
                             allow_throw_exception: true,
                         },
-                        result.data_type().clone(),
-                        None,
+                        result.clone(),
                     ),
                     slot(3, &boolean(false)),
                 ],
@@ -757,15 +745,14 @@ fn dead_cast_definitions_preserve_exact_identity_and_successful_narrowing_null()
         let (calls, types) = assembled(
             vec![
                 slot(0, &source),
-                StaticExprNode::new(
+                StaticExprNode::new_value_typed(
                     StaticExprKind::PreparedCast {
                         operation: CastOperation::Carrier,
                         child: ProgramExprId::new(0),
                         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                         allow_throw_exception: true,
                     },
-                    result.data_type().clone(),
-                    None,
+                    result.clone(),
                 ),
                 slot(2, &boolean(false)),
             ],
@@ -822,15 +809,14 @@ fn float_integer_cast_all_definitions_use_the_frozen_allow_mode_for_successful_n
                                 let (calls, types) = assembled(
                                     vec![
                                         slot(0, &source),
-                                        StaticExprNode::new(
+                                        StaticExprNode::new_value_typed(
                                             StaticExprKind::PreparedCast {
                                                 operation: CastOperation::Carrier,
                                                 child: ProgramExprId::new(0),
                                                 decimal_overflow_policy: policy,
                                                 allow_throw_exception: allow,
                                             },
-                                            target_type.clone(),
-                                            None,
+                                            result.clone(),
                                         ),
                                         slot(2, &boolean(false)),
                                     ],

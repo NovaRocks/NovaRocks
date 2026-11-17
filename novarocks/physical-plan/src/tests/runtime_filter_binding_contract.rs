@@ -30,13 +30,16 @@ const BROADCAST_FRAGMENT: u32 = 412;
 /// is produced and consumed at one broadcast join in fragment 412. Fragments
 /// 410 and 411 attach nothing.
 pub(super) fn numbered_plan() -> PhysicalPlan {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let (partitioned, scan_fragment, join_fragment) =
-        super::contract_regressions::cross_fragment_scan_lineage_plan();
+        super::contract_regressions::cross_fragment_scan_lineage_plan(&mut fixture_constants);
     assert_eq!(
         (scan_fragment.get(), join_fragment.get()),
         (PARTITIONED_CONSUMER_FRAGMENT, PARTITIONED_PRODUCER_FRAGMENT)
     );
-    let broadcast = super::runtime_filter_wait_contract::acyclic_cross_fragment_fixture().plan;
+    let broadcast =
+        super::runtime_filter_wait_contract::acyclic_cross_fragment_fixture(&mut fixture_constants)
+            .plan;
     let mut builder = PlanBuilder::new(version());
     for plan in [&partitioned, &broadcast] {
         for fragment in plan.fragments().values() {
@@ -49,7 +52,7 @@ pub(super) fn numbered_plan() -> PhysicalPlan {
             builder.add_runtime_filter(filter.clone()).unwrap();
         }
     }
-    builder.finish().unwrap()
+    crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap()
 }
 
 /// The numbering the native v1 encoder minted before the physical plan

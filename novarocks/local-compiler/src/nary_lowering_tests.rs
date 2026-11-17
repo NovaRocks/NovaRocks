@@ -30,9 +30,9 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackageInput,
     FragmentSink, FrozenCallError, FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall,
-    LiteralValue, NodeId, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
-    PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
-    RootUseBindingError, ValidationErrors, ValueDef, ValueId, ValueOrigin,
+    NodeId, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain,
+    PlanVersionId, RequiredContracts, ResultField, ResultPort, RootUseBindingError,
+    ValidationErrors, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
@@ -139,6 +139,7 @@ enum Shape {
     NarrowResult,
 }
 struct Fixture {
+    constants: novarocks_physical_plan::ConstantPools,
     fragment: Fragment,
     connective: ExprId,
 }
@@ -159,6 +160,7 @@ fn fixture(
         ValueId::new(100),
         ValueId::new(u32::MAX - 32),
     ];
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fragment_id);
     builder
         .add_values(source, Box::from([Box::default()]), Box::default())
@@ -172,7 +174,11 @@ fn fixture(
             boolean.clone()
         };
         let definition = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                crate::test_constants::null(&mut constants, &ty, options().constants),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -242,6 +248,7 @@ fn fixture(
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     Ok(Fixture {
+        constants,
         fragment,
         connective,
     })
@@ -267,7 +274,7 @@ fn uses(fixture: &Fixture, style: Flow) -> Result<PhysicalRootUses, RootUseBindi
         let (control, args) = match &fragment.expressions().get(id).unwrap().kind {
             ExprKind::Conjunction { args } => (ControlShape::Conjunction, args.as_ref()),
             ExprKind::Disjunction { args } => (ControlShape::Disjunction, args.as_ref()),
-            ExprKind::Value(_) | ExprKind::Literal(_) => (ControlShape::Eager, &[][..]),
+            ExprKind::Value(_) | ExprKind::Constant(_) => (ControlShape::Eager, &[][..]),
             other => panic!("fixture lacks control projection for {other:?}"),
         };
         let mut arguments = args
@@ -358,7 +365,7 @@ fn package(fixture: Fixture) -> Arc<FragmentPackage> {
             FragmentPackageInput {
                 version: PlanVersionId::try_new([91; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants: fixture.constants,
                 fragment: fixture.fragment,
                 expression_uses,
                 calls,
@@ -407,12 +414,12 @@ fn ordered_nullable_nary_three_and_wide_320_lower_into_one_intrinsic_definition_
                 assert!(source.calls().entries().is_empty());
                 let arena = &calls.snapshot().roots().arenas()[&ProgramExpressionArena::Main];
                 assert_eq!(arena.nodes().len(), 7); // Three source literals, three references, one n-ary root.
-                assert!(!arena.nodes().iter().any(|node| matches!(
-                    node.kind(),
-                    StaticExprKind::And(..)
-                        | StaticExprKind::Or(..)
-                        | StaticExprKind::BoundCall { .. }
-                )));
+                assert!(
+                    !arena
+                        .nodes()
+                        .iter()
+                        .any(|node| matches!(node.kind(), StaticExprKind::BoundCall { .. }))
+                );
                 let flow = &calls.snapshot().flows()[&ProgramExpressionArena::Main];
                 let roots = calls.snapshot().bindings();
                 let (site, root_use) = roots

@@ -73,7 +73,7 @@ pub use expression_roots::*;
 pub use expressions::{
     ExpressionsCompileError, ImmutableExpressions, MAX_STATIC_EXPRESSION_DEPTH,
     MAX_STATIC_EXPRESSION_DYNAMIC_BYTES, MAX_STATIC_EXPRESSIONS, ProgramExprId, StaticExprKind,
-    StaticExprNode, StaticExpressionError, StaticFunctionKind, StaticLiteral,
+    StaticExprNode, StaticExpressionError,
 };
 pub use layout::{LayoutCompileError, LayoutCreationFailure, LayoutError, StaticLayout};
 pub use lexical_bindings::*;
@@ -152,3 +152,6 @@ pub use novarocks_result_contract::{
     DeleteVerificationCounts, FinishCountMode, FinishInputs, LogicalChangeCounts, PerKind,
     SummaryField, SummaryKind, SummaryValue, SummaryWireType,
 };
+
+#[cfg(test)]
+mod test_support;

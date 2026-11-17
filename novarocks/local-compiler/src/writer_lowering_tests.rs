@@ -303,15 +303,16 @@ fn fixture_with_types(
     draft: ConnectorWriteRecipeDraft,
 ) -> Result<Fixture, Box<dyn std::error::Error>> {
     let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(WRITER_FRAGMENT);
     let source = builder.reserve_node_id().unwrap();
     let cells = source_types.into_iter().enumerate().map(|(ordinal, ty)| {
         let literal = if ty.nullable() {
-            LiteralValue::Null
+            crate::test_constants::null(&mut constants, &ty, options(1, None).constants)
         } else if ordinal == 0 {
-            LiteralValue::Int64(1)
+            crate::test_constants::i64(&mut constants, &ty, 1, options(1, None).constants)
         } else {
-            LiteralValue::Utf8("a".into())
+            crate::test_constants::utf8(&mut constants, &ty, "a", options(1, None).constants)
         };
         (ty, literal)
     });
@@ -320,7 +321,7 @@ fn fixture_with_types(
     for (ordinal, (value_type, literal)) in cells.enumerate() {
         row.push(
             builder
-                .add_expression(source, value_type.clone(), ExprKind::Literal(literal))
+                .add_expression(source, value_type.clone(), literal)
                 .unwrap(),
         );
         values.push(
@@ -498,6 +499,9 @@ fn fixture_with_types(
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([1; 16]).unwrap());
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone())?;
+    }
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
@@ -547,7 +551,7 @@ fn fixture_with_types(
             .collect(),
     })
     .unwrap();
-    let plan = plan.finish()?;
+    let plan = plan.finish_observed(&FixtureControl)?;
 
     let mut uses = BTreeMap::new();
     let mut calls = BTreeMap::new();
@@ -596,7 +600,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             let id = ExpressionUseId::new(index as u32);
             assert!(matches!(
                 fragment.expressions().get(root.expr).unwrap().kind,
-                ExprKind::Literal(_) | ExprKind::Value(_)
+                ExprKind::Constant(_) | ExprKind::Value(_)
             ));
             // A literal has no argument, so its control shape is trivially eager.
             let _ = control_argument_semantics(ControlShape::Eager, 0, 0, root.demand);
@@ -1328,18 +1332,38 @@ fn statistics_fixture() -> StatisticsFixture {
     let catalog = theta_catalog();
     let draft = draft();
     let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
+    for (id, pool) in pools() {
+        constants.insert(id, pool).unwrap();
+    }
     let mut builder = FragmentBuilder::new(WRITER_FRAGMENT);
     let source = builder.reserve_node_id().unwrap();
     let cells = [
-        (ty(DataType::Int64, false), LiteralValue::Int64(1)),
-        (ty(DataType::Utf8, false), LiteralValue::Utf8("a".into())),
+        (
+            ty(DataType::Int64, false),
+            crate::test_constants::i64(
+                &mut constants,
+                &ty(DataType::Int64, false),
+                1,
+                options(1, None).constants,
+            ),
+        ),
+        (
+            ty(DataType::Utf8, false),
+            crate::test_constants::utf8(
+                &mut constants,
+                &ty(DataType::Utf8, false),
+                "a",
+                options(1, None).constants,
+            ),
+        ),
     ];
     let mut row = Vec::new();
     let mut values = Vec::new();
     for (ordinal, (value_type, literal)) in cells.into_iter().enumerate() {
         row.push(
             builder
-                .add_expression(source, value_type.clone(), ExprKind::Literal(literal))
+                .add_expression(source, value_type.clone(), literal)
                 .unwrap(),
         );
         values.push(
@@ -1568,7 +1592,12 @@ fn statistics_fixture() -> StatisticsFixture {
                 .add_expression(
                     finish,
                     ty(DataType::Utf8, false),
-                    ExprKind::Literal(LiteralValue::Utf8(BLOB_TYPE.into())),
+                    crate::test_constants::utf8(
+                        &mut constants,
+                        &ty(DataType::Utf8, false),
+                        BLOB_TYPE,
+                        options(1, None).constants,
+                    ),
                 )
                 .unwrap();
             WriterGroupedUnpivotMapping {
@@ -1654,8 +1683,8 @@ fn statistics_fixture() -> StatisticsFixture {
     );
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([2; 16]).unwrap());
-    for (id, pool) in pools() {
-        plan.insert_constant_pool(id, pool).unwrap();
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
     }
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();

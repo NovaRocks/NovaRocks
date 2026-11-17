@@ -18,6 +18,7 @@
 // Child of the real guarded-owner fixture module. All arithmetic is authored
 // by the production recipe and executed through the checked local compiler.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{ArrayRef, Int8Array, Int16Array, Int32Array};
 use novarocks_functions::PreparedArithmeticRecipe;
 use novarocks_local_program::{ProgramUseRef, StaticExprKind};
@@ -54,9 +55,18 @@ fn allow_ref() -> SemanticParameterRef {
         expected_key: SemanticParameterKey::AllowThrowException,
     }
 }
-fn literal(builder: &mut FragmentBuilder, ty: &FunctionValueType, value: LiteralValue) -> ExprId {
+fn literal(
+    builder: &mut FragmentBuilder,
+    ty: &FunctionValueType,
+    value: novarocks_functions::ConstantValue,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
+) -> ExprId {
     builder
-        .add_expression(NodeId::new(0), ty.clone(), ExprKind::Literal(value))
+        .add_expression(
+            NodeId::new(0),
+            ty.clone(),
+            checked_constants::kind(source_pools, value),
+        )
         .unwrap()
 }
 fn arithmetic(
@@ -87,8 +97,9 @@ fn compile_arithmetic(
     authors: &BTreeMap<ExprId, Author>,
     result: ResultPort,
     allow: bool,
+    source_pools: novarocks_physical_plan::ConstantPools,
 ) -> Arc<LocalProgram> {
-    let (fragment, constants) = original_request_sources(fragment, authors);
+    let (fragment, constants) = original_request_sources(fragment, authors, source_pools);
     let fragment_id = fragment.id();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
     let mut author = FlowAuthor::new();
@@ -252,6 +263,7 @@ fn build_program(
     wrap: Wrap,
     allow: bool,
 ) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let fragment_id = FragmentId::new(213);
     let source = NodeId::new(u32::MAX);
@@ -272,7 +284,14 @@ fn build_program(
     let mut projections = Vec::new();
     for (id, ty) in &columns {
         let expression = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -298,7 +317,12 @@ fn build_program(
         .add_expression(output, left_type.clone(), ExprKind::Value(columns[0].0))
         .unwrap();
     let right = if matches!(wrap, Wrap::ConstantRight) {
-        literal(&mut builder, &right_type, LiteralValue::Int64(2))
+        literal(
+            &mut builder,
+            &right_type,
+            checked_constants::i64(&right_type, 2, options().constants),
+            &mut source_pools,
+        )
     } else {
         builder
             .add_expression(output, right_type.clone(), ExprKind::Value(columns[1].0))
@@ -314,7 +338,12 @@ fn build_program(
     let root = match wrap {
         Wrap::Bare | Wrap::ConstantRight => computed,
         Wrap::NullParent => {
-            let null = literal(&mut builder, &result_type, LiteralValue::Null);
+            let null = literal(
+                &mut builder,
+                &result_type,
+                checked_constants::null(&result_type, options().constants),
+                &mut source_pools,
+            );
             arithmetic(
                 &mut builder,
                 BinaryOperator::Add,
@@ -324,7 +353,12 @@ fn build_program(
             )
         }
         Wrap::Coalesce | Wrap::If => {
-            let fallback = literal(&mut builder, &result_type, LiteralValue::Int64(71));
+            let fallback = literal(
+                &mut builder,
+                &result_type,
+                checked_constants::i64(&result_type, 71, options().constants),
+                &mut source_pools,
+            );
             let (name, shape, arguments, defs) = if matches!(wrap, Wrap::If) {
                 let flag = builder
                     .add_expression(output, boolean.clone(), ExprKind::Value(columns[2].0))
@@ -375,7 +409,12 @@ fn build_program(
                 let decide = literal(
                     &mut builder,
                     &result_type,
-                    LiteralValue::Boolean(matches!(wrap, Wrap::Or)),
+                    checked_constants::boolean(
+                        &result_type,
+                        matches!(wrap, Wrap::Or),
+                        options().constants,
+                    ),
+                    &mut source_pools,
                 );
                 builder
                     .add_expression(
@@ -436,7 +475,7 @@ fn build_program(
             ty: result_type,
         }]),
     };
-    compile_arithmetic(&functions, fragment, &authors, result, allow)
+    compile_arithmetic(&functions, fragment, &authors, result, allow, source_pools)
 }
 fn signed(carrier: &DataType, values: &[Option<i64>]) -> ArrayRef {
     match carrier {

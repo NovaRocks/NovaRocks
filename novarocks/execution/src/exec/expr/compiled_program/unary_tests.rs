@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::ArrayRef;
 use novarocks_functions::EvaluatedArgument;
 use novarocks_local_program::{ProgramUseRef, StaticExprKind};
@@ -45,6 +46,7 @@ fn unary(builder: &mut FragmentBuilder, child: ExprId, negated: bool) -> ExprId 
 }
 
 fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let fragment_id = FragmentId::new(197);
     let source = NodeId::new(u32::MAX);
@@ -63,7 +65,14 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -96,8 +105,15 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
         let actual_true = builder
             .add_expression(
                 output,
-                FunctionValueType::new(DataType::Boolean, false),
-                ExprKind::Literal(LiteralValue::Boolean(true)),
+                (FunctionValueType::new(DataType::Boolean, false)).clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::boolean(
+                        &(FunctionValueType::new(DataType::Boolean, false)),
+                        true,
+                        options().constants,
+                    ),
+                ),
             )
             .unwrap();
         let conjunction = builder
@@ -127,7 +143,10 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
             .add_expression(
                 output,
                 integer.clone(),
-                ExprKind::Literal(LiteralValue::Int64(-1)),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::i64(&(integer.clone()), -1, options().constants),
+                ),
             )
             .unwrap();
         let round = call(
@@ -170,7 +189,10 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
                     .add_expression(
                         output,
                         integer.clone(),
-                        ExprKind::Literal(LiteralValue::Int64(42)),
+                        checked_constants::kind(
+                            &mut source_pools,
+                            checked_constants::i64(&(integer.clone()), 42, options().constants),
+                        ),
                     )
                     .unwrap();
                 let rand = call(
@@ -261,7 +283,7 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
         output: fragment.nodes()[&output].output.clone(),
         fields: result_fields.into_boxed_slice(),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
 }
 fn unary_root(case: UnaryCase) -> ProgramExpressionRootSite {
     ProgramExpressionRootSite::Node {

@@ -16,14 +16,14 @@
 // under the License.
 
 use super::*;
+use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
-    BinaryOperator, BoundFunction, Distribution, ExprKind, FragmentBuilder, FragmentId,
-    FragmentSink, FunctionArgumentEvaluation, FunctionArgumentType, FunctionFailureBehavior,
-    FunctionId, FunctionIntrinsicRowError, FunctionKind, FunctionOverloadId, FunctionVolatility,
-    JoinDistribution, JoinKey, JoinKind, LiteralValue, NodeKind, OutputPort,
-    PhysicalExpressionRoots, PhysicalNode, PhysicalProperties, PipelineDopDomain, RowMultiplicity,
-    ValueOrigin, ValueType,
+    BinaryOperator, BoundFunction, Distribution, ExprKind, FragmentId, FragmentSink,
+    FunctionArgumentEvaluation, FunctionArgumentType, FunctionFailureBehavior, FunctionId,
+    FunctionIntrinsicRowError, FunctionKind, FunctionOverloadId, FunctionVolatility,
+    JoinDistribution, JoinKey, JoinKind, NodeKind, OutputPort, PhysicalExpressionRoots,
+    PhysicalNode, PhysicalProperties, PipelineDopDomain, RowMultiplicity, ValueOrigin, ValueType,
 };
 use novarocks_type_contract::{DecimalOverflowPolicy, control_argument_semantics};
 use std::sync::Mutex;
@@ -129,20 +129,8 @@ fn binary_fixture() -> (Fragment, PhysicalRootUses) {
     let mut builder = FragmentBuilder::new(FragmentId::new(701));
     let node = builder.reserve_node_id().unwrap();
     let ty = ValueType::new(DataType::Boolean, false);
-    let left = builder
-        .add_expression(
-            node,
-            ty.clone(),
-            ExprKind::Literal(LiteralValue::Boolean(true)),
-        )
-        .unwrap();
-    let right = builder
-        .add_expression(
-            node,
-            ty.clone(),
-            ExprKind::Literal(LiteralValue::Boolean(false)),
-        )
-        .unwrap();
+    let left = builder.constant(node, ty.clone(), checked::boolean(true));
+    let right = builder.constant(node, ty.clone(), checked::boolean(false));
     let root = builder
         .add_expression(
             node,
@@ -244,13 +232,11 @@ fn typed_control_roundtrip_preserves_presence_and_ordered_children() {
 }
 
 fn boolean(builder: &mut FragmentBuilder, node: NodeId, value: bool) -> ExprId {
-    builder
-        .add_expression(
-            node,
-            ValueType::new(DataType::Boolean, false),
-            ExprKind::Literal(LiteralValue::Boolean(value)),
-        )
-        .unwrap()
+    builder.constant(
+        node,
+        ValueType::new(DataType::Boolean, false),
+        checked::boolean(value),
+    )
 }
 fn leaf_root_uses(fragment: &Fragment) -> PhysicalRootUses {
     let sites = PhysicalExpressionRoots::try_new(fragment, &Control::default()).unwrap();
@@ -264,7 +250,7 @@ fn leaf_root_uses(fragment: &Fragment) -> PhysicalRootUses {
             // This fixture deliberately contains only literal/value leaves.
             assert!(matches!(
                 fragment.expressions().get(root.expr).unwrap().kind,
-                ExprKind::Literal(_) | ExprKind::Value(_)
+                ExprKind::Constant(_) | ExprKind::Value(_)
             ));
             let id = ordinal as u32;
             bindings.push((*site, ExpressionUseId::new(id)));

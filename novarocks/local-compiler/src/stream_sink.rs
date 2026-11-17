@@ -30,7 +30,7 @@ use novarocks_type_contract::{
 };
 use novarocks_types::SlotId;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
 
@@ -482,20 +482,16 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         work,
     )
     .map_err(crate::creation::argument_types_failure)?;
-    let arena = ImmutableExpressions::try_new_for_compile(
-        nodes,
-        false,
-        HashMap::new(),
-        None,
-        work.control(),
-    )
-    .map_err(|error| match error {
-        ExpressionsCompileError::Control(cause) => FragmentCompileError::Control(cause),
-        error => FragmentCompileError::Owner {
-            phase: "sink expressions",
-            error: novarocks_failure_contract::SharedFailureCause::new(error),
-        },
-    })?;
+    let arena =
+        ImmutableExpressions::try_new_for_compile(nodes, work.control()).map_err(|error| {
+            match error {
+                ExpressionsCompileError::Control(cause) => FragmentCompileError::Control(cause),
+                error => FragmentCompileError::Owner {
+                    phase: "sink expressions",
+                    error: novarocks_failure_contract::SharedFailureCause::new(error),
+                },
+            }
+        })?;
     let definitions = arena.nodes().len();
     let arena = Arc::new(arena);
     let (flow, roots, slots) = read_flow(

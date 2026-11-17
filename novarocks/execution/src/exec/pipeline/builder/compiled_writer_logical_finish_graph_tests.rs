@@ -31,6 +31,9 @@ mod logical_finish_graph {
     /// original value, expression, call request, pool and result declaration
     /// retains its original owner; no LocalProgram is edited or reconstructed.
     fn logical_package(original: p::FragmentPackage) -> p::FragmentPackage {
+        let fixture_sources =
+            crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
         let fragment = original.fragment();
         let summary_node = p::NodeId::new(
             fragment
@@ -47,24 +50,33 @@ mod logical_finish_graph {
             p::ValueId::new(902),
             p::ValueId::new(903),
         );
-        let mut builder = p::FragmentBuilder::new(fragment.id());
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                fragment.id(),
+                &fixture_sources,
+            );
         for value in fragment.values().values() {
             builder.insert_value(value.clone()).unwrap();
         }
         for (_, expression) in fragment.expressions().iter() {
             builder.insert_expression(expression.clone()).unwrap();
         }
-        let imports = source.values().iter().copied().map(|source_value| {
-            builder
-                .add_value(
-                    ty(DataType::Int64, false),
-                    p::ValueOrigin::ExchangeImport {
-                        edge: SUMMARY_EDGE,
-                        source_value,
-                    },
-                )
-                .unwrap()
-        }).collect::<Vec<_>>();
+        let imports = source
+            .values()
+            .iter()
+            .copied()
+            .map(|source_value| {
+                builder
+                    .add_value(
+                        ty(DataType::Int64, false),
+                        p::ValueOrigin::ExchangeImport {
+                            edge: SUMMARY_EDGE,
+                            source_value,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
         let destination = p::SummaryColumns::write_counts(imports[0], imports[1], imports[2]);
         for node in fragment.nodes().values() {
             let mut node = node.clone();
@@ -89,7 +101,9 @@ mod logical_finish_graph {
                 summary_node,
                 SUMMARY_EDGE,
                 source
-                    .values().iter().copied()
+                    .values()
+                    .iter()
+                    .copied()
                     .zip(destination.values().iter().copied())
                     .collect(),
                 destination.values().into(),
@@ -118,6 +132,9 @@ mod logical_finish_graph {
                 &FixtureControl,
             )
             .unwrap();
+        let (fragment, sources) = fragment.into_parts();
+        let mut constants = original.constants().clone();
+        crate::exec::operators::family_fixture::constant_sources::merge(&mut constants, &sources);
         let (uses, calls) = freeze(&fragment, &theta_catalog());
         let mut cuts = original.cuts().clone();
         let mut inbound = cuts.inbound.into_vec();
@@ -127,7 +144,9 @@ mod logical_finish_graph {
             source_fragment: p::FragmentId::new(77),
             destination_node: summary_node,
             imports: source
-                .values().iter().copied()
+                .values()
+                .iter()
+                .copied()
                 .zip(destination.values().iter().copied())
                 .map(|(source, destination)| p::CutImport {
                     source: p::CutValue {
@@ -154,7 +173,7 @@ mod logical_finish_graph {
         cuts.inbound = inbound.into();
         p::FragmentPackage::try_new(
             p::FragmentPackageInput {
-                constants: original.constants().clone(),
+                constants,
                 version: original.version(),
                 required: original.required(),
                 fragment,
@@ -260,7 +279,10 @@ mod logical_finish_graph {
             .exchange_inputs()
             .iter()
             .find(|(_, input)| {
-                input.role == novarocks_local_program::ProgramOutputRole::Summary(novarocks_result_contract::SummaryKind::WriteCounts)
+                input.role
+                    == novarocks_local_program::ProgramOutputRole::Summary(
+                        novarocks_result_contract::SummaryKind::WriteCounts,
+                    )
             })
             .unwrap();
         let summary_node = i32::try_from(summary_input.receiver_node).unwrap();
@@ -467,7 +489,11 @@ mod logical_finish_graph {
             .bind_finish(
                 root_of(&compiled.finish),
                 TableFinishRuntimeBinding::new(Arc::new(AcceptCarriers))
-                    .with_summary(novarocks_result_contract::SummaryKind::WriteCounts, summary_node, Arc::from([summary_stream.source()]))
+                    .with_summary(
+                        novarocks_result_contract::SummaryKind::WriteCounts,
+                        summary_node,
+                        Arc::from([summary_stream.source()]),
+                    )
                     .unwrap(),
             )
             .unwrap();

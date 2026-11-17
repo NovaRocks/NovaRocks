@@ -48,7 +48,7 @@ fn fixture_expression_uses(fragment: &Fragment) -> PhysicalRootUses {
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
         let definition = fragment.expressions().get(root.expr).unwrap();
         match &definition.kind {
-            ExprKind::Literal(_) | ExprKind::Value(_) => {}
+            ExprKind::Constant(_) | ExprKind::Value(_) => {}
             ExprKind::FunctionCall { function, args } => {
                 // This fixture declares only the exact zero-argument Eager
                 // call below; legacy bits are never a general control fallback.
@@ -193,7 +193,7 @@ fn intrinsic_reference(id: u32) -> SemanticParameterRef {
 
 fn fixture_plan_parameters(plan: &PhysicalPlan, parameters: SemanticParameters) -> PhysicalPlan {
     let plan = crate::plan::PhysicalPlanParts {
-        constants: crate::ConstantPools::empty(),
+        constants: plan.constants().clone(),
         parameters,
         version: plan.version(),
         fragments: plan.fragments().clone(),
@@ -229,16 +229,20 @@ fn extract(
     )
 }
 
-fn package_input(fragment: Fragment) -> FragmentPackageInput {
+fn package_input(
+    fragment: Fragment,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> FragmentPackageInput {
     let expression_uses = fixture_expression_uses(&fragment);
     let calls = fixture_calls(&fragment, &expression_uses);
-    package_input_with_controls(fragment, expression_uses, calls)
+    package_input_with_controls(fragment, expression_uses, calls, fixture_constants)
 }
 
 pub(super) fn package_input_with_controls(
     fragment: Fragment,
     expression_uses: PhysicalRootUses,
     calls: FrozenFragmentCalls,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> FragmentPackageInput {
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), Vec::new(), &Control).unwrap();
     let parameters = SemanticParameters::try_new(
@@ -256,7 +260,7 @@ pub(super) fn package_input_with_controls(
     )
     .unwrap();
     FragmentPackageInput {
-        constants: crate::ConstantPools::empty(),
+        constants: fixture_constants.for_fragment(&fragment),
         version: version(),
         required: RequiredContracts::default(),
         expression_uses,
@@ -275,10 +279,16 @@ pub(super) fn package_input_with_controls(
 
 #[test]
 fn extraction_requires_exact_expression_control_fragment_coverage() {
-    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, _) = literal_fragment(
+        FragmentId::new(81),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let controls = fixture_controls(&plan);
     let calls = fixture_call_tables(&plan, &controls);
     let parameters = SemanticParameters::default();
@@ -303,7 +313,12 @@ fn extraction_requires_exact_expression_control_fragment_coverage() {
         extract_with(&BTreeMap::new()).unwrap_err(),
         FragmentPackageExtractionError::MissingExpressionUses(fragment.id())
     );
-    let (extra_fragment, _) = literal_fragment(FragmentId::new(82), FragmentSink::Noop, false);
+    let (extra_fragment, _) = literal_fragment(
+        FragmentId::new(82),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
     let mut extra = controls;
     extra.insert(
         extra_fragment.id(),
@@ -317,10 +332,16 @@ fn extraction_requires_exact_expression_control_fragment_coverage() {
 
 #[test]
 fn extraction_requires_explicit_pruning_table_for_every_fragment() {
-    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, _) = literal_fragment(
+        FragmentId::new(81),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let controls = fixture_controls(&plan);
     let calls = fixture_call_tables(&plan, &controls);
     let parameters = SemanticParameters::default();
@@ -360,9 +381,15 @@ fn extraction_requires_explicit_pruning_table_for_every_fragment() {
 
 #[test]
 fn package_and_extraction_reject_pruning_table_fragment_identity_mismatch() {
-    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, _) = literal_fragment(
+        FragmentId::new(81),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
     let wrong = FrozenFragmentPruning::try_new(FragmentId::new(82), Vec::new(), &Control).unwrap();
-    let mut input = package_input(fragment.clone());
+    let mut input = package_input(fragment.clone(), &mut fixture_constants);
     input.pruning = wrong.clone();
     assert_eq!(
         FragmentPackage::try_new(input, package_admission(), &Control).unwrap_err(),
@@ -370,7 +397,7 @@ fn package_and_extraction_reject_pruning_table_fragment_identity_mismatch() {
     );
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let controls = fixture_controls(&plan);
     let calls = fixture_call_tables(&plan, &controls);
     // The map key is correct; the table's own exact fragment identity is not.
@@ -395,21 +422,23 @@ fn package_and_extraction_reject_pruning_table_fragment_identity_mismatch() {
     );
 }
 
-fn binary_control_fixture() -> (Fragment, PhysicalRootUses, ExprId, ExprId, ExprId) {
+fn binary_control_fixture(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (Fragment, PhysicalRootUses, ExprId, ExprId, ExprId) {
     let mut builder = FragmentBuilder::new(FragmentId::new(83));
     let node = builder.reserve_node_id().unwrap();
     let left = builder
         .add_expression(
             node,
-            ty(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Int64(11)),
+            (ty(DataType::Int64, false)).clone(),
+            fixture_constants.i64(11, &(ty(DataType::Int64, false))),
         )
         .unwrap();
     let right = builder
         .add_expression(
             node,
-            ty(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Int64(22)),
+            (ty(DataType::Int64, false)).clone(),
+            fixture_constants.i64(22, &(ty(DataType::Int64, false))),
         )
         .unwrap();
     let root = builder
@@ -520,10 +549,16 @@ fn binary_control_fixture() -> (Fragment, PhysicalRootUses, ExprId, ExprId, Expr
 
 #[test]
 fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids() {
-    let (original, uses, root, left, right) = binary_control_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (original, uses, root, left, right) = binary_control_fixture(&mut fixture_constants);
     let calls = fixture_calls(&original, &uses);
     FragmentPackage::try_new(
-        package_input_with_controls(original.clone(), uses.clone(), calls.clone()),
+        package_input_with_controls(
+            original.clone(),
+            uses.clone(),
+            calls.clone(),
+            &mut fixture_constants,
+        ),
         package_admission(),
         &Control,
     )
@@ -549,7 +584,7 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
             1 => {
                 let mut condition = expressions.get(left).unwrap().clone();
                 condition.ty = ty(DataType::Boolean, false);
-                condition.kind = ExprKind::Literal(LiteralValue::Boolean(true));
+                condition.kind = fixture_constants.boolean(true, &condition.ty);
                 expressions.insert(condition);
                 let mut root_definition = expressions.get(root).unwrap().clone();
                 root_definition.ty = ty(DataType::Int64, true);
@@ -591,7 +626,12 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
         assert_eq!(changed.expressions().len(), original.expressions().len());
         assert_eq!(
             FragmentPackage::try_new(
-                package_input_with_controls(changed, uses.clone(), calls.clone()),
+                package_input_with_controls(
+                    changed,
+                    uses.clone(),
+                    calls.clone(),
+                    &mut fixture_constants
+                ),
                 package_admission(),
                 &Control,
             )
@@ -620,11 +660,17 @@ impl PureCompileControl for FailureControl {
 
 #[test]
 fn package_and_extraction_keep_typed_control_failures_before_and_during_validation() {
-    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
-    let input = package_input(fragment.clone());
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, _) = literal_fragment(
+        FragmentId::new(81),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
+    let input = package_input(fragment.clone(), &mut fixture_constants);
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let controls = fixture_controls(&plan);
     let calls = fixture_call_tables(&plan, &controls);
     for failure in [
@@ -677,7 +723,13 @@ fn package_and_extraction_keep_typed_control_failures_before_and_during_validati
 
 #[test]
 fn package_control_checks_correspondence_without_claiming_literal_content_identity() {
-    let (original, _) = literal_fragment(FragmentId::new(84), FragmentSink::Noop, false);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (original, _) = literal_fragment(
+        FragmentId::new(84),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
     let checked = fixture_expression_uses(&original);
     let calls = fixture_calls(&original, &checked);
     let mut expressions = original.expressions().clone();
@@ -685,11 +737,23 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
         unreachable!();
     };
     let mut literal = expressions.get(rows[0][0]).unwrap().clone();
-    assert!(matches!(
-        literal.kind,
-        ExprKind::Literal(LiteralValue::Int64(11))
-    ));
-    literal.kind = ExprKind::Literal(LiteralValue::Int64(22));
+    let ExprKind::Constant(original_reference) = literal.kind else {
+        panic!("expected checked constant")
+    };
+    let mut work =
+        novarocks_type_contract::CompileCheckpoints::try_new(&Control, CompilePhase::Validate)
+            .unwrap();
+    assert_eq!(
+        fixture_constants
+            .pools()
+            .resolve_observed(original_reference, &literal.ty, &mut work)
+            .unwrap()
+            .try_i64()
+            .unwrap(),
+        Some(11)
+    );
+    work.finish().unwrap();
+    literal.kind = fixture_constants.i64(22, &literal.ty);
     expressions.insert(literal);
     let changed = Fragment::from(FragmentParts {
         summaries: Box::default(),
@@ -706,7 +770,12 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
     });
     validate_fragment_definition(&changed).unwrap();
     let package = FragmentPackage::try_new(
-        package_input_with_controls(changed.clone(), checked.clone(), calls.clone()),
+        package_input_with_controls(
+            changed.clone(),
+            checked.clone(),
+            calls.clone(),
+            &mut fixture_constants,
+        ),
         package_admission(),
         &Control,
     )
@@ -714,10 +783,15 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
     assert_eq!(package.fragment(), &changed);
     assert_eq!(package.expression_uses(), &checked);
 
-    let (other, _) = literal_fragment(FragmentId::new(85), FragmentSink::Noop, false);
+    let (other, _) = literal_fragment(
+        FragmentId::new(85),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
     assert_eq!(
         FragmentPackage::try_new(
-            package_input_with_controls(other, checked, calls),
+            package_input_with_controls(other, checked, calls, &mut fixture_constants),
             package_admission(),
             &Control
         )
@@ -728,12 +802,13 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
 
 #[test]
 fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_type_contract::{GuardKind, RegionGuard};
-    let (original, _, root, left, right) = binary_control_fixture();
+    let (original, _, root, left, right) = binary_control_fixture(&mut fixture_constants);
     let mut expressions = original.expressions().clone();
     let mut condition = expressions.get(left).unwrap().clone();
     condition.ty = ty(DataType::Boolean, false);
-    condition.kind = ExprKind::Literal(LiteralValue::Boolean(true));
+    condition.kind = fixture_constants.boolean(true, &condition.ty);
     expressions.insert(condition);
     let mut result = expressions.get(root).unwrap().clone();
     result.ty = ty(DataType::Int64, true);
@@ -866,7 +941,7 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
     .unwrap();
     let calls = fixture_calls(&fragment, &uses);
     let package = FragmentPackage::try_new(
-        package_input_with_controls(fragment, uses.clone(), calls),
+        package_input_with_controls(fragment, uses.clone(), calls, &mut fixture_constants),
         package_admission(),
         &Control,
     )
@@ -1012,6 +1087,7 @@ fn public_read(
 
 #[test]
 fn package_extracts_metadata_without_losing_public_scan_facts() {
+    let fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let binding = connector_binding();
     let column = ProviderColumnReference {
         column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 7),
@@ -1027,7 +1103,7 @@ fn package_extracts_metadata_without_losing_public_scan_facts() {
         key: "statistics.row_count".into(),
         value: "17".into(),
     });
-    let plan = builder.finish().unwrap();
+    let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let parameters = SemanticParameters::default();
     let scans = BTreeMap::from([(ProviderReadOccurrenceId::new(0), scan.clone())]);
     let packages = extract(&plan, &scans, &parameters, &BTreeMap::new()).unwrap();
@@ -1053,6 +1129,7 @@ fn package_extracts_metadata_without_losing_public_scan_facts() {
 
 #[test]
 fn explicit_empty_pruning_table_keeps_actual_scan_and_provider_domains() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_connector_contract::{ConnectorValue, Domain};
     let binding = connector_binding();
     let column = ProviderColumnReference {
@@ -1083,7 +1160,7 @@ fn explicit_empty_pruning_table_keeps_actual_scan_and_provider_domains() {
     )
     .unwrap();
     let read = public_read(&fragment, fragment.root(), frozen).unwrap();
-    let mut input = package_input(fragment.clone());
+    let mut input = package_input(fragment.clone(), &mut fixture_constants);
     let uses = input.expression_uses.clone();
     assert!(input.pruning.witnesses().is_empty());
     input.scans.insert(fragment.root(), read.clone());
@@ -1100,7 +1177,7 @@ fn explicit_empty_pruning_table_keeps_actual_scan_and_provider_domains() {
     // they establish neither implication nor runtime pruning permission.
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let packages = extract(
         &plan,
         &BTreeMap::from([(ProviderReadOccurrenceId::new(0), read)]),
@@ -1128,12 +1205,13 @@ fn explicit_empty_pruning_table_keeps_actual_scan_and_provider_domains() {
 
 #[test]
 fn package_refuses_missing_or_wrong_scan_node_facts() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let binding = connector_binding();
     let column = ProviderColumnReference {
         column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 7),
     };
     let fragment = finish_scan_relation(metadata_relation(&binding, column)).unwrap();
-    let mut input = package_input(fragment.clone());
+    let mut input = package_input(fragment.clone(), &mut fixture_constants);
     assert!(
         FragmentPackage::try_new(input.clone(), package_admission(), &Control)
             .unwrap_err()
@@ -1155,6 +1233,7 @@ fn package_refuses_missing_or_wrong_scan_node_facts() {
 
 #[test]
 fn package_refuses_complete_public_source_drift() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_connector_contract::*;
     let binding = connector_binding();
     let column = ProviderColumnReference {
@@ -1229,7 +1308,7 @@ fn package_refuses_complete_public_source_drift() {
         )
         .unwrap();
         let scan = FrozenConnectorRead::try_new(original.scan().clone(), public).unwrap();
-        let mut input = package_input(fragment.clone());
+        let mut input = package_input(fragment.clone(), &mut fixture_constants);
         input.scans.insert(fragment.root(), scan);
         assert!(
             FragmentPackage::try_new(input, package_admission(), &Control).is_err(),
@@ -1240,6 +1319,7 @@ fn package_refuses_complete_public_source_drift() {
 
 #[test]
 fn package_refuses_exact_relation_and_batch_contract_drift() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let binding = connector_binding();
     let column = ProviderColumnReference {
         column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 7),
@@ -1286,7 +1366,7 @@ fn package_refuses_exact_relation_and_batch_contract_drift() {
             assert!(malformed.is_err());
             continue;
         }
-        let mut input = package_input(fragment.clone());
+        let mut input = package_input(fragment.clone(), &mut fixture_constants);
         input.scans.insert(fragment.root(), malformed.unwrap());
         assert!(
             FragmentPackage::try_new(input, package_admission(), &Control).is_err(),
@@ -1297,8 +1377,10 @@ fn package_refuses_exact_relation_and_batch_contract_drift() {
 
 #[test]
 fn result_and_annotation_facts_are_checked_at_the_local_boundary() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let id = FragmentId::new(81);
-    let (fragment, value) = literal_fragment(id, FragmentSink::Result, false);
+    let (fragment, value) =
+        literal_fragment(id, FragmentSink::Result, false, &mut fixture_constants);
     let field = ResultField {
         domain: crate::ResultValueDomain::Plain,
         name: "v".into(),
@@ -1306,7 +1388,7 @@ fn result_and_annotation_facts_are_checked_at_the_local_boundary() {
         value,
         ty: fragment.values()[&value].ty.clone(),
     };
-    let mut input = package_input(fragment.clone());
+    let mut input = package_input(fragment.clone(), &mut fixture_constants);
     assert!(FragmentPackage::try_new(input.clone(), package_admission(), &Control).is_err());
     input.result = Some(ResultPort {
         scalar_schema: None,
@@ -1340,11 +1422,18 @@ fn result_and_annotation_facts_are_checked_at_the_local_boundary() {
     );
 }
 
-// These legacy fixtures have no checked backing. Compare every owned fact;
-// adding a backing must explicitly migrate this fixture's comparison.
+// Compare every owned fact and each original checked backing identity.
+// Equal addresses alone do not establish equality across different pools.
 fn assert_no_constant_package_equal(left: &FragmentPackage, right: &FragmentPackage) {
-    assert!(left.constants().entries().is_empty());
-    assert!(right.constants().entries().is_empty());
+    assert_eq!(
+        left.constants().entries().keys().collect::<Vec<_>>(),
+        right.constants().entries().keys().collect::<Vec<_>>()
+    );
+    for (id, pool) in left.constants().entries() {
+        let other = &right.constants().entries()[id];
+        assert_eq!(pool.backing_identity(), other.backing_identity());
+        assert_eq!(pool.value_type(), other.value_type());
+    }
     assert_eq!(left.version(), right.version());
     assert_eq!(left.required(), right.required());
     assert_eq!(left.fragment(), right.fragment());
@@ -1361,10 +1450,16 @@ fn assert_no_constant_package_equal(left: &FragmentPackage, right: &FragmentPack
 
 #[test]
 fn remote_plan_statistics_do_not_grow_a_fragment_package() {
-    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, _) = literal_fragment(
+        FragmentId::new(81),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
-    let before = builder.finish().unwrap();
+    let before = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
     builder.add_annotation(PlanAnnotation {
@@ -1372,7 +1467,7 @@ fn remote_plan_statistics_do_not_grow_a_fragment_package() {
         key: "optimizer.table_statistics".into(),
         value: "remote table statistics".repeat(100).into(),
     });
-    let after = builder.finish().unwrap();
+    let after = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let parameters = SemanticParameters::default();
     let before_packages =
         extract(&before, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap();
@@ -1389,8 +1484,14 @@ fn remote_plan_statistics_do_not_grow_a_fragment_package() {
 
 #[test]
 fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
-    let (fragment, filter, second) =
-        super::contract_regressions::scan_lineage_filter(false, false, false, true);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, filter, second) = super::contract_regressions::scan_lineage_filter(
+        false,
+        false,
+        false,
+        true,
+        &mut fixture_constants,
+    );
     let scan_id = filter.consumers[0].endpoint.node;
     let second = second.unwrap();
     let mut nodes = fragment.nodes().clone();
@@ -1446,7 +1547,7 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
             .collect(),
     )
     .unwrap();
-    let mut input = package_input(fragment.clone());
+    let mut input = package_input(fragment.clone(), &mut fixture_constants);
     input.cuts = FragmentCuts {
         runtime_filter_bindings: single_fragment_runtime_filter_bindings(
             fragment.id(),
@@ -1485,10 +1586,19 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
 
 #[test]
 fn package_refuses_a_runtime_filter_binding_table_other_than_its_plan_slice() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let plan = super::runtime_filter_binding_contract::numbered_plan();
     let fragment = plan.fragments()[&FragmentId::new(412)].clone();
-    let mut input = package_input(fragment.clone());
+    let mut input = package_input(fragment.clone(), &mut fixture_constants);
     input.cuts = fragment_cuts(&plan, fragment.id()).unwrap();
+    let mut constant_work =
+        novarocks_type_contract::CompileCheckpoints::try_new(&Control, CompilePhase::Validate)
+            .unwrap();
+    input.constants = plan
+        .constants()
+        .project_fragment_observed(&fragment, &mut constant_work)
+        .unwrap();
+    constant_work.finish().unwrap();
     let package = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     assert_eq!(
         package.cuts().runtime_filter_bindings,
@@ -1624,6 +1734,7 @@ fn parameter_occurrences_fragment(reference: SemanticParameterRef, occurrences: 
 
 #[test]
 fn package_and_observed_plan_require_original_static_requests_and_keep_first_control_cause() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let source = parameter_fragment(SemanticParameterRef {
         id: SemanticParameterId::new(7),
         expected_key: SemanticParameterKey::TimeZone,
@@ -1632,7 +1743,7 @@ fn package_and_observed_plan_require_original_static_requests_and_keep_first_con
     let mut parts = source.into_parts();
     parts.call_requests = crate::FragmentCallRequests::unpublished_empty(parts.id);
     let fragment = Fragment::from(parts);
-    let mut input = package_input(fragment.clone());
+    let mut input = package_input(fragment.clone(), &mut fixture_constants);
     input.parameters = SemanticParameters::try_new([(
         SemanticParameterId::new(7),
         SemanticParameterValue::TimeZone("UTC".into()),
@@ -1714,10 +1825,16 @@ fn package_and_observed_plan_require_original_static_requests_and_keep_first_con
 
 #[test]
 fn extraction_requires_frozen_call_table_for_every_fragment_even_without_calls() {
-    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, _) = literal_fragment(
+        FragmentId::new(81),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let controls = fixture_controls(&plan);
     let calls = fixture_call_tables(&plan, &controls);
     let parameters = SemanticParameters::default();
@@ -1740,7 +1857,12 @@ fn extraction_requires_frozen_call_table_for_every_fragment_even_without_calls()
         extract_with(&BTreeMap::new()).unwrap_err(),
         FragmentPackageExtractionError::MissingCalls(fragment.id())
     );
-    let (extra_fragment, _) = literal_fragment(FragmentId::new(82), FragmentSink::Noop, false);
+    let (extra_fragment, _) = literal_fragment(
+        FragmentId::new(82),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
     let extra_uses = fixture_expression_uses(&extra_fragment);
     let mut extra = calls;
     extra.insert(
@@ -1755,17 +1877,28 @@ fn extraction_requires_frozen_call_table_for_every_fragment_even_without_calls()
 
 #[test]
 fn package_empty_noncall_table_cannot_substitute_for_an_actual_call_occurrence() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let reference = SemanticParameterRef {
         id: SemanticParameterId::new(7),
         expected_key: SemanticParameterKey::TimeZone,
     };
     let fragment = parameter_fragment(reference);
     let uses = fixture_expression_uses(&fragment);
-    let (literal, _) = literal_fragment(fragment.id(), FragmentSink::Noop, false);
+    let (literal, _) = literal_fragment(
+        fragment.id(),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
     let literal_uses = fixture_expression_uses(&literal);
     let empty_calls = fixture_calls(&literal, &literal_uses);
     let empty = FragmentPackage::try_new(
-        package_input_with_controls(literal, literal_uses, empty_calls.clone()),
+        package_input_with_controls(
+            literal,
+            literal_uses,
+            empty_calls.clone(),
+            &mut fixture_constants,
+        ),
         package_admission(),
         &Control,
     )
@@ -1773,7 +1906,7 @@ fn package_empty_noncall_table_cannot_substitute_for_an_actual_call_occurrence()
     assert!(empty.calls().entries().is_empty());
     assert_eq!(
         FragmentPackage::try_new(
-            package_input_with_controls(fragment, uses, empty_calls),
+            package_input_with_controls(fragment, uses, empty_calls, &mut fixture_constants),
             package_admission(),
             &Control
         )
@@ -1827,6 +1960,7 @@ fn parameter_calls_with_references(
 
 #[test]
 fn package_preserves_same_key_different_lexical_references_for_shared_definition_uses() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let first = SemanticParameterRef {
         id: SemanticParameterId::new(7),
         expected_key: SemanticParameterKey::TimeZone,
@@ -1841,7 +1975,12 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
     assert_eq!(contexts[0].definition, contexts[1].definition);
     assert_ne!(contexts[0].context.use_id, contexts[1].context.use_id);
     let calls = parameter_calls_with_references(&fragment, &uses, &[first, second]);
-    let mut input = package_input_with_controls(fragment.clone(), uses.clone(), calls.clone());
+    let mut input = package_input_with_controls(
+        fragment.clone(),
+        uses.clone(),
+        calls.clone(),
+        &mut fixture_constants,
+    );
     input.parameters = SemanticParameters::try_new([
         (first.id, SemanticParameterValue::TimeZone("UTC".into())),
         (
@@ -1925,6 +2064,7 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
 
 #[test]
 fn frozen_call_environment_is_the_only_package_dependency_authority() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let legacy = SemanticParameterRef {
         id: SemanticParameterId::new(7),
         expected_key: SemanticParameterKey::TimeZone,
@@ -1936,7 +2076,12 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
     let fragment = parameter_fragment(legacy);
     let uses = fixture_expression_uses(&fragment);
     let calls = parameter_calls_with_references(&fragment, &uses, &[active]);
-    let mut input = package_input_with_controls(fragment.clone(), uses.clone(), calls.clone());
+    let mut input = package_input_with_controls(
+        fragment.clone(),
+        uses.clone(),
+        calls.clone(),
+        &mut fixture_constants,
+    );
     input.parameters = SemanticParameters::try_new([(
         active.id,
         SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
@@ -2083,8 +2228,14 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
 
 #[test]
 fn package_cannot_carry_whole_plan_display_annotations() {
-    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
-    let mut input = package_input(fragment);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, _) = literal_fragment(
+        FragmentId::new(81),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
+    let mut input = package_input(fragment, &mut fixture_constants);
     input.annotations = Box::from([PlanAnnotation {
         subject: AnnotationSubject::Plan,
         key: "optimizer.table_statistics".into(),
@@ -2095,12 +2246,14 @@ fn package_cannot_carry_whole_plan_display_annotations() {
 
 #[test]
 fn writer_package_requires_the_exact_public_input_recipe() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_connector_contract::{
         ConnectorWriteBinding, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
         ConnectorWriteInputShape, ConnectorWriteRecipeDraft,
     };
     let plan = super::sink_contract::finish_router_writer_plan(
         super::sink_contract::RouterWriterShape::Valid,
+        &mut fixture_constants,
     )
     .unwrap();
     let fragment = plan.fragments()[&FragmentId::new(722)].clone();
@@ -2135,7 +2288,7 @@ fn writer_package_requires_the_exact_public_input_recipe() {
         },
     )
     .unwrap();
-    let mut input = package_input(fragment.clone());
+    let mut input = package_input(fragment.clone(), &mut fixture_constants);
     input.cuts = fragment_cuts(&plan, fragment.id()).unwrap();
     assert!(
         FragmentPackage::try_new(input.clone(), package_admission(), &Control)
@@ -2189,6 +2342,7 @@ fn writer_package_requires_the_exact_public_input_recipe() {
 
 #[test]
 fn writer_package_separates_declared_value_binding_from_provider_dictionary_facts() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_connector_contract::{
         ConnectorWriteBinding, ConnectorWriteFieldBinding, ConnectorWriteInputShape,
         ConnectorWriteRecipeDraft,
@@ -2208,6 +2362,7 @@ fn writer_package_separates_declared_value_binding_from_provider_dictionary_fact
     };
     let plan = super::sink_contract::finish_router_writer_plan(
         super::sink_contract::RouterWriterShape::Valid,
+        &mut fixture_constants,
     )
     .unwrap();
     let original = &plan.fragments()[&FragmentId::new(722)];
@@ -2239,7 +2394,7 @@ fn writer_package_separates_declared_value_binding_from_provider_dictionary_fact
         runtime_filters: original.runtime_filters().into(),
         call_requests: original.call_requests().clone(),
     });
-    let mut input = package_input(fragment);
+    let mut input = package_input(fragment, &mut fixture_constants);
     input.cuts = fragment_cuts(&plan, original.id()).unwrap();
     for cut in &mut input.cuts.inbound {
         for import in &mut cut.imports {
@@ -2284,6 +2439,7 @@ fn writer_package_separates_declared_value_binding_from_provider_dictionary_fact
 
 #[test]
 fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identity() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
 
     let reference = SemanticParameterRef {
@@ -2302,7 +2458,12 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
         SemanticParameterValue::TimeZone("UTC".into()),
     )])
     .unwrap();
-    let mut input = package_input_with_controls(fragment.clone(), uses.clone(), calls.clone());
+    let mut input = package_input_with_controls(
+        fragment.clone(),
+        uses.clone(),
+        calls.clone(),
+        &mut fixture_constants,
+    );
     input.parameters = parameters.clone();
     let checked = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     assert_eq!(checked.calls(), &calls);
@@ -2328,21 +2489,23 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
     assert_no_constant_package_equal(&packages[&fragment.id()], &checked);
 }
 
-fn intrinsic_package_fixture() -> FragmentPackageInput {
+fn intrinsic_package_fixture(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> FragmentPackageInput {
     let mut builder = FragmentBuilder::new(FragmentId::new(91));
     let node = builder.reserve_node_id().unwrap();
     let left = builder
         .add_expression(
             node,
-            ty(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Int64(4)),
+            (ty(DataType::Int64, false)).clone(),
+            fixture_constants.i64(4, &(ty(DataType::Int64, false))),
         )
         .unwrap();
     let right = builder
         .add_expression(
             node,
-            ty(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Int64(2)),
+            (ty(DataType::Int64, false)).clone(),
+            fixture_constants.i64(2, &(ty(DataType::Int64, false))),
         )
         .unwrap();
     let arithmetic = builder
@@ -2441,7 +2604,7 @@ fn intrinsic_package_fixture() -> FragmentPackageInput {
     )
     .unwrap();
     let calls = FrozenFragmentCalls::try_new(&fragment, &uses, Vec::new(), &Control).unwrap();
-    let mut input = package_input_with_controls(fragment, uses, calls);
+    let mut input = package_input_with_controls(fragment, uses, calls, fixture_constants);
     input.parameters = SemanticParameters::try_new([
         (
             SemanticParameterId::new(0),
@@ -2458,7 +2621,8 @@ fn intrinsic_package_fixture() -> FragmentPackageInput {
 
 #[test]
 fn intrinsic_arithmetic_and_cast_use_the_only_plan_table_with_sparse_false_true_scopes() {
-    let input = intrinsic_package_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let input = intrinsic_package_fixture(&mut fixture_constants);
     let checked = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     assert_eq!(
         checked
@@ -2477,7 +2641,7 @@ fn intrinsic_arithmetic_and_cast_use_the_only_plan_table_with_sparse_false_true_
     let mut builder =
         PlanBuilder::new(version()).with_semantic_parameters(input.parameters.clone());
     builder.add_fragment(input.fragment).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let packages = extract_fragment_packages(
         &plan,
         &BTreeMap::new(),
@@ -2494,7 +2658,8 @@ fn intrinsic_arithmetic_and_cast_use_the_only_plan_table_with_sparse_false_true_
 
 #[test]
 fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values() {
-    let input = intrinsic_package_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let input = intrinsic_package_fixture(&mut fixture_constants);
     let mut missing = input.clone();
     missing.parameters = SemanticParameters::default();
     assert_eq!(
@@ -2542,7 +2707,7 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
     );
     let mut builder = PlanBuilder::new(version()).with_semantic_parameters(extra.parameters);
     builder.add_fragment(extra.fragment).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     assert_eq!(
         extract_fragment_packages(
             &plan,
@@ -2562,8 +2727,7 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
     let mut missing_plan = PlanBuilder::new(version());
     missing_plan.add_fragment(input.fragment).unwrap();
     assert!(
-        missing_plan
-            .finish()
+        crate::tests::constant_fixture::publish_plan(missing_plan, &fixture_constants)
             .unwrap_err()
             .errors()
             .iter()
@@ -2573,7 +2737,8 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
 
 #[test]
 fn intrinsic_operator_profiles_refuse_missing_extra_or_foreign_key_refs() {
-    let input = intrinsic_package_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let input = intrinsic_package_fixture(&mut fixture_constants);
     for mutation in 0..4 {
         let mut expressions = input.fragment.expressions().clone();
         let (id, mut expression) = expressions
@@ -2637,6 +2802,7 @@ fn intrinsic_operator_profiles_refuse_missing_extra_or_foreign_key_refs() {
 
 #[test]
 fn parameter_free_actual_definitions_keep_original_control_at_every_package_boundary() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let mut builder = FragmentBuilder::new(FragmentId::new(92));
     let node = builder.reserve_node_id().unwrap();
     let mut row = Vec::new();
@@ -2646,8 +2812,8 @@ fn parameter_free_actual_definitions_keep_original_control_at_every_package_boun
             builder
                 .add_expression(
                     node,
-                    ty(DataType::Int64, false),
-                    ExprKind::Literal(LiteralValue::Int64(ordinal)),
+                    (ty(DataType::Int64, false)).clone(),
+                    fixture_constants.i64(ordinal, &(ty(DataType::Int64, false))),
                 )
                 .unwrap(),
         );
@@ -2682,7 +2848,7 @@ fn parameter_free_actual_definitions_keep_original_control_at_every_package_boun
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let input = package_input(fragment);
+    let input = package_input(fragment, &mut fixture_constants);
     assert_eq!(input.fragment.expressions().len(), 320);
     assert!(input.parameters.entries().is_empty());
     struct Trace {
@@ -2798,6 +2964,7 @@ fn package_admissions(
 
 #[test]
 fn exact_signature_without_legacy_metadata_uses_fresh_frozen_package_authority() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let reference = SemanticParameterRef {
         id: SemanticParameterId::new(7),
         expected_key: SemanticParameterKey::TimeZone,
@@ -2900,7 +3067,7 @@ fn exact_signature_without_legacy_metadata_uses_fresh_frozen_package_authority()
     .unwrap();
     let uses = PhysicalRootUses::try_new(&fragment, flow, root_bindings, &Control).unwrap();
     let calls = parameter_calls_with_references(&fragment, &uses, &[reference]);
-    let mut input = package_input_with_controls(fragment, uses, calls);
+    let mut input = package_input_with_controls(fragment, uses, calls, &mut fixture_constants);
     input.parameters = SemanticParameters::try_new([(
         reference.id,
         SemanticParameterValue::TimeZone("UTC".into()),

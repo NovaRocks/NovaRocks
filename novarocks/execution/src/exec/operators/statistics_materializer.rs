@@ -68,23 +68,17 @@ const BATCH_ROWS: usize = 32;
 const BYTE_QUANTUM: usize = RootProfileV1::EMIT_BYTES_PER_TURN;
 const WORK_QUANTUM: usize = RootProfileV1::CELLS_PER_TURN;
 
-enum StatisticsLiteralSource {
+enum StatisticsConstantSource {
     #[cfg(test)]
-    Fixture(Arc<[novarocks_local_program::StaticLiteral]>),
+    Fixture(Arc<[String]>),
     Compiled(Arc<novarocks_local_program::LocalProgram>),
 }
-impl StatisticsLiteralSource {
+impl StatisticsConstantSource {
     fn blob(&self, expr: novarocks_local_program::ProgramExprId) -> Option<&str> {
         match self {
             #[cfg(test)]
-            Self::Fixture(literals) => match literals.get(expr.index())? {
-                novarocks_local_program::StaticLiteral::Utf8(value) => Some(value),
-                _ => None,
-            },
+            Self::Fixture(literals) => literals.get(expr.index()).map(String::as_str),
             Self::Compiled(program) => match program.graph().expressions().node(expr)?.kind() {
-                novarocks_local_program::StaticExprKind::Literal(
-                    novarocks_local_program::StaticLiteral::Utf8(value),
-                ) => Some(value),
                 novarocks_local_program::StaticExprKind::Constant(value) => {
                     Self::constant_blob(value)
                 }
@@ -139,7 +133,7 @@ impl StatisticsSchemaPreparation {
     }
 }
 struct Definition {
-    source: StatisticsLiteralSource,
+    source: StatisticsConstantSource,
     mappings: Vec<UnpivotValueMapping>,
     input_slots: Vec<SlotId>,
     input_ordinals: Vec<usize>,
@@ -151,7 +145,7 @@ pub(crate) struct StatisticsMaterializerFactory(Arc<Definition>);
 impl StatisticsMaterializerFactory {
     #[cfg(test)]
     fn from_test_facts(
-        literals: Arc<[novarocks_local_program::StaticLiteral]>,
+        literals: Arc<[String]>,
         value_slot: SlotId,
         literal_slots: Vec<SlotId>,
         mappings: Vec<UnpivotValueMapping>,
@@ -162,7 +156,7 @@ impl StatisticsMaterializerFactory {
         max_bytes: usize,
     ) -> ExecutionResult<Self> {
         Self::try_new_from_source(
-            StatisticsLiteralSource::Fixture(literals),
+            StatisticsConstantSource::Fixture(literals),
             value_slot,
             literal_slots,
             mappings,
@@ -188,7 +182,7 @@ impl StatisticsMaterializerFactory {
         max_bytes: usize,
     ) -> ExecutionResult<Self> {
         Self::try_new_from_source(
-            StatisticsLiteralSource::Compiled(program),
+            StatisticsConstantSource::Compiled(program),
             value_slot,
             literal_slots,
             mappings,
@@ -200,7 +194,7 @@ impl StatisticsMaterializerFactory {
         )
     }
     fn try_new_from_source(
-        source: StatisticsLiteralSource,
+        source: StatisticsConstantSource,
         value_slot: SlotId,
         literal_slots: Vec<SlotId>,
         mappings: Vec<UnpivotValueMapping>,
@@ -1334,7 +1328,7 @@ mod tests {
         mappings: usize,
     ) -> ExecutionResult<StatisticsMaterializerFactory> {
         let expr_id = novarocks_local_program::ProgramExprId::new(0);
-        let literals = Arc::from([novarocks_local_program::StaticLiteral::Utf8(blob.into())]);
+        let literals = Arc::from([blob]);
         let mapping = UnpivotValueMapping {
             input_value_slot_id: SlotId::new(99),
             constants: vec![
@@ -1707,6 +1701,9 @@ mod tests {
         protected: bool,
         state: &RuntimeState,
     ) -> crate::exec::pipeline::builder::PipelineGraph {
+        let fixture_sources =
+            crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
         use crate::exec::pipeline::builder::{
             build_compiled_pipeline_graph, compile_family_fixture,
             family_package_with_sink_and_names, family_values,
@@ -1716,9 +1713,8 @@ mod tests {
             dependency::DependencyManager,
         };
         use novarocks_physical_plan::{
-            ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder,
-            FragmentId, FragmentSink, LiteralValue as PhysicalLiteral, NodeId, NodeKind,
-            UnpivotConstant as PhysicalConstant, UnpivotSpec,
+            ConstantPoolId, ConstantPools, ConstantReference, FragmentId, FragmentSink, NodeId,
+            NodeKind, UnpivotConstant as PhysicalConstant, UnpivotSpec,
             UnpivotValueMapping as PhysicalMapping, ValueOrigin,
         };
         use novarocks_type_contract::{
@@ -1804,7 +1800,11 @@ mod tests {
         let mut constants = ConstantPools::empty();
         constants.insert(ConstantPoolId::new(1), list_pool).unwrap();
         constants.insert(ConstantPoolId::new(2), map_pool).unwrap();
-        let mut builder = FragmentBuilder::new(FragmentId::new(73));
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                FragmentId::new(73),
+                &fixture_sources,
+            );
         let source = NodeId::new(0);
         let target = NodeId::new(1);
         let body_type = FunctionValueType::new(DataType::Binary, false);
@@ -1812,18 +1812,18 @@ mod tests {
             &mut builder,
             source,
             std::slice::from_ref(&body_type),
-            &[vec![PhysicalLiteral::Binary(
-                b"actual decoded aggregate".to_vec().into_boxed_slice(),
-            )]],
+            &[vec![
+                crate::exec::operators::family_fixture::constant_sources::binary(
+                    b"actual decoded aggregate".to_vec().into_boxed_slice(),
+                ),
+            ]],
         );
         let label_type = FunctionValueType::new(DataType::Utf8, false);
-        let label = builder
-            .add_expression(
-                target,
-                label_type.clone(),
-                ExprKind::Literal(PhysicalLiteral::Utf8("theta".into())),
-            )
-            .unwrap();
+        let label = builder.constant(
+            target,
+            label_type.clone(),
+            crate::exec::operators::family_fixture::constant_sources::utf8("theta".into()),
+        );
         let output = [list_binding, label_type, body_type, map_binding]
             .into_iter()
             .enumerate()

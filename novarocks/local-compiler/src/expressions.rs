@@ -20,7 +20,7 @@
 //! This is not the complete expression compiler or a host allocation grant.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     sync::Arc,
@@ -36,8 +36,6 @@ use novarocks_local_program::{
     ExpressionsCompileError, ImmutableExpressions, ProgramCallSite, ProgramExprId,
     ProgramExpressionArena, ProgramUseRef, StaticExprKind, StaticExprNode,
 };
-#[cfg(test)]
-use novarocks_physical_plan::LiteralValue;
 use novarocks_physical_plan::{
     ConstantReferenceError, ExprId, ExprKind, ExprNode, FragmentPackage, PhysicalCallDefinition,
     PhysicalCallSite,
@@ -284,14 +282,12 @@ fn finish<T>(
 #[cfg(test)]
 pub(crate) fn lower_expressions(
     package: &FragmentPackage,
-    policy: ConstantPolicy,
     inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredExpressions, ExpressionLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = lower_core::<std::convert::Infallible, crate::creation::NoFactory>(
         package,
-        policy,
         inputs,
         &BTreeMap::new(),
         &BTreeMap::new(),
@@ -311,7 +307,6 @@ pub(crate) fn lower_expressions(
 /// consumer key, each typed exactly as the channel it reads.
 pub(crate) fn lower_expressions_with_unions(
     package: &FragmentPackage,
-    policy: ConstantPolicy,
     inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
     unions: &BTreeMap<novarocks_physical_plan::NodeId, Vec<crate::channels::UnionChannelBranch>>,
     runtime_filter_keys: &BTreeMap<
@@ -323,7 +318,6 @@ pub(crate) fn lower_expressions_with_unions(
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = lower_core::<std::convert::Infallible, crate::creation::NoFactory>(
         package,
-        policy,
         inputs,
         unions,
         runtime_filter_keys,
@@ -633,7 +627,6 @@ pub(crate) fn lower_expressions_with_unions_with_creator<
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
 >(
     package: &FragmentPackage,
-    policy: ConstantPolicy,
     inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
     unions: &BTreeMap<novarocks_physical_plan::NodeId, Vec<crate::channels::UnionChannelBranch>>,
     runtime_filter_keys: &BTreeMap<
@@ -647,7 +640,6 @@ pub(crate) fn lower_expressions_with_unions_with_creator<
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = lower_core(
         package,
-        policy,
         inputs,
         unions,
         runtime_filter_keys,
@@ -677,7 +669,6 @@ pub(crate) fn lower_expressions_with_unions_with_creator<
 }
 fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
-    policy: ConstantPolicy,
     inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
     unions: &BTreeMap<novarocks_physical_plan::NodeId, Vec<crate::channels::UnionChannelBranch>>,
     runtime_filter_keys: &BTreeMap<
@@ -738,7 +729,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                 .into());
             }
             let child = match &node.kind {
-                ExprKind::Literal(_) | ExprKind::Constant(_) | ExprKind::Value(_) => None,
+                ExprKind::Constant(_) | ExprKind::Value(_) => None,
                 ExprKind::FunctionCall { args, .. }
                 | ExprKind::Conjunction { args }
                 | ExprKind::Disjunction { args } => args.get(next).copied(),
@@ -824,17 +815,6 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                         .constants()
                         .resolve_observed(*reference, &node.ty, work)?,
                 ),
-                ExprKind::Literal(literal) => {
-                    StaticExprKind::Constant(novarocks_physical_plan::literal_constant_observed::<
-                        ExpressionLoweringError,
-                    >(
-                        literal,
-                        &node.ty,
-                        policy,
-                        CompilePhase::LowerProgram,
-                        work,
-                    )?)
-                }
                 ExprKind::Conjunction { args } | ExprKind::Disjunction { args } => {
                     if args.is_empty()
                         || node.ty.data_type() != &arrow_schema::DataType::Boolean
@@ -1298,13 +1278,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     work.flush()?;
     // No legacy exception or session-timezone capability is authored here.
     // Frozen semantic parameters remain on exact prepared call contracts.
-    let arena = Arc::new(ImmutableExpressions::try_new_for_compile(
-        nodes,
-        false,
-        HashMap::new(),
-        None,
-        control,
-    )?);
+    let arena = Arc::new(ImmutableExpressions::try_new_for_compile(nodes, control)?);
     work.flush()?;
     let types = crate::creation::publish_argument_types(
         types,
@@ -1736,7 +1710,7 @@ fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
                 }
-                (ExprKind::Literal(_) | ExprKind::Constant(_), StaticExprKind::Constant(_)) => {
+                (ExprKind::Constant(_), StaticExprKind::Constant(_)) => {
                     if invocation.control != ControlShape::Eager || !invocation.arguments.is_empty()
                     {
                         return Err(ExpressionLoweringError::Invalid(
@@ -2764,9 +2738,7 @@ fn literal_argument(
             ));
         }
         match (&source.kind, node.kind()) {
-            (ExprKind::Literal(_) | ExprKind::Constant(_), StaticExprKind::Constant(value)) => {
-                Ok(Some(value.clone()))
-            }
+            (ExprKind::Constant(_), StaticExprKind::Constant(value)) => Ok(Some(value.clone())),
             // A resolved input is not a constant, even if this particular runtime
             // batch happens to broadcast one scalar value (notably RAND seeds).
             (ExprKind::Value(_), StaticExprKind::SlotId(_)) => Ok(None),

@@ -24,21 +24,29 @@ use super::*;
 use arrow::array::{Array, BinaryArray, Int64Array};
 use novarocks_functions::PureKernelAbi;
 use novarocks_physical_plan::{
-    AggregateCallId, AggregateGrouping, AggregatePhase, AggregateSequenceId, FragmentBuilder,
-    FragmentId, FragmentSink, LiteralValue, PlanBuilder, PlanVersionId, ResultField, ResultPort,
+    AggregateCallId, AggregateGrouping, AggregatePhase, AggregateSequenceId, FragmentId,
+    FragmentSink, PlanVersionId, ResultField, ResultPort,
 };
 
 fn program(two_phase: bool) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let catalog = aggregate_catalog(&[("ds_hll_count_distinct", PureKernelAbi::AggregateV1)]);
     let bound = bind(&catalog, "ds_hll_count_distinct", &[int64(false)]);
     let fragment = FragmentId::new(1);
-    let mut builder = FragmentBuilder::new(fragment);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            fragment,
+            &fixture_sources,
+        );
     let source = builder.reserve_node_id().unwrap();
     let input = values(
         &mut builder,
         source,
         &[int64(false)],
-        &[vec![LiteralValue::Int64(1)]],
+        &[vec![
+            crate::exec::operators::family_fixture::constant_sources::i64(1),
+        ]],
     );
     let sequence = AggregateSequenceId::new(1);
     let (first, state) = add_aggregate(
@@ -82,7 +90,10 @@ fn program(two_phase: bool) -> Arc<LocalProgram> {
     };
     let definition = finish(builder, root, FragmentSink::Result, 2);
     let output = definition.nodes()[&root].output.clone();
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([117; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([117; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,

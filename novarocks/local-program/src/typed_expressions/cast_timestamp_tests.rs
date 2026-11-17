@@ -58,15 +58,14 @@ fn timestamp_cast_all_sixteen_live_and_dead_definitions_keep_successful_null_con
                                 let (calls, types) = assembled(
                                     vec![
                                         slot(0, &source),
-                                        StaticExprNode::new(
+                                        StaticExprNode::new_value_typed(
                                             StaticExprKind::PreparedCast {
                                                 operation: CastOperation::Carrier,
                                                 child: ProgramExprId::new(0),
                                                 decimal_overflow_policy: policy,
                                                 allow_throw_exception: allow,
                                             },
-                                            result.data_type().clone(),
-                                            None,
+                                            result.clone(),
                                         ),
                                         slot(2, &boolean(false)),
                                     ],

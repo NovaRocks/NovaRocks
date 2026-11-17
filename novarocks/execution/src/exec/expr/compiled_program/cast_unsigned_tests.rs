@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{UInt8Array, UInt16Array, UInt32Array, UInt64Array};
 use arrow::record_batch::RecordBatchOptions;
 use novarocks_type_contract::ExpressionEffects;
@@ -349,6 +350,7 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
     // Build a genuine UInt64 literal -> narrow unsigned CAST -> UInt64 CAST.
     // The intermediate permits NULL by its profile; it is not a retagged literal.
     for narrow in [DataType::UInt8, DataType::UInt16, DataType::UInt32] {
+        let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
         let functions = catalogue(Shape::Decimal);
         let fid = FragmentId::new(213);
         let mut builder = FragmentBuilder::new(fid);
@@ -364,7 +366,14 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
         let intermediate = FunctionValueType::new(narrow.clone(), true);
         let output = FunctionValueType::new(DataType::UInt64, true);
         let literal = builder
-            .add_expression(node, wide, ExprKind::Literal(LiteralValue::UInt64(42)))
+            .add_expression(
+                node,
+                (wide).clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::u64(&(wide), 42, options().constants),
+                ),
+            )
             .unwrap();
         let inner = builder
             .add_expression(
@@ -425,7 +434,14 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
                 ty: output,
             }]),
         };
-        let package = package(&functions, fragment, &BTreeMap::new(), port, false);
+        let package = package(
+            &functions,
+            fragment,
+            &BTreeMap::new(),
+            port,
+            false,
+            source_pools,
+        );
         let program = compile(&functions, package, &Control).unwrap();
         let site = ProgramExpressionRootSite::Node {
             node: ProgramNodeId::new(1),

@@ -28,9 +28,9 @@ use novarocks_local_program::{KernelAbiVersion, ProgramNodeId, ProgramNodeKind, 
 use novarocks_physical_plan::{
     ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder, FragmentCuts,
     FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots,
-    PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
-    RequiredContracts, ResultField, ResultPort, ValueId, ValueOrigin,
+    FrozenFragmentCalls, FrozenFragmentPruning, NodeId, PhysicalExpressionRoots, PhysicalRootUses,
+    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
+    ResultField, ResultPort, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
@@ -160,6 +160,7 @@ fn try_fixture(
     let empty = NodeId::new(u32::MAX);
     let initial = NodeId::new(0);
     let event_node = NodeId::new(901);
+    let mut constants = ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fid);
     builder
         .add_values(empty, Box::from([Box::default()]), Box::default())
@@ -210,9 +211,15 @@ fn try_fixture(
         initial,
         empty,
         vec![
-            (ExprKind::Literal(LiteralValue::Int64(11)), integer.clone()),
+            (
+                crate::test_constants::i64(&mut constants, &integer, 11, options().constants),
+                integer.clone(),
+            ),
             (ExprKind::Constant(selected), nested.clone()),
-            (ExprKind::Literal(LiteralValue::Null), text.clone()),
+            (
+                crate::test_constants::null(&mut constants, &text, options().constants),
+                text.clone(),
+            ),
         ],
     );
 
@@ -234,7 +241,12 @@ fn try_fixture(
         .add_expression(
             event_node,
             FunctionValueType::new(DataType::Boolean, false),
-            ExprKind::Literal(LiteralValue::Boolean(true)),
+            crate::test_constants::boolean(
+                &mut constants,
+                &FunctionValueType::new(DataType::Boolean, false),
+                true,
+                options().constants,
+            ),
         )
         .unwrap();
     let value = builder
@@ -397,7 +409,6 @@ fn try_fixture(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     };
-    let mut constants = ConstantPools::empty();
     constants.insert(pool_id, pool).unwrap();
     let package = FragmentPackage::try_new(
         FragmentPackageInput {

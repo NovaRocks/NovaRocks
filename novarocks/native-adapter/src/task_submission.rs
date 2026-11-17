@@ -314,11 +314,9 @@ mod tests {
                 },
             )],
             Arc::new(
-                ImmutableExpressions::try_new(
+                ImmutableExpressions::try_new_for_compile(
                     vec![],
-                    false,
-                    std::collections::HashMap::new(),
-                    None,
+                    &novarocks_sql::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap(),
             ),
@@ -396,11 +394,9 @@ mod tests {
             )
             .expect("compiled stream branch"),
             arena: std::sync::Arc::new(
-                novarocks_local_program::ImmutableExpressions::try_new(
+                novarocks_local_program::ImmutableExpressions::try_new_for_compile(
                     Vec::new(),
-                    false,
-                    std::collections::HashMap::new(),
-                    None,
+                    &novarocks_sql::compiler::SqlCompileControl::unbounded(),
                 )
                 .expect("empty sink arena"),
             ),

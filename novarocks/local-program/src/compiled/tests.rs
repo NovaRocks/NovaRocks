@@ -28,7 +28,6 @@ use novarocks_type_contract::{
 };
 use novarocks_types::SlotId;
 use std::{
-    collections::HashMap,
     num::NonZeroUsize,
     sync::{Arc, Mutex},
 };
@@ -91,16 +90,10 @@ fn checked_with(writer: bool, sink: bool, legacy: bool, nullable: bool) -> Progr
     let mut nodes = vec![node(0, ProgramNodeKind::Values { values })];
     if writer {
         let arena = Arc::new(
-            ImmutableExpressions::try_new(
-                vec![StaticExprNode::new(
-                    StaticExprKind::Literal(StaticLiteral::Int64(7)),
-                    DataType::Int64,
-                    None,
-                )],
-                false,
-                HashMap::new(),
-                None,
-            )
+            crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+                crate::test_support::integer_typed(7, value_type.clone()),
+                value_type.clone(),
+            )])
             .unwrap(),
         );
         nodes.push(node(
@@ -139,7 +132,7 @@ fn checked_with(writer: bool, sink: bool, legacy: bool, nullable: bool) -> Progr
     let graph = LocalProgramGraph::try_new_with_sink(
         nodes,
         root,
-        Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+        Arc::new(crate::test_support::arena(vec![]).unwrap()),
         CompileProfile::new(
             NonZeroUsize::new(1).unwrap(),
             None,
@@ -155,10 +148,12 @@ fn checked_with(writer: bool, sink: bool, legacy: bool, nullable: bool) -> Progr
     let mut flows = BTreeMap::new();
     let mut types = BTreeMap::new();
     for (scope, arena) in roots.arenas() {
-        assert!(arena.nodes().iter().all(|expr| matches!(
-            expr.kind(),
-            StaticExprKind::Literal(StaticLiteral::Int64(7))
-        )));
+        assert!(
+            arena
+                .nodes()
+                .iter()
+                .all(|expr| matches!(expr.kind(), StaticExprKind::Constant(value) if value.try_i64().unwrap()==Some(7)))
+        );
         let uses = roots
             .sites()
             .iter()

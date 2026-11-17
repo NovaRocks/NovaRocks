@@ -23,6 +23,7 @@ use super::super::{
 };
 use super::*;
 use crate::functions::build_builtin_engine_function_catalog;
+use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
 use arrow::{
     array::{Array, DictionaryArray, Int8Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Int8Type},
@@ -33,9 +34,9 @@ use novarocks_functions::{
 };
 use novarocks_physical_plan::{
     AggregateBinding, AggregatePhase, BoundFunction, ConstantPoolId, ConstantPools,
-    ConstantReference, Fragment, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, NodeId,
-    NodeKind, PhysicalRootUses, PipelineDopDomain, PlanLimits, ValueOrigin, WindowBound,
-    WindowExpression, WindowFrame, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+    ConstantReference, FragmentId, FragmentSink, NodeId, NodeKind, PhysicalRootUses,
+    PipelineDopDomain, PlanLimits, ValueOrigin, WindowBound, WindowExpression, WindowFrame,
+    WindowFrameExclusion, WindowFrameUnits, WindowSpec,
 };
 use novarocks_type_contract::{
     AggregateStateFormatId, ArgumentControl, CompilePhase, FunctionInstanceState,
@@ -111,11 +112,9 @@ fn literal(
     builder: &mut FragmentBuilder,
     owner: NodeId,
     ty: FunctionValueType,
-    value: LiteralValue,
+    value: checked::Source,
 ) -> ExprId {
-    builder
-        .add_expression(owner, ty, ExprKind::Literal(value))
-        .unwrap()
+    builder.constant(owner, ty, value)
 }
 
 fn finish(builder: FragmentBuilder, root: NodeId) -> Fragment {
@@ -294,9 +293,11 @@ fn request<'a>(
     pools: &ConstantPools,
     control: &Control,
 ) -> Result<AuthoredPhysicalWindowRequest<'a>, PhysicalWindowRequestError> {
+    let mut sources = pools.clone();
+    checked::merge(&mut sources, fragment.constants());
     let mut work = CompileCheckpoints::try_new(control, PHASE)?;
     let result =
-        author_physical_window_request_observed(source, fragment, pools, policy(), &mut work);
+        author_physical_window_request_observed(source, fragment, &sources, policy(), &mut work);
     if matches!(&result, Err(PhysicalWindowRequestError::Control(_))) {
         return result;
     }
@@ -540,9 +541,9 @@ fn window_occurrences_lead_lag_checked_default_nonzero_ordinal_keeps_original_d_
             &mut builder,
             owner,
             text.clone(),
-            LiteralValue::Utf8("value".into()),
+            checked::utf8("value".into()),
         );
-        let offset = literal(&mut builder, owner, integer.clone(), LiteralValue::Int64(1));
+        let offset = literal(&mut builder, owner, integer.clone(), checked::i64(1));
         let default = builder
             .add_expression(
                 owner,
@@ -616,9 +617,9 @@ fn window_occurrences_ntile_constant_valid_null_and_dynamic_are_distinct_owner_p
             owner,
             integer.clone(),
             if mode == 1 {
-                LiteralValue::Null
+                checked::null()
             } else {
-                LiteralValue::Int64(3)
+                checked::i64(3)
             },
         );
         let arg = if mode == 2 {
@@ -692,7 +693,7 @@ fn window_occurrences_count_over_keeps_single_signature_state_format_and_complet
                     &mut builder,
                     owner,
                     integer.clone(),
-                    LiteralValue::Int64(7),
+                    checked::i64(7),
                 )]
             } else {
                 vec![]
@@ -756,19 +757,16 @@ fn window_occurrences_count_over_keeps_single_signature_state_format_and_complet
         } else {
             ty(DataType::Null, true)
         };
+        let kind = if encoded_root {
+            ExprKind::Constant(ConstantReference {
+                pool: ConstantPoolId::new(7),
+                ordinal: 0,
+            })
+        } else {
+            builder.constant_kind(&argument_type, checked::null())
+        };
         let arg = builder
-            .add_expression(
-                owner,
-                argument_type.clone(),
-                if encoded_root {
-                    ExprKind::Constant(ConstantReference {
-                        pool: ConstantPoolId::new(7),
-                        ordinal: 0,
-                    })
-                } else {
-                    ExprKind::Literal(LiteralValue::Null)
-                },
-            )
+            .add_expression(owner, argument_type.clone(), kind)
             .unwrap();
         let binding = count_binding(&catalog, &[argument_type]);
         let root = window(
@@ -945,7 +943,7 @@ fn window_occurrences_foreign_source_missing_ordered_effects_environment_and_pro
         &mut builder,
         owner,
         ty(DataType::Int64, false),
-        LiteralValue::Int64(1),
+        checked::i64(1),
     );
     let root = window(
         &mut builder,
@@ -1121,7 +1119,7 @@ fn window_occurrences_wide_complete_source_types_sample_actual_comparison_quantu
     let mut builder = FragmentBuilder::new(FragmentId::new(71));
     let leaf = NodeId::new(7);
     let owner = NodeId::new(901);
-    let initial = literal(&mut builder, leaf, source_type.clone(), LiteralValue::Null);
+    let initial = literal(&mut builder, leaf, source_type.clone(), checked::null());
     let value = builder
         .add_value(
             source_type.clone(),

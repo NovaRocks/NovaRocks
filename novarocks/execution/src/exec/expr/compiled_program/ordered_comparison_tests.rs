@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{
     ArrayRef, BinaryArray, FixedSizeBinaryBuilder, LargeBinaryArray, LargeStringArray, StringArray,
 };
@@ -69,6 +70,7 @@ fn ordered_value_program(
     source_kind: Source,
     truth_only: bool,
 ) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let mut builder = FragmentBuilder::new(FragmentId::new(211));
     let source = NodeId::new(u32::MAX);
@@ -86,7 +88,14 @@ fn ordered_value_program(
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -114,8 +123,13 @@ fn ordered_value_program(
         let condition = builder
             .add_expression(output, flag.clone(), ExprKind::Value(columns[2].0))
             .unwrap();
-        let left_rand = random(&mut builder, &mut authors, &functions);
-        let null = literal(&mut builder, scalar.clone(), LiteralValue::Null);
+        let left_rand = random(&mut builder, &mut authors, &functions, &mut source_pools);
+        let null = literal(
+            &mut builder,
+            scalar.clone(),
+            checked_constants::null(&(scalar.clone()), options().constants),
+            &mut source_pools,
+        );
         let left = call(
             &mut builder,
             &mut authors,
@@ -131,7 +145,10 @@ fn ordered_value_program(
             ),
             vec![condition, left_rand, null],
         );
-        (left, random(&mut builder, &mut authors, &functions))
+        (
+            left,
+            random(&mut builder, &mut authors, &functions, &mut source_pools),
+        )
     } else {
         let left = builder
             .add_expression(output, scalar.clone(), ExprKind::Value(columns[0].0))
@@ -141,8 +158,20 @@ fn ordered_value_program(
             .unwrap();
         if matches!(source_kind, Source::Rounded) {
             (
-                round_value(&mut builder, &mut authors, &functions, left),
-                round_value(&mut builder, &mut authors, &functions, right),
+                round_value(
+                    &mut builder,
+                    &mut authors,
+                    &functions,
+                    left,
+                    &mut source_pools,
+                ),
+                round_value(
+                    &mut builder,
+                    &mut authors,
+                    &functions,
+                    right,
+                    &mut source_pools,
+                ),
             )
         } else {
             (left, right)
@@ -215,7 +244,7 @@ fn ordered_value_program(
         output: fragment.nodes()[&output].output.clone(),
         fields: fields.into_boxed_slice(),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
 }
 fn ordered_root(truth: bool) -> ProgramExpressionRootSite {
     if truth {

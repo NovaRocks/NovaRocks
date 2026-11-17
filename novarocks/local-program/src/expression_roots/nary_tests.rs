@@ -21,11 +21,11 @@ use super::*;
 use crate::{
     BindingRequirements, CompileProfile, ExpressionsCompileError, KernelAbiVersion,
     MAX_STATIC_EXPRESSION_DEPTH, ProgramControlFlowError, ProgramEvaluationRegion,
-    ProgramExpressionUse, ProgramNode, StaticExprNode, StaticExpressionError, StaticLiteral,
+    ProgramExpressionUse, ProgramNode, StaticExprNode, StaticExpressionError,
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::{EvaluationRegionId, ExpressionEffectContext};
-use std::{collections::HashMap, num::NonZeroUsize, sync::Mutex};
+use std::{num::NonZeroUsize, sync::Mutex};
 
 #[derive(Default)]
 struct Control {
@@ -51,21 +51,22 @@ fn kind(and: bool, args: &[usize]) -> StaticExprKind {
 }
 fn nodes(and: bool, args: &[usize]) -> Vec<StaticExprNode> {
     vec![
-        StaticExprNode::new(
-            StaticExprKind::Literal(StaticLiteral::Bool(true)),
-            DataType::Boolean,
-            None,
+        StaticExprNode::new_value_typed(
+            crate::test_support::boolean(true),
+            novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
         ),
-        StaticExprNode::new(
-            StaticExprKind::Literal(StaticLiteral::Bool(false)),
-            DataType::Boolean,
-            None,
+        StaticExprNode::new_value_typed(
+            crate::test_support::boolean(false),
+            novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
         ),
-        StaticExprNode::new(kind(and, args), DataType::Boolean, None),
+        StaticExprNode::new_value_typed(
+            kind(and, args),
+            novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
+        ),
     ]
 }
 fn arena(and: bool, args: &[usize]) -> Arc<ImmutableExpressions> {
-    Arc::new(ImmutableExpressions::try_new(nodes(and, args), false, HashMap::new(), None).unwrap())
+    Arc::new(crate::test_support::arena(nodes(and, args)).unwrap())
 }
 fn shape(and: bool) -> ControlShape {
     if and {
@@ -320,26 +321,23 @@ fn nary_definition_author_rejects_empty_forward_and_dangling_references_without_
             (vec![usize::MAX], StaticExpressionError::InvalidReference),
         ] {
             assert_eq!(
-                ImmutableExpressions::try_new(nodes(and, &args), false, HashMap::new(), None)
-                    .unwrap_err(),
+                crate::test_support::arena(nodes(and, &args)).unwrap_err(),
                 error
             );
         }
         arena(and, &vec![0; 320]);
         let nested = |count: usize| {
-            let mut nodes = vec![StaticExprNode::new(
-                StaticExprKind::Literal(StaticLiteral::Bool(true)),
-                DataType::Boolean,
-                None,
+            let mut nodes = vec![StaticExprNode::new_value_typed(
+                crate::test_support::boolean(true),
+                novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
             )];
             for ordinal in 1..count {
-                nodes.push(StaticExprNode::new(
+                nodes.push(StaticExprNode::new_value_typed(
                     kind(and, &[ordinal - 1]),
-                    DataType::Boolean,
-                    None,
+                    novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
                 ));
             }
-            ImmutableExpressions::try_new(nodes, false, HashMap::new(), None)
+            crate::test_support::arena(nodes)
         };
         nested(MAX_STATIC_EXPRESSION_DEPTH).unwrap();
         assert_eq!(
@@ -363,14 +361,8 @@ fn nary_definition_and_root_correspondence_keep_original_entry_and_256_control_f
                 ..Control::default()
             };
             assert_eq!(
-                ImmutableExpressions::try_new_for_compile(
-                    nodes(true, &args),
-                    false,
-                    HashMap::new(),
-                    None,
-                    &control
-                )
-                .unwrap_err(),
+                ImmutableExpressions::try_new_for_compile(nodes(true, &args), &control)
+                    .unwrap_err(),
                 ExpressionsCompileError::Control(failure.clone())
             );
             assert_eq!(

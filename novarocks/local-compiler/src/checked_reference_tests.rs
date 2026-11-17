@@ -29,7 +29,7 @@ use novarocks_type_contract::{
     EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, FunctionValueType, SemanticParameters,
 };
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex};
 
 struct Control {
     trace: Mutex<Vec<(CompilePhase, u32)>>,
@@ -276,25 +276,16 @@ fn lower(
     package: &FragmentPackage,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredExpressions, ExpressionLoweringError> {
-    lower_expressions(package, policy(), &BTreeMap::new(), control)
+    lower_expressions(package, &BTreeMap::new(), control)
 }
 fn replace_constant(lowered: &mut LoweredExpressions, id: ProgramExprId, value: ConstantValue) {
     let mut nodes = lowered.arena.nodes().to_vec();
-    nodes[id.index()] = StaticExprNode::new(
+    nodes[id.index()] = StaticExprNode::new_value_typed(
         StaticExprKind::Constant(value.clone()),
-        value.value_type().data_type().clone(),
-        None,
+        value.value_type().clone(),
     );
-    lowered.arena = Arc::new(
-        ImmutableExpressions::try_new_for_compile(
-            nodes,
-            false,
-            HashMap::new(),
-            None,
-            &Control::good(),
-        )
-        .unwrap(),
-    );
+    lowered.arena =
+        Arc::new(ImmutableExpressions::try_new_for_compile(nodes, &Control::good()).unwrap());
 }
 
 #[test]

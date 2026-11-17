@@ -33,15 +33,14 @@ fn fixture(
     assembled(
         vec![
             slot(0, &source),
-            StaticExprNode::new(
+            StaticExprNode::new_value_typed(
                 StaticExprKind::PreparedCast {
                     operation: CastOperation::Carrier,
                     child: ProgramExprId::new(0),
                     decimal_overflow_policy: policy,
                     allow_throw_exception: allow,
                 },
-                result.data_type().clone(),
-                None,
+                result.clone(),
             ),
             slot(2, &boolean(false)),
         ],

@@ -110,13 +110,19 @@ fn request_fragment(
     use crate::{ExprKind, FragmentBuilder, FragmentId, NodeId};
     let owner = NodeId::new(8);
     let mut builder = FragmentBuilder::new(FragmentId::new(id));
-    builder
-        .add_values(NodeId::new(99), Box::from([Box::default()]), Box::default())
+    let source_value = builder
+        .add_value(
+            ty.clone(),
+            crate::ValueOrigin::NodeOutput {
+                node: NodeId::new(99),
+                output_ordinal: 0,
+            },
+        )
         .unwrap();
-    let argument_kind = match &ty.data_type() {
-        DataType::Int64 => ExprKind::Literal(crate::LiteralValue::Int64(42)),
-        _ => ExprKind::Literal(crate::LiteralValue::Null),
-    };
+    builder
+        .add_values(NodeId::new(99), Box::default(), Box::from([source_value]))
+        .unwrap();
+    let argument_kind = ExprKind::Value(source_value);
     let input = builder
         .add_expression(owner, ty.clone(), argument_kind)
         .unwrap();

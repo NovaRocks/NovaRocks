@@ -63,9 +63,6 @@ pub enum ProgramNodeExpressionRole {
     RuntimeFilter {
         binding: u32,
     },
-    ExchangePartition {
-        key: u32,
-    },
     AggregateGroup {
         group: u32,
     },
@@ -157,18 +154,15 @@ pub enum ProgramExpressionRootSite {
     SinkApplicability {
         branch: u32,
     },
-    SinkSplitPredicate {
-        branch: u32,
-    },
 }
 impl ProgramExpressionRootSite {
     pub const fn arena(self) -> ProgramExpressionArena {
         match self {
             Self::Node { .. } => ProgramExpressionArena::Main,
             Self::WriterProjection { node, .. } => ProgramExpressionArena::WriterProjection(node),
-            Self::SinkPartition { .. }
-            | Self::SinkSplitPredicate { .. }
-            | Self::SinkApplicability { .. } => ProgramExpressionArena::Sink,
+            Self::SinkPartition { .. } | Self::SinkApplicability { .. } => {
+                ProgramExpressionArena::Sink
+            }
         }
     }
 }
@@ -326,15 +320,12 @@ impl ProgramExpressionRoots {
                     )?;
                 }
             }
-            for (branch, definition) in sink.split_exprs().iter().enumerate() {
-                builder.add(
-                    ProgramExpressionRootSite::SinkSplitPredicate {
-                        branch: ordinal(branch)?,
-                    },
-                    *definition,
-                    EvaluationDemand::TruthOnly,
-                )?;
-            }
+        }
+        if program
+            .sink()
+            .is_some_and(|sink| !sink.split_exprs().is_empty())
+        {
+            return Err(ProgramExpressionRootError::InvalidDefinition.into());
         }
         // Preserve the original tail control before publishing either map.
         builder.work.flush()?;
@@ -545,13 +536,8 @@ impl<H> RootCollector<'_, '_, H> {
                 runtime_filters,
                 ..
             } => {
-                for (key, definition) in hash_partition_exprs.iter().enumerate() {
-                    self.node_root(
-                        node,
-                        Role::ExchangePartition { key: ordinal(key)? },
-                        *definition,
-                        Value,
-                    )?;
+                if !hash_partition_exprs.is_empty() {
+                    return Err(ProgramExpressionRootError::InvalidDefinition.into());
                 }
                 for (binding, value) in runtime_filters.iter().enumerate() {
                     self.node_root(
@@ -1089,16 +1075,15 @@ fn validate_intrinsic_correspondence(
             .node(invocation.definition)
             .ok_or(ProgramRootBindingError::InvalidDefinition)?;
         let expected = match definition.kind() {
-            StaticExprKind::FunctionCall { .. } | StaticExprKind::BoundCall { .. } => continue,
-            StaticExprKind::And(..) | StaticExprKind::NaryAnd { .. } => ControlShape::Conjunction,
-            StaticExprKind::Or(..) | StaticExprKind::NaryOr { .. } => ControlShape::Disjunction,
+            StaticExprKind::BoundCall { .. } => continue,
+            StaticExprKind::NaryAnd { .. } => ControlShape::Conjunction,
+            StaticExprKind::NaryOr { .. } => ControlShape::Disjunction,
             StaticExprKind::PreparedInList { is_not_in, .. } => ControlShape::Membership {
                 negated: *is_not_in,
             },
             StaticExprKind::PreparedBetween { plan, .. } => ControlShape::Between {
                 negated: plan.negated(),
             },
-            StaticExprKind::LambdaFunction { .. } => ControlShape::LambdaBody,
             StaticExprKind::Case {
                 has_case_expr,
                 has_else_expr,
@@ -1117,26 +1102,13 @@ fn validate_intrinsic_correspondence(
                 }
             }
             StaticExprKind::Constant(_)
-            | StaticExprKind::Literal(_)
             | StaticExprKind::SlotId(_)
-            | StaticExprKind::ArrayExpr { .. }
-            | StaticExprKind::StructExpr { .. }
-            | StaticExprKind::DictDecode { .. }
-            | StaticExprKind::Cast(..)
-            | StaticExprKind::CastTime(..)
-            | StaticExprKind::CastTimeFromDatetime(..)
             | StaticExprKind::PreparedCast { .. }
             | StaticExprKind::PreparedNativeNegate(..)
             | StaticExprKind::PreparedNativeBitNot(..)
             | StaticExprKind::PreparedLike { .. }
             | StaticExprKind::PreparedArithmetic { .. }
-            | StaticExprKind::Add(..)
-            | StaticExprKind::Sub(..)
-            | StaticExprKind::Mul(..)
-            | StaticExprKind::Div(..)
-            | StaticExprKind::Mod(..)
             | StaticExprKind::Eq(..)
-            | StaticExprKind::EqForNull(..)
             | StaticExprKind::PreparedNullSafeComparison { .. }
             | StaticExprKind::Ne(..)
             | StaticExprKind::Lt(..)
@@ -1145,9 +1117,7 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::Ge(..)
             | StaticExprKind::Not(..)
             | StaticExprKind::IsNull(..)
-            | StaticExprKind::IsNotNull(..)
-            | StaticExprKind::In { .. }
-            | StaticExprKind::Clone(..) => ControlShape::Eager,
+            | StaticExprKind::IsNotNull(..) => ControlShape::Eager,
         };
         if invocation.control != expected {
             return Err(ProgramRootBindingError::WrongControl);
@@ -1166,13 +1136,9 @@ fn validate_intrinsic_correspondence(
             Ok(())
         };
         match definition.kind() {
-            StaticExprKind::Constant(_)
-            | StaticExprKind::Literal(_)
-            | StaticExprKind::SlotId(_) => {}
-            StaticExprKind::ArrayExpr { elements }
-            | StaticExprKind::NaryAnd { args: elements }
+            StaticExprKind::Constant(_) | StaticExprKind::SlotId(_) => {}
+            StaticExprKind::NaryAnd { args: elements }
             | StaticExprKind::NaryOr { args: elements }
-            | StaticExprKind::StructExpr { fields: elements }
             | StaticExprKind::Case {
                 children: elements, ..
             } => {
@@ -1180,32 +1146,14 @@ fn validate_intrinsic_correspondence(
                     child(*definition)?;
                 }
             }
-            StaticExprKind::LambdaFunction {
-                body,
-                common_sub_exprs,
-                ..
-            } => {
-                // Local computations execute in declaration order, then body.
-                for (_, definition) in common_sub_exprs {
-                    child(*definition)?;
-                }
-                child(*body)?;
-            }
             StaticExprKind::PreparedCast {
                 child: definition, ..
             }
-            | StaticExprKind::DictDecode {
-                child: definition, ..
-            }
-            | StaticExprKind::Cast(definition, _)
-            | StaticExprKind::CastTime(definition, _)
-            | StaticExprKind::CastTimeFromDatetime(definition, _)
             | StaticExprKind::PreparedNativeNegate(definition)
             | StaticExprKind::PreparedNativeBitNot(definition)
             | StaticExprKind::Not(definition)
             | StaticExprKind::IsNull(definition)
-            | StaticExprKind::IsNotNull(definition)
-            | StaticExprKind::Clone(definition) => child(*definition)?,
+            | StaticExprKind::IsNotNull(definition) => child(*definition)?,
             StaticExprKind::PreparedLike {
                 text: a,
                 pattern: b,
@@ -1214,21 +1162,13 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::PreparedArithmetic {
                 left: a, right: b, ..
             }
-            | StaticExprKind::Add(a, b, _)
-            | StaticExprKind::Sub(a, b, _)
-            | StaticExprKind::Mul(a, b, _)
-            | StaticExprKind::Div(a, b, _)
-            | StaticExprKind::Mod(a, b, _)
             | StaticExprKind::Eq(a, b)
-            | StaticExprKind::EqForNull(a, b)
             | StaticExprKind::PreparedNullSafeComparison { left: a, right: b }
             | StaticExprKind::Ne(a, b)
             | StaticExprKind::Lt(a, b)
             | StaticExprKind::Le(a, b)
             | StaticExprKind::Gt(a, b)
-            | StaticExprKind::Ge(a, b)
-            | StaticExprKind::And(a, b)
-            | StaticExprKind::Or(a, b) => {
+            | StaticExprKind::Ge(a, b) => {
                 child(*a)?;
                 child(*b)?;
             }
@@ -1246,12 +1186,7 @@ fn validate_intrinsic_correspondence(
                     })?;
                 }
             }
-            StaticExprKind::In {
-                child: definition,
-                values,
-                ..
-            }
-            | StaticExprKind::PreparedInList {
+            StaticExprKind::PreparedInList {
                 child: definition,
                 values,
                 ..
@@ -1261,7 +1196,7 @@ fn validate_intrinsic_correspondence(
                     child(*definition)?;
                 }
             }
-            StaticExprKind::FunctionCall { .. } | StaticExprKind::BoundCall { .. } => {
+            StaticExprKind::BoundCall { .. } => {
                 unreachable!("frozen owner checks calls")
             }
         }

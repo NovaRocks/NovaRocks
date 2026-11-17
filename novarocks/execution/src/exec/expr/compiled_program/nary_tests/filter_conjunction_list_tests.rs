@@ -19,12 +19,13 @@
 use super::*;
 use crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance;
 fn list_fixture(width: usize) -> Fixture {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let fragment_id = FragmentId::new(91);
     let source = NodeId::new(u32::MAX);
     let input = NodeId::new(41);
     let root = NodeId::new(0);
     let mut builder = FragmentBuilder::new(fragment_id);
-    let operands = source_columns(&mut builder, source, input, root);
+    let operands = source_columns(&mut builder, source, input, root, &mut source_pools);
     let order = [operands[2], operands[0], operands[1]];
     let predicates = (0..width)
         .map(|ordinal| order[ordinal % 3])
@@ -32,6 +33,7 @@ fn list_fixture(width: usize) -> Fixture {
         .into_boxed_slice();
     builder.add_filter(root, input, predicates).unwrap();
     Fixture {
+        constants: source_pools,
         fragment: builder
             .finish_definition(
                 root,

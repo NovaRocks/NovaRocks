@@ -61,7 +61,7 @@ fn roots_for_fixture(fragment: &Fragment) -> PhysicalRootUses {
     let mut invocations = Vec::new();
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
         match &fragment.expressions().get(root.expr).unwrap().kind {
-            ExprKind::Literal(_) | ExprKind::Value(_) => {}
+            ExprKind::Constant(_) | ExprKind::Value(_) => {}
             ExprKind::FunctionCall { args, .. } => assert!(args.is_empty()),
             _ => panic!("fixture uses explicit leaf roots only"),
         }
@@ -99,13 +99,17 @@ fn rich_result() -> ValueType {
     )
 }
 
-fn fixture(operator: Operator, ordered: bool) -> Fixture {
+fn fixture(
+    operator: Operator,
+    ordered: bool,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(match operator {
         Operator::Filter => 801,
         Operator::Project => 802,
         Operator::Table => 803,
     }));
-    let (values, _) = add_values(&mut builder, 1, false);
+    let (values, _) = add_values(&mut builder, 1, false, fixture_constants);
     let input_value = ValueId::new(0);
     let child = if ordered {
         let sort = builder.reserve_node_id().unwrap();
@@ -420,8 +424,9 @@ fn prefixes(
 
 #[test]
 fn replica_property_derivation_uses_three_original_formulas_and_keeps_row_error_claims() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for operator in [Operator::Filter, Operator::Project, Operator::Table] {
-        let fixture = fixture(operator, false);
+        let fixture = fixture(operator, false, &mut fixture_constants);
         let calls = fixture.checked().unwrap();
         let (actual, facts) = derive(
             &fixture,
@@ -463,9 +468,10 @@ fn replica_property_derivation_uses_three_original_formulas_and_keeps_row_error_
 
 #[test]
 fn replica_property_derivation_relinquishes_only_unsafe_broadcast_without_mutating_source() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for operator in [Operator::Filter, Operator::Project, Operator::Table] {
         for mode in 0..3 {
-            let mut fixture = fixture(operator, false);
+            let mut fixture = fixture(operator, false, &mut fixture_constants);
             broadcast(&mut fixture);
             match mode {
                 0 => fixture.calls[0].effects.value_stability = FunctionVolatility::Volatile,
@@ -516,8 +522,9 @@ fn replica_property_derivation_relinquishes_only_unsafe_broadcast_without_mutati
 
 #[test]
 fn replica_property_derivation_immutable_table_lifecycle_and_maskable_errors_preserve_broadcast() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for operator in [Operator::Filter, Operator::Project, Operator::Table] {
-        let mut fixture = fixture(operator, false);
+        let mut fixture = fixture(operator, false, &mut fixture_constants);
         broadcast(&mut fixture);
         fixture.calls[0].effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
         fixture.calls[0].effects.failure_behavior = FunctionFailureBehavior::ReturnsNull;
@@ -553,8 +560,9 @@ fn replica_property_derivation_immutable_table_lifecycle_and_maskable_errors_pre
 
 #[test]
 fn replica_property_derivation_keeps_final_child_ordering_repeated_columns_and_complete_types() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for operator in [Operator::Filter, Operator::Project, Operator::Table] {
-        let fixture = fixture(operator, true);
+        let fixture = fixture(operator, true, &mut fixture_constants);
         let calls = fixture.checked().unwrap();
         validate(&fixture, &calls).unwrap();
         let child = fixture.fragment.nodes()[&fixture.fragment.root()].inputs[0];
@@ -634,7 +642,8 @@ fn replica_property_derivation_keeps_final_child_ordering_repeated_columns_and_c
 #[test]
 fn replica_property_derivation_corrects_wrong_provisional_claim_and_leaves_other_node_without_default()
  {
-    let mut fixture = fixture(Operator::Project, true);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = fixture(Operator::Project, true, &mut fixture_constants);
     edit(&mut fixture, |parts| {
         parts
             .nodes
@@ -680,7 +689,8 @@ fn replica_property_derivation_corrects_wrong_provisional_claim_and_leaves_other
 
 #[test]
 fn replica_property_derivation_unknown_node_and_source_floor_have_typed_ordinary_refusals() {
-    let fixture = fixture(Operator::Filter, false);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = fixture(Operator::Filter, false, &mut fixture_constants);
     let calls = fixture.checked().unwrap();
     let control = DeriveControl::default();
     let error = derive(&fixture, &calls, NodeId::new(u32::MAX), SOURCE, &control).unwrap_err();
@@ -720,8 +730,9 @@ fn replica_property_derivation_unknown_node_and_source_floor_have_typed_ordinary
 
 #[test]
 fn replica_property_derivation_every_actual_callback_keeps_three_causes_and_ordinary_tails() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for operator in [Operator::Filter, Operator::Project, Operator::Table] {
-        let mut fixture = fixture(operator, false);
+        let mut fixture = fixture(operator, false, &mut fixture_constants);
         broadcast(&mut fixture);
         fixture.calls[0].effects.observable_effects.warnings = true;
         let calls = fixture.checked().unwrap();

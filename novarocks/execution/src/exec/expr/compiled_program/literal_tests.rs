@@ -30,21 +30,27 @@ use arrow::{
 use novarocks_local_program::{ProgramChannelLayoutRole, ProgramChannelSite};
 use novarocks_type_contract::ValueLogicalType;
 
-fn literal_program(cases: &[(FunctionValueType, LiteralValue)]) -> Arc<LocalProgram> {
+fn literal_program(cases: &[LiteralCase]) -> Arc<LocalProgram> {
     let fragment_id = FragmentId::new(93);
     let source = NodeId::new(u32::MAX);
     let project = NodeId::new(31);
     let mut builder = FragmentBuilder::new(fragment_id);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     builder
         .add_values(source, Box::from([Box::default()]), Box::default())
         .unwrap();
     let mut output = Vec::new();
     let mut assignments = Vec::new();
     let mut result_fields = Vec::new();
-    for (ordinal, (ty, literal)) in cases.iter().enumerate() {
+    for (ordinal, case) in cases.iter().enumerate() {
+        let ty = case.value.value_type();
         let value = ValueId::new(900 + u32::try_from(ordinal).unwrap());
         let expr = builder
-            .add_expression(project, ty.clone(), ExprKind::Literal(literal.clone()))
+            .add_expression(
+                project,
+                ty.clone(),
+                checked_source(&mut constants, &case.value),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -127,7 +133,7 @@ fn literal_program(cases: &[(FunctionValueType, LiteralValue)]) -> Arc<LocalProg
             FragmentPackageInput {
                 version: PlanVersionId::try_new([93; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,
@@ -155,104 +161,47 @@ fn literal_program(cases: &[(FunctionValueType, LiteralValue)]) -> Arc<LocalProg
     Arc::new(compile_fragment(validated, &rng_subset(), options(1), &FixtureControl).unwrap())
 }
 
-fn assert_literal_payload(array: &ArrayRef, ty: &DataType, literal: &LiteralValue, rows: usize) {
-    assert_eq!(array.len(), rows);
-    assert_eq!(array.data_type(), ty);
-    for row in 0..rows {
-        if matches!(literal, LiteralValue::Null) {
-            assert!(array.is_null(row));
-            continue;
-        }
-        assert!(!array.is_null(row));
-        macro_rules! value {
-            ($array:ty, $expected:expr) => {
-                assert_eq!(
-                    array.as_any().downcast_ref::<$array>().unwrap().value(row),
-                    $expected
-                )
-            };
-        }
-        match literal {
-            LiteralValue::UInt64(expected) => value!(UInt64Array, *expected),
-            LiteralValue::Float64Bits(expected) => {
-                assert_eq!(
-                    array
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .unwrap()
-                        .value(row)
-                        .to_bits(),
-                    *expected
-                );
-            }
-            LiteralValue::LargeInt(expected) => {
-                value!(FixedSizeBinaryArray, expected.to_be_bytes().as_slice())
-            }
-            LiteralValue::Decimal128(expected) => value!(Decimal128Array, *expected),
-            LiteralValue::Decimal256(expected) => {
-                assert_eq!(
-                    array
-                        .as_any()
-                        .downcast_ref::<Decimal256Array>()
-                        .unwrap()
-                        .value(row)
-                        .to_be_bytes(),
-                    *expected
-                );
-            }
-            LiteralValue::IntervalMonthDayNano {
-                months,
-                days,
-                nanoseconds,
-            } => {
-                let actual = array
-                    .as_any()
-                    .downcast_ref::<IntervalMonthDayNanoArray>()
-                    .unwrap()
-                    .value(row);
-                assert_eq!(actual.months, *months);
-                assert_eq!(actual.days, *days);
-                assert_eq!(actual.nanoseconds, *nanoseconds);
-            }
-            LiteralValue::Date32(expected) => value!(Date32Array, *expected),
-            LiteralValue::Time64(expected) => match ty {
-                DataType::Time64(TimeUnit::Microsecond) => {
-                    value!(Time64MicrosecondArray, *expected)
-                }
-                DataType::Time64(TimeUnit::Nanosecond) => value!(Time64NanosecondArray, *expected),
-                _ => panic!("unexpected literal time carrier"),
-            },
-            LiteralValue::Timestamp(expected) => match ty {
-                DataType::Timestamp(TimeUnit::Second, _) => value!(TimestampSecondArray, *expected),
-                DataType::Timestamp(TimeUnit::Millisecond, _) => {
-                    value!(TimestampMillisecondArray, *expected)
-                }
-                DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                    value!(TimestampMicrosecondArray, *expected)
-                }
-                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                    value!(TimestampNanosecondArray, *expected)
-                }
-                _ => panic!("unexpected literal timestamp carrier"),
-            },
-            LiteralValue::Utf8(expected) => match ty {
-                DataType::Utf8 => value!(StringArray, expected.as_ref()),
-                DataType::LargeUtf8 => value!(LargeStringArray, expected.as_ref()),
-                DataType::Utf8View => value!(StringViewArray, expected.as_ref()),
-                _ => panic!("unexpected literal text carrier"),
-            },
-            LiteralValue::Binary(expected) => match ty {
-                DataType::Binary => value!(BinaryArray, expected.as_ref()),
-                DataType::LargeBinary => value!(LargeBinaryArray, expected.as_ref()),
-                DataType::BinaryView => value!(BinaryViewArray, expected.as_ref()),
-                _ => panic!("unexpected literal binary carrier"),
-            },
-            _ => panic!("literal fixture has no independent payload oracle"),
-        }
+type LiteralCheck = Box<dyn Fn(&ArrayRef, usize)>;
+
+struct LiteralCase {
+    value: ConstantValue,
+    check: LiteralCheck,
+    is_null: bool,
+}
+fn literal_case(value: ConstantValue, check: impl Fn(&ArrayRef, usize) + 'static) -> LiteralCase {
+    LiteralCase {
+        value,
+        check: Box::new(check),
+        is_null: false,
     }
 }
-
-fn check_literal_roots(cases: Vec<(FunctionValueType, LiteralValue)>) {
+macro_rules! checked_value {
+    ($ty:expr, $factory:ident($($payload:expr),* $(,)?) $(,)?) => {{
+        let ty = $ty;
+        ConstantValue::$factory(
+            Arc::new(ty.try_to_field("source").unwrap()), ty,
+            $($payload,)* options(1).constants, CompilePhase::Validate, &FixtureControl,
+        ).unwrap()
+    }};
+}
+macro_rules! scalar_case {
+    ($ty:expr, $factory:ident($($payload:expr),* $(,)?), $array:ty, $expected:expr $(,)?) => {{
+        let expected = $expected;
+        literal_case(checked_value!($ty, $factory($($payload),*)), move |array, rows| {
+            let values = array.as_any().downcast_ref::<$array>().unwrap();
+            for row in 0..rows { assert_eq!(values.value(row), expected); }
+        })
+    }};
+}
+fn assert_literal_payload(array: &ArrayRef, case: &LiteralCase, rows: usize) {
+    assert_eq!(array.len(), rows);
+    assert_eq!(array.data_type(), case.value.value_type().data_type());
+    for row in 0..rows {
+        assert_eq!(array.is_null(row), case.is_null);
+    }
+    (case.check)(array, rows);
+}
+fn check_literal_roots(cases: Vec<LiteralCase>) {
     let program = literal_program(&cases);
     let child_schema = program.graph().nodes()[0].output_layout().schema().clone();
     assert!(child_schema.fields().is_empty());
@@ -264,7 +213,8 @@ fn check_literal_roots(cases: Vec<(FunctionValueType, LiteralValue)>) {
     .unwrap();
     let original_rows = [1, 4];
     let selection = Selection::try_sparse(6, &original_rows).unwrap();
-    for (ordinal, (ty, literal)) in cases.iter().enumerate() {
+    for (ordinal, case) in cases.iter().enumerate() {
+        let ty = case.value.value_type();
         let ordinal = u32::try_from(ordinal).unwrap();
         assert_eq!(
             program
@@ -292,7 +242,7 @@ fn check_literal_roots(cases: Vec<(FunctionValueType, LiteralValue)>) {
                 .unwrap();
             assert_eq!(result.selection(), selection);
             assert!(result.errors().is_empty());
-            assert_literal_payload(result.values(), ty.data_type(), literal, 2);
+            assert_literal_payload(result.values(), case, 2);
         }
         let result = evaluator
             .evaluate(
@@ -303,26 +253,26 @@ fn check_literal_roots(cases: Vec<(FunctionValueType, LiteralValue)>) {
             .unwrap();
         assert!(result.selection().is_empty());
         assert!(result.errors().is_empty());
-        assert_literal_payload(result.values(), ty.data_type(), literal, 0);
+        assert_literal_payload(result.values(), case, 0);
         assert!(evaluator.instances.is_empty());
     }
 }
-
-fn with_typed_nulls(
-    cases: Vec<(FunctionValueType, LiteralValue)>,
-) -> Vec<(FunctionValueType, LiteralValue)> {
+fn with_typed_nulls(cases: Vec<LiteralCase>) -> Vec<LiteralCase> {
     cases
         .into_iter()
-        .flat_map(|(ty, literal)| {
-            let mut null_type = ty.clone();
-            null_type = null_type
-                .with_nullable(true)
-                .expect("valid test root nullability");
-            [(ty, literal), (null_type, LiteralValue::Null)]
+        .flat_map(|case| {
+            let ty = case.value.value_type().clone().with_nullable(true).unwrap();
+            let null = checked_value!(ty, null());
+            let mut null_case = literal_case(null, |array, rows| {
+                for row in 0..rows {
+                    assert!(array.is_null(row));
+                }
+            });
+            null_case.is_null = true;
+            [case, null_case]
         })
         .collect()
 }
-
 #[test]
 fn actual_compiled_literal_numeric_temporal_bits_and_typed_nulls_survive_sparse_batches() {
     let mut negative_2pow200 = [0; 32];
@@ -333,53 +283,99 @@ fn actual_compiled_literal_numeric_temporal_bits_and_typed_nulls_survive_sparse_
         ValueLogicalType::LargeInt,
     )
     .unwrap();
+    let large = checked_value!(largeint, from_largeint(i128::MIN));
     let mut cases = vec![
-        (
+        scalar_case!(
             FunctionValueType::new(DataType::UInt64, false),
-            LiteralValue::UInt64(u64::MAX),
+            from_u64(u64::MAX),
+            UInt64Array,
+            u64::MAX
         ),
-        (largeint, LiteralValue::LargeInt(i128::MIN)),
-        (
+        literal_case(large, |array, rows| {
+            let values = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            for row in 0..rows {
+                assert_eq!(values.value(row), i128::MIN.to_be_bytes().as_slice());
+            }
+        }),
+        scalar_case!(
             FunctionValueType::new(DataType::Decimal128(38, -2), false),
-            LiteralValue::Decimal128(-123456789),
+            from_decimal128(-123456789),
+            Decimal128Array,
+            -123456789
         ),
-        (
-            FunctionValueType::new(DataType::Decimal256(76, -3), false),
-            LiteralValue::Decimal256(negative_2pow200),
-        ),
-        (
-            FunctionValueType::new(DataType::Float64, false),
-            LiteralValue::Float64Bits((-0.0f64).to_bits()),
-        ),
-        (
-            FunctionValueType::new(DataType::Float64, false),
-            LiteralValue::Float64Bits(0x7ff8_1234_5678_9abc),
-        ),
-        (
-            FunctionValueType::new(DataType::Date32, false),
-            LiteralValue::Date32(-7),
-        ),
-        (
-            FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), false),
-            LiteralValue::Time64(86399999999),
-        ),
-        (
-            FunctionValueType::new(DataType::Time64(TimeUnit::Nanosecond), false),
-            LiteralValue::Time64(123456789),
+        literal_case(
+            checked_value!(
+                FunctionValueType::new(DataType::Decimal256(76, -3), false),
+                from_decimal256_be(negative_2pow200)
+            ),
+            move |array, rows| {
+                let values = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+                for row in 0..rows {
+                    assert_eq!(values.value(row).to_be_bytes(), negative_2pow200);
+                }
+            },
         ),
     ];
+    for bits in [(-0.0f64).to_bits(), 0x7ff8_1234_5678_9abc] {
+        cases.push(literal_case(
+            checked_value!(
+                FunctionValueType::new(DataType::Float64, false),
+                from_f64_bits(bits)
+            ),
+            move |array, rows| {
+                let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                for row in 0..rows {
+                    assert_eq!(values.value(row).to_bits(), bits);
+                }
+            },
+        ));
+    }
+    cases.extend([
+        scalar_case!(
+            FunctionValueType::new(DataType::Date32, false),
+            from_date32(-7),
+            Date32Array,
+            -7
+        ),
+        scalar_case!(
+            FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), false),
+            from_time64(86399999999),
+            Time64MicrosecondArray,
+            86399999999
+        ),
+        scalar_case!(
+            FunctionValueType::new(DataType::Time64(TimeUnit::Nanosecond), false),
+            from_time64(123456789),
+            Time64NanosecondArray,
+            123456789
+        ),
+    ]);
     for (months, days, nanoseconds) in [
         (i32::MIN, i32::MAX, i64::MIN),
         (i32::MAX, i32::MIN, i64::MAX),
         (-17, -31, -123456789),
         (0, 0, 0),
     ] {
-        cases.push((
-            FunctionValueType::new(DataType::Interval(IntervalUnit::MonthDayNano), false),
-            LiteralValue::IntervalMonthDayNano {
-                months,
-                days,
-                nanoseconds,
+        cases.push(literal_case(
+            checked_value!(
+                FunctionValueType::new(DataType::Interval(IntervalUnit::MonthDayNano), false),
+                from_interval_month_day_nano((months, days, nanoseconds))
+            ),
+            move |array, rows| {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<IntervalMonthDayNanoArray>()
+                    .unwrap();
+                for row in 0..rows {
+                    let actual = values.value(row);
+                    assert_eq!(
+                        (actual.months, actual.days, actual.nanoseconds),
+                        (months, days, nanoseconds)
+                    );
+                }
             },
         ));
     }
@@ -390,49 +386,134 @@ fn actual_compiled_literal_numeric_temporal_bits_and_typed_nulls_survive_sparse_
         TimeUnit::Nanosecond,
     ] {
         for zone in [None, Some(Arc::<str>::from("Europe/Berlin"))] {
-            cases.push((
-                FunctionValueType::new(DataType::Timestamp(unit, zone), false),
-                LiteralValue::Timestamp(-1234567),
+            cases.push(literal_case(
+                checked_value!(
+                    FunctionValueType::new(DataType::Timestamp(unit, zone), false),
+                    from_timestamp(-1234567)
+                ),
+                move |array, rows| {
+                    for row in 0..rows {
+                        let actual = match unit {
+                            TimeUnit::Second => array
+                                .as_any()
+                                .downcast_ref::<TimestampSecondArray>()
+                                .unwrap()
+                                .value(row),
+                            TimeUnit::Millisecond => array
+                                .as_any()
+                                .downcast_ref::<TimestampMillisecondArray>()
+                                .unwrap()
+                                .value(row),
+                            TimeUnit::Microsecond => array
+                                .as_any()
+                                .downcast_ref::<TimestampMicrosecondArray>()
+                                .unwrap()
+                                .value(row),
+                            TimeUnit::Nanosecond => array
+                                .as_any()
+                                .downcast_ref::<TimestampNanosecondArray>()
+                                .unwrap()
+                                .value(row),
+                        };
+                        assert_eq!(actual, -1234567);
+                    }
+                },
             ));
         }
     }
     check_literal_roots(with_typed_nulls(cases));
 }
-
 #[test]
 fn actual_compiled_literal_offset_view_and_nominal_bytes_keep_payload_and_typed_nulls() {
     let text = format!("prefix\0é🙂{}suffix", "x".repeat(2048));
     let binary = [vec![0, 0xff, 0x80], vec![0x5a; 4096], vec![0]].concat();
     let mut cases = Vec::new();
     for carrier in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
-        cases.push((
-            FunctionValueType::new(carrier, false),
-            LiteralValue::Utf8(text.clone().into_boxed_str()),
-        ));
+        let expected = text.clone();
+        let ty = FunctionValueType::new(carrier.clone(), false);
+        let value = checked_value!(ty, from_utf8(&expected));
+        cases.push(literal_case(value, move |array, rows| {
+            for row in 0..rows {
+                let actual = match carrier {
+                    DataType::Utf8 => array
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(row),
+                    DataType::LargeUtf8 => array
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .unwrap()
+                        .value(row),
+                    DataType::Utf8View => array
+                        .as_any()
+                        .downcast_ref::<StringViewArray>()
+                        .unwrap()
+                        .value(row),
+                    _ => unreachable!(),
+                };
+                assert_eq!(actual, expected.as_str());
+            }
+        }));
     }
     for carrier in [
         DataType::Binary,
         DataType::LargeBinary,
         DataType::BinaryView,
     ] {
-        cases.push((
-            FunctionValueType::new(carrier, false),
-            LiteralValue::Binary(binary.clone().into_boxed_slice()),
-        ));
+        let expected = binary.clone();
+        let ty = FunctionValueType::new(carrier.clone(), false);
+        let value = checked_value!(ty, from_binary(&expected));
+        cases.push(literal_case(value, move |array, rows| {
+            for row in 0..rows {
+                let actual = match carrier {
+                    DataType::Binary => array
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .unwrap()
+                        .value(row),
+                    DataType::LargeBinary => array
+                        .as_any()
+                        .downcast_ref::<LargeBinaryArray>()
+                        .unwrap()
+                        .value(row),
+                    DataType::BinaryView => array
+                        .as_any()
+                        .downcast_ref::<BinaryViewArray>()
+                        .unwrap()
+                        .value(row),
+                    _ => unreachable!(),
+                };
+                assert_eq!(actual, expected.as_slice());
+            }
+        }));
     }
-    cases.push((
+    let json_type =
         FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap(),
-        LiteralValue::Utf8("{\"value\":42}".into()),
+            .unwrap();
+    cases.push(literal_case(
+        checked_value!(json_type, from_utf8("{\"value\":42}")),
+        |array, rows| {
+            let values = array.as_any().downcast_ref::<StringArray>().unwrap();
+            for row in 0..rows {
+                assert_eq!(values.value(row), "{\"value\":42}");
+            }
+        },
     ));
-    cases.push((
-        FunctionValueType::try_with_logical_type(
-            DataType::LargeBinary,
-            false,
-            ValueLogicalType::Variant,
-        )
-        .unwrap(),
-        LiteralValue::Binary(vec![0, 0xff, 0x32, 0x80].into_boxed_slice()),
+    let variant_type = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Variant,
+    )
+    .unwrap();
+    cases.push(literal_case(
+        checked_value!(variant_type, from_binary(&[0, 0xff, 0x32, 0x80])),
+        |array, rows| {
+            let values = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            for row in 0..rows {
+                assert_eq!(values.value(row), &[0, 0xff, 0x32, 0x80]);
+            }
+        },
     ));
     check_literal_roots(with_typed_nulls(cases));
 }

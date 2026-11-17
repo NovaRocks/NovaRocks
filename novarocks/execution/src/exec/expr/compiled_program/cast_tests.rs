@@ -17,6 +17,7 @@
 
 // Complete Physical packages using the production owners from the parent fixture.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::Float32Array;
 use novarocks_functions::CastOperation;
 use novarocks_local_compiler::FragmentCompileError;
@@ -27,8 +28,9 @@ fn package(
     authors: &BTreeMap<ExprId, Author>,
     result: ResultPort,
     allow: bool,
+    source_pools: novarocks_physical_plan::ConstantPools,
 ) -> Arc<FragmentPackage> {
-    let (fragment, constants) = original_request_sources(fragment, authors);
+    let (fragment, constants) = original_request_sources(fragment, authors, source_pools);
     let fragment_id = fragment.id();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
     let mut author = FlowAuthor::new();
@@ -186,15 +188,31 @@ fn result_literal(
     builder: &mut FragmentBuilder,
     result: &FunctionValueType,
     policy: DecimalOverflowPolicy,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> ExprId {
     if matches!(result.data_type(), DataType::Timestamp(_, None)) {
-        return literal(builder, result, LiteralValue::Timestamp(71));
+        return literal(
+            builder,
+            result,
+            checked_constants::timestamp(result, 71, options().constants),
+            source_pools,
+        );
     }
     if *result.data_type() == DataType::Int64 {
-        return literal(builder, result, LiteralValue::Int64(71));
+        return literal(
+            builder,
+            result,
+            checked_constants::i64(result, 71, options().constants),
+            source_pools,
+        );
     }
     let source = FunctionValueType::new(DataType::Int64, false);
-    let value = literal(builder, &source, LiteralValue::Int64(71));
+    let value = literal(
+        builder,
+        &source,
+        checked_constants::i64(&source, 71, options().constants),
+        source_pools,
+    );
     builder
         .add_expression(
             NodeId::new(0),
@@ -217,6 +235,7 @@ fn fixture(
     policy: DecimalOverflowPolicy,
     allow: bool,
 ) -> (PureEngineFunctionCatalog, Arc<FragmentPackage>) {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let fid = FragmentId::new(213);
     let start = NodeId::new(u32::MAX);
@@ -239,8 +258,15 @@ fn fixture(
             let exact = builder
                 .add_expression(
                     input_node,
-                    FunctionValueType::new(DataType::Float64, false),
-                    ExprKind::Literal(LiteralValue::Float64Bits(0.0_f64.to_bits())),
+                    (FunctionValueType::new(DataType::Float64, false)).clone(),
+                    checked_constants::kind(
+                        &mut source_pools,
+                        checked_constants::f64_bits(
+                            &(FunctionValueType::new(DataType::Float64, false)),
+                            0.0_f64.to_bits(),
+                            options().constants,
+                        ),
+                    ),
                 )
                 .unwrap();
             builder
@@ -257,35 +283,49 @@ fn fixture(
                 .unwrap()
         } else {
             let value = if ty.nullable() {
-                LiteralValue::Null
+                checked_constants::null(ty, options().constants)
             } else {
                 match ty.data_type() {
-                    DataType::Binary => {
-                        LiteralValue::Binary(b"native producer".to_vec().into_boxed_slice())
+                    DataType::Binary => checked_constants::binary(
+                        ty,
+                        &(b"native producer".to_vec().into_boxed_slice()),
+                        options().constants,
+                    ),
+                    DataType::Decimal128(..) => {
+                        checked_constants::decimal128(ty, 0, options().constants)
                     }
-                    DataType::Decimal128(..) => LiteralValue::Decimal128(0),
-                    DataType::Decimal256(..) => {
-                        LiteralValue::Decimal256(arrow_buffer::i256::ZERO.to_be_bytes())
-                    }
-                    DataType::Boolean => LiteralValue::Boolean(false),
-                    DataType::Date32 => LiteralValue::Date32(0),
+                    DataType::Decimal256(..) => checked_constants::decimal256(
+                        ty,
+                        arrow_buffer::i256::ZERO.to_be_bytes(),
+                        options().constants,
+                    ),
+                    DataType::Boolean => checked_constants::boolean(ty, false, options().constants),
+                    DataType::Date32 => checked_constants::date32(ty, 0, options().constants),
                     DataType::FixedSizeBinary(16)
                         if ty.logical_type()
                             == novarocks_type_contract::ValueLogicalType::LargeInt =>
                     {
-                        LiteralValue::LargeInt(0)
+                        checked_constants::largeint(ty, 0, options().constants)
                     }
-                    DataType::Int64 => LiteralValue::Int64(0),
-                    DataType::UInt64 => LiteralValue::UInt64(0),
-                    DataType::Timestamp(_, None) => LiteralValue::Timestamp(0),
-                    DataType::Float64 => LiteralValue::Float64Bits(0.0_f64.to_bits()),
+                    DataType::Int64 => checked_constants::i64(ty, 0, options().constants),
+                    DataType::UInt64 => checked_constants::u64(ty, 0, options().constants),
+                    DataType::Timestamp(_, None) => {
+                        checked_constants::timestamp(ty, 0, options().constants)
+                    }
+                    DataType::Float64 => {
+                        checked_constants::f64_bits(ty, 0.0_f64.to_bits(), options().constants)
+                    }
                     _ => {
                         panic!("nonnullable fixture requires an implemented exact numeric literal")
                     }
                 }
             };
             builder
-                .add_expression(input_node, ty.clone(), ExprKind::Literal(value))
+                .add_expression(
+                    input_node,
+                    ty.clone(),
+                    checked_constants::kind(&mut source_pools, value),
+                )
                 .unwrap()
         };
         builder
@@ -314,7 +354,12 @@ fn fixture(
             let exact = literal(
                 &mut builder,
                 &FunctionValueType::new(DataType::Float64, false),
-                LiteralValue::Float64Bits((-0.0_f64).to_bits()),
+                checked_constants::f64_bits(
+                    &FunctionValueType::new(DataType::Float64, false),
+                    (-0.0_f64).to_bits(),
+                    options().constants,
+                ),
+                &mut source_pools,
             );
             builder
                 .add_expression(
@@ -330,28 +375,46 @@ fn fixture(
                 .unwrap()
         } else {
             let value = match source_type.data_type() {
-                DataType::Binary => {
-                    LiteralValue::Binary(b"native\0producer".to_vec().into_boxed_slice())
+                DataType::Binary => checked_constants::binary(
+                    &source_type,
+                    &(b"native\0producer".to_vec().into_boxed_slice()),
+                    options().constants,
+                ),
+                DataType::Decimal128(..) => {
+                    checked_constants::decimal128(&source_type, 1, options().constants)
                 }
-                DataType::Decimal128(..) => LiteralValue::Decimal128(1),
-                DataType::Decimal256(..) => {
-                    LiteralValue::Decimal256(arrow_buffer::i256::from_i128(1).to_be_bytes())
+                DataType::Decimal256(..) => checked_constants::decimal256(
+                    &source_type,
+                    arrow_buffer::i256::from_i128(1).to_be_bytes(),
+                    options().constants,
+                ),
+                DataType::Boolean => {
+                    checked_constants::boolean(&source_type, true, options().constants)
                 }
-                DataType::Boolean => LiteralValue::Boolean(true),
-                DataType::Date32 => LiteralValue::Date32(71),
+                DataType::Date32 => {
+                    checked_constants::date32(&source_type, 71, options().constants)
+                }
                 DataType::FixedSizeBinary(16)
                     if source_type.logical_type()
                         == novarocks_type_contract::ValueLogicalType::LargeInt =>
                 {
-                    LiteralValue::LargeInt(i128::MIN)
+                    checked_constants::largeint(&source_type, i128::MIN, options().constants)
                 }
-                DataType::Int64 => LiteralValue::Int64(71),
-                DataType::UInt64 => LiteralValue::UInt64(u64::MAX),
-                DataType::Timestamp(_, None) => LiteralValue::Timestamp(71),
-                DataType::Float64 => LiteralValue::Float64Bits((-0.0_f64).to_bits()),
+                DataType::Int64 => checked_constants::i64(&source_type, 71, options().constants),
+                DataType::UInt64 => {
+                    checked_constants::u64(&source_type, u64::MAX, options().constants)
+                }
+                DataType::Timestamp(_, None) => {
+                    checked_constants::timestamp(&source_type, 71, options().constants)
+                }
+                DataType::Float64 => checked_constants::f64_bits(
+                    &source_type,
+                    (-0.0_f64).to_bits(),
+                    options().constants,
+                ),
                 _ => panic!("constant fixture requires an implemented exact numeric literal"),
             };
-            literal(&mut builder, &source_type, value)
+            literal(&mut builder, &source_type, value, &mut source_pools)
         }
     } else {
         builder
@@ -363,7 +426,12 @@ fn fixture(
             .unwrap()
     };
     if matches!(source, Source::Add) {
-        let rhs = literal(&mut builder, &source_type, LiteralValue::Int64(1));
+        let rhs = literal(
+            &mut builder,
+            &source_type,
+            checked_constants::i64(&source_type, 1, options().constants),
+            &mut source_pools,
+        );
         child = arithmetic(&mut builder, BinaryOperator::Add, child, rhs, &source_type);
     }
     if matches!(source, Source::Round) {
@@ -396,7 +464,7 @@ fn fixture(
     let expression = match wrap {
         Wrap::Bare | Wrap::ConstantRight => cast,
         Wrap::Coalesce | Wrap::If => {
-            let fallback = result_literal(&mut builder, &result_type, policy);
+            let fallback = result_literal(&mut builder, &result_type, policy, &mut source_pools);
             if matches!(wrap, Wrap::Coalesce) {
                 call(
                     &mut builder,
@@ -487,7 +555,12 @@ fn fixture(
                 let decide = literal(
                     &mut builder,
                     &root_type,
-                    LiteralValue::Boolean(matches!(wrap, Wrap::Or)),
+                    checked_constants::boolean(
+                        &root_type,
+                        matches!(wrap, Wrap::Or),
+                        options().constants,
+                    ),
+                    &mut source_pools,
                 );
                 builder
                     .add_expression(
@@ -549,7 +622,7 @@ fn fixture(
             ty: root_type,
         }]),
     };
-    let package = package(&functions, fragment, &authors, result, allow);
+    let package = package(&functions, fragment, &authors, result, allow, source_pools);
     (functions, package)
 }
 fn compile(

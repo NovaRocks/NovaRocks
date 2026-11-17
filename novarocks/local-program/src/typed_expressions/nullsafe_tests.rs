@@ -30,13 +30,12 @@ fn safe_fixture(
     let mut nodes = vec![
         slot(0, &left),
         slot(1, &right),
-        StaticExprNode::new(
+        StaticExprNode::new_value_typed(
             StaticExprKind::PreparedNullSafeComparison {
                 left: ProgramExprId::new(0),
                 right: ProgramExprId::new(1),
             },
-            result.data_type().clone(),
-            None,
+            result.clone(),
         ),
     ];
     let mut types = vec![
@@ -292,24 +291,17 @@ fn nullsafe_callable_operand_is_rejected_even_without_an_evaluation_use() {
         let ty = integer(false);
         let mut nodes = vec![
             slot(0, &ty),
-            StaticExprNode::new(
-                StaticExprKind::LambdaFunction {
-                    body: ProgramExprId::new(0),
-                    arg_slots: vec![],
-                    common_sub_exprs: vec![],
-                    is_nondeterministic: false,
-                },
-                DataType::Int64,
-                None,
+            StaticExprNode::new_value_typed(
+                StaticExprKind::SlotId(SlotId::new(1)),
+                novarocks_functions::FunctionValueType::new(DataType::Int64, false),
             ),
             slot(2, &ty),
-            StaticExprNode::new(
+            StaticExprNode::new_value_typed(
                 StaticExprKind::PreparedNullSafeComparison {
                     left: ProgramExprId::new(1),
                     right: ProgramExprId::new(2),
                 },
-                DataType::Boolean,
-                None,
+                novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
             ),
         ];
         let mut types = vec![

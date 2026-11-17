@@ -322,9 +322,6 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                             let branch = fragment.expressions().get(*arg).unwrap();
                             assert_eq!(branch.ty.data_type(), &DataType::Int32);
                             let actual = match &branch.kind {
-                                ExprKind::Literal(
-                                    novarocks_physical_plan::LiteralValue::Int64(v),
-                                ) => Some(*v),
                                 ExprKind::Constant(reference) => {
                                     let pool =
                                         &source.plan().constants().entries()[&reference.pool];

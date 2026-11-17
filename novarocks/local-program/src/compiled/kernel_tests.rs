@@ -36,7 +36,7 @@ use novarocks_type_contract::{
 };
 use novarocks_types::SlotId;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
     sync::{Arc, Mutex},
     time::Duration,
@@ -183,22 +183,17 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
     let arena = Arc::new(
         ImmutableExpressions::try_new_for_compile(
             vec![
-                StaticExprNode::new(
-                    StaticExprKind::Literal(StaticLiteral::Int64(42)),
-                    DataType::Int64,
-                    None,
+                StaticExprNode::new_value_typed(
+                    crate::test_support::integer(42),
+                    novarocks_functions::FunctionValueType::new(DataType::Int64, false),
                 ),
-                StaticExprNode::new(
+                StaticExprNode::new_value_typed(
                     StaticExprKind::BoundCall {
                         args: vec![ProgramExprId::new(0)],
                     },
-                    DataType::Float64,
-                    None,
+                    result_type.clone(),
                 ),
             ],
-            false,
-            HashMap::new(),
-            None,
             &control,
         )
         .unwrap(),

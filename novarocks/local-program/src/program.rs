@@ -2451,7 +2451,7 @@ fn validate_shape(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+
     use std::num::{NonZeroU32, NonZeroUsize};
 
     use arrow_array::{Int64Array, RecordBatch};
@@ -2492,16 +2492,10 @@ mod tests {
         let make = |rank_group_ordinals| {
             let (values, layout) = values();
             let expressions = Arc::new(
-                ImmutableExpressions::try_new(
-                    vec![StaticExprNode::new(
-                        StaticExprKind::SlotId(SlotId::new(1)),
-                        DataType::Int64,
-                        None,
-                    )],
-                    false,
-                    HashMap::new(),
-                    None,
-                )
+                crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+                    StaticExprKind::SlotId(SlotId::new(1)),
+                    novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+                )])
                 .unwrap(),
             );
             LocalProgramGraph::try_new(
@@ -2531,16 +2525,10 @@ mod tests {
         let make_program = |last_constant: UnpivotConstant| {
             let (values, layout) = values();
             let expressions = Arc::new(
-                ImmutableExpressions::try_new(
-                    vec![StaticExprNode::new(
-                        StaticExprKind::Literal(crate::StaticLiteral::Int64(7)),
-                        DataType::Int64,
-                        None,
-                    )],
-                    false,
-                    HashMap::new(),
-                    None,
-                )
+                crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+                    crate::test_support::integer(7),
+                    novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+                )])
                 .unwrap(),
             );
             let unpivot = WriterGroupedUnpivotPlan {
@@ -2632,16 +2620,10 @@ mod tests {
             let partition_limit = (!partition_exprs.is_empty()).then_some(2);
             let (values, layout) = values();
             let expressions = Arc::new(
-                ImmutableExpressions::try_new(
-                    vec![StaticExprNode::new(
-                        StaticExprKind::SlotId(SlotId::new(1)),
-                        DataType::Int64,
-                        None,
-                    )],
-                    false,
-                    HashMap::new(),
-                    None,
-                )
+                crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+                    StaticExprKind::SlotId(SlotId::new(1)),
+                    novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+                )])
                 .unwrap(),
             );
             LocalProgramGraph::try_new(
@@ -2691,16 +2673,10 @@ mod tests {
     fn shares_flat_values_and_expressions_across_instances() {
         let (values, layout) = values();
         let exprs = Arc::new(
-            ImmutableExpressions::try_new(
-                vec![StaticExprNode::new(
-                    StaticExprKind::SlotId(SlotId::new(1)),
-                    DataType::Int64,
-                    None,
-                )],
-                false,
-                HashMap::new(),
-                None,
-            )
+            crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+                StaticExprKind::SlotId(SlotId::new(1)),
+                novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+            )])
             .unwrap(),
         );
         let nodes = vec![
@@ -2733,8 +2709,7 @@ mod tests {
     #[test]
     fn rejects_cycle_before_any_runtime_binding() {
         let (values, layout) = values();
-        let exprs =
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap());
+        let exprs = Arc::new(crate::test_support::arena(vec![]).unwrap());
         let nodes = vec![
             ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
             ProgramNode::new(
@@ -2769,7 +2744,7 @@ mod tests {
                 layout.clone(),
             )],
             ProgramNodeId::new(0),
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+            Arc::new(crate::test_support::arena(vec![]).unwrap()),
             CompileProfile::new(
                 NonZeroUsize::new(1).unwrap(),
                 None,
@@ -2801,7 +2776,7 @@ mod tests {
         let program = LocalProgramGraph::try_new(
             nodes,
             ProgramNodeId::new(17),
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+            Arc::new(crate::test_support::arena(vec![]).unwrap()),
             profile(&layout),
             BindingRequirements::try_new(vec![]).unwrap(),
         );
@@ -2820,9 +2795,7 @@ mod tests {
                     layout.clone(),
                 )],
                 ProgramNodeId::new(0),
-                Arc::new(
-                    ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap(),
-                ),
+                Arc::new(crate::test_support::arena(vec![]).unwrap()),
                 profile(&layout),
                 BindingRequirements::try_new(vec![]).unwrap(),
             );
@@ -2842,9 +2815,7 @@ mod tests {
     #[test]
     fn rejects_unreachable_nodes_and_unbound_exchange_source() {
         let (values, layout) = values();
-        let empty_expressions = || {
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap())
-        };
+        let empty_expressions = || Arc::new(crate::test_support::arena(vec![]).unwrap());
         let unreachable = LocalProgramGraph::try_new(
             vec![
                 ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
@@ -2910,9 +2881,7 @@ mod tests {
             let program = LocalProgramGraph::try_new(
                 nodes,
                 ProgramNodeId::new(width),
-                Arc::new(
-                    ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap(),
-                ),
+                Arc::new(crate::test_support::arena(vec![]).unwrap()),
                 profile(&layout),
                 BindingRequirements::try_new(vec![]).unwrap(),
             )
@@ -2942,7 +2911,7 @@ mod tests {
                 },
             )
             .unwrap(),
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+            Arc::new(crate::test_support::arena(vec![]).unwrap()),
         )
         .unwrap();
         let result = LocalProgramGraph::try_new_with_sink(
@@ -2952,7 +2921,7 @@ mod tests {
                 layout.clone(),
             )],
             ProgramNodeId::new(0),
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+            Arc::new(crate::test_support::arena(vec![]).unwrap()),
             profile(&layout),
             BindingRequirements::try_new(vec![]).unwrap(),
             Some(sink),
@@ -2963,8 +2932,7 @@ mod tests {
     #[test]
     fn local_program_rejects_the_pre_policy_kernel_abi() {
         let (_, layout) = values();
-        let expressions =
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap());
+        let expressions = Arc::new(crate::test_support::arena(vec![]).unwrap());
         let requirements = BindingRequirements::try_new(vec![]).unwrap();
         let old = CompileProfile::new(
             NonZeroUsize::new(1).unwrap(),
@@ -3023,16 +2991,10 @@ mod tests {
     fn exchange_fixture(edges: usize, children: bool) -> LocalProgramGraph {
         let (_, layout) = values();
         let expressions = Arc::new(
-            ImmutableExpressions::try_new(
-                vec![StaticExprNode::new(
-                    StaticExprKind::SlotId(SlotId::new(1)),
-                    DataType::Int64,
-                    None,
-                )],
-                false,
-                HashMap::new(),
-                None,
-            )
+            crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+                StaticExprKind::SlotId(SlotId::new(1)),
+                novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+            )])
             .unwrap(),
         );
         let mut nodes = vec![ProgramNode::new(

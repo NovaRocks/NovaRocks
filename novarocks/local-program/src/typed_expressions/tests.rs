@@ -21,8 +21,7 @@ use crate::{
     KernelAbiVersion, LocalProgramGraph, ProgramControlFlow, ProgramEvaluationRegion,
     ProgramExpressionRootSite, ProgramExpressionUse, ProgramNode, ProgramNodeExpressionRole,
     ProgramNodeId, ProgramNodeKind, ProgramRootControlBindings, ProgramRootUseBinding,
-    StaticExprNode, StaticLayout, StaticLiteral, StaticSinkProgram, StaticStreamBranch,
-    StaticValues,
+    StaticExprNode, StaticLayout, StaticSinkProgram, StaticStreamBranch, StaticValues,
 };
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -38,10 +37,9 @@ struct Control {
 }
 
 fn shared_truth_value_fixture(ty: DataType) -> ProgramResolvedCalls {
-    let nodes = arena(vec![StaticExprNode::new(
-        StaticExprKind::Literal(StaticLiteral::Null),
-        ty.clone(),
-        None,
+    let nodes = arena(vec![StaticExprNode::new_value_typed(
+        StaticExprKind::SlotId(SlotId::new(1)),
+        novarocks_functions::FunctionValueType::new(ty.clone(), true),
     )]);
     let source_schema = Arc::new(Schema::new(vec![Field::new(
         "source",
@@ -197,14 +195,14 @@ impl PureCompileControl for Control {
     }
 }
 fn arena(nodes: Vec<StaticExprNode>) -> Arc<ImmutableExpressions> {
-    Arc::new(ImmutableExpressions::try_new(nodes, false, HashMap::new(), None).unwrap())
+    Arc::new(crate::test_support::arena(nodes).unwrap())
 }
 fn bool_node() -> StaticExprNode {
-    StaticExprNode::new(
-        StaticExprKind::Literal(StaticLiteral::Bool(true)),
-        DataType::Boolean,
-        None,
-    )
+    cv_node(cv(
+        Arc::new(BooleanArray::from(vec![true])),
+        FunctionValueType::new(DataType::Boolean, false),
+        0,
+    ))
 }
 fn value(ty: DataType, nullable: bool) -> FunctionArgumentType {
     FunctionArgumentType::Value(FunctionValueType::new(ty, nullable))
@@ -303,18 +301,16 @@ fn main_types(
 
 #[test]
 fn unused_definitions_still_have_explicit_full_logical_and_nullable_types() {
+    let ty = FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+        .unwrap();
     let source = resolved(
-        vec![StaticExprNode::new(
-            StaticExprKind::Literal(StaticLiteral::Utf8("null".into())),
-            DataType::Utf8,
-            None,
+        vec![StaticExprNode::new_value_typed(
+            StaticExprKind::SlotId(SlotId::new(1)),
+            ty.clone(),
         )],
         None,
     );
-    let json = FunctionArgumentType::Value(
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap(),
-    );
+    let json = FunctionArgumentType::Value(ty);
     let typed = ProgramTypedExpressions::try_new(
         source,
         main_types(vec![json.clone()]),
@@ -359,70 +355,18 @@ fn missing_extra_arena_and_definition_positions_are_not_optional() {
 }
 
 #[test]
-fn lambda_parameter_shape_and_body_type_remain_explicit() {
-    let source = resolved(
-        vec![
-            bool_node(),
-            StaticExprNode::new(
-                StaticExprKind::LambdaFunction {
-                    body: ProgramExprId::new(0),
-                    arg_slots: vec![SlotId::new(7)],
-                    common_sub_exprs: vec![],
-                    is_nondeterministic: false,
-                },
-                DataType::Boolean,
-                None,
-            ),
-        ],
-        None,
-    );
+fn lambda_argument_types_are_rejected_without_a_lowered_lambda_definition() {
+    let source = resolved(vec![bool_node()], None);
     let lambda = FunctionArgumentType::Lambda {
-        parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
-            vec![FunctionValueType::new(DataType::Int64, false)].into_boxed_slice(),
-        ),
-        result_type: FunctionValueType::new(DataType::Boolean, true),
-    };
-    ProgramTypedExpressions::try_new(
-        source.clone(),
-        main_types(vec![value(DataType::Boolean, true), lambda.clone()]),
-        &Control::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        ProgramTypedExpressions::try_new(
-            source.clone(),
-            main_types(vec![value(DataType::Boolean, true); 2]),
-            &Control::default()
-        )
-        .unwrap_err(),
-        ProgramExpressionTypeError::WrongKind
-    );
-    let FunctionArgumentType::Lambda { result_type, .. } = lambda.clone() else {
-        unreachable!()
-    };
-    let wrong = FunctionArgumentType::Lambda {
         parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
             Box::default(),
         ),
-        result_type,
+        result_type: FunctionValueType::new(DataType::Boolean, true),
     };
     assert_eq!(
-        ProgramTypedExpressions::try_new(
-            source.clone(),
-            main_types(vec![value(DataType::Boolean, true), wrong]),
-            &Control::default()
-        )
-        .unwrap_err(),
-        ProgramExpressionTypeError::WrongLambda
-    );
-    assert_eq!(
-        ProgramTypedExpressions::try_new(
-            source,
-            main_types(vec![value(DataType::Boolean, false), lambda]),
-            &Control::default()
-        )
-        .unwrap_err(),
-        ProgramExpressionTypeError::TypeMismatch
+        ProgramTypedExpressions::try_new(source, main_types(vec![lambda]), &Control::default())
+            .unwrap_err(),
+        ProgramExpressionTypeError::WrongKind
     );
 }
 
@@ -442,12 +386,9 @@ fn source_dictionary_ids_do_not_change_static_value_binding_and_invalid_nominals
     let right = DataType::Struct(vec![field(2)].into());
     assert_eq!(left, right); // Arrow logical equality is deliberately coarser.
     let source = resolved(
-        vec![StaticExprNode::new(
-            StaticExprKind::Literal(StaticLiteral::Null),
-            FunctionValueType::new(left.clone(), true)
-                .data_type()
-                .clone(),
-            None,
+        vec![StaticExprNode::new_value_typed(
+            StaticExprKind::SlotId(SlotId::new(1)),
+            FunctionValueType::new(left.clone(), true),
         )],
         None,
     );
@@ -560,8 +501,8 @@ fn cv(
     .unwrap()
 }
 fn cv_node(value: novarocks_functions::ConstantValue) -> StaticExprNode {
-    let ty = value.value_type().data_type().clone();
-    StaticExprNode::new(StaticExprKind::Constant(value), ty, None)
+    let ty = value.value_type().clone();
+    StaticExprNode::new_value_typed(StaticExprKind::Constant(value), ty)
 }
 
 #[test]
@@ -701,16 +642,10 @@ fn shared_constants_reject_logical_nullable_and_carrier_retagging() {
         0,
     );
     assert_eq!(
-        ImmutableExpressions::try_new(
-            vec![StaticExprNode::new(
-                StaticExprKind::Constant(float),
-                DataType::Float64,
-                None
-            )],
-            false,
-            HashMap::new(),
-            None,
-        )
+        crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+            StaticExprKind::Constant(float),
+            novarocks_functions::FunctionValueType::new(DataType::Float64, false)
+        )])
         .unwrap_err(),
         crate::StaticExpressionError::ConstantTypeMismatch
     );
@@ -734,13 +669,7 @@ fn shared_constant_backing_is_bounded_as_retained_storage_and_deduplicated() {
         cv_node(same),
     ]);
     assert_eq!(
-        ImmutableExpressions::try_new(
-            vec![cv_node(make()), cv_node(make())],
-            false,
-            HashMap::new(),
-            None,
-        )
-        .unwrap_err(),
+        crate::test_support::arena(vec![cv_node(make()), cv_node(make())]).unwrap_err(),
         crate::StaticExpressionError::TooManyBytes
     );
 }
@@ -963,10 +892,9 @@ fn complete_map64_definition_uses_canonical_depth_and_keeps_layout_mismatch() {
     let expected = map(DataType::Utf8);
     let source = || {
         resolved(
-            vec![StaticExprNode::new(
-                StaticExprKind::Literal(StaticLiteral::Null),
-                expected.clone(),
-                None,
+            vec![StaticExprNode::new_value_typed(
+                StaticExprKind::SlotId(SlotId::new(1)),
+                novarocks_functions::FunctionValueType::new(expected.clone(), true),
             )],
             None,
         )

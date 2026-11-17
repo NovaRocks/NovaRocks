@@ -59,11 +59,7 @@ use novarocks_type_contract::{
     FunctionValueType, PureCompileControl,
 };
 use novarocks_types::SlotId;
-use std::{
-    collections::{BTreeMap, HashMap},
-    num::NonZeroUsize,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
 /// Additional typed channels one writer-family node owns beyond its output
 /// occurrences: the writer's projection and multiplex roles, or the finish's
@@ -586,20 +582,16 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
         work,
     )
     .map_err(crate::creation::argument_types_failure)?;
-    let arena = ImmutableExpressions::try_new_for_compile(
-        nodes,
-        false,
-        HashMap::new(),
-        None,
-        work.control(),
-    )
-    .map_err(|error| match error {
-        ExpressionsCompileError::Control(cause) => FragmentCompileError::Control(cause),
-        error => FragmentCompileError::Owner {
-            phase: "writer projection expressions",
-            error: novarocks_failure_contract::SharedFailureCause::new(error),
-        },
-    })?;
+    let arena =
+        ImmutableExpressions::try_new_for_compile(nodes, work.control()).map_err(|error| {
+            match error {
+                ExpressionsCompileError::Control(cause) => FragmentCompileError::Control(cause),
+                error => FragmentCompileError::Owner {
+                    phase: "writer projection expressions",
+                    error: novarocks_failure_contract::SharedFailureCause::new(error),
+                },
+            }
+        })?;
     let arena = Arc::new(arena);
     work.flush()?;
     let multiplex = relation_layout_inner_with_creation(

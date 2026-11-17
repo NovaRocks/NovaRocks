@@ -81,21 +81,31 @@ fn fixture(make: impl FnOnce(&mut FragmentBuilder, NodeId) -> (ExprId, Vec<ExprI
         definitions,
     }
 }
-fn integer(builder: &mut FragmentBuilder, node: NodeId, value: i64) -> ExprId {
+fn integer(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    value: i64,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> ExprId {
     builder
         .add_expression(
             node,
-            ty(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Int64(value)),
+            (ty(DataType::Int64, false)).clone(),
+            fixture_constants.i64(value, &(ty(DataType::Int64, false))),
         )
         .unwrap()
 }
-fn boolean(builder: &mut FragmentBuilder, node: NodeId, value: bool) -> ExprId {
+fn boolean(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    value: bool,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> ExprId {
     builder
         .add_expression(
             node,
-            ty(DataType::Boolean, false),
-            ExprKind::Literal(LiteralValue::Boolean(value)),
+            (ty(DataType::Boolean, false)).clone(),
+            fixture_constants.boolean(value, &(ty(DataType::Boolean, false))),
         )
         .unwrap()
 }
@@ -219,8 +229,9 @@ fn bind(
 
 #[test]
 fn literal_cannot_invent_a_runtime_child_from_an_existing_valid_definition() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let fixture = fixture(|builder, node| {
-        let root = integer(builder, node, 1);
+        let root = integer(builder, node, 1, &mut fixture_constants);
         (root, vec![root])
     });
     bind(&fixture, graph(&fixture, leaf(7, fixture.root)).unwrap()).unwrap();
@@ -240,13 +251,16 @@ fn literal_cannot_invent_a_runtime_child_from_an_existing_valid_definition() {
     );
 }
 
-fn binary_fixture(repeated: bool) -> Fixture {
+fn binary_fixture(
+    repeated: bool,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
     fixture(|builder, node| {
-        let left = integer(builder, node, 11);
+        let left = integer(builder, node, 11, fixture_constants);
         let right = if repeated {
             left
         } else {
-            integer(builder, node, 22)
+            integer(builder, node, 22, fixture_constants)
         };
         let root = builder
             .add_expression(
@@ -271,7 +285,8 @@ fn binary_fixture(repeated: bool) -> Fixture {
 }
 #[test]
 fn binary_children_must_match_the_actual_ordered_definitions() {
-    let fixture = binary_fixture(false);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = binary_fixture(false, &mut fixture_constants);
     let correct = graph(
         &fixture,
         tree(
@@ -307,7 +322,8 @@ fn binary_children_must_match_the_actual_ordered_definitions() {
 
 #[test]
 fn repeated_definition_preserves_two_occurrences_and_cannot_share_one_use() {
-    let fixture = binary_fixture(true);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = binary_fixture(true, &mut fixture_constants);
     let flow = graph(
         &fixture,
         tree(
@@ -352,12 +368,13 @@ fn repeated_definition_preserves_two_occurrences_and_cannot_share_one_use() {
 
 #[test]
 fn case_shape_metadata_and_ordered_when_then_occurrences_follow_actual_case() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let fixture = fixture(|builder, node| {
-        let first_when = boolean(builder, node, true);
-        let first_then = integer(builder, node, 11);
-        let second_when = boolean(builder, node, false);
-        let second_then = integer(builder, node, 22);
-        let otherwise = integer(builder, node, 33);
+        let first_when = boolean(builder, node, true, &mut fixture_constants);
+        let first_then = integer(builder, node, 11, &mut fixture_constants);
+        let second_when = boolean(builder, node, false, &mut fixture_constants);
+        let second_then = integer(builder, node, 22, &mut fixture_constants);
+        let otherwise = integer(builder, node, 33, &mut fixture_constants);
         let root = builder
             .add_expression(
                 node,
@@ -416,8 +433,9 @@ fn case_shape_metadata_and_ordered_when_then_occurrences_follow_actual_case() {
 
 #[test]
 fn type_only_keeps_checked_static_arguments_without_runtime_children() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let fixture = fixture(|builder, node| {
-        let argument = integer(builder, node, 11);
+        let argument = integer(builder, node, 11, &mut fixture_constants);
         let result = ty(DataType::Boolean, false);
         let root = builder
             .add_expression(
@@ -475,9 +493,11 @@ fn type_only_keeps_checked_static_arguments_without_runtime_children() {
     );
 }
 
-fn higher_fixture() -> Fixture {
+fn higher_fixture(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
     fixture(|builder, node| {
-        let ordinary = boolean(builder, node, true);
+        let ordinary = boolean(builder, node, true, fixture_constants);
         let lambda = builder.reserve_expression_id().unwrap();
         let bool_type = ty(DataType::Boolean, false);
         let body = builder
@@ -547,7 +567,8 @@ fn higher_tree(fixture: &Fixture, body_ordinal: u32, wrapper: ControlShape) -> U
 
 #[test]
 fn truth_only_lambda_wrapper_and_body_share_the_exact_invocation_guard_and_demand() {
-    let fixture = higher_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = higher_fixture(&mut fixture_constants);
     let flow = graph(&fixture, higher_tree(&fixture, 1, ControlShape::LambdaBody)).unwrap();
     let bound = bind(&fixture, flow).unwrap();
     let lambda = &bound.flow().uses()[&ExpressionUseId::new(2000)];
@@ -566,7 +587,8 @@ fn truth_only_lambda_wrapper_and_body_share_the_exact_invocation_guard_and_deman
 
 #[test]
 fn structurally_legal_higher_body_ordinal_and_eager_lambda_wrapper_are_rejected() {
-    let fixture = higher_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = higher_fixture(&mut fixture_constants);
     let wrong_ordinal =
         graph(&fixture, higher_tree(&fixture, 0, ControlShape::LambdaBody)).unwrap();
     assert_eq!(

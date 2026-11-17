@@ -1027,7 +1027,6 @@ fn lower_with_creation<
                 .map_err(crate::FragmentCreationError::Creator)?;
             lower_expressions_with_unions_with_creator(
                 package,
-                options.constants,
                 &channels_plan.inputs,
                 &channels_plan.unions,
                 &runtime_filter_keys,
@@ -1038,7 +1037,6 @@ fn lower_with_creation<
         }
         None => lower_expressions_with_unions(
             package,
-            options.constants,
             &channels_plan.inputs,
             &channels_plan.unions,
             &runtime_filter_keys,

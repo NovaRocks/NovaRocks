@@ -18,7 +18,7 @@
 use super::*;
 use crate::physical_package_v2::definition_sources::tests::{
     change_stream_packages, cv_package, repeated_change_stream_packages, rich_package,
-    writer_constant_package, writer_package,
+    writer_constant_package,
 };
 use crate::physical_package_v2::prepare_package_wire_in;
 use crate::physical_package_v2::provider_sources::tests::checked_read;
@@ -178,46 +178,6 @@ fn whole_sender_preserves_component_limit_and_control() {
             ));
             assert_eq!(stop.trace.lock().unwrap().len(), at + 1);
         }
-    }
-}
-
-// The checked writer fixture still carries a legacy Literal in its Values
-// row. The v2 sender refuses it as an ordinary expression error: literals
-// must be authored as constant pool references before publication.
-#[test]
-fn legacy_literal_package_is_an_ordinary_refusal_not_a_silent_conversion() {
-    let package = writer_package();
-    assert!(matches!(
-        encode_fragment_package(&package, &encode_limits(), &Control::default()),
-        Err(PackageEncodeError::Expression(_))
-    ));
-}
-
-#[test]
-fn original_sender_refusal_precedes_late_footer_control() {
-    use novarocks_failure_contract::FailureProjection;
-    let package = writer_package();
-    let original_control = Control::default();
-    let mut work = CompileCheckpoints::try_new(&original_control, CompilePhase::Encode).unwrap();
-    let original = encode_fragment_package_in(&package, &encode_limits(), &mut work).unwrap_err();
-    assert!(matches!(original, PackageEncodeError::Expression(_)));
-    let original_trace = original_control.trace.lock().unwrap().clone();
-    assert!(!original_trace.is_empty());
-    for cause in [
-        CompileControlError::Cancelled,
-        CompileControlError::DeadlineExceeded,
-        CompileControlError::ResourceExhausted,
-    ] {
-        let stop = Control {
-            stop: Some((original_trace.len(), cause)),
-            ..Default::default()
-        };
-        let refused = encode_fragment_package(&package, &encode_limits(), &stop).unwrap_err();
-        assert!(matches!(refused, PackageEncodeError::Expression(_)));
-        assert_eq!(refused.to_string(), original.to_string());
-        assert_eq!(refused.failure_fact(), original.failure_fact());
-        assert_eq!(*stop.trace.lock().unwrap(), original_trace);
-        assert!(std::error::Error::source(&refused).is_some());
     }
 }
 

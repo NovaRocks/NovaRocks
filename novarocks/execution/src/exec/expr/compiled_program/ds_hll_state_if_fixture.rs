@@ -16,6 +16,7 @@
 // under the License.
 //! Real catalogue -> frozen Physical call -> LocalCompiler -> runtime Frame fixture.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::StringArray;
 fn functions() -> PureEngineFunctionCatalog {
     let actual =
@@ -59,6 +60,7 @@ pub(super) fn row_data_program() -> Arc<LocalProgram> {
     program_with_target(FunctionValueType::new(DataType::Utf8, true))
 }
 fn program_with_target(target: FunctionValueType) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = functions();
     let fragment_id = FragmentId::new(198);
     let source = NodeId::new(0);
@@ -78,7 +80,14 @@ fn program_with_target(target: FunctionValueType) -> Arc<LocalProgram> {
             _ => FunctionValueType::new(DataType::Boolean, true),
         };
         let expr = b
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         let value = ValueId::new(91 + i as u32);
         b.insert_value(ValueDef {
@@ -129,7 +138,10 @@ fn program_with_target(target: FunctionValueType) -> Arc<LocalProgram> {
         .add_expression(
             output,
             result_ty.clone(),
-            ExprKind::Literal(LiteralValue::Null),
+            checked_constants::kind(
+                &mut source_pools,
+                checked_constants::null(&(result_ty.clone()), options().constants),
+            ),
         )
         .unwrap();
     let conditional = author(
@@ -195,7 +207,7 @@ fn program_with_target(target: FunctionValueType) -> Arc<LocalProgram> {
             ty: result_ty,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
 }
 pub(super) fn source_batch(p: &LocalProgram) -> RecordBatch {
     use arrow::array::builder::{ListBuilder, StringBuilder};

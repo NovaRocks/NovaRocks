@@ -25,10 +25,7 @@ fn unary(
 ) -> Result<ProgramTypedExpressions, ProgramExpressionTypeError> {
     let (node, ty) = operand;
     let (calls, types) = assembled(
-        vec![
-            node,
-            StaticExprNode::new(kind, output.data_type().clone(), None),
-        ],
+        vec![node, StaticExprNode::new_value_typed(kind, output.clone())],
         vec![ty, FunctionArgumentType::Value(output.clone())],
         ProgramExprId::new(1),
         output,
@@ -98,7 +95,10 @@ fn public_unary_type_author_refuses_wrong_boolean_domains_and_nullability() {
             )
             .unwrap();
             let operand = (
-                StaticExprNode::new(StaticExprKind::Constant(constant), DataType::Utf8, None),
+                StaticExprNode::new_value_typed(
+                    StaticExprKind::Constant(constant),
+                    novarocks_functions::FunctionValueType::new(DataType::Utf8, false),
+                ),
                 FunctionArgumentType::Value(operand_type),
             );
             assert_eq!(
@@ -164,24 +164,17 @@ fn public_null_predicate_rejects_callable_operand_without_erasing_its_value_resu
         let (calls, types) = assembled(
             vec![
                 body,
-                StaticExprNode::new(
-                    StaticExprKind::LambdaFunction {
-                        body: ProgramExprId::new(0),
-                        arg_slots: vec![],
-                        common_sub_exprs: vec![],
-                        is_nondeterministic: false,
-                    },
-                    DataType::Boolean,
-                    None,
+                StaticExprNode::new_value_typed(
+                    StaticExprKind::SlotId(SlotId::new(1)),
+                    novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
                 ),
-                StaticExprNode::new(
+                StaticExprNode::new_value_typed(
                     if negated {
                         StaticExprKind::IsNotNull(ProgramExprId::new(1))
                     } else {
                         StaticExprKind::IsNull(ProgramExprId::new(1))
                     },
-                    DataType::Boolean,
-                    None,
+                    novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
                 ),
             ],
             vec![

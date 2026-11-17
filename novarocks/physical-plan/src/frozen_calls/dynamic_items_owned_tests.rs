@@ -44,7 +44,8 @@ fn count_in(
 
 #[test]
 fn actual_sparse_call_environments_keep_original_count_and_caller_phase_without_nested_scope() {
-    let mut fixture = scalar_fixture(3, u32::MAX);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(3, u32::MAX, &mut fixture_constants);
     fixture.calls[0].effects.environment = Box::from([
         SemanticParameterRef {
             id: SemanticParameterId::new(0),
@@ -91,11 +92,12 @@ fn actual_sparse_call_environments_keep_original_count_and_caller_phase_without_
 
 #[test]
 fn actual_wide_call_count_quantum_and_empty_tail_preserve_every_first_control_cause() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for count in [0, 3, 320] {
         let fixture = if count == 0 {
             empty_fixture()
         } else {
-            scalar_fixture(count, 0)
+            scalar_fixture(count, 0, &mut fixture_constants)
         };
         let calls = fixture.checked().unwrap();
         let baseline = BorrowedControl::default();

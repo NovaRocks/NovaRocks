@@ -969,15 +969,13 @@ mod tests {
             Arc::clone(main)
         } else {
             Arc::new(
-                ImmutableExpressions::try_new(
+                ImmutableExpressions::try_new_for_compile(
                     main.nodes()
                         .iter()
                         .cloned()
                         .chain(added_definitions.iter().map(|(node, _)| node.clone()))
                         .collect(),
-                    main.allow_throw_exception(),
-                    main.query_global_dicts().clone(),
-                    main.session_time_zone().map(Arc::from),
+                    &control,
                 )
                 .map_err(|error| format!("{error:?}"))?,
             )
@@ -1179,10 +1177,16 @@ mod tests {
     ) -> CompiledFixture {
         use crate::exec::pipeline::builder::{compile_family_fixture, family_package_with_sink};
         use novarocks_physical_plan::{
-            ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder,
-            FragmentId, FragmentSink, NodeId, ValueOrigin,
+            ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentId, FragmentSink,
+            NodeId, ValueOrigin,
         };
-        let mut builder = FragmentBuilder::new(FragmentId::new(19));
+        let fixture_sources =
+            crate::exec::operators::family_fixture::constant_sources::Sources::new();
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                FragmentId::new(19),
+                &fixture_sources,
+            );
         let source = NodeId::new(18);
         let project = NodeId::new(19);
         let declared = FunctionValueType::new(DataType::Int32, false);
@@ -1316,10 +1320,9 @@ mod tests {
             Additions {
                 root: Some(node),
                 definitions: vec![(
-                    StaticExprNode::new(
+                    StaticExprNode::new_value_typed(
                         StaticExprKind::SlotId(SlotId::new(1)),
-                        DataType::Int32,
-                        None,
+                        value_type.clone(),
                     ),
                     value_type.clone(),
                 )],

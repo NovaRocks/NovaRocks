@@ -33,10 +33,10 @@ use novarocks_physical_plan::{
     ConstantPoolId, ConstantPools, ConstantReference, ConstantReferenceError, ExprKind,
     FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
     FragmentPackageError, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, LiteralValue, NodeId, NodeKind, PhysicalExpressionRoots,
-    PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
-    RequiredContracts, ResultField, ResultPort, UnpivotConstant, UnpivotSpec, UnpivotValueMapping,
-    ValueId, ValueOrigin,
+    FrozenFragmentPruning, NodeId, NodeKind, PhysicalExpressionRoots, PhysicalRootUses,
+    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
+    ResultField, ResultPort, UnpivotConstant, UnpivotSpec, UnpivotValueMapping, ValueId,
+    ValueOrigin,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
@@ -305,6 +305,7 @@ fn fixture(
     let unpivot = NodeId::new(901);
     let integer = FunctionValueType::new(DataType::Int64, false);
     let nullable = FunctionValueType::new(DataType::Int64, true);
+    let mut constants = ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fid);
     builder
         .add_values(empty, Box::from([Box::default()]), Box::default())
@@ -314,10 +315,21 @@ fn fixture(
         initial,
         empty,
         vec![
-            (ExprKind::Literal(LiteralValue::Int64(7)), integer.clone()),
-            (ExprKind::Literal(LiteralValue::Null), nullable.clone()),
             (
-                ExprKind::Literal(LiteralValue::Utf8("source".into())),
+                crate::test_constants::i64(&mut constants, &integer, 7, options().constants),
+                integer.clone(),
+            ),
+            (
+                crate::test_constants::null(&mut constants, &nullable, options().constants),
+                nullable.clone(),
+            ),
+            (
+                crate::test_constants::utf8(
+                    &mut constants,
+                    &FunctionValueType::new(DataType::Utf8, false),
+                    "source",
+                    options().constants,
+                ),
                 FunctionValueType::new(DataType::Utf8, false),
             ),
         ],
@@ -434,7 +446,12 @@ fn fixture(
             .add_expression(
                 unpivot,
                 FunctionValueType::new(DataType::Utf8, false),
-                ExprKind::Literal(LiteralValue::Utf8("authored-literal".into())),
+                crate::test_constants::utf8(
+                    &mut constants,
+                    &FunctionValueType::new(DataType::Utf8, false),
+                    "authored-literal",
+                    options().constants,
+                ),
             )
             .unwrap()
     } else {
@@ -501,7 +518,6 @@ fn fixture(
     } else {
         mappings
     };
-    let mut constants = ConstantPools::empty();
     constants.insert(pool_id, pool)?;
     let map_pool_id = ConstantPoolId::new(u32::MAX - 1);
     if actual_mappings != 0 {
@@ -511,20 +527,26 @@ fn fixture(
         )?;
     }
     let mut items = Vec::new();
+    let mut prior_list_pool = None;
     for index in 0..actual_mappings {
         // Each pair shares the original three-row backing and selects a
         // different nonzero ordinal. The unused row is never copied to LP.
-        let list_pool_id = ConstantPoolId::new((index / 2) as u32);
-        if index % 2 == 0 {
-            constants.insert(
-                list_pool_id,
-                checked_list_pool(
-                    index as i32,
-                    matches!(shape, Shape::BadCollectionNullable),
-                    matches!(shape, Shape::BadCollectionType),
-                ),
-            )?;
-        }
+        let list_pool_id = if index % 2 == 0 {
+            let pool = checked_list_pool(
+                index as i32,
+                matches!(shape, Shape::BadCollectionNullable),
+                matches!(shape, Shape::BadCollectionType),
+            );
+            let ExprKind::Constant(reference) =
+                crate::test_constants::insert(&mut constants, pool.value(1).unwrap())
+            else {
+                unreachable!()
+            };
+            prior_list_pool = Some(reference.pool);
+            reference.pool
+        } else {
+            prior_list_pool.expect("same pair's original checked list backing")
+        };
         let list_reference = ConstantReference {
             pool: if matches!(shape, Shape::MissingCollectionPool) {
                 ConstantPoolId::new(u32::MAX - 2)

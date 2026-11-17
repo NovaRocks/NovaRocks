@@ -42,10 +42,9 @@ use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_functions::{ConstantPool, PureKernelAbi};
 use novarocks_physical_plan::{
     AggregateCall, AggregateCallId, AggregateGrouping, AggregatePhase, AggregateSequenceId,
-    ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder, FragmentId,
-    FragmentSink, LiteralValue, NodeId, NodeKind, NullOrdering, OrderingKey, OutputPort,
-    PhysicalNode, PlanBuilder, PlanVersionId, ResultField, ResultPort, SortDirection, SortExpr,
-    TopNPhase, TopNReduction, TopNSequenceId, ValueOrigin,
+    ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentId, FragmentSink, NodeId,
+    NodeKind, NullOrdering, OrderingKey, OutputPort, PhysicalNode, PlanVersionId, ResultField,
+    ResultPort, SortDirection, SortExpr, TopNPhase, TopNReduction, TopNSequenceId, ValueOrigin,
 };
 use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
 use std::collections::BTreeMap;
@@ -106,7 +105,7 @@ fn fixture(limit: usize, asc: bool, nulls_first: bool) -> Fixture {
 /// all calls, frozen effects and runtime state phases still use the real owners.
 fn fixture_with_keys(
     key_types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
     ranking: &[(usize, bool, bool)],
     limit: usize,
 ) -> Fixture {
@@ -124,7 +123,7 @@ fn largeint_type() -> FunctionValueType {
 
 fn fixture_with_calls(
     key_types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
     ranking: &[(usize, bool, bool)],
     limit: usize,
     n_lists: bool,
@@ -134,7 +133,7 @@ fn fixture_with_calls(
 
 fn fixture_with_independent_limits(
     key_types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
     ranking: &[(usize, bool, bool)],
     limit: usize,
     n_lists: bool,
@@ -153,7 +152,7 @@ fn fixture_with_independent_limits(
 
 fn fixture_with_source(
     key_types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
     ranking: &[(usize, bool, bool)],
     limit: usize,
     n_lists: bool,
@@ -173,13 +172,13 @@ fn fixture_with_source(
 }
 
 type ScanResidualAuthor = fn(
-    &mut FragmentBuilder,
+    &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     NodeId,
     &[novarocks_physical_plan::ValueId],
 ) -> Box<[novarocks_physical_plan::ExprId]>;
 fn fixture_with_source_residual(
     key_types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
     ranking: &[(usize, bool, bool)],
     limit: usize,
     n_lists: bool,
@@ -201,7 +200,7 @@ fn fixture_with_source_residual(
 }
 fn fixture_with_source_parameters(
     key_types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
     ranking: &[(usize, bool, bool)],
     limit: usize,
     n_lists: bool,
@@ -210,6 +209,8 @@ fn fixture_with_source_parameters(
     residual: Option<ScanResidualAuthor>,
     parameters: novarocks_type_contract::SemanticParameters,
 ) -> Fixture {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     assert!(!independent_n_limits || n_lists);
     let groups = key_types.len();
     assert_eq!(ranking.len(), groups);
@@ -240,7 +241,11 @@ fn fixture_with_source_parameters(
             bind(&catalog, name, &arguments)
         })
         .collect::<Vec<_>>();
-    let mut builder = FragmentBuilder::new(FragmentId::new(1));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(1),
+            &fixture_sources,
+        );
     let source = builder.reserve_node_id().unwrap();
     let mut types = key_types.to_vec();
     if n_lists {
@@ -473,9 +478,12 @@ fn fixture_with_source_parameters(
             ty: definition.values()[value].ty.clone(),
         })
         .collect();
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([121; 16]).unwrap())
-        .with_constant_pools(constants)
-        .with_semantic_parameters(parameters);
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([121; 16]).unwrap(),
+        &fixture_sources,
+    )
+    .with_constant_pools(constants)
+    .with_semantic_parameters(parameters);
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
@@ -535,20 +543,12 @@ fn fixture_with_source_parameters(
                 let columns: Vec<ArrayRef> = vec![
                     Arc::new(StringArray::from(
                         rows.iter()
-                            .map(|row| match &row[0] {
-                                LiteralValue::Utf8(value) => Some(value.as_ref()),
-                                LiteralValue::Null => None,
-                                other => panic!("ordered scan key: {other:?}"),
-                            })
+                            .map(|row| if crate::exec::operators::family_fixture::constant_sources::is_null(&row[0]) { None } else { row[0].try_utf8().unwrap() })
                             .collect::<Vec<_>>(),
                     )),
                     Arc::new(Int64Array::from(
                         rows.iter()
-                            .map(|row| match &row[1] {
-                                LiteralValue::Int64(value) => Some(*value),
-                                LiteralValue::Null => None,
-                                other => panic!("ordered scan payload: {other:?}"),
-                            })
+                            .map(|row| if crate::exec::operators::family_fixture::constant_sources::is_null(&row[1]) { None } else { row[1].try_i64().unwrap() })
                             .collect::<Vec<_>>(),
                     )),
                 ];
@@ -583,10 +583,10 @@ fn fixture_with_source_parameters(
 /// Physical literal Int64 is exactly BIGINT, so narrow signed cells use the
 /// same checked constant-pool author as other compiled Values fixtures.
 fn declared_values(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     source: NodeId,
     types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
 ) -> (Vec<novarocks_physical_plan::ValueId>, ConstantPools) {
     if !types.iter().any(|ty| {
         matches!(
@@ -608,10 +608,12 @@ fn declared_values(
         }
         let row_values = rows
             .iter()
-            .map(|row| match row[column] {
-                LiteralValue::Null => None,
-                LiteralValue::Int64(value) => Some(value),
-                _ => panic!("narrow signed fixture literal"),
+            .map(|row| {
+                if crate::exec::operators::family_fixture::constant_sources::is_null(&row[column]) {
+                    None
+                } else {
+                    row[column].try_i64().unwrap()
+                }
             })
             .collect::<Vec<_>>();
         // Repeated rows refer to the same declared pool cell; keep the original
@@ -676,7 +678,7 @@ fn declared_values(
                             pool: *pool,
                             ordinal: ordinals[ordinal],
                         }),
-                        None => ExprKind::Literal(literal.clone()),
+                        None => builder.constant_kind(&types[column], literal),
                     };
                     builder
                         .add_expression(source, types[column].clone(), kind)
@@ -932,17 +934,21 @@ enum KeyCell {
     Integer(i128),
     Text(String),
 }
-fn literal_key(literal: &LiteralValue) -> Option<KeyCell> {
-    Some(match literal {
-        LiteralValue::Null => return None,
-        LiteralValue::Boolean(value) => KeyCell::Boolean(*value),
-        LiteralValue::Int64(value) | LiteralValue::Timestamp(value) => {
-            KeyCell::Integer(*value as i128)
+fn literal_key(literal: &novarocks_functions::ConstantValue) -> Option<KeyCell> {
+    if crate::exec::operators::family_fixture::constant_sources::is_null(literal) {
+        return None;
+    }
+    Some(match literal.value_type().data_type() {
+        DataType::Boolean => KeyCell::Boolean(literal.try_boolean().unwrap().unwrap()),
+        DataType::Int64 => KeyCell::Integer(i128::from(literal.try_i64().unwrap().unwrap())),
+        DataType::Timestamp(_, _) => {
+            KeyCell::Integer(i128::from(literal.try_timestamp().unwrap().unwrap()))
         }
-        LiteralValue::Date32(value) => KeyCell::Integer(*value as i128),
-        LiteralValue::LargeInt(value) | LiteralValue::Decimal128(value) => KeyCell::Integer(*value),
-        LiteralValue::Utf8(value) => KeyCell::Text(value.to_string()),
-        _ => panic!("undeclared key oracle literal"),
+        DataType::Date32 => KeyCell::Integer(i128::from(literal.try_date32().unwrap().unwrap())),
+        DataType::FixedSizeBinary(16) => KeyCell::Integer(literal.try_largeint().unwrap().unwrap()),
+        DataType::Decimal128(_, _) => KeyCell::Integer(literal.try_decimal128().unwrap().unwrap()),
+        DataType::Utf8 => KeyCell::Text(literal.try_utf8().unwrap().unwrap().to_owned()),
+        _ => panic!("undeclared key oracle constant"),
     })
 }
 fn array_key(array: &ArrayRef, row: usize) -> Option<KeyCell> {
@@ -995,7 +1001,7 @@ fn array_key(array: &ArrayRef, row: usize) -> Option<KeyCell> {
 type KeyRow = Vec<Option<KeyCell>>;
 type Measures = (i64, Option<i64>, Option<i64>, Option<i64>);
 fn complete_key_oracle(
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
     ranking: &[(usize, bool, bool)],
     limit: usize,
 ) -> Vec<(KeyRow, Measures)> {
@@ -1005,14 +1011,16 @@ fn complete_key_oracle(
         let key = row[..groups].iter().map(literal_key).collect();
         let aggregate = all.entry(key).or_insert((0, None, None, None));
         aggregate.0 += 1;
-        match row[groups] {
-            LiteralValue::Int64(value) => {
-                aggregate.1 = Some(aggregate.1.unwrap_or(0) + value);
-                aggregate.2 = Some(aggregate.2.map_or(value, |old| old.min(value)));
-                aggregate.3 = Some(aggregate.3.map_or(value, |old| old.max(value)));
-            }
-            LiteralValue::Null => (),
-            _ => panic!("undeclared aggregate input"),
+        let payload =
+            if crate::exec::operators::family_fixture::constant_sources::is_null(&row[groups]) {
+                None
+            } else {
+                row[groups].try_i64().unwrap()
+            };
+        if let Some(value) = payload {
+            aggregate.1 = Some(aggregate.1.unwrap_or(0) + value);
+            aggregate.2 = Some(aggregate.2.map_or(value, |old| old.min(value)));
+            aggregate.3 = Some(aggregate.3.map_or(value, |old| old.max(value)));
         }
     }
     let mut result = all.into_iter().collect::<Vec<_>>();
@@ -1051,13 +1059,13 @@ fn complete_key_oracle(
     result.truncate(limit);
     result
 }
-fn key_domains() -> Vec<(FunctionValueType, Vec<LiteralValue>)> {
+fn key_domains() -> Vec<(FunctionValueType, Vec<novarocks_functions::ConstantValue>)> {
     let mut domains = vec![(
         FunctionValueType::new(DataType::Boolean, true),
         vec![
-            LiteralValue::Null,
-            LiteralValue::Boolean(false),
-            LiteralValue::Boolean(true),
+            crate::exec::operators::family_fixture::constant_sources::null(),
+            crate::exec::operators::family_fixture::constant_sources::boolean(false),
+            crate::exec::operators::family_fixture::constant_sources::boolean(true),
         ],
     )];
     for (ty, min, max) in [
@@ -1069,32 +1077,32 @@ fn key_domains() -> Vec<(FunctionValueType, Vec<LiteralValue>)> {
         domains.push((
             FunctionValueType::new(ty, true),
             vec![
-                LiteralValue::Null,
-                LiteralValue::Int64(min),
-                LiteralValue::Int64(-1),
-                LiteralValue::Int64(0),
-                LiteralValue::Int64(max),
+                crate::exec::operators::family_fixture::constant_sources::null(),
+                crate::exec::operators::family_fixture::constant_sources::i64(min),
+                crate::exec::operators::family_fixture::constant_sources::i64(-1),
+                crate::exec::operators::family_fixture::constant_sources::i64(0),
+                crate::exec::operators::family_fixture::constant_sources::i64(max),
             ],
         ));
     }
     domains.push((
         FunctionValueType::new(DataType::Utf8, true),
         vec![
-            LiteralValue::Null,
-            LiteralValue::Utf8("".into()),
-            LiteralValue::Utf8("a".into()),
-            LiteralValue::Utf8("é".into()),
-            LiteralValue::Utf8("中".into()),
+            crate::exec::operators::family_fixture::constant_sources::null(),
+            crate::exec::operators::family_fixture::constant_sources::utf8("".into()),
+            crate::exec::operators::family_fixture::constant_sources::utf8("a".into()),
+            crate::exec::operators::family_fixture::constant_sources::utf8("é".into()),
+            crate::exec::operators::family_fixture::constant_sources::utf8("中".into()),
         ],
     ));
     domains.push((
         FunctionValueType::new(DataType::Date32, true),
         vec![
-            LiteralValue::Null,
-            LiteralValue::Date32(i32::MIN),
-            LiteralValue::Date32(-1),
-            LiteralValue::Date32(0),
-            LiteralValue::Date32(i32::MAX),
+            crate::exec::operators::family_fixture::constant_sources::null(),
+            crate::exec::operators::family_fixture::constant_sources::date32(i32::MIN),
+            crate::exec::operators::family_fixture::constant_sources::date32(-1),
+            crate::exec::operators::family_fixture::constant_sources::date32(0),
+            crate::exec::operators::family_fixture::constant_sources::date32(i32::MAX),
         ],
     ));
     for unit in [
@@ -1107,11 +1115,11 @@ fn key_domains() -> Vec<(FunctionValueType, Vec<LiteralValue>)> {
             domains.push((
                 FunctionValueType::new(DataType::Timestamp(unit, zone), true),
                 vec![
-                    LiteralValue::Null,
-                    LiteralValue::Timestamp(i64::MIN),
-                    LiteralValue::Timestamp(-1),
-                    LiteralValue::Timestamp(0),
-                    LiteralValue::Timestamp(i64::MAX),
+                    crate::exec::operators::family_fixture::constant_sources::null(),
+                    crate::exec::operators::family_fixture::constant_sources::timestamp(i64::MIN),
+                    crate::exec::operators::family_fixture::constant_sources::timestamp(-1),
+                    crate::exec::operators::family_fixture::constant_sources::timestamp(0),
+                    crate::exec::operators::family_fixture::constant_sources::timestamp(i64::MAX),
                 ],
             ));
         }
@@ -1120,11 +1128,11 @@ fn key_domains() -> Vec<(FunctionValueType, Vec<LiteralValue>)> {
         domains.push((
             FunctionValueType::new(DataType::Decimal128(precision, scale), true),
             vec![
-                LiteralValue::Null,
-                LiteralValue::Decimal128(-bound),
-                LiteralValue::Decimal128(-1),
-                LiteralValue::Decimal128(0),
-                LiteralValue::Decimal128(bound),
+                crate::exec::operators::family_fixture::constant_sources::null(),
+                crate::exec::operators::family_fixture::constant_sources::decimal128(-bound),
+                crate::exec::operators::family_fixture::constant_sources::decimal128(-1),
+                crate::exec::operators::family_fixture::constant_sources::decimal128(0),
+                crate::exec::operators::family_fixture::constant_sources::decimal128(bound),
             ],
         ));
     }
@@ -1136,11 +1144,11 @@ fn key_domains() -> Vec<(FunctionValueType, Vec<LiteralValue>)> {
         )
         .unwrap(),
         vec![
-            LiteralValue::Null,
-            LiteralValue::LargeInt(i128::MIN),
-            LiteralValue::LargeInt(-1),
-            LiteralValue::LargeInt(0),
-            LiteralValue::LargeInt(i128::MAX),
+            crate::exec::operators::family_fixture::constant_sources::null(),
+            crate::exec::operators::family_fixture::constant_sources::largeint(i128::MIN),
+            crate::exec::operators::family_fixture::constant_sources::largeint(-1),
+            crate::exec::operators::family_fixture::constant_sources::largeint(0),
+            crate::exec::operators::family_fixture::constant_sources::largeint(i128::MAX),
         ],
     ));
     domains

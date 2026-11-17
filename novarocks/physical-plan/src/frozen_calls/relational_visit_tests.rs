@@ -116,7 +116,8 @@ fn assert_relational_prefixes(fragment: &Fragment, failure: Option<usize>) {
 
 #[test]
 fn relational_visitor_preserves_all_actual_site_order_and_original_binding_addresses() {
-    let (fragment, uses) = all_sites();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, uses) = all_sites(&mut fixture_constants);
     let control = TraceControl::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
     let mut actual = Vec::new();
@@ -210,7 +211,8 @@ fn relational_visitor_preserves_all_actual_site_order_and_original_binding_addre
 
 #[test]
 fn relational_visitor_needs_no_expression_roots_for_zero_argument_occurrences() {
-    let (source, _) = all_sites();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (source, _) = all_sites(&mut fixture_constants);
     // This is a raw representation fixture, deliberately not a full writer
     // placement/admission claim. The visitor has no RootUses prerequisite.
     let mut nodes = source.nodes().clone();
@@ -266,7 +268,8 @@ fn relational_visitor_needs_no_expression_roots_for_zero_argument_occurrences() 
 
 #[test]
 fn relational_visitor_leaves_success_and_ordinary_error_tails_to_original_caller() {
-    let (fragment, _) = all_sites();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, _) = all_sites(&mut fixture_constants);
     let control = TraceControl::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
     let mut count = 0;
@@ -303,7 +306,8 @@ fn relational_visitor_leaves_success_and_ordinary_error_tails_to_original_caller
 
 #[test]
 fn relational_visitor_all_small_actual_callback_prefixes_preserve_three_first_causes() {
-    let (fragment, _) = all_sites();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, _) = all_sites(&mut fixture_constants);
     assert_relational_prefixes(&fragment, None);
     assert_relational_prefixes(&fragment, Some(1));
     assert_relational_prefixes(&fragment, Some(9));
@@ -311,7 +315,8 @@ fn relational_visitor_all_small_actual_callback_prefixes_preserve_three_first_ca
 
 #[test]
 fn relational_visitor_wide_real_call_array_observes_quantum_without_binding_dedup() {
-    let fixture = special_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = special_fixture(&mut fixture_constants);
     let mut nodes = fixture.fragment.nodes().clone();
     let aggregate = nodes
         .values_mut()

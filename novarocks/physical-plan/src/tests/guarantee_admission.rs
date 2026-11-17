@@ -198,6 +198,7 @@ fn fixture_with_guarantee_count(
     guarantee_count: usize,
     sparse_last: bool,
 ) -> FragmentPackageInput {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let binding = connector_binding();
     let column = ProviderColumnReference {
         column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 33),
@@ -427,7 +428,12 @@ fn fixture_with_guarantee_count(
         .unwrap();
     let read = package_contract::frozen_scan(&fragment);
     let (uses, calls) = fixture_uses_and_calls(&fragment);
-    let mut input = package_contract::package_input_with_controls(fragment, uses, calls);
+    let mut input = package_contract::package_input_with_controls(
+        fragment,
+        uses,
+        calls,
+        &mut fixture_constants,
+    );
     input.scans.insert(scan, read);
     input
 }

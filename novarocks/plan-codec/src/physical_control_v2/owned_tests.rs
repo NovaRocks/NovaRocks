@@ -16,11 +16,11 @@
 // under the License.
 
 use super::*;
+use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
-    BinaryOperator, Distribution, ExprKind, FragmentBuilder, FragmentId, FragmentSink,
-    LiteralValue, NodeKind, OutputPort, PhysicalNode, PhysicalProperties, PipelineDopDomain,
-    RowMultiplicity, ValueOrigin, ValueType,
+    BinaryOperator, Distribution, ExprKind, FragmentId, FragmentSink, NodeKind, OutputPort,
+    PhysicalNode, PhysicalProperties, PipelineDopDomain, RowMultiplicity, ValueOrigin, ValueType,
 };
 use std::{alloc::Layout, sync::Mutex};
 const B: usize = 4 * 1024 * 1024;
@@ -70,13 +70,7 @@ fn fixture() -> (Fragment, PhysicalRootUses) {
     let mut b = FragmentBuilder::new(FragmentId::new(741));
     let node = b.reserve_node_id().unwrap();
     let ty = ValueType::new(DataType::Boolean, false);
-    let leaf = b
-        .add_expression(
-            node,
-            ty.clone(),
-            ExprKind::Literal(LiteralValue::Boolean(true)),
-        )
-        .unwrap();
+    let leaf = b.constant(node, ty.clone(), checked::boolean(true));
     let root = b
         .add_expression(
             node,

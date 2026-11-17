@@ -1743,7 +1743,6 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                     expr(*lambda)
                 )
             }
-            ExprKind::Literal(value) => format_literal(value).fmt(formatter),
             ExprKind::Constant(reference) => write!(
                 formatter,
                 "constant-reference(pool={}, ordinal={})",
@@ -3383,48 +3382,6 @@ fn format_expr_id(expression: ExprId) -> String {
     format!("e{}", expression.get())
 }
 
-struct LiteralDisplay<'a>(&'a novarocks_physical_plan::LiteralValue);
-
-impl fmt::Display for LiteralDisplay<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            novarocks_physical_plan::LiteralValue::Null => formatter.write_str("NULL"),
-            novarocks_physical_plan::LiteralValue::Boolean(value) => value.fmt(formatter),
-            novarocks_physical_plan::LiteralValue::Int64(value) => value.fmt(formatter),
-            novarocks_physical_plan::LiteralValue::UInt64(value) => value.fmt(formatter),
-            novarocks_physical_plan::LiteralValue::Float64Bits(value) => {
-                write!(formatter, "{}[bits=0x{value:016x}]", f64::from_bits(*value))
-            }
-            novarocks_physical_plan::LiteralValue::LargeInt(value)
-            | novarocks_physical_plan::LiteralValue::Decimal128(value) => value.fmt(formatter),
-            novarocks_physical_plan::LiteralValue::IntervalMonthDayNano {
-                months,
-                days,
-                nanoseconds,
-            } => {
-                write!(
-                    formatter,
-                    "INTERVAL(months={months}, days={days}, nanoseconds={nanoseconds})"
-                )
-            }
-            novarocks_physical_plan::LiteralValue::Decimal256(value) => {
-                arrow::datatypes::i256::from_be_bytes(*value).fmt(formatter)
-            }
-            novarocks_physical_plan::LiteralValue::Utf8(value) => quote_text(value).fmt(formatter),
-            novarocks_physical_plan::LiteralValue::Binary(value) => {
-                write!(formatter, "X'{}'", format_hex(value))
-            }
-            novarocks_physical_plan::LiteralValue::Date32(value) => value.fmt(formatter),
-            novarocks_physical_plan::LiteralValue::Time64(value)
-            | novarocks_physical_plan::LiteralValue::Timestamp(value) => value.fmt(formatter),
-        }
-    }
-}
-
-fn format_literal(value: &novarocks_physical_plan::LiteralValue) -> LiteralDisplay<'_> {
-    LiteralDisplay(value)
-}
-
 fn function_display_name(identity: &novarocks_physical_plan::FunctionId) -> &str {
     identity
         .as_str()
@@ -3898,19 +3855,6 @@ fn node_header<'a>(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn explicit_interval_literal_display_preserves_all_three_components() {
-        let literal = novarocks_physical_plan::LiteralValue::IntervalMonthDayNano {
-            months: -7,
-            days: 23,
-            nanoseconds: i64::MIN,
-        };
-        assert_eq!(
-            super::format_literal(&literal).to_string(),
-            "INTERVAL(months=-7, days=23, nanoseconds=-9223372036854775808)"
-        );
-    }
-
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::{
         ExactInputVersion, PipelineDopDomain, PlanVersionId, PredicateGuaranteeKind,
@@ -4955,15 +4899,12 @@ mod tests {
         let mut builder = novarocks_physical_plan::FragmentBuilder::new(fragment_id);
         let root = builder.reserve_node_id().expect("values node id");
         let ty = novarocks_physical_plan::ValueType::new(DataType::Int64, false);
+        let mut constants = novarocks_physical_plan::ConstantPools::empty();
+        let kind =
+            crate::test_constants::insert(&mut constants, crate::test_constants::i64(1)(&ty));
         let expression = builder
-            .add_expression(
-                root,
-                ty.clone(),
-                novarocks_physical_plan::ExprKind::Literal(
-                    novarocks_physical_plan::LiteralValue::Int64(1),
-                ),
-            )
-            .expect("literal expression");
+            .add_expression(root, ty.clone(), kind)
+            .expect("constant expression");
         let value = builder
             .add_value(
                 ty.clone(),
@@ -5032,6 +4973,7 @@ mod tests {
             )
             .expect("deep fragment");
         let mut plan = novarocks_physical_plan::PlanBuilder::new(seed.plan().version())
+            .with_constant_pools(constants)
             .with_required_contracts(seed.plan().required());
         plan.add_fragment(deep_fragment)
             .expect("deep fragment in plan");
@@ -5048,7 +4990,9 @@ mod tests {
             }]),
         })
         .expect("deep result port");
-        let deep = plan.finish().expect("deep complete plan");
+        let deep = plan
+            .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
+            .expect("deep complete plan");
         let rendered = render_plan(
             &seed,
             &deep,

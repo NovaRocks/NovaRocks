@@ -732,8 +732,8 @@ mod tests {
     fn intrinsic_description(values: &[bool], nonconsumers: usize) -> FrozenExecutionDescription {
         use arrow::datatypes::DataType;
         use novarocks_physical_plan::{
-            ExprKind, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, PipelineDopDomain,
-            PlanBuilder, PlanVersionId, ValueOrigin, ValueType,
+            ExprKind, FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, PlanBuilder,
+            PlanVersionId, ValueOrigin, ValueType,
         };
         use novarocks_type_contract::{
             DecimalOverflowPolicy, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
@@ -742,15 +742,45 @@ mod tests {
         let mut fragment = FragmentBuilder::new(FragmentId::new(7));
         let node = fragment.reserve_node_id().unwrap();
         let ty = ValueType::new(DataType::Int64, false);
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        let policy = novarocks_constant_contract::ConstantPolicy {
+            max_rows: 8,
+            max_array_nodes: 32,
+            max_logical_elements: 4096,
+            max_retained_buffer_bytes: 4 << 20,
+            max_type_depth: 16,
+            max_type_nodes: 64,
+            max_dictionary_depth: 4,
+            max_metadata_bytes: 65536,
+            max_library_validation_work: 64 << 20,
+            max_library_validation_bytes: 64 << 20,
+        };
+        let mut constants = novarocks_physical_plan::ConstantPools::empty();
+        let mut scalar = |value| {
+            let source = novarocks_constant_contract::ConstantValue::from_i64(
+                std::sync::Arc::new(ty.try_to_field("fixture").unwrap()),
+                ty.clone(),
+                value,
+                policy,
+                novarocks_type_contract::CompilePhase::Validate,
+                &control,
+            )
+            .unwrap();
+            let pool = novarocks_physical_plan::ConstantPoolId::new(
+                u32::try_from(constants.entries().len()).unwrap(),
+            );
+            let reference = novarocks_physical_plan::ConstantReference {
+                pool,
+                ordinal: source.ordinal(),
+            };
+            constants.insert(pool, source.pool().clone()).unwrap();
+            ExprKind::Constant(reference)
+        };
         let mut row = Vec::new();
         for ordinal in 0..nonconsumers {
             row.push(
                 fragment
-                    .add_expression(
-                        node,
-                        ty.clone(),
-                        ExprKind::Literal(LiteralValue::Int64(ordinal as i64)),
-                    )
+                    .add_expression(node, ty.clone(), scalar(ordinal as i64))
                     .unwrap(),
             );
         }
@@ -758,7 +788,7 @@ mod tests {
         assert!(values.len() <= ids.len());
         for (ordinal, _) in values.iter().enumerate() {
             let literal = fragment
-                .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(13)))
+                .add_expression(node, ty.clone(), scalar(13))
                 .unwrap();
             row.push(
                 fragment
@@ -819,10 +849,11 @@ mod tests {
             }))
             .unwrap();
         let mut builder = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap())
+            .with_constant_pools(constants)
             .with_semantic_parameters(parameters);
         builder.add_fragment(fragment).unwrap();
         let candidate = CompletedPhysicalPlanCandidate::for_program(
-            builder.finish().unwrap(),
+            builder.finish_observed(&control).unwrap(),
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();

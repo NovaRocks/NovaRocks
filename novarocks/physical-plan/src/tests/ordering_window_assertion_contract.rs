@@ -233,6 +233,7 @@ fn finish_topn_reduction(
     partial_offset: u64,
     final_limit: u64,
     final_offset: u64,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<PhysicalPlan, String> {
     let source_fragment = FragmentId::new(410);
     let partial_fragment = FragmentId::new(411);
@@ -243,6 +244,7 @@ fn finish_topn_reduction(
         source_fragment,
         FragmentSink::Stream { edge: partial_edge },
         false,
+        fixture_constants,
     );
 
     let mut partial_builder = FragmentBuilder::new(partial_fragment);
@@ -457,7 +459,8 @@ fn finish_topn_reduction(
         },
     })
     .unwrap();
-    plan.finish().map_err(|error| error.to_string())
+    crate::tests::constant_fixture::publish_plan(plan, fixture_constants)
+        .map_err(|error| error.to_string())
 }
 
 fn window_function() -> BoundFunction {
@@ -489,9 +492,14 @@ enum WindowFixtureLayout {
 }
 
 fn finish_window(
-    build_frame: impl FnOnce(&mut FragmentBuilder, NodeId) -> WindowFrame,
+    build_frame: impl FnOnce(
+        &mut FragmentBuilder,
+        NodeId,
+        &mut crate::tests::constant_fixture::ConstantFixture,
+    ) -> WindowFrame,
     layout: WindowFixtureLayout,
-) -> Result<Fragment, ValidationErrors> {
+) -> Result<(Fragment, ConstantPools), ValidationErrors> {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let mut builder = FragmentBuilder::new(FragmentId::new(403));
     let distribution_kind = match layout {
         WindowFixtureLayout::Singleton => SourceDistribution::Singleton,
@@ -513,7 +521,7 @@ fn finish_window(
             .add_expression(node, ty(DataType::Int64, false), ExprKind::Value(order))
             .unwrap()
     });
-    let frame = build_frame(&mut builder, node);
+    let frame = build_frame(&mut builder, node, &mut fixture_constants);
     let call = builder
         .add_expression(
             node,
@@ -623,12 +631,35 @@ fn finish_window(
             }),
         })
         .unwrap();
-    builder.finish_definition(
+    let fragment = builder.finish_definition(
         node,
         FragmentSink::Noop,
         dop(),
         crate::StagePlacementPolicy::Singleton,
-    )
+    )?;
+    let pools = fixture_constants.into_pools();
+    if let Err(error) = crate::constants::validate_fragment_constants_observed(
+        &fragment,
+        &pools,
+        true,
+        PlanLimits::FROZEN,
+        &WindowConstantControl,
+    ) {
+        let mut errors = crate::validation::ValidationContext::new();
+        errors.push(ValidationError::new("window.constants", error.to_string()));
+        return Err(ValidationErrors::from_collector(errors));
+    }
+    Ok((fragment, pools))
+}
+struct WindowConstantControl;
+impl novarocks_type_contract::PureCompileControl for WindowConstantControl {
+    fn checkpoint(
+        &self,
+        _: novarocks_type_contract::CompilePhase,
+        _: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
+    }
 }
 
 fn finish_assertion(
@@ -660,7 +691,7 @@ fn finish_assertion(
     )
 }
 
-fn contains_error(result: Result<Fragment, ValidationErrors>, expected: &str) -> bool {
+fn contains_error<T: std::fmt::Debug>(result: Result<T, ValidationErrors>, expected: &str) -> bool {
     result
         .expect_err("fixture must be rejected")
         .to_string()
@@ -691,9 +722,19 @@ fn sort_modes_close_global_analytic_and_partition_topn_contracts() {
 
 #[test]
 fn topn_phase_contract_separates_global_and_partial_completion() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     finish_topn(SourceDistribution::Singleton, TopNPhase::Single).unwrap();
     let sequence = TopNSequenceId::new(1);
-    finish_topn_reduction(sequence, Some(sequence), 15, 0, 10, 5).unwrap();
+    finish_topn_reduction(
+        sequence,
+        Some(sequence),
+        15,
+        0,
+        10,
+        5,
+        &mut fixture_constants,
+    )
+    .unwrap();
 
     assert!(contains_error(
         finish_topn(SourceDistribution::Hash(74), TopNPhase::Final { sequence }),
@@ -705,20 +746,46 @@ fn topn_phase_contract_separates_global_and_partial_completion() {
     )
     .unwrap();
 
-    let orphan = finish_topn_reduction(sequence, None, 10, 0, 10, 0).unwrap_err();
+    let orphan =
+        finish_topn_reduction(sequence, None, 10, 0, 10, 0, &mut fixture_constants).unwrap_err();
     assert!(orphan.contains("TopN sequence must have exactly one final node"));
 
-    let mismatch =
-        finish_topn_reduction(sequence, Some(TopNSequenceId::new(2)), 10, 0, 10, 0).unwrap_err();
+    let mismatch = finish_topn_reduction(
+        sequence,
+        Some(TopNSequenceId::new(2)),
+        10,
+        0,
+        10,
+        0,
+        &mut fixture_constants,
+    )
+    .unwrap_err();
     assert!(mismatch.contains("TopN sequence must have exactly one final node"));
 
-    let partial_offset = finish_topn_reduction(sequence, Some(sequence), 15, 1, 10, 5).unwrap_err();
+    let partial_offset = finish_topn_reduction(
+        sequence,
+        Some(sequence),
+        15,
+        1,
+        10,
+        5,
+        &mut fixture_constants,
+    )
+    .unwrap_err();
     assert!(
         partial_offset.contains("partial TopN cannot apply an offset before global completion")
     );
 
-    let undersized_partial =
-        finish_topn_reduction(sequence, Some(sequence), 10, 0, 10, 5).unwrap_err();
+    let undersized_partial = finish_topn_reduction(
+        sequence,
+        Some(sequence),
+        10,
+        0,
+        10,
+        5,
+        &mut fixture_constants,
+    )
+    .unwrap_err();
     assert!(
         undersized_partial
             .contains("TopN partial paths do not reduce exactly into their matching final")
@@ -733,7 +800,7 @@ fn window_owns_one_partition_order_and_preserves_frame_exclusion() {
         end: WindowBound::UnboundedFollowing,
         exclusion: WindowFrameExclusion::Ties,
     };
-    let fragment = finish_window(|_, _| frame, WindowFixtureLayout::Exact).unwrap();
+    let (fragment, _pools) = finish_window(|_, _, _| frame, WindowFixtureLayout::Exact).unwrap();
     let NodeKind::Window(spec) = &fragment.nodes()[&fragment.root()].kind else {
         panic!("expected window root");
     };
@@ -751,7 +818,7 @@ fn window_owns_one_partition_order_and_preserves_frame_exclusion() {
 
     assert!(contains_error(
         finish_window(
-            |_, _| WindowFrame {
+            |_, _, _| WindowFrame {
                 units: WindowFrameUnits::Rows,
                 start: WindowBound::CurrentRow,
                 end: WindowBound::UnboundedFollowing,
@@ -763,7 +830,7 @@ fn window_owns_one_partition_order_and_preserves_frame_exclusion() {
     ));
     assert!(contains_error(
         finish_window(
-            |_, _| WindowFrame {
+            |_, _, _| WindowFrame {
                 units: WindowFrameUnits::Range,
                 start: WindowBound::UnboundedFollowing,
                 end: WindowBound::UnboundedFollowing,
@@ -776,19 +843,19 @@ fn window_owns_one_partition_order_and_preserves_frame_exclusion() {
 
     for (start_offset, end_offset, preceding) in [(5, 10, true), (10, 5, false)] {
         let result = finish_window(
-            |builder, owner| {
+            |builder, owner, fixture_constants| {
                 let start = builder
                     .add_expression(
                         owner,
-                        ty(DataType::UInt64, false),
-                        ExprKind::Literal(LiteralValue::UInt64(start_offset)),
+                        (ty(DataType::UInt64, false)).clone(),
+                        fixture_constants.u64(start_offset, &(ty(DataType::UInt64, false))),
                     )
                     .unwrap();
                 let end = builder
                     .add_expression(
                         owner,
-                        ty(DataType::UInt64, false),
-                        ExprKind::Literal(LiteralValue::UInt64(end_offset)),
+                        (ty(DataType::UInt64, false)).clone(),
+                        fixture_constants.u64(end_offset, &(ty(DataType::UInt64, false))),
                     )
                     .unwrap();
                 if preceding {
@@ -811,18 +878,18 @@ fn window_owns_one_partition_order_and_preserves_frame_exclusion() {
         );
         assert!(contains_error(
             result,
-            "window frame start follows its end after comparing exact offsets"
+            "window frame start follows its end after comparing exact constant offsets"
         ));
     }
 
     assert!(contains_error(
         finish_window(
-            |builder, owner| {
+            |builder, owner, fixture_constants| {
                 let offset = builder
                     .add_expression(
                         owner,
-                        ty(DataType::Int64, false),
-                        ExprKind::Literal(LiteralValue::Int64(1)),
+                        (ty(DataType::Int64, false)).clone(),
+                        fixture_constants.i64(1, &(ty(DataType::Int64, false))),
                     )
                     .unwrap();
                 WindowFrame {
@@ -841,7 +908,7 @@ fn window_owns_one_partition_order_and_preserves_frame_exclusion() {
 #[test]
 fn window_call_cannot_be_reused_as_an_expression_child() {
     let error = finish_window(
-        |_, _| WindowFrame {
+        |_, _, _| WindowFrame {
             units: WindowFrameUnits::Rows,
             start: WindowBound::UnboundedPreceding,
             end: WindowBound::CurrentRow,
@@ -856,12 +923,15 @@ fn window_call_cannot_be_reused_as_an_expression_child() {
 
 #[test]
 fn window_accepts_singleton_coarser_hash_and_stronger_ordering() {
-    let frame = |_: &mut FragmentBuilder, _: NodeId| WindowFrame {
-        units: WindowFrameUnits::Rows,
-        start: WindowBound::UnboundedPreceding,
-        end: WindowBound::CurrentRow,
-        exclusion: WindowFrameExclusion::NoOthers,
-    };
+    let frame =
+        |_: &mut FragmentBuilder,
+         _: NodeId,
+         _: &mut crate::tests::constant_fixture::ConstantFixture| WindowFrame {
+            units: WindowFrameUnits::Rows,
+            start: WindowBound::UnboundedPreceding,
+            end: WindowBound::CurrentRow,
+            exclusion: WindowFrameExclusion::NoOthers,
+        };
     finish_window(frame, WindowFixtureLayout::Singleton).unwrap();
     finish_window(frame, WindowFixtureLayout::HashKeySubset).unwrap();
     finish_window(frame, WindowFixtureLayout::StrongerOrdering).unwrap();

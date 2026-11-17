@@ -32,9 +32,9 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     BuildError, Distribution, ExprKind, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage,
     FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots, PhysicalRootUses,
-    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
-    RequiredInputs, ResultField, ResultPort, SetOperationKind, ValueDef, ValueId, ValueOrigin,
+    FrozenFragmentPruning, NodeId, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain,
+    PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts, RequiredInputs,
+    ResultField, ResultPort, SetOperationKind, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
@@ -162,6 +162,7 @@ fn fixture(case: Case) -> Fixture {
     let left = NodeId::new(u32::MAX);
     let right = NodeId::new(0);
     let union = NodeId::new(41);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fragment_id);
     let nested_field = Arc::new(
         Field::new("original-nested", DataType::Utf8, true).with_metadata(
@@ -183,13 +184,16 @@ fn fixture(case: Case) -> Fixture {
                 FunctionValueType::new(DataType::Int64, branch == 1 && case.right_nullable)
             };
             let literal = if case.nested || (branch == 1 && case.right_nullable && column == 0) {
-                LiteralValue::Null
+                crate::test_constants::null(&mut constants, &ty, options().constants)
             } else {
-                LiteralValue::Int64([[11, 22], [33, 44]][branch][column])
+                crate::test_constants::i64(
+                    &mut constants,
+                    &ty,
+                    [[11, 22], [33, 44]][branch][column],
+                    options().constants,
+                )
             };
-            let expression = builder
-                .add_expression(node, ty.clone(), ExprKind::Literal(literal))
-                .unwrap();
+            let expression = builder.add_expression(node, ty.clone(), literal).unwrap();
             // Explicit sparse value identities are authored by the real builder.
             let value = ValueId::new([[0, 7], [900, 901]][branch][column]);
             builder
@@ -338,7 +342,12 @@ fn fixture(case: Case) -> Fixture {
             .add_expression(
                 filter,
                 FunctionValueType::new(DataType::Boolean, false),
-                ExprKind::Literal(LiteralValue::Boolean(true)),
+                crate::test_constants::boolean(
+                    &mut constants,
+                    &FunctionValueType::new(DataType::Boolean, false),
+                    true,
+                    options().constants,
+                ),
             )
             .unwrap();
         builder
@@ -350,7 +359,7 @@ fn fixture(case: Case) -> Fixture {
     } else {
         (union, outputs, None)
     };
-    let package = finish_package(builder, fragment_id, root, &result_values);
+    let package = finish_package(builder, constants, fragment_id, root, &result_values);
     Fixture {
         package,
         union,
@@ -362,6 +371,7 @@ fn fixture(case: Case) -> Fixture {
 
 fn finish_package(
     builder: FragmentBuilder,
+    constants: novarocks_physical_plan::ConstantPools,
     fragment_id: FragmentId,
     root: NodeId,
     result_values: &[ValueId],
@@ -435,7 +445,7 @@ fn finish_package(
     };
     let package = FragmentPackage::try_new(
         FragmentPackageInput {
-            constants: novarocks_physical_plan::ConstantPools::empty(),
+            constants,
             version: PlanVersionId::try_new([73; 16]).unwrap(),
             required: RequiredContracts::default(),
             fragment,
@@ -940,9 +950,10 @@ fn union_all_wide_real_mapping_work_keeps_order_and_quantum_prefix() {
 
 fn nested_union_package(layers: usize) -> (Arc<FragmentPackage>, Vec<NodeId>) {
     let fragment_id = FragmentId::new(97);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fragment_id);
     let integer = FunctionValueType::new(DataType::Int64, false);
-    let add_values = |builder: &mut FragmentBuilder, node: NodeId, numbers: [i64; 2]| {
+    let mut add_values = |builder: &mut FragmentBuilder, node: NodeId, numbers: [i64; 2]| {
         let mut cells = Vec::new();
         let mut values = Vec::new();
         for (ordinal, number) in numbers.into_iter().enumerate() {
@@ -951,7 +962,12 @@ fn nested_union_package(layers: usize) -> (Arc<FragmentPackage>, Vec<NodeId>) {
                     .add_expression(
                         node,
                         integer.clone(),
-                        ExprKind::Literal(LiteralValue::Int64(number)),
+                        crate::test_constants::i64(
+                            &mut constants,
+                            &integer,
+                            number,
+                            options().constants,
+                        ),
                     )
                     .unwrap(),
             );
@@ -1023,7 +1039,7 @@ fn nested_union_package(layers: usize) -> (Arc<FragmentPackage>, Vec<NodeId>) {
         unions.push(union);
     }
     (
-        finish_package(builder, fragment_id, root, &previous),
+        finish_package(builder, constants, fragment_id, root, &previous),
         unions,
     )
 }

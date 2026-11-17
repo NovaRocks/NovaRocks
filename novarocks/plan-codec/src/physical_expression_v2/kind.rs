@@ -44,11 +44,6 @@ pub(super) fn encode_kind(
                 ordinal: *ordinal,
             })
         }
-        ExprKind::Literal(_) => {
-            return Err(ExpressionCodecError::InvalidShape(
-                "legacy literal cannot be encoded as a constant reference",
-            ));
-        }
         ExprKind::Constant(reference) => Kind::Literal(wire::ConstantReference {
             pool_id: Some(reference.pool.get()),
             row_ordinal: reference.ordinal,

@@ -215,11 +215,7 @@ fn sql_call_dependency_loan_original_foreign_and_missing_source_refusals_stay_ty
         .expressions()
         .iter()
         .find_map(|(_, expression)| {
-            matches!(
-                expression.kind,
-                ExprKind::Literal(_) | ExprKind::Constant(_)
-            )
-            .then_some(expression)
+            matches!(expression.kind, ExprKind::Constant(_)).then_some(expression)
         })
         .expect("original argument expression");
     assert!(matches!(

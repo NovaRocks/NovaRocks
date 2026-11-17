@@ -39,9 +39,9 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
     FragmentPackage, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPhysicalCall, LiteralValue, NodeId, PhysicalCallSite,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts,
-    ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
+    FrozenFragmentPruning, FrozenPhysicalCall, NodeId, PhysicalCallSite, PhysicalExpressionRoots,
+    PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
+    ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
@@ -142,7 +142,7 @@ fn invocation(
                 .map(|child| invocation(fragment, *child, EvaluationDemand::Value, next, uses))
                 .collect::<Vec<_>>()
         }
-        ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+        ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
         other => panic!("fixture has no exact control protocol for {other:?}"),
     };
     uses.push(ExpressionInvocation {
@@ -156,6 +156,61 @@ fn invocation(
         arguments: children.into_boxed_slice(),
     });
     id
+}
+
+fn checked_source(
+    pools: &mut novarocks_physical_plan::ConstantPools,
+    value: &ConstantValue,
+) -> ExprKind {
+    ExprKind::Constant(crate::exec::expr::test_support::register_constant(
+        pools, value,
+    ))
+}
+fn i64_source(
+    pools: &mut novarocks_physical_plan::ConstantPools,
+    ty: &FunctionValueType,
+    value: i64,
+) -> ExprKind {
+    let value = ConstantValue::from_i64(
+        Arc::new(ty.try_to_field("source").unwrap()),
+        ty.clone(),
+        value,
+        options(1).constants,
+        CompilePhase::Validate,
+        &FixtureControl,
+    )
+    .unwrap();
+    checked_source(pools, &value)
+}
+fn bool_source(
+    pools: &mut novarocks_physical_plan::ConstantPools,
+    ty: &FunctionValueType,
+    value: bool,
+) -> ExprKind {
+    let value = ConstantValue::from_boolean(
+        Arc::new(ty.try_to_field("source").unwrap()),
+        ty.clone(),
+        value,
+        options(1).constants,
+        CompilePhase::Validate,
+        &FixtureControl,
+    )
+    .unwrap();
+    checked_source(pools, &value)
+}
+fn null_source(
+    pools: &mut novarocks_physical_plan::ConstantPools,
+    ty: &FunctionValueType,
+) -> ExprKind {
+    let value = ConstantValue::null(
+        Arc::new(ty.try_to_field("source").unwrap()),
+        ty.clone(),
+        options(1).constants,
+        CompilePhase::Validate,
+        &FixtureControl,
+    )
+    .unwrap();
+    checked_source(pools, &value)
 }
 
 fn package(
@@ -261,14 +316,14 @@ fn package_with_dictionary(
         .add_expression(
             first_project,
             extra_type.clone(),
-            ExprKind::Literal(LiteralValue::Int64(999)),
+            i64_source(&mut constants, &extra_type, 999),
         )
         .unwrap();
     let seed_expr = builder
         .add_expression(
             first_project,
             seed_type.clone(),
-            ExprKind::Literal(LiteralValue::Int64(42)),
+            i64_source(&mut constants, &seed_type, 42),
         )
         .unwrap();
     let bool_type = FunctionValueType::new(DataType::Boolean, false);
@@ -276,7 +331,7 @@ fn package_with_dictionary(
         .add_expression(
             first_project,
             bool_type.clone(),
-            ExprKind::Literal(LiteralValue::Boolean(true)),
+            bool_source(&mut constants, &bool_type, true),
         )
         .unwrap();
     let mut first_definitions = vec![
@@ -290,11 +345,7 @@ fn package_with_dictionary(
             true,
         );
         let expr = builder
-            .add_expression(
-                first_project,
-                ty.clone(),
-                ExprKind::Literal(LiteralValue::Null),
-            )
+            .add_expression(first_project, ty.clone(), null_source(&mut constants, &ty))
             .unwrap();
         first_definitions.push((ValueId::new(400), ty, expr));
     }
@@ -340,7 +391,16 @@ fn package_with_dictionary(
             seed_type.clone(),
             match mode {
                 SeedMode::Input => ExprKind::Value(seed_value),
-                SeedMode::DirectConstant => ExprKind::Literal(LiteralValue::Int64(42)),
+                SeedMode::DirectConstant => checked_source(
+                    &mut constants,
+                    match &arguments[0] {
+                        FunctionArgument::Value {
+                            constant: Some(value),
+                            ..
+                        } => value,
+                        _ => panic!("direct seed has its actual request value"),
+                    },
+                ),
             },
         )
         .unwrap();

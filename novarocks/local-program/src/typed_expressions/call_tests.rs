@@ -83,10 +83,10 @@ fn type_only_dead_channels_still_require_exact_owner_static_types() {
     assert_mismatch(calls, wrong);
     // Admission can widen only top-level NULL presence in a value argument.
     let admitted = FunctionValueType::new(DataType::Int64, true);
-    let calls = typed_call_fixture(TypedCallFixture::TypedTypeOnly([
-        admitted.clone(),
-        admitted,
-    ]));
+    let calls = typed_call_fixture(TypedCallFixture::TypedTypeOnlyWithSources {
+        selected: [admitted.clone(), admitted],
+        sources: [integer(), integer()],
+    });
     ProgramTypedExpressions::try_new(calls, table(ordinary_types()), &Control).unwrap();
 }
 
@@ -216,39 +216,4 @@ fn nested_dictionary_identity_logical_metadata_and_null_fields_remain_exact() {
         &Control,
     )
     .unwrap();
-}
-
-fn higher_types(parameters: Box<[FunctionValueType]>) -> Vec<FunctionArgumentType> {
-    vec![
-        value(integer()),
-        value(boolean()),
-        FunctionArgumentType::Lambda {
-            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
-                parameters,
-            ),
-            result_type: boolean(),
-        },
-        value(boolean()),
-    ]
-}
-#[test]
-fn higher_order_lambda_type_matches_exact_body_and_ordered_parameters() {
-    let calls = typed_call_fixture(TypedCallFixture::HigherOrder);
-    let entries = higher_types(Box::from([integer()]));
-    ProgramTypedExpressions::try_new(calls.clone(), table(entries.clone()), &Control).unwrap();
-    let mut wrong_parameter = entries.clone();
-    wrong_parameter[2] = FunctionArgumentType::Lambda {
-        parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
-            Box::from([boolean()]),
-        ),
-        result_type: boolean(),
-    };
-    assert_mismatch(calls.clone(), wrong_parameter);
-    let mut wrong_body = entries;
-    wrong_body[1] = value(FunctionValueType::new(DataType::Boolean, false));
-    assert_mismatch(calls, wrong_body);
-    let calls = typed_call_fixture(TypedCallFixture::HigherOrderTwoParameters);
-    let exact = higher_types(Box::from([integer(), boolean()]));
-    ProgramTypedExpressions::try_new(calls.clone(), table(exact), &Control).unwrap();
-    assert_mismatch(calls, higher_types(Box::from([boolean(), integer()])));
 }

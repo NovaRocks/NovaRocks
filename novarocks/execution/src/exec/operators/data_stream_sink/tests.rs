@@ -1776,12 +1776,12 @@ mod conditional_compiled_selection {
     };
     use novarocks_local_program::{KernelAbiVersion, ProgramNodeExpressionRole, ProgramNodeId};
     use novarocks_physical_plan::{
-        BinaryOperator, ConstantPools, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts,
-        FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-        FrozenFragmentCalls, FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots,
-        PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
-        PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort,
-        ResultValueDomain, StagePlacementPolicy, ValueId, ValueOrigin,
+        BinaryOperator, ExprId, ExprKind, Fragment, FragmentCuts, FragmentId, FragmentPackage,
+        FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
+        FrozenFragmentPruning, NodeId, PhysicalExpressionRoots, PhysicalRootUses,
+        PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
+        RequiredContracts, ResultField, ResultPort, ResultValueDomain, StagePlacementPolicy,
+        ValueId, ValueOrigin,
     };
     use novarocks_type_contract::{
         CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
@@ -1817,7 +1817,7 @@ mod conditional_compiled_selection {
                 .into_iter()
                 .map(|child| visit(fragment, child, EvaluationDemand::Value, ordered))
                 .collect::<Vec<_>>(),
-            ExprKind::Value(_) | ExprKind::Literal(LiteralValue::Null) => Vec::new(),
+            ExprKind::Value(_) | ExprKind::Constant(_) => Vec::new(),
             other => panic!("unexpected conditional exchange fixture expression: {other:?}"),
         };
         let use_id = ExpressionUseId::new(u32::try_from(ordered.len()).unwrap());
@@ -1835,21 +1835,30 @@ mod conditional_compiled_selection {
     }
 
     fn program() -> Arc<LocalProgram> {
+        let fixture_sources =
+            crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
         let fragment_id = FragmentId::new(219);
         let source = NodeId::new(10);
         let input = NodeId::new(20);
         let output = NodeId::new(30);
         let integer = FunctionValueType::new(DataType::Int64, true);
         let boolean = FunctionValueType::new(DataType::Boolean, true);
-        let mut builder = FragmentBuilder::new(fragment_id);
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                fragment_id,
+                &fixture_sources,
+            );
         builder
             .add_values(source, Box::from([Box::default()]), Box::default())
             .unwrap();
         let mut inputs = Vec::new();
         for ty in [&integer, &integer, &boolean] {
-            let expr = builder
-                .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
-                .unwrap();
+            let expr = builder.constant(
+                input,
+                ty.clone(),
+                crate::exec::operators::family_fixture::constant_sources::null(),
+            );
             let value = builder
                 .add_value(ty.clone(), ValueOrigin::Expr { node: input, expr })
                 .unwrap();
@@ -1926,6 +1935,7 @@ mod conditional_compiled_selection {
                 StagePlacementPolicy::Singleton,
             )
             .unwrap();
+        let (fragment, constants) = fragment.into_parts();
         let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
         let mut ordered = Vec::new();
         let bindings = roots
@@ -1964,7 +1974,7 @@ mod conditional_compiled_selection {
                 FragmentPackageInput {
                     version: PlanVersionId::try_new([219; 16]).unwrap(),
                     required: RequiredContracts::default(),
-                    constants: ConstantPools::empty(),
+                    constants,
                     fragment,
                     expression_uses: uses,
                     calls,

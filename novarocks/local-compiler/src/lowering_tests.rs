@@ -19,11 +19,11 @@ use super::*;
 use arrow_array::Float64Array;
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionBindingRequest,
-    FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel,
-    KernelEvaluationControl, KernelFailure, PureCallPreparation, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, PurePreparationSource,
-    ScalarEvaluationInstance, ScopedExpressionEffects, Selection,
+    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder,
+    FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
+    InstalledPureKernel, KernelEvaluationControl, KernelFailure, PureCallPreparation,
+    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    PurePreparationSource, ScalarEvaluationInstance, ScopedExpressionEffects, Selection,
 };
 use novarocks_local_program::{
     KernelAbiVersion, ProgramCallSite, ProgramExpressionArena, ProgramExpressionRootSite,
@@ -32,9 +32,9 @@ use novarocks_local_program::{
 };
 use novarocks_physical_plan::{
     BoundFunction, ExprKind, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackageInput,
-    FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, LiteralValue,
-    NodeId, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain,
-    PlanVersionId, RequiredContracts, ResultField, ResultPort, ValueOrigin,
+    FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, NodeId,
+    PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanVersionId,
+    RequiredContracts, ResultField, ResultPort, ValueOrigin,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
@@ -167,11 +167,29 @@ fn package_with_case(
             Box::default(),
         )
         .unwrap();
+    let predicate_type = FunctionValueType::new(DataType::Boolean, false);
+    let predicate_value = ConstantValue::from_boolean(
+        Arc::new(predicate_type.try_to_field("predicate").unwrap()),
+        predicate_type.clone(),
+        true,
+        options(1).constants,
+        CompilePhase::Validate,
+        &FixtureControl,
+    )
+    .unwrap();
+    let pool = novarocks_physical_plan::ConstantPoolId::new(0);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
+    constants
+        .insert(pool, predicate_value.pool().clone())
+        .unwrap();
     let predicate = builder
         .add_expression(
             filter_node,
-            FunctionValueType::new(DataType::Boolean, false),
-            ExprKind::Literal(LiteralValue::Boolean(true)),
+            predicate_type,
+            ExprKind::Constant(novarocks_physical_plan::ConstantReference {
+                pool,
+                ordinal: predicate_value.ordinal(),
+            }),
         )
         .unwrap();
     builder
@@ -395,7 +413,7 @@ fn package_with_case(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([27; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,

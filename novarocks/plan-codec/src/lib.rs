@@ -93,3 +93,6 @@ pub use sealed_write_targets::SealedWriteTargets;
     all(not(novarocks_dev_controls), debug_assertions)
 ))]
 compile_error!("novarocks_dev_controls must match debug_assertions");
+
+#[cfg(test)]
+mod test_constants;

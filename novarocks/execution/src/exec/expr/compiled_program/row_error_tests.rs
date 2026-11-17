@@ -16,6 +16,7 @@
 // under the License.
 
 use super::CompiledExpressionInstance;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::{
     array::{Array, Decimal128Array, Float64Array, Int64Array},
     datatypes::DataType,
@@ -39,9 +40,9 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
     FragmentPackage, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPhysicalCall, LiteralValue, NodeId, PhysicalCallSite,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts,
-    ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
+    FrozenFragmentPruning, FrozenPhysicalCall, NodeId, PhysicalCallSite, PhysicalExpressionRoots,
+    PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
+    ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
@@ -192,13 +193,11 @@ fn constant_policy() -> ConstantPolicy {
 fn original_request_sources(
     fragment: Fragment,
     authors: &BTreeMap<ExprId, Author>,
+    mut pools: novarocks_physical_plan::ConstantPools,
 ) -> (Fragment, novarocks_physical_plan::ConstantPools) {
     use novarocks_physical_plan::{
-        ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallDefinition,
-        PhysicalCallRequest, StaticFunctionArgument,
+        PhysicalCallDefinition, PhysicalCallRequest, StaticFunctionArgument,
     };
-    let mut pools = ConstantPools::empty();
-    let mut backing_ids = BTreeMap::new();
     let mut entries = vec![];
     for (&definition, owner) in authors {
         let original = owner.request();
@@ -211,17 +210,7 @@ fn original_request_sources(
                     constant,
                 } => {
                     let constant = constant.as_ref().map(|value| {
-                        let identity = value.pool().backing_identity();
-                        let pool = *backing_ids.entry(identity).or_insert_with(|| {
-                            let id =
-                                ConstantPoolId::new(u32::try_from(pools.entries().len()).unwrap());
-                            pools.insert(id, value.pool().clone()).unwrap();
-                            id
-                        });
-                        ConstantReference {
-                            pool,
-                            ordinal: value.ordinal(),
-                        }
+                        crate::exec::expr::test_support::register_constant(&mut pools, value)
                     });
                     StaticFunctionArgument::Value {
                         value_type: value_type.clone(),
@@ -310,7 +299,7 @@ fn invocation(
             .iter()
             .map(|child| invocation(fragment, *child, EvaluationDemand::Value, next, out))
             .collect::<Vec<_>>(),
-        ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+        ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
         _ => panic!("unsupported fixture shape"),
     };
     out.push(ExpressionInvocation {
@@ -334,6 +323,7 @@ enum Shape {
 }
 
 fn program(shape: Shape) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue();
     let fragment_id = FragmentId::new(93);
     let source = NodeId::new(100);
@@ -352,7 +342,14 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
     let mut input_items = vec![];
     for (id, ty) in [(value, decimal.clone()), (digits_value, integer.clone())] {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), constant_policy()),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -378,7 +375,10 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             .add_expression(
                 output,
                 ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(42)),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::i64(&(ty.clone()), 42, constant_policy()),
+                ),
             )
             .unwrap();
         call(
@@ -405,7 +405,10 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             if matches!(shape, Shape::ObservableSibling) {
                 ExprKind::Value(digits_value)
             } else {
-                ExprKind::Literal(LiteralValue::Int64(-1))
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::i64(&(integer.clone()), -1, constant_policy()),
+                )
             },
         )
         .unwrap();
@@ -436,7 +439,10 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             .add_expression(
                 output,
                 integer.clone(),
-                ExprKind::Literal(LiteralValue::Int64(0)),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::i64(&(integer.clone()), 0, constant_policy()),
+                ),
             )
             .unwrap();
         call(
@@ -495,7 +501,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let (fragment, constants) = original_request_sources(fragment, &authors);
+    let (fragment, constants) = original_request_sources(fragment, &authors, source_pools);
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
     let mut next = 1000;
     let mut ordered_uses = vec![];

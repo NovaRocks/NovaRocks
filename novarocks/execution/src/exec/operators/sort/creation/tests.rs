@@ -23,8 +23,8 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
 };
 use novarocks_physical_plan::{
-    ConstantPools, ExprKind, FragmentBuilder, FragmentId, NodeId, NullOrdering, SortDirection,
-    SortExpr, SortMode, SystemRelationData, ValueOrigin,
+    ConstantPools, ExprKind, FragmentId, NodeId, NullOrdering, SortDirection, SortExpr, SortMode,
+    SystemRelationData, ValueOrigin,
 };
 use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
 use std::{error::Error, sync::Arc};
@@ -46,6 +46,8 @@ fn list_program(
     nullable_row: bool,
     wire_roundtrip: bool,
 ) -> Arc<novarocks_local_program::LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     use crate::exec::operators::family_fixture::{compile, package};
     let item = Arc::new(Field::new("item", DataType::Utf8, false));
     let types = [
@@ -83,7 +85,11 @@ fn list_program(
     } else {
         vec![batch]
     };
-    let mut builder = FragmentBuilder::new(FragmentId::new(94));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(94),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let sort_node = NodeId::new(1);
     let mut values = types

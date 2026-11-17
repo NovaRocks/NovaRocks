@@ -34,9 +34,9 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
     FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning,
-    FrozenPhysicalCall, LiteralValue, NodeId, PhysicalCallSite, PhysicalExpressionRoots,
-    PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
-    ValueDef, ValueId, ValueOrigin,
+    FrozenPhysicalCall, NodeId, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
+    PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort, ValueDef,
+    ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
@@ -138,7 +138,7 @@ fn invocation(
                 .map(|child| invocation(fragment, *child, EvaluationDemand::Value, next, uses))
                 .collect::<Vec<_>>()
         }
-        ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+        ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
         other => panic!("fixture has no exact control protocol for {other:?}"),
     };
     uses.push(ExpressionInvocation {
@@ -253,14 +253,14 @@ fn package_with_outputs(
         .add_expression(
             first_project,
             extra_type.clone(),
-            ExprKind::Literal(LiteralValue::Int64(999)),
+            crate::test_constants::i64(&mut constants, &extra_type, 999, options(1).constants),
         )
         .unwrap();
     let seed_expr = builder
         .add_expression(
             first_project,
             seed_type.clone(),
-            ExprKind::Literal(LiteralValue::Int64(42)),
+            crate::test_constants::i64(&mut constants, &seed_type, 42, options(1).constants),
         )
         .unwrap();
     let bool_type = FunctionValueType::new(DataType::Boolean, false);
@@ -268,7 +268,7 @@ fn package_with_outputs(
         .add_expression(
             first_project,
             bool_type.clone(),
-            ExprKind::Literal(LiteralValue::Boolean(true)),
+            crate::test_constants::boolean(&mut constants, &bool_type, true, options(1).constants),
         )
         .unwrap();
     for (id, ty, expr) in [
@@ -314,7 +314,7 @@ fn package_with_outputs(
             match mode {
                 SeedMode::Input => ExprKind::Value(seed_value),
                 SeedMode::DirectConstant | SeedMode::LiteralWithoutConstant => {
-                    ExprKind::Literal(LiteralValue::Int64(42))
+                    crate::test_constants::i64(&mut constants, &seed_type, 42, options(1).constants)
                 }
             },
         )
@@ -1056,16 +1056,28 @@ fn original_nonconstant_seed_is_not_promoted_by_its_physical_literal() {
         request.arguments[0],
         novarocks_physical_plan::StaticFunctionArgument::Value { constant: None, .. }
     ));
-    assert!(source.constants().entries().is_empty());
     let ExprKind::FunctionCall { args, .. } =
         &source.fragment().expressions().get(id).unwrap().kind
     else {
         panic!("actual RAND call");
     };
-    assert!(matches!(
-        source.fragment().expressions().get(args[0]).unwrap().kind,
-        ExprKind::Literal(LiteralValue::Int64(42))
-    ));
+    let child = source.fragment().expressions().get(args[0]).unwrap();
+    let ExprKind::Constant(reference) = child.kind else {
+        panic!("actual checked seed")
+    };
+    assert_eq!(
+        source
+            .constants()
+            .resolve_observed(
+                reference,
+                &child.ty,
+                &mut CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap()
+            )
+            .unwrap()
+            .try_i64()
+            .unwrap(),
+        Some(42)
+    );
     let program = compile(source, &functions);
     let mut instance = instance(&program);
     let seed: ArrayRef = Arc::new(Int64Array::from(vec![42]));

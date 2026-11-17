@@ -16,6 +16,7 @@
 // under the License.
 //! Actual prepared owners, frozen source edges and the sole compiled evaluator.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{ArrayRef, Date32Array, StringArray, TimestampMicrosecondArray};
 use novarocks_type_contract::{TemporalSourceKind as Kind, TemporalSourceShape as Source};
 
@@ -70,6 +71,7 @@ fn catalogue() -> PureEngineFunctionCatalog {
     builder.seal_pure(manifest).unwrap()
 }
 fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue();
     let source = NodeId::new(u32::MAX);
     let input = NodeId::new(41);
@@ -93,7 +95,14 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
         (flag, boolean.clone()),
     ] {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -242,7 +251,10 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
             .add_expression(
                 output,
                 integer.clone(),
-                ExprKind::Literal(LiteralValue::Null),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(integer.clone()), options().constants),
+                ),
             )
             .unwrap();
         root_expr = call(
@@ -320,6 +332,7 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
             )])
             .unwrap()
         },
+        source_pools,
     )
 }
 fn batch(

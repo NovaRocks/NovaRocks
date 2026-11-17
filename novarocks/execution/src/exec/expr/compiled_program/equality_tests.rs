@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use novarocks_local_program::{ProgramComparisonSite, ProgramUseRef};
 use novarocks_physical_plan::BinaryOperator;
 
@@ -29,18 +30,33 @@ enum EqualityCase {
     ErrorOperand,
     ErrorLabel,
 }
-fn literal(builder: &mut FragmentBuilder, ty: FunctionValueType, value: LiteralValue) -> ExprId {
+fn literal(
+    builder: &mut FragmentBuilder,
+    ty: FunctionValueType,
+    value: novarocks_functions::ConstantValue,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
+) -> ExprId {
     builder
-        .add_expression(NodeId::new(0), ty, ExprKind::Literal(value))
+        .add_expression(
+            NodeId::new(0),
+            ty,
+            checked_constants::kind(source_pools, value),
+        )
         .unwrap()
 }
 fn random(
     builder: &mut FragmentBuilder,
     authors: &mut BTreeMap<ExprId, Author>,
     functions: &PureEngineFunctionCatalog,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> ExprId {
     let integer = FunctionValueType::new(DataType::Int64, false);
-    let seed = literal(builder, integer.clone(), LiteralValue::Int64(42));
+    let seed = literal(
+        builder,
+        integer.clone(),
+        checked_constants::i64(&(integer.clone()), 42, options().constants),
+        source_pools,
+    );
     call(
         builder,
         authors,
@@ -58,9 +74,15 @@ fn round_value(
     authors: &mut BTreeMap<ExprId, Author>,
     functions: &PureEngineFunctionCatalog,
     value: ExprId,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> ExprId {
     let integer = FunctionValueType::new(DataType::Int64, false);
-    let digits = literal(builder, integer.clone(), LiteralValue::Int64(-1));
+    let digits = literal(
+        builder,
+        integer.clone(),
+        checked_constants::i64(&(integer.clone()), -1, options().constants),
+        source_pools,
+    );
     call(
         builder,
         authors,
@@ -80,6 +102,7 @@ fn round_value(
     )
 }
 fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let mut builder = FragmentBuilder::new(FragmentId::new(203));
     let source = NodeId::new(u32::MAX);
@@ -100,7 +123,14 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -166,46 +196,84 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
                 value(&mut builder, 2),
             ),
             EqualityCase::RandomOperand => {
-                let operand = random(&mut builder, &mut authors, &functions);
+                let operand = random(&mut builder, &mut authors, &functions, &mut source_pools);
                 let first = literal(
                     &mut builder,
                     floating.clone(),
-                    LiteralValue::Float64Bits(SEED_42[0]),
+                    checked_constants::f64_bits(
+                        &(floating.clone()),
+                        SEED_42[0],
+                        options().constants,
+                    ),
+                    &mut source_pools,
                 );
                 let second = literal(
                     &mut builder,
-                    floating,
-                    LiteralValue::Float64Bits(SEED_42[1]),
+                    (floating).clone(),
+                    checked_constants::f64_bits(&(floating), SEED_42[1], options().constants),
+                    &mut source_pools,
                 );
                 (operand, first, second)
             }
             EqualityCase::RandomLabels => (
                 value(&mut builder, 0),
-                random(&mut builder, &mut authors, &functions),
-                random(&mut builder, &mut authors, &functions),
+                random(&mut builder, &mut authors, &functions, &mut source_pools),
+                random(&mut builder, &mut authors, &functions, &mut source_pools),
             ),
             EqualityCase::ErrorOperand => {
                 let source = value(&mut builder, 3);
-                let operand = round_value(&mut builder, &mut authors, &functions, source);
+                let operand = round_value(
+                    &mut builder,
+                    &mut authors,
+                    &functions,
+                    source,
+                    &mut source_pools,
+                );
                 (
                     operand,
                     value(&mut builder, 4),
-                    literal(&mut builder, decimal.clone(), LiteralValue::Null),
+                    literal(
+                        &mut builder,
+                        decimal.clone(),
+                        checked_constants::null(&(decimal.clone()), options().constants),
+                        &mut source_pools,
+                    ),
                 )
             }
             EqualityCase::ErrorLabel => {
                 let operand = value(&mut builder, 3);
                 let source = value(&mut builder, 4);
-                let first = round_value(&mut builder, &mut authors, &functions, source);
+                let first = round_value(
+                    &mut builder,
+                    &mut authors,
+                    &functions,
+                    source,
+                    &mut source_pools,
+                );
                 // The later label is a separate occurrence of the original
                 // operand definition; no failed first label may reach it.
                 (operand, first, operand)
             }
             EqualityCase::Eq | EqualityCase::NotEq => unreachable!(),
         };
-        let then_first = literal(&mut builder, result_type.clone(), LiteralValue::Int64(10));
-        let then_second = literal(&mut builder, result_type.clone(), LiteralValue::Int64(20));
-        let otherwise = literal(&mut builder, result_type.clone(), LiteralValue::Int64(30));
+        let then_first = literal(
+            &mut builder,
+            result_type.clone(),
+            checked_constants::i64(&(result_type.clone()), 10, options().constants),
+            &mut source_pools,
+        );
+        let then_second = literal(
+            &mut builder,
+            result_type.clone(),
+            checked_constants::i64(&(result_type.clone()), 20, options().constants),
+            &mut source_pools,
+        );
+        let otherwise = literal(
+            &mut builder,
+            result_type.clone(),
+            checked_constants::i64(&(result_type.clone()), 30, options().constants),
+            &mut source_pools,
+        );
         builder
             .add_expression(
                 output,
@@ -256,7 +324,7 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
             ty: result_type,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
 }
 fn batch(
     program: &LocalProgram,

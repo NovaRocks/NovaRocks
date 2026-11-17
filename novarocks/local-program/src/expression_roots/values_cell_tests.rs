@@ -27,14 +27,14 @@ use crate::{
     ProgramLexicalBindingError, ProgramLexicalBindings, ProgramLexicalSource, ProgramNode,
     ProgramResolvedCalls, ProgramRootInput, ProgramSlotBinding, ProgramTypedChannels,
     ProgramTypedExpressions, ProgramUseRef, StaticExprKind, StaticExprNode, StaticLayout,
-    StaticLiteral, StaticValues, StaticValuesCell, root_input_layout,
+    StaticValues, StaticValuesCell, root_input_layout,
 };
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_functions::{FunctionArgumentType, FunctionValueType};
 use novarocks_type_contract::{EvaluationRegionId, ExpressionEffectContext};
 use novarocks_types::SlotId;
-use std::{collections::HashMap, num::NonZeroUsize};
+use std::num::NonZeroUsize;
 
 struct Control;
 impl PureCompileControl for Control {
@@ -51,28 +51,20 @@ const SLOT: usize = 2;
 /// 0: TRUE, 1: NOT(0), 2: the Values node's own output slot.
 fn arena() -> Arc<ImmutableExpressions> {
     Arc::new(
-        ImmutableExpressions::try_new(
-            vec![
-                StaticExprNode::new(
-                    StaticExprKind::Literal(StaticLiteral::Bool(true)),
-                    DataType::Boolean,
-                    None,
-                ),
-                StaticExprNode::new(
-                    StaticExprKind::Not(ProgramExprId::new(TRUE)),
-                    DataType::Boolean,
-                    None,
-                ),
-                StaticExprNode::new(
-                    StaticExprKind::SlotId(SlotId::new(1)),
-                    DataType::Boolean,
-                    None,
-                ),
-            ],
-            false,
-            HashMap::new(),
-            None,
-        )
+        crate::test_support::arena(vec![
+            StaticExprNode::new_value_typed(
+                crate::test_support::boolean(true),
+                novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
+            ),
+            StaticExprNode::new_value_typed(
+                StaticExprKind::Not(ProgramExprId::new(TRUE)),
+                novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
+            ),
+            StaticExprNode::new_value_typed(
+                StaticExprKind::SlotId(SlotId::new(1)),
+                novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
+            ),
+        ])
         .unwrap(),
     )
 }
@@ -184,8 +176,46 @@ fn channels(
     definition: usize,
     cell_nullable: bool,
 ) -> Result<ProgramTypedChannels, ProgramChannelTypeError> {
-    let calls =
-        ProgramResolvedCalls::try_new(bind(definition, 1).unwrap(), vec![], &Control).unwrap();
+    let graph = graph(definition);
+    let source_types = [cell_nullable, cell_nullable, false];
+    let nodes = graph
+        .expressions()
+        .nodes()
+        .iter()
+        .zip(source_types)
+        .map(|(node, nullable)| {
+            let ty = FunctionValueType::new(DataType::Boolean, nullable);
+            let kind = match node.kind() {
+                StaticExprKind::Constant(value) => crate::test_support::boolean_typed(
+                    value.try_boolean().unwrap().unwrap(),
+                    ty.clone(),
+                ),
+                kind => kind.clone(),
+            };
+            StaticExprNode::new_value_typed(kind, ty)
+        })
+        .collect();
+    let graph = LocalProgramGraph::try_new_with_outputs(
+        graph.nodes().to_vec(),
+        graph.root(),
+        Arc::new(crate::test_support::arena(nodes).unwrap()),
+        graph.profile(),
+        graph.requirements().clone(),
+        graph.sink().cloned(),
+        graph.summaries().to_vec(),
+    )
+    .unwrap();
+    let bindings = ProgramRootControlBindings::try_new(
+        graph,
+        flow(definition),
+        vec![ProgramRootUseBinding {
+            site: cell_site(1),
+            use_id: ExpressionUseId::new(0),
+        }],
+        &Control,
+    )
+    .unwrap();
+    let calls = ProgramResolvedCalls::try_new(bindings, vec![], &Control).unwrap();
     let mut types = vec![boolean(false), boolean(false), boolean(false)];
     if cell_nullable {
         types[TRUE] = boolean(true);

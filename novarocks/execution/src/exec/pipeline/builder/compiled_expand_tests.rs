@@ -28,9 +28,9 @@ use novarocks_connector_contract::ConnectorRowMutationEffect;
 use novarocks_functions::ConstantPool;
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
-    ChangeEventSpec, ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder,
-    FragmentId, GroupingOutput, LiteralValue, NodeId, NodeKind, UnpivotConstant, UnpivotSpec,
-    UnpivotValueMapping, ValueId, ValueOrigin,
+    ChangeEventSpec, ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentId,
+    GroupingOutput, NodeId, NodeKind, UnpivotConstant, UnpivotSpec, UnpivotValueMapping, ValueId,
+    ValueOrigin,
 };
 use novarocks_type_contract::{CompilePhase, FunctionValueType};
 
@@ -45,7 +45,7 @@ use crate::exec::operators::compiled_unpivot::CompiledUnpivotProcessorFactory;
 use crate::runtime::runtime_state::RuntimeErrorState;
 
 fn node_output(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     ordinal: u32,
     ty: FunctionValueType,
@@ -68,7 +68,13 @@ const REPEAT_ROWS: [(i64, i64, i64); 2] = [(1, 10, 100), (2, 20, 200)];
 /// `Values(k1, k2, v) -> Repeat(ROLLUP(k1, k2)) -> Result` with outputs
 /// `(k1', k2', v, GROUPING_ID(k1, k2), GROUPING(k2))`.
 fn repeat_program() -> Arc<LocalProgram> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(61));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(61),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let repeat = NodeId::new(1);
     let rows = REPEAT_ROWS
@@ -418,7 +424,13 @@ fn map_pool() -> ConstantPool {
 /// `Values(id, v1, v2) -> Unpivot -> Result` with outputs
 /// `(id, value, label, codes, attrs)` and a two-row output budget.
 pub(crate) fn unpivot_program() -> Arc<LocalProgram> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(62));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(62),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let unpivot = NodeId::new(1);
     let rows = UNPIVOT_ROWS
@@ -433,13 +445,11 @@ pub(crate) fn unpivot_program() -> Arc<LocalProgram> {
     );
     let utf8 = FunctionValueType::new(DataType::Utf8, false);
     let labels = ["first", "second"].map(|label| {
-        builder
-            .add_expression(
-                unpivot,
-                utf8.clone(),
-                ExprKind::Literal(LiteralValue::Utf8(label.into())),
-            )
-            .unwrap()
+        builder.constant(
+            unpivot,
+            utf8.clone(),
+            crate::exec::operators::family_fixture::constant_sources::utf8(label.into()),
+        )
     });
     let outputs = [
         int64(false),
@@ -700,7 +710,13 @@ const CHANGE_ROWS: [(i64, Option<i64>, Option<bool>); 4] = [
 /// `(k', v', effect)`: a Delete event for rows whose `flag` is TRUE that
 /// assigns only `k'`, then an unconditional Insert event assigning both.
 fn change_program() -> Arc<LocalProgram> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(63));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(63),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let expand = NodeId::new(1);
     let rows = CHANGE_ROWS
@@ -709,7 +725,10 @@ fn change_program() -> Arc<LocalProgram> {
             vec![
                 cell(Some(*k)),
                 cell(*v),
-                flag.map_or(LiteralValue::Null, LiteralValue::Boolean),
+                flag.map_or(
+                    crate::exec::operators::family_fixture::constant_sources::null(),
+                    crate::exec::operators::family_fixture::constant_sources::boolean,
+                ),
             ]
         })
         .collect::<Vec<_>>();
@@ -898,6 +917,8 @@ fn nested_change_program(
     parents: Vec<bool>,
     selected: Vec<bool>,
 ) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     use arrow::{array::StructArray, buffer::NullBuffer};
     assert_eq!(children.len(), parents.len());
     assert_eq!(children.len(), selected.len());
@@ -924,7 +945,11 @@ fn nested_change_program(
     let pool_id = ConstantPoolId::new(903);
     let mut constants = ConstantPools::empty();
     constants.insert(pool_id, pool).unwrap();
-    let mut builder = FragmentBuilder::new(FragmentId::new(65));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(65),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let expand = NodeId::new(1);
     let value = node_output(&mut builder, source, 0, source_ty.clone());
@@ -944,13 +969,11 @@ fn nested_change_program(
                         }),
                     )
                     .unwrap(),
-                builder
-                    .add_expression(
-                        source,
-                        boolean(false),
-                        ExprKind::Literal(LiteralValue::Boolean(*selected)),
-                    )
-                    .unwrap(),
+                builder.constant(
+                    source,
+                    boolean(false),
+                    crate::exec::operators::family_fixture::constant_sources::boolean(*selected),
+                ),
             ]
             .into_boxed_slice()
         })
@@ -1095,6 +1118,8 @@ fn licensed_change_program(
     selected: Vec<bool>,
     root_required: bool,
 ) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     use arrow::{array::StructArray, buffer::NullBuffer};
     assert_eq!(children.len(), parents.len());
     assert_eq!(children.len(), selected.len());
@@ -1127,7 +1152,11 @@ fn licensed_change_program(
     let pool_id = ConstantPoolId::new(903);
     let mut constants = ConstantPools::empty();
     constants.insert(pool_id, pool).unwrap();
-    let mut builder = FragmentBuilder::new(FragmentId::new(65));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(65),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let expand = NodeId::new(1);
     let value = node_output(&mut builder, source, 0, source_ty.clone());
@@ -1147,13 +1176,11 @@ fn licensed_change_program(
                         }),
                     )
                     .unwrap(),
-                builder
-                    .add_expression(
-                        source,
-                        boolean(false),
-                        ExprKind::Literal(LiteralValue::Boolean(*selected)),
-                    )
-                    .unwrap(),
+                builder.constant(
+                    source,
+                    boolean(false),
+                    crate::exec::operators::family_fixture::constant_sources::boolean(*selected),
+                ),
             ]
             .into_boxed_slice()
         })

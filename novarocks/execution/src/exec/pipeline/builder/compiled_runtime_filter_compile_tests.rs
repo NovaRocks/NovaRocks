@@ -156,8 +156,14 @@ fn singleton() -> PhysicalProperties {
 
 /// The join fragment, its one runtime filter and the frozen read of its scan.
 fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let columns = columns();
-    let mut builder = FragmentBuilder::new(FRAGMENT);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FRAGMENT,
+            &fixture_sources,
+        );
     let scan = columns.clone().map(|field| {
         builder
             .add_value(
@@ -214,9 +220,11 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
         .unwrap();
     let cells = BUILD_KEYS
         .map(|key| {
-            Box::from([builder
-                .add_expression(VALUES, int64(), ExprKind::Literal(LiteralValue::Int64(key)))
-                .unwrap()])
+            Box::from([builder.constant(
+                VALUES,
+                int64(),
+                crate::exec::operators::family_fixture::constant_sources::i64(key),
+            )])
         })
         .into_iter()
         .collect();
@@ -265,7 +273,10 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
@@ -355,7 +366,7 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
     })
     .unwrap();
     let plan = plan
-        .finish()
+        .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the runtime-filter join plan validates: {error:?}"));
 
     let draft = ConnectorReadRelationRecipeDraft::try_new(
@@ -444,7 +455,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             self.next += 1;
             let args = match &self.fragment.expressions().get(expr).unwrap().kind {
                 ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+                ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
                 other => panic!("the join fixture has no {other:?}"),
             };
             let arguments = args

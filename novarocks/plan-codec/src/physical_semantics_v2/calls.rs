@@ -906,6 +906,7 @@ fn validate_writer_source_shape(call: &FrozenPhysicalCall) -> Result<(), E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::*;
     use novarocks_type_contract::{
@@ -1043,20 +1044,15 @@ mod tests {
     fn add_values(builder: &mut FragmentBuilder, count: usize, scalar: bool) -> NodeId {
         let node = builder.reserve_node_id().unwrap();
         let ty = if scalar { boolean() } else { integer() };
-        let expression = builder
-            .add_expression(
-                node,
-                ty.clone(),
-                if scalar {
-                    ExprKind::FunctionCall {
-                        function: function(FunctionKind::Scalar, ty.clone()),
-                        args: Box::default(),
-                    }
-                } else {
-                    ExprKind::Literal(LiteralValue::Int64(17))
-                },
-            )
-            .unwrap();
+        let kind = if scalar {
+            ExprKind::FunctionCall {
+                function: function(FunctionKind::Scalar, ty.clone()),
+                args: Box::default(),
+            }
+        } else {
+            builder.constant_kind(&ty, checked::i64(17))
+        };
+        let expression = builder.add_expression(node, ty.clone(), kind).unwrap();
         let value = builder
             .add_value(
                 ty,
@@ -1085,7 +1081,7 @@ mod tests {
             // These fixtures explicitly use literals or zero-argument calls.
             // This is not a production inference of function control semantics.
             match &fragment.expressions().get(root.expr).unwrap().kind {
-                ExprKind::Literal(_) => {}
+                ExprKind::Constant(_) => {}
                 ExprKind::FunctionCall { args, .. } | ExprKind::WindowCall { args, .. } => {
                     assert!(args.is_empty());
                 }

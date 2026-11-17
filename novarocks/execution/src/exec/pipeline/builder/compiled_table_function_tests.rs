@@ -37,15 +37,14 @@ use novarocks_local_program::{LocalProgram, ProgramNodeKind};
 use novarocks_physical_plan::{
     BinaryOperator, BoundTableFunction, ConstantPoolId, ConstantPools, ConstantReference,
     Distribution, EdgeId, ExprId, ExprKind, ExpressionRootRole, ExpressionRootSite, Fragment,
-    FragmentBuilder, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
-    FrozenCallError, FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall,
-    FunctionArgumentType, LegacyBindingMetadata, LiteralValue, NodeId, NodeKind, NullOrdering,
-    OutputPort, PhysicalCallBinding, PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite,
-    PhysicalExpressionRoots, PhysicalNode, PhysicalPlan, PhysicalProperties, PhysicalRootUses,
-    PipelineDopDomain, PlanBuilder, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
-    RequiredInputs, ResultField, ResultPort, SetOperationKind, SortDirection, SortExpr, SortMode,
-    StaticFunctionArgument, TableFunctionOutput, ValueId, ValueOrigin, extract_fragment_packages,
-    passthrough_requirement,
+    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink, FrozenCallError,
+    FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType,
+    LegacyBindingMetadata, NodeId, NodeKind, NullOrdering, OutputPort, PhysicalCallBinding,
+    PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite, PhysicalExpressionRoots,
+    PhysicalNode, PhysicalPlan, PhysicalProperties, PhysicalRootUses, PipelineDopDomain,
+    PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredInputs, ResultField,
+    ResultPort, SetOperationKind, SortDirection, SortExpr, SortMode, StaticFunctionArgument,
+    TableFunctionOutput, ValueId, ValueOrigin, extract_fragment_packages, passthrough_requirement,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
@@ -186,7 +185,7 @@ impl Pools {
 
 /// `Values(k, l0, l1, ...)` at `node`, every list cell a constant reference.
 fn values(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     pools: &mut Pools,
     node: NodeId,
     rows: &[Row],
@@ -214,15 +213,11 @@ fn values(
         .collect::<Vec<_>>();
     let mut cells = Vec::new();
     for (row, (k, _)) in rows.iter().enumerate() {
-        let mut cell = vec![
-            builder
-                .add_expression(
-                    node,
-                    int64(false),
-                    ExprKind::Literal(LiteralValue::Int64(*k)),
-                )
-                .unwrap(),
-        ];
+        let mut cell = vec![builder.constant(
+            node,
+            int64(false),
+            crate::exec::operators::family_fixture::constant_sources::i64(*k),
+        )];
         for pool in &pool_ids {
             cell.push(
                 builder
@@ -252,7 +247,7 @@ fn values(
 /// Add `UNNEST(args)` over `input`, whose key and list columns are given, with
 /// the spec's outputs and the output properties the physical law derives.
 fn add_table_function(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     input: NodeId,
     key: ValueId,
     lists: &[ValueId],
@@ -376,7 +371,7 @@ fn add_table_function(
 /// `CASE WHEN k + i64::MAX IS NULL THEN l ELSE l END`: a List argument root
 /// whose condition raises an arithmetic overflow for every positive key.
 fn faulty_argument(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     key: ValueId,
     list: ValueId,
@@ -395,13 +390,11 @@ fn faulty_argument(
     let left = builder
         .add_expression(node, operand.clone(), ExprKind::Value(key))
         .unwrap();
-    let right = builder
-        .add_expression(
-            node,
-            operand,
-            ExprKind::Literal(LiteralValue::Int64(i64::MAX)),
-        )
-        .unwrap();
+    let right = builder.constant(
+        node,
+        operand,
+        crate::exec::operators::family_fixture::constant_sources::i64(i64::MAX),
+    );
     let sum = builder
         .add_expression(
             node,
@@ -446,7 +439,12 @@ fn faulty_argument(
 
 /// Finish a fragment and attach the original request of each table call: its
 /// bound Value arguments.
-fn finish(builder: FragmentBuilder, root: NodeId, sink: FragmentSink, max_dop: u32) -> Fragment {
+fn finish(
+    builder: crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+    root: NodeId,
+    sink: FragmentSink,
+    max_dop: u32,
+) -> crate::exec::operators::family_fixture::constant_sources::Fragment {
     let fragment = builder
         .finish_definition(
             root,
@@ -789,8 +787,14 @@ fn version() -> PlanVersionId {
 
 /// `Values -> [global Sort by k DESC] -> UNNEST -> Result` in one fragment.
 fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalProgram>, String> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let mut pools = Pools::new();
-    let mut builder = FragmentBuilder::new(SOLE);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            SOLE,
+            &fixture_sources,
+        );
     let values_node = builder.reserve_node_id().unwrap();
     let (key, lists) = values(&mut builder, &mut pools, values_node, rows, spec.lists);
     let input = if sorted {
@@ -817,9 +821,12 @@ fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalPr
     let (table, _) = add_table_function(&mut builder, input, key, &lists, spec);
     let fragment = finish(builder, table, FragmentSink::Result, 1);
     let port = result_port(&fragment, table);
-    let mut plan = PlanBuilder::new(version())
-        .with_constant_pools(pools.0)
-        .with_semantic_parameters(parameters(spec));
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        version(),
+        &fixture_sources,
+    )
+    .with_constant_pools(pools.0)
+    .with_semantic_parameters(parameters(spec));
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(port).unwrap();
     let plan = plan
@@ -1095,8 +1102,13 @@ fn exchanged_programs(
     spec: &Spec,
     dop: usize,
 ) -> (Arc<LocalProgram>, Arc<LocalProgram>) {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let mut pools = Pools::new();
-    let mut source = FragmentBuilder::new(SOURCE);
+    let mut source = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        SOURCE,
+        &fixture_sources,
+    );
     let union = source.reserve_node_id().unwrap();
     let mut inputs = Vec::new();
     let mut mappings = Vec::new();
@@ -1140,7 +1152,11 @@ fn exchanged_programs(
         .unwrap();
     let source = finish(source, union, FragmentSink::Stream { edge: TO_CONSUMER }, 1);
 
-    let mut consumer = FragmentBuilder::new(CONSUMER);
+    let mut consumer =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            CONSUMER,
+            &fixture_sources,
+        );
     let receiver = consumer.reserve_node_id().unwrap();
     let imports = receive(
         &mut consumer,
@@ -1162,9 +1178,12 @@ fn exchanged_programs(
     );
     let port = result_port(&consumer, table);
 
-    let mut plan = PlanBuilder::new(version())
-        .with_constant_pools(pools.0)
-        .with_semantic_parameters(parameters(spec));
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        version(),
+        &fixture_sources,
+    )
+    .with_constant_pools(pools.0)
+    .with_semantic_parameters(parameters(spec));
     plan.add_fragment(source).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(edge(

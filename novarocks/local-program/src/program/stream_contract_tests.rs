@@ -29,7 +29,7 @@ use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
     ValueTypeStorageLifetime,
 };
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
+use std::{num::NonZeroUsize, sync::Arc};
 
 struct Control;
 impl PureCompileControl for Control {
@@ -68,7 +68,7 @@ fn layout(fields: &[(&str, DataType, u32)]) -> StaticLayout {
     .unwrap()
 }
 fn expressions() -> Arc<ImmutableExpressions> {
-    Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap())
+    Arc::new(crate::test_support::arena(vec![]).unwrap())
 }
 fn profile(layout: &StaticLayout) -> CompileProfile {
     CompileProfile::new(
@@ -157,16 +157,10 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
     )
     .unwrap();
     let main = Arc::new(
-        ImmutableExpressions::try_new(
-            vec![StaticExprNode::new(
-                StaticExprKind::SlotId(SlotId::new(2)),
-                DataType::Int64,
-                None,
-            )],
-            false,
-            HashMap::new(),
-            None,
-        )
+        crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+            StaticExprKind::SlotId(SlotId::new(2)),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+        )])
         .unwrap(),
     );
     let nodes = vec![

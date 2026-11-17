@@ -21,9 +21,8 @@ use crate::{
     FilterNullSemantics, FilterOrderKey, FilterProducerAtExpr, FilterProducerKind, FilterReduction,
     FilterSortDirection, JoinDistributionMode, JoinType, KernelAbiVersion, LocalProgramError,
     ProgramNode, StaticExprKind, StaticExprNode, StaticFilterContract, StaticFilterProducer,
-    StaticLayout, StaticLiteral, StaticSinkProgram, StaticStreamBranch, StaticValues,
-    StaticWriterProjection, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
-    WriterGroupedUnpivotPlan,
+    StaticLayout, StaticSinkProgram, StaticStreamBranch, StaticValues, StaticWriterProjection,
+    WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
 };
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -31,7 +30,6 @@ use novarocks_connector_contract::WriteTargetOrdinal;
 use novarocks_execution_contract::DataStreamPartitionType;
 use novarocks_types::SlotId;
 use std::{
-    collections::HashMap,
     num::{NonZeroU32, NonZeroUsize},
     sync::Mutex,
 };
@@ -55,20 +53,18 @@ impl PureCompileControl for Control {
     }
 }
 fn arena(nodes: Vec<StaticExprNode>) -> Arc<ImmutableExpressions> {
-    Arc::new(ImmutableExpressions::try_new(nodes, false, HashMap::new(), None).unwrap())
+    Arc::new(crate::test_support::arena(nodes).unwrap())
 }
 fn integer_arena(value: i64) -> Arc<ImmutableExpressions> {
-    arena(vec![StaticExprNode::new(
-        StaticExprKind::Literal(StaticLiteral::Int64(value)),
-        DataType::Int64,
-        None,
+    arena(vec![StaticExprNode::new_value_typed(
+        crate::test_support::integer(value),
+        novarocks_functions::FunctionValueType::new(DataType::Int64, false),
     )])
 }
 fn boolean_arena() -> Arc<ImmutableExpressions> {
-    arena(vec![StaticExprNode::new(
-        StaticExprKind::Literal(StaticLiteral::Bool(true)),
-        DataType::Boolean,
-        None,
+    arena(vec![StaticExprNode::new_value_typed(
+        crate::test_support::boolean(true),
+        novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
     )])
 }
 fn values(columns: usize) -> (StaticValues, StaticLayout) {
@@ -104,15 +100,13 @@ fn metadata_source_program(
 ) -> Result<LocalProgramGraph, LocalProgramError> {
     let (source, layout) = values(1);
     let definitions = arena(vec![
-        StaticExprNode::new(
-            StaticExprKind::Literal(StaticLiteral::Int64(7)),
-            DataType::Int64,
-            None,
+        StaticExprNode::new_value_typed(
+            crate::test_support::integer(7),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
         ),
-        StaticExprNode::new(
-            StaticExprKind::Literal(StaticLiteral::Int64(9)),
-            DataType::Int64,
-            None,
+        StaticExprNode::new_value_typed(
+            crate::test_support::integer(9),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
         ),
     ]);
     let mut nodes = vec![ProgramNode::new(
@@ -305,18 +299,8 @@ fn scoped_program(shared: bool) -> LocalProgramGraph {
             layout.clone(),
         ),
     ];
-    let sink = if shared {
-        StaticSinkProgram::try_multicast(vec![branch(0, 1, 2), branch(1, 1, 2)], sink_arena)
-            .unwrap()
-    } else {
-        StaticSinkProgram::try_split(
-            vec![branch(0, 1, 2), branch(1, 1, 2)],
-            vec![ProgramExprId::new(0); 2],
-            sink_arena,
-            true,
-        )
-        .unwrap()
-    };
+    let sink = StaticSinkProgram::try_multicast(vec![branch(0, 1, 2), branch(1, 1, 2)], sink_arena)
+        .unwrap();
     let requirements = BindingRequirements::try_new(vec![
         BindingRequirement::TableWriter {
             node: ProgramNodeId::new(2),
@@ -351,7 +335,7 @@ fn repeated_definition_zero_keeps_every_actual_main_writer_and_sink_site_with_ex
     let program = scoped_program(false);
     let roots = ProgramExpressionRoots::collect(&program, &Control::default()).unwrap();
     assert_eq!(roots.arenas().len(), 3);
-    assert_eq!(roots.sites().len(), 8);
+    assert_eq!(roots.sites().len(), 6);
     assert!(Arc::ptr_eq(
         &roots.arenas()[&ProgramExpressionArena::Main],
         program.expressions()
@@ -367,28 +351,32 @@ fn repeated_definition_zero_keeps_every_actual_main_writer_and_sink_site_with_ex
         &roots.arenas()[&ProgramExpressionArena::Sink],
         program.sink().unwrap().arena().unwrap()
     ));
-    let literal = |scope| match roots.arenas()[&scope]
+    let constant = |scope| match roots.arenas()[&scope]
         .node(ProgramExprId::new(0))
         .unwrap()
         .kind()
     {
-        StaticExprKind::Literal(value) => value.clone(),
-        _ => panic!("fixture root is literal"),
+        StaticExprKind::Constant(value) => value.clone(),
+        _ => panic!("fixture root is a checked constant"),
     };
-    assert!(matches!(
-        literal(ProgramExpressionArena::Main),
-        StaticLiteral::Int64(7)
-    ));
-    assert!(matches!(
-        literal(ProgramExpressionArena::WriterProjection(
+    assert_eq!(
+        constant(ProgramExpressionArena::Main).try_i64().unwrap(),
+        Some(7)
+    );
+    assert_eq!(
+        constant(ProgramExpressionArena::WriterProjection(
             ProgramNodeId::new(2)
-        )),
-        StaticLiteral::Int64(8)
-    ));
-    assert!(matches!(
-        literal(ProgramExpressionArena::Sink),
-        StaticLiteral::Bool(true)
-    ));
+        ))
+        .try_i64()
+        .unwrap(),
+        Some(8)
+    );
+    assert_eq!(
+        constant(ProgramExpressionArena::Sink)
+            .try_boolean()
+            .unwrap(),
+        Some(true)
+    );
     for expression in 0..2 {
         assert_eq!(
             roots.sites()[&ProgramExpressionRootSite::Node {
@@ -417,11 +405,6 @@ fn repeated_definition_zero_keeps_every_actual_main_writer_and_sink_site_with_ex
             }]
                 .demand,
             EvaluationDemand::Value
-        );
-        assert_eq!(
-            roots.sites()[&ProgramExpressionRootSite::SinkSplitPredicate { branch: expression }]
-                .demand,
-            EvaluationDemand::TruthOnly
         );
     }
 }
@@ -889,20 +872,17 @@ fn role_join_program(
 ) -> Result<LocalProgramGraph, LocalProgramError> {
     let (source, layout) = values(1);
     let definitions = arena(vec![
-        StaticExprNode::new(
-            StaticExprKind::Literal(StaticLiteral::Int64(7)),
-            DataType::Int64,
-            None,
+        StaticExprNode::new_value_typed(
+            crate::test_support::integer(7),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
         ),
-        StaticExprNode::new(
-            StaticExprKind::Literal(StaticLiteral::Int64(9)),
-            DataType::Int64,
-            None,
+        StaticExprNode::new_value_typed(
+            crate::test_support::integer(9),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
         ),
-        StaticExprNode::new(
-            StaticExprKind::Literal(StaticLiteral::Bool(true)),
-            DataType::Boolean,
-            None,
+        StaticExprNode::new_value_typed(
+            crate::test_support::boolean(true),
+            novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
         ),
     ]);
     let requirements = if runtime_filters.is_empty() {

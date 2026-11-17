@@ -141,15 +141,13 @@ fn rebuild(
         Arc::clone(main)
     } else {
         Arc::new(
-            ImmutableExpressions::try_new(
+            ImmutableExpressions::try_new_for_compile(
                 main.nodes()
                     .iter()
                     .cloned()
                     .chain(added_definitions.iter().map(|(node, _)| node.clone()))
                     .collect(),
-                main.allow_throw_exception(),
-                main.query_global_dicts().clone(),
-                main.session_time_zone().map(Arc::from),
+                &control,
             )
             .map_err(|error| format!("{error:?}"))?,
         )
@@ -2109,10 +2107,9 @@ fn join_under_consumer_node(program: &LocalProgram) -> Result<Arc<LocalProgram>,
             scalar_root: None,
             root: Some(consumer),
             definitions: vec![(
-                StaticExprNode::new(
+                StaticExprNode::new_value_typed(
                     StaticExprKind::SlotId(output.slots()[0]),
-                    key_type.data_type().clone(),
-                    None,
+                    key_type.clone(),
                 ),
                 key_type,
             )],

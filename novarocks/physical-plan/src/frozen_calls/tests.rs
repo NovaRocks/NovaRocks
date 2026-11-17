@@ -178,20 +178,25 @@ fn zero_argument_request() -> PhysicalCallRequest {
         },
     }
 }
-fn add_values(builder: &mut FragmentBuilder, count: usize, scalar: bool) -> (NodeId, ExprId) {
+fn add_values(
+    builder: &mut FragmentBuilder,
+    count: usize,
+    scalar: bool,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (NodeId, ExprId) {
     let node = builder.reserve_node_id().unwrap();
     let ty = if scalar { boolean() } else { integer() };
     let expression = builder
         .add_expression(
             node,
-            ty.clone(),
+            (ty.clone()).clone(),
             if scalar {
                 ExprKind::FunctionCall {
                     function: function(FunctionKind::Scalar, ty.clone()),
                     args: Box::default(),
                 }
             } else {
-                ExprKind::Literal(LiteralValue::Int64(17))
+                fixture_constants.i64(17, &(ty.clone()))
             },
         )
         .unwrap();
@@ -223,7 +228,7 @@ fn leaf_roots(fragment: &Fragment) -> PhysicalRootUses {
         // These fixtures explicitly use literals or zero-argument calls.
         // This is not a production inference of function control semantics.
         match &fragment.expressions().get(root.expr).unwrap().kind {
-            ExprKind::Literal(_) => {}
+            ExprKind::Constant(_) => {}
             ExprKind::FunctionCall { args, .. } | ExprKind::WindowCall { args, .. } => {
                 assert!(args.is_empty());
             }
@@ -300,10 +305,14 @@ fn empty_fixture() -> Fixture {
     }
 }
 
-fn scalar_fixture(count: usize, fragment_id: u32) -> Fixture {
+fn scalar_fixture(
+    count: usize,
+    fragment_id: u32,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(fragment_id));
     let request = zero_argument_request();
-    let (node, expression) = add_values(&mut builder, count, true);
+    let (node, expression) = add_values(&mut builder, count, true, fixture_constants);
     let fragment = builder
         .finish_definition(
             node,
@@ -343,7 +352,8 @@ fn scalar_fixture(count: usize, fragment_id: u32) -> Fixture {
 
 #[test]
 fn repeated_definition_preserves_complete_per_use_claims_and_exact_binding_borrow() {
-    let mut fixture = scalar_fixture(2, 0);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 0, &mut fixture_constants);
     let reference = SemanticParameterRef {
         id: SemanticParameterId::new(u32::MAX),
         expected_key: SemanticParameterKey::TimeZone,
@@ -401,7 +411,8 @@ fn repeated_definition_preserves_complete_per_use_claims_and_exact_binding_borro
 
 #[test]
 fn missing_extra_duplicate_foreign_fragment_context_scope_and_control_fail_closed() {
-    let fixture = scalar_fixture(2, 7);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 7, &mut fixture_constants);
     let check = |calls| {
         FrozenFragmentCalls::try_new(&fixture.fragment, &fixture.uses, calls, &Control::default())
     };
@@ -432,7 +443,7 @@ fn missing_extra_duplicate_foreign_fragment_context_scope_and_control_fail_close
     calls[0].effects.argument_control = ArgumentControl::TypeOnly;
     assert_eq!(check(calls), Err(FrozenCallError::WrongControl));
     let checked = fixture.checked().unwrap();
-    let foreign = scalar_fixture(2, 8);
+    let foreign = scalar_fixture(2, 8, &mut fixture_constants);
     assert_eq!(
         checked.validate_fragment(&foreign.fragment, &foreign.uses, &Control::default()),
         Err(FrozenCallError::WrongFragment)
@@ -446,7 +457,8 @@ fn missing_extra_duplicate_foreign_fragment_context_scope_and_control_fail_close
 
 #[test]
 fn malformed_full_effect_shape_and_duplicate_environment_are_rejected() {
-    let fixture = scalar_fixture(1, 11);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(1, 11, &mut fixture_constants);
     let check = |effects| {
         let mut calls = fixture.calls.clone();
         calls[0].effects = effects;
@@ -487,7 +499,9 @@ fn malformed_full_effect_shape_and_duplicate_environment_are_rejected() {
     );
 }
 
-fn case_fixture() -> Fixture {
+fn case_fixture(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(31));
     let node = builder.reserve_node_id().unwrap();
     let function = builder
@@ -503,8 +517,8 @@ fn case_fixture() -> Fixture {
     let otherwise = builder
         .add_expression(
             node,
-            boolean(),
-            ExprKind::Literal(LiteralValue::Boolean(false)),
+            (boolean()).clone(),
+            fixture_constants.boolean(false, &(boolean())),
         )
         .unwrap();
     let case = builder
@@ -650,7 +664,8 @@ fn case_fixture() -> Fixture {
 
 #[test]
 fn one_scalar_definition_has_independent_truth_and_guarded_value_occurrences() {
-    let mut fixture = case_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = case_fixture(&mut fixture_constants);
     fixture.calls[1].effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
     let checked = fixture.checked().unwrap();
     let first = &checked.entries()[&PhysicalCallSite::Expression(ExpressionUseId::new(0))];
@@ -678,13 +693,18 @@ fn one_scalar_definition_has_independent_truth_and_guarded_value_occurrences() {
     );
 }
 
-fn special_fixture() -> Fixture {
-    special_fixture_with_rows(1)
+fn special_fixture(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
+    special_fixture_with_rows(1, fixture_constants)
 }
 
-fn special_fixture_with_rows(input_rows: usize) -> Fixture {
+fn special_fixture_with_rows(
+    input_rows: usize,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(41));
-    let (input, _) = add_values(&mut builder, input_rows, false);
+    let (input, _) = add_values(&mut builder, input_rows, false, fixture_constants);
     let aggregate = builder.reserve_node_id().unwrap();
     let mut outputs = Vec::new();
     let mut aggregate_calls = Vec::new();
@@ -885,7 +905,8 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
 
 #[test]
 fn real_aggregate_window_table_positions_borrow_selected_bindings() {
-    let fixture = special_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = special_fixture(&mut fixture_constants);
     let checked = fixture.checked().unwrap();
     assert_eq!(checked.entries().len(), 4);
     for call in &fixture.calls {
@@ -948,7 +969,8 @@ fn real_aggregate_window_table_positions_borrow_selected_bindings() {
 
 #[test]
 fn relational_occurrences_require_fresh_ids_value_demand_actual_domain_and_kind() {
-    let fixture = special_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = special_fixture(&mut fixture_constants);
     let check = |calls| {
         FrozenFragmentCalls::try_new(&fixture.fragment, &fixture.uses, calls, &Control::default())
     };
@@ -993,11 +1015,12 @@ fn relational_occurrences_require_fresh_ids_value_demand_actual_domain_and_kind(
 
 #[test]
 fn combined_expression_and_relational_occurrences_share_one_near_over_budget() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for (rows, accepted) in [
         (MAX_CONTROL_USE_REFERENCES - 4, true),
         (MAX_CONTROL_USE_REFERENCES - 3, false),
     ] {
-        let fixture = special_fixture_with_rows(rows);
+        let fixture = special_fixture_with_rows(rows, &mut fixture_constants);
         // Actual Values rows plus one Window call are expression uses; two
         // Aggregate calls and one Table call add three distinct occurrences.
         assert_eq!(fixture.uses.flow().use_reference_count(), rows + 1);
@@ -1035,7 +1058,8 @@ fn combined_expression_and_relational_occurrences_share_one_near_over_budget() {
 
 #[test]
 fn entry_and_mid_quantum_compile_failures_keep_exact_outer_categories() {
-    let fixture = scalar_fixture(300, 71);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(300, 71, &mut fixture_constants);
     let checked = fixture.checked().unwrap();
     for error in [
         CompileControlError::Cancelled,
@@ -1082,7 +1106,8 @@ fn entry_and_mid_quantum_compile_failures_keep_exact_outer_categories() {
 
 #[test]
 fn call_count_preflight_rejects_over_budget_without_visiting_entries() {
-    let fixture = scalar_fixture(1, 81);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(1, 81, &mut fixture_constants);
     let calls = vec![fixture.calls[0].clone(); MAX_CONTROL_USE_REFERENCES + 1];
     let control = Control::default();
     assert_eq!(
@@ -1236,9 +1261,10 @@ fn type_only_parent_retains_static_child_binding_without_runtime_child_claim() {
 
 #[test]
 fn decimal_policy_is_independent_of_equal_effects_and_call_context() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
 
-    let mut fixture = scalar_fixture(1, 83);
+    let mut fixture = scalar_fixture(1, 83, &mut fixture_constants);
     let output_null = fixture.checked().unwrap();
     let site = fixture.calls[0].site;
     fixture.calls[0].decimal_overflow_policy = ReportError;
@@ -1261,9 +1287,10 @@ fn decimal_policy_is_independent_of_equal_effects_and_call_context() {
 
 #[test]
 fn shared_definition_occurrences_keep_distinct_decimal_policies_in_one_table() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
 
-    let mut fixture = scalar_fixture(2, 84);
+    let mut fixture = scalar_fixture(2, 84, &mut fixture_constants);
     for call in &mut fixture.calls {
         call.effects.proof_scope = CallProofScope::Unconditional;
     }
@@ -1299,9 +1326,10 @@ fn shared_definition_occurrences_keep_distinct_decimal_policies_in_one_table() {
 
 #[test]
 fn relational_and_window_sites_preserve_their_own_explicit_decimal_policy() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
 
-    let mut fixture = special_fixture();
+    let mut fixture = special_fixture(&mut fixture_constants);
     let policies = [ReportError, OutputNull, ReportError, OutputNull];
     for (call, policy) in fixture.calls.iter_mut().zip(policies) {
         call.decimal_overflow_policy = policy;

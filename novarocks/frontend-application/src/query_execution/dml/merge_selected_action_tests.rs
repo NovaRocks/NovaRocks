@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use novarocks_physical_plan::{
-    ExprId, ExprKind, FragmentId, LiteralValue, NodeKind, PhysicalPlan, ValueId, ValueOrigin,
+    ExprId, ExprKind, FragmentId, NodeKind, PhysicalPlan, ValueId, ValueOrigin,
 };
 
 // These are compiler witnesses, not a second evaluator. Literal relations
@@ -204,9 +204,6 @@ fn scalar(plan: &PhysicalPlan, fragment: FragmentId, expr: ExprId) -> Option<Sel
     let arena = plan.fragments()[&fragment].expressions();
     let expr = arena.get(expr).unwrap();
     match &expr.kind {
-        ExprKind::Literal(LiteralValue::Null) => Some(SelectedScalar::Null),
-        ExprKind::Literal(LiteralValue::Boolean(value)) => Some(SelectedScalar::Boolean(*value)),
-        ExprKind::Literal(LiteralValue::Int64(value)) => Some(SelectedScalar::Integer(*value)),
         ExprKind::Cast {
             expr: source,
             target,

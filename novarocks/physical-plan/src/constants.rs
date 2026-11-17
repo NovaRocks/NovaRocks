@@ -39,74 +39,6 @@ pub struct ConstantPools {
     storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 
-/// Materialize a legacy literal using the original compiler's sole CV factory.
-/// No type, logical identity, policy or phase is inferred. Field/type clones
-/// remain caller-admitted opaque work around the original observations; this
-/// port grants no memory budget. Pool references instead resolve their actual
-/// existing admitted backing through ConstantPools::resolve_observed.
-/// The caller owns entry/finish and preserves the first typed refusal. Generic
-/// error conversion keeps field/type, CV and control categories separate.
-pub fn literal_constant_observed<E>(
-    literal: &crate::LiteralValue,
-    value_type: &FunctionValueType,
-    policy: novarocks_constant_contract::ConstantPolicy,
-    phase: novarocks_type_contract::CompilePhase,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<ConstantValue, E>
-where
-    E: From<novarocks_type_contract::ValueTypeError>
-        + From<ConstantError>
-        + From<CompileControlError>,
-{
-    use crate::LiteralValue;
-    use std::sync::Arc;
-    work.flush()?;
-    let field = Arc::new(arrow_schema::Field::new(
-        "constant",
-        value_type.data_type().clone(),
-        value_type.nullable(),
-    ));
-    work.flush()?;
-    macro_rules! scalar {
-        ($factory:ident, $value:expr) => {
-            ConstantValue::$factory(
-                field,
-                value_type.clone(),
-                $value,
-                policy,
-                phase,
-                work.control(),
-            )?
-        };
-    }
-    let value = match literal {
-        LiteralValue::Null => {
-            ConstantValue::null(field, value_type.clone(), policy, phase, work.control())?
-        }
-        LiteralValue::Boolean(value) => scalar!(from_boolean, *value),
-        LiteralValue::Int64(value) => scalar!(from_i64, *value),
-        LiteralValue::UInt64(value) => scalar!(from_u64, *value),
-        LiteralValue::Float64Bits(value) => scalar!(from_f64_bits, *value),
-        LiteralValue::LargeInt(value) => scalar!(from_largeint, *value),
-        LiteralValue::Decimal128(value) => scalar!(from_decimal128, *value),
-        LiteralValue::Decimal256(value) => scalar!(from_decimal256_be, *value),
-        LiteralValue::Utf8(value) => scalar!(from_utf8, value.as_ref()),
-        LiteralValue::Binary(value) => scalar!(from_binary, value.as_ref()),
-        LiteralValue::Date32(value) => scalar!(from_date32, *value),
-        LiteralValue::Time64(value) => scalar!(from_time64, *value),
-        LiteralValue::Timestamp(value) => scalar!(from_timestamp, *value),
-        LiteralValue::IntervalMonthDayNano {
-            months,
-            days,
-            nanoseconds,
-        } => {
-            scalar!(from_interval_month_day_nano, (*months, *days, *nanoseconds))
-        }
-    };
-    work.flush()?;
-    Ok(value)
-}
-
 impl ConstantPools {
     pub fn empty() -> Self {
         Self {
@@ -796,7 +728,6 @@ fn validate_fragment_constants_core(
 
 /// Read the original window-bound constant through its admitted source type.
 /// Checked references retain the existing exact non-null I64/U64 rules;
-/// legacy literals use the same structural validator's extraction.
 /// The caller owns entry and the ordinary/success footer. Originating control
 /// or resource failures return without an additional observation.
 pub fn window_offset_observed(
@@ -810,7 +741,7 @@ pub fn window_offset_observed(
         return Ok(None);
     };
     let crate::ExprKind::Constant(reference) = node.kind else {
-        return Ok(crate::validation::window_row_offset(fragment, id));
+        return Ok(None);
     };
     let value = pools.resolve_observed(reference, &node.ty, work)?;
     if node.ty.nullable()
@@ -904,7 +835,7 @@ fn validate_unpivot_constants(
                         ConstantValidationMode::Caller => value.selected_payload_bytes_in(work)?,
                     }
                 } else {
-                    crate::validation::unpivot_scalar_literal_bytes(fragment, *id) as u64
+                    0
                 }
             }
             crate::UnpivotConstant::Int32List(reference)
@@ -1024,9 +955,6 @@ fn validate_plan_constants_core(
     Ok(())
 }
 
-#[cfg(test)]
-#[path = "constants/literal_factory_tests.rs"]
-mod literal_factory_tests;
 #[cfg(test)]
 #[path = "constants/request_reference_tests.rs"]
 mod request_reference_tests;

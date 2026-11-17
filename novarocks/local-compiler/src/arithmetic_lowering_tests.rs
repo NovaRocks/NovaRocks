@@ -30,9 +30,8 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     BinaryOperator, ExprId, ExprKind, ExprNode, Fragment, FragmentBuilder, FragmentCuts,
     FragmentId, FragmentPackageError, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots, PhysicalRootUses,
-    PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort, ValueDef,
-    ValueId, ValueOrigin,
+    FrozenFragmentPruning, NodeId, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain,
+    PlanVersionId, RequiredContracts, ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     ArithmeticOperator, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
@@ -121,6 +120,7 @@ fn reference(id: u32) -> SemanticParameterRef {
     }
 }
 struct Fixture {
+    constants: novarocks_physical_plan::ConstantPools,
     fragment: Fragment,
     root: ExprId,
     left: ExprId,
@@ -138,6 +138,7 @@ fn fixture(
     result_nullable: bool,
     nested_mod: bool,
 ) -> Fixture {
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(FragmentId::new(113));
     builder
         .add_values(
@@ -169,11 +170,11 @@ fn fixture(
                 owner: NodeId::new(44),
                 lambda_scope: None,
                 ty: ty.clone(),
-                kind: ExprKind::Literal(if ty.nullable() {
-                    LiteralValue::Null
+                kind: if ty.nullable() {
+                    crate::test_constants::null(&mut constants, &ty, options().constants)
                 } else {
-                    LiteralValue::Int64(number)
-                }),
+                    crate::test_constants::i64(&mut constants, &ty, number, options().constants)
+                },
             })
             .unwrap();
         builder
@@ -292,6 +293,7 @@ fn fixture(
         )
         .unwrap();
     Fixture {
+        constants,
         fragment,
         root,
         left,
@@ -314,7 +316,7 @@ fn uses(fragment: &Fragment) -> PhysicalRootUses {
         *next += 19;
         let children = match &fragment.expressions().get(definition).unwrap().kind {
             ExprKind::Binary { left, right, .. } => vec![*left, *right],
-            ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+            ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
             _ => panic!("fixture declares only exact eager intrinsic definitions"),
         };
         let arguments = children
@@ -415,7 +417,7 @@ fn package_input(fixture: &Fixture) -> FragmentPackageInput {
     FragmentPackageInput {
         version: PlanVersionId::try_new([113; 16]).unwrap(),
         required: RequiredContracts::default(),
-        constants: novarocks_physical_plan::ConstantPools::empty(),
+        constants: fixture.constants.clone(),
         fragment: fixture.fragment.clone(),
         expression_uses,
         calls,

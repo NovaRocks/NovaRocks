@@ -80,10 +80,18 @@ fn mark_fragment(
             null_extended: Box::default(),
         }
     } else {
+        let input = builder.add_expression(
+            join,
+            ValueType::new(DataType::Utf8, true),
+            ExprKind::Value(inputs[0]),
+        )?;
         let predicate = builder.add_expression(
             join,
             ValueType::new(DataType::Boolean, false),
-            ExprKind::Literal(LiteralValue::Boolean(true)),
+            ExprKind::IsNull {
+                expr: input,
+                negated: false,
+            },
         )?;
         NodeKind::NestLoopJoin {
             kind: JoinKind::LeftMark,

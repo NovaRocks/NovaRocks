@@ -32,7 +32,7 @@ use novarocks_plan_codec::physical_type_v2::{
 use novarocks_type_contract::{CompileControlError, PureCompileControl, ValueLogicalType};
 
 struct SourceFixture {
-    fragment: Fragment,
+    fragment: crate::exec::operators::family_fixture::constant_sources::Fragment,
     pools: ConstantPools,
     first: ExprId,
     later: ExprId,
@@ -75,7 +75,13 @@ fn scalar_binding(name: &str, request: &[FunctionArgument]) -> BoundFunction {
 }
 
 fn source_fixture() -> SourceFixture {
-    let mut builder = FragmentBuilder::new(SOLE);
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            SOLE,
+            &fixture_sources,
+        );
     let input = builder.reserve_node_id().unwrap();
     let mut pools = Pools::new();
     let (key, _lists) = values(
@@ -436,7 +442,13 @@ fn all_definition_source_first_control_cause_stops_every_callback_prefix() {
 
 #[test]
 fn all_definition_source_uses_real_unnest_relational_binding_author() {
-    let mut builder = FragmentBuilder::new(SOLE);
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            SOLE,
+            &fixture_sources,
+        );
     let mut pools = Pools::new();
     let input = builder.reserve_node_id().unwrap();
     let (key, lists) = values(
@@ -594,7 +606,13 @@ fn all_definition_source_borrowed_type_encoder_keeps_nested_provider_and_nominal
 
 #[test]
 fn all_definition_source_original_publication_rejects_unreachable_definition() {
-    let mut builder = FragmentBuilder::new(SOLE);
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            SOLE,
+            &fixture_sources,
+        );
     let mut pools = Pools::new();
     let input = builder.reserve_node_id().unwrap();
     values(
@@ -604,13 +622,11 @@ fn all_definition_source_original_publication_rejects_unreachable_definition() {
         &[(1, vec![Some(vec![Some(2)])])],
         1,
     );
-    builder
-        .add_expression(
-            input,
-            int64(false),
-            ExprKind::Literal(LiteralValue::Int64(99)),
-        )
-        .unwrap();
+    builder.constant(
+        input,
+        int64(false),
+        crate::exec::operators::family_fixture::constant_sources::i64(99),
+    );
     let error = builder
         .finish_definition(
             input,

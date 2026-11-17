@@ -65,22 +65,20 @@ fn fixture(
     let mut nodes = Vec::new();
     let mut types = Vec::new();
     for (ordinal, value) in children.into_iter().enumerate() {
-        nodes.push(StaticExprNode::new(
+        nodes.push(StaticExprNode::new_value_typed(
             StaticExprKind::SlotId(SlotId::new(ordinal as u32 + 1)),
-            value.data_type().clone(),
-            None,
+            value.clone(),
         ));
         types.push(FunctionArgumentType::Value(value));
     }
     let root = ProgramExprId::new(nodes.len());
-    nodes.push(StaticExprNode::new(
+    nodes.push(StaticExprNode::new_value_typed(
         StaticExprKind::Case {
             has_case_expr: simple,
             has_else_expr: has_else,
             children: (0..nodes.len()).map(ProgramExprId::new).collect(),
         },
-        result.data_type().clone(),
-        None,
+        result.clone(),
     ));
     types.push(FunctionArgumentType::Value(result.clone()));
     assembled(nodes, types, root, result, demand)
@@ -95,8 +93,7 @@ fn assembled(
     ProgramResolvedCalls,
     BTreeMap<ProgramExpressionArena, Vec<FunctionArgumentType>>,
 ) {
-    let arena =
-        Arc::new(ImmutableExpressions::try_new(nodes, false, HashMap::new(), None).unwrap());
+    let arena = Arc::new(crate::test_support::arena(nodes).unwrap());
     let input_schema = Arc::new(Schema::new(vec![Field::new(
         "input",
         DataType::Boolean,
@@ -209,7 +206,7 @@ fn add_use(
             },
             children.clone(),
         ),
-        StaticExprKind::LambdaFunction { body, .. } => (ControlShape::LambdaBody, vec![*body]),
+
         _ => (ControlShape::Eager, vec![]),
     };
     uses.push(ProgramExpressionUse {
@@ -586,23 +583,16 @@ fn actual_case_value_positions_reject_lambda_wrappers_in_operand_labels_and_resu
         for position in 0..count {
             // The Lambda has a real earlier Boolean body and its own actual
             // LambdaBody use. Its result carrier is not a scalar argument.
-            let mut nodes = vec![StaticExprNode::new(
+            let mut nodes = vec![StaticExprNode::new_value_typed(
                 StaticExprKind::SlotId(SlotId::new(1)),
-                DataType::Boolean,
-                None,
+                novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
             )];
             let mut types = vec![FunctionArgumentType::Value(boolean(false))];
             for ordinal in 0..count {
                 if ordinal == position {
-                    nodes.push(StaticExprNode::new(
-                        StaticExprKind::LambdaFunction {
-                            body: ProgramExprId::new(0),
-                            arg_slots: vec![],
-                            common_sub_exprs: vec![],
-                            is_nondeterministic: false,
-                        },
-                        DataType::Boolean,
-                        None,
+                    nodes.push(StaticExprNode::new_value_typed(
+                        StaticExprKind::SlotId(SlotId::new(1)),
+                        novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
                     ));
                     types.push(FunctionArgumentType::Lambda {
                         parameter_types:
@@ -612,23 +602,21 @@ fn actual_case_value_positions_reject_lambda_wrappers_in_operand_labels_and_resu
                         result_type: boolean(false),
                     });
                 } else {
-                    nodes.push(StaticExprNode::new(
+                    nodes.push(StaticExprNode::new_value_typed(
                         StaticExprKind::SlotId(SlotId::new(1)),
-                        DataType::Boolean,
-                        None,
+                        novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
                     ));
                     types.push(FunctionArgumentType::Value(boolean(false)));
                 }
             }
             let root = ProgramExprId::new(nodes.len());
-            nodes.push(StaticExprNode::new(
+            nodes.push(StaticExprNode::new_value_typed(
                 StaticExprKind::Case {
                     has_case_expr: simple,
                     has_else_expr: true,
                     children: (1..=count).map(ProgramExprId::new).collect(),
                 },
-                DataType::Boolean,
-                None,
+                novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
             ));
             types.push(FunctionArgumentType::Value(boolean(false)));
             let (calls, types) =
@@ -650,28 +638,25 @@ fn dead_case_definitions_cannot_bypass_flags_arity_or_value_type_validation() {
         (true, false, 2),
         (true, true, 3),
     ] {
-        let mut nodes = vec![StaticExprNode::new(
+        let mut nodes = vec![StaticExprNode::new_value_typed(
             StaticExprKind::SlotId(SlotId::new(1)),
-            DataType::Boolean,
-            None,
+            novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
         )];
         let mut types = vec![FunctionArgumentType::Value(boolean(false))];
         for _ in 0..count {
-            nodes.push(StaticExprNode::new(
+            nodes.push(StaticExprNode::new_value_typed(
                 StaticExprKind::SlotId(SlotId::new(1)),
-                DataType::Boolean,
-                None,
+                novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
             ));
             types.push(FunctionArgumentType::Value(boolean(false)));
         }
-        nodes.push(StaticExprNode::new(
+        nodes.push(StaticExprNode::new_value_typed(
             StaticExprKind::Case {
                 has_case_expr: simple,
                 has_else_expr: has_else,
                 children: (1..count + 1).map(ProgramExprId::new).collect(),
             },
-            DataType::Boolean,
-            None,
+            novarocks_functions::FunctionValueType::new(DataType::Boolean, false),
         ));
         types.push(FunctionArgumentType::Value(boolean(true)));
         let (calls, types) = assembled(

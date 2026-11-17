@@ -20,26 +20,32 @@ use super::*;
 use novarocks_failure_contract::FailureProjection;
 
 pub(crate) fn boundary_program(project: Option<bool>) -> Arc<LocalProgram> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(57));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(57),
+            &fixture_sources,
+        );
     let values = super::super::family_fixture::values(
         &mut builder,
         VALUES,
         &[FunctionValueType::new(DataType::Int64, false)],
-        &[vec![LiteralValue::Int64(7)]],
+        &[vec![
+            crate::exec::operators::family_fixture::constant_sources::i64(7),
+        ]],
     );
     let root = if let Some(computed) = project {
         let ty = FunctionValueType::new(DataType::Int64, false);
-        let expr = builder
-            .add_expression(
-                PROJECT,
-                ty.clone(),
-                if computed {
-                    ExprKind::Literal(LiteralValue::Int64(19))
-                } else {
-                    ExprKind::Value(values[0])
-                },
+        let kind = if computed {
+            builder.constant_kind(
+                &ty,
+                &crate::exec::operators::family_fixture::constant_sources::i64(19),
             )
-            .unwrap();
+        } else {
+            ExprKind::Value(values[0])
+        };
+        let expr = builder.add_expression(PROJECT, ty.clone(), kind).unwrap();
         let output = builder
             .add_value(
                 ty,

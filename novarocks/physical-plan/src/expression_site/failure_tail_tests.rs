@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::tests::constant_fixture::ConstantFixture;
 use std::fmt::Debug;
 
 struct Trace {
@@ -94,7 +95,8 @@ fn every_callback<T: Debug, E: Debug + PartialEq>(
     calls
 }
 
-fn checked_values(rows: usize) -> Fragment {
+fn checked_values(rows: usize) -> (Fragment, ConstantPools) {
+    let mut constants = ConstantFixture::new();
     let mut builder = FragmentBuilder::new(FragmentId::new(27));
     let owner = builder.reserve_node_id().unwrap();
     let mut cells = Vec::new();
@@ -105,7 +107,7 @@ fn checked_values(rows: usize) -> Fragment {
                 .add_expression(
                     owner,
                     ty(DataType::Boolean, false),
-                    ExprKind::Literal(LiteralValue::Boolean(value)),
+                    constants.boolean(value, &ty(DataType::Boolean, false)),
                 )
                 .unwrap(),
         );
@@ -131,14 +133,15 @@ fn checked_values(rows: usize) -> Fragment {
             output.into_boxed_slice(),
         )
         .unwrap();
-    builder
+    let fragment = builder
         .finish_definition(
             owner,
             FragmentSink::Noop,
             dop(),
             crate::StagePlacementPolicy::Singleton,
         )
-        .unwrap()
+        .unwrap();
+    (fragment, constants.into_pools())
 }
 
 fn snapshot(
@@ -262,7 +265,7 @@ fn forged_second_literal_argument(source: &Fragment) -> ExpressionControlFlow<Ex
 
 #[test]
 fn actual_values_roots_observe_success_and_missing_scope_failure_tails() {
-    let valid = checked_values(1);
+    let (valid, _valid_pools) = checked_values(1);
     assert_eq!(
         PhysicalExpressionRoots::try_new(&valid, &control())
             .unwrap()
@@ -301,7 +304,7 @@ fn actual_values_roots_observe_success_and_missing_scope_failure_tails() {
 
 #[test]
 fn actual_root_bindings_observe_second_site_and_correspondence_failure_tails() {
-    let source = checked_values(1);
+    let (source, _source_pools) = checked_values(1);
     let (flow, bindings) = checked_flow(&source);
     every_callback(
         |control| PhysicalRootUses::try_new(&source, flow.clone(), bindings.clone(), control),
@@ -329,7 +332,7 @@ fn actual_root_bindings_observe_second_site_and_correspondence_failure_tails() {
 
 #[test]
 fn actual_fragment_recheck_observes_changed_roots_and_wrong_arguments_tails() {
-    let source = checked_values(1);
+    let (source, _source_pools) = checked_values(1);
     let (flow, bindings) = checked_flow(&source);
     let bound = PhysicalRootUses::try_new(&source, flow, bindings, &control()).unwrap();
     every_callback(
@@ -338,7 +341,7 @@ fn actual_fragment_recheck_observes_changed_roots_and_wrong_arguments_tails() {
         RootUseBindingError::Control,
         false,
     );
-    let changed = checked_values(2);
+    let (changed, _changed_pools) = checked_values(2);
     every_callback(
         |control| bound.validate_fragment(&changed, control),
         Some(RootUseBindingError::ChangedRoots),
@@ -365,7 +368,7 @@ fn actual_fragment_recheck_observes_changed_roots_and_wrong_arguments_tails() {
 
 #[test]
 fn actual_wide_values_cover_all_owner_quantums_and_ordinary_refusal_prefixes() {
-    let source = checked_values(320);
+    let (source, _source_pools) = checked_values(320);
     let (flow, bindings) = checked_flow(&source);
     assert_eq!(bindings.len(), 640);
     let bound =

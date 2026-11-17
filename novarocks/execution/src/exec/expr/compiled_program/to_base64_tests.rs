@@ -17,6 +17,7 @@
 //! Actual Physical source author -> frozen contract -> LocalCompiler -> controller witnesses.
 //! This executes that checked layer, not the separate native protobuf emitter/BE decoder.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{ArrayRef, StringArray};
 use novarocks_type_contract::{
     SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
@@ -77,6 +78,7 @@ fn functions() -> PureEngineFunctionCatalog {
     builder.seal_pure(installed).unwrap()
 }
 fn program(shape: Shape) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = functions();
     let fragment_id = FragmentId::new(197);
     let source = NodeId::new(0);
@@ -88,7 +90,14 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         .add_values(source, Box::from([Box::default()]), Box::default())
         .unwrap();
     let input_expr = builder
-        .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+        .add_expression(
+            input,
+            ty.clone(),
+            checked_constants::kind(
+                &mut source_pools,
+                checked_constants::null(&(ty.clone()), options().constants),
+            ),
+        )
         .unwrap();
     let value = ValueId::new(91);
     builder
@@ -124,11 +133,11 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         .add_expression(
             output,
             ty.clone(),
-            if cv.is_some() {
-                ExprKind::Constant(novarocks_physical_plan::ConstantReference {
-                    pool: novarocks_physical_plan::ConstantPoolId::new(0),
-                    ordinal: 0,
-                })
+            if let Some(value) = &cv {
+                ExprKind::Constant(crate::exec::expr::test_support::register_constant(
+                    &mut source_pools,
+                    value,
+                ))
             } else {
                 ExprKind::Value(value)
             },
@@ -261,7 +270,14 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
     } else {
         SemanticParameters::default()
     };
-    compile_checked_fragment_with_parameters(&functions, fragment, &authors, result, parameters)
+    compile_checked_fragment_with_parameters(
+        &functions,
+        fragment,
+        &authors,
+        result,
+        parameters,
+        source_pools,
+    )
 }
 // RFC 4648 section 4 uses the standard alphabet and '=' padding. These
 // values are independent byte derivations, not output from either evaluator:
@@ -510,21 +526,7 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
             Source::Ordinary
         );
     }
-    assert!(matches!(
-        classify(
-            vec![leaf(
-                0,
-                ExprKind::Literal(LiteralValue::Utf8("ÿ".into())),
-                utf8.clone()
-            )],
-            &[ExprId::new(0)]
-        ),
-        Err(
-            novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
-                "to_base64 requires checked native-v1 source; unchecked Literal is not emitted"
-            )
-        )
-    ));
+
     assert!(matches!(
         classify(
             vec![leaf(0, ExprKind::Value(ValueId::new(91)), utf8.clone())],

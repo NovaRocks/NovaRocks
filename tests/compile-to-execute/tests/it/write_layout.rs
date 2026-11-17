@@ -82,16 +82,28 @@ fn sender_package() -> FragmentPackage {
             )
             .unwrap()
     });
+    let mut constants = ConstantPools::empty();
     let rows: Box<[_]> = [[900, 13], [800, -42], [700, 13]]
         .into_iter()
         .map(|row| {
             Box::new(row.map(|value| {
+                let source = novarocks_functions::ConstantValue::from_i64(
+                    Arc::new(ty.try_to_field("layout-fixture").unwrap()),
+                    ty.clone(),
+                    value,
+                    compile_options().constants,
+                    CompilePhase::Validate,
+                    &Control,
+                )
+                .unwrap();
+                let pool = ConstantPoolId::new(u32::try_from(constants.entries().len()).unwrap());
+                let reference = ConstantReference {
+                    pool,
+                    ordinal: source.ordinal(),
+                };
+                constants.insert(pool, source.pool().clone()).unwrap();
                 builder
-                    .add_expression(
-                        values,
-                        ty.clone(),
-                        ExprKind::Literal(LiteralValue::Int64(value)),
-                    )
+                    .add_expression(values, ty.clone(), ExprKind::Constant(reference))
                     .unwrap()
             })) as Box<[_]>
         })
@@ -251,7 +263,7 @@ fn sender_package() -> FragmentPackage {
     .unwrap();
     FragmentPackage::try_new(
         FragmentPackageInput {
-            constants: ConstantPools::empty(),
+            constants,
             version: PlanVersionId::try_new([11; 16]).unwrap(),
             required: RequiredContracts::default(),
             fragment,

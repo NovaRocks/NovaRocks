@@ -659,7 +659,6 @@ fn validate_split_core<E: From<StaticSinkError>>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use arrow_schema::DataType;
 
@@ -668,16 +667,10 @@ mod tests {
 
     fn arena() -> Arc<ImmutableExpressions> {
         Arc::new(
-            ImmutableExpressions::try_new(
-                vec![StaticExprNode::new(
-                    StaticExprKind::SlotId(SlotId::new(1)),
-                    DataType::Int64,
-                    None,
-                )],
-                false,
-                HashMap::new(),
-                None,
-            )
+            crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+                StaticExprKind::SlotId(SlotId::new(1)),
+                novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+            )])
             .unwrap(),
         )
     }
@@ -1007,7 +1000,6 @@ mod router_contract_tests {
     use arrow_schema::{DataType, Field, Schema};
     use novarocks_connector_contract::{ConnectorRowMutationEffect, WriteTargetOrdinal};
     use novarocks_result_contract::SummaryKind;
-    use std::collections::HashMap;
     struct Control;
     impl PureCompileControl for Control {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
@@ -1081,8 +1073,7 @@ mod router_contract_tests {
                 target: WriteTargetOrdinal::try_new(0).unwrap(),
             },
         )];
-        let arena =
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap());
+        let arena = Arc::new(crate::test_support::arena(vec![]).unwrap());
         let routes = vec![StaticRouterRoute {
             layout: crate::ProgramWriteLayoutPreference::None,
             branch: 0,

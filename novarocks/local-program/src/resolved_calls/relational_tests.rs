@@ -31,7 +31,6 @@ use novarocks_type_contract::{
     FunctionNullBehavior, ObservableEffects, SemanticParameters, WindowFrame as CommonWindowFrame,
 };
 use std::{
-    collections::HashMap,
     mem::MaybeUninit,
     num::NonZeroUsize,
     sync::{
@@ -825,16 +824,10 @@ pub(crate) fn aggregate_catalog(owner: Arc<Owner>) -> PureEngineFunctionCatalog 
 
 fn literal_arena(ty: DataType) -> Arc<ImmutableExpressions> {
     Arc::new(
-        ImmutableExpressions::try_new(
-            vec![StaticExprNode::new(
-                StaticExprKind::Literal(StaticLiteral::Int64(7)),
-                ty,
-                None,
-            )],
-            false,
-            HashMap::new(),
-            None,
-        )
+        crate::test_support::arena(vec![StaticExprNode::new_value_typed(
+            crate::test_support::integer(7),
+            novarocks_functions::FunctionValueType::new(ty, false),
+        )])
         .unwrap(),
     )
 }

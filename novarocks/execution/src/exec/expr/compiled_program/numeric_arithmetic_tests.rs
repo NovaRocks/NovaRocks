@@ -18,6 +18,7 @@
 // Actual full FVT source facts, compiler recipes, and selected runtime. This
 // fixture never derives LargeInt identity from its fixed-width byte carrier.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{Decimal128Array, Decimal256Array, FixedSizeBinaryBuilder};
 use arrow_buffer::i256;
 use novarocks_type_contract::ValueLogicalType;
@@ -34,17 +35,21 @@ fn largeint() -> FunctionValueType {
     )
     .unwrap()
 }
-fn scalar_literal(ty: &FunctionValueType, value: i128) -> LiteralValue {
+fn scalar_literal(ty: &FunctionValueType, value: i128) -> novarocks_functions::ConstantValue {
     match (&ty.data_type(), ty.logical_type()) {
-        (DataType::Decimal128(..), ValueLogicalType::Physical) => LiteralValue::Decimal128(value),
-        (DataType::Decimal256(..), ValueLogicalType::Physical) => {
-            LiteralValue::Decimal256(i256::from_i128(value).to_be_bytes())
+        (DataType::Decimal128(..), ValueLogicalType::Physical) => {
+            checked_constants::decimal128(ty, value, options().constants)
         }
+        (DataType::Decimal256(..), ValueLogicalType::Physical) => checked_constants::decimal256(
+            ty,
+            i256::from_i128(value).to_be_bytes(),
+            options().constants,
+        ),
         (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt) => {
-            LiteralValue::LargeInt(value)
+            checked_constants::largeint(ty, value, options().constants)
         }
         (DataType::Int64, ValueLogicalType::Physical) => {
-            LiteralValue::Int64(i64::try_from(value).unwrap())
+            checked_constants::i64(ty, i64::try_from(value).unwrap(), options().constants)
         }
         _ => panic!("explicit numeric scalar fixture author"),
     }
@@ -56,8 +61,9 @@ fn typed_program(
     wrap: Wrap,
     allow: bool,
     policy: DecimalOverflowPolicy,
-    right_literal: Option<LiteralValue>,
+    right_literal: Option<novarocks_functions::ConstantValue>,
 ) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let fragment_id = FragmentId::new(213);
     let source = NodeId::new(u32::MAX);
@@ -76,7 +82,14 @@ fn typed_program(
     let mut projections = Vec::new();
     for (id, ty) in &columns {
         let expression = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -102,7 +115,7 @@ fn typed_program(
         .add_expression(output, left_type.clone(), ExprKind::Value(columns[0].0))
         .unwrap();
     let right = if let Some(value) = right_literal {
-        literal(&mut builder, &right_type, value)
+        literal(&mut builder, &right_type, value, &mut source_pools)
     } else {
         builder
             .add_expression(output, right_type.clone(), ExprKind::Value(columns[1].0))
@@ -131,7 +144,12 @@ fn typed_program(
         Wrap::Bare | Wrap::ConstantRight => computed,
         Wrap::NullParent => panic!("numeric fixture has no untyped parent result rule"),
         Wrap::Coalesce | Wrap::If => {
-            let fallback = literal(&mut builder, &result_type, scalar_literal(&result_type, 71));
+            let fallback = literal(
+                &mut builder,
+                &result_type,
+                scalar_literal(&result_type, 71),
+                &mut source_pools,
+            );
             let (name, shape, arguments, defs) = if matches!(wrap, Wrap::If) {
                 let flag = builder
                     .add_expression(output, boolean.clone(), ExprKind::Value(columns[2].0))
@@ -182,7 +200,12 @@ fn typed_program(
                 let decide = literal(
                     &mut builder,
                     &result_type,
-                    LiteralValue::Boolean(matches!(wrap, Wrap::Or)),
+                    checked_constants::boolean(
+                        &result_type,
+                        matches!(wrap, Wrap::Or),
+                        options().constants,
+                    ),
+                    &mut source_pools,
                 );
                 builder
                     .add_expression(
@@ -243,7 +266,7 @@ fn typed_program(
             ty: result_type,
         }]),
     };
-    compile_arithmetic(&functions, fragment, &authors, result, allow)
+    compile_arithmetic(&functions, fragment, &authors, result, allow, source_pools)
 }
 fn d128(ty: &FunctionValueType, values: &[Option<i128>]) -> ArrayRef {
     let DataType::Decimal128(p, s) = ty.data_type() else {
@@ -559,7 +582,7 @@ fn decimal_precision_factor_and_mul_overflow_keep_independent_policies_and_null_
         Wrap::ConstantRight,
         false,
         DecimalOverflowPolicy::OutputNull,
-        Some(LiteralValue::Decimal128(125)),
+        Some(checked_constants::decimal128(&ty, 125, options().constants)),
     );
     let batch = typed_input(
         &program,

@@ -292,7 +292,6 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         work.step()?;
         Some(EmittedScalarArgumentSource {
             value_type: &definition.ty,
-            unchecked_literal: matches!(definition.kind, ExprKind::Literal(_)),
             checked_constant_reference:
                 novarocks_physical_plan::native_v1_emitted_constant_reference(&definition.kind)
                     .is_some(),

@@ -336,6 +336,7 @@ fn rand_operand_fixture(
     op: BinaryOperator,
     mode: Mode,
 ) -> Fixture {
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(FragmentId::new(101));
     builder
         .add_values(
@@ -362,7 +363,12 @@ fn rand_operand_fixture(
         .add_expression(
             NodeId::new(44),
             ty.clone(),
-            ExprKind::Literal(LiteralValue::Float64Bits(1f64.to_bits())),
+            crate::test_constants::f64_bits(
+                &mut constants,
+                &ty,
+                1f64.to_bits(),
+                options().constants,
+            ),
         )
         .unwrap();
     let input = builder
@@ -449,6 +455,7 @@ fn rand_operand_fixture(
         }
     }
     Fixture {
+        constants,
         fragment: builder
             .finish_definition(
                 NodeId::new(0),

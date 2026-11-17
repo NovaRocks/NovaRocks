@@ -50,14 +50,17 @@ fn any_of(witnesses: &[RuntimeFilterWitnessId]) -> RuntimeFilterCoverage {
     }
 }
 
-fn append_single_copy_literal(builder: &mut FragmentBuilder) -> (NodeId, ValueId) {
+fn append_single_copy_literal(
+    builder: &mut FragmentBuilder,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (NodeId, ValueId) {
     let node = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, false);
     let expression = builder
         .add_expression(
             node,
-            value_type.clone(),
-            ExprKind::Literal(LiteralValue::Int64(11)),
+            (value_type.clone()).clone(),
+            fixture_constants.i64(11, &(value_type.clone())),
         )
         .unwrap();
     let value = builder
@@ -354,6 +357,7 @@ fn add_edge_with_kind(
 
 #[test]
 fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let source_fragment_id = FragmentId::new(420);
     let build_fragment_id = FragmentId::new(421);
     let probe_fragment_id = FragmentId::new(422);
@@ -363,7 +367,8 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
     let filter_id = RuntimeFilterId::new(420);
 
     let mut source_builder = FragmentBuilder::new(source_fragment_id);
-    let (source_root, source_value) = append_single_copy_literal(&mut source_builder);
+    let (source_root, source_value) =
+        append_single_copy_literal(&mut source_builder, &mut fixture_constants);
     let source_fragment = source_builder
         .finish_definition(
             source_root,
@@ -472,7 +477,7 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
             true,
         );
         plan.add_runtime_filter(filter).unwrap();
-        plan.finish()
+        crate::tests::constant_fixture::publish_plan(plan, &fixture_constants)
     };
 
     let mut non_blocking = filter.clone();
@@ -509,6 +514,7 @@ struct NestedJoinFacts {
 
 fn nested_unicast_plan(
     make_filters: impl FnOnce(NestedJoinFacts, NestedJoinFacts) -> Vec<RuntimeFilter>,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<PhysicalPlan, ValidationErrors> {
     let build_fragment_id = FragmentId::new(400);
     let inner_fragment_id = FragmentId::new(401);
@@ -517,7 +523,8 @@ fn nested_unicast_plan(
     let nested_build_edge = EdgeId::new(401);
 
     let mut build_builder = FragmentBuilder::new(build_fragment_id);
-    let (build_root, build_value) = append_single_copy_literal(&mut build_builder);
+    let (build_root, build_value) =
+        append_single_copy_literal(&mut build_builder, fixture_constants);
     let build_fragment = build_builder
         .finish_definition(
             build_root,
@@ -528,12 +535,12 @@ fn nested_unicast_plan(
         .unwrap();
 
     let mut inner_builder = FragmentBuilder::new(inner_fragment_id);
-    let inner_probe = append_single_copy_literal(&mut inner_builder);
+    let inner_probe = append_single_copy_literal(&mut inner_builder, fixture_constants);
     let inner_build = append_exchange(&mut inner_builder, build_edge, build_value, broadcast());
     let inner_join = append_broadcast_join(&mut inner_builder, inner_probe, inner_build);
 
     let mut outer_builder = FragmentBuilder::new(outer_fragment_id);
-    let outer_probe = append_single_copy_literal(&mut outer_builder);
+    let outer_probe = append_single_copy_literal(&mut outer_builder, fixture_constants);
     let outer_build = append_exchange(
         &mut outer_builder,
         nested_build_edge,
@@ -627,41 +634,45 @@ fn nested_unicast_plan(
     for filter in filters {
         plan.add_runtime_filter(filter).unwrap();
     }
-    plan.finish()
+    crate::tests::constant_fixture::publish_plan(plan, fixture_constants)
 }
 
 #[test]
 fn nested_runtime_filter_consumer_cannot_borrow_another_joins_equality_witness() {
-    let error = nested_unicast_plan(|inner, outer| {
-        let mut filter = filter(
-            RuntimeFilterId::new(400),
-            Box::from([
-                equality(inner.equality, inner.fragment, inner.join),
-                equality(outer.equality, outer.fragment, outer.join),
-            ]),
-            Box::from([producer(
-                outer.equality,
-                outer.equality,
-                outer.fragment,
-                outer.join,
-                outer.build,
-                Box::from([outer.build_edge]),
-            )]),
-            Box::from([blocking_consumer(
-                inner.equality,
-                inner.fragment,
-                inner.join,
-                inner.probe,
-            )]),
-        );
-        // This is a same-key contract negative, not an executable RF cycle.
-        // Disable the optional wait so no dependency diagnostic can mask it.
-        filter.consumers[0].activation =
-            RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
-                late_apply: LateApplyGranularity::Batch,
-            };
-        vec![filter]
-    })
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = nested_unicast_plan(
+        |inner, outer| {
+            let mut filter = filter(
+                RuntimeFilterId::new(400),
+                Box::from([
+                    equality(inner.equality, inner.fragment, inner.join),
+                    equality(outer.equality, outer.fragment, outer.join),
+                ]),
+                Box::from([producer(
+                    outer.equality,
+                    outer.equality,
+                    outer.fragment,
+                    outer.join,
+                    outer.build,
+                    Box::from([outer.build_edge]),
+                )]),
+                Box::from([blocking_consumer(
+                    inner.equality,
+                    inner.fragment,
+                    inner.join,
+                    inner.probe,
+                )]),
+            );
+            // This is a same-key contract negative, not an executable RF cycle.
+            // Disable the optional wait so no dependency diagnostic can mask it.
+            filter.consumers[0].activation =
+                RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+                    late_apply: LateApplyGranularity::Batch,
+                };
+            vec![filter]
+        },
+        &mut fixture_constants,
+    )
     .expect_err("an outer producer cannot authorize an inner join's consumer equality");
     assert_eq!(error.errors().len(), 1, "{error:?}");
     let diagnostic = &error.errors()[0];
@@ -679,33 +690,37 @@ fn nested_runtime_filter_consumer_cannot_borrow_another_joins_equality_witness()
 #[test]
 fn nested_unicast_joins_keep_their_own_blocking_or_late_runtime_filter_contracts() {
     let make = |activation| {
-        nested_unicast_plan(|inner, outer| {
-            [inner, outer]
-                .into_iter()
-                .map(|join| {
-                    let mut filter = filter(
-                        RuntimeFilterId::new(join.equality),
-                        Box::from([equality(join.equality, join.fragment, join.join)]),
-                        Box::from([producer(
-                            join.equality,
-                            join.equality,
-                            join.fragment,
-                            join.join,
-                            join.build,
-                            Box::from([join.build_edge]),
-                        )]),
-                        Box::from([blocking_consumer(
-                            join.equality,
-                            join.fragment,
-                            join.join,
-                            join.probe,
-                        )]),
-                    );
-                    filter.consumers[0].activation = activation;
-                    filter
-                })
-                .collect()
-        })
+        let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+        nested_unicast_plan(
+            |inner, outer| {
+                [inner, outer]
+                    .into_iter()
+                    .map(|join| {
+                        let mut filter = filter(
+                            RuntimeFilterId::new(join.equality),
+                            Box::from([equality(join.equality, join.fragment, join.join)]),
+                            Box::from([producer(
+                                join.equality,
+                                join.equality,
+                                join.fragment,
+                                join.join,
+                                join.build,
+                                Box::from([join.build_edge]),
+                            )]),
+                            Box::from([blocking_consumer(
+                                join.equality,
+                                join.fragment,
+                                join.join,
+                                join.probe,
+                            )]),
+                        );
+                        filter.consumers[0].activation = activation;
+                        filter
+                    })
+                    .collect()
+            },
+            &mut fixture_constants,
+        )
         .expect("each nested join owns one exact producer, consumer, and coverage witness")
     };
     let blocking = make(RuntimeFilterConsumerActivation::BlockingSnapshot);
@@ -772,7 +787,9 @@ pub(super) struct AcyclicFixture {
     recursive_source_fragment: FragmentId,
 }
 
-pub(super) fn acyclic_cross_fragment_fixture() -> AcyclicFixture {
+pub(super) fn acyclic_cross_fragment_fixture(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> AcyclicFixture {
     let source_fragment = FragmentId::new(410);
     let relay_fragment = FragmentId::new(411);
     let target_fragment = FragmentId::new(412);
@@ -781,7 +798,8 @@ pub(super) fn acyclic_cross_fragment_fixture() -> AcyclicFixture {
     let filter_id = RuntimeFilterId::new(410);
 
     let mut source_builder = FragmentBuilder::new(source_fragment);
-    let (source_root, source_value) = append_single_copy_literal(&mut source_builder);
+    let (source_root, source_value) =
+        append_single_copy_literal(&mut source_builder, fixture_constants);
     let source = source_builder
         .finish_definition(
             source_root,
@@ -812,7 +830,7 @@ pub(super) fn acyclic_cross_fragment_fixture() -> AcyclicFixture {
         .unwrap();
 
     let mut target_builder = FragmentBuilder::new(target_fragment);
-    let probe = append_single_copy_literal(&mut target_builder);
+    let probe = append_single_copy_literal(&mut target_builder, fixture_constants);
     let build = append_exchange(
         &mut target_builder,
         direct_build_edge,
@@ -875,7 +893,7 @@ pub(super) fn acyclic_cross_fragment_fixture() -> AcyclicFixture {
     plan.add_runtime_filter(filter).unwrap();
 
     AcyclicFixture {
-        plan: plan.finish().unwrap(),
+        plan: crate::tests::constant_fixture::publish_plan(plan, fixture_constants).unwrap(),
         target_fragment,
         recursive_build_edge,
         recursive_source_fragment: source_fragment,
@@ -920,7 +938,8 @@ fn replace_source_fragment(
 
 #[test]
 fn blocking_runtime_filter_accepts_an_acyclic_recursive_build_dependency() {
-    let fixture = acyclic_cross_fragment_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = acyclic_cross_fragment_fixture(&mut fixture_constants);
     let target = &fixture.plan.fragments()[&fixture.target_fragment];
     let cuts = fragment_cuts(&fixture.plan, fixture.target_fragment).unwrap();
     validate_fragment(target, &cuts).unwrap();
@@ -928,7 +947,8 @@ fn blocking_runtime_filter_accepts_an_acyclic_recursive_build_dependency() {
 
 #[test]
 fn remote_execution_growth_does_not_expand_local_boundary_facts() {
-    let fixture = acyclic_cross_fragment_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = acyclic_cross_fragment_fixture(&mut fixture_constants);
     let cuts = fragment_cuts(&fixture.plan, fixture.target_fragment).unwrap();
     for count in [2, 64, 1024] {
         let enlarged =
@@ -948,7 +968,8 @@ fn remote_execution_growth_does_not_expand_local_boundary_facts() {
 
 #[test]
 fn global_validation_rejects_remote_sink_ownership_that_local_facts_cannot_prove() {
-    let fixture = acyclic_cross_fragment_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = acyclic_cross_fragment_fixture(&mut fixture_constants);
     let cuts = fragment_cuts(&fixture.plan, fixture.target_fragment).unwrap();
     let direct_edge = cuts.inbound[0].edge;
     for sink in [
@@ -971,7 +992,8 @@ fn global_validation_rejects_remote_sink_ownership_that_local_facts_cannot_prove
 
 #[test]
 fn local_validation_rejects_an_unattached_runtime_filter() {
-    let fixture = acyclic_cross_fragment_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = acyclic_cross_fragment_fixture(&mut fixture_constants);
     let mut cuts = fragment_cuts(&fixture.plan, fixture.target_fragment).unwrap();
     cuts.runtime_filters = Box::default();
     let error = validate_fragment(&fixture.plan.fragments()[&fixture.target_fragment], &cuts)
@@ -982,6 +1004,7 @@ fn local_validation_rejects_an_unattached_runtime_filter() {
 
 #[test]
 fn caller_observed_complete_plan_waits_keep_the_original_three_control_causes() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_type_contract::{
         CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
     };
@@ -1002,7 +1025,7 @@ fn caller_observed_complete_plan_waits_keep_the_original_three_control_causes() 
             }
         }
     }
-    let fixture = acyclic_cross_fragment_fixture();
+    let fixture = acyclic_cross_fragment_fixture(&mut fixture_constants);
     for cause in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,
@@ -1045,6 +1068,7 @@ fn caller_observed_complete_plan_waits_keep_the_original_three_control_causes() 
 
 #[test]
 fn observed_complete_plan_validation_retains_acyclic_frozen_blocking_activations() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1055,7 +1079,7 @@ fn observed_complete_plan_validation_retains_acyclic_frozen_blocking_activations
             Ok(())
         }
     }
-    let fixture = acyclic_cross_fragment_fixture();
+    let fixture = acyclic_cross_fragment_fixture(&mut fixture_constants);
     let owner = ObserveWork(AtomicUsize::new(0));
     validate_plan_observed(&fixture.plan, &owner).unwrap();
     assert!(owner.0.load(Ordering::Relaxed) > 1);

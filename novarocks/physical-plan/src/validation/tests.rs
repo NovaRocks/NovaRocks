@@ -44,7 +44,7 @@ mod validation_error_tests {
                 logical_type,
             )
             .unwrap(),
-            kind: ExprKind::Literal(crate::LiteralValue::LargeInt(1)),
+            kind: ExprKind::Value(ValueId::new(id)),
         };
         let uuid = expression(1, ValueLogicalType::Uuid);
         for op in [crate::BinaryOperator::Add, crate::BinaryOperator::BitAnd] {
@@ -52,14 +52,6 @@ mod validation_error_tests {
             validate_binary_types(&uuid, op, &uuid, &uuid, "uuid", &mut errors);
             assert!(!errors.is_empty());
         }
-        let mut errors = ValidationContext::new();
-        validate_literal_type(
-            &crate::LiteralValue::LargeInt(1),
-            &uuid.ty,
-            "uuid",
-            &mut errors,
-        );
-        assert!(!errors.is_empty());
         let integer = expression(2, ValueLogicalType::LargeInt);
         let plain = expression(3, ValueLogicalType::Physical);
         for (input, output, valid) in [
@@ -88,7 +80,7 @@ mod validation_error_tests {
             owner: NodeId::new(1),
             lambda_scope: None,
             ty: ValueType::try_with_logical_type(DataType::Utf8, true, logical_type).unwrap(),
-            kind: ExprKind::Literal(crate::LiteralValue::Null),
+            kind: ExprKind::Value(ValueId::new(id)),
         };
         let json = expression(1, ValueLogicalType::Json);
         let plain = expression(2, ValueLogicalType::Physical);
@@ -97,7 +89,7 @@ mod validation_error_tests {
             owner: NodeId::new(1),
             lambda_scope: None,
             ty: ValueType::new(DataType::Boolean, true),
-            kind: ExprKind::Literal(crate::LiteralValue::Null),
+            kind: ExprKind::Value(ValueId::new(3)),
         };
         let mut errors = ValidationContext::new();
         validate_binary_types(
@@ -128,7 +120,7 @@ mod validation_error_tests {
             owner: NodeId::new(1),
             lambda_scope: None,
             ty: value_type,
-            kind: ExprKind::Literal(crate::LiteralValue::Null),
+            kind: ExprKind::Value(ValueId::new(id)),
         };
         let decimal = expression(1, ValueType::new(DataType::Decimal128(38, 15), true));
         let integer = expression(
@@ -190,7 +182,7 @@ mod validation_error_tests {
             owner: NodeId::new(1),
             lambda_scope: None,
             ty: value_type,
-            kind: ExprKind::Literal(crate::LiteralValue::Null),
+            kind: ExprKind::Value(ValueId::new(id)),
         };
         let largeint = DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH);
         let largeint_type = ValueType::try_with_logical_type(

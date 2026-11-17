@@ -35,6 +35,8 @@ use std::fmt;
 
 use arrow::datatypes::DataType;
 use novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft;
+#[cfg(test)]
+use novarocks_physical_plan::ProviderReadOccurrenceId;
 use novarocks_physical_plan::{
     AggregateBinding, AggregateCall as ContractAggregateCall, AggregateCallId, AggregateGrouping,
     AggregatePhase, AggregateSequenceId, BinaryOperator, BoundFunction, BoundTableFunction,
@@ -67,8 +69,6 @@ use novarocks_physical_plan::{
     WriterFinishSpec, WriterGroupedUnpivotMapping, WriterGroupedUnpivotSpec, WriterRelationField,
     WriterRelationFieldRole, WriterRelationSchema, WriterTarget, WriterTargetField,
 };
-#[cfg(test)]
-use novarocks_physical_plan::{LiteralValue as ContractLiteralValue, ProviderReadOccurrenceId};
 use novarocks_spi::connector::read_stack::ConnectorReadRelationKind;
 use novarocks_spi::connector::write_stack::{
     ConnectorWriteLayoutPreference, RootWriteResultSchema, WriteTargetOrdinal,
@@ -13138,112 +13138,6 @@ fn lower_unary_operator(operator: UnOp) -> UnaryOperator {
     }
 }
 
-#[cfg(test)]
-fn lower_literal(
-    literal: &LiteralValue,
-    target: &ValueType,
-) -> Result<(ContractLiteralValue, ValueType), ContractLoweringError> {
-    match literal {
-        // A null literal admits null because it is one. Where the statement
-        // was analyzed to say the slot it fills never carries one, the
-        // annotation is what is wrong, and everything above this reads the
-        // expression rather than the annotation.
-        LiteralValue::Null => Ok((
-            ContractLiteralValue::Null,
-            (target.clone())
-                .with_nullable(true)
-                .expect("validated root NULL contract"),
-        )),
-        LiteralValue::Bool(value) => Ok((
-            ContractLiteralValue::Boolean(*value),
-            ValueType::new(DataType::Boolean, false),
-        )),
-        // A date, a time and a timestamp all reach the planner as the integer
-        // they are stored as, and only the position says which. Reading the
-        // position is what makes them that value: an integer converted to a
-        // date instead reads its digits as `YYYYMMDD`, so `DATE '2024-01-10'`
-        // would arrive as a null.
-        LiteralValue::Int(value) if matches!(target.data_type(), DataType::Date32) => {
-            let days =
-                i32::try_from(*value).map_err(|_| ContractLoweringError::InvalidLiteral {
-                    kind: "Date32",
-                    detail: format!("{value} is outside the day range a date is stored in"),
-                })?;
-            Ok((
-                ContractLiteralValue::Date32(days),
-                ValueType::new(DataType::Date32, false),
-            ))
-        }
-        LiteralValue::Int(value) if matches!(target.data_type(), DataType::Time64(_)) => Ok((
-            ContractLiteralValue::Time64(*value),
-            ValueType::new(target.data_type().clone(), false),
-        )),
-        LiteralValue::Int(value) if matches!(target.data_type(), DataType::Timestamp(_, _)) => {
-            Ok((
-                ContractLiteralValue::Timestamp(*value),
-                ValueType::new(target.data_type().clone(), false),
-            ))
-        }
-        LiteralValue::Int(value) => Ok((
-            ContractLiteralValue::Int64(*value),
-            ValueType::new(DataType::Int64, false),
-        )),
-        LiteralValue::LargeInt(value)
-            if target.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt
-                && novarocks_type_contract::is_largeint_data_type(target.data_type()) =>
-        {
-            Ok((
-                ContractLiteralValue::LargeInt(*value),
-                target
-                    .with_nullable(false)
-                    .expect("validated LARGEINT literal type"),
-            ))
-        }
-        LiteralValue::LargeInt(_) => Err(ContractLoweringError::InvalidLiteral {
-            kind: "LargeInt",
-            detail: format!(
-                "requires an authored LARGEINT FixedSizeBinary({}), got {:?}",
-                novarocks_type_contract::LARGEINT_BYTE_WIDTH,
-                target.data_type(),
-            ),
-        }),
-        LiteralValue::Float(value) => Ok((
-            ContractLiteralValue::Float64Bits(value.to_bits()),
-            ValueType::new(DataType::Float64, false),
-        )),
-        LiteralValue::String(value) => Ok((
-            ContractLiteralValue::Utf8(value.clone().into_boxed_str()),
-            ValueType::new(DataType::Utf8, false),
-        )),
-        LiteralValue::Binary(value) => Ok((
-            ContractLiteralValue::Binary(value.clone().into_boxed_slice()),
-            ValueType::new(DataType::Binary, false),
-        )),
-        LiteralValue::Decimal(value) => match &target.data_type() {
-            DataType::Decimal128(precision, scale) => {
-                let unscaled = parse_decimal128(value, *scale)?;
-                require_decimal_precision(unscaled, *precision, "Decimal")?;
-                Ok((
-                    ContractLiteralValue::Decimal128(unscaled),
-                    ValueType::new(target.data_type().clone(), false),
-                ))
-            }
-            DataType::Decimal256(precision, scale) => {
-                let unscaled = parse_decimal256(value, *scale)?;
-                require_decimal256_precision(unscaled, *precision)?;
-                Ok((
-                    ContractLiteralValue::Decimal256(unscaled.to_be_bytes()),
-                    ValueType::new(target.data_type().clone(), false),
-                ))
-            }
-            other => Err(ContractLoweringError::InvalidLiteral {
-                kind: "Decimal",
-                detail: format!("requires a decimal type, got {other:?}"),
-            }),
-        },
-    }
-}
-
 fn require_decimal_precision(
     unscaled: i128,
     precision: u8,
@@ -20257,9 +20151,11 @@ mod tests {
         assert_eq!(parse_decimal128("1200", -2).unwrap(), 12);
         assert!(parse_decimal128("12.34", 1).is_err());
         assert!(
-            lower_literal(
+            crate::constant::admit_syntax_constant(
                 &LiteralValue::Decimal("999".to_string()),
                 &ValueType::new(DataType::Decimal128(2, 0), false),
+                crate::test_constants::policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .is_err()
         );
@@ -20383,9 +20279,11 @@ mod tests {
     #[test]
     fn largeint_literal_identity_cannot_be_authored_as_opaque_fixed_binary() {
         assert!(
-            lower_literal(
+            crate::constant::admit_syntax_constant(
                 &LiteralValue::LargeInt(7),
-                &ValueType::new(DataType::FixedSizeBinary(16), false)
+                &ValueType::new(DataType::FixedSizeBinary(16), false),
+                crate::test_constants::policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .is_err()
         );

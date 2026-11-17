@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     EngineFunctionCatalog, FunctionArgument, FunctionBindingError, FunctionKind,
@@ -23,10 +24,9 @@ use novarocks_functions::{
     builtin::catalogue::build_builtin_engine_function_catalog,
 };
 use novarocks_physical_plan::{
-    BoundFunction, ChangeEventSpec, ExprNode, ExpressionRootRole, FragmentBuilder, FragmentId,
-    FragmentSink, LiteralValue, NodeId, NodeKind, PipelineDopDomain, PlanLimits, UnaryOperator,
-    ValueOrigin, WindowBound, WindowExpression, WindowFrame, WindowFrameExclusion,
-    WindowFrameUnits, WindowSpec,
+    BoundFunction, ChangeEventSpec, ExprNode, ExpressionRootRole, FragmentId, FragmentSink, NodeId,
+    NodeKind, PipelineDopDomain, PlanLimits, UnaryOperator, ValueOrigin, WindowBound,
+    WindowExpression, WindowFrame, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
 };
 use novarocks_type_contract::{EvaluationDemand, FunctionArgumentEvaluation, GuardKind};
 use std::sync::{Arc, Mutex};
@@ -131,13 +131,7 @@ fn empty() -> (FragmentBuilder, NodeId) {
     (builder, leaf)
 }
 fn boolean(builder: &mut FragmentBuilder, owner: NodeId, value: bool) -> ExprId {
-    builder
-        .add_expression(
-            owner,
-            ty(DataType::Boolean, false),
-            ExprKind::Literal(LiteralValue::Boolean(value)),
-        )
-        .unwrap()
+    builder.constant(owner, ty(DataType::Boolean, false), checked::boolean(value))
 }
 fn binding(
     catalog: &EngineFunctionCatalog,
@@ -355,16 +349,8 @@ fn occurrence_installed_coalesce_and_lower_have_exact_guarded_and_eager_edges() 
     let (mut builder, input) = empty();
     let owner = NodeId::new(901);
     let text = ty(DataType::Utf8, true);
-    let first = builder
-        .add_expression(owner, text.clone(), ExprKind::Literal(LiteralValue::Null))
-        .unwrap();
-    let second = builder
-        .add_expression(
-            owner,
-            text.clone(),
-            ExprKind::Literal(LiteralValue::Utf8("Selected".into())),
-        )
-        .unwrap();
+    let first = builder.constant(owner, text.clone(), checked::null());
+    let second = builder.constant(owner, text.clone(), checked::utf8("Selected".into()));
     let lower = binding(
         &catalog,
         "lower",
@@ -547,15 +533,8 @@ fn occurrence_window_optional_frame_offsets_are_eager_topology_not_scalar_lifecy
         let (mut builder, input) = empty();
         let owner = NodeId::new(901);
         let function = binding(&catalog, "rank", &[], FunctionKind::Window);
-        let offset = with_frame.then(|| {
-            builder
-                .add_expression(
-                    owner,
-                    ty(DataType::Int64, false),
-                    ExprKind::Literal(LiteralValue::Int64(1)),
-                )
-                .unwrap()
-        });
+        let offset = with_frame
+            .then(|| builder.constant(owner, ty(DataType::Int64, false), checked::i64(1)));
         let frame = offset.map(|offset| WindowFrame {
             units: WindowFrameUnits::Rows,
             start: WindowBound::Preceding(offset),
@@ -734,13 +713,7 @@ fn occurrence_metadata_only_refusal_and_nested_typed_controls_never_fallback_or_
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let (mut builder, input) = empty();
     let owner = NodeId::new(901);
-    let arg = builder
-        .add_expression(
-            owner,
-            ty(DataType::Utf8, false),
-            ExprKind::Literal(LiteralValue::Utf8("Ä".into())),
-        )
-        .unwrap();
+    let arg = builder.constant(owner, ty(DataType::Utf8, false), checked::utf8("Ä".into()));
     let function = binding(
         &catalog,
         "lower",

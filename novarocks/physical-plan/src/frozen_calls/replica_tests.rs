@@ -111,7 +111,8 @@ fn prefixes(
 
 #[test]
 fn frozen_construction_success_duplicate_and_missing_site_observe_all_original_tails() {
-    let fixture = scalar_fixture(2, u32::MAX);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, u32::MAX, &mut fixture_constants);
     for variant in 0..3 {
         let mut calls = fixture.calls.clone();
         match variant {
@@ -160,7 +161,8 @@ fn frozen_construction_success_duplicate_and_missing_site_observe_all_original_t
 
 #[test]
 fn frozen_validation_success_ordinary_context_and_public_shape_keep_every_tail_cause() {
-    let fixture = scalar_fixture(2, 711);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 711, &mut fixture_constants);
     let checked = fixture.checked().unwrap();
     for variant in 0..3 {
         let mut actual = checked.clone();
@@ -195,9 +197,10 @@ fn frozen_validation_success_ordinary_context_and_public_shape_keep_every_tail_c
 
 #[test]
 fn frozen_validation_foreign_fragment_and_extra_site_keep_zero_tail_observation() {
-    let fixture = scalar_fixture(2, 712);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 712, &mut fixture_constants);
     let checked = fixture.checked().unwrap();
-    let foreign = scalar_fixture(2, 713);
+    let foreign = scalar_fixture(2, 713, &mut fixture_constants);
     assert_eq!(
         checked.validate_fragment(&foreign.fragment, &foreign.uses, &ReplicaControl::default()),
         Err(FrozenCallError::WrongFragment)
@@ -227,7 +230,8 @@ fn frozen_validation_foreign_fragment_and_extra_site_keep_zero_tail_observation(
 
 #[test]
 fn frozen_dynamic_item_invoice_success_uses_original_control_for_each_tail() {
-    let fixture = scalar_fixture(2, 714);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 714, &mut fixture_constants);
     let checked = fixture.checked().unwrap();
     let expected = checked.entries().len()
         + checked
@@ -248,7 +252,8 @@ fn frozen_dynamic_item_invoice_success_uses_original_control_for_each_tail() {
 
 #[test]
 fn replica_equivalence_shared_definition_checks_each_sparse_use_and_domain() {
-    let mut fixture = scalar_fixture(2, 0);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 0, &mut fixture_constants);
     broadcast(&mut fixture);
     let invocations = fixture.uses.flow().uses();
     assert_eq!(
@@ -276,7 +281,8 @@ fn replica_equivalence_shared_definition_checks_each_sparse_use_and_domain() {
 
 #[test]
 fn replica_equivalence_complete_claims_override_contradictory_legacy_volatility() {
-    let mut fixture = scalar_fixture(1, u32::MAX);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(1, u32::MAX, &mut fixture_constants);
     broadcast(&mut fixture);
     fixture.calls[0].effects.value_stability = FunctionVolatility::Volatile;
     let site = fixture.calls[0].site;
@@ -309,7 +315,8 @@ fn replica_equivalence_complete_claims_override_contradictory_legacy_volatility(
 
 #[test]
 fn replica_equivalence_immutable_state_and_each_observable_are_refused() {
-    let mut fixture = scalar_fixture(1, 0);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(1, 0, &mut fixture_constants);
     broadcast(&mut fixture);
     let site = fixture.calls[0].site;
     fixture.calls[0].effects.instance_state = FunctionInstanceState::ScalarInstance;
@@ -345,7 +352,8 @@ fn replica_equivalence_immutable_state_and_each_observable_are_refused() {
 
 #[test]
 fn replica_equivalence_keeps_same_occurrence_domain_proof_and_row_errors() {
-    let mut fixture = scalar_fixture(2, 0);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 0, &mut fixture_constants);
     broadcast(&mut fixture);
     fixture.calls[0].effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
     fixture.calls[0].effects.failure_behavior = FunctionFailureBehavior::ReturnsNull;
@@ -372,7 +380,8 @@ fn replica_equivalence_keeps_same_occurrence_domain_proof_and_row_errors() {
 
 #[test]
 fn replica_equivalence_single_copy_does_not_invent_a_replay_requirement() {
-    let mut fixture = scalar_fixture(2, 0);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 0, &mut fixture_constants);
     for call in &mut fixture.calls {
         call.effects.value_stability = FunctionVolatility::Volatile;
         call.effects.instance_state = FunctionInstanceState::ScalarInstance;
@@ -392,7 +401,8 @@ fn replica_equivalence_single_copy_does_not_invent_a_replay_requirement() {
 
 #[test]
 fn replica_equivalence_revalidates_fragment_roots_and_context_before_claims() {
-    let mut fixture = scalar_fixture(2, 0);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 0, &mut fixture_constants);
     broadcast(&mut fixture);
     let calls = fixture.checked().unwrap();
     let different = edit_fragment(&fixture.fragment, |parts| parts.id = FragmentId::new(7));
@@ -435,12 +445,13 @@ fn replica_equivalence_revalidates_fragment_roots_and_context_before_claims() {
 
 #[test]
 fn replica_equivalence_small_success_error_and_wide_quantum_preserve_all_control_causes() {
-    let mut small = scalar_fixture(2, 0);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut small = scalar_fixture(2, 0, &mut fixture_constants);
     broadcast(&mut small);
     prefixes(|control| check(&small, control), true, true);
     small.calls[1].effects.observable_effects.warnings = true;
     prefixes(|control| check(&small, control), false, true);
-    let mut wide = scalar_fixture(320, u32::MAX);
+    let mut wide = scalar_fixture(320, u32::MAX, &mut fixture_constants);
     broadcast(&mut wide);
     let good = ReplicaControl::default();
     check(&wide, &good).unwrap();
@@ -454,9 +465,11 @@ fn replica_equivalence_small_success_error_and_wide_quantum_preserve_all_control
     prefixes(|control| check(&wide, control), true, false);
 }
 
-fn broadcast_table_fixture() -> Fixture {
+fn broadcast_table_fixture(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(71));
-    let (input, _) = add_values(&mut builder, 1, true);
+    let (input, _) = add_values(&mut builder, 1, true, fixture_constants);
     // The input is an actual deterministic scalar occurrence. The table
     // argument reads its published value, rather than introducing a call
     // whose lifecycle state is inferred from legacy metadata.
@@ -609,7 +622,8 @@ fn broadcast_table_fixture() -> Fixture {
 
 #[test]
 fn replica_equivalence_canonical_table_lifecycle_accepts_broadcast_and_refuses_exact_unsafe_site() {
-    let mut fixture = broadcast_table_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = broadcast_table_fixture(&mut fixture_constants);
     let site = fixture.calls[1].site;
     assert!(matches!(site, PhysicalCallSite::Table { .. }));
     assert_eq!(
@@ -661,7 +675,8 @@ fn scalar_package_input(fixture: &Fixture) -> FragmentPackageInput {
 
 #[test]
 fn replica_equivalence_package_rejects_one_unsafe_shared_scalar_occurrence() {
-    let mut fixture = scalar_fixture(2, u32::MAX);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, u32::MAX, &mut fixture_constants);
     broadcast(&mut fixture);
     assert_eq!(
         fixture.uses.flow().uses()[&ExpressionUseId::new(0)].definition,
@@ -705,7 +720,8 @@ fn package_admission() -> crate::FragmentPackageAdmission {
 
 #[test]
 fn package_property_author_uses_complete_occurrence_facts_and_ignores_legacy_volatility() {
-    let mut fixture = scalar_fixture(2, 809);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 809, &mut fixture_constants);
     broadcast(&mut fixture);
     fixture.fragment = edit_fragment(&fixture.fragment, |parts| {
         let definitions = parts
@@ -741,7 +757,8 @@ fn package_property_author_uses_complete_occurrence_facts_and_ignores_legacy_vol
 
 #[test]
 fn package_property_projection_requires_each_explicit_ceiling_and_original_source_invoice() {
-    let fixture = scalar_fixture(2, 810);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 810, &mut fixture_constants);
     let input = scalar_package_input(&fixture);
     let base = package_admission();
     let facts = validate_fragment_output_properties_observed(

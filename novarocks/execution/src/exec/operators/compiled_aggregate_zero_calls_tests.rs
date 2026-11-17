@@ -18,21 +18,32 @@
 //! Genuine zero-call Physical aggregate; no invented LocalProgram or call token.
 use super::*;
 fn zero_program() -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let catalog = aggregate_catalog(&[("ds_hll_count_distinct", PureKernelAbi::AggregateV1)]);
     let fragment = FragmentId::new(1);
-    let mut builder = FragmentBuilder::new(fragment);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            fragment,
+            &fixture_sources,
+        );
     let source = builder.reserve_node_id().unwrap();
     values(
         &mut builder,
         source,
         &[int64(false)],
-        &[vec![LiteralValue::Int64(1)]],
+        &[vec![
+            crate::exec::operators::family_fixture::constant_sources::i64(1),
+        ]],
     );
     let (root, _) = add_aggregate(&mut builder, source, &[], &[], AggregateGrouping::Complete);
     let definition = finish(builder, root, FragmentSink::Result, 2);
     let output = definition.nodes()[&root].output.clone();
     assert!(output.columns.is_empty());
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([121; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([121; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,

@@ -35,8 +35,8 @@ use super::completed::{ExplainRenderBudget, ExplainRenderOutput, RenderDiagnosti
 
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
-    AnnotationSubject, Distribution, ExprId, ExprKind, Fragment, FragmentId, FragmentSink,
-    LiteralValue, NodeId, PhysicalNode, PhysicalPlan, PlanAnnotation, Relation, SortExpr, ValueId,
+    AnnotationSubject, Distribution, ExprId, ExprKind, Fragment, FragmentId, FragmentSink, NodeId,
+    PhysicalNode, PhysicalPlan, PlanAnnotation, Relation, SortExpr, ValueId,
 };
 
 use crate::compiler::SqlCompileError;
@@ -917,7 +917,6 @@ impl ExprText<'_> {
                 .context
                 .value_name(self.fragment.id(), *value)
                 .fmt(formatter),
-            ExprKind::Literal(value) => write!(formatter, "{}", literal_text(value)),
             ExprKind::Constant(reference) => match &self.context.diagnostic {
                 Some(diagnostic) => {
                     diagnostic.plan_constant(self.context.plan, *reference, &node.ty, formatter)
@@ -1115,54 +1114,6 @@ fn binary_operator_text(op: novarocks_physical_plan::BinaryOperator) -> &'static
         BinaryOperator::BitAnd => "&",
         BinaryOperator::BitOr => "|",
         BinaryOperator::BitXor => "^",
-    }
-}
-
-struct LiteralText<'a>(&'a LiteralValue);
-
-fn literal_text(value: &LiteralValue) -> LiteralText<'_> {
-    LiteralText(value)
-}
-
-impl std::fmt::Display for LiteralText<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            LiteralValue::Null => formatter.write_str("NULL"),
-            LiteralValue::Boolean(value) => write!(formatter, "{value}"),
-            LiteralValue::Int64(value) => write!(formatter, "{value}"),
-            LiteralValue::UInt64(value) => write!(formatter, "{value}"),
-            LiteralValue::Float64Bits(bits) => write!(formatter, "{}", f64::from_bits(*bits)),
-            LiteralValue::LargeInt(value) | LiteralValue::Decimal128(value) => {
-                write!(formatter, "{value}")
-            }
-            LiteralValue::Decimal256(bytes) => {
-                write!(
-                    formatter,
-                    "{}",
-                    arrow::datatypes::i256::from_be_bytes(*bytes)
-                )
-            }
-            LiteralValue::Utf8(value) => write!(formatter, "'{value}'"),
-            LiteralValue::Binary(value) => {
-                formatter.write_str("X'")?;
-                for byte in value.iter() {
-                    write!(formatter, "{byte:02x}")?;
-                }
-                formatter.write_str("'")
-            }
-            LiteralValue::Date32(value) => write!(formatter, "{value}"),
-            LiteralValue::Time64(value) | LiteralValue::Timestamp(value) => {
-                write!(formatter, "{value}")
-            }
-            LiteralValue::IntervalMonthDayNano {
-                months,
-                days,
-                nanoseconds,
-            } => write!(
-                formatter,
-                "interval(months={months}, days={days}, nanoseconds={nanoseconds})"
-            ),
-        }
     }
 }
 

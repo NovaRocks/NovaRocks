@@ -60,6 +60,8 @@ fn complete_fixture_with_types(
     key_type: FunctionValueType,
     payload: FunctionValueType,
 ) -> CompleteFixture {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     assert!(matches!(mode, CompleteMode::ZeroCalls) || payload == int64(true));
     let catalog = aggregate_catalog(&[
         ("count", PureKernelAbi::AggregateWindowV1),
@@ -80,7 +82,11 @@ fn complete_fixture_with_types(
         .collect::<Vec<_>>();
     let types = [key_type, payload.clone()];
     let fragment = FragmentId::new(1);
-    let mut builder = FragmentBuilder::new(fragment);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            fragment,
+            &fixture_sources,
+        );
     let source = builder.reserve_node_id().unwrap();
     let (columns, read) = crate::runtime::task::scan::compiled_fixture::add_typed_scan(
         &mut builder,
@@ -217,7 +223,10 @@ fn complete_fixture_with_types(
             }]),
         };
     }
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([122; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([122; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,

@@ -20,6 +20,7 @@
 // private diagnostic factory remains limited to the original failure probes;
 // it cannot fund successful computation.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::task::ExecutionFailure;
 use crate::runtime::task::ExecutionFailureCause;
@@ -87,6 +88,7 @@ fn invocation_program_with(
     field_name: &str,
     source_mode: SourceMode,
 ) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let id = FragmentId::new(271);
     let source = NodeId::new(u32::MAX);
     let input = NodeId::new(41);
@@ -107,7 +109,14 @@ fn invocation_program_with(
     let mut items = Vec::new();
     for (value, ty) in &columns {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -165,10 +174,10 @@ fn invocation_program_with(
         .add_expression(
             output,
             name_type.clone(),
-            ExprKind::Constant(novarocks_physical_plan::ConstantReference {
-                pool: novarocks_physical_plan::ConstantPoolId::new(0),
-                ordinal: name.ordinal(),
-            }),
+            ExprKind::Constant(crate::exec::expr::test_support::register_constant(
+                &mut source_pools,
+                &name,
+            )),
         )
         .unwrap();
     let allow_ref = novarocks_type_contract::SemanticParameterRef {
@@ -198,7 +207,10 @@ fn invocation_program_with(
             .add_expression(
                 output,
                 one_ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(1)),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::i64(&(one_ty.clone()), 1, options().constants),
+                ),
             )
             .unwrap();
         // Fractional Divide(1, 0) is a successful NULL by the frozen
@@ -265,7 +277,10 @@ fn invocation_program_with(
             .add_expression(
                 output,
                 source_type.clone(),
-                ExprKind::Literal(LiteralValue::Null),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(source_type.clone()), options().constants),
+                ),
             )
             .unwrap();
         if source_mode == SourceMode::NestedIf {
@@ -346,8 +361,15 @@ fn invocation_program_with(
         let zero = builder
             .add_expression(
                 output,
-                FunctionValueType::new(DataType::Int64, false),
-                ExprKind::Literal(LiteralValue::Int64(0)),
+                (FunctionValueType::new(DataType::Int64, false)).clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::i64(
+                        &(FunctionValueType::new(DataType::Int64, false)),
+                        0,
+                        options().constants,
+                    ),
+                ),
             )
             .unwrap();
         let divided_type = novarocks_type_contract::arithmetic_result_value_type_with_op(
@@ -408,8 +430,15 @@ fn invocation_program_with(
             let decisive = builder
                 .add_expression(
                     output,
-                    FunctionValueType::new(DataType::Boolean, false),
-                    ExprKind::Literal(LiteralValue::Boolean(matches!(guard, Guard::Or))),
+                    (FunctionValueType::new(DataType::Boolean, false)).clone(),
+                    checked_constants::kind(
+                        &mut source_pools,
+                        checked_constants::boolean(
+                            &(FunctionValueType::new(DataType::Boolean, false)),
+                            matches!(guard, Guard::Or),
+                            options().constants,
+                        ),
+                    ),
                 )
                 .unwrap();
             let kind = if matches!(guard, Guard::And) {
@@ -461,7 +490,10 @@ fn invocation_program_with(
                 .add_expression(
                     output,
                     otherwise_type.clone(),
-                    ExprKind::Literal(LiteralValue::Null),
+                    checked_constants::kind(
+                        &mut source_pools,
+                        checked_constants::null(&(otherwise_type.clone()), options().constants),
+                    ),
                 )
                 .unwrap();
             let (then_expr, else_expr, then_type, else_type) = if matches!(guard, Guard::IfThen) {
@@ -561,7 +593,14 @@ fn invocation_program_with(
     } else {
         SemanticParameters::try_new([]).unwrap()
     };
-    compile_checked_fragment_with_parameters(&functions, fragment, &authors, result, parameters)
+    compile_checked_fragment_with_parameters(
+        &functions,
+        fragment,
+        &authors,
+        result,
+        parameters,
+        source_pools,
+    )
 }
 fn input(program: &LocalProgram, flags: Vec<Option<bool>>, root_null: bool) -> RecordBatch {
     let rows = flags.len();

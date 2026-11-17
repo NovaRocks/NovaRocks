@@ -1258,11 +1258,6 @@ fn count_kind(
         ExprKind::Value(_) => {}
         ExprKind::LambdaParameter { .. } => refs = 1,
         ExprKind::Constant(_) => counts.constant_lookups = numeric_add(counts.constant_lookups, 1)?,
-        ExprKind::Literal(_) => {
-            return Err(shape(
-                "legacy literal cannot be encoded as a constant reference",
-            ));
-        }
         ExprKind::Unary { .. } | ExprKind::IsNull { .. } | ExprKind::IsTruthValue { .. } => {
             refs = 1
         }

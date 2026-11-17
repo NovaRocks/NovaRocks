@@ -38,10 +38,9 @@ use novarocks_physical_plan::{
     BinaryOperator, Distribution, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts,
     FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
     FrozenFragmentCalls, FrozenFragmentPruning, JoinDistribution, JoinKey, JoinKind, JoinSide,
-    LiteralValue, NestLoopJoinDistribution, NodeId, NodeKind, PhysicalExpressionRoots,
-    PhysicalProperties, PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
-    PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort, RowMultiplicity,
-    ValueId, ValueOrigin,
+    NestLoopJoinDistribution, NodeId, NodeKind, PhysicalExpressionRoots, PhysicalProperties,
+    PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
+    RequiredContracts, ResultField, ResultPort, RowMultiplicity, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationRegionId,
@@ -196,6 +195,7 @@ struct Fixture {
 
 fn values(
     builder: &mut FragmentBuilder,
+    constants: &mut novarocks_physical_plan::ConstantPools,
     node: NodeId,
     rows: &[[i64; 2]],
     canonical: bool,
@@ -225,11 +225,21 @@ fn values(
                         .add_expression(
                             node,
                             ty.clone(),
-                            ExprKind::Literal(if canonical {
-                                LiteralValue::Utf8(cell.to_string().into())
+                            if canonical {
+                                crate::test_constants::utf8(
+                                    constants,
+                                    &ty,
+                                    &cell.to_string(),
+                                    options().constants,
+                                )
                             } else {
-                                LiteralValue::Int64(*cell)
-                            }),
+                                crate::test_constants::i64(
+                                    constants,
+                                    &ty,
+                                    *cell,
+                                    options().constants,
+                                )
+                            },
                         )
                         .unwrap()
                 })
@@ -263,6 +273,7 @@ fn fixture(case: Case) -> Fixture {
 
 fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::ValidationErrors> {
     let fragment_id = FragmentId::new(41);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fragment_id);
     let kind = kind_of(case.family);
     let canonical = kind == JoinKind::LeftMark;
@@ -271,8 +282,20 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
     } else {
         int64()
     };
-    let left = values(&mut builder, LEFT, &[[1, 10], [2, 20], [3, 30]], canonical);
-    let right = values(&mut builder, RIGHT, &[[1, 15], [2, 5], [4, 40]], canonical);
+    let left = values(
+        &mut builder,
+        &mut constants,
+        LEFT,
+        &[[1, 10], [2, 20], [3, 30]],
+        canonical,
+    );
+    let right = values(
+        &mut builder,
+        &mut constants,
+        RIGHT,
+        &[[1, 15], [2, 5], [4, 40]],
+        canonical,
+    );
     let key = match case.family {
         Family::Hash { null_safe, .. } => Some(JoinKey {
             left: builder
@@ -410,7 +433,7 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     Ok(Fixture {
-        package: publish(fragment),
+        package: publish(fragment, constants),
         left,
         right,
         output,
@@ -438,7 +461,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             self.next += 3;
             let children = match &self.fragment.expressions().get(expr).unwrap().kind {
                 ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+                ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
                 other => panic!("fixture has no {other:?}"),
             };
             let arguments = children
@@ -496,7 +519,10 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
     PhysicalRootUses::try_new(fragment, flow, bindings, &Control).unwrap()
 }
 
-fn publish(fragment: Fragment) -> Arc<FragmentPackage> {
+fn publish(
+    fragment: Fragment,
+    constants: novarocks_physical_plan::ConstantPools,
+) -> Arc<FragmentPackage> {
     let uses = root_uses(&fragment);
     let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).unwrap();
     let root = &fragment.nodes()[&fragment.root()];
@@ -523,7 +549,7 @@ fn publish(fragment: Fragment) -> Arc<FragmentPackage> {
     Arc::new(
         FragmentPackage::try_new(
             FragmentPackageInput {
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 version: PlanVersionId::try_new([41; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,

@@ -150,15 +150,24 @@ fn collection_fragment_with_scalar(
     let empty = crate::NodeId::new(u32::MAX);
     let project = crate::NodeId::new(0);
     let unpivot = crate::NodeId::new(901);
-    builder
-        .add_values(empty, Box::from([Box::default()]), Box::default())
-        .unwrap();
     let integer = FunctionValueType::new(DataType::Int64, false);
+    let source_value = builder
+        .add_value(
+            integer.clone(),
+            crate::ValueOrigin::NodeOutput {
+                node: empty,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    builder
+        .add_values(empty, Box::default(), Box::from([source_value]))
+        .unwrap();
     let expression = builder
         .add_expression(
             project,
             integer.clone(),
-            crate::ExprKind::Literal(crate::LiteralValue::Int64(7)),
+            crate::ExprKind::Value(source_value),
         )
         .unwrap();
     let input = builder

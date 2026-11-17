@@ -57,11 +57,8 @@ impl FailureProjection for StaticExpressionError {
                 ResourceDimension::Bytes,
                 crate::MAX_STATIC_EXPRESSION_DYNAMIC_BYTES,
             ),
-            Self::DuplicateLambdaSlot => fact(FailureClass::Invariant, 6),
             Self::InvalidMetadataArity => fact(FailureClass::Invariant, 7),
-            Self::UnsupportedDecimalCastPolicy => fact(FailureClass::Invariant, 8),
             Self::ConstantTypeMismatch => fact(FailureClass::Invariant, 9),
-            Self::InvalidRegexpCountSource => fact(FailureClass::Invariant, 10),
         }
     }
 }
@@ -122,7 +119,7 @@ mod tests {
     use crate::{ImmutableExpressions, StaticStreamBranch};
     use novarocks_execution_contract::DataStreamPartitionType;
     use novarocks_types::SlotId;
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     #[test]
     fn actual_sink_shape_and_support_limit_keep_distinct_facts() {
@@ -170,19 +167,16 @@ mod tests {
 
     #[test]
     fn actual_expression_budget_refusal_does_not_retain_its_input() {
-        let zone: Arc<str> = Arc::from("x".repeat(crate::MAX_STATIC_EXPRESSION_DYNAMIC_BYTES + 1));
-        let owner = Arc::downgrade(&zone);
-        let error = ImmutableExpressions::try_new(
-            vec![crate::StaticExprNode::new(
-                crate::StaticExprKind::Literal(crate::StaticLiteral::Int64(0)),
-                arrow_schema::DataType::Int64,
-                None,
-            )],
-            false,
-            HashMap::new(),
-            Some(zone),
-        )
-        .unwrap_err();
+        let kind =
+            crate::test_support::utf8(&"x".repeat(crate::MAX_STATIC_EXPRESSION_DYNAMIC_BYTES + 1));
+        let crate::StaticExprKind::Constant(value) = &kind else {
+            unreachable!()
+        };
+        let owner = Arc::downgrade(value.pool().array());
+        let ty = value.value_type().clone();
+        let error =
+            crate::test_support::arena(vec![crate::StaticExprNode::new_value_typed(kind, ty)])
+                .unwrap_err();
         assert_eq!(error, StaticExpressionError::TooManyBytes);
         assert_eq!(error.failure_fact().class(), FailureClass::Resource);
         assert_eq!(
@@ -190,10 +184,6 @@ mod tests {
             ResourceDimension::Bytes
         );
         assert!(owner.upgrade().is_none());
-        assert_eq!(
-            ExpressionsCompileError::Expression(error).failure_fact(),
-            error.failure_fact()
-        );
     }
 
     #[test]
@@ -217,14 +207,8 @@ mod tests {
                     Err(self.0.clone())
                 }
             }
-            let error = ImmutableExpressions::try_new_for_compile(
-                vec![],
-                false,
-                HashMap::new(),
-                None,
-                &Stop(source.clone()),
-            )
-            .unwrap_err();
+            let error = ImmutableExpressions::try_new_for_compile(vec![], &Stop(source.clone()))
+                .unwrap_err();
             assert_eq!(error, ExpressionsCompileError::Control(source.clone()));
             assert_eq!(error.failure_fact(), source.failure_fact());
         }

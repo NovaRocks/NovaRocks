@@ -20,6 +20,7 @@ use super::*;
 use arrow::array::{Int32Array, StringArray};
 use std::collections::BTreeMap;
 fn grouped_program(two_phase: bool, nullable: bool) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
     let catalog = aggregate_catalog(&[("ds_hll_count_distinct", PureKernelAbi::AggregateV1)]);
     let key_type = novarocks_type_contract::FunctionValueType::new(DataType::Int32, nullable);
     let argument_types = [
@@ -29,7 +30,11 @@ fn grouped_program(two_phase: bool, nullable: bool) -> Arc<LocalProgram> {
     ];
     let bound = bind(&catalog, "ds_hll_count_distinct", &argument_types);
     let fragment = FragmentId::new(1);
-    let mut builder = FragmentBuilder::new(fragment);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            fragment,
+            &fixture_sources,
+        );
     let source = builder.reserve_node_id().unwrap();
     let input = values(
         &mut builder,
@@ -84,7 +89,10 @@ fn grouped_program(two_phase: bool, nullable: bool) -> Arc<LocalProgram> {
     };
     let definition = finish(builder, root, FragmentSink::Result, 2);
     let output = definition.nodes()[&root].output.clone();
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([117; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([117; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,

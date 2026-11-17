@@ -35,12 +35,11 @@ use novarocks_local_program::{
 };
 use novarocks_physical_plan::{
     BinaryOperator, Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning,
-    EdgeSource, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentId, FragmentPackage,
-    FragmentPackageAdmission, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning,
-    JoinDistribution, JoinKey, JoinKind, JoinSide, LiteralValue, NestLoopJoinDistribution, NodeId,
-    NodeKind, PhysicalExpressionRoots, PhysicalPlan, PhysicalRootUses, PlanBuilder, PlanLimits,
-    PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort, RowMultiplicity,
-    ValueId, ValueOrigin, extract_fragment_packages,
+    EdgeSource, ExprId, ExprKind, Fragment, FragmentId, FragmentPackage, FragmentPackageAdmission,
+    FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, JoinDistribution, JoinKey, JoinKind,
+    JoinSide, NestLoopJoinDistribution, NodeId, NodeKind, PhysicalExpressionRoots, PhysicalPlan,
+    PhysicalRootUses, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField,
+    ResultPort, RowMultiplicity, ValueId, ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
     ArithmeticOperator, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
@@ -315,7 +314,7 @@ pub(super) fn oracle(spec: Spec, left: &[Row], right: &[Row]) -> Rows {
 // ---------------------------------------------------------------------------
 // Physical authoring.
 
-fn literal_rows(rows: &[Row]) -> Vec<Vec<LiteralValue>> {
+fn literal_rows(rows: &[Row]) -> Vec<Vec<novarocks_functions::ConstantValue>> {
     rows.iter().map(|(k, v)| vec![cell(*k), cell(*v)]).collect()
 }
 
@@ -334,7 +333,7 @@ fn admission() -> FragmentPackageAdmission {
 
 /// Add the join of `left` and `right` and return its physical output.
 fn add_join(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     join: NodeId,
     left: (NodeId, [ValueId; 2]),
     right: (NodeId, [ValueId; 2]),
@@ -382,15 +381,11 @@ fn add_join(
     {
         // The existing unconditional NOT IN oracle now has an explicit
         // complete comparison, rather than a missing predicate default.
-        Some(
-            builder
-                .add_expression(
-                    join,
-                    FunctionValueType::new(DataType::Boolean, false),
-                    ExprKind::Literal(LiteralValue::Boolean(true)),
-                )
-                .unwrap(),
-        )
+        Some(builder.constant(
+            join,
+            FunctionValueType::new(DataType::Boolean, false),
+            crate::exec::operators::family_fixture::constant_sources::boolean(true),
+        ))
     } else {
         residual
     };
@@ -495,7 +490,7 @@ fn add_join(
 
 /// Imports `sources` of `edge` as an ExchangeSource at `node`.
 fn receive(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     edge: EdgeId,
     sources: &[ValueId],
@@ -614,7 +609,13 @@ pub(super) fn single_plan_with_dop(
     right: &[Row],
     pipeline_dop: u32,
 ) -> PhysicalPlan {
-    let mut builder = FragmentBuilder::new(SINGLE);
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            SINGLE,
+            &fixture_sources,
+        );
     let left_node = builder.reserve_node_id().unwrap();
     let left_values = values(
         &mut builder,
@@ -646,7 +647,10 @@ pub(super) fn single_plan_with_dop(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        version(),
+        &fixture_sources,
+    );
     plan.add_fragment(fragment).unwrap();
     let mut port = result_port(SINGLE, join, &output);
     if spec.kind == JoinKind::LeftMark {
@@ -661,8 +665,14 @@ pub(super) fn single_plan_with_dop(
 /// or Hash[k])` into two join instances, whose outputs are gathered into one
 /// result instance.
 fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) -> PhysicalPlan {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let source = |id: FragmentId, edge: EdgeId, rows: &[Row]| {
-        let mut builder = FragmentBuilder::new(id);
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                id,
+                &fixture_sources,
+            );
         let node = builder.reserve_node_id().unwrap();
         let columns = values(
             &mut builder,
@@ -683,7 +693,11 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
     let (left_fragment, left_columns) = source(LEFT_SOURCE, TO_PROBE, left);
     let (right_fragment, right_columns) = source(RIGHT_SOURCE, TO_BUILD, right);
 
-    let mut builder = FragmentBuilder::new(JOIN);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            JOIN,
+            &fixture_sources,
+        );
     let probe_node = builder.reserve_node_id().unwrap();
     let probe = receive(
         &mut builder,
@@ -731,7 +745,11 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
         )
         .unwrap();
 
-    let mut builder = FragmentBuilder::new(RESULT);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            RESULT,
+            &fixture_sources,
+        );
     let receiver = builder.reserve_node_id().unwrap();
     let gathered = receive(
         &mut builder,
@@ -750,7 +768,10 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        version(),
+        &fixture_sources,
+    );
     plan.add_fragment(left_fragment).unwrap();
     plan.add_fragment(right_fragment).unwrap();
     plan.add_fragment(join_fragment).unwrap();
@@ -814,7 +835,7 @@ fn freeze(fragment: &Fragment) -> PhysicalRootUses {
             };
             let children = match source {
                 ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+                ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
                 ExprKind::InList { expr, list, .. } => {
                     std::iter::once(*expr).chain(list.iter().copied()).collect()
                 }
@@ -1307,17 +1328,19 @@ pub(super) enum Overflow {
 }
 
 /// `value + 9223372036854775807`, which fails for every positive value.
-fn overflowing(builder: &mut FragmentBuilder, owner: NodeId, value: ValueId) -> ExprId {
+fn overflowing(
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+    owner: NodeId,
+    value: ValueId,
+) -> ExprId {
     let read = builder
         .add_expression(owner, int64(true), ExprKind::Value(value))
         .unwrap();
-    let max = builder
-        .add_expression(
-            owner,
-            int64(false),
-            ExprKind::Literal(LiteralValue::Int64(i64::MAX)),
-        )
-        .unwrap();
+    let max = builder.constant(
+        owner,
+        int64(false),
+        crate::exec::operators::family_fixture::constant_sources::i64(i64::MAX),
+    );
     let ty =
         arithmetic_result_value_type_with_op(&int64(true), &int64(false), ArithmeticOperator::Add)
             .unwrap();
@@ -1339,7 +1362,13 @@ fn overflowing(builder: &mut FragmentBuilder, owner: NodeId, value: ValueId) -> 
 
 /// An inner equi-join of the fixture rows whose `at` expression overflows.
 pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
-    let mut builder = FragmentBuilder::new(SINGLE);
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            SINGLE,
+            &fixture_sources,
+        );
     let left_node = builder.reserve_node_id().unwrap();
     let l = values(
         &mut builder,
@@ -1355,7 +1384,7 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
         &literal_rows(&RIGHT_ROWS),
     );
     let join = builder.reserve_node_id().unwrap();
-    let read = |builder: &mut FragmentBuilder, value| {
+    let read = |builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder, value| {
         builder
             .add_expression(join, int64(true), ExprKind::Value(value))
             .unwrap()
@@ -1420,7 +1449,11 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version()).with_semantic_parameters(
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        version(),
+        &fixture_sources,
+    )
+    .with_semantic_parameters(
         SemanticParameters::try_new([(
             ALLOW.id,
             SemanticParameterValue::AllowThrowException(true),
@@ -3141,7 +3174,13 @@ fn authored_naa_plan(
     eligibility: NaaEligibilityFixture,
     pipeline_dop: u32,
 ) -> PhysicalPlan {
-    let mut builder = FragmentBuilder::new(SINGLE);
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            SINGLE,
+            &fixture_sources,
+        );
     let left_node = builder.reserve_node_id().unwrap();
     let l = values(
         &mut builder,
@@ -3177,24 +3216,16 @@ fn authored_naa_plan(
     let late_overflow = matches!(eligibility, NaaEligibilityFixture::LateOverflow);
     let eligibility = match eligibility {
         NaaEligibilityFixture::None => None,
-        NaaEligibilityFixture::True => Some(
-            builder
-                .add_expression(
-                    join,
-                    FunctionValueType::new(DataType::Boolean, false),
-                    ExprKind::Literal(LiteralValue::Boolean(true)),
-                )
-                .unwrap(),
-        ),
-        NaaEligibilityFixture::Unknown => Some(
-            builder
-                .add_expression(
-                    join,
-                    FunctionValueType::new(DataType::Boolean, true),
-                    ExprKind::Literal(LiteralValue::Null),
-                )
-                .unwrap(),
-        ),
+        NaaEligibilityFixture::True => Some(builder.constant(
+            join,
+            FunctionValueType::new(DataType::Boolean, false),
+            crate::exec::operators::family_fixture::constant_sources::boolean(true),
+        )),
+        NaaEligibilityFixture::Unknown => Some(builder.constant(
+            join,
+            FunctionValueType::new(DataType::Boolean, true),
+            crate::exec::operators::family_fixture::constant_sources::null(),
+        )),
         NaaEligibilityFixture::LateOverflow => {
             let build = overflowing(&mut builder, join, r[0]);
             let probe = builder
@@ -3247,7 +3278,10 @@ fn authored_naa_plan(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        version(),
+        &fixture_sources,
+    );
     if late_overflow {
         plan = plan.with_semantic_parameters(
             SemanticParameters::try_new([(
@@ -3507,14 +3541,23 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
         ),
         (late, vec![Some(true), None, None, None, None, Some(true)]),
     ] {
+        let fixture_sources =
+            crate::exec::operators::family_fixture::constant_sources::Sources::new();
         // The SQL projection has already normalized each JSON once. The
         // hash owner consumes ordinary Utf8 canonical keys, not JSON text.
         let json = FunctionValueType::new(DataType::Utf8, true);
         let boolean = FunctionValueType::new(DataType::Boolean, true);
-        let mut builder = FragmentBuilder::new(SINGLE);
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                SINGLE,
+                &fixture_sources,
+            );
         let left = builder.reserve_node_id().unwrap();
         let literal = |value: Option<&str>| {
-            value.map_or(LiteralValue::Null, |text| LiteralValue::Utf8(text.into()))
+            value.map_or(
+                crate::exec::operators::family_fixture::constant_sources::null(),
+                |text| crate::exec::operators::family_fixture::constant_sources::utf8(text.into()),
+            )
         };
         let l = values(
             &mut builder,
@@ -3577,7 +3620,10 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
-        let mut plan = PlanBuilder::new(version());
+        let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+            version(),
+            &fixture_sources,
+        );
         plan.add_fragment(fragment).unwrap();
         plan.set_result_port(ResultPort {
             scalar_schema: None,

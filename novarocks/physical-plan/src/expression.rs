@@ -274,33 +274,6 @@ impl BinaryOperator {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum LiteralValue {
-    Null,
-    Boolean(bool),
-    Int64(i64),
-    UInt64(u64),
-    Float64Bits(u64),
-    LargeInt(i128),
-    Decimal128(i128),
-    /// A 256-bit decimal's unscaled value, big-endian two's complement.
-    ///
-    /// There is no 256-bit integer in this crate's vocabulary, and the bytes
-    /// are what every reader of the value wants anyway.
-    Decimal256([u8; 32]),
-    Utf8(Box<str>),
-    Binary(Box<[u8]>),
-    Date32(i32),
-    Time64(i64),
-    Timestamp(i64),
-    /// Independent calendar months, calendar days and elapsed nanoseconds.
-    IntervalMonthDayNano {
-        months: i32,
-        days: i32,
-        nanoseconds: i64,
-    },
-}
-
 pub use novarocks_type_contract::{WindowFrameExclusion, WindowFrameUnits};
 pub type WindowBound = novarocks_type_contract::WindowBound<ExprId>;
 pub type WindowFrame = novarocks_type_contract::WindowFrame<ExprId>;
@@ -312,7 +285,6 @@ pub enum ExprKind {
         lambda: ExprId,
         ordinal: u32,
     },
-    Literal(LiteralValue),
     /// Exact address in the sole immutable plan/package checked pool table.
     Constant(crate::ConstantReference),
     Unary {
@@ -439,7 +411,6 @@ impl ExprKind {
             ExprKind::FunctionCall { .. } => None,
             ExprKind::Value(_)
             | ExprKind::LambdaParameter { .. }
-            | ExprKind::Literal(_)
             | ExprKind::Constant(_)
             | ExprKind::Unary { .. }
             | ExprKind::Binary { .. }
@@ -512,10 +483,7 @@ impl ExprKind {
         mut visit: impl FnMut(ExprId) -> Result<(), E>,
     ) -> Result<(), E> {
         match self {
-            Self::Value(_)
-            | Self::LambdaParameter { .. }
-            | Self::Literal(_)
-            | Self::Constant(_) => {}
+            Self::Value(_) | Self::LambdaParameter { .. } | Self::Constant(_) => {}
             Self::Unary { expr, .. }
             | Self::Cast { expr, .. }
             | Self::IsNull { expr, .. }
@@ -807,8 +775,7 @@ fn check_definition_properties(
                     || function.require_legacy_metadata()?.volatility
                         == FunctionVolatility::Immutable
             }
-            ExprKind::Literal(_)
-            | ExprKind::Constant(_)
+            ExprKind::Constant(_)
             | ExprKind::LambdaParameter { .. }
             | ExprKind::Unary { .. }
             | ExprKind::Binary { .. }

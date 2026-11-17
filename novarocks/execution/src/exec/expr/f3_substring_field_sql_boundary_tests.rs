@@ -95,7 +95,7 @@ fn c12_p3_substring_index_actual_sql_keeps_ordered_three_child_types_for_compile
                 );
                 let child = fragment.expressions().get(*arg).unwrap();
                 assert_eq!(&child.ty, selected);
-                assert!(!matches!(child.kind, ExprKind::Literal(_)));
+                assert!(!matches!(child.kind, ExprKind::Constant(_)));
             }
             assert_eq!(node.ty, FunctionValueType::new(DataType::Utf8, true));
             found += 1;
@@ -409,8 +409,8 @@ fn slot_program(
 ) -> Arc<LocalProgram> {
     use super::compiled_program::guarded_tests as host;
     use novarocks_physical_plan::{
-        FragmentBuilder, FragmentId, FragmentSink, LiteralValue, NodeId, PipelineDopDomain,
-        ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
+        FragmentBuilder, FragmentId, FragmentSink, NodeId, PipelineDopDomain, ResultField,
+        ResultPort, ValueDef, ValueId, ValueOrigin,
     };
     use novarocks_type_contract::{ControlShape, SemanticParameters};
     let functions = installed_builtin_owner_catalogue();
@@ -419,6 +419,7 @@ fn slot_program(
     let input = NodeId::new(1);
     let source = NodeId::new(2);
     let mut builder = FragmentBuilder::new(fragment_id);
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     builder
         .add_values(source, Box::from([Box::default()]), Box::default())
         .unwrap();
@@ -427,8 +428,17 @@ fn slot_program(
     let mut args = vec![];
     for (i, ty) in types.iter().enumerate() {
         let value = ValueId::new(i as u32 + 10);
+        let null = novarocks_functions::ConstantValue::null(
+            Arc::new(ty.try_to_field("input").unwrap()),
+            ty.clone(),
+            super::test_support::constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            &HarnessControl,
+        )
+        .unwrap();
+        let reference = super::test_support::register_constant(&mut source_pools, &null);
         let literal = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(input, ty.clone(), ExprKind::Constant(reference))
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -479,10 +489,10 @@ fn slot_program(
                 .add_expression(
                     output,
                     ty.clone(),
-                    ExprKind::Constant(novarocks_physical_plan::ConstantReference {
-                        pool: novarocks_physical_plan::ConstantPoolId::new(0),
-                        ordinal: value.ordinal(),
-                    }),
+                    ExprKind::Constant(super::test_support::register_constant(
+                        &mut source_pools,
+                        &value,
+                    )),
                 )
                 .unwrap(),
         );
@@ -553,6 +563,7 @@ fn slot_program(
         &authors,
         result,
         SemanticParameters::try_new([]).unwrap(),
+        source_pools,
     )
 }
 

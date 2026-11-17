@@ -19,8 +19,8 @@ use super::*;
 #[path = "owned_tests.rs"]
 mod owned_tests;
 use crate::{
-    Distribution, ExprId, ExprKind, ExprNode, LiteralValue, NodeKind, OutputPort,
-    PhysicalProperties, RowMultiplicity, ValidationErrorCategory, ValueOrigin, ValueType,
+    Distribution, ExprId, ExprKind, ExprNode, NodeKind, OutputPort, PhysicalProperties,
+    RowMultiplicity, ValidationErrorCategory, ValueOrigin, ValueType,
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::CompileControlError;
@@ -53,7 +53,10 @@ fn properties() -> PhysicalProperties {
         ordering: Box::default(),
     }
 }
-fn input(count: usize) -> FragmentStructureInput {
+fn input(
+    count: usize,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> FragmentStructureInput {
     let ids = (0..count)
         .map(|i| if i + 1 == count { u32::MAX } else { i as u32 })
         .collect::<Vec<_>>();
@@ -63,7 +66,7 @@ fn input(count: usize) -> FragmentStructureInput {
             owner: NodeId::new(0),
             lambda_scope: None,
             ty: ValueType::new(DataType::Int64, false),
-            kind: ExprKind::Literal(LiteralValue::Int64(i64::from(*id))),
+            kind: fixture_constants.i64(i64::from(*id), &ValueType::new(DataType::Int64, false)),
         }),
         &PlanLimits::FROZEN,
         &Control::default(),
@@ -139,7 +142,8 @@ fn construct(
 }
 #[test]
 fn receiving_structure_preserves_zero_max_namespaces_and_original_ordered_fields() {
-    let source = input(2);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let source = input(2, &mut fixture_constants);
     let expected = source.clone();
     let result = construct(source, PlanLimits::FROZEN, &Control::default()).unwrap();
     assert_eq!(result.id(), FragmentId::new(u32::MAX));
@@ -163,7 +167,7 @@ fn receiving_structure_preserves_zero_max_namespaces_and_original_ordered_fields
     // frozen effects, roots, property proof or a final Package certificate.
     assert!(result.call_requests().entries().is_empty());
 
-    let mut source = input(2);
+    let mut source = input(2, &mut fixture_constants);
     let mut definition = source
         .expressions
         .get(ExprId::new(u32::MAX))
@@ -189,6 +193,7 @@ fn receiving_structure_preserves_zero_max_namespaces_and_original_ordered_fields
 }
 #[test]
 fn receiving_structure_rejects_key_drift_and_keeps_original_count_graph_and_dop_gates() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let exact = PlanLimits {
         fragment_nodes: 2,
         fragment_values: 2,
@@ -196,7 +201,7 @@ fn receiving_structure_rejects_key_drift_and_keeps_original_count_graph_and_dop_
         plan_runtime_filters: 2,
         ..PlanLimits::FROZEN
     };
-    construct(input(2), exact, &Control::default()).unwrap();
+    construct(input(2, &mut fixture_constants), exact, &Control::default()).unwrap();
     for axis in 0..4 {
         let mut l = exact;
         match axis {
@@ -207,7 +212,7 @@ fn receiving_structure_rejects_key_drift_and_keeps_original_count_graph_and_dop_
             _ => unreachable!(),
         }
         let Err(FragmentStructureError::Structure(errors)) =
-            construct(input(2), l, &Control::default())
+            construct(input(2, &mut fixture_constants), l, &Control::default())
         else {
             panic!("axis {axis}")
         };
@@ -219,7 +224,7 @@ fn receiving_structure_rejects_key_drift_and_keeps_original_count_graph_and_dop_
         );
     }
     for fault in 0..5 {
-        let mut s = input(2);
+        let mut s = input(2, &mut fixture_constants);
         match fault {
             0 => s.values.get_mut(&ValueId::new(0)).unwrap().id = ValueId::new(7),
             1 => s.nodes.get_mut(&NodeId::new(0)).unwrap().id = NodeId::new(7),
@@ -276,7 +281,8 @@ fn prefixes(source: &FragmentStructureInput, success: bool, wide: bool) {
 }
 #[test]
 fn receiving_structure_observes_each_small_success_and_ordinary_failure_prefix() {
-    let s = input(2);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let s = input(2, &mut fixture_constants);
     prefixes(&s, true, false);
     let mut malformed = s.clone();
     malformed.root = NodeId::new(7);
@@ -287,5 +293,6 @@ fn receiving_structure_observes_each_small_success_and_ordinary_failure_prefix()
 }
 #[test]
 fn receiving_structure_wide_quantum_comes_from_actual_sparse_definition_checks() {
-    prefixes(&input(320), true, true);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    prefixes(&input(320, &mut fixture_constants), true, true);
 }

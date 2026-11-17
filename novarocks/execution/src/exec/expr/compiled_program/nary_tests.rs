@@ -18,6 +18,7 @@
 // These full checked compiler fixtures exercise intrinsic Boolean roots only.
 // The unused real RAND subset does not attest Server catalogue coverage.
 use super::CompiledExpressionInstance;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::{array::BooleanArray, datatypes::DataType, record_batch::RecordBatch};
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
@@ -37,9 +38,9 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
     FragmentPackage, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPhysicalCall, LiteralValue, NodeId, PhysicalCallSite,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts,
-    ResultField, ResultPort, RootUseBindingError, ValidationErrors, ValueDef, ValueId, ValueOrigin,
+    FrozenFragmentPruning, FrozenPhysicalCall, NodeId, PhysicalCallSite, PhysicalExpressionRoots,
+    PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
+    RootUseBindingError, ValidationErrors, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
@@ -163,12 +164,14 @@ enum Use {
 }
 struct Fixture {
     fragment: Fragment,
+    constants: novarocks_physical_plan::ConstantPools,
 }
 fn source_columns(
     builder: &mut FragmentBuilder,
     source: NodeId,
     input: NodeId,
     root: NodeId,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> Vec<ExprId> {
     // Leave room for the builder's generated Project result identities.
     let values = [
@@ -184,7 +187,14 @@ fn source_columns(
     for &value in &values {
         let ty = FunctionValueType::new(DataType::Boolean, true);
         let definition = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -209,13 +219,14 @@ fn source_columns(
     operands
 }
 fn fixture(op: Connective, mode: Use, width: usize) -> Result<Fixture, ValidationErrors> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let fragment_id = FragmentId::new(91);
     let source = NodeId::new(u32::MAX);
     let input = NodeId::new(41);
     let root = NodeId::new(0);
     let boolean = FunctionValueType::new(DataType::Boolean, true);
     let mut builder = FragmentBuilder::new(fragment_id);
-    let operands = source_columns(&mut builder, source, input, root);
+    let operands = source_columns(&mut builder, source, input, root, &mut source_pools);
     // Neither ValueId nor definition order establishes the argument order.
     let order = [operands[2], operands[0], operands[1]];
     let args = (0..width)
@@ -262,7 +273,10 @@ fn fixture(op: Connective, mode: Use, width: usize) -> Result<Fixture, Validatio
         },
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
-    Ok(Fixture { fragment })
+    Ok(Fixture {
+        fragment,
+        constants: source_pools,
+    })
 }
 fn uses(fixture: &Fixture) -> Result<PhysicalRootUses, RootUseBindingError> {
     struct FlowAuthor {
@@ -288,7 +302,7 @@ fn uses(fixture: &Fixture) -> Result<PhysicalRootUses, RootUseBindingError> {
                     assert_eq!(function.function_id.as_str(), "builtin.scalar/if/v1");
                     (ControlShape::If, args.as_ref())
                 }
-                ExprKind::Value(_) | ExprKind::Literal(_) => (ControlShape::Eager, &[][..]),
+                ExprKind::Value(_) | ExprKind::Constant(_) => (ControlShape::Eager, &[][..]),
                 other => panic!("fixture lacks control projection for {other:?}"),
             };
             let mut arguments = vec![];
@@ -399,7 +413,7 @@ fn package_with_calls(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([91; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants: fixture.constants,
                 fragment: fixture.fragment,
                 expression_uses,
                 calls,
@@ -773,6 +787,7 @@ fn assert_all_nary_evaluation_callbacks(
 }
 
 fn dual_demand_program() -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = functions_with_if(true);
     let boolean = FunctionValueType::new(DataType::Boolean, true);
     let arguments = [
@@ -820,7 +835,7 @@ fn dual_demand_program() -> Arc<LocalProgram> {
     let input = NodeId::new(41);
     let root_node = NodeId::new(0);
     let mut builder = FragmentBuilder::new(FragmentId::new(92));
-    let operands = source_columns(&mut builder, source, input, root_node);
+    let operands = source_columns(&mut builder, source, input, root_node, &mut source_pools);
     let shared = builder
         .add_expression(
             root_node,
@@ -833,8 +848,15 @@ fn dual_demand_program() -> Arc<LocalProgram> {
     let yes = builder
         .add_expression(
             root_node,
-            FunctionValueType::new(DataType::Boolean, false),
-            ExprKind::Literal(LiteralValue::Boolean(true)),
+            (FunctionValueType::new(DataType::Boolean, false)).clone(),
+            checked_constants::kind(
+                &mut source_pools,
+                checked_constants::boolean(
+                    &(FunctionValueType::new(DataType::Boolean, false)),
+                    true,
+                    options().constants,
+                ),
+            ),
         )
         .unwrap();
     // The same physical definition is required first as an IF condition
@@ -867,6 +889,7 @@ fn dual_demand_program() -> Arc<LocalProgram> {
         )
         .unwrap();
     let fixture = Fixture {
+        constants: source_pools,
         fragment: builder
             .finish_definition(
                 root_node,

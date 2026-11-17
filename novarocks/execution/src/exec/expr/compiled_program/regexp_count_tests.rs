@@ -16,6 +16,7 @@
 // under the License.
 //! Actual local compiler uses the same native-v1 source author, with no CV inference.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{Array, ArrayRef, StringArray};
 use novarocks_type_contract::RegexpCountPatternSource as Source;
 fn functions() -> PureEngineFunctionCatalog {
@@ -50,6 +51,7 @@ fn functions() -> PureEngineFunctionCatalog {
         .unwrap()
 }
 fn program(constant: Option<&str>) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = functions();
     let fragment_id = FragmentId::new(194);
     let source = NodeId::new(0);
@@ -64,7 +66,14 @@ fn program(constant: Option<&str>) -> Arc<LocalProgram> {
     let values = [ValueId::new(91), ValueId::new(7)];
     for value in values {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -101,11 +110,11 @@ fn program(constant: Option<&str>) -> Arc<LocalProgram> {
         .add_expression(
             output,
             ty.clone(),
-            if cv.is_some() {
-                ExprKind::Constant(novarocks_physical_plan::ConstantReference {
-                    pool: novarocks_physical_plan::ConstantPoolId::new(0),
-                    ordinal: 0,
-                })
+            if let Some(value) = &cv {
+                ExprKind::Constant(crate::exec::expr::test_support::register_constant(
+                    &mut source_pools,
+                    value,
+                ))
             } else {
                 ExprKind::Value(values[1])
             },
@@ -171,7 +180,7 @@ fn program(constant: Option<&str>) -> Arc<LocalProgram> {
             ty: result_ty,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
 }
 #[test]
 fn regexp_count_actual_compiler_emitted_constant_and_dynamic_bytes_keep_original_error_policy() {
@@ -249,12 +258,7 @@ fn regexp_count_shared_native_projection_distinguishes_constant_from_value_witho
             ordinal: 2
         })
     );
-    assert_eq!(
-        novarocks_physical_plan::native_v1_emitted_constant_reference(&ExprKind::Literal(
-            LiteralValue::Utf8("[".into())
-        )),
-        None
-    );
+
     assert_eq!(
         novarocks_physical_plan::native_v1_emitted_constant_reference(&ExprKind::Value(
             ValueId::new(91)

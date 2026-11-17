@@ -26,9 +26,7 @@ use novarocks_functions::{
     FunctionSpecializationFailure, KernelFailure, PureCallPreparation, PureCallSpecialization,
     PureKernelAbi, ScopedExpressionEffects,
 };
-use novarocks_physical_plan::{
-    ConstantPoolId, ConstantReference, LiteralValue, NodeId, PlanLimits, ValueId,
-};
+use novarocks_physical_plan::{ConstantPoolId, ConstantReference, NodeId, PlanLimits, ValueId};
 use novarocks_type_contract::{
     CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, FunctionArgumentEvaluation, FunctionFailureBehavior,
@@ -874,13 +872,15 @@ fn scalar_requests_every_small_source_and_installed_owner_callback_preserves_ori
             }
         }
     }
-    let null = node(
-        0,
-        ty(DataType::Utf8, false),
-        ExprKind::Literal(LiteralValue::Null),
+    let mut nullable_sources = pools.clone();
+    let nullable = ty(DataType::Utf8, true);
+    let kind = crate::test_constants::insert(
+        &mut nullable_sources,
+        crate::test_constants::null()(&nullable),
     );
+    let null = node(0, ty(DataType::Utf8, false), kind);
     let bad_arena = arena(vec![null]);
-    prefixes(&source, &bad_arena, &pools, false, false);
+    prefixes(&source, &bad_arena, &nullable_sources, false, false);
 }
 
 #[test]

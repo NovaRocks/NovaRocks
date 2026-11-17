@@ -128,7 +128,8 @@ fn prefixes(
 
 #[test]
 fn frozen_property_formulas_use_complete_occurrences_despite_legacy_volatile_and_keep_row_errors() {
-    let mut fixture = scalar_fixture(2, u32::MAX);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, u32::MAX, &mut fixture_constants);
     broadcast(&mut fixture);
     legacy_volatile(&mut fixture);
     assert!(validate_fragment_definition(&fixture.fragment).is_err());
@@ -166,9 +167,10 @@ fn frozen_property_formulas_use_complete_occurrences_despite_legacy_volatile_and
 
 #[test]
 fn frozen_property_formulas_reject_each_sparse_unsafe_use_with_exact_global_replica_site() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for at in 0..2 {
         for mode in 0..4 {
-            let mut fixture = scalar_fixture(2, 23);
+            let mut fixture = scalar_fixture(2, 23, &mut fixture_constants);
             broadcast(&mut fixture);
             match mode {
                 0 => {
@@ -190,7 +192,8 @@ fn frozen_property_formulas_reject_each_sparse_unsafe_use_with_exact_global_repl
 
 #[test]
 fn frozen_property_formulas_single_copy_does_not_impose_replication_or_drop_effects() {
-    let mut fixture = scalar_fixture(2, 29);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 29, &mut fixture_constants);
     fixture.calls[0].effects.instance_state = FunctionInstanceState::ScalarInstance;
     fixture.calls[0].effects.observable_effects.rng_sampling = true;
     fixture.calls[1].effects.value_stability = FunctionVolatility::Volatile;
@@ -209,9 +212,11 @@ fn frozen_property_formulas_single_copy_does_not_impose_replication_or_drop_effe
     );
 }
 
-fn table_fixture() -> Fixture {
+fn table_fixture(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(37));
-    let (input, _) = add_values(&mut builder, 1, false);
+    let (input, _) = add_values(&mut builder, 1, false, fixture_constants);
     let input_value = ValueId::new(0);
     assert!(matches!(builder.value(input_value).unwrap().origin,
         ValueOrigin::NodeOutput { node, output_ordinal: 0 } if node == input));
@@ -307,7 +312,8 @@ fn table_fixture() -> Fixture {
 
 #[test]
 fn frozen_property_formulas_canonical_relational_lifecycle_is_not_scalar_state() {
-    let mut fixture = table_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = table_fixture(&mut fixture_constants);
     legacy_volatile(&mut fixture);
     assert!(validate_fragment_definition(&fixture.fragment).is_err());
     assert_eq!(
@@ -322,7 +328,7 @@ fn frozen_property_formulas_canonical_relational_lifecycle_is_not_scalar_state()
         matches!(run(&fixture, &calls, SOURCE, &FormulaControl::default()),
         Err(FragmentPropertyError::Calls(FrozenCallError::ReplicaEquivalence(site))) if site == fixture.calls[0].site)
     );
-    let relational = special_fixture();
+    let relational = special_fixture(&mut fixture_constants);
     let calls = relational.checked().unwrap();
     run(&relational, &calls, SOURCE, &FormulaControl::default()).unwrap();
     assert!(
@@ -341,8 +347,9 @@ fn frozen_property_formulas_canonical_relational_lifecycle_is_not_scalar_state()
 
 #[test]
 fn frozen_property_formulas_keep_required_inputs_ordering_and_geometry_rejections() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for bad in 0..3 {
-        let mut fixture = table_fixture();
+        let mut fixture = table_fixture(&mut fixture_constants);
         edit(&mut fixture, |parts| {
             let root = parts.nodes.get_mut(&parts.root).unwrap();
             match bad {
@@ -367,7 +374,7 @@ fn frozen_property_formulas_keep_required_inputs_ordering_and_geometry_rejection
             "malformed shape {bad}"
         );
     }
-    let mut fixture = scalar_fixture(1, 43);
+    let mut fixture = scalar_fixture(1, 43, &mut fixture_constants);
     broadcast(&mut fixture);
     edit(&mut fixture, |parts| {
         let value = parts.nodes[&parts.root].output.columns[0];
@@ -391,7 +398,8 @@ fn frozen_property_formulas_keep_required_inputs_ordering_and_geometry_rejection
 
 #[test]
 fn frozen_property_formulas_keep_closed_values_scope_separate_from_legacy_volatility() {
-    let mut fixture = scalar_fixture(1, 47);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(1, 47, &mut fixture_constants);
     broadcast(&mut fixture);
     legacy_volatile(&mut fixture);
     let root_expression = fixture.uses.flow().uses()[&ExpressionUseId::new(0)].definition;
@@ -446,7 +454,8 @@ fn frozen_property_formulas_keep_closed_values_scope_separate_from_legacy_volati
 
 #[test]
 fn frozen_property_formulas_success_ordinary_and_exact_call_error_observe_all_original_tails() {
-    let mut fixture = scalar_fixture(2, 53);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 53, &mut fixture_constants);
     broadcast(&mut fixture);
     let calls = fixture.checked().unwrap();
     prefixes(|control| run(&fixture, &calls, SOURCE, control), true, true);
@@ -470,7 +479,7 @@ fn frozen_property_formulas_success_ordinary_and_exact_call_error_observe_all_or
         false,
         true,
     );
-    let mut unsafe_fixture = scalar_fixture(2, 59);
+    let mut unsafe_fixture = scalar_fixture(2, 59, &mut fixture_constants);
     broadcast(&mut unsafe_fixture);
     unsafe_fixture.calls[1].effects.observable_effects.warnings = true;
     let unsafe_calls = unsafe_fixture.checked().unwrap();
@@ -484,7 +493,8 @@ fn frozen_property_formulas_success_ordinary_and_exact_call_error_observe_all_or
 #[test]
 fn frozen_property_formulas_real_wide_occurrences_keep_actual_quantum_and_sampled_primary_prefixes()
 {
-    let mut fixture = scalar_fixture(320, 61);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(320, 61, &mut fixture_constants);
     broadcast(&mut fixture);
     legacy_volatile(&mut fixture);
     let calls = fixture.checked().unwrap();

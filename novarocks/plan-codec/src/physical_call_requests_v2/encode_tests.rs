@@ -208,14 +208,14 @@ fn fixture_with_parameters(reference: p::ConstantReference, parameter_count: usi
             owner,
             ty: int(),
             lambda_scope: None,
-            kind: p::ExprKind::Literal(p::LiteralValue::Int64(5)),
+            kind: crate::test_constants::insert(&mut pools, crate::test_constants::i64(5)(&int())),
         },
         p::ExprNode {
             id: body,
             owner,
             ty: int(),
             lambda_scope: Some(lambda),
-            kind: p::ExprKind::Literal(p::LiteralValue::Int64(9)),
+            kind: crate::test_constants::insert(&mut pools, crate::test_constants::i64(9)(&int())),
         },
         p::ExprNode {
             id: lambda,

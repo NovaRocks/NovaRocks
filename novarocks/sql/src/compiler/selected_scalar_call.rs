@@ -328,7 +328,6 @@ impl novarocks_type_contract::ExpressionDefinitionMembership<u32> for SingleCall
 /// The shared author below never examines values or infers source from equality.
 pub(crate) struct EmittedScalarArgumentSource<'a> {
     pub value_type: &'a FunctionValueType,
-    pub unchecked_literal: bool,
     pub checked_constant_reference: bool,
     pub immediate_function: Option<&'a novarocks_type_contract::FunctionId>,
 }
@@ -354,11 +353,6 @@ pub(crate) fn scalar_argument_source(
         return Ok(Source::Selected);
     };
     let source = source.ok_or("source-sensitive scalar argument is absent")?;
-    if source.unchecked_literal {
-        return Err(
-            "source-sensitive scalar requires checked native-v1 source; unchecked Literal is not emitted",
-        );
-    }
     match function.as_str() {
         "builtin.scalar/regexp_count/v1" => Ok(Source::RegexpCountPattern(
             novarocks_type_contract::RegexpCountPatternSource::from_native_v1_emitted_shape(
@@ -590,7 +584,6 @@ pub(crate) fn freeze_fold_call(
         args.len(),
         source_ordinal.map(|ordinal| EmittedScalarArgumentSource {
             value_type: &args[ordinal].value_type,
-            unchecked_literal: false,
             checked_constant_reference: capture_constants,
             immediate_function: None,
         }),
@@ -931,7 +924,6 @@ mod tests {
             novarocks_type_contract::FunctionId::try_new("builtin.scalar/aes_encrypt/v1").unwrap();
         let fact = |constant, immediate| EmittedScalarArgumentSource {
             value_type: &utf8,
-            unchecked_literal: false,
             checked_constant_reference: constant,
             immediate_function: immediate,
         };

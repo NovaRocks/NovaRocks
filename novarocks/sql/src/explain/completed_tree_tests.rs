@@ -16,18 +16,17 @@
 // under the License.
 
 use super::*;
+use crate::test_constants::{self as checked, FragmentBuilder};
 use novarocks_physical_plan::{
-    FragmentBuilder, OutputPort, PipelineDopDomain, PlanBuilder, PlanVersionId, ResultField,
-    ResultPort, ResultValueDomain, UnaryOperator, ValueOrigin, ValueType,
+    OutputPort, PipelineDopDomain, PlanBuilder, PlanVersionId, ResultField, ResultPort,
+    ResultValueDomain, UnaryOperator, ValueOrigin, ValueType,
 };
 
 fn base() -> (FragmentBuilder, NodeId, ValueId, ValueType) {
     let mut builder = FragmentBuilder::new(FragmentId::new(0));
     let node = builder.reserve_node_id().unwrap();
     let ty = ValueType::new(DataType::Int64, false);
-    let expression = builder
-        .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(1)))
-        .unwrap();
+    let expression = builder.constant(node, ty.clone(), checked::i64(1));
     let value = builder
         .add_value(
             ty.clone(),
@@ -66,8 +65,10 @@ fn finish(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
+    let (fragment, constants) = fragment.into_parts();
     let fragment_id = fragment.id();
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([1; 16]).unwrap());
+    let mut plan =
+        PlanBuilder::new(PlanVersionId::try_new([1; 16]).unwrap()).with_constant_pools(constants);
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
@@ -88,7 +89,8 @@ fn finish(
     for annotation in annotations {
         plan.add_annotation(annotation);
     }
-    plan.finish().unwrap()
+    plan.finish_observed(&crate::compiler::SqlCompileControl::unbounded())
+        .unwrap()
 }
 
 fn project(
@@ -145,11 +147,7 @@ fn normal_bytes_keep_alias_suppression_literals_and_default_value_names() {
         (None, "0:PROJECT [1 AS v1]"),
     ] {
         let plan = project(
-            |builder, node, ty| {
-                builder
-                    .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(1)))
-                    .unwrap()
-            },
+            |builder, node, ty| builder.constant(node, ty.clone(), checked::i64(1)),
             ValueType::new(DataType::Int64, false),
             name,
         );
@@ -164,15 +162,7 @@ fn normal_bytes_keep_alias_suppression_literals_and_default_value_names() {
         );
     }
     let plan = project(
-        |builder, node, ty| {
-            builder
-                .add_expression(
-                    node,
-                    ty.clone(),
-                    ExprKind::Literal(LiteralValue::Utf8("名🦀".into())),
-                )
-                .unwrap()
-        },
+        |builder, node, ty| builder.constant(node, ty.clone(), checked::utf8("名🦀".into())),
         ValueType::new(DataType::Utf8, false),
         Some("'名🦀'"),
     );
@@ -191,11 +181,7 @@ fn normal_bytes_keep_alias_suppression_literals_and_default_value_names() {
 fn large_borrowed_alias_and_literal_are_refused_by_the_streamed_line_budget() {
     let alias = "a".repeat(16 * 1024);
     let plan = project(
-        |builder, node, ty| {
-            builder
-                .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(1)))
-                .unwrap()
-        },
+        |builder, node, ty| builder.constant(node, ty.clone(), checked::i64(1)),
         ValueType::new(DataType::Int64, false),
         Some(&alias),
     );
@@ -204,34 +190,58 @@ fn large_borrowed_alias_and_literal_are_refused_by_the_streamed_line_budget() {
     );
     let literal = "🦀".repeat(4096);
     let plan = project(
-        |builder, node, ty| {
-            builder
-                .add_expression(
-                    node,
-                    ty.clone(),
-                    ExprKind::Literal(LiteralValue::Utf8(literal.into())),
-                )
-                .unwrap()
-        },
+        |builder, node, ty| builder.constant(node, ty.clone(), checked::utf8(literal)),
         ValueType::new(DataType::Utf8, false),
         Some("text"),
     );
     assert_budget(
         render_tree_with_budget(&plan, ExplainLevel::Normal, small_budget()).unwrap_err(),
     );
-    let literal = LiteralValue::Utf8("x".repeat(8 * 1024 * 1024 + 1).into_boxed_str());
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    let diagnostic = RenderDiagnostic::new(&control);
+    // Admit the genuine source before checking the independent output bound.
+    let policy = novarocks_constant_contract::ConstantPolicy {
+        max_logical_elements: 16 << 20,
+        max_retained_buffer_bytes: 32 << 20,
+        ..checked::policy()
+    };
+    let ty = ValueType::new(DataType::Utf8, false);
+    let literal = novarocks_constant_contract::ConstantValue::from_utf8(
+        std::sync::Arc::new(ty.try_to_field("large-source").unwrap()),
+        ty,
+        &"x".repeat(8 * 1024 * 1024 + 1),
+        policy,
+        novarocks_type_contract::CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
     let mut output = ExplainRenderOutput::new(ExplainRenderBudget::default());
     assert_budget(
         output
-            .push(format_args!("{}", literal_text(&literal)))
+            .push(format_args!(
+                "{}",
+                text(|f| diagnostic.constant(&literal, f))
+            ))
             .unwrap_err(),
     );
     // Hex expansion is admitted against output bytes, not borrowed input size.
-    let literal = LiteralValue::Binary(vec![255; 256].into_boxed_slice());
+    let ty = ValueType::new(DataType::Binary, false);
+    let literal = novarocks_constant_contract::ConstantValue::from_binary(
+        std::sync::Arc::new(ty.try_to_field("binary-source").unwrap()),
+        ty,
+        &[255; 256],
+        checked::policy(),
+        novarocks_type_contract::CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
     let mut output = ExplainRenderOutput::new(small_budget());
     assert_budget(
         output
-            .push(format_args!("{}", literal_text(&literal)))
+            .push(format_args!(
+                "{}",
+                text(|f| diagnostic.constant(&literal, f))
+            ))
             .unwrap_err(),
     );
 }
@@ -240,13 +250,7 @@ fn large_borrowed_alias_and_literal_are_refused_by_the_streamed_line_budget() {
 fn wide_boolean_arguments_remain_shallow_and_streamed() {
     let plan = project(
         |builder, node, ty| {
-            let leaf = builder
-                .add_expression(
-                    node,
-                    ty.clone(),
-                    ExprKind::Literal(LiteralValue::Boolean(true)),
-                )
-                .unwrap();
+            let leaf = builder.constant(node, ty.clone(), checked::boolean(true));
             builder
                 .add_expression(
                     node,
@@ -309,13 +313,7 @@ fn valid_but_deep_node_and_expression_inputs_are_refused_without_elision() {
     );
     let plan = project(
         |builder, node, ty| {
-            let mut expression = builder
-                .add_expression(
-                    node,
-                    ty.clone(),
-                    ExprKind::Literal(LiteralValue::Boolean(true)),
-                )
-                .unwrap();
+            let mut expression = builder.constant(node, ty.clone(), checked::boolean(true));
             for _ in 0..ExprText::MAX_DEPTH + 1 {
                 expression = builder
                     .add_expression(

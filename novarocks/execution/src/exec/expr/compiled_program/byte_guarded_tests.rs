@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
 
 fn carriers() -> [DataType; 4] {
@@ -30,6 +31,7 @@ fn carriers() -> [DataType; 4] {
 // Typed NULL definitions author the incoming layout; actual byte values below
 // come from source channels, not a hypothetical string literal compiler.
 fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let mut builder = FragmentBuilder::new(FragmentId::new(201));
     let source = NodeId::new(u32::MAX);
@@ -50,7 +52,14 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -87,8 +96,15 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
         let digits = builder
             .add_expression(
                 output,
-                FunctionValueType::new(DataType::Int64, false),
-                ExprKind::Literal(LiteralValue::Int64(-1)),
+                (FunctionValueType::new(DataType::Int64, false)).clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::i64(
+                        &(FunctionValueType::new(DataType::Int64, false)),
+                        -1,
+                        options().constants,
+                    ),
+                ),
             )
             .unwrap();
         let rounded = call(
@@ -194,7 +210,7 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
             ty: bytes,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
 }
 
 fn byte_array(ty: &DataType, values: &[Option<&[u8]>]) -> ArrayRef {

@@ -34,11 +34,10 @@ use novarocks_local_program::{
 };
 use novarocks_physical_plan::{
     BinaryOperator, ConstantPoolId, ConstantPools, ConstantReference, ExprId, ExprKind, Fragment,
-    FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
-    FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, LiteralValue,
-    NodeId, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits,
-    PlanVersionId, PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort,
-    ValueOrigin,
+    FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput,
+    FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, NodeId, PhysicalExpressionRoots,
+    PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
+    RequiredContracts, ResultField, ResultPort, ValueOrigin,
 };
 use novarocks_type_contract::{
     CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
@@ -93,7 +92,7 @@ fn constant_pools() -> Vec<ConstantPool> {
 #[derive(Clone, Debug)]
 enum Cell {
     /// A literal already of the column type.
-    Literal(LiteralValue),
+    Literal(novarocks_functions::ConstantValue),
     /// A checked constant already of the complete column type.
     Constant(u32, u32),
     /// `CAST(constant AS BIGINT)` over an analyzed source constant.
@@ -119,6 +118,8 @@ fn values_program_with_sources(
     pools: Vec<ConstantPool>,
     types: &[FunctionValueType],
 ) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     // The package constant namespace is closed: publish only cited pools.
     let mut constants = ConstantPools::empty();
     for (id, pool) in pools.iter().enumerate() {
@@ -132,7 +133,11 @@ fn values_program_with_sources(
                 .unwrap();
         }
     }
-    let mut builder = FragmentBuilder::new(FragmentId::new(57));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(57),
+            &fixture_sources,
+        );
     let columns = types
         .iter()
         .enumerate()
@@ -154,9 +159,7 @@ fn values_program_with_sources(
         for (column, cell) in row.iter().enumerate() {
             let ty = types[column].clone();
             let expr = match cell {
-                Cell::Literal(value) => builder
-                    .add_expression(VALUES, ty, ExprKind::Literal(value.clone()))
-                    .unwrap(),
+                Cell::Literal(value) => builder.constant(VALUES, ty, value.clone()),
                 Cell::Constant(source, ordinal) => builder
                     .add_expression(
                         VALUES,
@@ -203,16 +206,16 @@ fn values_program_with_sources(
                         .with_nullable(true)
                         .expect("valid test root nullability");
                     assert_eq!(sum, ty, "BIGINT + BIGINT fills the nullable BIGINT column");
-                    let left = builder
-                        .add_expression(
-                            VALUES,
-                            operand.clone(),
-                            ExprKind::Literal(LiteralValue::Int64(i64::MAX)),
-                        )
-                        .unwrap();
-                    let right = builder
-                        .add_expression(VALUES, operand, ExprKind::Literal(LiteralValue::Int64(1)))
-                        .unwrap();
+                    let left = builder.constant(
+                        VALUES,
+                        operand.clone(),
+                        crate::exec::operators::family_fixture::constant_sources::i64(i64::MAX),
+                    );
+                    let right = builder.constant(
+                        VALUES,
+                        operand,
+                        crate::exec::operators::family_fixture::constant_sources::i64(1),
+                    );
                     builder
                         .add_expression(
                             VALUES,
@@ -294,7 +297,7 @@ fn visit(
     let children = match &fragment.expressions().get(definition).unwrap().kind {
         ExprKind::Cast { expr, .. } => vec![*expr],
         ExprKind::Binary { left, right, .. } => vec![*left, *right],
-        ExprKind::Constant(_) | ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+        ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
         other => panic!("fixture authors no control for {other:?}"),
     };
     let arguments = children
@@ -314,7 +317,10 @@ fn visit(
     use_id
 }
 
-fn package(fragment: Fragment, constants: ConstantPools) -> Arc<FragmentPackage> {
+fn package(
+    fragment: crate::exec::operators::family_fixture::constant_sources::Fragment,
+    constants: ConstantPools,
+) -> Arc<FragmentPackage> {
     package_with_parameters(
         fragment,
         constants,
@@ -327,10 +333,13 @@ fn package(fragment: Fragment, constants: ConstantPools) -> Arc<FragmentPackage>
 }
 
 fn package_with_parameters(
-    fragment: Fragment,
+    fragment: crate::exec::operators::family_fixture::constant_sources::Fragment,
     constants: ConstantPools,
     parameters: SemanticParameters,
 ) -> Arc<FragmentPackage> {
+    let (fragment, sources) = fragment.into_parts();
+    let mut constants = constants;
+    crate::exec::operators::family_fixture::constant_sources::merge(&mut constants, &sources);
     let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
     let mut next = 0;
     let mut uses = Vec::new();
@@ -413,8 +422,12 @@ fn package_with_parameters(
 /// The independent oracle: an analyzed constant converted to BIGINT.
 fn oracle(cell: &Cell) -> Option<i64> {
     match cell {
-        Cell::Literal(LiteralValue::Int64(value)) => Some(*value),
-        Cell::Literal(LiteralValue::Null) => None,
+        Cell::Literal(value)
+            if crate::exec::operators::family_fixture::constant_sources::is_null(value) =>
+        {
+            None
+        }
+        Cell::Literal(value) => value.try_i64().unwrap(),
         Cell::Cast(TINYINT, ordinal) => Some(i64::from([1_i8, -5, -128][*ordinal as usize])),
         Cell::Cast(SMALLINT, ordinal) => Some(i64::from([300_i16][*ordinal as usize])),
         Cell::Cast(NULL_TINYINT, _) => None,
@@ -469,13 +482,16 @@ fn values_cast_cells_run_through_a_projection_with_exact_values_and_nulls() {
     let rows = vec![
         vec![
             Cell::Cast(TINYINT, 0),
-            Cell::Literal(LiteralValue::Int64(10)),
+            Cell::Literal(crate::exec::operators::family_fixture::constant_sources::i64(10)),
         ],
-        vec![Cell::Literal(LiteralValue::Null), Cell::Cast(SMALLINT, 0)],
+        vec![
+            Cell::Literal(crate::exec::operators::family_fixture::constant_sources::null()),
+            Cell::Cast(SMALLINT, 0),
+        ],
         vec![Cell::Cast(TINYINT, 1), Cell::Cast(TINYINT, 2)],
         vec![
             Cell::Cast(NULL_TINYINT, 0),
-            Cell::Literal(LiteralValue::Int64(20)),
+            Cell::Literal(crate::exec::operators::family_fixture::constant_sources::i64(20)),
         ],
     ];
     let program = values_program(&rows);
@@ -506,10 +522,13 @@ fn values_failing_cell_is_a_typed_required_error_of_its_own_root() {
     let rows = vec![
         vec![
             Cell::Cast(TINYINT, 0),
-            Cell::Literal(LiteralValue::Int64(10)),
+            Cell::Literal(crate::exec::operators::family_fixture::constant_sources::i64(10)),
         ],
         vec![Cell::Overflow, Cell::Cast(SMALLINT, 0)],
-        vec![Cell::Overflow, Cell::Literal(LiteralValue::Int64(30))],
+        vec![
+            Cell::Overflow,
+            Cell::Literal(crate::exec::operators::family_fixture::constant_sources::i64(30)),
+        ],
     ];
     let program = values_program(&rows);
     let failure = failure(&program);
@@ -527,9 +546,12 @@ fn values_cell_root_is_evaluated_only_over_its_empty_one_row_port() {
     let program = values_program(&[
         vec![
             Cell::Cast(TINYINT, 0),
-            Cell::Literal(LiteralValue::Int64(10)),
+            Cell::Literal(crate::exec::operators::family_fixture::constant_sources::i64(10)),
         ],
-        vec![Cell::Literal(LiteralValue::Null), Cell::Cast(SMALLINT, 0)],
+        vec![
+            Cell::Literal(crate::exec::operators::family_fixture::constant_sources::null()),
+            Cell::Cast(SMALLINT, 0),
+        ],
     ]);
     let control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
     let empty = |rows: usize| {

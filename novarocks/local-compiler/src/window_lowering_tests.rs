@@ -42,12 +42,11 @@ use novarocks_physical_plan::{
     AggregateBinding, AggregatePhase, BoundFunction, ConstantPoolId, ConstantPools,
     ConstantReference, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
     FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType,
-    LiteralValue, NodeId, NodeKind, NullOrdering, PhysicalCallDefinition, PhysicalCallRequest,
-    PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits,
-    PlanVersionId, PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort,
-    SortDirection, SortExpr, SortMode, StaticFunctionArgument, ValueOrigin, WindowExpression,
-    WindowSpec,
+    FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType, NodeId,
+    NodeKind, NullOrdering, PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite,
+    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
+    PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort, SortDirection,
+    SortExpr, SortMode, StaticFunctionArgument, ValueOrigin, WindowExpression, WindowSpec,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
@@ -239,6 +238,7 @@ fn references(fragment: &Fragment, definition: ExprId) -> Vec<ExprId> {
 fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPackage> {
     let complete =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
+    let mut pools = ConstantPools::empty();
     let mut builder = FragmentBuilder::new(FragmentId::new(47));
     let columns = (0..3)
         .map(|ordinal| {
@@ -262,7 +262,19 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                         .add_expression(
                             VALUES,
                             int64(true),
-                            ExprKind::Literal(cell.map_or(LiteralValue::Null, LiteralValue::Int64)),
+                            match cell {
+                                Some(value) => crate::test_constants::i64(
+                                    &mut pools,
+                                    &int64(true),
+                                    *value,
+                                    constant_policy(),
+                                ),
+                                None => crate::test_constants::null(
+                                    &mut pools,
+                                    &int64(true),
+                                    constant_policy(),
+                                ),
+                            },
                         )
                         .unwrap()
                 })
@@ -292,7 +304,6 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
         )
         .unwrap()
     });
-    let mut pools = ConstantPools::empty();
     if let Some(pool) = &pool {
         pools
             .insert(ConstantPoolId::new(CONSTANT_POOL), pool.clone())
@@ -435,7 +446,12 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                         .add_expression(
                             WINDOW,
                             int64(false),
-                            ExprKind::Literal(LiteralValue::Int64(i64::try_from(offset).unwrap())),
+                            crate::test_constants::i64(
+                                &mut pools,
+                                &int64(false),
+                                i64::try_from(offset).unwrap(),
+                                constant_policy(),
+                            ),
                         )
                         .unwrap();
                     if matches!(bound, WindowBound::Preceding(_)) {

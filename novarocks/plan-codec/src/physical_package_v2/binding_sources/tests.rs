@@ -170,6 +170,9 @@ fn node(
 // exercised. Exact signatures and fixture effect claims certify no installed
 // function or executable implementation.
 fn package() -> p::FragmentPackage {
+    let mut constants = p::ConstantPools::empty();
+    let literal_source =
+        crate::test_constants::insert(&mut constants, crate::test_constants::i64(42)(&int()));
     let source = p::NodeId::new(0);
     let agg = p::NodeId::new(7);
     let table = p::NodeId::new(u32::MAX);
@@ -212,7 +215,7 @@ fn package() -> p::FragmentPackage {
                 owner: source,
                 lambda_scope: Some(lambda),
                 ty: int(),
-                kind: p::ExprKind::Literal(p::LiteralValue::Int64(42)),
+                kind: literal_source,
             },
         ]
         .into_iter(),
@@ -515,7 +518,7 @@ fn package() -> p::FragmentPackage {
     let claims = p::FrozenFragmentCalls::try_new(&fragment, &uses, claims, &Setup).unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
-            constants: p::ConstantPools::empty(),
+            constants,
             version: p::PlanVersionId::try_new([3; 16]).unwrap(),
             required: p::RequiredContracts {
                 plan_contract_revision: p::PLAN_CONTRACT_REVISION,
@@ -912,7 +915,13 @@ fn actual_checked_scalar_lambda_table_and_aggregate_sources_reach_original_encod
     let facts = project(&package, &control, limits()).unwrap();
     assert!(facts.allocation_requests_upper_bound > 0);
     assert!(facts.value_root_count > 0);
-    assert_eq!(facts.field_root_count, 0);
+    // The checked scalar now contributes its original source Field as well
+    // as its complete value type; the Field is not a function binding root.
+    assert_eq!(facts.field_root_count, 1);
+    assert_eq!(package.constants().entries().len(), 1);
+    let pool = package.constants().entries().values().next().unwrap();
+    assert_eq!(pool.value_type(), &int());
+    assert_eq!(pool.value(0).unwrap().try_i64().unwrap(), Some(42));
     assert_eq!(package.fragment().id(), p::FragmentId::new(u32::MAX));
     assert!(
         package
@@ -1226,6 +1235,9 @@ fn actual_binding_header_limits_preserve_exact_counts_and_refuse_each_one_under(
 // only two expression definitions. Reusing the reachable literal prevents the
 // outer definition walk from accidentally supplying the Count quantum oracle.
 fn wide_package() -> p::FragmentPackage {
+    let mut constants = p::ConstantPools::empty();
+    let literal_source =
+        crate::test_constants::insert(&mut constants, crate::test_constants::i64(42)(&int()));
     let node_id = p::NodeId::new(u32::MAX);
     let scalar = p::ExprId::new(0);
     let value = p::ValueId::new(u32::MAX);
@@ -1251,7 +1263,7 @@ fn wide_package() -> p::FragmentPackage {
         owner: node_id,
         lambda_scope: None,
         ty: int(),
-        kind: p::ExprKind::Literal(p::LiteralValue::Int64(42)),
+        kind: literal_source,
     });
     let expressions = p::ExprArena::try_from_definitions_observed(
         definitions.into_iter(),
@@ -1372,7 +1384,7 @@ fn wide_package() -> p::FragmentPackage {
     .unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
-            constants: p::ConstantPools::empty(),
+            constants,
             version: p::PlanVersionId::try_new([4; 16]).unwrap(),
             required: p::RequiredContracts {
                 plan_contract_revision: p::PLAN_CONTRACT_REVISION,

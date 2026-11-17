@@ -40,7 +40,7 @@ use novarocks_physical_plan::{
     ExpressionRootRole, ExpressionRootSite, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
     FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
     FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType,
-    LegacyBindingMetadata, LiteralValue, NodeId, NodeKind, OutputPort, PhysicalCallDefinition,
+    LegacyBindingMetadata, NodeId, NodeKind, OutputPort, PhysicalCallDefinition,
     PhysicalCallRequest, PhysicalCallSite, PhysicalExpressionRoots, PhysicalNode,
     PhysicalProperties, PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
     PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort,
@@ -335,7 +335,12 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
                     .add_expression(
                         VALUES,
                         int64(false),
-                        ExprKind::Literal(LiteralValue::Int64(*k)),
+                        crate::test_constants::i64(
+                            &mut constants,
+                            &int64(false),
+                            *k,
+                            options().constants,
+                        ),
                     )
                     .unwrap(),
             ];

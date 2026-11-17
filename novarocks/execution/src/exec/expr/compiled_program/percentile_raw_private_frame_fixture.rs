@@ -16,6 +16,7 @@
 // under the License.
 //! Real catalogue -> frozen Physical call -> LocalCompiler -> runtime Frame fixture.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{ArrayRef, BinaryArray};
 fn functions() -> PureEngineFunctionCatalog {
     let actual = novarocks_functions::builtin::catalogue::percentile_raw_private_test_catalog();
@@ -51,6 +52,7 @@ fn functions() -> PureEngineFunctionCatalog {
     builder.seal_pure(installed).unwrap()
 }
 pub(super) fn program() -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = functions();
     let fragment_id = FragmentId::new(198);
     let source = NodeId::new(0);
@@ -68,7 +70,14 @@ pub(super) fn program() -> Arc<LocalProgram> {
     let mut children = vec![];
     for (i, ty) in types.iter().enumerate() {
         let expr = b
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         let value = ValueId::new(91 + i as u32);
         b.insert_value(ValueDef {
@@ -151,7 +160,7 @@ pub(super) fn program() -> Arc<LocalProgram> {
             ty: result_ty,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
 }
 pub(super) fn source_arrays() -> Vec<ArrayRef> {
     let mut state = novarocks_functions::approx_percentile_core::PercentileState::default();

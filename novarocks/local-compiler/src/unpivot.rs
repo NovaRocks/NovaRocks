@@ -418,10 +418,7 @@ fn lower_core_with_creation<H>(
                             .ok_or(UnpivotLoweringError::Invalid(
                                 "missing Unpivot scalar constant",
                             ))?;
-                    let valid = matches!(
-                        definition.kind,
-                        ExprKind::Literal(_) | ExprKind::Constant(_)
-                    );
+                    let valid = matches!(definition.kind, ExprKind::Constant(_));
                     let expr_id = input.expressions.get(id).copied();
                     work.step()?;
                     if !valid {

@@ -92,7 +92,8 @@ fn prefixes(run: impl Fn(&ProofControl) -> Result<(), FrozenCallError>, succeeds
 
 #[test]
 fn occurrence_property_proof_preserves_each_shared_use_and_guarded_domain() {
-    let mut fixture = scalar_fixture(2, 0);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 0, &mut fixture_constants);
     assert_eq!(
         fixture.uses.flow().uses()[&ExpressionUseId::new(0)].definition,
         fixture.uses.flow().uses()[&ExpressionUseId::new(u32::MAX)].definition
@@ -126,7 +127,7 @@ fn occurrence_property_proof_preserves_each_shared_use_and_guarded_domain() {
         );
         fixture.calls[unsafe_at].effects.observable_effects = ObservableEffects::NONE;
     }
-    let mut guarded = case_fixture();
+    let mut guarded = case_fixture(&mut fixture_constants);
     assert!(guarded.calls.iter().any(|call| {
         guarded.uses.flow().regions()[&call.context.region]
             .guard
@@ -146,7 +147,8 @@ fn occurrence_property_proof_preserves_each_shared_use_and_guarded_domain() {
 
 #[test]
 fn occurrence_property_proof_keeps_row_errors_and_relational_lifecycle() {
-    let mut scalar = scalar_fixture(1, u32::MAX);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut scalar = scalar_fixture(1, u32::MAX, &mut fixture_constants);
     scalar.calls[0].effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
     assert!(
         safe(
@@ -167,7 +169,7 @@ fn occurrence_property_proof_keeps_row_errors_and_relational_lifecycle() {
         )
         .unwrap()
     );
-    let mut relational = special_fixture();
+    let mut relational = special_fixture(&mut fixture_constants);
     let calls = relational.checked().unwrap();
     for node in relational.fragment.nodes().keys() {
         assert!(safe(&calls, &relational, *node, &ProofControl::default()).unwrap());
@@ -195,7 +197,8 @@ fn occurrence_property_proof_keeps_row_errors_and_relational_lifecycle() {
 
 #[test]
 fn occurrence_property_proof_sparse_node_index_refuses_foreign_snapshot_and_missing_node() {
-    let mut fixture = scalar_fixture(1, u32::MAX);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(1, u32::MAX, &mut fixture_constants);
     // Move the one node and its original definitions, retaining their facts.
     // Sparse MAX is a map key; it never becomes a vector capacity.
     let mut parts = fixture.fragment.into_parts();
@@ -255,7 +258,8 @@ fn occurrence_property_proof_sparse_node_index_refuses_foreign_snapshot_and_miss
 
 #[test]
 fn occurrence_property_proof_bounds_source_before_index_and_rechecks_call_correspondence() {
-    let fixture = scalar_fixture(2, 71);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 71, &mut fixture_constants);
     let calls = fixture.checked().unwrap();
     for limits in [
         PlanLimits {
@@ -347,7 +351,8 @@ fn occurrence_property_proof_bounds_source_before_index_and_rechecks_call_corres
 
 #[test]
 fn occurrence_property_proof_actual_quantum_and_every_callback_keep_original_causes() {
-    let fixture = scalar_fixture(320, 17);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(320, 17, &mut fixture_constants);
     let calls = fixture.checked().unwrap();
     let control = ProofControl::default();
     assert!(safe(&calls, &fixture, fixture.fragment.root(), &control).unwrap());
@@ -371,7 +376,8 @@ fn occurrence_property_proof_actual_quantum_and_every_callback_keep_original_cau
 
 #[test]
 fn occurrence_property_proof_exact_projection_envelopes_and_overflow_are_checked() {
-    let fixture = scalar_fixture(320, 17);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(320, 17, &mut fixture_constants);
     let calls = fixture.checked().unwrap();
     let measured = calls
         .property_proof(
@@ -477,7 +483,8 @@ fn occurrence_property_proof_exact_projection_envelopes_and_overflow_are_checked
 
 #[test]
 fn occurrence_property_proof_broadcast_error_retains_original_first_site() {
-    let mut fixture = scalar_fixture(2, 73);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 73, &mut fixture_constants);
     fixture.calls[0].effects.observable_effects.warnings = true;
     fixture.calls[1].effects.observable_effects.rng_sampling = true;
     let root = fixture.fragment.root();
@@ -527,7 +534,8 @@ fn occurrence_property_proof_broadcast_error_retains_original_first_site() {
 
 #[test]
 fn occurrence_property_proof_global_broadcast_fault_follows_visit_order_not_node_order() {
-    let mut fixture = special_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = special_fixture(&mut fixture_constants);
     let aggregate_site = fixture.calls[0].site;
     let window_site = fixture.calls[2].site;
     fixture.calls[0].effects.observable_effects.warnings = true;
@@ -671,7 +679,8 @@ fn borrowed_gate(
 
 #[test]
 fn borrowed_property_source_and_complete_formulas_keep_actual_admission_exact_replay() {
-    let fixture = scalar_fixture(2, u32::MAX);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, u32::MAX, &mut fixture_constants);
     let calls = fixture.checked().unwrap();
     for complete in [false, true] {
         let plain = if complete {
@@ -784,7 +793,8 @@ fn borrowed_property_source_and_complete_formulas_keep_actual_admission_exact_re
 
 #[test]
 fn borrowed_property_success_and_ordinary_source_error_keep_every_actual_primary_prefix() {
-    let fixture = scalar_fixture(2, 71);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 71, &mut fixture_constants);
     let calls = fixture.checked().unwrap();
     for complete in [false, true] {
         for source in [SOURCE_INVOICE, 0] {

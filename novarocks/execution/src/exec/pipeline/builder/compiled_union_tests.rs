@@ -23,9 +23,8 @@ use std::sync::Arc;
 
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
-    ConstantPools, Distribution, ExprKind, FragmentBuilder, FragmentId, NodeId, NodeKind,
-    NullOrdering, RequiredInputs, SetOperationKind, SortDirection, SortExpr, SortMode, ValueId,
-    ValueOrigin,
+    ConstantPools, Distribution, ExprKind, FragmentId, NodeId, NodeKind, NullOrdering,
+    RequiredInputs, SetOperationKind, SortDirection, SortExpr, SortMode, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::FunctionValueType;
 
@@ -44,7 +43,13 @@ fn branch_rows(branch: usize) -> Vec<(i64, Option<i64>)> {
 /// `Values_k(a, b)` for each branch, `UnionAll(b, a)`, and optionally a
 /// downstream global sort by the union's second column.
 fn program(branches: usize, sorted: bool, dop: usize) -> (Arc<LocalProgram>, Vec<NodeId>) {
-    let mut builder = FragmentBuilder::new(FragmentId::new(41));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(41),
+            &fixture_sources,
+        );
     let union = NodeId::new(100);
     let mut inputs = Vec::new();
     let mut mappings = Vec::new();

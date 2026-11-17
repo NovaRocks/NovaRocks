@@ -317,7 +317,8 @@ fn frozen_read_declared_typed(
 }
 
 /// `VALUES (7), (8), (20)` as the one-column build source of `edge`.
-fn build_fragment(edge: EdgeId, nullable: bool) -> (Fragment, ValueId) {
+fn build_fragment(edge: EdgeId, nullable: bool) -> (Fragment, ValueId, ConstantPools) {
+    let mut constants = ConstantPools::empty();
     let mut build = FragmentBuilder::new(BUILD);
     let column = build
         .add_value(
@@ -334,7 +335,12 @@ fn build_fragment(edge: EdgeId, nullable: bool) -> (Fragment, ValueId) {
                 .add_expression(
                     VALUES,
                     nullable_int64(nullable),
-                    ExprKind::Literal(LiteralValue::Int64(value)),
+                    crate::test_constants::i64(
+                        &mut constants,
+                        &nullable_int64(nullable),
+                        value,
+                        options(None).constants,
+                    ),
                 )
                 .unwrap()])
         })
@@ -349,7 +355,7 @@ fn build_fragment(edge: EdgeId, nullable: bool) -> (Fragment, ValueId) {
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    (fragment, column)
+    (fragment, column, constants)
 }
 
 fn receive(
@@ -729,7 +735,7 @@ fn dynamic_filter() -> StaticScanDynamicFilter {
 pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
     let mut builder = FragmentBuilder::new(PROBE);
     let scan = add_scan(&mut builder, Distribution::Unconstrained);
-    let (build, build_column) = build_fragment(BUILD_EDGE, rf.null_safe);
+    let (build, build_column, constants) = build_fragment(BUILD_EDGE, rf.null_safe);
     let imported = receive(
         &mut builder,
         BUILD_RECEIVER,
@@ -776,6 +782,9 @@ pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(probe).unwrap();
     plan.add_fragment(gather).unwrap();
     plan.add_fragment(build).unwrap();
@@ -812,7 +821,7 @@ pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
     ))
     .unwrap();
     let plan = plan
-        .finish()
+        .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the broadcast runtime-filter plan validates: {error:?}"));
     let dynamic = if rf.scan_consumer() {
         vec![dynamic_filter()]
@@ -862,7 +871,7 @@ fn partitioned() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let (build, build_column) = build_fragment(BUILD_EDGE, false);
+    let (build, build_column, constants) = build_fragment(BUILD_EDGE, false);
 
     let mut joiner = FragmentBuilder::new(JOINER);
     let probe_columns = receive(
@@ -901,6 +910,9 @@ fn partitioned() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(probe).unwrap();
     plan.add_fragment(build).unwrap();
     plan.add_fragment(joiner).unwrap();
@@ -940,7 +952,7 @@ fn partitioned() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
     ))
     .unwrap();
     let plan = plan
-        .finish()
+        .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the partitioned runtime-filter plan validates: {error:?}"));
     let mut packages = packages(&plan, Some(frozen_read(false, vec![dynamic_filter()])));
     (
@@ -1543,7 +1555,7 @@ fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage
     ))
     .unwrap();
     let plan = plan
-        .finish()
+        .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the aggregate TopN filter plan validates: {error:?}"));
     let read = frozen_read_declared_typed(
         true,
@@ -1978,7 +1990,7 @@ fn count_star_join() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
     let count = CountStar::bind(&catalog);
     let mut builder = FragmentBuilder::new(PROBE);
     let scan = add_scan_columns(&mut builder, Distribution::Unconstrained, 1);
-    let (build, build_column) = build_fragment(BUILD_EDGE, false);
+    let (build, build_column, constants) = build_fragment(BUILD_EDGE, false);
     let imported = receive(
         &mut builder,
         BUILD_RECEIVER,
@@ -2036,6 +2048,9 @@ fn count_star_join() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
     let gather = finish_with_requests(gather, FINAL, FragmentSink::Result);
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(probe).unwrap();
     plan.add_fragment(gather).unwrap();
     plan.add_fragment(build).unwrap();

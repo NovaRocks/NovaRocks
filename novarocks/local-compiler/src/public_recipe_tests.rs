@@ -47,6 +47,7 @@ fn arithmetic_fixture(
     operator: BinaryOperator,
     result: FunctionValueType,
 ) -> Result<Fixture, ValidationErrors> {
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(FragmentId::new(101));
     builder
         .add_values(
@@ -62,7 +63,7 @@ fn arithmetic_fixture(
             .add_expression(
                 NodeId::new(44),
                 input.clone(),
-                ExprKind::Literal(LiteralValue::Int64(value)),
+                crate::test_constants::i64(&mut constants, &input, value, options().constants),
             )
             .unwrap();
         let value = builder
@@ -139,6 +140,7 @@ fn arithmetic_fixture(
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     Ok(Fixture {
+        constants,
         fragment,
         expression,
         ordered: vec![a, b],

@@ -43,14 +43,24 @@ fn coverage(
     }
 }
 
-fn append_literal(builder: &mut FragmentBuilder, nullable: bool) -> (NodeId, ValueId) {
-    append_literal_with_distribution(builder, nullable, Distribution::Singleton)
+fn append_literal(
+    builder: &mut FragmentBuilder,
+    nullable: bool,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (NodeId, ValueId) {
+    append_literal_with_distribution(
+        builder,
+        nullable,
+        Distribution::Singleton,
+        fixture_constants,
+    )
 }
 
 fn append_literal_with_distribution(
     builder: &mut FragmentBuilder,
     nullable: bool,
     distribution: Distribution,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> (NodeId, ValueId) {
     let row_multiplicity = if distribution == Distribution::Broadcast {
         RowMultiplicity::Replicated
@@ -63,11 +73,11 @@ fn append_literal_with_distribution(
         .add_expression(
             node,
             value_type.clone(),
-            ExprKind::Literal(if nullable {
-                LiteralValue::Null
+            if nullable {
+                fixture_constants.null(&value_type)
             } else {
-                LiteralValue::Int64(11)
-            }),
+                fixture_constants.i64(11, &value_type)
+            },
         )
         .unwrap();
     let value = builder
@@ -101,7 +111,10 @@ fn append_literal_with_distribution(
     (node, value)
 }
 
-fn finish_largeint_literal(value_type: ValueType) -> Result<Fragment, String> {
+fn finish_largeint_literal(
+    value_type: ValueType,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Result<Fragment, String> {
     let mut builder = FragmentBuilder::new(FragmentId::new(99));
     let node = builder
         .reserve_node_id()
@@ -109,8 +122,10 @@ fn finish_largeint_literal(value_type: ValueType) -> Result<Fragment, String> {
     let expression = builder
         .add_expression(
             node,
-            value_type.clone(),
-            ExprKind::Literal(LiteralValue::LargeInt(i128::MIN)),
+            (value_type.clone()).clone(),
+            fixture_constants
+                .try_largeint(i128::MIN, &(value_type.clone()))
+                .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
     let value = builder
@@ -153,6 +168,7 @@ fn finish_largeint_literal(value_type: ValueType) -> Result<Fragment, String> {
 /// position typed conservatively.
 #[test]
 fn largeint_literal_requires_a_largeint_carrier_that_may_admit_null() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let largeint = DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH);
     for nullable in [false, true] {
         finish_largeint_literal(
@@ -162,23 +178,26 @@ fn largeint_literal_requires_a_largeint_carrier_that_may_admit_null() {
                 novarocks_type_contract::ValueLogicalType::LargeInt,
             )
             .unwrap(),
+            &mut fixture_constants,
         )
         .unwrap();
     }
     // The same physical width does not author the LARGEINT logical domain.
-    let opaque = finish_largeint_literal(ty(largeint, false)).unwrap_err();
-    assert!(opaque.contains("literal largeint differs from its declared type"));
+    let opaque = finish_largeint_literal(ty(largeint, false), &mut fixture_constants).unwrap_err();
+    assert!(opaque.contains("LARGEINT factory requires exact logical LARGEINT type"));
 
-    let wrong_type = finish_largeint_literal(ty(DataType::Int64, false)).unwrap_err();
-    assert!(wrong_type.contains("literal largeint differs from its declared type Int64"));
+    let wrong_type =
+        finish_largeint_literal(ty(DataType::Int64, false), &mut fixture_constants).unwrap_err();
+    assert!(wrong_type.contains("LARGEINT factory requires exact logical LARGEINT type"));
 }
 
 fn null_safe_join_filter(
     null_semantics: RuntimeFilterNullSemantics,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> (Fragment, RuntimeFilter, ValueId) {
     let fragment_id = FragmentId::new(100);
     let mut builder = FragmentBuilder::new(fragment_id);
-    let (left_source, left_value) = append_literal(&mut builder, true);
+    let (left_source, left_value) = append_literal(&mut builder, true, fixture_constants);
     let left = builder.reserve_node_id().unwrap();
     let left_identity = builder
         .add_expression(left, ty(DataType::Int64, true), ExprKind::Value(left_value))
@@ -186,8 +205,8 @@ fn null_safe_join_filter(
     let other_expression = builder
         .add_expression(
             left,
-            ty(DataType::Int64, true),
-            ExprKind::Literal(LiteralValue::Null),
+            (ty(DataType::Int64, true)).clone(),
+            fixture_constants.null(&(ty(DataType::Int64, true))),
         )
         .unwrap();
     let other_left_value = builder
@@ -221,8 +240,12 @@ fn null_safe_join_filter(
             },
         })
         .unwrap();
-    let (right, right_value) =
-        append_literal_with_distribution(&mut builder, true, Distribution::Broadcast);
+    let (right, right_value) = append_literal_with_distribution(
+        &mut builder,
+        true,
+        Distribution::Broadcast,
+        fixture_constants,
+    );
     let join = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, true);
     let left_key = builder
@@ -346,6 +369,7 @@ pub(super) fn scan_lineage_filter(
     through_project: bool,
     through_inner_join: bool,
     second_provider_field: bool,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> (Fragment, RuntimeFilter, Option<ValueId>) {
     let fragment_id = FragmentId::new(101);
     let binding = connector_binding();
@@ -421,8 +445,8 @@ pub(super) fn scan_lineage_filter(
         let predicate = builder
             .add_expression(
                 filter,
-                ty(DataType::Boolean, false),
-                ExprKind::Literal(LiteralValue::Boolean(true)),
+                (ty(DataType::Boolean, false)).clone(),
+                fixture_constants.boolean(true, &(ty(DataType::Boolean, false))),
             )
             .unwrap();
         builder
@@ -474,8 +498,8 @@ pub(super) fn scan_lineage_filter(
         let other_expression = builder
             .add_expression(
                 project,
-                ty(DataType::Int64, false),
-                ExprKind::Literal(LiteralValue::Int64(7)),
+                (ty(DataType::Int64, false)).clone(),
+                fixture_constants.i64(7, &(ty(DataType::Int64, false))),
             )
             .unwrap();
         let other = builder
@@ -520,8 +544,12 @@ pub(super) fn scan_lineage_filter(
     };
 
     if through_inner_join {
-        let (equivalent, equivalent_value) =
-            append_literal_with_distribution(&mut builder, false, Distribution::Broadcast);
+        let (equivalent, equivalent_value) = append_literal_with_distribution(
+            &mut builder,
+            false,
+            Distribution::Broadcast,
+            fixture_constants,
+        );
         let inner_join = builder.reserve_node_id().unwrap();
         let left_key = builder
             .add_expression(
@@ -583,8 +611,12 @@ pub(super) fn scan_lineage_filter(
         probe_node = inner_join;
     }
 
-    let (build, build_value) =
-        append_literal_with_distribution(&mut builder, false, Distribution::Broadcast);
+    let (build, build_value) = append_literal_with_distribution(
+        &mut builder,
+        false,
+        Distribution::Broadcast,
+        fixture_constants,
+    );
     let join = builder.reserve_node_id().unwrap();
     let probe_key = builder
         .add_expression(
@@ -711,13 +743,17 @@ pub(super) fn scan_lineage_filter(
     (fragment, filter, scan_values.get(1).copied())
 }
 
-fn assert_runtime_filter_plan_accepted(fragment: Fragment, filter: RuntimeFilter) {
+fn assert_runtime_filter_plan_accepted(
+    fragment: Fragment,
+    filter: RuntimeFilter,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) {
     let cuts = local_runtime_filter_cuts(&fragment, &filter);
     validate_fragment(&fragment, &cuts).unwrap();
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
     builder.add_runtime_filter(filter).unwrap();
-    builder.finish().unwrap();
+    crate::tests::constant_fixture::publish_plan(builder, fixture_constants).unwrap();
 }
 
 fn local_runtime_filter_cuts(fragment: &Fragment, filter: &RuntimeFilter) -> FragmentCuts {
@@ -922,8 +958,9 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
 
 #[test]
 fn aggregate_topn_runtime_filter_requires_a_positive_frozen_limit() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let (fragment, filter) = aggregate_topn_filter();
-    assert_runtime_filter_plan_accepted(fragment.clone(), filter.clone());
+    assert_runtime_filter_plan_accepted(fragment.clone(), filter.clone(), &mut fixture_constants);
 
     let mut invalid = filter;
     let RuntimeFilterProducerTarget::AggregateTopNKey { limit, .. } =
@@ -936,11 +973,13 @@ fn aggregate_topn_runtime_filter_requires_a_positive_frozen_limit() {
         fragment,
         invalid,
         "runtime filter Aggregate TopN producer has a zero limit",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn aggregate_topn_runtime_filter_recomputes_the_exact_topn_witness() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let (fragment, mut filter) = aggregate_topn_filter();
     let RuntimeFilterProducerTarget::AggregateTopNKey { direction, .. } =
         &mut filter.producers[0].target
@@ -952,11 +991,13 @@ fn aggregate_topn_runtime_filter_recomputes_the_exact_topn_witness() {
         fragment,
         filter,
         "runtime filter Aggregate TopN producer target does not match its exact group key",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn aggregate_topn_runtime_filter_consumer_requires_its_exact_producer_witness() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let (fragment, mut filter) = aggregate_topn_filter();
     let RuntimeFilterConsumerTarget::AggregateTopNScanField { producer, .. } =
         &mut filter.consumers[0].target
@@ -968,11 +1009,13 @@ fn aggregate_topn_runtime_filter_consumer_requires_its_exact_producer_witness() 
         fragment,
         filter,
         "runtime filter Aggregate TopN consumer has no exact producer witness",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn aggregate_topn_monotonic_updates_require_live_activation() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let (fragment, mut filter) = aggregate_topn_filter();
     filter.consumers[0].activation =
         RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
@@ -983,23 +1026,32 @@ fn aggregate_topn_monotonic_updates_require_live_activation() {
         fragment,
         filter,
         "monotonic runtime-filter consumer requires non-blocking live-update activation",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn runtime_filter_scan_field_accepts_direct_and_identity_project_lineage() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for (through_filter, through_project) in
         [(false, false), (false, true), (true, false), (true, true)]
     {
-        let (fragment, filter, _) =
-            scan_lineage_filter(through_filter, through_project, false, false);
-        assert_runtime_filter_plan_accepted(fragment, filter);
+        let (fragment, filter, _) = scan_lineage_filter(
+            through_filter,
+            through_project,
+            false,
+            false,
+            &mut fixture_constants,
+        );
+        assert_runtime_filter_plan_accepted(fragment, filter, &mut fixture_constants);
     }
 }
 
 #[test]
 fn remote_labels_cannot_bypass_local_runtime_filter_lineage() {
-    let (fragment, filter, _) = scan_lineage_filter(true, true, false, false);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, filter, _) =
+        scan_lineage_filter(true, true, false, false, &mut fixture_constants);
     for mutation in 0..3 {
         let mut malformed = filter.clone();
         let RuntimeFilterConsumerTarget::ScanField { lineage, .. } =
@@ -1044,12 +1096,16 @@ fn remote_labels_cannot_bypass_local_runtime_filter_lineage() {
             fragment.clone(),
             malformed,
             "runtime filter scan consumer is not connected to its exact probe key by a safe lineage",
+            &mut fixture_constants,
         );
     }
 }
 
-pub(super) fn cross_fragment_scan_lineage_plan() -> (PhysicalPlan, FragmentId, FragmentId) {
-    let (original, mut filter, _) = scan_lineage_filter(true, true, false, false);
+pub(super) fn cross_fragment_scan_lineage_plan(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (PhysicalPlan, FragmentId, FragmentId) {
+    let (original, mut filter, _) =
+        scan_lineage_filter(true, true, false, false, fixture_constants);
     let destination_id = original.id();
     let source_id = FragmentId::new(900);
     let edge_id = EdgeId::new(900);
@@ -1187,12 +1243,18 @@ pub(super) fn cross_fragment_scan_lineage_plan() -> (PhysicalPlan, FragmentId, F
     })
     .unwrap();
     plan.add_runtime_filter(filter).unwrap();
-    (plan.finish().unwrap(), source_id, destination_id)
+    (
+        crate::tests::constant_fixture::publish_plan(plan, fixture_constants).unwrap(),
+        source_id,
+        destination_id,
+    )
 }
 
 #[test]
 fn cross_fragment_runtime_filter_validates_local_prefix_and_suffix() {
-    let (plan, source_id, destination_id) = cross_fragment_scan_lineage_plan();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (plan, source_id, destination_id) =
+        cross_fragment_scan_lineage_plan(&mut fixture_constants);
     for id in [source_id, destination_id] {
         let fragment = &plan.fragments()[&id];
         let cuts = fragment_cuts(&plan, id).unwrap();
@@ -1261,7 +1323,9 @@ fn cross_fragment_runtime_filter_validates_local_prefix_and_suffix() {
 
 #[test]
 fn runtime_filter_scan_field_rejects_filter_lineage_drift() {
-    let (fragment, mut filter, _) = scan_lineage_filter(true, false, false, false);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, mut filter, _) =
+        scan_lineage_filter(true, false, false, false, &mut fixture_constants);
     let RuntimeFilterConsumerTarget::ScanField { lineage, .. } = &mut filter.consumers[0].target
     else {
         unreachable!();
@@ -1280,8 +1344,10 @@ fn runtime_filter_scan_field_rejects_filter_lineage_drift() {
 
 #[test]
 fn runtime_filter_project_identity_uses_the_exact_output_occurrence() {
-    let (fragment, mut filter, _) = scan_lineage_filter(false, true, false, false);
-    assert_runtime_filter_plan_accepted(fragment.clone(), filter.clone());
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, mut filter, _) =
+        scan_lineage_filter(false, true, false, false, &mut fixture_constants);
+    assert_runtime_filter_plan_accepted(fragment.clone(), filter.clone(), &mut fixture_constants);
 
     let RuntimeFilterConsumerTarget::ScanField { lineage, .. } = &mut filter.consumers[0].target
     else {
@@ -1295,13 +1361,16 @@ fn runtime_filter_project_identity_uses_the_exact_output_occurrence() {
         fragment,
         filter,
         "runtime filter scan consumer is not connected to its exact probe key by a safe lineage",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn runtime_filter_join_equality_lineage_recomputes_inner_key_direction() {
-    let (fragment, mut filter, _) = scan_lineage_filter(false, false, true, false);
-    assert_runtime_filter_plan_accepted(fragment.clone(), filter.clone());
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, mut filter, _) =
+        scan_lineage_filter(false, false, true, false, &mut fixture_constants);
+    assert_runtime_filter_plan_accepted(fragment.clone(), filter.clone(), &mut fixture_constants);
 
     let RuntimeFilterConsumerTarget::ScanField { lineage, .. } = &mut filter.consumers[0].target
     else {
@@ -1315,12 +1384,15 @@ fn runtime_filter_join_equality_lineage_recomputes_inner_key_direction() {
         fragment,
         filter,
         "runtime filter scan consumer is not connected to its exact probe key by a safe lineage",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn runtime_filter_scan_field_rejects_a_same_typed_non_key_provider_field() {
-    let (fragment, mut filter, second) = scan_lineage_filter(false, false, false, true);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, mut filter, second) =
+        scan_lineage_filter(false, false, false, true, &mut fixture_constants);
     filter.consumers[0].endpoint.values = Box::from([second.unwrap()]);
 
     let cuts = local_runtime_filter_cuts(&fragment, &filter);
@@ -1331,7 +1403,8 @@ fn runtime_filter_scan_field_rejects_a_same_typed_non_key_provider_field() {
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
     builder.add_runtime_filter(filter).unwrap();
-    let error = builder.finish().unwrap_err();
+    let error =
+        crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap_err();
     assert!(error.to_string().contains(
         "runtime filter scan consumer is not connected to its exact probe key by a safe lineage"
     ));
@@ -1339,17 +1412,18 @@ fn runtime_filter_scan_field_rejects_a_same_typed_non_key_provider_field() {
 
 #[test]
 fn null_safe_join_membership_filter_preserves_null_matches_at_both_boundaries() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for null_semantics in [
         RuntimeFilterNullSemantics::NeverMatches,
         RuntimeFilterNullSemantics::NullSafeEqual,
     ] {
-        let (fragment, filter, _) = null_safe_join_filter(null_semantics);
+        let (fragment, filter, _) = null_safe_join_filter(null_semantics, &mut fixture_constants);
         let cuts = local_runtime_filter_cuts(&fragment, &filter);
         let standalone_result = validate_fragment(&fragment, &cuts);
         let mut builder = PlanBuilder::new(version());
         builder.add_fragment(fragment).unwrap();
         builder.add_runtime_filter(filter).unwrap();
-        let plan_result = builder.finish();
+        let plan_result = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants);
         if null_semantics == RuntimeFilterNullSemantics::NeverMatches {
             for error in [standalone_result.unwrap_err(), plan_result.unwrap_err()] {
                 assert!(error.to_string().contains(
@@ -1371,21 +1445,28 @@ fn null_safe_join_membership_filter_preserves_null_matches_at_both_boundaries() 
 
 #[test]
 fn runtime_filter_consumer_cannot_substitute_a_same_typed_non_key_value() {
-    let (fragment, mut filter, non_key) =
-        null_safe_join_filter(RuntimeFilterNullSemantics::NullSafeEqual);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, mut filter, non_key) = null_safe_join_filter(
+        RuntimeFilterNullSemantics::NullSafeEqual,
+        &mut fixture_constants,
+    );
     filter.consumers[0].endpoint.values = Box::from([non_key]);
 
     assert_local_runtime_filter_rejected_at_both_boundaries(
         fragment,
         filter,
         "runtime filter consumer target is not locally valid for its equality witness",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn runtime_filter_consumer_requires_a_producer_for_its_exact_equality_witness() {
-    let (fragment, mut filter, _) =
-        null_safe_join_filter(RuntimeFilterNullSemantics::NullSafeEqual);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, mut filter, _) = null_safe_join_filter(
+        RuntimeFilterNullSemantics::NullSafeEqual,
+        &mut fixture_constants,
+    );
     let mut second = filter.equality_witnesses[0];
     second.id = RuntimeFilterEqualityWitnessId::new(10_001);
     filter.equality_witnesses = Box::from([filter.equality_witnesses[0], second]);
@@ -1401,6 +1482,7 @@ fn runtime_filter_consumer_requires_a_producer_for_its_exact_equality_witness() 
         fragment,
         filter,
         "runtime filter consumer equality witness has no producer for the same join key",
+        &mut fixture_constants,
     );
 }
 
@@ -1408,6 +1490,7 @@ fn assert_local_runtime_filter_rejected_at_both_boundaries(
     fragment: Fragment,
     filter: RuntimeFilter,
     expected: &str,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) {
     let cuts = local_runtime_filter_cuts(&fragment, &filter);
     let independent = validate_fragment(&fragment, &cuts).unwrap_err();
@@ -1415,7 +1498,8 @@ fn assert_local_runtime_filter_rejected_at_both_boundaries(
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
     builder.add_runtime_filter(filter).unwrap();
-    let whole_plan = builder.finish().unwrap_err();
+    let whole_plan =
+        crate::tests::constant_fixture::publish_plan(builder, fixture_constants).unwrap_err();
 
     for error in [independent, whole_plan] {
         assert!(
@@ -1427,8 +1511,11 @@ fn assert_local_runtime_filter_rejected_at_both_boundaries(
 
 #[test]
 fn complete_once_coverage_requires_the_same_boolean_shape_not_only_the_same_leaves() {
-    let (fragment, mut filter, _) =
-        null_safe_join_filter(RuntimeFilterNullSemantics::NullSafeEqual);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, mut filter, _) = null_safe_join_filter(
+        RuntimeFilterNullSemantics::NullSafeEqual,
+        &mut fixture_constants,
+    );
     let witness = filter.producers[0].witness;
     filter.terminal_coverage = coverage([witness], false);
 
@@ -1436,13 +1523,17 @@ fn complete_once_coverage_requires_the_same_boolean_shape_not_only_the_same_leav
         fragment,
         filter,
         "complete-once runtime filter has different availability and terminal coverage",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn runtime_filter_coverage_depth_is_bounded_without_recursive_values() {
-    let (fragment, mut filter, _) =
-        null_safe_join_filter(RuntimeFilterNullSemantics::NullSafeEqual);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, mut filter, _) = null_safe_join_filter(
+        RuntimeFilterNullSemantics::NullSafeEqual,
+        &mut fixture_constants,
+    );
     let witness = filter.producers[0].witness;
     let mut nodes = vec![RuntimeFilterCoverageNode::Witness(witness)];
     for child in 0..PlanLimits::FROZEN.runtime_filter_coverage_depth {
@@ -1461,12 +1552,17 @@ fn runtime_filter_coverage_depth_is_bounded_without_recursive_values() {
         fragment,
         filter,
         "runtime filter availability coverage exceeds semantic depth",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn membership_filter_rejects_each_contribution_and_completion_matrix_drift() {
-    let (fragment, filter, _) = null_safe_join_filter(RuntimeFilterNullSemantics::NullSafeEqual);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, filter, _) = null_safe_join_filter(
+        RuntimeFilterNullSemantics::NullSafeEqual,
+        &mut fixture_constants,
+    );
 
     let mut wrong_coverage = filter.clone();
     let witness = wrong_coverage.producers[0].witness;
@@ -1476,6 +1572,7 @@ fn membership_filter_rejects_each_contribution_and_completion_matrix_drift() {
         fragment.clone(),
         wrong_coverage,
         "fenced final-domain runtime filter requires null-safe AllOf coverage",
+        &mut fixture_constants,
     );
 
     let mut wrong_contributions = filter.clone();
@@ -1488,6 +1585,7 @@ fn membership_filter_rejects_each_contribution_and_completion_matrix_drift() {
         fragment.clone(),
         wrong_contributions,
         "runtime filter producer contributions differ from the channel matrix",
+        &mut fixture_constants,
     );
 
     let mut wrong_completion = filter;
@@ -1496,6 +1594,7 @@ fn membership_filter_rejects_each_contribution_and_completion_matrix_drift() {
         fragment,
         wrong_completion,
         "runtime filter producer completion differs from the channel matrix",
+        &mut fixture_constants,
     );
 }
 
@@ -1732,6 +1831,7 @@ fn append_partitioned_inner_join(
 
 #[test]
 fn runtime_filter_producer_target_must_match_its_reduction() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let (fragment, mut filter) = ordered_join_filter();
     filter.producers[0].apply_point = RuntimeFilterApplyPoint::NodeOutput;
 
@@ -1739,11 +1839,13 @@ fn runtime_filter_producer_target_must_match_its_reduction() {
         fragment,
         filter,
         "runtime filter producer target does not match its equality witness and exact build key",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn ordered_runtime_filter_rejects_an_unfrozen_comparison_domain() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let (fragment, mut filter) = ordered_join_filter();
     let RuntimeFilterDomain::Ordered { key, .. } = &mut filter.domain else {
         panic!("ordered fixture must have an ordered domain");
@@ -1754,11 +1856,13 @@ fn ordered_runtime_filter_rejects_an_unfrozen_comparison_domain() {
         fragment,
         filter,
         "ordered runtime-filter key type is unsupported by its comparison algorithm",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn runtime_filter_safety_must_match_the_exact_consumer_join_semantics() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let (fragment, mut filter) = ordered_join_filter();
     filter.consumers[0].target = RuntimeFilterConsumerTarget::JoinProbeKey {
         equality: RuntimeFilterEqualityWitnessId::new(999),
@@ -1768,13 +1872,17 @@ fn runtime_filter_safety_must_match_the_exact_consumer_join_semantics() {
         fragment,
         filter,
         "runtime filter equality witness references differ from their definitions",
+        &mut fixture_constants,
     );
 }
 
 #[test]
 fn runtime_filter_late_apply_granularity_must_match_the_consumer_target() {
-    let (fragment, mut filter, _) =
-        null_safe_join_filter(RuntimeFilterNullSemantics::NullSafeEqual);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, mut filter, _) = null_safe_join_filter(
+        RuntimeFilterNullSemantics::NullSafeEqual,
+        &mut fixture_constants,
+    );
     filter.consumers[0].activation =
         RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
             late_apply: LateApplyGranularity::File,
@@ -1784,6 +1892,7 @@ fn runtime_filter_late_apply_granularity_must_match_the_consumer_target() {
         fragment,
         filter,
         "runtime filter late-apply granularity is unsupported at its consumer target",
+        &mut fixture_constants,
     );
 }
 
@@ -1901,7 +2010,9 @@ fn append_broadcast_inner_join(
     )
 }
 
-fn join_build_frontier_fixture() -> JoinBuildFrontierFixture {
+fn join_build_frontier_fixture(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> JoinBuildFrontierFixture {
     let target_fragment = FragmentId::new(210);
     let probe_edge = EdgeId::new(210);
     let nested_probe_edge = EdgeId::new(211);
@@ -1922,6 +2033,7 @@ fn join_build_frontier_fixture() -> JoinBuildFrontierFixture {
             FragmentId::new(220 + u32::try_from(ordinal).unwrap()),
             FragmentSink::Stream { edge },
             false,
+            fixture_constants,
         );
         fragments.push(fragment);
         source_values.push(value);
@@ -2155,6 +2267,7 @@ fn join_build_frontier_fixture() -> JoinBuildFrontierFixture {
 fn build_join_build_frontier_plan(
     fixture: &JoinBuildFrontierFixture,
     filter: RuntimeFilter,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<PhysicalPlan, ValidationErrors> {
     let mut builder = PlanBuilder::new(version());
     for fragment in &fixture.fragments {
@@ -2164,19 +2277,22 @@ fn build_join_build_frontier_plan(
         builder.add_edge(edge.clone()).unwrap();
     }
     builder.add_runtime_filter(filter).unwrap();
-    builder.finish()
+    crate::tests::constant_fixture::publish_plan(builder, fixture_constants)
 }
 
 fn assert_frontier_rejected_at_both_boundaries(
     fixture: &JoinBuildFrontierFixture,
     filter: RuntimeFilter,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) {
-    let valid_plan = build_join_build_frontier_plan(fixture, fixture.filter.clone()).unwrap();
+    let valid_plan =
+        build_join_build_frontier_plan(fixture, fixture.filter.clone(), fixture_constants).unwrap();
     let fragment = &valid_plan.fragments()[&fixture.target_fragment];
     let mut cuts = fragment_cuts(&valid_plan, fixture.target_fragment).unwrap();
     cuts.runtime_filters = Box::from([filter.clone()]);
     let independent = validate_fragment(fragment, &cuts).unwrap_err();
-    let whole_plan = build_join_build_frontier_plan(fixture, filter).unwrap_err();
+    let whole_plan =
+        build_join_build_frontier_plan(fixture, filter, fixture_constants).unwrap_err();
 
     for error in [independent, whole_plan] {
         assert!(error.to_string().contains(
@@ -2187,26 +2303,28 @@ fn assert_frontier_rejected_at_both_boundaries(
 
 #[test]
 fn join_build_frontier_cannot_omit_a_nested_build_subtree_edge() {
-    let fixture = join_build_frontier_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = join_build_frontier_fixture(&mut fixture_constants);
     let mut filter = fixture.filter.clone();
     filter.producers[0].progress = RuntimeFilterProducerProgress {
         build_edges: Box::default(),
         non_build_edges: Box::from([fixture.probe_edge, fixture.outer_sibling_edge]),
     };
 
-    assert_frontier_rejected_at_both_boundaries(&fixture, filter);
+    assert_frontier_rejected_at_both_boundaries(&fixture, filter, &mut fixture_constants);
 }
 
 #[test]
 fn join_build_frontier_non_build_partition_includes_outer_sibling_inbound_edges() {
-    let fixture = join_build_frontier_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = join_build_frontier_fixture(&mut fixture_constants);
     let mut filter = fixture.filter.clone();
     filter.producers[0].progress = RuntimeFilterProducerProgress {
         build_edges: Box::from(fixture.nested_build_edges),
         non_build_edges: Box::from([fixture.probe_edge]),
     };
 
-    assert_frontier_rejected_at_both_boundaries(&fixture, filter);
+    assert_frontier_rejected_at_both_boundaries(&fixture, filter, &mut fixture_constants);
 }
 
 #[derive(Clone, Copy)]
@@ -2219,9 +2337,10 @@ enum TableFunctionFixture {
 fn table_function_fragment(
     left_outer: bool,
     fixture: TableFunctionFixture,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<Fragment, ValidationErrors> {
     let mut builder = FragmentBuilder::new(FragmentId::new(101));
-    let (input, outer_value) = append_literal(&mut builder, false);
+    let (input, outer_value) = append_literal(&mut builder, false, fixture_constants);
     let node = builder.reserve_node_id().unwrap();
     let argument = builder
         .add_expression(
@@ -2312,8 +2431,14 @@ fn table_function_fragment(
 
 #[test]
 fn table_function_relation_results_and_outer_occurrences_have_separate_mappings() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for left_outer in [false, true] {
-        let fragment = table_function_fragment(left_outer, TableFunctionFixture::Valid).unwrap();
+        let fragment = table_function_fragment(
+            left_outer,
+            TableFunctionFixture::Valid,
+            &mut fixture_constants,
+        )
+        .unwrap();
         let root = &fragment.nodes()[&fragment.root()];
         let columns = &root.output.columns;
         assert_eq!(
@@ -2335,7 +2460,8 @@ fn table_function_relation_results_and_outer_occurrences_have_separate_mappings(
         );
         let mut builder = PlanBuilder::new(version());
         builder.add_fragment(fragment).unwrap();
-        let plan = builder.finish_observed(&GroupedConstantControl).unwrap();
+        let plan =
+            crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
         let fragment_id = FragmentId::new(101);
         validate_fragment(
             &plan.fragments()[&fragment_id],
@@ -2347,17 +2473,27 @@ fn table_function_relation_results_and_outer_occurrences_have_separate_mappings(
 
 #[test]
 fn table_function_cannot_claim_outer_input_as_a_function_result() {
-    let error = table_function_fragment(false, TableFunctionFixture::PassThroughAsResult)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = table_function_fragment(
+        false,
+        TableFunctionFixture::PassThroughAsResult,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("table function result value is not owned by its output occurrence"));
 }
 
 #[test]
 fn left_outer_table_function_requires_nullable_function_results() {
-    let error = table_function_fragment(true, TableFunctionFixture::NonNullableOuterResult)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = table_function_fragment(
+        true,
+        TableFunctionFixture::NonNullableOuterResult,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("table function result type differs from its bound schema"));
 }
 
@@ -2444,9 +2580,10 @@ enum HigherOrderFixture {
 
 fn higher_order_function_fragment(
     fixture: HigherOrderFixture,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<Fragment, ValidationErrors> {
     let mut builder = FragmentBuilder::new(FragmentId::new(104));
-    let (input, _) = append_literal(&mut builder, false);
+    let (input, _) = append_literal(&mut builder, false, fixture_constants);
     let node = builder.reserve_node_id().unwrap();
     let lambda = builder.reserve_expression_id().unwrap();
     let parameter_type = ty(DataType::Int64, false);
@@ -2592,12 +2729,13 @@ fn higher_order_function_fragment(
 
 #[test]
 fn higher_order_function_binding_matches_the_exact_lambda_shape() {
-    higher_order_function_fragment(HigherOrderFixture::Valid).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    higher_order_function_fragment(HigherOrderFixture::Valid, &mut fixture_constants).unwrap();
     for fixture in [
         HigherOrderFixture::ScalarBinding,
         HigherOrderFixture::ParameterTypeDrift,
     ] {
-        let error = higher_order_function_fragment(fixture)
+        let error = higher_order_function_fragment(fixture, &mut fixture_constants)
             .unwrap_err()
             .to_string();
         assert!(error.contains("argument 0 shape differs from its bound signature"));
@@ -2606,12 +2744,13 @@ fn higher_order_function_binding_matches_the_exact_lambda_shape() {
 
 #[test]
 fn lambda_cannot_be_reused_outside_its_exact_bound_argument_positions() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for fixture in [
         HigherOrderFixture::ReusedAsExpressionChild,
         HigherOrderFixture::ReusedAsValueArgument,
         HigherOrderFixture::LambdaOperatorRoot,
     ] {
-        let error = higher_order_function_fragment(fixture)
+        let error = higher_order_function_fragment(fixture, &mut fixture_constants)
             .unwrap_err()
             .to_string();
         assert!(
@@ -2632,11 +2771,12 @@ pub(super) enum TableWriterFixture {
 
 pub(super) fn invalid_table_writer_fragment(
     fixture: TableWriterFixture,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<Fragment, ValidationErrors> {
     use novarocks_connector_contract::{ConnectorCodecCategory, ConnectorWriteFieldToken};
 
     let mut builder = FragmentBuilder::new(FragmentId::new(105));
-    let (input, input_value) = append_literal(&mut builder, false);
+    let (input, input_value) = append_literal(&mut builder, false, fixture_constants);
     let writer = builder.reserve_node_id().unwrap();
     let output_specs = [
         (
@@ -2768,56 +2908,72 @@ pub(super) fn invalid_table_writer_fragment(
 
 #[test]
 fn table_writer_input_must_equal_its_exact_child_port() {
-    let error = invalid_table_writer_fragment(TableWriterFixture::InputPort)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error =
+        invalid_table_writer_fragment(TableWriterFixture::InputPort, &mut fixture_constants)
+            .unwrap_err()
+            .to_string();
     assert!(error.contains("table writer input differs from its exact child output"));
 }
 
 #[test]
 fn table_writer_target_fields_must_come_from_its_exact_child_port() {
-    let error = invalid_table_writer_fragment(TableWriterFixture::TargetField)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error =
+        invalid_table_writer_fragment(TableWriterFixture::TargetField, &mut fixture_constants)
+            .unwrap_err()
+            .to_string();
     assert!(error.contains("table writer target field is absent from its exact child output"));
 }
 
 #[test]
 fn table_writer_has_one_input_distribution_authority() {
-    let error = invalid_table_writer_fragment(TableWriterFixture::Distribution)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error =
+        invalid_table_writer_fragment(TableWriterFixture::Distribution, &mut fixture_constants)
+            .unwrap_err()
+            .to_string();
     assert!(error.contains("table writer has two different input distribution contracts"));
 }
 
 #[test]
 fn table_writer_rejects_an_unknown_relation_schema_revision() {
-    let error = invalid_table_writer_fragment(TableWriterFixture::SchemaRevision)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error =
+        invalid_table_writer_fragment(TableWriterFixture::SchemaRevision, &mut fixture_constants)
+            .unwrap_err()
+            .to_string();
     assert!(error.contains("writer relation schema has an unsupported revision or width"));
 }
 
 #[test]
 fn table_writer_rejects_a_relabelled_fixed_relation_field() {
-    let error = invalid_table_writer_fragment(TableWriterFixture::SchemaRole)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error =
+        invalid_table_writer_fragment(TableWriterFixture::SchemaRole, &mut fixture_constants)
+            .unwrap_err()
+            .to_string();
     assert!(error.contains("writer relation field differs from its closed role contract"));
 }
 
 #[test]
 fn table_writer_provider_name_is_complete_and_bounded() {
-    invalid_table_writer_fragment(TableWriterFixture::ProviderName(1)).unwrap();
-    invalid_table_writer_fragment(TableWriterFixture::ProviderName(
-        MAX_DATA_TYPE_FIELD_NAME_BYTES,
-    ))
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    invalid_table_writer_fragment(TableWriterFixture::ProviderName(1), &mut fixture_constants)
+        .unwrap();
+    invalid_table_writer_fragment(
+        TableWriterFixture::ProviderName(MAX_DATA_TYPE_FIELD_NAME_BYTES),
+        &mut fixture_constants,
+    )
     .unwrap();
-    let empty = invalid_table_writer_fragment(TableWriterFixture::ProviderName(0)).unwrap_err();
+    let empty =
+        invalid_table_writer_fragment(TableWriterFixture::ProviderName(0), &mut fixture_constants)
+            .unwrap_err();
     assert!(empty.to_string().contains("empty provider name"));
-    let oversized = invalid_table_writer_fragment(TableWriterFixture::ProviderName(
-        MAX_DATA_TYPE_FIELD_NAME_BYTES + 1,
-    ))
+    let oversized = invalid_table_writer_fragment(
+        TableWriterFixture::ProviderName(MAX_DATA_TYPE_FIELD_NAME_BYTES + 1),
+        &mut fixture_constants,
+    )
     .unwrap_err();
     assert!(oversized.to_string().contains("field-name byte limit"));
 }
@@ -2960,13 +3116,15 @@ fn grouped_reference(pool: u32, target: usize) -> ConstantReference {
 }
 fn grouped_writer_fragment(
     fixture: GroupedWriterFixture,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<Fragment, PlanConstructionError> {
-    grouped_writer_fragment_with_sources(fixture).map(|(fragment, _)| fragment)
+    grouped_writer_fragment_with_sources(fixture, fixture_constants).map(|(fragment, _)| fragment)
 }
 // This helper exercises structure first, then the original mandatory observed
 // constant consumer. It is not a complete FragmentPackage or runtime fixture.
 fn grouped_writer_fragment_with_sources(
     fixture: GroupedWriterFixture,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<(Fragment, ConstantPools), PlanConstructionError> {
     use std::sync::Arc;
 
@@ -2983,7 +3141,7 @@ fn grouped_writer_fragment_with_sources(
     const ROOT_WRITE_RESULT_SCHEMA_REVISION: u32 = 2;
 
     let control = GroupedConstantControl;
-    let pools = grouped_collection_pools(fixture, &control);
+    let mut pools = grouped_collection_pools(fixture, &control);
     let mut builder = FragmentBuilder::new(FragmentId::new(103));
     let input = builder.reserve_node_id().unwrap();
     let finish = builder.reserve_node_id().unwrap();
@@ -3203,20 +3361,22 @@ fn grouped_writer_fragment_with_sources(
             builder
                 .add_expression(
                     finish,
-                    ty(DataType::Binary, false),
-                    ExprKind::Literal(LiteralValue::Binary(
-                        format!("target-{target}-statistics").into_bytes().into(),
-                    )),
+                    (ty(DataType::Binary, false)).clone(),
+                    fixture_constants.binary(
+                        &(format!("target-{target}-statistics").into_bytes()),
+                        &(ty(DataType::Binary, false)),
+                    ),
                 )
                 .unwrap()
         } else {
             builder
                 .add_expression(
                     finish,
-                    ty(DataType::Utf8, false),
-                    ExprKind::Literal(LiteralValue::Utf8(
-                        format!("target-{target}-statistics").into(),
-                    )),
+                    (ty(DataType::Utf8, false)).clone(),
+                    fixture_constants.utf8(
+                        &(format!("target-{target}-statistics")),
+                        &(ty(DataType::Utf8, false)),
+                    ),
                 )
                 .unwrap()
         };
@@ -3351,6 +3511,9 @@ fn grouped_writer_fragment_with_sources(
         dop(),
         crate::StagePlacementPolicy::Singleton,
     )?;
+    for (id, pool) in fixture_constants.for_fragment(&fragment).entries() {
+        pools.insert(*id, pool.clone()).unwrap();
+    }
     crate::constants::validate_fragment_constants_observed(
         &fragment,
         &pools,
@@ -3363,7 +3526,12 @@ fn grouped_writer_fragment_with_sources(
 
 #[test]
 fn writer_grouped_unpivot_allows_a_write_target_without_statistics() {
-    let fragment = grouped_writer_fragment(GroupedWriterFixture::SingleStatisticsTarget).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fragment = grouped_writer_fragment(
+        GroupedWriterFixture::SingleStatisticsTarget,
+        &mut fixture_constants,
+    )
+    .unwrap();
     let NodeKind::TableFinish(finish) = &fragment.nodes()[&fragment.root()].kind else {
         panic!("expected a table finish node");
     };
@@ -3381,8 +3549,12 @@ fn writer_grouped_unpivot_allows_a_write_target_without_statistics() {
 
 #[test]
 fn writer_grouped_unpivot_keeps_target_local_mappings_for_a_shared_aggregate_channel() {
-    let (fragment, pools) =
-        grouped_writer_fragment_with_sources(GroupedWriterFixture::SharedChannel).unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, pools) = grouped_writer_fragment_with_sources(
+        GroupedWriterFixture::SharedChannel,
+        &mut fixture_constants,
+    )
+    .unwrap();
     let NodeKind::TableFinish(finish) = &fragment.nodes()[&fragment.root()].kind else {
         panic!("expected a table finish node");
     };
@@ -3442,25 +3614,33 @@ fn writer_grouped_unpivot_keeps_target_local_mappings_for_a_shared_aggregate_cha
 
 #[test]
 fn writer_grouped_unpivot_requires_every_expected_target() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::MissingTarget)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error =
+        grouped_writer_fragment(GroupedWriterFixture::MissingTarget, &mut fixture_constants)
+            .unwrap_err()
+            .to_string();
     assert!(error.contains("writer grouped Unpivot mappings do not cover every statistics target"));
 }
 
 #[test]
 fn writer_grouped_unpivot_cannot_expand_an_intermediate_input_as_a_final_result() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::NonFinalInput)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error =
+        grouped_writer_fragment(GroupedWriterFixture::NonFinalInput, &mut fixture_constants)
+            .unwrap_err()
+            .to_string();
     assert!(error.contains("writer grouped Unpivot mapping input is not a final aggregate output"));
 }
 
 #[test]
 fn writer_grouped_unpivot_cannot_drop_a_declared_final_aggregate_output() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::UnmappedFinalOutput)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::UnmappedFinalOutput,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(
         error.contains("writer grouped Unpivot mappings do not cover every final aggregate output")
     );
@@ -3468,17 +3648,25 @@ fn writer_grouped_unpivot_cannot_drop_a_declared_final_aggregate_output() {
 
 #[test]
 fn writer_grouped_unpivot_constants_must_match_the_root_relation_field_types() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::WrongConstantType)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::WrongConstantType,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("writer grouped Unpivot constant type differs from its literal output"));
 }
 
 #[test]
 fn writer_final_aggregates_require_a_grouped_unpivot_contract() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::MissingGroupedUnpivot)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::MissingGroupedUnpivot,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains(
         "table finish final aggregates and grouped Unpivot must be both absent or both present"
     ));
@@ -3486,33 +3674,49 @@ fn writer_final_aggregates_require_a_grouped_unpivot_contract() {
 
 #[test]
 fn writer_grouped_unpivot_rejects_a_duplicate_target_input_pair() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::DuplicateMapping)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::DuplicateMapping,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("writer grouped Unpivot repeats a target and aggregate output mapping"));
 }
 
 #[test]
 fn writer_grouped_unpivot_scalar_constants_must_be_literals() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::NonLiteralScalar)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::NonLiteralScalar,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("writer grouped Unpivot constant type differs from its literal output"));
 }
 
 #[test]
 fn writer_grouped_unpivot_value_output_type_must_match_the_final_aggregate() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::MismatchedValueOutputType)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::MismatchedValueOutputType,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("writer grouped Unpivot aggregate type differs from its value output"));
 }
 
 #[test]
 fn writer_grouped_unpivot_value_and_literal_roles_cannot_overlap() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::OverlappingOutputRoles)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::OverlappingOutputRoles,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains(
         "writer grouped Unpivot roles do not exactly cover distinct auxiliary finish fields"
     ));
@@ -3520,9 +3724,13 @@ fn writer_grouped_unpivot_value_and_literal_roles_cannot_overlap() {
 
 #[test]
 fn writer_grouped_unpivot_roles_must_cover_every_auxiliary_output() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::UncoveredAuxiliaryOutput)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::UncoveredAuxiliaryOutput,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains(
         "writer grouped Unpivot roles do not exactly cover distinct auxiliary finish fields"
     ));
@@ -3530,7 +3738,9 @@ fn writer_grouped_unpivot_roles_must_cover_every_auxiliary_output() {
 
 #[test]
 fn writer_grouped_unpivot_map_keys_must_be_non_empty() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::EmptyMapKey).unwrap_err();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(GroupedWriterFixture::EmptyMapKey, &mut fixture_constants)
+        .unwrap_err();
     assert_eq!(
         error,
         PlanConstructionError::Constants(ConstantReferenceError::InvalidConsumer(
@@ -3541,7 +3751,12 @@ fn writer_grouped_unpivot_map_keys_must_be_non_empty() {
 
 #[test]
 fn writer_grouped_unpivot_map_keys_must_be_strictly_ordered() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::UnsortedMapKeys).unwrap_err();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::UnsortedMapKeys,
+        &mut fixture_constants,
+    )
+    .unwrap_err();
     assert_eq!(
         error,
         PlanConstructionError::Constants(ConstantReferenceError::InvalidConsumer(
@@ -3552,7 +3767,12 @@ fn writer_grouped_unpivot_map_keys_must_be_strictly_ordered() {
 
 #[test]
 fn writer_grouped_unpivot_map_keys_must_be_unique() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::DuplicateMapKey).unwrap_err();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::DuplicateMapKey,
+        &mut fixture_constants,
+    )
+    .unwrap_err();
     assert_eq!(
         error,
         PlanConstructionError::Constants(ConstantReferenceError::InvalidConsumer(
@@ -3563,33 +3783,49 @@ fn writer_grouped_unpivot_map_keys_must_be_unique() {
 
 #[test]
 fn table_finish_input_schema_must_equal_its_exact_child_port() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::InputSchemaDrift)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::InputSchemaDrift,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("table finish input schema differs from its exact child output"));
 }
 
 #[test]
 fn table_finish_aggregate_input_must_come_from_its_exact_child_port() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::AggregateInputDrift)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::AggregateInputDrift,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("table finish aggregate input is absent from its exact child output"));
 }
 
 #[test]
 fn writer_aggregate_single_input_carrier_rejects_multi_argument_bindings() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::MultiArgumentBinding)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::MultiArgumentBinding,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("writer aggregate carrier supports exactly one logical argument"));
 }
 
 #[test]
 fn writer_grouped_unpivot_grouping_input_must_have_the_target_ordinal_role() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::GroupingRoleDrift)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::GroupingRoleDrift,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(
         error.contains(
             "writer grouped Unpivot grouping input is not the finish target ordinal field"
@@ -3599,9 +3835,13 @@ fn writer_grouped_unpivot_grouping_input_must_have_the_target_ordinal_role() {
 
 #[test]
 fn writer_grouped_unpivot_passthrough_must_be_owned_as_the_target_ordinal() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::PassthroughOriginDrift)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::PassthroughOriginDrift,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains(
         "writer grouped Unpivot passthrough output is not this finish node's target ordinal"
     ));
@@ -3609,16 +3849,24 @@ fn writer_grouped_unpivot_passthrough_must_be_owned_as_the_target_ordinal() {
 
 #[test]
 fn writer_grouped_unpivot_rejects_output_bounds_above_the_contract_maximum() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::OutputLimitExceeded)
-        .unwrap_err()
-        .to_string();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::OutputLimitExceeded,
+        &mut fixture_constants,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("unpivot row/byte bounds are zero or exceed the contract maximum"));
 }
 
 #[test]
 fn writer_grouped_unpivot_rejects_nested_literal_collections_above_the_budget() {
-    let error =
-        grouped_writer_fragment(GroupedWriterFixture::NestedLiteralBudgetExceeded).unwrap_err();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let error = grouped_writer_fragment(
+        GroupedWriterFixture::NestedLiteralBudgetExceeded,
+        &mut fixture_constants,
+    )
+    .unwrap_err();
     assert_eq!(
         error,
         PlanConstructionError::Constants(ConstantReferenceError::Control(
@@ -3629,6 +3877,7 @@ fn writer_grouped_unpivot_rejects_nested_literal_collections_above_the_budget() 
 
 #[test]
 fn writer_grouped_unpivot_source_gate_preserves_each_original_control_and_ordinary_tail() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
     use std::sync::Mutex;
     struct Control {
@@ -3651,8 +3900,11 @@ fn writer_grouped_unpivot_source_gate_preserves_each_original_control_and_ordina
             }
         }
     }
-    let (fragment, pools) =
-        grouped_writer_fragment_with_sources(GroupedWriterFixture::SharedChannel).unwrap();
+    let (fragment, pools) = grouped_writer_fragment_with_sources(
+        GroupedWriterFixture::SharedChannel,
+        &mut fixture_constants,
+    )
+    .unwrap();
     let mut parts = fragment.clone().into_parts();
     let NodeKind::TableFinish(finish) = &mut parts.nodes.get_mut(&fragment.root()).unwrap().kind
     else {
@@ -3715,6 +3967,7 @@ fn writer_grouped_unpivot_source_gate_preserves_each_original_control_and_ordina
 
 #[test]
 fn package_parameter_closure_includes_writer_final_state_calls() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_type_contract::{
         ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase,
         ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
@@ -3729,7 +3982,9 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
             Ok(())
         }
     }
-    let fragment = grouped_writer_fragment(GroupedWriterFixture::SharedChannel).unwrap();
+    let fragment =
+        grouped_writer_fragment(GroupedWriterFixture::SharedChannel, &mut fixture_constants)
+            .unwrap();
     let reference = SemanticParameterRef {
         id: SemanticParameterId::new(u32::MAX),
         expected_key: SemanticParameterKey::TimeZone,
@@ -3741,7 +3996,7 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
         assert!(matches!(
             fragment.expressions().get(root.expr).unwrap().kind,
-            ExprKind::Literal(_)
+            ExprKind::Constant(_)
         ));
         let id = ExpressionUseId::new(ordinal as u32);
         invocations.push(ExpressionInvocation {

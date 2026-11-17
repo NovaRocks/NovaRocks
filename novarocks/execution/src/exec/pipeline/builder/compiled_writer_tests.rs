@@ -44,15 +44,14 @@ use novarocks_local_compiler::{
 };
 use novarocks_local_program::{KernelAbiVersion, LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
-    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprKind,
-    Fragment, FragmentBuilder, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, LiteralValue, NodeId, NodeKind, OutputPort,
-    PhysicalExpressionRoots, PhysicalNode, PhysicalPlan, PhysicalProperties, PhysicalRootUses,
-    PipelineDopDomain, PlanBuilder, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
-    ROOT_WRITE_RESULT_SCHEMA_REVISION, ResultField, ResultPort, RowMultiplicity, ValueOrigin,
-    WRITER_MULTIPLEX_SCHEMA_REVISION, WriteTargetOrdinal, WriterDerivedKind, WriterFinishSpec,
-    WriterRelationField, WriterRelationFieldRole, WriterRelationSchema, WriterTarget,
-    WriterTargetField, extract_fragment_packages,
+    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, Fragment,
+    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink, FrozenFragmentCalls,
+    FrozenFragmentPruning, NodeId, NodeKind, OutputPort, PhysicalExpressionRoots, PhysicalNode,
+    PhysicalPlan, PhysicalProperties, PhysicalRootUses, PipelineDopDomain, PlanLimits,
+    PlanVersionId, PropertyProofProjectionLimits, ROOT_WRITE_RESULT_SCHEMA_REVISION, ResultField,
+    ResultPort, RowMultiplicity, ValueOrigin, WRITER_MULTIPLEX_SCHEMA_REVISION, WriteTargetOrdinal,
+    WriterDerivedKind, WriterFinishSpec, WriterRelationField, WriterRelationFieldRole,
+    WriterRelationSchema, WriterTarget, WriterTargetField, extract_fragment_packages,
 };
 use novarocks_spi::connector::write_stack::{
     ConnectorBatchWriter, ConnectorCommitFragment, ConnectorOpenWriterRequest,
@@ -189,7 +188,7 @@ fn draft_with_storage(
 /// The writer multiplex relation (`root == false`) or the Root result
 /// relation (`root == true`): the SPI's own schema, field by field.
 fn relation_fields(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     owner: NodeId,
     root: bool,
 ) -> Box<[WriterRelationField]> {
@@ -254,8 +253,11 @@ fn plan(rows: &[(Option<i64>, &str)]) -> (PhysicalPlan, NodeId) {
         rows.iter()
             .map(|(value, text)| {
                 [
-                    ExprKind::Literal(value.map_or(LiteralValue::Null, LiteralValue::Int64)),
-                    ExprKind::Literal(LiteralValue::Utf8((*text).into())),
+                    value.map_or(
+                        crate::exec::operators::family_fixture::constant_sources::null(),
+                        crate::exec::operators::family_fixture::constant_sources::i64,
+                    ),
+                    crate::exec::operators::family_fixture::constant_sources::utf8((*text).into()),
                 ]
             })
             .collect(),
@@ -266,12 +268,21 @@ fn plan(rows: &[(Option<i64>, &str)]) -> (PhysicalPlan, NodeId) {
 
 fn plan_with_cells(
     types: [FunctionValueType; 2],
-    rows: Vec<[ExprKind; 2]>,
+    rows: Vec<[novarocks_functions::ConstantValue; 2]>,
     draft: &ConnectorWriteRecipeDraft,
     constants: novarocks_physical_plan::ConstantPools,
 ) -> (PhysicalPlan, NodeId) {
+    let fixture_sources =
+        crate::exec::operators::family_fixture::constant_sources::Sources::from_pools(
+            constants.clone(),
+        );
+
     let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
-    let mut builder = FragmentBuilder::new(FragmentId::new(1));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(1),
+            &fixture_sources,
+        );
     let source = builder.reserve_node_id().unwrap();
     let values = types
         .iter()
@@ -293,7 +304,7 @@ fn plan_with_cells(
         .map(|row| {
             row.into_iter()
                 .zip(&types)
-                .map(|(kind, ty)| builder.add_expression(source, ty.clone(), kind).unwrap())
+                .map(|(value, ty)| builder.constant(source, ty.clone(), value))
                 .collect::<Box<[_]>>()
         })
         .collect::<Box<[_]>>();
@@ -376,7 +387,11 @@ fn plan_with_cells(
         )
         .unwrap();
 
-    let mut builder = FragmentBuilder::new(FragmentId::new(2));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(2),
+            &fixture_sources,
+        );
     let exchange = builder.reserve_node_id().unwrap();
     let imported = fields
         .iter()
@@ -461,8 +476,11 @@ fn plan_with_cells(
         )
         .unwrap();
 
-    let mut plan =
-        PlanBuilder::new(PlanVersionId::try_new([8; 16]).unwrap()).with_constant_pools(constants);
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([8; 16]).unwrap(),
+        &fixture_sources,
+    )
+    .with_constant_pools(constants);
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
@@ -1085,7 +1103,7 @@ fn a_null_into_a_not_null_provider_field_is_refused_before_any_page_is_written()
 fn nested_insert(child: Option<i64>, source_child_nullable: bool, parent_valid: bool) -> Insert {
     use arrow::array::StructArray;
     use arrow::buffer::NullBuffer;
-    use novarocks_physical_plan::{ConstantPool, ConstantPoolId, ConstantPools, ConstantReference};
+    use novarocks_physical_plan::{ConstantPool, ConstantPoolId, ConstantPools};
     let source_fields = vec![Field::new("f", DataType::Int64, source_child_nullable)].into();
     let array = StructArray::try_new(
         source_fields,
@@ -1129,11 +1147,8 @@ fn nested_insert(child: Option<i64>, source_child_nullable: bool, parent_valid: 
     let (plan, receiver) = plan_with_cells(
         [ty(DataType::Int64, false), source],
         vec![[
-            ExprKind::Literal(LiteralValue::Int64(1)),
-            ExprKind::Constant(ConstantReference {
-                pool: id,
-                ordinal: 0,
-            }),
+            crate::exec::operators::family_fixture::constant_sources::i64(1),
+            pools.entries()[&id].value(0).unwrap(),
         ]],
         &target,
         pools,
@@ -1149,7 +1164,7 @@ fn nested_insert(child: Option<i64>, source_child_nullable: bool, parent_valid: 
 fn nested_fixed_insert(child: Option<[u8; 4]>, parent_valid: bool) -> Insert {
     use arrow::array::StructArray;
     use arrow::buffer::NullBuffer;
-    use novarocks_physical_plan::{ConstantPool, ConstantPoolId, ConstantPools, ConstantReference};
+    use novarocks_physical_plan::{ConstantPool, ConstantPoolId, ConstantPools};
     let source_fields = vec![Field::new("f", DataType::FixedSizeBinary(4), true)].into();
     let array = StructArray::try_new(
         source_fields,
@@ -1208,11 +1223,8 @@ fn nested_fixed_insert(child: Option<[u8; 4]>, parent_valid: bool) -> Insert {
     let (plan, receiver) = plan_with_cells(
         [ty(DataType::Int64, false), source],
         vec![[
-            ExprKind::Literal(LiteralValue::Int64(1)),
-            ExprKind::Constant(ConstantReference {
-                pool: id,
-                ordinal: 0,
-            }),
+            crate::exec::operators::family_fixture::constant_sources::i64(1),
+            pools.entries()[&id].value(0).unwrap(),
         ]],
         &target,
         pools,
@@ -1740,9 +1752,9 @@ mod statistics {
     }
 
     fn with_requests<'a>(
-        fragment: Fragment,
+        fragment: crate::exec::operators::family_fixture::constant_sources::Fragment,
         sites: impl Iterator<Item = (PhysicalCallSite, &'a AggregateBinding)>,
-    ) -> Fragment {
+    ) -> crate::exec::operators::family_fixture::constant_sources::Fragment {
         let mut entries = fragment
             .call_requests()
             .entries()
@@ -1763,9 +1775,16 @@ mod statistics {
     /// The two-fragment plan of `INSERT INTO t VALUES <rows>` into write
     /// target `target`, collecting a Theta sketch of each column.
     fn plan(target: u32, rows: &[(i64, Option<&str>)]) -> (PhysicalPlan, NodeId) {
+        let fixture_sources =
+            crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
         let catalog = theta_catalog();
         let ordinal = WriteTargetOrdinal::try_new(target).unwrap();
-        let mut builder = FragmentBuilder::new(FragmentId::new(1));
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                FragmentId::new(1),
+                &fixture_sources,
+            );
         let source = builder.reserve_node_id().unwrap();
         // The source declaration comes from the same explicit provider-column
         // vocabulary used by the original Theta request, independently of
@@ -1789,23 +1808,23 @@ mod statistics {
         let cells = rows
             .iter()
             .map(|(int, text)| {
-                let int = builder
-                    .add_expression(
-                        source,
-                        types[0].clone(),
-                        ExprKind::Literal(LiteralValue::Int64(*int)),
-                    )
-                    .unwrap();
-                let text = builder
-                    .add_expression(
-                        source,
-                        types[1].clone(),
-                        ExprKind::Literal(match text {
-                            Some(text) => LiteralValue::Utf8((*text).into()),
-                            None => LiteralValue::Null,
-                        }),
-                    )
-                    .unwrap();
+                let int = builder.constant(
+                    source,
+                    types[0].clone(),
+                    crate::exec::operators::family_fixture::constant_sources::i64(*int),
+                );
+                let text = builder.constant(
+                    source,
+                    types[1].clone(),
+                    match text {
+                        Some(text) => {
+                            crate::exec::operators::family_fixture::constant_sources::utf8(
+                                (*text).into(),
+                            )
+                        }
+                        None => crate::exec::operators::family_fixture::constant_sources::null(),
+                    },
+                );
                 Box::from([int, text])
             })
             .collect::<Box<[_]>>();
@@ -1939,7 +1958,11 @@ mod statistics {
             }),
         );
 
-        let mut builder = FragmentBuilder::new(FragmentId::new(2));
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                FragmentId::new(2),
+                &fixture_sources,
+            );
         let exchange = builder.reserve_node_id().unwrap();
         let imported = fields
             .iter()
@@ -2017,13 +2040,13 @@ mod statistics {
             .unwrap();
         let mappings = (0..2u32)
             .map(|channel| {
-                let blob = builder
-                    .add_expression(
-                        finish,
-                        ty(DataType::Utf8, false),
-                        ExprKind::Literal(LiteralValue::Utf8(BLOB_TYPE.into())),
-                    )
-                    .unwrap();
+                let blob = builder.constant(
+                    finish,
+                    ty(DataType::Utf8, false),
+                    crate::exec::operators::family_fixture::constant_sources::utf8(
+                        BLOB_TYPE.into(),
+                    ),
+                );
                 WriterGroupedUnpivotMapping {
                     write_target_ordinal: ordinal,
                     input: final_aggregates[channel as usize].output,
@@ -2106,7 +2129,10 @@ mod statistics {
             }),
         );
 
-        let mut plan = PlanBuilder::new(PlanVersionId::try_new([8; 16]).unwrap());
+        let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+            PlanVersionId::try_new([8; 16]).unwrap(),
+            &fixture_sources,
+        );
         for (id, pool) in pools() {
             plan.insert_constant_pool(id, pool).unwrap();
         }

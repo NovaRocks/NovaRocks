@@ -32,7 +32,7 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{
     BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
     FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning,
-    FrozenPhysicalCall, LiteralValue, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
+    FrozenPhysicalCall, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
     PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
     RootUseBindingError, UnaryOperator, ValidationErrors, ValueOrigin,
 };
@@ -185,12 +185,12 @@ impl IfAuthor {
 fn original_request_sources(
     fragment: Fragment,
     call: &Option<(ExprId, IfAuthor)>,
+    mut pools: novarocks_physical_plan::ConstantPools,
 ) -> (Fragment, novarocks_physical_plan::ConstantPools) {
     use novarocks_physical_plan::{
-        ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallDefinition,
-        PhysicalCallRequest, StaticFunctionArgument,
+        ConstantPoolId, ConstantReference, PhysicalCallDefinition, PhysicalCallRequest,
+        StaticFunctionArgument,
     };
-    let mut pools = ConstantPools::empty();
     let mut backing_ids = std::collections::BTreeMap::new();
     let mut entries = vec![];
     for (definition, owner) in call.iter() {
@@ -249,6 +249,7 @@ fn original_request_sources(
     )
 }
 struct Fixture {
+    constants: novarocks_physical_plan::ConstantPools,
     fragment: Fragment,
     wrapper: ExprId,
     input: ExprId,
@@ -264,6 +265,7 @@ fn fixture(
     let source = NodeId::new(u32::MAX);
     let input = NodeId::new(44);
     let root = NodeId::new(0);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(FragmentId::new(93));
     builder
         .add_values(source, Box::from([Box::default()]), Box::default())
@@ -272,7 +274,7 @@ fn fixture(
         .add_expression(
             input,
             input_type.clone(),
-            ExprKind::Literal(LiteralValue::Null),
+            crate::test_constants::null(&mut constants, &input_type, options().constants),
         )
         .unwrap();
     let value = builder
@@ -404,6 +406,7 @@ fn fixture(
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     Ok(Fixture {
+        constants,
         fragment,
         wrapper,
         input: reference,
@@ -438,7 +441,7 @@ fn uses(fixture: &Fixture, claim: Flow) -> Result<PhysicalRootUses, RootUseBindi
                     (ControlShape::Eager, std::slice::from_ref(expr))
                 }
                 ExprKind::FunctionCall { args, .. } => (ControlShape::If, args.as_ref()),
-                ExprKind::Value(_) | ExprKind::Literal(_) => (ControlShape::Eager, &[][..]),
+                ExprKind::Value(_) | ExprKind::Constant(_) => (ControlShape::Eager, &[][..]),
                 other => panic!("fixture has no exact control projection for {other:?}"),
             };
             if expr == fixture.wrapper && matches!(claim, Flow::WrongControl) {
@@ -506,13 +509,15 @@ fn uses(fixture: &Fixture, claim: Flow) -> Result<PhysicalRootUses, RootUseBindi
 }
 fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<FragmentPackage> {
     let Fixture {
+        constants,
         fragment,
         wrapper,
         input,
         call,
     } = fixture;
-    let (fragment, constants) = original_request_sources(fragment, &call);
+    let (fragment, constants) = original_request_sources(fragment, &call, constants);
     let fixture = Fixture {
+        constants: constants.clone(),
         fragment,
         wrapper,
         input,

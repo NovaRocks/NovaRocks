@@ -706,7 +706,7 @@ fn static_requests_window_logical_count_excludes_function_order_channels() {
         owner: NodeId::new(9),
         lambda_scope: None,
         ty: integer(false),
-        kind: ExprKind::Literal(crate::LiteralValue::Int64(number)),
+        kind: ExprKind::Value(crate::ValueId::new(number)),
     };
     // This is an unpublished receiver-shape fixture, not an installed Window
     // capability: one logical argument and one independent function ORDER.

@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use novarocks_local_program::StaticExprKind;
 
 #[derive(Clone, Copy)]
@@ -26,12 +27,23 @@ enum CaseKind {
     DeferredRandom,
     ErrorThen,
 }
-fn literal_i64(builder: &mut FragmentBuilder, value: i64) -> ExprId {
+fn literal_i64(
+    builder: &mut FragmentBuilder,
+    value: i64,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
+) -> ExprId {
     builder
         .add_expression(
             NodeId::new(0),
-            FunctionValueType::new(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Int64(value)),
+            (FunctionValueType::new(DataType::Int64, false)).clone(),
+            checked_constants::kind(
+                source_pools,
+                checked_constants::i64(
+                    &(FunctionValueType::new(DataType::Int64, false)),
+                    value,
+                    options().constants,
+                ),
+            ),
         )
         .unwrap()
 }
@@ -39,9 +51,10 @@ fn constant_rand(
     builder: &mut FragmentBuilder,
     authors: &mut BTreeMap<ExprId, Author>,
     functions: &PureEngineFunctionCatalog,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> ExprId {
     let ty = FunctionValueType::new(DataType::Int64, false);
-    let seed = literal_i64(builder, 42);
+    let seed = literal_i64(builder, 42, source_pools);
     call(
         builder,
         authors,
@@ -59,8 +72,9 @@ fn rounded(
     authors: &mut BTreeMap<ExprId, Author>,
     functions: &PureEngineFunctionCatalog,
     value: ExprId,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> ExprId {
-    let digits = literal_i64(builder, -1);
+    let digits = literal_i64(builder, -1, source_pools);
     call(
         builder,
         authors,
@@ -80,6 +94,7 @@ fn rounded(
     )
 }
 fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let fragment_id = FragmentId::new(199);
     let source = NodeId::new(u32::MAX);
@@ -104,7 +119,14 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -136,10 +158,10 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
             let when_second = builder
                 .add_expression(output, boolean, ExprKind::Value(second))
                 .unwrap();
-            let first = literal_i64(&mut builder, 11);
-            let second = literal_i64(&mut builder, 22);
+            let first = literal_i64(&mut builder, 11, &mut source_pools);
+            let second = literal_i64(&mut builder, 22, &mut source_pools);
             let otherwise = if matches!(kind, CaseKind::Priority) {
-                Some(literal_i64(&mut builder, 33))
+                Some(literal_i64(&mut builder, 33, &mut source_pools))
             } else {
                 None
             };
@@ -156,7 +178,13 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
                 let value = builder
                     .add_expression(output, decimal.clone(), ExprKind::Value(decimal_value))
                     .unwrap();
-                let round = rounded(&mut builder, &mut authors, &functions, value);
+                let round = rounded(
+                    &mut builder,
+                    &mut authors,
+                    &functions,
+                    value,
+                    &mut source_pools,
+                );
                 builder
                     .add_expression(
                         output,
@@ -172,9 +200,10 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
                     .add_expression(output, boolean, ExprKind::Value(second))
                     .unwrap()
             };
-            let first = constant_rand(&mut builder, &mut authors, &functions);
-            let second = constant_rand(&mut builder, &mut authors, &functions);
-            let otherwise = constant_rand(&mut builder, &mut authors, &functions);
+            let first = constant_rand(&mut builder, &mut authors, &functions, &mut source_pools);
+            let second = constant_rand(&mut builder, &mut authors, &functions, &mut source_pools);
+            let otherwise =
+                constant_rand(&mut builder, &mut authors, &functions, &mut source_pools);
             (
                 when_second,
                 first,
@@ -190,7 +219,13 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
             let value = builder
                 .add_expression(output, decimal.clone(), ExprKind::Value(decimal_value))
                 .unwrap();
-            let first = rounded(&mut builder, &mut authors, &functions, value);
+            let first = rounded(
+                &mut builder,
+                &mut authors,
+                &functions,
+                value,
+                &mut source_pools,
+            );
             let fallback = builder
                 .add_expression(output, decimal.clone(), ExprKind::Value(fallback))
                 .unwrap();
@@ -251,7 +286,7 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
             ty: result_type,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
 }
 fn case_batch(
     program: &LocalProgram,

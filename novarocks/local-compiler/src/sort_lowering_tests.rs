@@ -104,7 +104,12 @@ pub(super) fn package(
             .add_expression(
                 filter,
                 FunctionValueType::new(DataType::Boolean, false),
-                ExprKind::Literal(novarocks_physical_plan::LiteralValue::Boolean(true)),
+                crate::test_constants::boolean(
+                    &mut input.constants,
+                    &FunctionValueType::new(DataType::Boolean, false),
+                    true,
+                    compile_options().constants,
+                ),
             )
             .unwrap();
         builder

@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{
     Date32Array, Float32Array, NullArray, StringArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
@@ -26,8 +27,9 @@ fn checked_package(
     fragment: Fragment,
     authors: &BTreeMap<ExprId, Author>,
     result: ResultPort,
+    source_pools: novarocks_physical_plan::ConstantPools,
 ) -> Arc<FragmentPackage> {
-    let (fragment, constants) = original_request_sources(fragment, authors);
+    let (fragment, constants) = original_request_sources(fragment, authors, source_pools);
     let fragment_id = fragment.id();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
     let mut flow_author = FlowAuthor::new();
@@ -172,6 +174,7 @@ fn nullsafe_fixture(
     ty: FunctionValueType,
     right_kind: Right,
 ) -> (PureEngineFunctionCatalog, Arc<FragmentPackage>) {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let mut builder = FragmentBuilder::new(FragmentId::new(307));
     let source = NodeId::new(u32::MAX);
@@ -184,7 +187,14 @@ fn nullsafe_fixture(
     let mut items = vec![];
     for id in ids {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .add_expression(
+                input,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -208,7 +218,12 @@ fn nullsafe_fixture(
             .unwrap(),
         Right::Random => {
             let integer = FunctionValueType::new(DataType::Int64, false);
-            let seed = literal(&mut builder, &integer, LiteralValue::Int64(42));
+            let seed = literal(
+                &mut builder,
+                &integer,
+                checked_constants::i64(&integer, 42, options().constants),
+                &mut source_pools,
+            );
             call(
                 &mut builder,
                 &mut authors,
@@ -226,7 +241,12 @@ fn nullsafe_fixture(
                 .add_expression(output, ty.clone(), ExprKind::Value(ids[1]))
                 .unwrap();
             let integer = FunctionValueType::new(DataType::Int64, false);
-            let digits = literal(&mut builder, &integer, LiteralValue::Int64(-1));
+            let digits = literal(
+                &mut builder,
+                &integer,
+                checked_constants::i64(&integer, -1, options().constants),
+                &mut source_pools,
+            );
             call(
                 &mut builder,
                 &mut authors,
@@ -292,7 +312,7 @@ fn nullsafe_fixture(
             ty: result_type,
         }]),
     };
-    let package = checked_package(&functions, fragment, &authors, result);
+    let package = checked_package(&functions, fragment, &authors, result, source_pools);
     (functions, package)
 }
 fn nullsafe_program(ty: FunctionValueType, right_kind: Right) -> Arc<LocalProgram> {
