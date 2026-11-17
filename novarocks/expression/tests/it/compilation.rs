@@ -2791,3 +2791,320 @@ fn nullable_boolean_connectives_require_actual_deciding_cv_under_both_root_deman
         );
     }
 }
+
+#[test]
+fn sparse_non_dfs_nested_shared_calls_keep_actual_edges_claims_and_compile_prefixes() {
+    use novarocks_functions::{
+        CallArgumentUses, CallEffectInput, PureCallPreparation, ScopedExpressionEffects,
+    };
+    // Reuse the installed RAND fixture's real metadata, request and control.
+    // Only use coordinates are projected below; the SDK remains the sole
+    // author of control shape, guards, child edges and ordered roots.
+    let (template, catalog, parameters) = rand_unit();
+    let source = template
+        .definitions()
+        .iter()
+        .find(|node| matches!(node.kind, ExprKind::FunctionCall { .. }))
+        .unwrap();
+    let mut b = builder();
+    let rand = b.add(None, source.ty.clone(), source.kind.clone()).unwrap();
+    b.request(rand, template.requests()[&source.id].clone())
+        .unwrap();
+    let original = template
+        .control_flow()
+        .uses()
+        .values()
+        .find(|item| item.definition == source.id)
+        .unwrap();
+    b.definition_control(
+        rand,
+        DefinitionControl {
+            shape: original.control,
+            temporal_sources: None,
+        },
+    )
+    .unwrap();
+    let shared = b
+        .add(
+            None,
+            boolean(false),
+            ExprKind::IsNull {
+                expr: rand,
+                negated: false,
+            },
+        )
+        .unwrap();
+    let root = b
+        .add(
+            None,
+            boolean(false),
+            ExprKind::Conjunction {
+                args: Box::new([shared, shared]),
+            },
+        )
+        .unwrap();
+    let value_root = b
+        .root(root, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let truth_root = b
+        .root(root, EvaluationDemand::TruthOnly, RootScope::AllPorts)
+        .unwrap();
+    let c = Control::good();
+    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
+    let sealed = b.seal(vec![], &mut work).unwrap();
+    assert_eq!(sealed.uses().len(), 10);
+    let permutation = [7u32, 2, 9, 0, 5, 1, 8, 3, 6, 4];
+    let ids: BTreeMap<_, _> = sealed
+        .uses()
+        .keys()
+        .enumerate()
+        .map(|(ordinal, &old)| (old, ExpressionUseId::new(1009 + 17 * permutation[ordinal])))
+        .collect();
+    let regions = sealed
+        .control_flow()
+        .regions()
+        .values()
+        .map(|region| ExpressionEvaluationRegion {
+            guard: region.guard.map(|guard| RegionGuard {
+                owner: ids[&guard.owner],
+                kind: guard.kind,
+            }),
+            ..*region
+        })
+        .collect();
+    let invocations = sealed
+        .uses()
+        .values()
+        .map(|item| ExpressionInvocation {
+            context: ExpressionEffectContext {
+                use_id: ids[&item.context.use_id],
+                ..item.context
+            },
+            definition: item.definition,
+            control: item.control,
+            arguments: item.arguments.iter().map(|id| ids[id]).collect(),
+        })
+        .collect();
+    let definitions = Definitions(sealed.definitions().iter().map(|node| node.id).collect());
+    let flow = ExpressionControlFlow::try_new_in(
+        regions,
+        invocations,
+        &definitions,
+        &mut |_| Ok(()),
+        &mut work,
+    )
+    .unwrap();
+    // Both numerical directions occur. Neither a sorted use map nor definition
+    // order is an evaluation schedule for this fixed graph.
+    assert!(
+        flow.uses()
+            .iter()
+            .any(|(&id, item)| item.arguments.iter().any(|child| id < *child))
+    );
+    assert!(
+        flow.uses()
+            .iter()
+            .any(|(&id, item)| item.arguments.iter().any(|child| id > *child))
+    );
+    let pools = ConstantPools::empty();
+    let request =
+        materialize_call_request_observed(&sealed.requests()[&rand], &pools, &mut work, 0).unwrap();
+    let bound = catalog
+        .metadata()
+        .resolve_bound_user("rand", FunctionKind::Scalar, request.request(), &c)
+        .unwrap();
+    let selected = Arc::new(bound.selected.clone());
+    let mut claims = BTreeMap::new();
+    for (&id, item) in flow
+        .uses()
+        .iter()
+        .filter(|(_, item)| item.definition == rand)
+    {
+        let fresh = catalog
+            .prepare_fresh(
+                CallEffectInput {
+                    context: item.context.into(),
+                    argument_uses: CallArgumentUses::SelectedChannels(&[]),
+                    function_id: &bound.function_id,
+                    kind: bound.kind,
+                    selected: selected.as_ref(),
+                    request: request.request(),
+                    environment: &[],
+                    parameters: &parameters,
+                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                    proof_scope: CallProofScope::Region(item.context.region),
+                },
+                Arc::clone(&selected),
+                PureCallPreparation::Scalar {
+                    arguments: ScopedExpressionEffects::pure_value(item.context),
+                },
+                &c,
+            )
+            .unwrap();
+        claims.insert(
+            id,
+            ExpressionCallClaim {
+                context: item.context,
+                effects: fresh.call_contract().effects().clone(),
+                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                temporal_source: None,
+                regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
+            },
+        );
+    }
+    assert_eq!(claims.len(), 4);
+    let roots: Vec<_> = sealed.root_use_ids().iter().map(|id| ids[id]).collect();
+    let unit = BoundExprSet::try_from_parts_in(
+        UnitParts::new(
+            sealed.ports().to_vec().into_boxed_slice(),
+            sealed.definitions().to_vec().into_boxed_slice(),
+            sealed.roots().to_vec().into_boxed_slice(),
+            roots.clone().into_boxed_slice(),
+            flow,
+            claims,
+            sealed.requests().clone(),
+        ),
+        limits(),
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    assert_eq!(
+        unit.root_use_ids()[value_root.get() as usize],
+        roots[value_root.get() as usize]
+    );
+    assert_eq!(
+        unit.root_use_ids()[truth_root.get() as usize],
+        roots[truth_root.get() as usize]
+    );
+    assert_eq!(
+        unit.roots()[value_root.get() as usize].demand,
+        EvaluationDemand::Value
+    );
+    assert_eq!(
+        unit.roots()[truth_root.get() as usize].demand,
+        EvaluationDemand::TruthOnly
+    );
+    assert_eq!(unit.definition(rand).unwrap().ty, source.ty);
+    // Exercise the neutral receiver's original validation and all control
+    // prefixes independently from installed compilation.
+    let receive = |control: &Control| -> Result<BoundExprSet, UnitError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+        let out = BoundExprSet::try_from_parts_in(
+            UnitParts::new(
+                unit.ports().to_vec().into_boxed_slice(),
+                unit.definitions().to_vec().into_boxed_slice(),
+                unit.roots().to_vec().into_boxed_slice(),
+                unit.root_use_ids().to_vec().into_boxed_slice(),
+                unit.control_flow().clone(),
+                unit.claims().clone(),
+                unit.requests().clone(),
+            ),
+            limits(),
+            &mut work,
+        );
+        if matches!(&out, Err(UnitError::Control(_))) {
+            return out;
+        }
+        work.finish()?;
+        out
+    };
+    let control = Control::good();
+    let checked = receive(&control).unwrap();
+    assert_eq!(checked.root_use_ids(), unit.root_use_ids());
+    assert_eq!(checked.control_flow(), unit.control_flow());
+    let trace = control.trace();
+    assert!(!trace.is_empty());
+    for at in 0..trace.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control::at(at, cause.clone());
+            assert!(
+                matches!(receive(&control), Err(UnitError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(control.trace(), trace[..=at]);
+        }
+    }
+    let invoke = |control: &Control| -> Result<Arc<CompiledExprSet>, ExprCompileError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let out = compile_expr_set_pure(
+            &unit,
+            EvaluationEnvironment {
+                constants: &pools,
+                parameters: &parameters,
+            },
+            ScopeLayouts {
+                ports: &[],
+                all_ports: None,
+            },
+            policy(),
+            &catalog,
+            &mut work,
+        );
+        if matches!(&out, Err(ExprCompileError::Control(_))) {
+            return out;
+        }
+        work.finish()?;
+        out
+    };
+    let control = Control::good();
+    let program = invoke(&control).unwrap();
+    assert_eq!(program.definitions().nodes().len(), 3);
+    assert_eq!(program.calls().len(), 4);
+    assert_eq!(program.effects().len(), 10);
+    assert_eq!(
+        program
+            .roots()
+            .iter()
+            .map(|root| root.use_id)
+            .collect::<Vec<_>>(),
+        roots
+    );
+    for (&id, item) in unit.control_flow().uses() {
+        let actual = &program.control_flow().uses()[&id];
+        assert_eq!(actual.context, item.context);
+        assert_eq!(actual.control, item.control);
+        assert_eq!(actual.arguments, item.arguments);
+        assert_eq!(
+            actual.definition,
+            program.compiled_definition(item.definition).unwrap()
+        );
+        assert_eq!(
+            program.types()[actual.definition.index()],
+            FunctionArgumentType::Value(unit.definition(item.definition).unwrap().ty.clone())
+        );
+        assert_eq!(program.effects()[&id].context(), item.context);
+        if item.definition == rand {
+            assert_eq!(
+                program.calls()[&id].call_contract().context(),
+                CallEffectContext::Expression(item.context)
+            );
+        }
+    }
+    for root in program.roots() {
+        let context = program.control_flow().uses()[&root.use_id].context;
+        let effects = program.effects()[&root.use_id].for_use(context).unwrap();
+        assert_eq!(effects.value_stability, FunctionVolatility::Volatile);
+        assert!(effects.has_instance_state);
+        assert!(effects.observable_effects.rng_sampling);
+    }
+    let trace = control.trace();
+    assert!(!trace.is_empty());
+    for at in 0..trace.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control::at(at, cause.clone());
+            assert!(
+                matches!(invoke(&control), Err(ExprCompileError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(control.trace(), trace[..=at]);
+        }
+    }
+}

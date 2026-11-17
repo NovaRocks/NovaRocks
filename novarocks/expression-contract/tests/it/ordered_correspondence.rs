@@ -477,3 +477,62 @@ fn higher_control_must_name_the_real_lambda_ordinal_and_wrapper() {
     });
     invalid(parts, "intrinsic control differs from its definition");
 }
+
+#[test]
+fn relational_window_binding_cannot_enter_a_scalar_expression_unit() {
+    // This malformed construction input proves the neutral kind gate only.
+    // It is neither a Window expression nor an installed relation capability.
+    let build = || {
+        let mut b = BoundExprSetBuilder::new(limits());
+        let mut binding = function("fixture/unit/non-scalar", vec![], integer(false));
+        binding.kind = FunctionKind::Window;
+        let definition = b
+            .add(
+                None,
+                integer(false),
+                ExprKind::FunctionCall {
+                    function: binding,
+                    args: Box::default(),
+                },
+            )
+            .unwrap();
+        b.root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+            .unwrap();
+        (b, definition)
+    };
+    let (_, definition) = build();
+    let invoke = |control: &Control| -> Result<SealedUnit, UnitError> {
+        let (b, _) = build();
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let result = b.seal(vec![], &mut work);
+        if matches!(&result, Err(UnitError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    };
+    let control = Control::good();
+    let error = match invoke(&control) {
+        Err(error) => error,
+        Ok(_) => panic!("a Window binding entered the scalar unit"),
+    };
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert!(
+        matches!(&error, UnitError::Invalid { definition: Some(id), root: None, message }
+        if *id == definition && message.contains("scalar call has non-scalar binding")),
+        "{error}"
+    );
+    let trace = control.trace();
+    assert!(!trace.is_empty());
+    for at in 0..trace.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control::at(at, cause.clone());
+            assert!(matches!(invoke(&control), Err(UnitError::Control(actual)) if actual == cause));
+            assert_eq!(control.trace(), trace[..=at]);
+        }
+    }
+}
