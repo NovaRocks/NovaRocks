@@ -529,14 +529,17 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
     use crate::runtime::task_control::test_support::Owner;
     use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    struct FirstHostCall(AtomicUsize);
-    impl crate::runtime::task::io::TaskCommitPort for FirstHostCall {
-        fn acquire(
-            &self,
-            _: UniqueId,
-        ) -> ExecutionResult<Box<dyn crate::runtime::task::io::TaskCommitRegistration>> {
+    // Result-writer open is the first host acquisition. A submission-boundary
+    // refusal must not reach it.
+    struct FirstResultOpen(AtomicUsize);
+    impl TaskResultWriter for FirstResultOpen {
+        fn open(&self, _: ResultWriteSpec) -> Result<Arc<dyn TaskResultSession>, TaskIoError> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Err(novarocks_functions::KernelFailure::ResourceExhausted.into())
+            Err(TaskIoError::new(
+                crate::runtime::task::io::TaskIoOperation::ResultOpen,
+                crate::runtime::task::io::TaskIoErrorKind::Unavailable,
+                "result writer probe",
+            ))
         }
     }
     // No first-host-call refusal is allowed to hide a missing role/control
@@ -544,9 +547,12 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
     for scenario in 0..6 {
         let owner = Owner::new();
         let foreign = Owner::new();
-        let calls = Arc::new(FirstHostCall(AtomicUsize::new(0)));
+        let writer_calls = Arc::new(FirstResultOpen(AtomicUsize::new(0)));
         let control = Arc::new(owner.view(TaskFailurePhase::Execution));
-        let mut context = LocalTaskPrepareContext::default().with_task_commit_port(calls.clone());
+        let mut context = LocalTaskPrepareContext {
+            result_writer: writer_calls.clone(),
+            ..LocalTaskPrepareContext::default()
+        };
         context = match scenario {
             0 => context
                 .with_result_identity(owner.identity())
@@ -588,9 +594,9 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
             "scenario {scenario}"
         );
         assert_eq!(
-            calls.0.load(Ordering::SeqCst),
+            writer_calls.0.load(Ordering::SeqCst),
             0,
-            "scenario {scenario} reached host acquisition"
+            "scenario {scenario} reached result-writer acquisition"
         );
         assert!(error.cleanup_diagnostics().is_empty());
     }

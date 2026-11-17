@@ -29,7 +29,7 @@ pub(crate) enum WorkerFailureReason {
     ScanWrongRangeKind = 6,
     ScanOutputSlots = 7,
     ScanStreamReclaimed = 8,
-    SinkCommitAlreadyRegistered = 9,
+    // 9 is retired and must not be reused (SinkCommitAlreadyRegistered).
     RootOutputRowCount = 10,
     RootProducerExitedWithoutEnd = 11,
     RuntimeFilterInvalidContract = 12,
@@ -108,7 +108,7 @@ pub(crate) enum WorkerFailureReason {
     PreparationChildUnresolved = 159,
     // 160 is retired and must not be reused (PreparationRuntimeStandDown).
     // 161 is retired and must not be reused (PreparationPanicPayloadDrop).
-    SinkCommitAfterSettled = 162,
+    // 162 is retired and must not be reused (SinkCommitAfterSettled).
     RootMetadataNotification = 163,
     RootMetadataNotificationInvariant = 164,
     RootReadUnknown = 165,

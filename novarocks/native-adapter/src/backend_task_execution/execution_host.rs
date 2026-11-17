@@ -63,7 +63,7 @@ use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragme
 use novarocks_execution::runtime::task::ExecutionFailureCause;
 use novarocks_execution::runtime::task::io::{
     ExchangeDestinationKey, ExchangeEdgeGates, ExchangeFrameTransmitter, ExchangeReceiverPort,
-    TaskCommitPort, TaskEvent, TaskEventSink, TaskResultWriter,
+    TaskEvent, TaskEventSink, TaskResultWriter,
 };
 use novarocks_execution::runtime::task::scan::compiled_scan_nodes;
 use novarocks_execution::runtime::task::{
@@ -251,7 +251,6 @@ pub struct NativeTaskExecutionHost {
     result_retained_limits: novarocks_worker::WorkerResultRetainedLimits,
     root_producer_pool: Arc<RootProducerPool>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
-    commit_port: Arc<dyn TaskCommitPort>,
     execution_runtime: Arc<ExecutionRuntime>,
     scan_stream_host: novarocks_worker::ScanStreamHost,
     completion_supervisor: Arc<TaskCompletionSupervisor>,
@@ -677,7 +676,6 @@ impl NativeTaskExecutionHost {
         result_retained_limits: novarocks_worker::WorkerResultRetainedLimits,
         root_producer_pool: Arc<RootProducerPool>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
-        commit_port: Arc<dyn TaskCommitPort>,
         execution_runtime: Arc<ExecutionRuntime>,
         scan_stream_host: novarocks_worker::ScanStreamHost,
         completion_supervisor: Arc<TaskCompletionSupervisor>,
@@ -692,7 +690,6 @@ impl NativeTaskExecutionHost {
             result_retained_limits,
             root_producer_pool,
             exchange_receiver_port,
-            commit_port,
             execution_runtime,
             scan_stream_host,
             completion_supervisor,
@@ -1128,7 +1125,6 @@ impl NativeTaskExecutionHost {
                 task_control,
                 admitted_work,
             )
-            .with_task_commit_port(Arc::clone(&self.commit_port))
             .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
             .with_registration_owned_exchange_receivers()
             .with_execution_runtime(Arc::clone(&self.execution_runtime))
@@ -3983,7 +3979,6 @@ pub(crate) mod tests {
             limits,
             pool,
             Arc::new(UnavailableExchangeReceiverPort),
-            Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
             runtime,
             novarocks_worker::ScanStreamHost::new(
                 novarocks_worker::ScanPreparationConfig::default(),
@@ -10575,7 +10570,6 @@ pub(crate) mod tests {
                 limits,
                 pool,
                 Arc::new(UnavailableExchangeReceiverPort),
-                Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
                 runtime,
                 novarocks_worker::ScanStreamHost::new(
                     novarocks_worker::ScanPreparationConfig::default(),
@@ -11121,7 +11115,6 @@ pub(crate) mod tests {
                 limits,
                 pool,
                 Arc::new(UnavailableExchangeReceiverPort),
-                Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
                 runtime,
                 novarocks_worker::ScanStreamHost::new(
                     novarocks_worker::ScanPreparationConfig::default(),

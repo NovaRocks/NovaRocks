@@ -75,8 +75,6 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         announce_interval: Duration::from_secs(60),
         announce_initial_backoff: Duration::from_millis(100),
         announce_max_backoff: Duration::from_secs(2),
-        write_commit_evidence_limits: novarocks_spi::connector::WriteCommitEvidenceLimits::default(
-        ),
         result_retained_limits: WorkerResultRetainedLimits::try_new(
             16 * 1024 * 1024,
             novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
