@@ -569,7 +569,7 @@ fn wrap_insert_query_with_write_projection(
                 )),
             ))],
             None,
-            ast::GroupBy::None,
+            None,
         )
         .map_err(|error| error.to_string())?,
     )));

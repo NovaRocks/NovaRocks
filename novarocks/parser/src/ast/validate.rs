@@ -234,7 +234,9 @@ fn validate_select(select: &Select) -> Result<(), ValidateError> {
     if let Some(qualify) = &select.qualify {
         validate_expr(qualify)?;
     }
-    validate_group_by(&select.group_by)?;
+    if let Some(group_by) = &select.group_by {
+        validate_group_by(group_by)?;
+    }
     validate_query_modifiers(&select.modifiers)?;
     Ok(())
 }
@@ -254,26 +256,32 @@ fn validate_select_item(item: &SelectItem) -> Result<(), ValidateError> {
     }
 }
 
+#[recursive::recursive]
 fn validate_group_by(group_by: &GroupBy) -> Result<(), ValidateError> {
-    match group_by {
-        GroupBy::None => Ok(()),
-        GroupBy::Expressions { expressions, .. }
-        | GroupBy::Rollup { expressions, .. }
-        | GroupBy::Cube { expressions, .. } => {
-            for expression in expressions {
-                validate_expr(expression)?;
-            }
-            Ok(())
-        }
-        GroupBy::GroupingSets { sets, .. } => {
-            for set in sets {
-                for expression in set {
+    for element in &group_by.elements {
+        match element {
+            super::GroupingElement::Simple(node) => {
+                for expression in &node.columns {
                     validate_expr(expression)?;
                 }
             }
-            Ok(())
+            super::GroupingElement::Sets(node) => {
+                if node.sets.is_empty() {
+                    return Err(ValidateError::invalid_structure(
+                        StructuralViolation::EmptyGroupingSets,
+                        node.span,
+                    ));
+                }
+                for set in &node.sets {
+                    for expression in set {
+                        validate_expr(expression)?;
+                    }
+                }
+            }
+            super::GroupingElement::Auto(_) => {}
         }
     }
+    Ok(())
 }
 
 fn validate_table_with_joins(table_with_joins: &TableWithJoins) -> Result<(), ValidateError> {

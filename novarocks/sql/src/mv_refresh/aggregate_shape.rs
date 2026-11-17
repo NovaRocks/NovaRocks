@@ -63,24 +63,17 @@ impl SqlAggregateCalls {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             return Err("extract_aggregate_sql_calls: expected a plain SELECT body".to_string());
         };
-        let group_by_exprs = match &select.group_by {
-            ast::GroupBy::Expressions { expressions, .. } if matches!(expressions.as_slice(), [ast::Expr::Identifier(ident)] if !ident.quoted && ident.value.eq_ignore_ascii_case("all")) =>
-            {
-                return Err("incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string());
-            }
-            ast::GroupBy::Expressions { expressions, .. } if !expressions.is_empty() => expressions,
-            ast::GroupBy::Expressions { .. } | ast::GroupBy::None => {
-                return Err("incremental aggregate MV requires a non-empty GROUP BY".to_string());
-            }
-            ast::GroupBy::Rollup { .. }
-            | ast::GroupBy::Cube { .. }
-            | ast::GroupBy::GroupingSets { .. } => {
-                return Err("incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string());
-            }
-        };
+        let group_by_exprs = crate::analyzer::simple_group_by_expressions(&select.group_by).ok_or_else(|| "incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string())?;
+        if matches!(group_by_exprs.as_slice(), [ast::Expr::Identifier(ident)] if !ident.quoted && ident.value.eq_ignore_ascii_case("all"))
+        {
+            return Err("incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string());
+        }
+        if group_by_exprs.is_empty() {
+            return Err("incremental aggregate MV requires a non-empty GROUP BY".to_string());
+        }
 
         let mut group_keys = group_by_exprs
-            .iter()
+            .into_iter()
             .cloned()
             .map(|expr| SqlAggregateGroupKey {
                 output_name: String::new(),

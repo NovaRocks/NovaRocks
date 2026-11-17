@@ -20,11 +20,12 @@
 use crate::{
     Span, Token, TokenKind,
     ast::{
-        AllRows, Cte, ExplainFormat, ExplainQuery, Expr, FetchFirst, GroupBy, Ident, Join,
-        JoinConstraint, JoinOperator, Limit, Literal, LiteralKind, NullOrdering, Offset, OrderBy,
-        Query, QueryLimit, Select, SelectItem, SelectQuantifier, SetExpr, SetOperator, SortItem,
-        SortOrdering, Statement, TableFactor, TableVersion, TableVersionKind, TableWithJoins,
-        Values, WildcardOptions, WindowDefinition, With,
+        AllRows, Cte, ExplainFormat, ExplainQuery, Expr, FetchFirst, GroupBy, GroupingElement,
+        GroupingSets, GroupingSetsKind, Ident, Join, JoinConstraint, JoinOperator, Limit, Literal,
+        LiteralKind, NullOrdering, Offset, OrderBy, Query, QueryLimit, Select, SelectItem,
+        SelectQuantifier, SetExpr, SetOperator, SimpleGroupBy, SortItem, SortOrdering, Statement,
+        TableFactor, TableVersion, TableVersionKind, TableWithJoins, Values, WildcardOptions,
+        WindowDefinition, With,
     },
     lex,
     token::{Keyword, Symbol},
@@ -409,9 +410,9 @@ fn parse_select(
     };
     let group_by = if parser.consume_if_word("GROUP") {
         parser.consume_word("BY")?;
-        parse_group_by(parser)?
+        Some(parse_group_by(parser)?)
     } else {
-        GroupBy::None
+        None
     };
     let having = if parser.consume_if_word("HAVING") {
         Some(parse_expression_until(
@@ -1181,18 +1182,33 @@ fn parse_join_operator(parser: &mut StatementParser<'_, '_>) -> Option<JoinOpera
 
 fn parse_group_by(parser: &mut StatementParser<'_, '_>) -> Result<GroupBy, crate::ParseError> {
     let start = parser.current_span().start();
-    if parser.consume_if_word("ROLLUP") {
+    let kind = if parser.consume_if_word("ROLLUP") {
+        Some(GroupingSetsKind::Rollup)
+    } else if parser.consume_if_word("CUBE") {
+        Some(GroupingSetsKind::Cube)
+    } else {
+        None
+    };
+    if let Some(kind) = kind {
         let (expressions, span) = parse_parenthesized_expressions(parser)?;
-        return Ok(GroupBy::Rollup {
-            expressions,
-            span: Span::new(start, span.end()),
-        });
-    }
-    if parser.consume_if_word("CUBE") {
-        let (expressions, span) = parse_parenthesized_expressions(parser)?;
-        return Ok(GroupBy::Cube {
-            expressions,
-            span: Span::new(start, span.end()),
+        let span = Span::new(start, span.end());
+        // The old zero-argument forms denote exactly one empty grouping set.
+        // A ROLLUP/CUBE containing one empty member would duplicate that group.
+        let (kind, sets) = if expressions.is_empty() {
+            (GroupingSetsKind::Explicit, vec![Vec::new().into()].into())
+        } else {
+            (
+                kind,
+                expressions
+                    .into_iter()
+                    .map(|expression| vec![expression].into())
+                    .collect(),
+            )
+        };
+        return Ok(GroupBy {
+            distinct: false,
+            elements: vec![GroupingElement::Sets(GroupingSets { kind, sets, span })].into(),
+            span,
         });
     }
     if parser.consume_if_word("GROUPING") {
@@ -1200,46 +1216,49 @@ fn parse_group_by(parser: &mut StatementParser<'_, '_>) -> Result<GroupBy, crate
         parser.consume_symbol(Symbol::LParen)?;
         let mut sets = Vec::new();
         loop {
-            parser.consume_symbol(Symbol::LParen)?;
-            let mut set = Vec::new();
-            if !parser.current_is_symbol(Symbol::RParen) {
-                loop {
-                    set.push(parse_expression_until(
-                        parser,
-                        query_clause_words(),
-                        &[Symbol::Comma, Symbol::RParen],
-                    )?);
-                    if !parser.consume_if_symbol(Symbol::Comma) {
-                        break;
-                    }
-                }
-            }
-            parser.consume_symbol(Symbol::RParen)?;
-            sets.push(set);
+            let (expressions, _) = parse_parenthesized_expressions(parser)?;
+            sets.push(expressions.into());
             if !parser.consume_if_symbol(Symbol::Comma) {
                 break;
             }
         }
         let end = parser.consume_symbol(Symbol::RParen)?.end();
-        return Ok(GroupBy::GroupingSets {
-            sets,
-            span: Span::new(start, end),
+        let span = Span::new(start, end);
+        return Ok(GroupBy {
+            distinct: false,
+            elements: vec![GroupingElement::Sets(GroupingSets {
+                kind: GroupingSetsKind::Explicit,
+                sets: sets.into(),
+                span,
+            })]
+            .into(),
+            span,
         });
     }
-    let mut expressions = Vec::new();
+    let mut elements = Vec::new();
     loop {
-        expressions.push(parse_expression_until(
+        // Preserve the old expression grammar. A Row expression is not evidence
+        // that the source authored a multi-column groupingSet production.
+        let expression = parse_expression_until(
             parser,
             query_clause_words(),
             &[Symbol::Comma, Symbol::Semicolon, Symbol::RParen],
-        )?);
+        )?;
+        let span = expression.span();
+        elements.push(GroupingElement::Simple(SimpleGroupBy {
+            columns: vec![expression].into(),
+            span,
+        }));
         if !parser.consume_if_symbol(Symbol::Comma) {
             break;
         }
     }
-    let end = expressions.last().map_or(start, |expr| expr.span().end());
-    Ok(GroupBy::Expressions {
-        expressions,
+    let end = elements
+        .last()
+        .map_or(start, |element| element.span().end());
+    Ok(GroupBy {
+        distinct: false,
+        elements: elements.into(),
         span: Span::new(start, end),
     })
 }

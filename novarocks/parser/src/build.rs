@@ -42,6 +42,7 @@ pub enum BuildError {
     EmptyTuple,
     EmptyInList,
     EmptyOrderBy,
+    EmptyGroupingSets,
     EmptyUnion,
     EmptyWildcardPrefix,
     Number(ParserError),
@@ -68,6 +69,7 @@ impl fmt::Display for BuildError {
             Self::EmptyOrderBy => {
                 formatter.write_str("ORDER BY must contain at least one sort item")
             }
+            Self::EmptyGroupingSets => formatter.write_str("grouping sets cannot be empty"),
             Self::EmptyUnion => formatter.write_str("UNION ALL must contain at least one operand"),
             Self::EmptyWildcardPrefix => {
                 formatter.write_str("qualified wildcard must contain a name prefix")
@@ -549,7 +551,7 @@ pub fn select(
     projection: Vec<SelectItem>,
     from: Vec<TableWithJoins>,
     selection: Option<Expr>,
-    group_by: GroupBy,
+    group_by: Option<GroupBy>,
 ) -> Result<Select, BuildError> {
     if projection.is_empty() {
         return Err(BuildError::EmptyProjection);
@@ -629,15 +631,40 @@ pub fn union_all(parts: Vec<SetExpr>) -> Result<SetExpr, BuildError> {
     }))
 }
 
-pub fn group_by(expressions: Vec<Expr>) -> GroupBy {
+pub fn group_by(expressions: Vec<Expr>) -> Option<GroupBy> {
     if expressions.is_empty() {
-        GroupBy::None
-    } else {
-        GroupBy::Expressions {
-            span: cover(expressions.iter().map(Expr::span)),
-            expressions,
-        }
+        return None;
     }
+    let span = cover(expressions.iter().map(Expr::span));
+    Some(GroupBy {
+        distinct: false,
+        elements: expressions
+            .into_iter()
+            .map(|expression| {
+                GroupingElement::Simple(SimpleGroupBy {
+                    span: expression.span(),
+                    columns: vec![expression].into(),
+                })
+            })
+            .collect(),
+        span,
+    })
+}
+
+/// Builds one nonempty family of grouping sets, preserving empty member sets.
+pub fn grouping_sets(
+    kind: GroupingSetsKind,
+    sets: Vec<Vec<Expr>>,
+) -> Result<GroupingSets, BuildError> {
+    if sets.is_empty() {
+        return Err(BuildError::EmptyGroupingSets);
+    }
+    let span = cover(sets.iter().flat_map(|set| set.iter().map(Expr::span)));
+    Ok(GroupingSets {
+        kind,
+        sets: sets.into_iter().map(AstVec::from).collect(),
+        span,
+    })
 }
 
 pub fn array(values: Vec<Expr>) -> Expr {

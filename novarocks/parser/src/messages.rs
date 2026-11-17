@@ -45,6 +45,9 @@ pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
         StructuralViolation::EmptySelectProjection => {
             "invalid SQL structure: empty SELECT projection list".to_owned()
         }
+        StructuralViolation::EmptyGroupingSets => {
+            "invalid SQL structure: empty grouping-set list".to_owned()
+        }
         StructuralViolation::InvalidSetOperationOperandCount => {
             "invalid SQL structure: invalid set operation operand count".to_owned()
         }

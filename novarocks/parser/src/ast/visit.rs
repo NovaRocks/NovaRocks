@@ -21,6 +21,22 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_group_by(&mut self, node: &GroupBy) {
+        walk_group_by(self, node);
+    }
+    fn visit_grouping_element(&mut self, node: &GroupingElement) {
+        walk_grouping_element(self, node);
+    }
+    fn visit_simple_group_by(&mut self, node: &SimpleGroupBy) {
+        walk_simple_group_by(self, node);
+    }
+    fn visit_grouping_sets(&mut self, node: &GroupingSets) {
+        walk_grouping_sets(self, node);
+    }
+    fn visit_auto_group_by(&mut self, node: &AutoGroupBy) {
+        walk_auto_group_by(self, node);
+    }
+
     fn visit_all_rows(&mut self, _node: &AllRows) {}
     fn visit_parameter(&mut self, _node: &Parameter) {}
     fn visit_limit(&mut self, node: &Limit) {
@@ -679,7 +695,9 @@ pub fn walk_select<V: Visit + ?Sized>(visitor: &mut V, select: &Select) {
     if let Some(selection) = &select.selection {
         visitor.visit_expr(selection);
     }
-    walk_group_by(visitor, &select.group_by);
+    if let Some(group_by) = &select.group_by {
+        visitor.visit_group_by(group_by);
+    }
     if let Some(having) = &select.having {
         visitor.visit_expr(having);
     }
@@ -692,20 +710,35 @@ pub fn walk_select<V: Visit + ?Sized>(visitor: &mut V, select: &Select) {
     walk_query_modifiers(visitor, &select.modifiers);
 }
 
-pub fn walk_group_by<V: Visit + ?Sized>(visitor: &mut V, group_by: &GroupBy) {
-    let groups: &[Vec<Expr>] = match group_by {
-        GroupBy::None => return,
-        GroupBy::Expressions { expressions, .. }
-        | GroupBy::Rollup { expressions, .. }
-        | GroupBy::Cube { expressions, .. } => std::slice::from_ref(expressions),
-        GroupBy::GroupingSets { sets, .. } => sets,
-    };
-    for group in groups {
-        for expr in group {
-            visitor.visit_expr(expr);
+#[recursive::recursive]
+pub fn walk_group_by<V: Visit + ?Sized>(visitor: &mut V, node: &GroupBy) {
+    for element in &node.elements {
+        visitor.visit_grouping_element(element);
+    }
+}
+#[recursive::recursive]
+pub fn walk_grouping_element<V: Visit + ?Sized>(visitor: &mut V, node: &GroupingElement) {
+    match node {
+        GroupingElement::Simple(node) => visitor.visit_simple_group_by(node),
+        GroupingElement::Sets(node) => visitor.visit_grouping_sets(node),
+        GroupingElement::Auto(node) => visitor.visit_auto_group_by(node),
+    }
+}
+#[recursive::recursive]
+pub fn walk_simple_group_by<V: Visit + ?Sized>(visitor: &mut V, node: &SimpleGroupBy) {
+    for column in &node.columns {
+        visitor.visit_expr(column);
+    }
+}
+#[recursive::recursive]
+pub fn walk_grouping_sets<V: Visit + ?Sized>(visitor: &mut V, node: &GroupingSets) {
+    for set in &node.sets {
+        for expression in set {
+            visitor.visit_expr(expression);
         }
     }
 }
+pub fn walk_auto_group_by<V: Visit + ?Sized>(_visitor: &mut V, _node: &AutoGroupBy) {}
 
 pub fn walk_table_with_joins<V: Visit + ?Sized>(visitor: &mut V, table: &TableWithJoins) {
     visitor.visit_table_factor(&table.relation);
@@ -927,6 +960,22 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_group_by(&mut self, node: GroupBy) -> GroupBy {
+        fold_group_by(self, node)
+    }
+    fn fold_grouping_element(&mut self, node: GroupingElement) -> GroupingElement {
+        fold_grouping_element(self, node)
+    }
+    fn fold_simple_group_by(&mut self, node: SimpleGroupBy) -> SimpleGroupBy {
+        fold_simple_group_by(self, node)
+    }
+    fn fold_grouping_sets(&mut self, node: GroupingSets) -> GroupingSets {
+        fold_grouping_sets(self, node)
+    }
+    fn fold_auto_group_by(&mut self, node: AutoGroupBy) -> AutoGroupBy {
+        fold_auto_group_by(self, node)
+    }
+
     fn fold_all_rows(&mut self, node: AllRows) -> AllRows {
         node
     }
@@ -1762,7 +1811,7 @@ pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Sele
         .map(|table| fold_table_with_joins(folder, table))
         .collect();
     select.selection = select.selection.map(|expr| folder.fold_expr(expr));
-    select.group_by = fold_group_by(folder, select.group_by);
+    select.group_by = select.group_by.map(|node| folder.fold_group_by(node));
     select.having = select.having.map(|expr| folder.fold_expr(expr));
     select.qualify = select.qualify.map(|expr| folder.fold_expr(expr));
     select.windows = select
@@ -1795,35 +1844,52 @@ fn fold_wildcard_options<F: Fold + ?Sized>(
     options
 }
 
-pub fn fold_group_by<F: Fold + ?Sized>(folder: &mut F, group_by: GroupBy) -> GroupBy {
-    let fold_exprs = |expressions: Vec<Expr>, folder: &mut F| {
-        expressions
-            .into_iter()
-            .map(|expr| folder.fold_expr(expr))
-            .collect()
-    };
-    match group_by {
-        GroupBy::None => GroupBy::None,
-        GroupBy::Expressions { expressions, span } => GroupBy::Expressions {
-            expressions: fold_exprs(expressions, folder),
-            span,
-        },
-        GroupBy::Rollup { expressions, span } => GroupBy::Rollup {
-            expressions: fold_exprs(expressions, folder),
-            span,
-        },
-        GroupBy::Cube { expressions, span } => GroupBy::Cube {
-            expressions: fold_exprs(expressions, folder),
-            span,
-        },
-        GroupBy::GroupingSets { sets, span } => GroupBy::GroupingSets {
-            sets: sets
-                .into_iter()
-                .map(|set| fold_exprs(set, folder))
-                .collect(),
-            span,
-        },
+#[recursive::recursive]
+pub fn fold_group_by<F: Fold + ?Sized>(folder: &mut F, mut node: GroupBy) -> GroupBy {
+    node.elements = node
+        .elements
+        .into_iter()
+        .map(|element| folder.fold_grouping_element(element))
+        .collect();
+    node
+}
+#[recursive::recursive]
+pub fn fold_grouping_element<F: Fold + ?Sized>(
+    folder: &mut F,
+    node: GroupingElement,
+) -> GroupingElement {
+    match node {
+        GroupingElement::Simple(node) => GroupingElement::Simple(folder.fold_simple_group_by(node)),
+        GroupingElement::Sets(node) => GroupingElement::Sets(folder.fold_grouping_sets(node)),
+        GroupingElement::Auto(node) => GroupingElement::Auto(folder.fold_auto_group_by(node)),
     }
+}
+#[recursive::recursive]
+pub fn fold_simple_group_by<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut node: SimpleGroupBy,
+) -> SimpleGroupBy {
+    node.columns = node
+        .columns
+        .into_iter()
+        .map(|expr| folder.fold_expr(expr))
+        .collect();
+    node
+}
+#[recursive::recursive]
+pub fn fold_grouping_sets<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut node: GroupingSets,
+) -> GroupingSets {
+    node.sets = node
+        .sets
+        .into_iter()
+        .map(|set| set.into_iter().map(|expr| folder.fold_expr(expr)).collect())
+        .collect();
+    node
+}
+pub fn fold_auto_group_by<F: Fold + ?Sized>(_folder: &mut F, node: AutoGroupBy) -> AutoGroupBy {
+    node
 }
 
 pub fn fold_table_with_joins<F: Fold + ?Sized>(

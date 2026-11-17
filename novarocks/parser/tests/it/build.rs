@@ -21,7 +21,7 @@
 
 use novarocks_parser::{
     SYNTHETIC, Span,
-    ast::{self, BinaryOperator, Expr, GroupBy, JoinConstraint, JoinOperator, SetExpr, SyntaxEq},
+    ast::{self, BinaryOperator, Expr, JoinConstraint, JoinOperator, SetExpr, SyntaxEq},
     build::{self, BuildError},
 };
 
@@ -63,7 +63,7 @@ fn select_body(value: i64) -> SetExpr {
             vec![build::item(build::integer(value), None, false)],
             Vec::new(),
             None,
-            GroupBy::None,
+            None,
         )
         .expect("nonempty projection"),
     ))
@@ -548,13 +548,8 @@ fn derived_expressions_retain_source_locations_and_envelopes_are_synthetic() {
         source_span
     );
     let built = build::query(SetExpr::Select(Box::new(
-        build::select(
-            vec![build::item(cast, None, false)],
-            Vec::new(),
-            None,
-            GroupBy::None,
-        )
-        .expect("SELECT"),
+        build::select(vec![build::item(cast, None, false)], Vec::new(), None, None)
+            .expect("SELECT"),
     )));
     assert_eq!(built.span, SYNTHETIC);
     assert_eq!(built.body.span(), SYNTHETIC);
@@ -583,7 +578,7 @@ fn builders_reject_missing_required_structure() {
         Err(BuildError::EmptyObjectName)
     );
     assert_eq!(
-        build::select(Vec::new(), Vec::new(), None, GroupBy::None),
+        build::select(Vec::new(), Vec::new(), None, None),
         Err(BuildError::EmptyProjection)
     );
     assert_eq!(build::values(Vec::new()), Err(BuildError::EmptyValues));

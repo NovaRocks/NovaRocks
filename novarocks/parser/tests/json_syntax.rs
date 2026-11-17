@@ -33,7 +33,7 @@ fn expression_query(expression: Expr) -> Statement {
             vec![build::item(expression, None, false)],
             vec![],
             None,
-            GroupBy::None,
+            None,
         )
         .unwrap(),
     ))))
@@ -54,7 +54,7 @@ fn table_query(table: JsonTable) -> Statement {
         span: SYNTHETIC,
     };
     Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(vec![build::wildcard()], vec![from], None, GroupBy::None).unwrap(),
+        build::select(vec![build::wildcard()], vec![from], None, None).unwrap(),
     ))))
 }
 

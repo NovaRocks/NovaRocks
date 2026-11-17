@@ -232,7 +232,7 @@ fn unwind_during_one_element_drop_releases_siblings_exactly_once() {
 
 #[test]
 fn actual_array_owning_carrier_guards_deep_traits_move_and_drop() {
-    use crate::ast::{Expr, GroupBy, LiteralKind, SetExpr, Statement};
+    use crate::ast::{Expr, LiteralKind, SetExpr, Statement};
     use crate::build;
     const DEPTH: usize = 20_000;
     let mut tree = build::integer(7);
@@ -273,7 +273,7 @@ fn actual_array_owning_carrier_guards_deep_traits_move_and_drop() {
             vec![build::item(tree.clone(), None, false)],
             Vec::new(),
             None,
-            GroupBy::None,
+            None,
         )
         .unwrap(),
     ))));
@@ -289,9 +289,7 @@ fn actual_array_owning_carrier_guards_deep_traits_move_and_drop() {
 
 #[test]
 fn actual_array_semantic_walk_fold_and_equivalence_preserve_deep_values_and_order() {
-    use crate::ast::{
-        Expr, Fold, GroupBy, Literal, LiteralKind, SetExpr, Statement, SyntaxEq, Visit,
-    };
+    use crate::ast::{Expr, Fold, Literal, LiteralKind, SetExpr, Statement, SyntaxEq, Visit};
     use crate::{Span, build};
     const DEPTH: i64 = 20_000;
     const LEAF: i64 = 1_000_000;
@@ -367,7 +365,7 @@ fn actual_array_semantic_walk_fold_and_equivalence_preserve_deep_values_and_orde
             vec![build::item(shifted, None, false)],
             Vec::new(),
             None,
-            GroupBy::None,
+            None,
         )
         .unwrap(),
     ))));
@@ -437,8 +435,8 @@ fn actual_row_owning_carrier_guards_deep_traits_move_and_drop() {
 #[test]
 fn actual_row_fields_preserve_names_order_spans_and_deep_semantic_children() {
     use crate::ast::{
-        Expr, Fold, GroupBy, Ident, Literal, LiteralKind, RowExpr, RowField, SetExpr, Statement,
-        SyntaxEq, Visit,
+        Expr, Fold, Ident, Literal, LiteralKind, RowExpr, RowField, SetExpr, Statement, SyntaxEq,
+        Visit,
     };
     use crate::{Span, build};
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -612,7 +610,7 @@ fn actual_row_fields_preserve_names_order_spans_and_deep_semantic_children() {
             vec![build::item(changed, None, false)],
             Vec::new(),
             None,
-            GroupBy::None,
+            None,
         )
         .unwrap(),
     ))));
@@ -708,8 +706,8 @@ fn actual_access_owning_cycles_keep_both_child_positions_and_deep_traits() {
 #[test]
 fn actual_access_children_keep_deep_visit_fold_equivalence_validation_and_printing() {
     use crate::ast::{
-        ArrayWildcardSubscriptExpr, DereferenceExpr, Expr, Fold, GroupBy, Ident, Literal,
-        LiteralKind, SetExpr, Statement, SubscriptExpr, SyntaxEq, Visit,
+        ArrayWildcardSubscriptExpr, DereferenceExpr, Expr, Fold, Ident, Literal, LiteralKind,
+        SetExpr, Statement, SubscriptExpr, SyntaxEq, Visit,
     };
     use crate::{Span, build};
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -884,7 +882,7 @@ fn actual_access_children_keep_deep_visit_fold_equivalence_validation_and_printi
             vec![build::item(changed, None, false)],
             Vec::new(),
             None,
-            GroupBy::None,
+            None,
         )
         .unwrap(),
     ))));
@@ -996,8 +994,8 @@ fn actual_function_order_by_owning_cycle_keeps_deep_traits_move_and_drop() {
 #[test]
 fn actual_function_order_by_preserves_facts_and_deep_semantic_children() {
     use crate::ast::{
-        Expr, Fold, FunctionCall, GroupBy, Ident, Literal, LiteralKind, NullOrdering, OrderBy,
-        SetExpr, SortItem, SortOrdering, Statement, SyntaxEq, Visit,
+        Expr, Fold, FunctionCall, Ident, Literal, LiteralKind, NullOrdering, OrderBy, SetExpr,
+        SortItem, SortOrdering, Statement, SyntaxEq, Visit,
     };
     use crate::{Span, build};
     fn call(items: Vec<SortItem>) -> Expr {
@@ -1229,7 +1227,7 @@ fn actual_function_order_by_preserves_facts_and_deep_semantic_children() {
             vec![build::item(changed, None, false)],
             Vec::new(),
             None,
-            GroupBy::None,
+            None,
         )
         .unwrap(),
     ))));
@@ -1241,9 +1239,9 @@ fn actual_function_order_by_preserves_facts_and_deep_semantic_children() {
 #[test]
 fn actual_window_operation_cycle_keeps_partition_and_frame_expression_children() {
     use crate::ast::{
-        Expr, Fold, GroupBy, Ident, Literal, LiteralKind, SetExpr, Statement, SyntaxEq, Visit,
-        Window, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits,
-        WindowOperation, WindowSpecification,
+        Expr, Fold, Ident, Literal, LiteralKind, SetExpr, Statement, SyntaxEq, Visit, Window,
+        WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowOperation,
+        WindowSpecification,
     };
     use crate::{Span, build};
     fn frame(child: Expr) -> WindowFrame {
@@ -1449,7 +1447,7 @@ fn actual_window_operation_cycle_keeps_partition_and_frame_expression_children()
             vec![build::item(changed, None, false)],
             Vec::new(),
             None,
-            GroupBy::None,
+            None,
         )
         .unwrap(),
     ))));
@@ -1471,8 +1469,8 @@ fn actual_window_operation_cycle_keeps_partition_and_frame_expression_children()
 #[test]
 fn actual_row_pattern_box_vec_cycle_keeps_quantifier_facts_and_real_children() {
     use crate::ast::{
-        Expr, Fold, GroupBy, Ident, PatternInteger, PatternQuantifier, RowPattern, SetExpr,
-        Statement, SyntaxEq, Visit, Window, WindowFrame, WindowFrameBound, WindowFrameExclusion,
+        Expr, Fold, Ident, PatternInteger, PatternQuantifier, RowPattern, SetExpr, Statement,
+        SyntaxEq, Visit, Window, WindowFrame, WindowFrameBound, WindowFrameExclusion,
         WindowFrameUnits, WindowOperation, WindowSpecification,
     };
     use crate::{Span, build};
@@ -1707,7 +1705,7 @@ fn actual_row_pattern_box_vec_cycle_keeps_quantifier_facts_and_real_children() {
             vec![build::item(operation(changed), None, false)],
             Vec::new(),
             None,
-            GroupBy::None,
+            None,
         )
         .unwrap(),
     ))));
@@ -1936,7 +1934,7 @@ fn assert_actual_call_argument_or_filter_cycle(filter_child: bool) {
                 vec![build::item(tree.clone(), None, false)],
                 Vec::new(),
                 None,
-                crate::ast::GroupBy::None,
+                None,
             )
             .unwrap(),
         ))));
@@ -2225,7 +2223,7 @@ fn actual_control_call_cycles_keep_all_alternative_child_slots_and_order() {
                 vec![build::item(tree.clone(), None, false)],
                 Vec::new(),
                 None,
-                crate::ast::GroupBy::None,
+                None,
             )
             .unwrap(),
         ))));
@@ -2253,8 +2251,8 @@ fn actual_control_call_cycles_keep_all_alternative_child_slots_and_order() {
 #[test]
 fn actual_extract_owning_and_semantic_cycle_keeps_deep_fields_and_original_leaf() {
     use crate::ast::{
-        Expr, ExtractExpr, ExtractField, Fold, GroupBy, Literal, LiteralKind, SetExpr, Statement,
-        SyntaxEq, Visit, walk_extract_expr,
+        Expr, ExtractExpr, ExtractField, Fold, Literal, LiteralKind, SetExpr, Statement, SyntaxEq,
+        Visit, walk_extract_expr,
     };
     use crate::build;
     const DEPTH: usize = 20_000;
@@ -2347,7 +2345,7 @@ fn actual_extract_owning_and_semantic_cycle_keeps_deep_fields_and_original_leaf(
             vec![build::item(changed, None, false)],
             Vec::new(),
             None,
-            GroupBy::None,
+            None,
         )
         .unwrap(),
     ))));
@@ -2591,7 +2589,7 @@ fn actual_plain_json_query_owning_chain_preserves_path_facts_and_original_input(
             vec![build::item(changed, None, false)],
             Vec::new(),
             None,
-            crate::ast::GroupBy::None,
+            None,
         )
         .unwrap(),
     ))));
@@ -2609,4 +2607,132 @@ fn actual_plain_json_query_owning_chain_preserves_path_facts_and_original_input(
         format!("strict $.p{DEPTH}")
     );
     drop(node.path_invocation.input_expression);
+}
+
+#[test]
+fn actual_group_by_query_subquery_cycle_preserves_owning_traits_order_hooks_and_leaf() {
+    use crate::ast::{
+        AutoGroupBy, Expr, Fold, GroupBy, GroupingElement, GroupingSets, GroupingSetsKind, Literal,
+        LiteralKind, Query, SetExpr, SimpleGroupBy, Statement, SubqueryExpr, SyntaxEq, Visit,
+    };
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    let mut tree = build::query(build::values(vec![vec![build::integer(7)]]).unwrap());
+    for marker in 1..=DEPTH {
+        let span = Span::new(10, 30);
+        let expressions = vec![
+            build::integer(marker),
+            Expr::Subquery(SubqueryExpr {
+                query: Box::new(tree),
+                span,
+            }),
+        ];
+        let element = match marker % 3 {
+            0 => GroupingElement::Simple(SimpleGroupBy {
+                columns: expressions.into(),
+                span,
+            }),
+            1 => GroupingElement::Sets(GroupingSets {
+                kind: GroupingSetsKind::Rollup,
+                sets: vec![expressions.into(), AstVec::new()].into(),
+                span,
+            }),
+            _ => GroupingElement::Sets(GroupingSets {
+                kind: GroupingSetsKind::Explicit,
+                sets: vec![AstVec::new(), expressions.into()].into(),
+                span,
+            }),
+        };
+        let group = GroupBy {
+            distinct: marker % 2 == 0,
+            elements: vec![element, GroupingElement::Auto(AutoGroupBy { span })].into(),
+            span,
+        };
+        tree = build::query(SetExpr::Select(Box::new(
+            build::select(vec![build::wildcard()], Vec::new(), None, Some(group)).unwrap(),
+        )));
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let SetExpr::Select(top) = copy.body.as_mut() else {
+        unreachable!()
+    };
+    top.group_by.as_mut().unwrap().span = Span::new(110, 130);
+    assert_ne!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    drop(copy);
+    #[derive(Default)]
+    struct Facts {
+        numbers: Vec<i64>,
+        distinct: Vec<bool>,
+        auto: usize,
+    }
+    impl Visit for Facts {
+        fn visit_literal(&mut self, node: &Literal) {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                panic!("integer");
+            };
+            self.numbers.push(parsed_value);
+        }
+        fn visit_group_by(&mut self, node: &GroupBy) {
+            self.distinct.push(node.distinct);
+            crate::ast::walk_group_by(self, node);
+        }
+        fn visit_auto_group_by(&mut self, _node: &AutoGroupBy) {
+            self.auto += 1;
+        }
+    }
+    let mut facts = Facts::default();
+    facts.visit_query(&tree);
+    let expected = (1..=DEPTH)
+        .rev()
+        .chain(std::iter::once(7))
+        .collect::<Vec<_>>();
+    assert_eq!(facts.numbers, expected);
+    assert_eq!(
+        facts.distinct,
+        (1..=DEPTH)
+            .rev()
+            .map(|marker| marker % 2 == 0)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(facts.auto, DEPTH as usize);
+    struct Change;
+    impl Fold for Change {
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                panic!("integer");
+            };
+            let Expr::Literal(node) = build::integer(parsed_value + 1) else {
+                unreachable!()
+            };
+            node
+        }
+    }
+    let changed = Change.fold_query(tree.clone());
+    let mut changed_facts = Facts::default();
+    changed_facts.visit_query(&changed);
+    assert_eq!(
+        changed_facts.numbers,
+        expected.iter().map(|value| value + 1).collect::<Vec<_>>()
+    );
+    assert_eq!(changed_facts.distinct, facts.distinct);
+    assert_eq!(changed_facts.auto, facts.auto);
+    assert!(!tree.syntax_eq(&changed));
+    crate::ast::validate_statement(&Statement::Query(changed)).unwrap();
+    let printed = crate::printer::print_query(&tree);
+    assert_eq!(printed.matches(" GROUP BY ").count(), DEPTH as usize);
+    // Move through the actual top AstVec edge; there is no second deep wrapper.
+    let Query { body, .. } = tree;
+    let SetExpr::Select(top) = *body else {
+        unreachable!()
+    };
+    let group = top.group_by.unwrap();
+    let elements = group.elements.into_inner();
+    assert_eq!(elements.len(), 2);
+    drop(elements);
 }

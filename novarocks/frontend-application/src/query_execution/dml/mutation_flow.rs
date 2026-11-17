@@ -953,7 +953,7 @@ fn build_update_match_query(
             ast::JoinConstraint::None,
         );
     }
-    let select = build::select(projection, vec![from], selection, ast::GroupBy::None)
+    let select = build::select(projection, vec![from], selection, None)
         .map_err(|error| error.to_string())?;
     Ok(build::query(ast::SetExpr::Select(Box::new(select))))
 }
@@ -1111,8 +1111,8 @@ fn build_merge_match_query(
         target,
         ast::JoinConstraint::On(on),
     );
-    let select = build::select(projection, vec![from], None, ast::GroupBy::None)
-        .map_err(|error| error.to_string())?;
+    let select =
+        build::select(projection, vec![from], None, None).map_err(|error| error.to_string())?;
     Ok(build::query(ast::SetExpr::Select(Box::new(select))))
 }
 

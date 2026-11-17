@@ -112,9 +112,33 @@ pub(crate) fn display_expr_for_test(expr: &ast::Expr) -> String {
 }
 
 #[derive(Clone, Debug)]
-struct RepeatGroupBySpec {
-    grouping_sets: Vec<Vec<ast::Expr>>,
-    all_group_by_exprs: Vec<ast::Expr>,
+struct RepeatGroupBySpec<'s> {
+    grouping_sets: Vec<Vec<&'s ast::Expr>>,
+    all_group_by_exprs: Vec<&'s ast::Expr>,
+}
+
+/// Borrow the actual plain grouping keys in their authored element/column order.
+/// None as a return value denotes a profile owned by Repeat or unsupported syntax.
+pub(crate) fn simple_group_by_expressions(
+    group_by: &Option<ast::GroupBy>,
+) -> Option<Vec<&ast::Expr>> {
+    let Some(group_by) = group_by else {
+        return Some(Vec::new());
+    };
+    if group_by.distinct || group_by.elements.is_empty() {
+        return None;
+    }
+    let mut expressions = Vec::new();
+    for element in &group_by.elements {
+        let ast::GroupingElement::Simple(simple) = element else {
+            return None;
+        };
+        if simple.columns.is_empty() {
+            return None;
+        }
+        expressions.extend(simple.columns.iter());
+    }
+    Some(expressions)
 }
 
 // ---------------------------------------------------------------------------
@@ -527,26 +551,33 @@ impl<'a> AnalyzerContext<'a> {
         select: Option<&ast::Select>,
         analyze: impl FnOnce(&Self) -> Result<T, AnalyzeError>,
     ) -> Result<T, AnalyzeError> {
-        let state = select.map(|select| {
-            let repeat = self.extract_repeat_from_group_by(select);
-            let keys = if let Some(spec) = &repeat {
-                spec.all_group_by_exprs.clone()
-            } else if let ast::GroupBy::Expressions { expressions, .. } = &select.group_by {
-                expressions.clone()
-            } else {
-                Vec::new()
-            };
-            std::rc::Rc::new(GroupingAnalysis {
-                select,
-                keys,
-                repeat: repeat.is_some(),
-                enabled: std::cell::Cell::new(false),
-                next_mask_index: std::cell::Cell::new(0),
-                from_scope: std::cell::RefCell::new(None),
-                resolved_keys: std::cell::RefCell::new(None),
-                calls: std::cell::RefCell::new(Vec::new()),
+        let state = select
+            .map(|select| -> Result<_, AnalyzeError> {
+                let repeat = self.extract_repeat_from_group_by(select)?;
+                let keys = if let Some(spec) = &repeat {
+                    spec.all_group_by_exprs
+                        .iter()
+                        .map(|expr| (*expr).clone())
+                        .collect()
+                } else {
+                    simple_group_by_expressions(&select.group_by)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                };
+                Ok(std::rc::Rc::new(GroupingAnalysis {
+                    select,
+                    keys,
+                    repeat: repeat.is_some(),
+                    enabled: std::cell::Cell::new(false),
+                    next_mask_index: std::cell::Cell::new(0),
+                    from_scope: std::cell::RefCell::new(None),
+                    resolved_keys: std::cell::RefCell::new(None),
+                    calls: std::cell::RefCell::new(Vec::new()),
+                }))
             })
-        });
+            .transpose()?;
         let previous = self.grouping_scope.replace(state);
         let result = analyze(self);
         self.grouping_scope.replace(previous);
@@ -971,7 +1002,7 @@ impl<'a> AnalyzerContext<'a> {
                     return self.with_grouping_scope(Some(s), |ctx| ctx.analyze_set_expr(set_expr));
                 }
                 // Check if GROUP BY contains ROLLUP/CUBE/GROUPING SETS.
-                if let Some(repeat_spec) = self.extract_repeat_from_group_by(s) {
+                if let Some(repeat_spec) = self.extract_repeat_from_group_by(s)? {
                     return self.resolve_repeat_group_by(s, &repeat_spec);
                 }
                 let (sel, cols) = self.analyze_select(s)?;
@@ -1209,12 +1240,13 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         select: &ast::Select,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
-        self.analyze_select_in_semantic_scope(select)
+        self.analyze_select_in_semantic_scope(select, None)
     }
 
     fn analyze_select_in_semantic_scope(
         &self,
         select: &ast::Select,
+        group_by_override: Option<&[&ast::Expr]>,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
         // --- FROM clause ---
         let (from, scope) = if select.from.is_empty() {
@@ -1249,7 +1281,7 @@ impl<'a> AnalyzerContext<'a> {
         // Finish FROM recursion before allocating the SELECT analysis frame.
         // Nested derived tables must not retain every outer projection,
         // grouping and subquery-rewrite temporary on the planning stack.
-        self.analyze_select_after_from(select, from, scope)
+        self.analyze_select_after_from(select, from, scope, group_by_override)
     }
 
     #[inline(never)]
@@ -1258,6 +1290,7 @@ impl<'a> AnalyzerContext<'a> {
         select: &ast::Select,
         from: Option<Relation>,
         scope: AnalyzerScope,
+        group_by_override: Option<&[&ast::Expr]>,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
         // --- WHERE clause ---
         let filter = match &select.selection {
@@ -1279,19 +1312,16 @@ impl<'a> AnalyzerContext<'a> {
             state.enabled.set(false);
         }
         // --- GROUP BY (with SELECT alias fallback) ---
-        let group_by_exprs = match &select.group_by {
-            ast::GroupBy::None => Vec::new(),
-            ast::GroupBy::Expressions { expressions, .. } => expressions.clone(),
-            ast::GroupBy::Rollup { .. }
-            | ast::GroupBy::Cube { .. }
-            | ast::GroupBy::GroupingSets { .. } => {
-                return Err(AnalyzeError::internal(
+        let group_by_exprs = match group_by_override {
+            Some(expressions) => expressions.to_vec(),
+            None => simple_group_by_expressions(&select.group_by).ok_or_else(|| {
+                AnalyzeError::internal(
                     "internal error: repeat GROUP BY must be expanded before select analysis",
-                ));
-            }
+                )
+            })?,
         };
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
-        for gb_expr in &group_by_exprs {
+        for gb_expr in group_by_exprs {
             if let ast::Expr::Literal(ast::Literal {
                 kind:
                     ast::LiteralKind::Long {
@@ -1900,38 +1930,56 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Check if a SELECT's GROUP BY clause contains ROLLUP/CUBE/GROUPING SETS.
     /// Returns the explicit grouping-set levels plus the full GROUP BY key list.
-    fn extract_repeat_from_group_by(&self, select: &ast::Select) -> Option<RepeatGroupBySpec> {
-        match &select.group_by {
-            ast::GroupBy::Rollup { expressions, .. } => {
-                let groups = expressions
-                    .iter()
-                    .cloned()
-                    .map(|expr| vec![expr])
-                    .collect::<Vec<_>>();
-                Some(RepeatGroupBySpec {
-                    grouping_sets: rollup_grouping_sets(&groups),
-                    all_group_by_exprs: flatten_grouping_groups(&groups),
-                })
-            }
-            ast::GroupBy::Cube { expressions, .. } => {
-                let groups = expressions
-                    .iter()
-                    .cloned()
-                    .map(|expr| vec![expr])
-                    .collect::<Vec<_>>();
-                Some(RepeatGroupBySpec {
-                    grouping_sets: cube_grouping_sets(&groups),
-                    all_group_by_exprs: flatten_grouping_groups(&groups),
-                })
-            }
-            ast::GroupBy::GroupingSets { sets, .. } => Some(RepeatGroupBySpec {
-                grouping_sets: sets.clone(),
-                all_group_by_exprs: unique_exprs_in_order(
-                    sets.iter().flat_map(|set| set.iter().cloned()),
-                ),
-            }),
-            ast::GroupBy::None | ast::GroupBy::Expressions { .. } => None,
+    fn extract_repeat_from_group_by<'s>(
+        &self,
+        select: &'s ast::Select,
+    ) -> Result<Option<RepeatGroupBySpec<'s>>, AnalyzeError> {
+        let Some(group_by) = &select.group_by else {
+            return Ok(None);
+        };
+        if group_by.distinct {
+            return Err(AnalyzeError::unsupported_expression(
+                "GROUP BY DISTINCT is not supported",
+                group_by.span,
+            ));
         }
+        if group_by.elements.is_empty() || group_by.elements.iter().any(|element| matches!(element, ast::GroupingElement::Simple(simple) if simple.columns.is_empty())) {
+            return Err(AnalyzeError::unsupported_expression("empty simple GROUP BY profiles are not supported", group_by.span));
+        }
+        if group_by
+            .elements
+            .iter()
+            .all(|element| matches!(element, ast::GroupingElement::Simple(_)))
+        {
+            return Ok(None);
+        }
+        let [ast::GroupingElement::Sets(sets)] = group_by.elements.as_slice() else {
+            return Err(AnalyzeError::unsupported_expression(
+                "mixed or AUTO GROUP BY elements are not supported",
+                group_by.span,
+            ));
+        };
+        let groups = sets
+            .sets
+            .iter()
+            .map(|group| group.as_slice())
+            .collect::<Vec<_>>();
+        let grouping_sets = match sets.kind {
+            ast::GroupingSetsKind::Explicit => {
+                groups.iter().map(|group| group.iter().collect()).collect()
+            }
+            ast::GroupingSetsKind::Rollup => rollup_grouping_sets(&groups),
+            ast::GroupingSetsKind::Cube => cube_grouping_sets(&groups),
+        };
+        let all_group_by_exprs = if sets.kind == ast::GroupingSetsKind::Explicit {
+            unique_exprs_in_order(groups.iter().flat_map(|group| group.iter()))
+        } else {
+            flatten_grouping_groups(&groups)
+        };
+        Ok(Some(RepeatGroupBySpec {
+            grouping_sets,
+            all_group_by_exprs,
+        }))
     }
 
     /// Resolve `GROUP BY ROLLUP/CUBE/GROUPING SETS` into a single SELECT with
@@ -1943,14 +1991,14 @@ impl<'a> AnalyzerContext<'a> {
     fn resolve_repeat_group_by(
         &self,
         select: &ast::Select,
-        repeat_spec: &RepeatGroupBySpec,
+        repeat_spec: &RepeatGroupBySpec<'_>,
     ) -> Result<(QueryBody, Vec<OutputColumn>), AnalyzeError> {
         use crate::analysis::RepeatInfo;
 
         let all_rollup_columns: Vec<String> = repeat_spec
             .all_group_by_exprs
             .iter()
-            .map(expr_syntax_key)
+            .map(|expr| expr_syntax_key(expr))
             .collect();
 
         // StarRocks uses the last grouping argument as the least-significant
@@ -1961,7 +2009,10 @@ impl<'a> AnalyzerContext<'a> {
         let mut grouping_ids: Vec<u64> = Vec::with_capacity(repeat_spec.grouping_sets.len());
 
         for grouping_set in &repeat_spec.grouping_sets {
-            let non_null_cols: Vec<String> = grouping_set.iter().map(expr_syntax_key).collect();
+            let non_null_cols: Vec<String> = grouping_set
+                .iter()
+                .map(|expr| expr_syntax_key(expr))
+                .collect();
             let active_cols: std::collections::HashSet<String> =
                 non_null_cols.iter().cloned().collect();
             repeat_column_ref_list.push(non_null_cols);
@@ -1978,12 +2029,8 @@ impl<'a> AnalyzerContext<'a> {
 
         // Analyze the original expressions with real, query-local mask
         // references. Only the GROUP BY key union is expanded for Repeat.
-        let mut modified_select = select.clone();
-        modified_select.group_by = ast::GroupBy::Expressions {
-            expressions: repeat_spec.all_group_by_exprs.clone(),
-            span: select.span,
-        };
-        let (mut sel, mut cols) = self.analyze_select(&modified_select)?;
+        let (mut sel, mut cols) =
+            self.analyze_select_in_semantic_scope(select, Some(&repeat_spec.all_group_by_exprs))?;
         let state = self
             .grouping_scope
             .borrow()
@@ -3175,21 +3222,18 @@ impl ast::Fold for GroupingDisplayFolder<'_> {
     }
 }
 
-fn flatten_grouping_groups(groups: &[Vec<ast::Expr>]) -> Vec<ast::Expr> {
-    groups
-        .iter()
-        .flat_map(|group| group.iter().cloned())
-        .collect()
+fn flatten_grouping_groups<'s>(groups: &[&'s [ast::Expr]]) -> Vec<&'s ast::Expr> {
+    groups.iter().flat_map(|group| group.iter()).collect()
 }
 
-fn unique_exprs_in_order<I>(exprs: I) -> Vec<ast::Expr>
+fn unique_exprs_in_order<'s, I>(exprs: I) -> Vec<&'s ast::Expr>
 where
-    I: IntoIterator<Item = ast::Expr>,
+    I: IntoIterator<Item = &'s ast::Expr>,
 {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
     for expr in exprs {
-        let key = expr_syntax_key(&expr);
+        let key = expr_syntax_key(expr);
         if seen.insert(key) {
             result.push(expr);
         }
@@ -3197,31 +3241,33 @@ where
     result
 }
 
-fn rollup_grouping_sets(groups: &[Vec<ast::Expr>]) -> Vec<Vec<ast::Expr>> {
+fn rollup_grouping_sets<'s>(groups: &[&'s [ast::Expr]]) -> Vec<Vec<&'s ast::Expr>> {
     let mut grouping_sets = Vec::with_capacity(groups.len() + 1);
     for active_count in (0..=groups.len()).rev() {
-        let grouping_set = groups
-            .iter()
-            .take(active_count)
-            .flat_map(|group| group.iter().cloned())
-            .collect();
-        grouping_sets.push(grouping_set);
+        grouping_sets.push(
+            groups
+                .iter()
+                .take(active_count)
+                .flat_map(|group| group.iter())
+                .collect(),
+        );
     }
     grouping_sets
 }
 
-fn cube_grouping_sets(groups: &[Vec<ast::Expr>]) -> Vec<Vec<ast::Expr>> {
+fn cube_grouping_sets<'s>(groups: &[&'s [ast::Expr]]) -> Vec<Vec<&'s ast::Expr>> {
     let group_count = groups.len();
     let total = 1usize.checked_shl(group_count as u32).unwrap_or(0);
     let mut grouping_sets = Vec::with_capacity(total);
     for mask in (0..total).rev() {
-        let grouping_set = groups
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| mask & (1usize << idx) != 0)
-            .flat_map(|(_, group)| group.iter().cloned())
-            .collect();
-        grouping_sets.push(grouping_set);
+        grouping_sets.push(
+            groups
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| mask & (1usize << idx) != 0)
+                .flat_map(|(_, group)| group.iter())
+                .collect(),
+        );
     }
     grouping_sets
 }
@@ -6719,6 +6765,101 @@ mod tests {
             },
             other => panic!("expected real -9000 literal to remain literal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn typed_grouping_profile_borrows_real_keys_and_preserves_repeat_facts() {
+        let mut query = parse_native_query(
+            "SELECT k, grouping(k), sum(v) FROM (VALUES (1,10),(2,20)) t(k,v) GROUP BY ROLLUP(k)",
+        )
+        .unwrap();
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let ctx = AnalyzerContext {
+            grouping_scope: Default::default(),
+            view_stack: Default::default(),
+            control: &control,
+            constant_policy: crate::constant::test_constant_policy(),
+            materialized_values: None,
+            catalog: &TestCatalog,
+            current_database: "default",
+            function_catalog: crate::functions::builtin_sql_function_catalog(),
+            sql_semantics: Default::default(),
+            factory: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::column_id::ColumnRefFactory::new(),
+            )),
+            ctes: Default::default(),
+            pending_ctes: Default::default(),
+            next_subquery_id: Default::default(),
+            next_lambda_slot_id: Default::default(),
+            collected_subqueries: Default::default(),
+            cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
+        };
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let ast::GroupingElement::Sets(sets) = &select.group_by.as_ref().unwrap().elements[0]
+        else {
+            panic!("ROLLUP");
+        };
+        let original_key = &sets.sets[0][0];
+        let spec = ctx.extract_repeat_from_group_by(select).unwrap().unwrap();
+        assert_eq!(
+            spec.grouping_sets.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert!(std::ptr::eq(spec.all_group_by_exprs[0], original_key));
+        assert!(std::ptr::eq(spec.grouping_sets[0][0], original_key));
+        let (actual, _, _) = analyze(&query, &TestCatalog, "default").unwrap();
+        let QueryBody::Select(actual) = actual.body else {
+            panic!("resolved SELECT");
+        };
+        let repeat = actual.repeat.as_ref().unwrap();
+        assert_eq!(repeat.grouping_ids, vec![0, 1]);
+        assert_eq!(repeat.all_rollup_columns, vec!["k"]);
+        assert_eq!(
+            actual.projection[0].expr.value_type.data_type(),
+            &DataType::Int32
+        );
+        assert!(actual.projection[0].expr.value_type.nullable());
+
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT");
+        };
+        let group = select.group_by.as_mut().unwrap();
+        group.distinct = true;
+        assert_eq!(
+            ctx.extract_repeat_from_group_by(select).unwrap_err().kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        let group = select.group_by.as_mut().unwrap();
+        group.distinct = false;
+        group
+            .elements
+            .push(ast::GroupingElement::Auto(ast::AutoGroupBy {
+                span: group.span,
+            }));
+        assert_eq!(
+            ctx.extract_repeat_from_group_by(select).unwrap_err().kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        let group = select.group_by.as_mut().unwrap();
+        group.elements.clear();
+        assert_eq!(
+            ctx.extract_repeat_from_group_by(select).unwrap_err().kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        let group = select.group_by.as_mut().unwrap();
+        group
+            .elements
+            .push(ast::GroupingElement::Simple(ast::SimpleGroupBy {
+                columns: ast::AstVec::new(),
+                span: group.span,
+            }));
+        assert_eq!(
+            ctx.extract_repeat_from_group_by(select).unwrap_err().kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert!(ctx.collected_subqueries.borrow().is_empty());
     }
 
     #[test]

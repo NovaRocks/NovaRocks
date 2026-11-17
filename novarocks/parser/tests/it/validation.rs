@@ -188,7 +188,7 @@ fn select_statement(windows: Vec<WindowDefinition>) -> Statement {
             projection: vec![SelectItem::UnnamedExpr(number("1"))],
             from: Vec::new(),
             selection: None,
-            group_by: novarocks_parser::ast::GroupBy::None,
+            group_by: None,
             having: None,
             qualify: None,
             windows: windows.into(),

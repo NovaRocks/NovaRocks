@@ -141,7 +141,7 @@ pub struct Select {
     pub projection: Vec<SelectItem>,
     pub from: Vec<TableWithJoins>,
     pub selection: Option<Expr>,
-    pub group_by: GroupBy,
+    pub group_by: Option<GroupBy>,
     pub having: Option<Expr>,
     pub qualify: Option<Expr>,
     pub windows: AstVec<WindowDefinition>,
@@ -200,13 +200,54 @@ pub struct ReplaceSelectItem {
     pub span: Span,
 }
 
+/// One GROUP BY clause; empty element lists remain structurally legal.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GroupBy {
-    None,
-    Expressions { expressions: Vec<Expr>, span: Span },
-    Rollup { expressions: Vec<Expr>, span: Span },
-    Cube { expressions: Vec<Expr>, span: Span },
-    GroupingSets { sets: Vec<Vec<Expr>>, span: Span },
+pub struct GroupBy {
+    pub distinct: bool,
+    pub elements: AstVec<GroupingElement>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroupingElement {
+    Simple(SimpleGroupBy),
+    Sets(GroupingSets),
+    Auto(AutoGroupBy),
+}
+
+impl GroupingElement {
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Simple(node) => node.span,
+            Self::Sets(node) => node.span,
+            Self::Auto(node) => node.span,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimpleGroupBy {
+    pub columns: AstVec<Expr>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupingSets {
+    pub kind: GroupingSetsKind,
+    pub sets: AstVec<AstVec<Expr>>,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupingSetsKind {
+    Explicit,
+    Rollup,
+    Cube,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutoGroupBy {
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

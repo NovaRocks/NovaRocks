@@ -128,6 +128,7 @@ pub enum StructuralViolation {
     InvalidLogicalTermCount,
     EmptyInList,
     EmptyOrderBy,
+    EmptyGroupingSets,
     EmptyPatternList,
     EmptySubsetIdentifierList,
     InvalidQueryModifierOwner,

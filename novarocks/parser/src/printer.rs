@@ -364,7 +364,9 @@ impl Printer {
             self.output.push_str(" WHERE ");
             self.write_expr(selection);
         }
-        self.write_group_by(&select.group_by);
+        if let Some(group_by) = &select.group_by {
+            self.write_group_by(group_by);
+        }
         if let Some(having) = &select.having {
             self.output.push_str(" HAVING ");
             self.write_expr(having);
@@ -449,31 +451,51 @@ impl Printer {
         }
     }
 
+    #[recursive::recursive]
     fn write_group_by(&mut self, group_by: &GroupBy) {
-        let (keyword, expressions): (&str, &[Expr]) = match group_by {
-            GroupBy::None => return,
-            GroupBy::Expressions { expressions, .. } => ("GROUP BY ", expressions),
-            GroupBy::Rollup { expressions, .. } => ("GROUP BY ROLLUP (", expressions),
-            GroupBy::Cube { expressions, .. } => ("GROUP BY CUBE (", expressions),
-            GroupBy::GroupingSets { sets, .. } => {
-                self.output.push_str(" GROUP BY GROUPING SETS (");
-                for (set_index, set) in sets.iter().enumerate() {
-                    if set_index != 0 {
-                        self.output.push_str(", ");
+        self.output.push_str(" GROUP BY ");
+        if group_by.distinct {
+            self.output.push_str("DISTINCT ");
+        }
+        for (index, element) in group_by.elements.iter().enumerate() {
+            if index > 0 {
+                self.output.push_str(", ");
+            }
+            match element {
+                GroupingElement::Simple(node) => {
+                    let parenthesized = node.columns.len() != 1;
+                    if parenthesized {
+                        self.output.push('(');
                     }
-                    self.output.push('(');
-                    self.write_expr_list(set);
+                    self.write_expr_list(&node.columns);
+                    if parenthesized {
+                        self.output.push(')');
+                    }
+                }
+                GroupingElement::Sets(node) => {
+                    self.output.push_str(match node.kind {
+                        GroupingSetsKind::Explicit => "GROUPING SETS (",
+                        GroupingSetsKind::Rollup => "ROLLUP (",
+                        GroupingSetsKind::Cube => "CUBE (",
+                    });
+                    for (index, set) in node.sets.iter().enumerate() {
+                        if index > 0 {
+                            self.output.push_str(", ");
+                        }
+                        let parenthesized =
+                            node.kind == GroupingSetsKind::Explicit || set.len() != 1;
+                        if parenthesized {
+                            self.output.push('(');
+                        }
+                        self.write_expr_list(set);
+                        if parenthesized {
+                            self.output.push(')');
+                        }
+                    }
                     self.output.push(')');
                 }
-                self.output.push(')');
-                return;
+                GroupingElement::Auto(_) => self.output.push_str("AUTO"),
             }
-        };
-        self.output.push(' ');
-        self.output.push_str(keyword);
-        self.write_expr_list(expressions);
-        if matches!(group_by, GroupBy::Rollup { .. } | GroupBy::Cube { .. }) {
-            self.output.push(')');
         }
     }
 
@@ -2628,7 +2650,7 @@ mod tests {
                     span: span(),
                 }],
                 selection: None,
-                group_by: GroupBy::None,
+                group_by: None,
                 having: None,
                 qualify: None,
                 windows: AstVec::new(),

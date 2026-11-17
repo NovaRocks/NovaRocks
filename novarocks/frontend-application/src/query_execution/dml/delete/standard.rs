@@ -324,7 +324,7 @@ fn delete_position_sink_query_ast(
         projection,
         vec![build::relation(build::table(name, version, None))],
         Some(where_clause.clone()),
-        ast::GroupBy::None,
+        None,
     )
     .map_err(|error| format!("internal DELETE query construction failed: {error}"))?;
     Ok(build::query(ast::SetExpr::Select(Box::new(select))))

@@ -3228,20 +3228,18 @@ impl<'a> AnalyzerContext<'a> {
             state.enabled.set(false);
         }
         // --- GROUP BY ---
-        let group_by_exprs = match &select.group_by {
-            ast::GroupBy::None => Vec::new(),
-            ast::GroupBy::Expressions { expressions, .. } => expressions.clone(),
-            ast::GroupBy::Rollup { span, .. }
-            | ast::GroupBy::Cube { span, .. }
-            | ast::GroupBy::GroupingSets { span, .. } => {
-                return Err(AnalyzeError::unsupported_query_shape(
+        let group_by_exprs =
+            super::simple_group_by_expressions(&select.group_by).ok_or_else(|| {
+                AnalyzeError::unsupported_query_shape(
                     "GROUP BY ALL is not supported",
-                    *span,
-                ));
-            }
-        };
+                    select
+                        .group_by
+                        .as_ref()
+                        .map_or(select.span, |group| group.span),
+                )
+            })?;
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
-        for gb_expr in &group_by_exprs {
+        for gb_expr in group_by_exprs {
             self.check_control()?;
             match self.analyze_expr(gb_expr, &merged_scope) {
                 Ok(typed) => group_by.push(qualify_inner_shadowing_column_refs(

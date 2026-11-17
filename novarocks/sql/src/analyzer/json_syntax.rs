@@ -534,7 +534,7 @@ mod tests {
                 vec![ast::SelectItem::UnnamedExpr(expression)],
                 from,
                 None,
-                ast::GroupBy::None,
+                None,
             )
             .unwrap(),
         )))

@@ -24,8 +24,8 @@
 use novarocks_parser::{
     Span,
     ast::{
-        Expr, Fold, GroupBy, Ident, JoinConstraint, JoinOperator, LiteralKind, Query, Select,
-        SelectItem, SetExpr, SetOperator, TableAlias, TableFactor, TableWithJoins, Visit,
+        Expr, Fold, Ident, JoinConstraint, JoinOperator, LiteralKind, Query, Select, SelectItem,
+        SetExpr, SetOperator, TableAlias, TableFactor, TableWithJoins, Visit,
     },
 };
 
@@ -518,7 +518,7 @@ fn inline_iteration(
             span,
         }],
         selection: None,
-        group_by: novarocks_parser::ast::GroupBy::None,
+        group_by: None,
         having: None,
         qualify: None,
         windows: Vec::new().into(),
@@ -626,22 +626,8 @@ fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, ex
             if let Some(selection) = &select.selection {
                 visitor.visit_expr(selection);
             }
-            match &select.group_by {
-                GroupBy::None => {}
-                GroupBy::Expressions { expressions, .. }
-                | GroupBy::Rollup { expressions, .. }
-                | GroupBy::Cube { expressions, .. } => {
-                    for expression in expressions {
-                        visitor.visit_expr(expression);
-                    }
-                }
-                GroupBy::GroupingSets { sets, .. } => {
-                    for set in sets {
-                        for expression in set {
-                            visitor.visit_expr(expression);
-                        }
-                    }
-                }
+            if let Some(group_by) = &select.group_by {
+                visitor.visit_group_by(group_by);
             }
             for expression in [&select.having, &select.qualify].into_iter().flatten() {
                 visitor.visit_expr(expression);
@@ -838,7 +824,7 @@ fn remove_bare_top_level_dual(query: &mut Query) {
         return;
     }
     if select.selection.is_some()
-        || !matches!(select.group_by, GroupBy::None)
+        || select.group_by.is_some()
         || select.having.is_some()
         || select.qualify.is_some()
         || !select.windows.is_empty()

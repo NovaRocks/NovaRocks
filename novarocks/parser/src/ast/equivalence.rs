@@ -141,7 +141,7 @@ impl SyntaxEq for Select {
             && syntax_eq_slice(&self.projection, &other.projection)
             && syntax_eq_slice(&self.from, &other.from)
             && syntax_eq_option(&self.selection, &other.selection)
-            && self.group_by.syntax_eq(&other.group_by)
+            && syntax_eq_option(&self.group_by, &other.group_by)
             && syntax_eq_option(&self.having, &other.having)
             && syntax_eq_option(&self.qualify, &other.qualify)
             && syntax_eq_slice(&self.windows, &other.windows)
@@ -219,38 +219,43 @@ impl SyntaxEq for ReplaceSelectItem {
 }
 
 impl SyntaxEq for GroupBy {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.distinct == other.distinct && syntax_eq_slice(&self.elements, &other.elements)
+    }
+}
+impl SyntaxEq for GroupingElement {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::None, Self::None) => true,
-            (
-                Self::Expressions {
-                    expressions: left, ..
-                },
-                Self::Expressions {
-                    expressions: right, ..
-                },
-            )
-            | (
-                Self::Rollup {
-                    expressions: left, ..
-                },
-                Self::Rollup {
-                    expressions: right, ..
-                },
-            )
-            | (
-                Self::Cube {
-                    expressions: left, ..
-                },
-                Self::Cube {
-                    expressions: right, ..
-                },
-            ) => syntax_eq_slice(left, right),
-            (Self::GroupingSets { sets: left, .. }, Self::GroupingSets { sets: right, .. }) => {
-                syntax_eq_nested_slice(left, right)
-            }
+            (Self::Simple(left), Self::Simple(right)) => left.syntax_eq(right),
+            (Self::Sets(left), Self::Sets(right)) => left.syntax_eq(right),
+            (Self::Auto(left), Self::Auto(right)) => left.syntax_eq(right),
             _ => false,
         }
+    }
+}
+impl SyntaxEq for SimpleGroupBy {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        syntax_eq_slice(&self.columns, &other.columns)
+    }
+}
+impl SyntaxEq for GroupingSets {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.sets.len() == other.sets.len()
+            && self
+                .sets
+                .iter()
+                .zip(&other.sets)
+                .all(|(left, right)| syntax_eq_slice(left, right))
+    }
+}
+impl SyntaxEq for AutoGroupBy {
+    fn syntax_eq(&self, _other: &Self) -> bool {
+        true
     }
 }
 
@@ -851,10 +856,15 @@ mod tests {
                 }],
                 from: Vec::new(),
                 selection: None,
-                group_by: GroupBy::Expressions {
-                    expressions: vec![Expr::Identifier(ident("k", start + 12))],
+                group_by: Some(GroupBy {
+                    distinct: false,
+                    elements: vec![GroupingElement::Simple(SimpleGroupBy {
+                        columns: vec![Expr::Identifier(ident("k", start + 12))].into(),
+                        span: span(start + 13),
+                    })]
+                    .into(),
                     span: span(start + 13),
-                },
+                }),
                 having: None,
                 qualify: None,
                 windows: AstVec::new(),

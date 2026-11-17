@@ -1056,8 +1056,20 @@ fn alias_incremental_aggregate_group_key_projection(
             format!("aggregate MV group key projection position {projection_index} is missing")
         })?;
         alias_incremental_select_projection_item(item, expected_name)?;
-        if let ast::GroupBy::Expressions { expressions, .. } = &mut select.group_by
-            && let Some(group_expr) = expressions.get_mut(*group_key_index)
+        if let Some(group_by) = &mut select.group_by
+            && !group_by.distinct
+            && let Some(group_expr) = group_by
+                .elements
+                .iter_mut()
+                .filter_map(|element| {
+                    if let ast::GroupingElement::Simple(simple) = element {
+                        Some(simple.columns.iter_mut())
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+                .nth(*group_key_index)
         {
             *group_expr = ast::Expr::Identifier(incremental_alias_ident(expected_name));
         }
@@ -2973,7 +2985,7 @@ fn aggregate_physical_query(
                 Some(build::alias(build::ident("state", false), Vec::new(), true)),
             ))],
             None,
-            ast::GroupBy::None,
+            None,
         )
         .map_err(|error| error.to_string())?,
     ))))

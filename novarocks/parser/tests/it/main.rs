@@ -31,3 +31,5 @@ mod query_count;
 mod json_arrow;
 
 mod ordinary_special;
+
+mod group_by;

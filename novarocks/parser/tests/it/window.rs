@@ -101,13 +101,7 @@ fn operation(frame: WindowFrame) -> Expr {
 }
 fn statement(expr: Expr) -> Statement {
     Statement::Query(build::query(SetExpr::Select(Box::new(
-        build::select(
-            vec![build::item(expr, None, false)],
-            Vec::new(),
-            None,
-            GroupBy::None,
-        )
-        .unwrap(),
+        build::select(vec![build::item(expr, None, false)], Vec::new(), None, None).unwrap(),
     ))))
 }
 

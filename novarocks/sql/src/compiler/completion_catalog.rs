@@ -623,19 +623,27 @@ impl<'a> CatalogNeedCollector<'a> {
 
     fn collect_group_by(
         &mut self,
-        group_by: &ast::GroupBy,
+        group_by: &Option<ast::GroupBy>,
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
-        let groups: &[Vec<ast::Expr>] = match group_by {
-            ast::GroupBy::None => return Ok(()),
-            ast::GroupBy::Expressions { expressions, .. }
-            | ast::GroupBy::Rollup { expressions, .. }
-            | ast::GroupBy::Cube { expressions, .. } => std::slice::from_ref(expressions),
-            ast::GroupBy::GroupingSets { sets, .. } => sets,
+        let Some(group_by) = group_by else {
+            return Ok(());
         };
-        for group in groups {
-            for expression in group {
-                self.collect_expr(expression, scope)?;
+        for element in &group_by.elements {
+            match element {
+                ast::GroupingElement::Simple(simple) => {
+                    for expression in &simple.columns {
+                        self.collect_expr(expression, scope)?;
+                    }
+                }
+                ast::GroupingElement::Sets(sets) => {
+                    for group in &sets.sets {
+                        for expression in group {
+                            self.collect_expr(expression, scope)?;
+                        }
+                    }
+                }
+                ast::GroupingElement::Auto(_) => {}
             }
         }
         Ok(())

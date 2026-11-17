@@ -288,13 +288,8 @@ fn equality_delete_sink_query_ast(
             true,
         )),
     );
-    let select = build::select(
-        projection,
-        vec![build::relation(source)],
-        None,
-        ast::GroupBy::None,
-    )
-    .map_err(|error| format!("internal equality-delete query construction failed: {error}"))?;
+    let select = build::select(projection, vec![build::relation(source)], None, None)
+        .map_err(|error| format!("internal equality-delete query construction failed: {error}"))?;
     Ok(build::query(ast::SetExpr::Select(Box::new(select))))
 }
 

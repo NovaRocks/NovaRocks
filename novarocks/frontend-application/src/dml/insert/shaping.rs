@@ -275,7 +275,7 @@ fn shape_body(
                         )),
                     ))],
                     None,
-                    ast::GroupBy::None,
+                    None,
                 )
                 .map_err(|error| error.to_string())?,
             )));
@@ -1043,7 +1043,7 @@ fn source_assignment_before_common_type(query: &ast::Query) -> bool {
                     && select.from.is_empty()
                     && !matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. })
                     && select.selection.is_none()
-                    && matches!(select.group_by, ast::GroupBy::None)
+                    && select.group_by.is_none()
                     && select.having.is_none()
                     && select.qualify.is_none()
                     && select.windows.is_empty()

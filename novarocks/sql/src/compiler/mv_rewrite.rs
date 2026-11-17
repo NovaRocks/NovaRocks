@@ -25,10 +25,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_parser::ast::{
-    Expr, FunctionCall, GroupBy, Ident, JoinConstraint, Literal, LiteralKind, ObjectName, Query,
-    Select, SelectItem, SelectQuantifier, SetExpr, TableAlias, TableFactor, TableWithJoins,
-    TypeName, Visit, WildcardOptions, WindowSpecification, walk_expr, walk_function_call,
-    walk_object_name, walk_query, walk_table_factor, walk_type_name,
+    Expr, FunctionCall, Ident, JoinConstraint, Literal, LiteralKind, ObjectName, Query, Select,
+    SelectItem, SelectQuantifier, SetExpr, TableAlias, TableFactor, TableWithJoins, TypeName,
+    Visit, WildcardOptions, WindowSpecification, walk_expr, walk_function_call, walk_object_name,
+    walk_query, walk_table_factor, walk_type_name,
 };
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 
@@ -2828,17 +2828,24 @@ impl CompletionRetainedBytes {
         for table in &select.from {
             self.add_table_with_joins_containers(table);
         }
-        match &select.group_by {
-            GroupBy::None => {}
-            GroupBy::Expressions { expressions, .. }
-            | GroupBy::Rollup { expressions, .. }
-            | GroupBy::Cube { expressions, .. } => {
-                self.add_vec_capacity::<Expr>(expressions.capacity());
-            }
-            GroupBy::GroupingSets { sets, .. } => {
-                self.add_vec_capacity::<Vec<Expr>>(sets.capacity());
-                for set in sets {
-                    self.add_vec_capacity::<Expr>(set.capacity());
+        if let Some(group_by) = &select.group_by {
+            self.add_vec_capacity::<novarocks_parser::ast::GroupingElement>(
+                group_by.elements.capacity(),
+            );
+            for element in &group_by.elements {
+                match element {
+                    novarocks_parser::ast::GroupingElement::Simple(simple) => {
+                        self.add_vec_capacity::<Expr>(simple.columns.capacity())
+                    }
+                    novarocks_parser::ast::GroupingElement::Sets(sets) => {
+                        self.add_vec_capacity::<novarocks_parser::ast::AstVec<Expr>>(
+                            sets.sets.capacity(),
+                        );
+                        for group in &sets.sets {
+                            self.add_vec_capacity::<Expr>(group.capacity());
+                        }
+                    }
+                    novarocks_parser::ast::GroupingElement::Auto(_) => {}
                 }
             }
         }

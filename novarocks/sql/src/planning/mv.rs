@@ -2828,12 +2828,12 @@ pub fn classify_aggregate_select_outputs(
     select: &Select,
 ) -> Result<AggregateSelectOutputs, String> {
     let group_by_exprs = aggregate_group_by_exprs(&select.group_by)?;
-    for expr in group_by_exprs {
+    for expr in &group_by_exprs {
         reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
     }
 
     let mut group_keys = group_by_exprs
-        .iter()
+        .into_iter()
         .cloned()
         .map(|expr| GroupKeyShape {
             output_name: String::new(),
@@ -3058,7 +3058,7 @@ fn reject_unsupported_select_clauses(select: &Select) -> Result<(), String> {
     if !matches!(
         select.quantifier,
         ast::SelectQuantifier::None | ast::SelectQuantifier::All(_)
-    ) || !matches!(select.group_by, ast::GroupBy::None)
+    ) || select.group_by.is_some()
         || select.having.is_some()
         || !select.windows.is_empty()
         || select.qualify.is_some()
@@ -3113,26 +3113,16 @@ fn extract_single_base_table(
     Ok(name.clone())
 }
 
-fn aggregate_group_by_exprs(group_by: &ast::GroupBy) -> Result<&[Expr], String> {
-    match group_by {
-        ast::GroupBy::Expressions { expressions, .. } => {
-            if matches!(expressions.as_slice(), [Expr::Identifier(ident)] if !ident.quoted && ident.value.eq_ignore_ascii_case("all")) {
-                return Err(
-                    "incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported"
-                        .to_string(),
-                );
-            }
-            if expressions.is_empty() {
-                return Err("incremental aggregate MV requires a non-empty GROUP BY".to_string());
-            }
-            Ok(expressions)
-        }
-        ast::GroupBy::None => Err("incremental aggregate MV requires a non-empty GROUP BY".to_string()),
-        ast::GroupBy::Rollup { .. } | ast::GroupBy::Cube { .. } | ast::GroupBy::GroupingSets { .. } => Err(
-            "incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported"
-                .to_string(),
-        ),
+fn aggregate_group_by_exprs(group_by: &Option<ast::GroupBy>) -> Result<Vec<&Expr>, String> {
+    let expressions = crate::analyzer::simple_group_by_expressions(group_by).ok_or_else(|| "incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string())?;
+    if matches!(expressions.as_slice(), [Expr::Identifier(ident)] if !ident.quoted && ident.value.eq_ignore_ascii_case("all"))
+    {
+        return Err("incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string());
     }
+    if expressions.is_empty() {
+        return Err("incremental aggregate MV requires a non-empty GROUP BY".to_string());
+    }
+    Ok(expressions)
 }
 
 fn projection_expr_and_output_name(item: &SelectItem) -> Result<(&Expr, String), String> {
@@ -3827,14 +3817,9 @@ fn is_aggregate_function(name: &str) -> bool {
     )
 }
 
-fn is_empty_group_by(group_by: &ast::GroupBy) -> bool {
-    match group_by {
-        ast::GroupBy::None => true,
-        ast::GroupBy::Expressions { expressions, .. } => expressions.is_empty(),
-        ast::GroupBy::Rollup { .. }
-        | ast::GroupBy::Cube { .. }
-        | ast::GroupBy::GroupingSets { .. } => false,
-    }
+fn is_empty_group_by(group_by: &Option<ast::GroupBy>) -> bool {
+    crate::analyzer::simple_group_by_expressions(group_by)
+        .is_some_and(|expressions| expressions.is_empty())
 }
 
 fn is_three_part_object_name(name: &ObjectName) -> bool {

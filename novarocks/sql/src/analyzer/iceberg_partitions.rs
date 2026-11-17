@@ -126,12 +126,9 @@ pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast
                 span,
             )),
             group_by: if partitioned {
-                ast::GroupBy::Expressions {
-                    expressions: vec![column("partition", span)],
-                    span,
-                }
+                novarocks_parser::build::group_by(vec![column("partition", span)])
             } else {
-                ast::GroupBy::None
+                None
             },
             having: (!partitioned).then(|| {
                 comparison(
@@ -200,11 +197,12 @@ mod tests {
                 assert_eq!(select.projection.len(), if partitioned { 4 } else { 3 });
                 if partitioned {
                     assert!(
-                        matches!(&select.group_by, ast::GroupBy::Expressions { expressions, .. } if expressions == &vec![column("partition", span)])
+                        crate::analyzer::simple_group_by_expressions(&select.group_by).unwrap()
+                            == vec![&column("partition", span)]
                     );
                     assert!(select.having.is_none());
                 } else {
-                    assert!(matches!(select.group_by, ast::GroupBy::None));
+                    assert!(select.group_by.is_none());
                     assert_eq!(
                         select.having,
                         Some(comparison(
