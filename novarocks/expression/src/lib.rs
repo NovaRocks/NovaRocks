@@ -16,3 +16,25 @@
 // under the License.
 
 //! Pure compilation of self-contained scalar expression units.
+
+mod definitions;
+pub use definitions::*;
+mod creation;
+pub use creation::ProgramCreationFailure as ExprConstructionFailure;
+mod compiler;
+pub use compiler::{ExprCompileError, ExprCompileFailure};
+mod original_requests;
+mod primitives;
+pub use primitives::{
+    ComparisonSite, ProgramPrimitiveError as PrimitiveError, prepare_arithmetic_node,
+    prepare_cast_node, prepare_comparison_node, prepare_native_bitnot_node,
+    prepare_native_negate_node, prepare_null_safe_comparison_node,
+};
+mod scopes;
+pub use scopes::*;
+mod compiled;
+pub use compiled::*;
+mod failure;
+use compiled::CompiledParts;
+
+pub(crate) use creation::ProgramCreationFailure;
