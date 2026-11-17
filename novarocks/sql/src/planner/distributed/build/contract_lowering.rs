@@ -29,6 +29,8 @@ mod grouped_topn;
 mod neutral_requests;
 mod nullable_transaction;
 mod scalar_emission;
+mod standalone_scalar;
+pub(crate) use standalone_scalar::{StandaloneScalarEmission, lower_required_constant_unit};
 mod scalar_nullability;
 mod unit_authorship;
 
@@ -100,12 +102,12 @@ use {
 
 use super::lowered_draft::{
     AggregateRuntimeDemand, AggregateSourceTarget, AggregateStateEndpoint, AggregateStateLink,
-    AggregateStateSources, AggregateStateTransport, CanonicalAggregateOperationalRequest,
-    CanonicalCallOperationalRequest, CapturedOperationalSource, EmittedOperationalCall,
-    LoweredAggregateLogicalSource, LoweredAggregateSourceEntry, LoweredExpressionLogicalSource,
-    LoweredExpressionSourceEntry, LoweredOperationalChannel, LoweredSqlPhysicalDraft,
-    LoweredTableSourceEntry, LoweredWindowSourceEntry, SqlExpressionCallKind,
-    SqlLogicalSourceJournal, SqlOperationalChannelRole, SqlOperationalProjectionError,
+    AggregateStateTransport, CanonicalAggregateOperationalRequest, CanonicalCallOperationalRequest,
+    CapturedOperationalSource, EmittedOperationalCall, LoweredAggregateLogicalSource,
+    LoweredAggregateSourceEntry, LoweredExpressionLogicalSource, LoweredExpressionSourceEntry,
+    LoweredOperationalChannel, LoweredSqlPhysicalDraft, LoweredTableSourceEntry,
+    LoweredWindowSourceEntry, SqlExpressionCallKind, SqlLogicalSourceJournal,
+    SqlOperationalChannelRole, SqlOperationalProjectionError,
     project_emitted_call_arguments_observed, project_emitted_writer_value_observed,
     validate_expression_source_entry_observed, validate_table_source_entry_observed,
 };
@@ -546,14 +548,14 @@ pub(super) struct SqlUnitSourceLoan<'a> {
     functions: &'a Arc<dyn crate::compiler::SqlFunctionCatalog>,
 }
 impl<'a> SqlUnitSourceLoan<'a> {
-    pub(super) const fn site(&self) -> ScalarSourceSite {
-        self.site
+    pub(super) fn site(&self) -> ScalarSourceSite {
+        self.site.clone()
     }
-    pub(super) const fn owner(&self) -> ScalarUnitOwner {
+    pub(super) fn owner(&self) -> ScalarUnitOwner {
         self.site.owner()
     }
-    pub(super) const fn definitions(&self) -> super::unit_source::UnitDefinitions<'a> {
-        self.definitions
+    pub(super) fn definitions(&self) -> super::unit_source::UnitDefinitions<'a> {
+        self.definitions.clone()
     }
     pub(super) const fn constants(&self) -> &'a novarocks_physical_plan::ConstantPools {
         self.constants
@@ -1565,7 +1567,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             work: &mut self.work,
             constant_emission: &mut self.constant_emission,
             lambda_scope: &mut self.lambda_scope,
-            storage: scalar_emission::NodeScalarStorage {
+            storage: scalar_emission::ScalarStorage::Node(scalar_emission::NodeScalarStorage {
                 fragment_id: fragment,
                 node: owner,
                 fragment: self
@@ -1573,7 +1575,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .get_mut(&fragment)
                     .expect("the current fragment is allocated before lowering"),
                 order: scalar_emission::NodeScalarOrder::new(self.definition_order.entry(fragment)),
-            },
+            }),
             call_sources: &mut self.call_sources,
         }
     }
@@ -1617,13 +1619,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             completions: BTreeMap::new(),
             plan_version: version,
             plan_builder: PlanBuilder::new(version, constant_policy),
-            call_sources: SqlLogicalSourceJournal {
-                state_sources: AggregateStateSources::default(),
-                expression_entries: BTreeMap::new(),
-                table_entries: BTreeMap::new(),
-                window_entries: BTreeMap::new(),
-                entries: BTreeMap::new(),
-            },
+            call_sources: SqlLogicalSourceJournal::new(),
             provider_partition_definitions: BTreeMap::new(),
             dop_domain,
             provider_reads,
@@ -2096,17 +2092,11 @@ impl<'a> ContractLoweringVisitor<'a> {
         let result: Result<Option<SemanticParameters>, ContractLoweringError> = (|| {
             self.plan_builder.set_result_port(result_port)?;
             self.attach_runtime_filter_endpoints()?;
-            if self.root_allow_throw_exception_used {
-                self.group_concat_parameters.insert(
-                    SemanticParameterId::new(0),
-                    SemanticParameterValue::AllowThrowException(self.root_allow_throw_exception),
-                );
-            }
-            let parameters =
-                SemanticParameters::try_new(std::mem::take(&mut self.group_concat_parameters))
-                    .map_err(|error| ContractLoweringError::InvalidFunctionBinding {
-                        detail: error.to_string(),
-                    })?;
+            let parameters = scalar_emission::freeze_semantic_parameters(
+                self.root_allow_throw_exception_used,
+                self.root_allow_throw_exception,
+                std::mem::take(&mut self.group_concat_parameters),
+            )?;
             #[cfg(test)]
             if let Some(observer) = self.original_emission_observer.take() {
                 observer.observe(
@@ -2286,12 +2276,18 @@ impl<'a> ContractLoweringVisitor<'a> {
             // Check retained source authors first. The mandatory static request
             // attachment below separately closes every actual call definition,
             // including definitions with no runtime invocation occurrence.
-            for (&address, entry) in &self.call_sources.expression_entries {
+            for (address, entry) in &self.call_sources.expression_entries {
                 self.work.step()?;
                 let ScalarSourceSite::Node {
                     fragment: fragment_id,
                     node: node_id,
-                } = address.site;
+                } = &address.site
+                else {
+                    return Err(ContractLoweringError::InvalidFunctionBinding {
+                        detail: "node publication contains a standalone scalar source".into(),
+                    });
+                };
+                let (fragment_id, node_id) = (*fragment_id, *node_id);
                 let expression_id = address.definition;
                 let fragment = finished_fragments.get(&fragment_id).ok_or(
                     ContractLoweringError::UnknownFragmentCompletion {
@@ -20657,3 +20653,6 @@ pub(super) fn node_effects_with_test_summaries(
     // facts to the original relation consumer. This is not a production issuer.
     NodeExpressionEffects { unit, summaries }
 }
+
+#[cfg(test)]
+pub(in crate::planner::distributed::build) use standalone_scalar::tests::sealed_standalone_source_for_effects;

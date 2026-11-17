@@ -712,8 +712,8 @@ impl<'a> CheckedExpressionLogicalSourceEntry<'a> {
     pub(crate) fn captured(&self) -> &'a CapturedLogicalCallArguments {
         self.entry.captured.captured()
     }
-    pub(crate) const fn definitions(&self) -> super::unit_source::UnitDefinitions<'a> {
-        self.definitions
+    pub(crate) fn definitions(&self) -> super::unit_source::UnitDefinitions<'a> {
+        self.definitions.clone()
     }
     pub(crate) const fn source(&self) -> &'a novarocks_expression_contract::ExprNode {
         self.source
@@ -1367,3 +1367,15 @@ impl LoweredSqlPhysicalDraft {
 #[cfg(test)]
 #[path = "lowered_draft_publication_tests.rs"]
 mod publication_tests;
+
+impl SqlLogicalSourceJournal {
+    pub(super) fn new() -> Self {
+        Self {
+            state_sources: AggregateStateSources::default(),
+            expression_entries: BTreeMap::new(),
+            table_entries: BTreeMap::new(),
+            window_entries: BTreeMap::new(),
+            entries: BTreeMap::new(),
+        }
+    }
+}

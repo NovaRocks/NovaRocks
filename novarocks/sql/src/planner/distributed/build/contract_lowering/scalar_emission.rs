@@ -91,6 +91,80 @@ impl NodeScalarStorage<'_> {
     }
 }
 
+pub(super) struct StandaloneScalarStorage<'emission> {
+    pub(super) brand: &'emission super::super::unit_source::StandaloneSourceBrand,
+    pub(super) draft: &'emission mut novarocks_expression_contract::BoundExprSetBuilder,
+    pub(super) events: &'emission mut Vec<ExprId>,
+}
+
+pub(super) enum ScalarStorage<'emission> {
+    Node(NodeScalarStorage<'emission>),
+    Standalone(StandaloneScalarStorage<'emission>),
+}
+impl ScalarStorage<'_> {
+    pub(super) fn definitions(&self) -> super::super::unit_source::UnitDefinitions<'_> {
+        match self {
+            Self::Node(storage) => storage.definitions(),
+            Self::Standalone(storage) => super::super::unit_source::UnitDefinitions::from_builder(
+                ScalarUnitOwner::Standalone(storage.brand.clone()),
+                storage.draft,
+            ),
+        }
+    }
+    pub(super) fn source_site(&self) -> ScalarSourceSite {
+        match self {
+            Self::Node(storage) => storage.source_site(),
+            Self::Standalone(storage) => ScalarSourceSite::Standalone(storage.brand.clone()),
+        }
+    }
+    pub(super) fn current_value_type(&self, value: ValueId) -> Option<&ValueType> {
+        match self {
+            Self::Node(storage) => storage.current_value_type(value),
+            Self::Standalone(_) => None,
+        }
+    }
+    pub(super) fn type_editor(
+        &mut self,
+    ) -> Result<novarocks_expression_contract::UnitTypeEditor<'_>, ContractLoweringError> {
+        Ok(self.unit_mut()?.types_mut())
+    }
+    fn unit_mut(
+        &mut self,
+    ) -> Result<&mut novarocks_expression_contract::BoundExprSetBuilder, ContractLoweringError>
+    {
+        match self {
+            Self::Node(storage) => Ok(storage.fragment.unit(storage.node)?),
+            Self::Standalone(storage) => Ok(storage.draft),
+        }
+    }
+    fn fragment_definition_count(&self) -> Option<usize> {
+        match self {
+            Self::Node(storage) => Some(storage.order.definition_count()),
+            Self::Standalone(_) => None,
+        }
+    }
+    fn reserve_definition_event(&mut self) -> Result<(), ContractLoweringError> {
+        match self {
+            Self::Node(storage) => storage.order.get_mut().events.try_reserve(1),
+            Self::Standalone(storage) => storage.events.try_reserve(1),
+        }
+        .map_err(|_| CompileControlError::ResourceExhausted.into())
+    }
+    fn record_definition(&mut self, definition: ExprId) {
+        match self {
+            Self::Node(storage) => {
+                let order = storage.order.get_mut();
+                order.definitions += 1;
+                order.events.push(NullableEmission::Definition {
+                    node: storage.node,
+                    definition,
+                });
+            }
+            Self::Standalone(storage) => storage.events.push(definition),
+        }
+    }
+}
+
 pub(super) struct ScalarEmission<'emission, 'control> {
     pub(super) root_allow_throw_exception: bool,
     pub(super) constant_policy: novarocks_constant_contract::ConstantPolicy,
@@ -100,14 +174,10 @@ pub(super) struct ScalarEmission<'emission, 'control> {
     pub(super) work: &'emission mut CompileCheckpoints<'control>,
     pub(super) constant_emission: &'emission mut constant_emission::SqlConstantEmission,
     pub(super) lambda_scope: &'emission mut Vec<LoweringLambdaScope>,
-    pub(super) storage: NodeScalarStorage<'emission>,
+    pub(super) storage: ScalarStorage<'emission>,
     pub(super) call_sources: &'emission mut SqlLogicalSourceJournal,
 }
 impl ScalarEmission<'_, '_> {
-    fn fragment_mut(&mut self) -> &mut FragmentBuilder {
-        self.storage.fragment
-    }
-
     pub(super) fn root_allow_throw_reference(&mut self) -> SemanticParameterRef {
         root_allow_throw_reference(self.root_allow_throw_exception_used)
     }
@@ -226,9 +296,13 @@ impl ScalarEmission<'_, '_> {
         &mut self,
         value: ValueId,
     ) -> Result<Option<ExprId>, ContractLoweringError> {
-        let owner = self.storage.node;
-
-        let fragment = &*self.storage.fragment;
+        let ScalarStorage::Node(storage) = &self.storage else {
+            return Err(ContractLoweringError::InvalidFunctionBinding {
+                detail: "standalone scalar unit cannot read an input value".into(),
+            });
+        };
+        let owner = storage.node;
+        let fragment = &*storage.fragment;
         let definition = fragment
             .value(value)
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))?;
@@ -261,7 +335,7 @@ impl ScalarEmission<'_, '_> {
             .expression_entries
             .get(&ScalarDefinitionAddress::new(
                 ScalarSourceSite::Node {
-                    fragment: self.storage.fragment_id,
+                    fragment: storage.fragment_id,
                     node: owner,
                 },
                 expression,
@@ -324,8 +398,6 @@ impl ScalarEmission<'_, '_> {
         expression: &TypedExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<ExprId, ContractLoweringError> {
-        let owner = self.storage.node;
-
         self.work.step()?;
         if let ExprKind::Literal(literal) = &expression.kind {
             return self.lower_literal_expression(literal, expression);
@@ -711,7 +783,7 @@ impl ScalarEmission<'_, '_> {
                 self.lambda_scope.pop();
                 let body_id = body_result?;
                 let body_type = self.expression_value_type(body_id)?;
-                self.fragment_mut().unit(owner)?.insert(
+                self.storage.unit_mut()?.insert(
                     lambda,
                     enclosing,
                     body_type,
@@ -809,17 +881,12 @@ impl ScalarEmission<'_, '_> {
         arguments: &[ExprId],
         channels: &[LoweredOperationalChannel],
     ) -> Result<Arc<CanonicalCallOperationalRequest>, ContractLoweringError> {
-        let owner = self.storage.node;
-
         self.work.flush()?;
         let projection = project_emitted_call_arguments_observed(
             EmittedOperationalCall {
-                expressions: super::super::unit_source::UnitDefinitions::from_draft(
-                    &*self.storage.fragment,
-                    owner,
-                ),
+                expressions: self.storage.definitions(),
                 pools: self.constant_emission.pools(),
-                owner: ScalarUnitOwner::Node(owner),
+                owner: self.storage.source_site().owner(),
                 lambda_scope: match kind {
                     Some(
                         SqlExpressionCallKind::Scalar
@@ -908,8 +975,6 @@ impl ScalarEmission<'_, '_> {
         channels: Box<[LoweredOperationalChannel]>,
         canonical_operational: Option<Arc<CanonicalCallOperationalRequest>>,
     ) -> Result<(), ContractLoweringError> {
-        let owner = self.storage.node;
-
         self.work.flush()?;
         let mut arguments = Vec::new();
         arguments
@@ -920,9 +985,8 @@ impl ScalarEmission<'_, '_> {
         let lambda_scope = self.lambda_scope.last().map(|scope| scope.lambda);
         let source = self
             .storage
-            .fragment
-            .construction_unit(owner)
-            .and_then(|unit| unit.definition(emitted))
+            .definitions()
+            .definition(emitted)
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))?;
         let args = match (&source.kind, kind) {
             (
@@ -959,13 +1023,7 @@ impl ScalarEmission<'_, '_> {
         let arguments = arguments.into_boxed_slice();
         self.work.step()?;
         self.work.flush()?;
-        let key = ScalarDefinitionAddress::new(
-            ScalarSourceSite::Node {
-                fragment: self.storage.fragment_id,
-                node: owner,
-            },
-            emitted,
-        );
+        let key = ScalarDefinitionAddress::new(self.storage.source_site(), emitted);
         let duplicate = self.call_sources.expression_entries.contains_key(&key);
         self.work.step()?;
         if duplicate {
@@ -981,7 +1039,7 @@ impl ScalarEmission<'_, '_> {
                 kind,
                 canonical_operational,
                 captured,
-                owner: ScalarUnitOwner::Node(owner),
+                owner: self.storage.source_site().owner(),
                 lambda_scope,
                 arguments,
                 channels,
@@ -1078,10 +1136,8 @@ impl ScalarEmission<'_, '_> {
     }
 
     pub(super) fn reserve_definition(&mut self) -> Result<ExprId, ContractLoweringError> {
-        let owner = self.storage.node;
-
-        let count = self.storage.order.definition_count();
-        if count == novarocks_physical_plan::PlanLimits::FROZEN.fragment_expressions {
+        let count = self.storage.fragment_definition_count();
+        if count == Some(novarocks_physical_plan::PlanLimits::FROZEN.fragment_expressions) {
             return Err(novarocks_expression_contract::UnitError::Resource(
                 "fragment expression definition limit exceeded",
             )
@@ -1090,20 +1146,10 @@ impl ScalarEmission<'_, '_> {
         // This scratch only remembers the original construction sequence.
         // It does not assign a global expression ID or grant source access.
         self.work.flush()?;
-        self.storage
-            .order
-            .get_mut()
-            .events
-            .try_reserve(1)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.storage.reserve_definition_event()?;
         self.work.flush()?;
-        let id = self.fragment_mut().unit(owner)?.reserve()?;
-        let order = self.storage.order.get_mut();
-        order.definitions += 1;
-        order.events.push(NullableEmission::Definition {
-            node: owner,
-            definition: id,
-        });
+        let id = self.storage.unit_mut()?.reserve()?;
+        self.storage.record_definition(id);
         self.work.step()?;
         Ok(id)
     }
@@ -1114,12 +1160,8 @@ impl ScalarEmission<'_, '_> {
         ty: ValueType,
         kind: ContractExprKind,
     ) -> Result<ExprId, ContractLoweringError> {
-        let owner = self.storage.node;
-
         let id = self.reserve_definition()?;
-        self.fragment_mut()
-            .unit(owner)?
-            .insert(id, scope, ty, kind)?;
+        self.storage.unit_mut()?.insert(id, scope, ty, kind)?;
         Ok(id)
     }
 
@@ -1137,12 +1179,7 @@ impl ScalarEmission<'_, '_> {
         demand: novarocks_type_contract::EvaluationDemand,
         scope: novarocks_expression_contract::RootScope,
     ) -> Result<novarocks_expression_contract::RootOrdinal, ContractLoweringError> {
-        let owner = self.storage.node;
-
-        Ok(self
-            .fragment_mut()
-            .unit(owner)?
-            .root(definition, demand, scope)?)
+        Ok(self.storage.unit_mut()?.root(definition, demand, scope)?)
     }
 
     pub(super) fn add_scoped_expression(
@@ -1178,9 +1215,9 @@ impl ScalarEmission<'_, '_> {
         &mut self,
         value: ValueId,
     ) -> Result<ValueType, ContractLoweringError> {
-        self.fragment_mut()
-            .value(value)
-            .map(|definition| definition.ty.clone())
+        self.storage
+            .current_value_type(value)
+            .cloned()
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))
     }
 
@@ -1188,12 +1225,9 @@ impl ScalarEmission<'_, '_> {
         &mut self,
         expr: ExprId,
     ) -> Result<ValueType, ContractLoweringError> {
-        let owner = self.storage.node;
-
         self.storage
-            .fragment
-            .construction_unit(owner)
-            .and_then(|unit| unit.definition(expr))
+            .definitions()
+            .definition(expr)
             .map(|expression| expression.ty.clone())
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))
     }
@@ -1259,8 +1293,7 @@ impl ScalarEmission<'_, '_> {
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<ExprId, ContractLoweringError> {
-        let owner = self.storage.node;
-
+        let site = self.storage.source_site();
         let source = self.expression_value_type(expression)?;
         let plan = crate::compiler::selected_scalar_call::plan_conversion(
             self.functions.as_ref(),
@@ -1275,14 +1308,15 @@ impl ScalarEmission<'_, '_> {
                 ContractLoweringError::Control(cause)
             }
             other => ContractLoweringError::InvalidFunctionBinding {
-                detail: format!(
-                    "{other} (assignment fragment={:?}, owner={owner:?}, expression={expression:?}, source-domain={:?}, target-domain={:?}, source-carrier={:?}, target-carrier={:?}; source={source:?}, target={target:?})",
-                    self.storage.fragment_id,
-                    source.logical_type(),
-                    target.logical_type(),
-                    source.data_type(),
-                    target.data_type(),
-                ),
+                detail: match &site {
+                    ScalarSourceSite::Node { fragment, node: owner } => format!(
+                        "{other} (assignment fragment={fragment:?}, owner={owner:?}, expression={expression:?}, source-domain={:?}, target-domain={:?}, source-carrier={:?}, target-carrier={:?}; source={source:?}, target={target:?})",
+                        source.logical_type(), target.logical_type(), source.data_type(), target.data_type(),
+                    ),
+                    ScalarSourceSite::Standalone(_) => format!(
+                        "{other} (standalone scalar assignment expression={expression:?}, source={source:?}, target={target:?})"
+                    ),
+                },
             },
         })?;
         use crate::compiler::selected_scalar_call::PlannedConversion;
@@ -1637,4 +1671,22 @@ pub(super) fn common_comparison_value_type(
     let result = crate::compiler::selected_scalar_call::comparison_type(left, right);
     control.checkpoint(CompilePhase::Validate, 0)?;
     result.map_err(ContractLoweringError::ComparisonCoercion)
+}
+
+pub(super) fn freeze_semantic_parameters(
+    root_used: bool,
+    allow_throw_exception: bool,
+    mut parameters: BTreeMap<SemanticParameterId, SemanticParameterValue>,
+) -> Result<SemanticParameters, ContractLoweringError> {
+    if root_used {
+        parameters.insert(
+            SemanticParameterId::new(0),
+            SemanticParameterValue::AllowThrowException(allow_throw_exception),
+        );
+    }
+    SemanticParameters::try_new(parameters).map_err(|error| {
+        ContractLoweringError::InvalidFunctionBinding {
+            detail: error.to_string(),
+        }
+    })
 }

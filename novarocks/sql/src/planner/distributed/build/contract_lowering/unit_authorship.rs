@@ -27,6 +27,160 @@ pub(super) struct FragmentUnitAuthorship {
         novarocks_expression_contract::PhysicalCallRequest,
     )>,
 }
+/// The same completed unit and child-first summaries, without a Node/Fragment
+/// association. The original producer retains the source/environment owner.
+pub(super) struct AuthoredScalarUnit {
+    pub(super) unit: Arc<novarocks_expression_contract::BoundExprSet>,
+    pub(super) summaries: BTreeMap<
+        novarocks_type_contract::ExpressionUseId,
+        novarocks_functions::ScopedExpressionEffects,
+    >,
+}
+
+/// The original static source gate, before request transfer or fresh effects.
+/// The presence projection is created once by the caller; the source loan
+/// retains the original immutable catalogue rather than replacing it.
+pub(super) fn admit_scalar_unit_sources_observed<'source>(
+    source_loan: &SqlUnitSourceLoan<'source>,
+    draft: &'source novarocks_expression_contract::BoundExprSetBuilder,
+    presence: &dyn crate::compiler::SqlFunctionCatalog,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ContractLoweringError> {
+    for source in draft.definitions() {
+        work.step()?;
+        if !matches!(source.kind, ContractExprKind::FunctionCall { .. }) {
+            continue;
+        }
+        let entry = source_loan.checked_expression_source_observed(source, work)?;
+        let canonical =
+            entry
+                .canonical_operational()
+                .ok_or(PackageSemanticsError::InvalidSource(
+                    "original scalar source has no canonical request",
+                ))?;
+        if !canonical.belongs_to(entry.captured()) {
+            return Err(PackageSemanticsError::InvalidSource(
+                "scalar canonical admission has a foreign original capture",
+            )
+            .into());
+        }
+        super::super::source_support::admit_original_binding_observed(
+            presence,
+            &canonical.binding,
+            entry.captured().binding(),
+            source_loan.parameters(),
+            PureCallLifecycle::Scalar,
+            control,
+        )?;
+    }
+    Ok(())
+}
+
+/// Consume one actual draft through the original controls, SDK seal, scopes,
+/// fresh effects and claim-consuming finish. No Node or relation is invented.
+/// Ports are authored at their original point after definition controls; this
+/// closure supplies declarations only, never capacity or source credentials.
+pub(super) fn finish_scalar_unit_observed(
+    site: ScalarSourceSite,
+    mut draft: novarocks_expression_contract::BoundExprSetBuilder,
+    ports: impl FnOnce() -> Result<Vec<novarocks_expression_contract::ExprPort>, ContractLoweringError>,
+    constants: &novarocks_physical_plan::ConstantPools,
+    parameters: &SemanticParameters,
+    journal: &SqlLogicalSourceJournal,
+    functions: &Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    policy: novarocks_constant_contract::ConstantPolicy,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<AuthoredScalarUnit, ContractLoweringError> {
+    let controls = {
+        let source = SqlUnitSourceLoan {
+            site: site.clone(),
+            definitions: super::super::unit_source::UnitDefinitions::from_builder(
+                site.owner(),
+                &draft,
+            ),
+            constants,
+            parameters,
+            journal,
+            functions,
+        };
+        super::super::expression_occurrences::author_original_unit_controls_observed(&source, work)
+            .map_err(PackageSemanticsError::from)?
+    };
+    for (definition, control) in controls {
+        draft.definition_control(definition, control)?;
+        work.step()?;
+    }
+    let ports = ports()?;
+    let sealed = draft.seal(ports, work)?;
+    let source = SqlUnitSourceLoan {
+        site: site.clone(),
+        definitions: super::super::unit_source::UnitDefinitions::from_sealed(site.owner(), &sealed),
+        constants,
+        parameters,
+        journal,
+        functions,
+    };
+    let mut scopes = BTreeMap::new();
+    for (&id, invocation) in sealed.uses() {
+        let definition = sealed.definition(invocation.definition).ok_or(
+            PackageSemanticsError::InvalidSource("sealed unit invocation has no actual definition"),
+        )?;
+        work.step()?;
+        if !matches!(definition.kind, ContractExprKind::FunctionCall { .. }) {
+            continue;
+        }
+        let entry = source.checked_expression_source_observed(definition, work)?;
+        if entry.captured().constant_policy() != policy {
+            return Err(match &site {
+                ScalarSourceSite::Node { node, .. } => {
+                    PackageSemanticsError::ExpressionPolicyMismatch {
+                        node: *node,
+                        invocation: id,
+                    }
+                }
+                ScalarSourceSite::Standalone(_) => {
+                    PackageSemanticsError::StandaloneExpressionPolicyMismatch { invocation: id }
+                }
+            }
+            .into());
+        }
+        work.flush()?;
+        scopes.insert(
+            id,
+            super::super::physical_expression_effects::PhysicalCallSourceScope {
+                source: definition,
+                decimal_overflow_policy: entry.captured().binding().decimal_overflow_policy(),
+                environment: &[],
+                proof_scope: novarocks_type_contract::CallProofScope::Region(
+                    invocation.context.region,
+                ),
+            },
+        );
+        work.step()?;
+    }
+    let authored =
+        super::super::physical_expression_effects::author_sql_expression_effects_observed(
+            &source,
+            super::super::physical_expression_effects::PhysicalExpressionEffectsInput {
+                owner: site.owner(),
+                unit: &sealed,
+                constants,
+                parameters,
+                literal_policy: policy,
+                call_scopes: &scopes,
+            },
+            control,
+        )
+        .map_err(PackageSemanticsError::from)?;
+    let unit = Arc::new(sealed.finish(authored.calls, work)?);
+    Ok(AuthoredScalarUnit {
+        unit,
+        summaries: authored.summaries,
+    })
+}
+
 impl ContractLoweringVisitor<'_> {
     /// Admit all stored sources before fresh preparation, using the same
     /// original binding/environment author as completed-source inspection.
@@ -104,32 +258,13 @@ impl ContractLoweringVisitor<'_> {
                     journal: &self.call_sources,
                     functions: &self.functions,
                 };
-                for source in unit.definitions() {
-                    self.work.step()?;
-                    if !matches!(source.kind, ContractExprKind::FunctionCall { .. }) {
-                        continue;
-                    }
-                    let entry = loan.checked_expression_source_observed(source, &mut self.work)?;
-                    let canonical = entry.canonical_operational().ok_or(
-                        PackageSemanticsError::InvalidSource(
-                            "original scalar source has no canonical request",
-                        ),
-                    )?;
-                    if !canonical.belongs_to(entry.captured()) {
-                        return Err(PackageSemanticsError::InvalidSource(
-                            "scalar canonical admission has a foreign original capture",
-                        )
-                        .into());
-                    }
-                    super::super::source_support::admit_original_binding_observed(
-                        functions.as_ref(),
-                        &canonical.binding,
-                        entry.captured().binding(),
-                        parameters,
-                        PureCallLifecycle::Scalar,
-                        self.control,
-                    )?;
-                }
+                admit_scalar_unit_sources_observed(
+                    &loan,
+                    unit,
+                    functions.as_ref(),
+                    self.control,
+                    &mut self.work,
+                )?;
             }
             if let Some(sources) = source_groups.remove(&fragment_id) {
                 for (_, (binding, original, lifecycle)) in sources {
@@ -199,96 +334,24 @@ impl ContractLoweringVisitor<'_> {
         }
         let mut effects = BTreeMap::new();
         for node in nodes {
-            let controls = {
-                let source = SqlUnitSourceLoan {
-                    site: ScalarSourceSite::Node { fragment, node },
-                    definitions: super::super::unit_source::UnitDefinitions::from_draft(
-                        builder, node,
-                    ),
-                    constants: self.constant_emission.pools(),
-                    parameters,
-                    journal: &self.call_sources,
-                    functions: &self.functions,
-                };
-                super::super::expression_occurrences::author_original_unit_controls_observed(
-                    &source,
-                    &mut self.work,
-                )
-                .map_err(PackageSemanticsError::from)?
-            };
-            for (definition, control) in controls {
-                builder
-                    .unit(node)?
-                    .definition_control(definition, control)?;
-                self.work.step()?;
-            }
-            let ports = builder.node_ports(node)?;
-            let sealed = builder
-                .take_unit_builder(node)?
-                .seal(ports, &mut self.work)?;
-            let source = SqlUnitSourceLoan {
-                site: ScalarSourceSite::Node { fragment, node },
-                definitions: super::super::unit_source::UnitDefinitions::from_sealed(
-                    ScalarUnitOwner::Node(node),
-                    &sealed,
-                ),
-                constants: self.constant_emission.pools(),
+            let draft = builder.take_unit_builder(node)?;
+            let authored = finish_scalar_unit_observed(
+                ScalarSourceSite::Node { fragment, node },
+                draft,
+                || {
+                    builder
+                        .node_ports(node)
+                        .map_err(ContractLoweringError::from)
+                },
+                self.constant_emission.pools(),
                 parameters,
-                journal: &self.call_sources,
-                functions: &self.functions,
-            };
-            let mut scopes = BTreeMap::new();
-            for (&id, invocation) in sealed.uses() {
-                let definition = sealed.definition(invocation.definition).ok_or(
-                    PackageSemanticsError::InvalidSource(
-                        "sealed unit invocation has no actual definition",
-                    ),
-                )?;
-                self.work.step()?;
-                if !matches!(definition.kind, ContractExprKind::FunctionCall { .. }) {
-                    continue;
-                }
-                let entry =
-                    source.checked_expression_source_observed(definition, &mut self.work)?;
-                if entry.captured().constant_policy() != self.constant_policy {
-                    return Err(PackageSemanticsError::ExpressionPolicyMismatch {
-                        node,
-                        invocation: id,
-                    }
-                    .into());
-                }
-                self.work.flush()?;
-                scopes.insert(
-                    id,
-                    super::super::physical_expression_effects::PhysicalCallSourceScope {
-                        source: definition,
-                        decimal_overflow_policy: entry
-                            .captured()
-                            .binding()
-                            .decimal_overflow_policy(),
-                        environment: &[],
-                        proof_scope: novarocks_type_contract::CallProofScope::Region(
-                            invocation.context.region,
-                        ),
-                    },
-                );
-                self.work.step()?;
-            }
-            let authored =
-                super::super::physical_expression_effects::author_sql_expression_effects_observed(
-                    &source,
-                    super::super::physical_expression_effects::PhysicalExpressionEffectsInput {
-                        owner: ScalarUnitOwner::Node(node),
-                        unit: &sealed,
-                        constants: self.constant_emission.pools(),
-                        parameters,
-                        literal_policy: self.constant_policy,
-                        call_scopes: &scopes,
-                    },
-                    self.control,
-                )
-                .map_err(PackageSemanticsError::from)?;
-            let unit = Arc::new(sealed.finish(authored.calls, &mut self.work)?);
+                &self.call_sources,
+                &self.functions,
+                self.constant_policy,
+                self.control,
+                &mut self.work,
+            )?;
+            let unit = authored.unit;
             builder.install_unit(node, Arc::clone(&unit))?;
             self.work.flush()?;
             effects.insert(

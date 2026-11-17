@@ -37,7 +37,7 @@ pub use crate::optimizer::options::SessionOptimizerSettings;
 mod required_constant;
 pub use required_constant::{
     PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
-    RequiredConstantTarget, prepare_required_constant,
+    RequiredConstantTarget, SqlAuthoredScalarUnit, prepare_required_constant,
 };
 
 mod captured_catalog;

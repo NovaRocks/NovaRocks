@@ -145,21 +145,21 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
     ) {
         return Err(PhysicalScalarOccurrenceError::UnsupportedAbi(abi));
     }
-    let shape = match selected_control {
-        novarocks_type_contract::ArgumentControl::TemporalSource(kind) => {
-            let source =
-                input
-                    .temporal_source
-                    .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
-                        "missing same-emission temporal source facts",
-                    ))?;
-            let definitions_source =
-                input
-                    .definitions
-                    .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
+    let shape =
+        match selected_control {
+            novarocks_type_contract::ArgumentControl::TemporalSource(kind) => {
+                let source =
+                    input
+                        .temporal_source
+                        .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
+                            "missing same-emission temporal source facts",
+                        ))?;
+                let definitions_source = input.definitions.as_ref().ok_or(
+                    PhysicalScalarOccurrenceError::InvalidSource(
                         "missing original temporal source unit",
-                    ))?;
-            let definitions =
+                    ),
+                )?;
+                let definitions =
                 novarocks_expression_contract::temporal_source_definitions_from_lookup_observed(
                     kind,
                     |id| definitions_source.definition(id),
@@ -174,22 +174,22 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
                         "invalid original temporal source projection",
                     ),
                 })?;
-            source.validate(&definitions).map_err(|_| {
-                PhysicalScalarOccurrenceError::InvalidSource(
-                    "stale temporal source roles, definitions or facts",
-                )
-            })?;
-            Some(ControlShape::TemporalSource(source.facts.shape()))
-        }
-        control => {
-            if input.temporal_source.is_some() {
-                return Err(PhysicalScalarOccurrenceError::InvalidSource(
-                    "temporal sources on an ordinary scalar call",
-                ));
+                source.validate(&definitions).map_err(|_| {
+                    PhysicalScalarOccurrenceError::InvalidSource(
+                        "stale temporal source roles, definitions or facts",
+                    )
+                })?;
+                Some(ControlShape::TemporalSource(source.facts.shape()))
             }
-            scalar_shape(control, args.len())
-        }
-    };
+            control => {
+                if input.temporal_source.is_some() {
+                    return Err(PhysicalScalarOccurrenceError::InvalidSource(
+                        "temporal sources on an ordinary scalar call",
+                    ));
+                }
+                scalar_shape(control, args.len())
+            }
+        };
     work.step()?;
     let shape = shape.ok_or(PhysicalScalarOccurrenceError::InvalidSource(
         "installed scalar owner has no scalar control shape",
@@ -261,6 +261,7 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
                 }
                 let node = input
                     .definitions
+                    .as_ref()
                     .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
                         "missing temporal source arena",
                     ))?
@@ -284,11 +285,13 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
     let source_ordinal = source_argument_ordinal(&function.function_id, args.len())
         .map_err(PhysicalScalarOccurrenceError::InvalidSource)?;
     let argument_source = if let Some(ordinal) = source_ordinal {
-        let definitions = input
-            .definitions
-            .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
-                "source-sensitive scalar requires the original emitted definition arena",
-            ))?;
+        let definitions =
+            input
+                .definitions
+                .as_ref()
+                .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
+                    "source-sensitive scalar requires the original emitted definition arena",
+                ))?;
         let definition = definitions.definition(args[ordinal]).ok_or(
             PhysicalScalarOccurrenceError::InvalidSource(
                 "source-sensitive scalar argument definition is absent",

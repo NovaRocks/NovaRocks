@@ -213,7 +213,8 @@ fn compose_expression_effects_observed<'source>(
             }
         }
         let flow = input.unit.control_flow();
-        let definitions = super::unit_source::UnitDefinitions::from_sealed(input.owner, input.unit);
+        let definitions =
+            super::unit_source::UnitDefinitions::from_sealed(input.owner.clone(), input.unit);
         // Exact scope coverage is checked before any owner preparation. A
         // matching topology is not proof of matching immutable source contents.
         for (&id, scope) in input.call_scopes {
@@ -369,7 +370,7 @@ fn compose_expression_effects_observed<'source>(
                         }
                         None => author_physical_scalar_request_observed(
                             source,
-                            definitions,
+                            definitions.clone(),
                             input.constants,
                             input.literal_policy,
                             &mut work,
@@ -446,7 +447,7 @@ fn compose_expression_effects_observed<'source>(
                     let fresh = prepare_physical_scalar_occurrence_observed(
                         PhysicalScalarOccurrenceInput {
                             source,
-                            definitions: Some(definitions),
+                            definitions: Some(definitions.clone()),
                             temporal_source: input.unit.temporal_source(id),
                             request,
                             flow,

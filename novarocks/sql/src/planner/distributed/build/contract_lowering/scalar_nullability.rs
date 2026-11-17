@@ -203,7 +203,7 @@ impl ScalarEmission<'_, '_> {
         let mut entry = self
             .call_sources
             .expression_entries
-            .remove(&ScalarDefinitionAddress::new(site, expression))
+            .remove(&ScalarDefinitionAddress::new(site.clone(), expression))
             .ok_or_else(|| invalid("call rebind lacks its original source entry"))?;
         let old = self.nullability_definition(expression)?.clone();
         self.work.flush()?;
@@ -218,7 +218,7 @@ impl ScalarEmission<'_, '_> {
             EmittedOperationalCall {
                 expressions: self.storage.definitions(),
                 pools: self.constant_emission.pools(),
-                owner: entry.owner,
+                owner: entry.owner.clone(),
                 lambda_scope: entry.lambda_scope,
                 kind: Some(entry.kind),
                 captured: CapturedOperationalSource::call(entry.captured.captured()),

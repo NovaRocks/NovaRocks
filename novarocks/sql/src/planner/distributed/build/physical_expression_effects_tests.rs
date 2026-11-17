@@ -1126,3 +1126,66 @@ fn expression_effects_whole_success_prefixes_and_wide_actual_traversal_sampling(
     );
     assert!(trace.contains(&(PHASE, 256)));
 }
+
+#[test]
+fn standalone_sealed_sources_reject_foreign_environment_loans_at_the_original_gate() {
+    use super::super::contract_lowering::sealed_standalone_source_for_effects;
+    use super::super::unit_source::ScalarUnitOwner;
+    let first = sealed_standalone_source_for_effects();
+    let second = sealed_standalone_source_for_effects();
+    assert_ne!(first.brand, second.brand);
+    assert!(!std::ptr::eq(
+        first.functions.as_ref(),
+        second.functions.as_ref()
+    ));
+    let loan = first.loan();
+    let scopes = BTreeMap::new();
+    let input = || PhysicalExpressionEffectsInput {
+        owner: ScalarUnitOwner::Standalone(first.brand.clone()),
+        unit: &first.sealed,
+        constants: &first.constants,
+        parameters: &first.parameters,
+        literal_policy: crate::constant::test_constant_policy(),
+        call_scopes: &scopes,
+    };
+    let control = Control::default();
+    let positive = compose_expression_effects_observed(
+        input(),
+        Some(&loan),
+        first.functions.as_ref(),
+        &control,
+    )
+    .unwrap();
+    assert!(positive.calls.is_empty());
+    assert_eq!(positive.summaries.len(), first.sealed.uses().len());
+    for changed in 0..4 {
+        let mut actual = input();
+        let functions = match changed {
+            0 => {
+                actual.unit = &second.sealed;
+                first.functions.as_ref()
+            }
+            1 => {
+                actual.constants = &second.constants;
+                first.functions.as_ref()
+            }
+            2 => {
+                actual.parameters = &second.parameters;
+                first.functions.as_ref()
+            }
+            3 => second.functions.as_ref(),
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            compose_expression_effects_observed(
+                actual,
+                Some(&loan),
+                functions,
+                &Control::default()
+            ),
+            Err(PhysicalExpressionEffectsError::InvalidSource(
+                "SQL scalar composition loans a foreign sealed unit, pool, parameters or catalogue"
+            ))
+        ));
+    }
+}

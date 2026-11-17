@@ -170,8 +170,8 @@ impl<'a> CheckedExpressionLogicalSourceEntry<'a> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
         let context = Projection {
-            expressions: self.definitions,
-            owner: self.entry.owner,
+            expressions: self.definitions.clone(),
+            owner: self.entry.owner.clone(),
             lambda_scope: self.entry.lambda_scope,
             kind: Some(self.entry.kind),
             captured: CapturedOperationalSource::call(self.entry.captured.captured()),
@@ -200,7 +200,7 @@ impl<'a> CheckedWindowLogicalSourceEntry<'a> {
     ) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
         let definitions = UnitDefinitions::from_node(self.node);
         let context = Projection {
-            expressions: definitions,
+            expressions: definitions.clone(),
             owner: ScalarUnitOwner::Node(self.node.id),
             lambda_scope: None,
             kind: Some(SqlExpressionCallKind::Window),

@@ -426,7 +426,10 @@ fn conversion_journal_lambda_scope_matches_the_actual_intermediate_emission() {
     let crate::planner::distributed::build::unit_source::ScalarSourceSite::Node {
         fragment: _,
         node: key_node,
-    } = key.site;
+    } = key.site.clone()
+    else {
+        panic!("the original fixture owns a real node source")
+    };
     assert_eq!(visitor.call_sources.expression_entries.len(), 1);
     assert_eq!(entry.lambda_scope, Some(lambda));
     let source=visitor.fragments[&ROOT_FRAGMENT_ID].construction_unit(key_node).unwrap().definitions().find(|node|

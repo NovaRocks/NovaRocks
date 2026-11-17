@@ -226,7 +226,10 @@ fn canonical_conversion_raw_lambda_uses_original_lexical_scope_and_none_request(
     let crate::planner::distributed::build::unit_source::ScalarSourceSite::Node {
         fragment: _,
         node: key_node,
-    } = key.site;
+    } = key.site.clone()
+    else {
+        panic!("the original fixture owns a real node source")
+    };
     let fragment = &visitor.fragments[&ROOT_FRAGMENT_ID];
     let unit = fragment.construction_unit(key_node).unwrap();
     let source=unit.definitions().find(|node|

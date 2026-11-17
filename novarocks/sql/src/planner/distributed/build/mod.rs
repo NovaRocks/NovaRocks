@@ -20,6 +20,7 @@ mod contract_lowering;
 mod lowered_draft;
 mod unit_source;
 mod wait_graph;
+pub(crate) use contract_lowering::{StandaloneScalarEmission, lower_required_constant_unit};
 #[cfg(test)]
 pub(crate) use lowered_draft::CheckedAggregateLogicalSourceEntry;
 pub use lowered_draft::{
@@ -29,6 +30,7 @@ pub use lowered_draft::{
     SqlSourceJournalError,
 };
 pub(crate) use lowered_draft::{LoweredSqlPhysicalDraft, SqlPublicationError};
+
 mod expression_occurrences;
 mod source_support;
 pub use source_support::check_pure_call_definitions_observed;

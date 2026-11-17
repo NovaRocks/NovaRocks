@@ -55,6 +55,10 @@ pub enum PackageSemanticsError {
         node: novarocks_physical_plan::NodeId,
         invocation: novarocks_type_contract::ExpressionUseId,
     },
+    /// The actual standalone source has no relational node identity.
+    StandaloneExpressionPolicyMismatch {
+        invocation: novarocks_type_contract::ExpressionUseId,
+    },
     InvalidSource(&'static str),
 }
 impl fmt::Display for PackageSemanticsError {
@@ -75,6 +79,11 @@ impl fmt::Display for PackageSemanticsError {
                 f,
                 "captured constant policy differs from the statement policy at node {} invocation {}",
                 node.get(),
+                invocation.get()
+            ),
+            Self::StandaloneExpressionPolicyMismatch { invocation } => write!(
+                f,
+                "captured constant policy differs from the statement policy at standalone scalar unit invocation {}",
                 invocation.get()
             ),
             Self::StatementPolicyMismatch => {
@@ -112,7 +121,8 @@ impl novarocks_failure_contract::FailureProjection for PackageSemanticsError {
             Self::Pruning(_) => (FailureClass::Invariant, 11),
             Self::PolicyMismatch(_)
             | Self::StatementPolicyMismatch
-            | Self::ExpressionPolicyMismatch { .. } => (FailureClass::Invariant, 12),
+            | Self::ExpressionPolicyMismatch { .. }
+            | Self::StandaloneExpressionPolicyMismatch { .. } => (FailureClass::Invariant, 12),
             Self::InvalidSource(_) => (FailureClass::Invariant, 13),
         };
         FailureFact::new(

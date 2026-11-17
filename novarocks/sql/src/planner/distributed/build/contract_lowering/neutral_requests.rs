@@ -32,8 +32,8 @@ use {
 };
 
 use super::{
-    AggregateRuntimeDemand, ContractLoweringError, LoweredAggregateSourceEntry, ScalarSourceSite,
-    SqlLogicalSourceJournal,
+    AggregateRuntimeDemand, ContractLoweringError, LoweredAggregateSourceEntry,
+    LoweredExpressionSourceEntry, ScalarSourceSite, SqlLogicalSourceJournal,
 };
 
 /// Construction-only routing. Scalar requests move straight into their actual
@@ -81,14 +81,26 @@ pub(super) fn transfer_neutral_requests_observed(
     for fragment in journal
         .expression_entries
         .keys()
-        .map(|address| {
-            let ScalarSourceSite::Node { fragment, .. } = address.site;
-            fragment
+        .map(|address| match &address.site {
+            ScalarSourceSite::Node { fragment, .. } => Ok(*fragment),
+            ScalarSourceSite::Standalone(_) => Err(invalid(
+                "fragment request routing has a standalone scalar source",
+            )),
         })
-        .chain(journal.window_entries.keys().map(|(fragment, _)| *fragment))
-        .chain(journal.table_entries.keys().map(|(fragment, _)| *fragment))
+        .chain(
+            journal
+                .window_entries
+                .keys()
+                .map(|(fragment, _)| Ok(*fragment)),
+        )
+        .chain(
+            journal
+                .table_entries
+                .keys()
+                .map(|(fragment, _)| Ok(*fragment)),
+        )
     {
-        count_fragment(&mut counts, fragment, work)?;
+        count_fragment(&mut counts, fragment?, work)?;
     }
     for (fragment, _) in journal.entries.keys() {
         count_fragment(&mut counts, *fragment, work)?;
@@ -108,29 +120,16 @@ pub(super) fn transfer_neutral_requests_observed(
         output.insert(fragment, entries);
         work.step()?;
     }
-    for (&address, entry) in &journal.expression_entries {
+    for (address, entry) in &journal.expression_entries {
         work.step()?;
-        let ScalarSourceSite::Node { fragment, node } = address.site;
-        let expression = address.definition;
-        let captured = entry.captured.captured();
-        let canonical = entry.canonical_operational.as_ref();
-        work.step()?;
-        let canonical = canonical.ok_or_else(|| {
-            invalid("neutral expression request has no canonical original source")
-        })?;
-        let belongs = canonical.belongs_to(captured);
-        work.step()?;
-        if !belongs {
+        let ScalarSourceSite::Node { fragment, node } = &address.site else {
             return Err(invalid(
-                "neutral expression request has another original source",
+                "fragment request routing has a standalone scalar source",
             ));
-        }
-        let record = transfer_request(
-            canonical.request(),
-            captured.constant_policy(),
-            work,
-            &mut register,
-        )?;
+        };
+        let (fragment, node) = (*fragment, *node);
+        let expression = address.definition;
+        let record = transfer_expression_request_observed(entry, work, &mut register)?;
         push(
             &mut output,
             fragment,
@@ -201,6 +200,37 @@ pub(super) fn transfer_neutral_requests_observed(
         )?;
     }
     Ok(output)
+}
+
+/// Transfer the original scalar entry's canonical request using the sole
+/// neutral record author. The caller owns per-entry/routing work and the same
+/// actual backing registry; no new source or implementation is synthesized.
+pub(super) fn transfer_expression_request_observed(
+    entry: &LoweredExpressionSourceEntry,
+    work: &mut CompileCheckpoints<'_>,
+    register: &mut impl FnMut(
+        &ConstantValue,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantReference, ContractLoweringError>,
+) -> Result<PhysicalCallRequest, ContractLoweringError> {
+    let captured = entry.captured.captured();
+    let canonical = entry.canonical_operational.as_ref();
+    work.step()?;
+    let canonical = canonical
+        .ok_or_else(|| invalid("neutral expression request has no canonical original source"))?;
+    let belongs = canonical.belongs_to(captured);
+    work.step()?;
+    if !belongs {
+        return Err(invalid(
+            "neutral expression request has another original source",
+        ));
+    }
+    transfer_request(
+        canonical.request(),
+        captured.constant_policy(),
+        work,
+        register,
+    )
 }
 
 fn invalid(detail: &'static str) -> ContractLoweringError {

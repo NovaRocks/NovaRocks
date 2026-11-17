@@ -458,7 +458,10 @@ fn scalar_journal_lambda_body_call_keeps_its_actual_emission_scope() {
     let crate::planner::distributed::build::unit_source::ScalarSourceSite::Node {
         fragment: key_fragment,
         node: key_node,
-    } = key.site;
+    } = key.site.clone()
+    else {
+        panic!("the original fixture owns a real node source")
+    };
     assert_eq!(visitor.call_sources.expression_entries.len(), 1);
     assert_eq!(key_fragment, ROOT_FRAGMENT_ID);
     assert_eq!(key_node, NodeId::new(73));

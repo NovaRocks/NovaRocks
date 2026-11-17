@@ -216,7 +216,7 @@ fn ordinary_occurrence_entry_without_original_journal_cannot_guess_temporal_fact
                 let request =
                     super::physical_scalar_requests::author_physical_scalar_request_observed(
                         source,
-                        definitions,
+                        definitions.clone(),
                         owner.plan().constants(),
                         policy(),
                         &mut work,

@@ -22,28 +22,67 @@ use novarocks_expression_contract::{
     BoundExprSet, BoundExprSetBuilder, ExprId, ExprNode, ExprRoot, RootOrdinal, SealedUnit,
 };
 use novarocks_physical_plan::{FragmentBuilder, FragmentId, NodeId, PhysicalNode};
+use std::{cmp::Ordering, sync::Arc};
+
+struct StandaloneIdentity {
+    _private: (),
+}
+
+/// One actual standalone producer owns this private, retained source brand.
+/// Pointer identity is local to this retained source; it grants no capacity.
+#[derive(Clone)]
+pub(crate) struct StandaloneSourceBrand(Arc<StandaloneIdentity>);
+impl StandaloneSourceBrand {
+    pub(super) fn new() -> Self {
+        Self(Arc::new(StandaloneIdentity { _private: () }))
+    }
+}
+impl std::fmt::Debug for StandaloneSourceBrand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StandaloneSourceBrand")
+    }
+}
+impl PartialEq for StandaloneSourceBrand {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for StandaloneSourceBrand {}
+impl PartialOrd for StandaloneSourceBrand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for StandaloneSourceBrand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (Arc::as_ptr(&self.0) as usize).cmp(&(Arc::as_ptr(&other.0) as usize))
+    }
+}
 
 /// Association with an actual scalar unit, not authentication or capacity.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ScalarUnitOwner {
     Node(NodeId),
+    Standalone(StandaloneSourceBrand),
 }
 
-/// Original emission site. Only the existing node producer is wired here.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// Original emission site, retained by its actual source owner.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ScalarSourceSite {
     Node { fragment: FragmentId, node: NodeId },
+    Standalone(StandaloneSourceBrand),
 }
 impl ScalarSourceSite {
-    pub(super) const fn owner(self) -> ScalarUnitOwner {
+    pub(super) fn owner(&self) -> ScalarUnitOwner {
         match self {
-            Self::Node { node, .. } => ScalarUnitOwner::Node(node),
+            Self::Node { node, .. } => ScalarUnitOwner::Node(*node),
+            Self::Standalone(brand) => ScalarUnitOwner::Standalone(brand.clone()),
         }
     }
 }
 
 /// The site precedes the local definition, preserving original journal order.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ScalarDefinitionAddress {
     pub(super) site: ScalarSourceSite,
     pub(super) definition: ExprId,
@@ -61,12 +100,21 @@ enum Storage<'source> {
     Sealed(&'source SealedUnit),
     Frozen(&'source BoundExprSet),
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct UnitDefinitions<'source> {
     owner: ScalarUnitOwner,
     storage: Storage<'source>,
 }
 impl<'source> UnitDefinitions<'source> {
+    pub(super) fn from_builder(
+        owner: ScalarUnitOwner,
+        draft: &'source BoundExprSetBuilder,
+    ) -> Self {
+        Self {
+            owner,
+            storage: Storage::Draft(draft),
+        }
+    }
     pub(super) fn from_draft(fragment: &'source FragmentBuilder, node: NodeId) -> Self {
         Self {
             owner: ScalarUnitOwner::Node(node),
@@ -84,6 +132,12 @@ impl<'source> UnitDefinitions<'source> {
             storage: Storage::Sealed(unit),
         }
     }
+    pub(super) fn from_unit(owner: ScalarUnitOwner, unit: &'source BoundExprSet) -> Self {
+        Self {
+            owner,
+            storage: Storage::Frozen(unit),
+        }
+    }
     pub(super) fn from_node(node: &'source PhysicalNode) -> Self {
         Self {
             owner: ScalarUnitOwner::Node(node.id),
@@ -93,13 +147,13 @@ impl<'source> UnitDefinitions<'source> {
             },
         }
     }
-    pub(super) const fn owner(self) -> ScalarUnitOwner {
-        self.owner
+    pub(super) fn owner(&self) -> ScalarUnitOwner {
+        self.owner.clone()
     }
-    pub(super) fn is_sealed_source(self, expected: &SealedUnit) -> bool {
+    pub(super) fn is_sealed_source(&self, expected: &SealedUnit) -> bool {
         matches!(self.storage, Storage::Sealed(original) if std::ptr::eq(original, expected))
     }
-    pub(super) fn len(self) -> usize {
+    pub(super) fn len(&self) -> usize {
         match self.storage {
             Storage::Empty => 0,
             Storage::Draft(draft) => draft.len(),
@@ -107,7 +161,7 @@ impl<'source> UnitDefinitions<'source> {
             Storage::Frozen(unit) => unit.definitions().len(),
         }
     }
-    pub(super) fn definition(self, id: ExprId) -> Option<&'source ExprNode> {
+    pub(super) fn definition(&self, id: ExprId) -> Option<&'source ExprNode> {
         match self.storage {
             Storage::Empty => None,
             Storage::Draft(draft) => draft.definition(id),
@@ -115,7 +169,7 @@ impl<'source> UnitDefinitions<'source> {
             Storage::Frozen(unit) => unit.definition(id),
         }
     }
-    pub(super) fn roots(self) -> &'source [ExprRoot] {
+    pub(super) fn roots(&self) -> &'source [ExprRoot] {
         match self.storage {
             Storage::Empty => &[],
             Storage::Draft(draft) => draft.roots(),
@@ -123,10 +177,10 @@ impl<'source> UnitDefinitions<'source> {
             Storage::Frozen(unit) => unit.roots(),
         }
     }
-    pub(super) fn root(self, root: RootOrdinal) -> Option<&'source ExprRoot> {
+    pub(super) fn root(&self, root: RootOrdinal) -> Option<&'source ExprRoot> {
         self.roots().get(root.get() as usize)
     }
-    pub(super) fn root_definition(self, root: RootOrdinal) -> Option<&'source ExprNode> {
+    pub(super) fn root_definition(&self, root: RootOrdinal) -> Option<&'source ExprNode> {
         self.definition(self.root(root)?.definition)
     }
 }
