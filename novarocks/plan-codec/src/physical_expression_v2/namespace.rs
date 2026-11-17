@@ -22,10 +22,7 @@ use crate::{
     borrowed_type_resources::{
         VerifiedTypeBinding, verify_type_binding, verify_type_binding_admitted,
     },
-    physical_aggregate_binding_v2::{
-        EncodedAggregateBindings, VerifiedAggregateSignature, verify_aggregate_signature,
-        verify_aggregate_signature_admitted,
-    },
+    physical_aggregate_binding_v2::EncodedAggregateBindings,
     physical_binding_v2::{
         EncodedFunctionBindings, VerifiedSignature, verify_scalar_signature,
         verify_scalar_signature_admitted,
@@ -33,9 +30,9 @@ use crate::{
     physical_semantics_v2::SemanticsCodecError,
     physical_type_v2::EncodedTypeTable,
 };
-use novarocks_physical_plan::{
-    BinaryOperator, ConstantPools, ExprArena, ExprId, ExprKind, ExprNode,
-};
+use novarocks_expression_contract::BoundExprSet;
+use novarocks_expression_contract::{BinaryOperator, ExprKind, ExprNode};
+use novarocks_physical_plan::{ConstantPools, ExprId};
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, PureCompileControl, SemanticParameterKey, SemanticParameters,
@@ -43,7 +40,46 @@ use novarocks_type_contract::{
 };
 use std::alloc::Layout;
 
-/// One ID binding per original definition, in ExprArena's canonical order.
+/// One node's immutable definition/root declaration, borrowing the original
+/// source slices. This codec loan grants no unit publication or SQL provenance.
+#[derive(Clone, Copy)]
+pub struct ExpressionDefinitionSource<'a> {
+    definitions: &'a [ExprNode],
+    roots: &'a [novarocks_expression_contract::ExprRoot],
+}
+impl<'a> ExpressionDefinitionSource<'a> {
+    pub const fn new(
+        definitions: &'a [ExprNode],
+        roots: &'a [novarocks_expression_contract::ExprRoot],
+    ) -> Self {
+        Self { definitions, roots }
+    }
+    pub fn from_unit(unit: &'a BoundExprSet) -> Self {
+        Self::new(unit.definitions(), unit.roots())
+    }
+    pub fn definitions(self) -> &'a [ExprNode] {
+        self.definitions
+    }
+    pub fn roots(self) -> &'a [novarocks_expression_contract::ExprRoot] {
+        self.roots
+    }
+    fn definition(self, id: ExprId) -> Option<&'a ExprNode> {
+        self.definitions
+            .get(id.get() as usize)
+            .filter(|definition| definition.id == id)
+    }
+    fn root(
+        self,
+        ordinal: novarocks_expression_contract::RootOrdinal,
+    ) -> Option<&'a novarocks_expression_contract::ExprRoot> {
+        self.roots.get(ordinal.get() as usize)
+    }
+}
+fn unit_definitions<'a>(unit: Option<ExpressionDefinitionSource<'a>>) -> &'a [ExprNode] {
+    unit.map_or(&[], ExpressionDefinitionSource::definitions)
+}
+
+/// One ID binding per original definition, in BoundExprSet's canonical order.
 /// This authoring order does not constrain a future receiving wire order.
 #[derive(Clone, Copy)]
 pub struct ExpressionTypeIds<'a> {
@@ -51,7 +87,6 @@ pub struct ExpressionTypeIds<'a> {
     pub value_type_id: u32,
     pub lambda_parameter_type_ids: &'a [u32],
     pub function_binding_id: Option<u32>,
-    pub aggregate_binding_id: Option<u32>,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct ExpressionProjectionLimits {
@@ -77,7 +112,7 @@ pub struct ExpressionNamespaceWriteFacts {
 /// namespace between preflight and emission. Preparing this owner allocates no
 /// heap storage and clones no source type or selected function signature.
 pub struct PreparedExpressionNamespaceWrite<'loan, 'source, 'control> {
-    arena: &'loan ExprArena,
+    unit: Option<ExpressionDefinitionSource<'loan>>,
     inputs: &'loan [ExpressionTypeIds<'source>],
     types: &'loan EncodedTypeTable<'source>,
     _functions: &'loan EncodedFunctionBindings<'loan, 'source>,
@@ -107,10 +142,10 @@ impl<'loan, 'source, 'control> EncodedExpressions<'loan, 'source, 'control> {
         &self.source.facts
     }
     pub fn source_count(&self) -> usize {
-        self.source.arena.len()
+        unit_definitions(self.source.unit).len()
     }
-    pub fn arena(&self) -> &'loan ExprArena {
-        self.source.arena
+    pub fn source(&self) -> Option<ExpressionDefinitionSource<'loan>> {
+        self.source.unit
     }
     pub fn types(&self) -> &'loan EncodedTypeTable<'source> {
         self.source.types
@@ -135,6 +170,21 @@ impl<'loan, 'source, 'control> EncodedExpressions<'loan, 'source, 'control> {
     pub fn lookup_work_upper_bound(&self) -> Result<usize, Error> {
         tree_lookup_work(self.source_count())
     }
+    pub(crate) fn root_expression_observed(
+        &self,
+        ordinal: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'loan ExprNode>, Error> {
+        work.step()?;
+        let root = self
+            .source
+            .unit
+            .and_then(|unit| unit.root(novarocks_expression_contract::RootOrdinal::new(ordinal)));
+        match root {
+            Some(root) => self.expression_observed(root.definition.get(), work),
+            None => Ok(None),
+        }
+    }
     pub fn expression(&self, id: u32) -> Result<Option<&'loan ExprNode>, Error> {
         let mut work = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Encode)?;
         let result = self.expression_observed(id, &mut work);
@@ -148,7 +198,10 @@ impl<'loan, 'source, 'control> EncodedExpressions<'loan, 'source, 'control> {
         // The actual BTree lookup remains opaque, rather than claiming its
         // internal comparisons as completed checkpoint units.
         work.flush()?;
-        let node = self.source.arena.get(ExprId::new(id));
+        let node = self
+            .source
+            .unit
+            .and_then(|unit| unit.definition(ExprId::new(id)));
         work.flush()?;
         work.step()?;
         Ok(node)
@@ -270,7 +323,11 @@ impl<'loan, 'source, 'control> PreparedExpressionNamespaceWrite<'loan, 'source, 
             let mut output = Vec::new();
             let reserved = output.try_reserve_exact(self.inputs.len());
             reserve_exit::<Error>(reserved, work)?;
-            for ((_, node), input) in self.arena.iter().zip(self.inputs) {
+            for ((_, node), input) in unit_definitions(self.unit)
+                .iter()
+                .map(|node| (&node.id, node))
+                .zip(self.inputs)
+            {
                 // Only CAST consumes the actual carrier ID. All other header
                 // type IDs were proved against this same immutable table.
                 let carrier = if matches!(node.kind, ExprKind::Cast { .. }) {
@@ -287,12 +344,11 @@ impl<'loan, 'source, 'control> PreparedExpressionNamespaceWrite<'loan, 'source, 
                     root_carrier_type_id: carrier,
                     lambda_parameter_type_ids: input.lambda_parameter_type_ids,
                     function_binding_id: input.function_binding_id,
-                    aggregate_binding_id: input.aggregate_binding_id,
                 };
                 let kind = encode_kind(node, &ids, work)?;
                 output.push(wire::ExpressionDefinition {
                     id: node.id.get(),
-                    owner_node_id: Some(node.owner.get()),
+
                     lambda_scope_expr_id: node.lambda_scope.map(ExprId::get),
                     value_type_id: Some(input.value_type_id),
                     kind: Some(kind),
@@ -483,8 +539,8 @@ fn binding_error(error: Error) -> crate::physical_binding_v2::BindingCodecError 
     }
 }
 fn compare_scalar(
-    left: &novarocks_physical_plan::BoundFunction,
-    right: &novarocks_physical_plan::BoundFunction,
+    left: &novarocks_expression_contract::BoundFunction,
+    right: &novarocks_expression_contract::BoundFunction,
     facts: &mut ExpressionNamespaceWriteFacts,
     admission: &mut Admission<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
@@ -522,48 +578,8 @@ fn compare_scalar(
         Ok(verified)
     }
 }
-fn compare_aggregate(
-    left: &novarocks_physical_plan::AggregateBinding,
-    right: &novarocks_physical_plan::AggregateBinding,
-    facts: &mut ExpressionNamespaceWriteFacts,
-    admission: &mut Admission<'_, '_>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<VerifiedAggregateSignature, Error> {
-    let remaining = admission.remaining(facts)?;
-    if admission.observed() {
-        let base = facts.cumulative_work_upper_bound;
-        let verified = verify_aggregate_signature_admitted(
-            left,
-            right,
-            admission.source,
-            remaining,
-            &mut |prefix| {
-                facts.cumulative_work_upper_bound = base
-                    .checked_add(prefix)
-                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
-                admission.gate(facts).map_err(|error| match error {
-                    Error::Control(cause) => {
-                        crate::physical_binding_v2::BindingCodecError::Control(cause)
-                    }
-                    _ => unreachable!("a numerical parent gate has only typed control errors"),
-                })
-            },
-            work,
-        )?;
-        cap(
-            facts.cumulative_work_upper_bound,
-            admission.limits.max_cumulative_work,
-            work,
-        )?;
-        Ok(verified)
-    } else {
-        let verified = verify_aggregate_signature(left, right, admission.source, remaining, work)?;
-        admission.charge(facts, verified.work_upper_bound(), work)?;
-        Ok(verified)
-    }
-}
 fn signature_source_floor(
-    function: &novarocks_physical_plan::BoundFunction,
+    function: &novarocks_expression_contract::BoundFunction,
     floor: &mut usize,
     source: usize,
     facts: &mut ExpressionNamespaceWriteFacts,
@@ -624,7 +640,7 @@ pub(super) fn finish<T>(
 /// or a formal host grant. Full graph, node, occurrence and kernel validity
 /// remains the sole checked FragmentPackage/compiler chain's responsibility.
 pub fn prepare_expression_definitions<'loan, 'source, 'control>(
-    arena: &'loan ExprArena,
+    unit: Option<ExpressionDefinitionSource<'loan>>,
     inputs: &'loan [ExpressionTypeIds<'source>],
     types: &'loan EncodedTypeTable<'source>,
     functions: &'loan EncodedFunctionBindings<'loan, 'source>,
@@ -637,7 +653,7 @@ pub fn prepare_expression_definitions<'loan, 'source, 'control>(
 ) -> Result<PreparedExpressionNamespaceWrite<'loan, 'source, 'control>, Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = prepare_core(
-        arena,
+        unit,
         inputs,
         types,
         functions,
@@ -657,7 +673,7 @@ pub fn prepare_expression_definitions<'loan, 'source, 'control>(
     reason = "The namespace boundary keeps original inputs, frozen limits, admission, and caller checkpoints explicit."
 )]
 pub fn prepare_expression_definitions_in<'loan, 'source, 'control>(
-    arena: &'loan ExprArena,
+    unit: Option<ExpressionDefinitionSource<'loan>>,
     inputs: &'loan [ExpressionTypeIds<'source>],
     types: &'loan EncodedTypeTable<'source>,
     functions: &'loan EncodedFunctionBindings<'loan, 'source>,
@@ -670,7 +686,7 @@ pub fn prepare_expression_definitions_in<'loan, 'source, 'control>(
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedExpressionNamespaceWrite<'loan, 'source, 'control>, Error> {
     prepare_core(
-        arena,
+        unit,
         inputs,
         types,
         functions,
@@ -689,7 +705,7 @@ pub fn prepare_expression_definitions_in<'loan, 'source, 'control>(
     reason = "The internal composer keeps expression sources and independent namespace authorities distinct."
 )]
 fn prepare_core<'loan, 'source, 'control>(
-    arena: &'loan ExprArena,
+    unit: Option<ExpressionDefinitionSource<'loan>>,
     inputs: &'loan [ExpressionTypeIds<'source>],
     types: &'loan EncodedTypeTable<'source>,
     functions: &'loan EncodedFunctionBindings<'loan, 'source>,
@@ -708,7 +724,7 @@ fn prepare_core<'loan, 'source, 'control>(
         limits,
     };
     (|| {
-        let count = arena.len();
+        let count = unit_definitions(unit).len();
         let numeric = Arithmetic(admission.observed());
         let initial_floor = if admission.observed() {
             Some(numeric.result(initial_source_floor(count, types, functions, aggregates))?)
@@ -741,6 +757,22 @@ fn prepare_core<'loan, 'source, 'control>(
             Some(value) => value,
             None => initial_source_floor(count, types, functions, aggregates)?,
         };
+        if let Some(unit) = unit {
+            source_floor = numeric.add(
+                source_floor,
+                numeric.bytes::<novarocks_expression_contract::ExprRoot>(unit.roots.len())?,
+            )?;
+            facts.cumulative_work_upper_bound =
+                numeric.add(facts.cumulative_work_upper_bound, unit.roots.len())?;
+            admission.gate(&mut facts)?;
+            for root in unit.roots {
+                let present = unit.definition(root.definition).is_some();
+                work.step()?;
+                if !present {
+                    return Err(shape("root definition is absent from this node namespace"));
+                }
+            }
+        }
         cap(source_floor, source_retained_bytes, work)?;
         if !admission.observed() {
             facts = initial_facts(count)?;
@@ -751,8 +783,14 @@ fn prepare_core<'loan, 'source, 'control>(
             work,
         )?;
         let mut counts = KindCounts::default();
-        for ((id, node), input) in arena.iter().zip(inputs) {
-            let id_matches = *id == input.expr && node.id == input.expr;
+        for (ordinal, ((id, node), input)) in unit_definitions(unit)
+            .iter()
+            .map(|node| (&node.id, node))
+            .zip(inputs)
+            .enumerate()
+        {
+            let id_matches =
+                *id == input.expr && node.id == input.expr && id.get() as usize == ordinal;
             let counted = if admission.observed() {
                 let result = count_kind(node, input, &mut facts, &mut counts, true);
                 if let Err(Error::Control(cause)) = &result {
@@ -785,73 +823,20 @@ fn prepare_core<'loan, 'source, 'control>(
                 ExprKind::Case { when_then, .. } => {
                     numeric.bytes::<(ExprId, ExprId)>(when_then.len())?
                 }
-                ExprKind::WindowCall {
-                    args,
-                    function_order_by,
-                    aggregate_binding,
-                    ..
-                } => {
-                    let mut owned = numeric.add(
-                        numeric.bytes::<ExprId>(args.len())?,
-                        numeric
-                            .bytes::<novarocks_physical_plan::SortExpr>(function_order_by.len())?,
-                    )?;
-                    if aggregate_binding.is_some() {
-                        owned = numeric.add(
-                            owned,
-                            std::mem::size_of::<novarocks_physical_plan::AggregateBinding>(),
-                        )?;
-                    }
-                    owned
-                }
+
                 _ => 0,
             };
             source_floor = numeric.add(source_floor, owned)?;
             cap(source_floor, source_retained_bytes, work)?;
-            match &node.kind {
-                ExprKind::FunctionCall { function, .. } => signature_source_floor(
+            if let ExprKind::FunctionCall { function, .. } = &node.kind {
+                signature_source_floor(
                     function,
                     &mut source_floor,
                     source_retained_bytes,
                     &mut facts,
                     &mut admission,
                     work,
-                )?,
-                ExprKind::WindowCall {
-                    function,
-                    aggregate_binding,
-                    ..
-                } => {
-                    signature_source_floor(
-                        function,
-                        &mut source_floor,
-                        source_retained_bytes,
-                        &mut facts,
-                        &mut admission,
-                        work,
-                    )?;
-                    if let Some(aggregate) = aggregate_binding {
-                        source_floor =
-                            numeric.add(source_floor, aggregate.state_format.as_str().len())?;
-                        if let Some(receipt) = &aggregate.state_interpretation {
-                            source_floor = numeric.add(
-                                source_floor,
-                                numeric.bytes::<novarocks_type_contract::AggregateStateOrderKey>(
-                                    receipt.order_keys.len(),
-                                )?,
-                            )?;
-                        }
-                        signature_source_floor(
-                            &aggregate.function,
-                            &mut source_floor,
-                            source_retained_bytes,
-                            &mut facts,
-                            &mut admission,
-                            work,
-                        )?;
-                    }
-                }
-                _ => {}
+                )?;
             }
             if let Some(counted) = counted {
                 counted?;
@@ -874,7 +859,11 @@ fn prepare_core<'loan, 'source, 'control>(
         )?;
         admission.complete(&mut facts, work)?;
         // Every original binding is proved before the first output allocation.
-        for ((_, node), input) in arena.iter().zip(inputs) {
+        for ((_, node), input) in unit_definitions(unit)
+            .iter()
+            .map(|node| (&node.id, node))
+            .zip(inputs)
+        {
             let verified = if admission.observed() {
                 let mut verified = None;
                 let source = types.value_type_captured::<Error>(
@@ -960,9 +949,7 @@ fn prepare_core<'loan, 'source, 'control>(
                 }
             }
             let selected_function = match &node.kind {
-                ExprKind::FunctionCall { function, .. } | ExprKind::WindowCall { function, .. } => {
-                    Some(function)
-                }
+                ExprKind::FunctionCall { function, .. } => Some(function),
                 _ => None,
             };
             let same_presence = selected_function.is_some() == input.function_binding_id.is_some();
@@ -1000,58 +987,6 @@ fn prepare_core<'loan, 'source, 'control>(
                 };
                 if !verified.matches() {
                     return Err(shape("expression function differs from original signature"));
-                }
-            }
-            let aggregate = match &node.kind {
-                ExprKind::WindowCall {
-                    aggregate_binding, ..
-                } => aggregate_binding.as_deref(),
-                _ => None,
-            };
-            let same_presence = aggregate.is_some() == input.aggregate_binding_id.is_some();
-            work.step()?;
-            if !same_presence {
-                return Err(shape(
-                    "expression aggregate ID presence differs from original kind",
-                ));
-            }
-            if let Some(aggregate) = aggregate {
-                let id = input
-                    .aggregate_binding_id
-                    .ok_or_else(|| shape("missing expression aggregate ID"))?;
-                let verified = if admission.observed() {
-                    let mut verified = None;
-                    let source = aggregates.binding_captured(
-                        id,
-                        &mut |source, work| {
-                            verified = Some(
-                                compare_aggregate(
-                                    aggregate,
-                                    source,
-                                    &mut facts,
-                                    &mut admission,
-                                    work,
-                                )
-                                .map_err(binding_error)?,
-                            );
-                            Ok(())
-                        },
-                        work,
-                    )?;
-                    source.ok_or_else(|| {
-                        shape("expression refers to an unknown aggregate signature")
-                    })?;
-                    verified.ok_or_else(|| shape("expression aggregate capture is absent"))?
-                } else {
-                    let source = aggregates.binding_observed(id, work)?.ok_or_else(|| {
-                        shape("expression refers to an unknown aggregate signature")
-                    })?;
-                    compare_aggregate(aggregate, source, &mut facts, &mut admission, work)?
-                };
-                if !verified.matches() {
-                    return Err(shape(
-                        "expression aggregate differs from original signature",
-                    ));
                 }
             }
             if let ExprKind::Cast { target, .. } = &node.kind {
@@ -1173,7 +1108,7 @@ fn prepare_core<'loan, 'source, 'control>(
             }
         }
         Ok(PreparedExpressionNamespaceWrite {
-            arena,
+            unit,
             inputs,
             types,
             _functions: functions,
@@ -1189,7 +1124,7 @@ fn prepare_core<'loan, 'source, 'control>(
 }
 
 pub fn encode_expression_definitions<'loan, 'source, 'control>(
-    arena: &'loan ExprArena,
+    unit: Option<ExpressionDefinitionSource<'loan>>,
     inputs: &'loan [ExpressionTypeIds<'source>],
     types: &'loan EncodedTypeTable<'source>,
     functions: &'loan EncodedFunctionBindings<'loan, 'source>,
@@ -1201,7 +1136,7 @@ pub fn encode_expression_definitions<'loan, 'source, 'control>(
     control: &'control dyn PureCompileControl,
 ) -> Result<EncodedExpressions<'loan, 'source, 'control>, Error> {
     prepare_expression_definitions(
-        arena,
+        unit,
         inputs,
         types,
         functions,
@@ -1218,7 +1153,6 @@ pub fn encode_expression_definitions<'loan, 'source, 'control>(
 #[derive(Default)]
 struct KindCounts {
     function_lookups: usize,
-    aggregate_lookups: usize,
     parameter_lookups: usize,
     constant_lookups: usize,
     max_lambda_id_bytes: usize,
@@ -1306,36 +1240,6 @@ fn count_kind(
             )?;
             numeric(vector::<wire::WhenThen>(facts, when_then.len()))?;
         }
-        ExprKind::WindowCall {
-            args,
-            function_order_by,
-            frame,
-            aggregate_binding,
-            ..
-        } => {
-            refs = numeric_add(args.len(), function_order_by.len())?;
-            if let Some(frame) = frame {
-                for bound in [&frame.start, &frame.end] {
-                    if matches!(
-                        bound,
-                        novarocks_physical_plan::WindowBound::Preceding(_)
-                            | novarocks_physical_plan::WindowBound::Following(_)
-                    ) {
-                        refs = numeric_add(refs, 1)?;
-                    }
-                }
-            }
-            numeric(vector::<u32>(facts, args.len()))?;
-            numeric(vector::<wire::SortExpression>(
-                facts,
-                function_order_by.len(),
-            ))?;
-            counts.function_lookups = numeric_add(counts.function_lookups, 1)?;
-            counts.aggregate_lookups = numeric_add(
-                counts.aggregate_lookups,
-                usize::from(aggregate_binding.is_some()),
-            )?;
-        }
     }
     facts.expression_reference_count = numeric_add(
         facts.expression_reference_count,
@@ -1407,17 +1311,14 @@ fn count_work(
     counts: &KindCounts,
     types: &EncodedTypeTable<'_>,
     functions: &EncodedFunctionBindings<'_, '_>,
-    aggregates: &EncodedAggregateBindings<'_, '_>,
+    _aggregates: &EncodedAggregateBindings<'_, '_>,
     parameters: &SemanticParameters,
     pools: &ConstantPools,
 ) -> Result<usize, Error> {
     let (value_roots, _) = types.source_counts();
     let lookups = add(
         mul(facts.type_reference_count, value_roots)?,
-        add(
-            mul(counts.function_lookups, functions.source_counts())?,
-            mul(counts.aggregate_lookups, aggregates.source_counts())?,
-        )?,
+        mul(counts.function_lookups, functions.source_counts())?,
     )?;
     let tree_work = add(
         mul(

@@ -20,27 +20,23 @@ use super::*;
 fn invoke(
     fixture: &Fixture,
     types: &EncodedTypeTable<'_>,
-    ids: &[CallRequestTypeIds<'_>],
+    ids: &[UnitRequestTypeIds<'_>],
     control: &Control,
     invoice: usize,
     limits: CallRequestProjectionLimits,
     parent: &mut CallRequestAdmit<'_>,
-) -> Result<(wire::FragmentCallRequests, CallRequestProjectionFacts), Error> {
+) -> Result<(Vec<wire::UnitCallRequest>, CallRequestProjectionFacts), Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = (|| {
-        let token = prepare_call_requests_encode_in(
-            fixture.fragment.call_requests(),
-            types,
-            ids,
-            &fixture.pools,
-            invoice,
-            limits,
-            parent,
-            &mut work,
-        )?;
-        let facts = *token.facts();
-        Ok((token.emit_in(parent, &mut work)?, facts))
-    })();
+    let result = encode_unit_requests_in(
+        &fixture.unit,
+        types,
+        ids,
+        &fixture.pools,
+        invoice,
+        limits,
+        parent,
+        &mut work,
+    );
     finish(work, result)
 }
 fn ids<'a>(parameters: &'a [u32]) -> [ArgumentTypeIds<'a>; 3] {
@@ -96,7 +92,7 @@ fn caller_sender_retains_original_none_cv_lambda_constraint_and_exact_six_axes()
     assert_eq!(facts.allocation_requests_upper_bound, 3);
     assert_eq!(
         facts.request_bytes_upper_bound,
-        size_of::<wire::OriginalCallRequest>()
+        size_of::<wire::UnitCallRequest>()
             + 3 * size_of::<wire::OriginalFunctionArgument>()
             + size_of::<u32>()
     );
@@ -109,9 +105,9 @@ fn caller_sender_retains_original_none_cv_lambda_constraint_and_exact_six_axes()
         assert!(pair[0].cumulative_work_upper_bound <= pair[1].cumulative_work_upper_bound);
     }
     assert_eq!(prefixes.last(), Some(&facts));
-    assert!(matches!(&actual.entries[0].arguments[0].kind,
+    assert!(matches!(&actual[0].arguments[0].kind,
         Some(wire::original_function_argument::Kind::Value(v)) if v.constant.is_none()));
-    assert!(matches!(&actual.entries[0].arguments[1].kind,
+    assert!(matches!(&actual[0].arguments[1].kind,
         Some(wire::original_function_argument::Kind::Value(v)) if v.constant.as_ref().is_some_and(|r| r.pool_id==Some(u32::MAX) && r.row_ordinal==1)));
     let original = f
         .pools
@@ -154,27 +150,12 @@ fn caller_sender_retains_original_none_cv_lambda_constraint_and_exact_six_axes()
     }
     // The fixture author explicitly supplies an unconstrained original
     // request; it is not inferred from the call result or physical children.
-    let mut unconstrained = f.fragment.call_requests().entries()
-        [&PhysicalCallDefinition::Expression(p::ExprId::new(0))]
-        .clone();
+    let mut unconstrained = f.unit.requests()[&ExprId::new(0)].clone();
     unconstrained.expected_result_type = None;
-    let source = Fixture {
-        fragment: f
-            .fragment
-            .clone()
-            .with_call_requests_observed(
-                vec![(
-                    PhysicalCallDefinition::Expression(p::ExprId::new(0)),
-                    unconstrained,
-                )],
-                &Control::default(),
-            )
-            .unwrap(),
-        roots: f.roots.clone(),
-        pools: f.pools.clone(),
-    };
-    let requests = [CallRequestTypeIds {
-        definition: PhysicalCallDefinition::Expression(p::ExprId::new(0)),
+    // The replacement passes the actual unit gate before projection.
+    let source = fixture().with_request(unconstrained);
+    let requests = [UnitRequestTypeIds {
+        definition: ExprId::new(0),
         arguments: &args,
         expected_result_type: None,
     }];
@@ -189,7 +170,7 @@ fn caller_sender_retains_original_none_cv_lambda_constraint_and_exact_six_axes()
         &mut |_| Ok(()),
     )
     .unwrap();
-    assert_eq!(wire.entries[0].expected_result_value_type_id, None);
+    assert_eq!(wire[0].expected_result_value_type_id, None);
     assert_eq!(facts.type_reference_count, 4);
 }
 
@@ -213,8 +194,8 @@ fn caller_sender_known_header_and_emit_refusal_precede_pending_control_and_forei
             if local {
                 cap.max_request_bytes = 0;
             }
-            let outcome = prepare_call_requests_encode_in(
-                f.fragment.call_requests(),
+            let outcome = encode_unit_requests_in(
+                &f.unit,
                 &types,
                 &requests,
                 &f.pools,
@@ -235,12 +216,24 @@ fn caller_sender_known_header_and_emit_refusal_precede_pending_control_and_forei
             assert_eq!(count, usize::from(!local));
             assert_eq!(c.trace(), [(CompilePhase::Encode, 0)]);
         }
+        // Unit requests have one borrowed operation, not a transferable token.
+        // The original token refusal law is exercised on this actual checked
+        // Window relation, whose real context and request are attached.
+        let relation = relation_fixture();
+        let relation_ids = [CallRequestTypeIds {
+            definition: PhysicalCallSite::Window {
+                node: p::NodeId::new(42),
+                call: 0,
+            },
+            arguments: &[],
+            expected_result_type: None,
+        }];
         c.arm(None);
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();
         let token = prepare_call_requests_encode_in(
-            f.fragment.call_requests(),
+            relation.call_requests(),
             &types,
-            &requests,
+            &relation_ids,
             &f.pools,
             SOURCE,
             limits(),
@@ -261,9 +254,9 @@ fn caller_sender_known_header_and_emit_refusal_precede_pending_control_and_forei
         assert!(c.trace().is_empty());
         c.arm(None);
         let token = prepare_call_requests_encode_in(
-            f.fragment.call_requests(),
+            relation.call_requests(),
             &types,
-            &requests,
+            &relation_ids,
             &f.pools,
             SOURCE,
             limits(),
@@ -418,7 +411,7 @@ fn caller_sender_wide_actual_lambda_emission_observes_and_refuses_real_quantum()
     c.arm(None);
     let (output, _) = invoke(&f, &types, &requests, &c, SOURCE, cap, &mut |_| Ok(())).unwrap();
     assert!(
-        matches!(&output.entries[0].arguments[2].kind,Some(wire::original_function_argument::Kind::Lambda(v)) if v.parameter_value_type_ids==params)
+        matches!(&output[0].arguments[2].kind,Some(wire::original_function_argument::Kind::Lambda(v)) if v.parameter_value_type_ids==params)
     );
     let trace = c.trace();
     let quantum = trace

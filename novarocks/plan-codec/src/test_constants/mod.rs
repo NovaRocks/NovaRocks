@@ -21,10 +21,7 @@
 use novarocks_constant_contract::{ConstantPolicy, ConstantValue};
 use novarocks_physical_plan as p;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
-use std::{
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 struct Setup;
 impl PureCompileControl for Setup {
@@ -67,7 +64,10 @@ macro_rules! scalar_factory {
 scalar_factory!(i64, i64, from_i64);
 scalar_factory!(boolean, bool, from_boolean);
 
-pub(crate) fn insert(pools: &mut p::ConstantPools, source: ConstantValue) -> p::ExprKind {
+pub(crate) fn insert(
+    pools: &mut p::ConstantPools,
+    source: ConstantValue,
+) -> novarocks_expression_contract::ExprKind {
     let mut ordinal = 0x8000_0000u32
         .checked_add(u32::try_from(pools.entries().len()).unwrap())
         .unwrap();
@@ -83,87 +83,76 @@ pub(crate) fn insert(pools: &mut p::ConstantPools, source: ConstantValue) -> p::
         ordinal: source.ordinal(),
     };
     pools.insert(pool, source.pool().clone()).unwrap();
-    p::ExprKind::Constant(reference)
+    novarocks_expression_contract::ExprKind::Constant(reference)
 }
 
-#[derive(Clone)]
-pub(crate) struct Fragment {
-    fragment: p::Fragment,
-    _constants: p::ConstantPools,
-}
-impl Fragment {}
-impl Deref for Fragment {
-    type Target = p::Fragment;
-    fn deref(&self) -> &Self::Target {
-        &self.fragment
-    }
-}
-impl DerefMut for Fragment {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.fragment
-    }
-}
-
-pub(crate) struct FragmentBuilder {
-    builder: p::FragmentBuilder,
-    constants: p::ConstantPools,
-}
-impl FragmentBuilder {
-    pub(crate) fn add_value(
-        &mut self,
-        ty: p::ValueType,
-        origin: p::ValueOrigin,
-    ) -> Result<p::ValueId, p::BuildError> {
-        self.builder.add_value(ty, origin)
-    }
-    pub(crate) fn add_expression(
-        &mut self,
-        node: p::NodeId,
-        ty: p::ValueType,
-        kind: p::ExprKind,
-    ) -> Result<p::ExprId, p::BuildError> {
-        self.builder.add_expression(node, ty, kind)
-    }
-    pub(crate) fn new(id: p::FragmentId) -> Self {
-        Self {
-            builder: p::FragmentBuilder::new(id),
-            constants: p::ConstantPools::empty(),
-        }
-    }
-    pub(crate) fn constant_kind(&mut self, ty: &p::ValueType, source: Source) -> p::ExprKind {
-        insert(&mut self.constants, source(ty))
-    }
-    pub(crate) fn constant(
-        &mut self,
-        owner: p::NodeId,
-        ty: p::ValueType,
-        source: Source,
-    ) -> p::ExprId {
-        let kind = self.constant_kind(&ty, source);
-        self.builder.add_expression(owner, ty, kind).unwrap()
-    }
-
-    pub(crate) fn finish_definition(
-        self,
-        root: p::NodeId,
-        sink: p::FragmentSink,
-        dop: p::PipelineDopDomain,
-        placement: p::StagePlacementPolicy,
-    ) -> Result<Fragment, p::ValidationErrors> {
-        Ok(Fragment {
-            fragment: self.builder.finish_definition(root, sink, dop, placement)?,
-            _constants: self.constants,
+/// The actual unit root addresses used by borrowed receiving namespaces.
+/// This fixture projects its explicit source; it creates no missing environment.
+pub(crate) fn wire_roots(
+    unit: &novarocks_expression_contract::BoundExprSet,
+) -> Vec<novarocks_proto_models::physical_package_v2::ExpressionRoot> {
+    use novarocks_expression_contract::RootScope;
+    use novarocks_proto_models::physical_package_v2 as wire;
+    unit.roots()
+        .iter()
+        .zip(unit.root_use_ids())
+        .map(|(root, use_id)| wire::ExpressionRoot {
+            definition_id: Some(root.definition.get()),
+            demand: crate::physical_control_v2::encode_demand(root.demand),
+            scope: Some(wire::RootScope {
+                kind: Some(match root.scope {
+                    RootScope::Port(port) => wire::root_scope::Kind::Port(port),
+                    RootScope::AllPorts => wire::root_scope::Kind::AllPorts(
+                        novarocks_proto_models::physical_control_v2::Empty {},
+                    ),
+                }),
+            }),
+            use_id: Some(use_id.get()),
         })
-    }
+        .collect()
 }
-impl Deref for FragmentBuilder {
-    type Target = p::FragmentBuilder;
-    fn deref(&self) -> &Self::Target {
-        &self.builder
-    }
+
+/// Explicit pure leaf/root author for fixed fixtures. The caller names the
+/// exact node-local scope; function calls must use their real claims instead.
+pub(crate) fn pure_root(
+    builder: &mut p::FragmentBuilder,
+    node: p::NodeId,
+    ty: p::ValueType,
+    kind: novarocks_expression_contract::ExprKind,
+    scope: novarocks_expression_contract::RootScope,
+) -> novarocks_expression_contract::RootOrdinal {
+    let draft = builder.unit(node).unwrap();
+    let definition = draft.add(None, ty, kind).unwrap();
+    draft
+        .root(
+            definition,
+            novarocks_type_contract::EvaluationDemand::Value,
+            scope,
+        )
+        .unwrap()
 }
-impl DerefMut for FragmentBuilder {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.builder
+
+/// Seal only drafts the fixture has actually authored. Empty claims are valid
+/// only for these fixed non-function units; the real constructor enforces this.
+pub(crate) fn seal_pure_units(builder: &mut p::FragmentBuilder) {
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+    let nodes = builder
+        .construction_nodes()
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    for node in nodes {
+        if builder.construction_unit(node).is_none() {
+            continue;
+        }
+        let ports = builder.node_ports(node).unwrap();
+        let draft = builder.take_unit_builder(node).unwrap();
+        let mut work = CompileCheckpoints::try_new(&Setup, CompilePhase::Validate).unwrap();
+        let unit = draft
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(std::collections::BTreeMap::new(), &mut work)
+            .unwrap();
+        work.finish().unwrap();
+        builder.install_unit(node, Arc::new(unit)).unwrap();
     }
 }

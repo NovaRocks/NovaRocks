@@ -24,13 +24,14 @@ use crate::{
     physical_binding_v2::ArgumentTypeIds, physical_semantics_v2::SemanticsCodecError,
     physical_type_v2::TypeCodecError,
 };
-use novarocks_physical_plan::{CallRequestError, ConstantReferenceError, PhysicalCallDefinition};
+use novarocks_physical_plan::{CallRequestError, ConstantReferenceError, PhysicalCallSite};
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use std::fmt;
 
 mod encode;
 mod read;
 pub use encode::{PreparedCallRequestsEncode, encode_call_requests, prepare_call_requests_encode};
+pub(crate) use encode::{encode_source_policy, encode_unit_requests_in};
 pub use encode::{prepare_call_requests_encode_in, prepare_call_requests_encode_with_host_in};
 pub use read::{
     CallRequestTypeOwner, DecodedCallRequests, PreparedCallRequestsDecode, decode_call_requests,
@@ -38,15 +39,17 @@ pub use read::{
     prepare_call_requests_decode_with_creator_in,
 };
 pub(crate) use read::{decode_call_requests_in, prepare_call_requests_decode_in};
+pub(crate) use read::{decode_unit_requests_in, policy as decode_source_policy};
 
 /// IDs name exact complete FVT roots in the same emitted type table. They are
 /// a projection loan, not another author of the original request.
 #[derive(Clone, Copy)]
-pub struct CallRequestTypeIds<'a> {
-    pub definition: PhysicalCallDefinition,
+pub struct CallRequestTypeIds<'a, K = PhysicalCallSite> {
+    pub definition: K,
     pub arguments: &'a [ArgumentTypeIds<'a>],
     pub expected_result_type: Option<u32>,
 }
+pub type UnitRequestTypeIds<'a> = CallRequestTypeIds<'a, novarocks_expression_contract::ExprId>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CallRequestProjectionLimits {

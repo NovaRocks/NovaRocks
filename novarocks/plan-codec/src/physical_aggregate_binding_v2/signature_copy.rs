@@ -54,6 +54,7 @@ fn header(
 /// Charge this actual owned aggregate occurrence into the caller's sole model.
 /// The original namespace association and outer AggregateBinding Box belong to
 /// the caller. This port neither authorizes compatibility nor grants resources.
+#[cfg(test)]
 pub(crate) fn preflight_aggregate_binding_copy(
     source: &AggregateBinding,
     model: &mut MaterializationModel,
@@ -71,16 +72,6 @@ pub(crate) fn preflight_aggregate_binding_copy_counts(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
     counts_core(source, model, limits, None, work)
-}
-pub(crate) fn preflight_aggregate_binding_copy_in(
-    source: &AggregateBinding,
-    model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
-    admit: &mut Admit<'_>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), BindingCodecError> {
-    preflight_aggregate_binding_copy_counts_in(source, model, limits, admit, work)?;
-    preflight_aggregate_binding_copy_types_in(source, model, limits, admit, work)
 }
 pub(crate) fn preflight_aggregate_binding_copy_counts_in(
     source: &AggregateBinding,

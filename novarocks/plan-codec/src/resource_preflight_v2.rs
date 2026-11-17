@@ -113,6 +113,8 @@ pub enum ResourceCursorStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodeResourceProjection {
+    /// A retired field in its exact generated message; Prost still owns format acceptance.
+    pub contains_retired_field: bool,
     pub status: ResourceCursorStatus,
     pub usage: DecodeResourceUsage,
 }

@@ -549,7 +549,7 @@ fn relation_caller_owned_actual_wide_guarantees_keep_order_and_sample_real_quant
             };
             assert_eq!(data.schema.len(), 0);
             for (ordinal, guarantee) in data.predicate_guarantees.iter().enumerate() {
-                assert_eq!(guarantee.predicate_expr_id, Some(u32::MAX - ordinal as u32));
+                assert_eq!(guarantee.predicate_root, Some(u32::MAX - ordinal as u32));
                 assert_eq!(guarantee.kind, wire::PredicateGuaranteeKind::Exact as i32);
             }
         }

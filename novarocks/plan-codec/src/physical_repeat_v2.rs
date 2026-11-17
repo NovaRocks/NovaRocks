@@ -615,6 +615,7 @@ fn emit_encode(
         w.step()?;
     }
     let node = wire::PhysicalNode {
+        expressions: None,
         id: input.id.get(),
         input_node_ids: inputs,
         required_inputs,
@@ -676,6 +677,7 @@ fn emit_decode(
     }
     let grouping_outputs = boxed(outputs, w)?;
     let node = p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(input.id),
         inputs,
         required_inputs,

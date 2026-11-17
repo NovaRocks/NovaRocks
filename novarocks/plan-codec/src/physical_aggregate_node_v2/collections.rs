@@ -60,7 +60,7 @@ pub(crate) struct CollectionProjection<'model> {
 }
 
 pub(crate) fn encode_collection_lookup_work(
-    groups: &[(p::ExprId, p::ValueId)],
+    groups: &[(novarocks_expression_contract::RootOrdinal, p::ValueId)],
     calls: &[p::AggregateCall],
     e: &EncodedExpressions<'_, '_, '_>,
 ) -> Result<usize, Error> {
@@ -122,7 +122,7 @@ impl CollectionProjection<'_> {
             known = add(
                 known,
                 add(
-                    bytes::<p::ExprId>(call.arguments.len())?,
+                    bytes::<novarocks_expression_contract::RootOrdinal>(call.arguments.len())?,
                     bytes::<p::SortExpr>(call.order_by.len())?,
                 )?,
             )?;
@@ -171,17 +171,20 @@ impl CollectionProjection<'_> {
         let expression_lookup = e.lookup_work_upper_bound()?;
         let mut nested_exprs = 0;
         for call in calls {
-            let nested = add(call.argument_expr_ids.len(), call.order_by.len())?;
+            let nested = add(call.argument_roots.len(), call.order_by.len())?;
             model.items = add(model.items, nested)?;
             known = add(
                 known,
                 add(
-                    bytes::<u32>(call.argument_expr_ids.capacity())?,
+                    bytes::<u32>(call.argument_roots.capacity())?,
                     bytes::<wire::SortExpression>(call.order_by.capacity())?,
                 )?,
             )?;
             nested_exprs = add(nested_exprs, nested)?;
-            model.request::<p::ExprId>(call.argument_expr_ids.len(), 2)?;
+            model.request::<novarocks_expression_contract::RootOrdinal>(
+                call.argument_roots.len(),
+                2,
+            )?;
             model.request::<p::SortExpr>(call.order_by.len(), 2)?;
             model.delegated_work = add(initial_work, mul(nested_exprs, expression_lookup)?)?;
             node_gate(model, source, value_count, limits, &mut admit)?;
@@ -297,7 +300,7 @@ pub(crate) fn preflight_collection_binding_copies_core<'parent>(
 }
 
 pub(crate) fn encode_collection_references(
-    groups: &[(p::ExprId, p::ValueId)],
+    groups: &[(novarocks_expression_contract::RootOrdinal, p::ValueId)],
     calls: &[p::AggregateCall],
     values: &EncodedValues<'_, '_, '_>,
     e: &EncodedExpressions<'_, '_, '_>,
@@ -330,17 +333,17 @@ pub(crate) fn decode_collection_references(
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
     for group in groups {
-        decoded_expr(required(group.expr_id, w)?, e, w)?;
+        decoded_expr(required(group.root_ordinal, w)?, e, w)?;
         reference(required(group.value_id, w)?, e.values(), w)?;
         w.step()?;
     }
     for call in calls {
-        for arg in &call.argument_expr_ids {
+        for arg in &call.argument_roots {
             decoded_expr(*arg, e, w)?;
             w.step()?;
         }
         for sort in &call.order_by {
-            decoded_expr(required(sort.expr_id, w)?, e, w)?;
+            decoded_expr(required(sort.root_ordinal, w)?, e, w)?;
             completed(
                 properties::decode_direction(sort.direction).map_err(Error::from),
                 w,
@@ -359,7 +362,7 @@ pub(crate) fn decode_collection_references(
 
 type WireCollections = (Vec<wire::ExpressionOutput>, Vec<wire::AggregateCall>);
 pub(crate) fn encode_collections(
-    groups: &[(p::ExprId, p::ValueId)],
+    groups: &[(novarocks_expression_contract::RootOrdinal, p::ValueId)],
     calls: &[p::AggregateCall],
     e: &EncodedExpressions<'_, '_, '_>,
     w: &mut CompileCheckpoints<'_>,
@@ -367,7 +370,7 @@ pub(crate) fn encode_collections(
     let mut group_by = reserve(groups.len(), w)?;
     for (expr, value) in groups {
         group_by.push(wire::ExpressionOutput {
-            expr_id: Some(expr.get()),
+            root_ordinal: Some(expr.get()),
             value_id: Some(value.get()),
         });
         w.step()?;
@@ -383,7 +386,7 @@ pub(crate) fn encode_collections(
         emitted.push(wire::AggregateCall {
             id: call.id.get(),
             aggregate_binding_id: Some(id),
-            argument_expr_ids: args,
+            argument_roots: args,
             distinct: call.distinct,
             order_by: encode_sorts(&call.order_by, w)?,
             output_value_id: Some(call.output.get()),
@@ -393,7 +396,10 @@ pub(crate) fn encode_collections(
     Ok((group_by, emitted))
 }
 
-type OwnedCollections = (Vec<(p::ExprId, p::ValueId)>, Vec<p::AggregateCall>);
+type OwnedCollections = (
+    Vec<(novarocks_expression_contract::RootOrdinal, p::ValueId)>,
+    Vec<p::AggregateCall>,
+);
 /// Return the original Vecs. Boxing remains at the containing node's original
 /// construction position, after both collection loops have completed.
 pub(crate) fn decode_collections(
@@ -405,7 +411,7 @@ pub(crate) fn decode_collections(
     let mut group_by = reserve(groups.len(), w)?;
     for group in groups {
         group_by.push((
-            p::ExprId::new(required(group.expr_id, w)?),
+            novarocks_expression_contract::RootOrdinal::new(required(group.root_ordinal, w)?),
             p::ValueId::new(required(group.value_id, w)?),
         ));
         w.step()?;
@@ -416,9 +422,9 @@ pub(crate) fn decode_collections(
             binding(required(call.aggregate_binding_id, w)?, a, w)?,
             w,
         )?;
-        let mut args = reserve(call.argument_expr_ids.len(), w)?;
-        for id in &call.argument_expr_ids {
-            args.push(p::ExprId::new(*id));
+        let mut args = reserve(call.argument_roots.len(), w)?;
+        for id in &call.argument_roots {
+            args.push(novarocks_expression_contract::RootOrdinal::new(*id));
             w.step()?;
         }
         calls.push(p::AggregateCall {

@@ -289,6 +289,7 @@ enum ProgramReason {
     ProgramResolvedCallsWrongStateFormat = 295,
     ProgramResolvedCallsTypeMismatch = 296,
     ProgramResolvedCallsInvalidType = 297,
+    ProgramResolvedCallsDuplicateRelationCall = 298,
     ProgramExpressionTypeTooManyDefinitions = 300,
     ProgramExpressionTypeIncompleteCoverage = 301,
     ProgramExpressionTypeWrongKind = 302,
@@ -612,6 +613,10 @@ impl FailureProjection for ProgramResolvedCallsError {
             Self::SharedUse => fact(
                 FailureClass::Invariant,
                 ProgramReason::ProgramResolvedCallsSharedUse as u16,
+            ),
+            Self::DuplicateRelationCall => fact(
+                FailureClass::Invariant,
+                ProgramReason::ProgramResolvedCallsDuplicateRelationCall as u16,
             ),
             Self::WrongControl => fact(
                 FailureClass::Invariant,

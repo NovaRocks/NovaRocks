@@ -47,7 +47,7 @@ struct Physical<'a> {
     relation: &'a p::Relation,
     budget: p::ScanReadBudget,
     columns: &'a [(p::ProviderColumnReference, p::ValueId)],
-    residuals: &'a [p::ExprId],
+    residuals: &'a [novarocks_expression_contract::RootOrdinal],
     derived: &'a [p::ValueId],
 }
 fn physical(input: &p::PhysicalNode) -> Result<Physical<'_>, Error> {
@@ -82,11 +82,13 @@ fn required(id: Option<u32>, work: &mut CompileCheckpoints<'_>) -> Result<u32, E
     result
 }
 fn expression_encode(
-    id: p::ExprId,
+    id: novarocks_expression_contract::RootOrdinal,
     namespace: &EncodedExpressions<'_, '_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let found = namespace.expression_observed(id.get(), work)?.is_some();
+    let found = namespace
+        .root_expression_observed(id.get(), work)?
+        .is_some();
     work.step()?;
     if found {
         Ok(())
@@ -101,7 +103,7 @@ fn expression_decode(
     namespace: &DecodedExpressions<'_, '_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let found = namespace.definition_observed(id, work)?.is_some();
+    let found = namespace.root_definition_observed(id, work)?.is_some();
     work.step()?;
     if found {
         Ok(())
@@ -149,7 +151,7 @@ fn physical_model(
         add(
             bytes::<(p::ProviderColumnReference, p::ValueId)>(body.columns.len())?,
             add(
-                bytes::<p::ExprId>(body.residuals.len())?,
+                bytes::<novarocks_expression_contract::RootOrdinal>(body.residuals.len())?,
                 bytes::<p::ValueId>(body.derived.len())?,
             )?,
         )?,
@@ -365,7 +367,7 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
                     add(input.required_inputs.len(), port.value_ids.len())?,
                     add(
                         body.provider_outputs.len(),
-                        add(body.residual_expr_ids.len(), body.derived_value_ids.len())?,
+                        add(body.residual_roots.len(), body.derived_value_ids.len())?,
                     )?,
                 )?,
                 refs: add(
@@ -377,7 +379,7 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
             let backing = add(
                 bytes::<wire::ProviderOutput>(body.provider_outputs.capacity())?,
                 add(
-                    bytes::<u32>(body.residual_expr_ids.capacity())?,
+                    bytes::<u32>(body.residual_roots.capacity())?,
                     bytes::<u32>(body.derived_value_ids.capacity())?,
                 )?,
             )?;
@@ -408,7 +410,8 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
         model.request::<p::Relation>(1, 1)?;
         model
             .request::<(p::ProviderColumnReference, p::ValueId)>(body.provider_outputs.len(), 2)?;
-        model.request::<p::ExprId>(body.residual_expr_ids.len(), 2)?;
+        model
+            .request::<novarocks_expression_contract::RootOrdinal>(body.residual_roots.len(), 2)?;
         model.request::<p::ValueId>(body.derived_value_ids.len(), 2)?;
         model.delegated_work = add(
             mul(relations.source_count(), 8)?,
@@ -421,7 +424,7 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
                     2,
                 )?,
                 mul(
-                    body.residual_expr_ids.len(),
+                    body.residual_roots.len(),
                     expressions.lookup_work_upper_bound()?,
                 )?,
             )?,
@@ -478,7 +481,7 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
                 2,
             )?,
             mul(
-                body.residual_expr_ids.len(),
+                body.residual_roots.len(),
                 expressions.lookup_work_upper_bound()?,
             )?,
         )?,
@@ -499,7 +502,8 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
         model.request::<p::Relation>(1, 1)?;
         model
             .request::<(p::ProviderColumnReference, p::ValueId)>(body.provider_outputs.len(), 2)?;
-        model.request::<p::ExprId>(body.residual_expr_ids.len(), 2)?;
+        model
+            .request::<novarocks_expression_contract::RootOrdinal>(body.residual_roots.len(), 2)?;
         model.request::<p::ValueId>(body.derived_value_ids.len(), 2)?;
     }
     for property in input
@@ -559,7 +563,7 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
     for id in body.derived_value_ids.iter().chain(port.value_ids.iter()) {
         reference(*id, values, work)?;
     }
-    for expression in &body.residual_expr_ids {
+    for expression in &body.residual_roots {
         expression_decode(*expression, expressions, work)?;
     }
     for property in input
@@ -669,6 +673,7 @@ fn emit_encode(
         work.step()?;
     }
     let node = wire::PhysicalNode {
+        expressions: None,
         id: input.id.get(),
         input_node_ids: inputs,
         required_inputs,
@@ -682,7 +687,7 @@ fn emit_encode(
                 max_batch_bytes: body.budget.max_batch_bytes,
             }),
             provider_outputs: columns,
-            residual_expr_ids: residuals,
+            residual_roots: residuals,
             derived_value_ids: encode_ids(body.derived, work)?,
         })),
     };
@@ -748,9 +753,9 @@ fn emit_decode_core(
         ));
         work.step()?;
     }
-    let mut residuals = reserve(body.residual_expr_ids.len(), work)?;
-    for id in &body.residual_expr_ids {
-        residuals.push(p::ExprId::new(*id));
+    let mut residuals = reserve(body.residual_roots.len(), work)?;
+    for id in &body.residual_roots {
+        residuals.push(novarocks_expression_contract::RootOrdinal::new(*id));
         work.step()?;
     }
     let budget = body
@@ -758,6 +763,7 @@ fn emit_decode_core(
         .as_ref()
         .ok_or_else(|| invalid("prepared Scan read budget is absent"))?;
     let node = p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(input.id),
         inputs,
         required_inputs,

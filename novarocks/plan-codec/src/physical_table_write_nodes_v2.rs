@@ -947,13 +947,8 @@ fn prepare_decode_core(
         None => m.numerical_facts(source, e.values().count(), l.node)?,
     };
     count_prefix(m.inputs, m.items, source, known, l.node, w)?;
-    let dependency = add(
-        e.retained_floor_observed(w)?,
-        add(
-            a.functions().retained_output_floor()?,
-            a.retained_output_floor()?,
-        )?,
-    )?;
+    e.retained_floor_observed(w)?;
+    let dependency = e.owned_binding_floor(a.functions(), Some(a))?;
     floor(source, dependency, w)?;
     if admit.is_none() {
         decode_header_requests(n, port, &mut m)?;
@@ -1396,6 +1391,7 @@ fn emit_encode(
         _ => return Err(invalid("writer type ID view has a different node kind")),
     };
     let out = wire::PhysicalNode {
+        expressions: None,
         id: n.id.get(),
         input_node_ids: inputs,
         required_inputs,
@@ -1483,6 +1479,7 @@ fn emit_decode(
         }
     };
     let out = p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(n.id),
         inputs,
         required_inputs,

@@ -154,7 +154,7 @@ fn def(id: u32, ty: FunctionValueType, origin: p::ValueOrigin) -> p::ValueDef {
 fn expression() -> p::ValueOrigin {
     p::ValueOrigin::Expr {
         node: p::NodeId::new(u32::MAX),
-        expr: p::ExprId::new(0),
+        root: novarocks_expression_contract::RootOrdinal::new(0),
     }
 }
 fn w(kind: wire::value_origin::Kind) -> wire::ValueOrigin {
@@ -180,7 +180,7 @@ fn all_origins() -> Vec<(p::ValueOrigin, wire::value_origin::Kind)> {
             expression(),
             wire::value_origin::Kind::Expression(wire::ExpressionOrigin {
                 node_id: Some(u32::MAX),
-                expr_id: Some(0),
+                root_ordinal: Some(0),
             }),
         ),
         (
@@ -460,7 +460,7 @@ fn value_namespace_exact_type_and_source_binding_refuse_foreign_or_missing_facts
         0,
         wire::value_origin::Kind::Expression(wire::ExpressionOrigin {
             node_id: Some(u32::MAX),
-            expr_id: Some(0),
+            root_ordinal: Some(0),
         }),
     );
     let mut invalids = Vec::new();
@@ -489,7 +489,7 @@ fn value_namespace_exact_type_and_source_binding_refuse_foreign_or_missing_facts
         0,
         wire::value_origin::Kind::Expression(wire::ExpressionOrigin {
             node_id: None,
-            expr_id: Some(0),
+            root_ordinal: Some(0),
         }),
     ));
     invalids.push(expected(
@@ -750,7 +750,7 @@ fn value_namespace_original_control_at_every_success_ordinary_and_lookup_boundar
     bad[0].origin.as_mut().unwrap().kind = Some(wire::value_origin::Kind::Expression(
         wire::ExpressionOrigin {
             node_id: Some(0),
-            expr_id: None,
+            root_ordinal: None,
         },
     ));
     every_callback(&control, CompilePhase::Decode, true, || {

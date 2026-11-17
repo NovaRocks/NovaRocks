@@ -17,7 +17,8 @@
 
 use super::{BindingCodecError, BindingProjectionLimits, MaterializationModel, add};
 use crate::physical_type_v2::clone_value_type_observed;
-use novarocks_physical_plan::{BoundFunction, BoundTableFunction};
+use novarocks_expression_contract::BoundFunction;
+use novarocks_physical_plan::BoundTableFunction;
 use novarocks_type_contract::{
     CompileCheckpoints, FunctionArgumentType, FunctionId, FunctionKind, FunctionOverloadId,
     FunctionValueType,

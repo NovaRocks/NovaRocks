@@ -191,6 +191,7 @@ fn required_property() -> p::PhysicalProperties {
 }
 fn source() -> p::PhysicalNode {
     p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(u32::MAX),
         inputs: Box::from([p::NodeId::new(0)]),
         required_inputs: Box::from([required_property()]),
@@ -233,6 +234,7 @@ fn expected_required_property() -> wire::PhysicalProperties {
 }
 fn expected() -> wire::PhysicalNode {
     wire::PhysicalNode {
+        expressions: None,
         id: u32::MAX,
         input_node_ids: vec![0],
         required_inputs: vec![expected_required_property()],

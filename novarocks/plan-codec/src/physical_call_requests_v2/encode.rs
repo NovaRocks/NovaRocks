@@ -27,13 +27,13 @@ use crate::{
     physical_semantics_v2::encode_call_site,
     physical_type_v2::EncodedTypeTable,
 };
+use novarocks_expression_contract::PhysicalCallRequest;
 use novarocks_physical_plan::{
-    ConstantPools, FragmentCallRequests, PhysicalCallRequest, PhysicalCallSite,
-    StaticFunctionArgument as Argument,
+    ConstantPools, FragmentCallRequests, PhysicalCallSite, StaticFunctionArgument as Argument,
 };
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{CompilePhase, FunctionValueType, PureCompileControl};
-use std::mem::size_of;
+use std::{collections::BTreeMap, mem::size_of};
 
 type Error = CallRequestCodecError;
 use crate::host_projection_v2::{AdmissionRefusal, ProjectionFailure};
@@ -239,15 +239,15 @@ impl<'parent, 'callback, H> Model<'parent, 'callback, H> {
 
 /// Retains all original immutable loans until the single consuming emission.
 /// Source invoices and request facts do not authorize host/library allocation.
-pub struct PreparedCallRequestsEncode<'loan, 'source> {
-    source: &'loan FragmentCallRequests,
+pub struct PreparedCallRequestsEncode<'loan, 'source, K = PhysicalCallSite> {
+    source: &'loan BTreeMap<K, PhysicalCallRequest>,
     types: &'loan EncodedTypeTable<'source>,
-    type_ids: &'loan [CallRequestTypeIds<'loan>],
+    type_ids: &'loan [CallRequestTypeIds<'loan, K>],
     pools: &'loan ConstantPools,
     control: &'loan dyn PureCompileControl,
     facts: CallRequestProjectionFacts,
 }
-impl PreparedCallRequestsEncode<'_, '_> {
+impl<K> PreparedCallRequestsEncode<'_, '_, K> {
     pub const fn facts(&self) -> &CallRequestProjectionFacts {
         &self.facts
     }
@@ -355,9 +355,9 @@ fn capture_constant<H>(
     model.check(limits)?;
     model.comparison_prefix(expected, selected.value_type(), limits)
 }
-fn count_request_header<H>(
+fn count_request_header<H, K>(
     request: &PhysicalCallRequest,
-    ids: &CallRequestTypeIds<'_>,
+    ids: &CallRequestTypeIds<'_, K>,
     model: &mut Model<'_, '_, H>,
     owned_source: &mut usize,
     limits: CallRequestProjectionLimits,
@@ -368,7 +368,7 @@ fn count_request_header<H>(
         bytes::<Argument<novarocks_physical_plan::ConstantReference>>(request.arguments.len())?,
     )?;
     model.known = model.known.max(*owned_source).max(add(
-        size_of::<CallRequestTypeIds<'_>>(),
+        size_of::<CallRequestTypeIds<'_, K>>(),
         bytes::<ArgumentTypeIds<'_>>(ids.arguments.len())?,
     )?);
     model.request::<wire::OriginalFunctionArgument>(request.arguments.len())?;
@@ -397,10 +397,10 @@ fn count_lambda_header<H>(
     model.request::<u32>(parameter_types.len())?;
     model.check(limits)
 }
-fn preflight<H>(
-    source: &FragmentCallRequests,
+fn preflight<H, K: WireRequestKey>(
+    source: &BTreeMap<K, PhysicalCallRequest>,
     types: &EncodedTypeTable<'_>,
-    ids: &[CallRequestTypeIds<'_>],
+    ids: &[CallRequestTypeIds<'_, K>],
     pools: &ConstantPools,
     invoice: usize,
     limits: CallRequestProjectionLimits,
@@ -408,37 +408,29 @@ fn preflight<H>(
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<CallRequestProjectionFacts, HostError<H>> {
     let mut model = Model::new(invoice, types, pools, parent)?;
-    model.facts.definition_count = source.entries().len();
+    model.facts.definition_count = source.len();
     model.known = model.known.max(add(
-        size_of::<FragmentCallRequests>(),
+        size_of::<BTreeMap<K, PhysicalCallRequest>>(),
         add(
-            bytes::<(PhysicalCallDefinition, PhysicalCallRequest)>(source.entries().len())?,
-            bytes::<CallRequestTypeIds<'_>>(ids.len())?,
+            bytes::<(K, PhysicalCallRequest)>(source.len())?,
+            bytes::<CallRequestTypeIds<'_, K>>(ids.len())?,
         )?,
     )?);
-    model.request::<wire::OriginalCallRequest>(source.entries().len())?;
+    model.request::<K::Wire>(source.len())?;
     model.check(limits)?;
     checked_shape(
-        ids.len() == source.entries().len(),
+        ids.len() == source.len(),
         "request type bindings do not cover the original table",
         w,
     )?;
     let mut owned_source = model.known;
-    for ((definition, request), ids) in source.entries().iter().zip(ids) {
+    for ((definition, request), ids) in source.iter().zip(ids) {
         if model.parent.is_some() {
             count_request_header(request, ids, &mut model, &mut owned_source, limits)?;
         }
         checked_shape(
             *definition == ids.definition,
             "request type bindings differ from original ordered definitions",
-            w,
-        )?;
-        checked_shape(
-            !matches!(
-                definition,
-                PhysicalCallDefinition::Relational(PhysicalCallSite::Expression(_))
-            ),
-            "request relational definition names an expression use",
             w,
         )?;
         checked_shape(
@@ -525,7 +517,7 @@ fn preflight<H>(
     }
     // All cumulative requests, source floors and own-loop bounds precede type
     // walks, constant selection and the first output allocation.
-    for ((_, request), ids) in source.entries().iter().zip(ids) {
+    for ((_, request), ids) in source.iter().zip(ids) {
         for (argument, ids) in request.arguments.iter().zip(ids.arguments) {
             match (argument, ids) {
                 (
@@ -578,8 +570,8 @@ pub fn prepare_call_requests_encode<'loan, 'source>(
     control: &'loan dyn PureCompileControl,
 ) -> Result<PreparedCallRequestsEncode<'loan, 'source>, Error> {
     let mut w = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = preflight::<std::convert::Infallible>(
-        source,
+    let result = preflight::<std::convert::Infallible, PhysicalCallSite>(
+        source.entries(),
         types,
         type_ids,
         pools,
@@ -589,7 +581,7 @@ pub fn prepare_call_requests_encode<'loan, 'source>(
         &mut w,
     )
     .map(|facts| PreparedCallRequestsEncode {
-        source,
+        source: source.entries(),
         types,
         type_ids,
         pools,
@@ -627,27 +619,19 @@ pub fn encode_call_requests(
     token: PreparedCallRequestsEncode<'_, '_>,
 ) -> Result<wire::FragmentCallRequests, Error> {
     let mut w = CompileCheckpoints::try_new(token.control, CompilePhase::Encode)?;
-    let result = emit_core(token, &mut w);
+    let result = emit_core(token, &mut w).map(|entries| wire::FragmentCallRequests { entries });
     finish(w, result)
 }
-fn emit_core(
-    token: PreparedCallRequestsEncode<'_, '_>,
+fn emit_core<K: WireRequestKey>(
+    token: PreparedCallRequestsEncode<'_, '_, K>,
     w: &mut CompileCheckpoints<'_>,
-) -> Result<wire::FragmentCallRequests, Error> {
+) -> Result<Vec<K::Wire>, Error> {
     (|| {
         // These loans remain live through emission; nothing is re-resolved or
         // re-admitted after the immutable prepared correspondence was checked.
         let _loans = (token.types, token.pools);
-        let mut entries = reserve::<wire::OriginalCallRequest>(token.source.entries().len(), w)?;
-        for ((definition, request), ids) in token.source.entries().iter().zip(token.type_ids) {
-            let kind = match definition {
-                PhysicalCallDefinition::Expression(id) => {
-                    wire::call_request_definition::Kind::ExpressionDefinitionId(id.get())
-                }
-                PhysicalCallDefinition::Relational(site) => {
-                    wire::call_request_definition::Kind::Relational(encode_call_site(*site))
-                }
-            };
+        let mut entries = reserve::<K::Wire>(token.source.len(), w)?;
+        for ((definition, request), ids) in token.source.iter().zip(token.type_ids) {
             w.step()?;
             let mut arguments =
                 reserve::<wire::OriginalFunctionArgument>(request.arguments.len(), w)?;
@@ -678,19 +662,21 @@ fn emit_core(
                 arguments.push(wire::OriginalFunctionArgument { kind: Some(kind) });
                 w.step()?;
             }
-            entries.push(wire::OriginalCallRequest {
-                definition: Some(wire::CallRequestDefinition { kind: Some(kind) }),
-                arguments,
-                logical_argument_count: Some(
-                    u32::try_from(request.logical_argument_count)
-                        .map_err(|_| shape("request prepared logical count changed"))?,
-                ),
-                expected_result_value_type_id: ids.expected_result_type,
-                constant_policy: Some(encode_source_policy(request.constant_policy)),
-            });
+            entries.push(K::project(
+                *definition,
+                RequestFields {
+                    arguments,
+                    logical_argument_count: Some(
+                        u32::try_from(request.logical_argument_count)
+                            .map_err(|_| shape("request prepared logical count changed"))?,
+                    ),
+                    expected_result_value_type_id: ids.expected_result_type,
+                    constant_policy: Some(encode_source_policy(request.constant_policy)),
+                },
+            ));
             w.step()?;
         }
-        Ok(wire::FragmentCallRequests { entries })
+        Ok(entries)
     })()
 }
 
@@ -753,7 +739,7 @@ pub fn prepare_call_requests_encode_host_core<'loan, 'source, 'control: 'loan, H
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsEncode<'loan, 'source>, HostError<H>> {
     let facts = preflight(
-        source,
+        source.entries(),
         types,
         type_ids,
         pools,
@@ -763,7 +749,7 @@ pub fn prepare_call_requests_encode_host_core<'loan, 'source, 'control: 'loan, H
         work,
     )?;
     Ok(PreparedCallRequestsEncode {
-        source,
+        source: source.entries(),
         types,
         type_ids,
         pools,
@@ -792,7 +778,9 @@ fn encode_call_requests_with_host_in<H>(
         return Err(shape("request encoder belongs to another controller").into());
     }
     admit(&token.facts).map_err(project_admission)?;
-    emit_core(token, work).map_err(ProjectionFailure::Codec)
+    emit_core(token, work)
+        .map(|entries| wire::FragmentCallRequests { entries })
+        .map_err(ProjectionFailure::Codec)
 }
 impl PreparedCallRequestsEncode<'_, '_> {
     pub fn emit_in(
@@ -814,3 +802,79 @@ impl PreparedCallRequestsEncode<'_, '_> {
 #[cfg(test)]
 #[path = "encode_tests.rs"]
 mod tests;
+
+struct RequestFields {
+    arguments: Vec<wire::OriginalFunctionArgument>,
+    logical_argument_count: Option<u32>,
+    expected_result_value_type_id: Option<u32>,
+    constant_policy: Option<wire::SourceConstantPolicy>,
+}
+trait WireRequestKey: Copy + Ord {
+    type Wire;
+    fn project(self, fields: RequestFields) -> Self::Wire;
+}
+impl WireRequestKey for PhysicalCallSite {
+    type Wire = wire::OriginalCallRequest;
+    fn project(self, f: RequestFields) -> Self::Wire {
+        wire::OriginalCallRequest {
+            definition: Some(wire::CallRequestDefinition {
+                kind: Some(wire::call_request_definition::Kind::Relational(
+                    encode_call_site(self),
+                )),
+            }),
+            arguments: f.arguments,
+            logical_argument_count: f.logical_argument_count,
+            expected_result_value_type_id: f.expected_result_value_type_id,
+            constant_policy: f.constant_policy,
+        }
+    }
+}
+impl WireRequestKey for novarocks_expression_contract::ExprId {
+    type Wire = wire::UnitCallRequest;
+    fn project(self, f: RequestFields) -> Self::Wire {
+        wire::UnitCallRequest {
+            definition_id: Some(self.get()),
+            arguments: f.arguments,
+            logical_argument_count: f.logical_argument_count,
+            expected_result_value_type_id: f.expected_result_value_type_id,
+            constant_policy: f.constant_policy,
+        }
+    }
+}
+pub(crate) fn encode_unit_requests_in(
+    unit: &novarocks_expression_contract::BoundExprSet,
+    types: &EncodedTypeTable<'_>,
+    ids: &[super::UnitRequestTypeIds<'_>],
+    pools: &ConstantPools,
+    invoice: usize,
+    limits: CallRequestProjectionLimits,
+    admit: &mut CallRequestAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(Vec<wire::UnitCallRequest>, CallRequestProjectionFacts), Error> {
+    let facts = preflight::<std::convert::Infallible, _>(
+        unit.requests(),
+        types,
+        ids,
+        pools,
+        invoice,
+        limits,
+        Some(&mut |facts| {
+            admit(facts).map_err(|cause| ProjectionFailure::Codec(Error::Control(cause)))
+        }),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)?;
+    admit(&facts)?;
+    let output = emit_core(
+        PreparedCallRequestsEncode {
+            source: unit.requests(),
+            types,
+            type_ids: ids,
+            pools,
+            control: work.control(),
+            facts,
+        },
+        work,
+    )?;
+    Ok((output, facts))
+}

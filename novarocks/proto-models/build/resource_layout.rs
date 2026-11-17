@@ -34,6 +34,7 @@ struct SchemaObject {
     oneof: bool,
     fields: BTreeMap<u32, FieldDescriptorProto>,
     proto3: bool,
+    reserved: Vec<(u32, u32)>,
 }
 
 pub struct Generator {
@@ -85,6 +86,16 @@ impl Generator {
             oneof: false,
             fields,
             proto3,
+            reserved: message
+                .reserved_range
+                .iter()
+                .map(|range| {
+                    let start = u32::try_from(range.start()).expect("reserved range start");
+                    let end = u32::try_from(range.end()).expect("reserved range end");
+                    assert!(start > 0 && start < end, "invalid reserved range: {id}");
+                    (start, end)
+                })
+                .collect(),
         };
         if message.options.as_ref().is_some_and(|o| o.map_entry()) {
             assert!(
@@ -120,6 +131,7 @@ impl Generator {
                     .map(|f| (f.number() as u32, f.clone()))
                     .collect(),
                 proto3,
+                reserved: Vec::new(),
             };
             assert!(
                 self.objects.insert(oneof_id, object).is_none(),
@@ -376,6 +388,10 @@ impl Generator {
         } else {
             quote! {Message}
         };
+        let reserved = object
+            .reserved
+            .iter()
+            .map(|(start, end)| quote! { (#start, #end) });
         syn::parse2(quote! {
             impl crate::resource_layout::GeneratedResourceLayout for #ident {
                 const SCHEMA_ID: &'static str = #id;
@@ -383,6 +399,7 @@ impl Generator {
                     schema_id: #id, kind: crate::resource_layout::ObjectKind::#kind,
                     size: ::core::mem::size_of::<Self>(), alignment: ::core::mem::align_of::<Self>(),
                     fields: &[#(#layouts),*],
+                    reserved: &[#(#reserved),*],
                 };
             }
         }).expect("generated layout implementation")

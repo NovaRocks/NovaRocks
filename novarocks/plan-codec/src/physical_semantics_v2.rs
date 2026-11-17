@@ -22,9 +22,8 @@
 //! refinement, implication and allocation admission remain separate checks.
 
 use novarocks_physical_plan::{
-    ExpressionRootError, Fragment, FragmentPackage, FrozenCallError, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPruningError, PhysicalRootUses, PredicateSourceError,
-    PruningStructureError, RootUseBindingError,
+    Fragment, FragmentPackage, FrozenCallError, FrozenFragmentCalls, FrozenFragmentPruning,
+    FrozenPruningError, PredicateSourceError, PruningStructureError,
 };
 use novarocks_proto_models::physical_semantics_v2 as wire;
 use novarocks_type_contract::{
@@ -57,8 +56,10 @@ pub use calls::{
 pub use pruning::{decode_frozen_pruning_observed, encode_frozen_pruning_observed};
 
 pub(crate) use calls::{
+    decode_expression_claims_in, decode_frozen_call_entries_observed,
     decode_policy as decode_decimal_policy, decode_site as decode_call_site,
-    encode_policy as encode_decimal_policy, encode_site as encode_call_site,
+    encode_expression_claims_in, encode_policy as encode_decimal_policy,
+    encode_site as encode_call_site,
 };
 pub use parameters::{
     CreatedWriterSemanticParameters, decode_writer_semantic_parameters_with_creator_in,
@@ -116,11 +117,7 @@ impl From<SemanticParameterError> for SemanticsCodecError {
 impl From<FrozenCallError> for SemanticsCodecError {
     fn from(error: FrozenCallError) -> Self {
         match error {
-            FrozenCallError::Control(error)
-            | FrozenCallError::Roots(RootUseBindingError::Control(error))
-            | FrozenCallError::Roots(RootUseBindingError::Roots(ExpressionRootError::Control(
-                error,
-            ))) => Self::Control(error),
+            FrozenCallError::Control(error) => Self::Control(error),
             error => Self::Calls(error),
         }
     }
@@ -141,11 +138,9 @@ impl From<ControlCodecError> for SemanticsCodecError {
     fn from(error: ControlCodecError) -> Self {
         match error {
             ControlCodecError::Control(error)
-            | ControlCodecError::Flow(ExpressionControlFlowError::Control(error))
-            | ControlCodecError::Roots(RootUseBindingError::Control(error))
-            | ControlCodecError::Roots(RootUseBindingError::Roots(ExpressionRootError::Control(
-                error,
-            ))) => Self::Control(error),
+            | ControlCodecError::Flow(ExpressionControlFlowError::Control(error)) => {
+                Self::Control(error)
+            }
             error => Self::ControlComponent(error),
         }
     }
@@ -216,14 +211,13 @@ pub fn encode_fragment_semantics(
 
 pub fn decode_fragment_semantics(
     fragment: &Fragment,
-    uses: &PhysicalRootUses,
     encoded: &EncodedFragmentSemantics,
     control: &dyn PureCompileControl,
 ) -> Result<DecodedFragmentSemantics, SemanticsCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = (|| {
         let parameters = parameters::decode_parameters(&encoded.parameters, &mut work)?;
-        let calls = calls::decode_calls(fragment, uses, &encoded.calls, &mut work, control)?;
+        let calls = calls::decode_calls(fragment, &encoded.calls, &mut work, control)?;
         let pruning = pruning::decode_pruning(fragment.id(), &encoded.pruning, &mut work, control)?;
         Ok(DecodedFragmentSemantics {
             parameters,

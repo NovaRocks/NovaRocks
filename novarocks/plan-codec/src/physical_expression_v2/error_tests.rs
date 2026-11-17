@@ -39,9 +39,9 @@ fn receiving_dependency_refusals_never_reobserve_an_originating_cause() {
     ] {
         for lifted in [
             ExpressionCodecError::from(ValueCodecError::Control(cause.clone())),
-            ExpressionCodecError::from(
-                novarocks_physical_plan::ExprArenaConstructionError::Control(cause.clone()),
-            ),
+            ExpressionCodecError::from(novarocks_expression_contract::UnitError::Control(
+                cause.clone(),
+            )),
             ExpressionCodecError::from(ConstantReferenceError::Control(cause.clone())),
             ExpressionCodecError::from(ConstantReferenceError::Constant(ConstantError::Control(
                 cause.clone(),
@@ -87,15 +87,17 @@ fn receiving_ordinary_dependency_errors_keep_the_completed_tail_and_typed_detail
 }
 
 #[test]
-fn receiving_sparse_arena_structure_error_keeps_original_detail_and_ordinary_tail() {
+fn receiving_unit_structure_error_keeps_original_detail_and_ordinary_tail() {
     let control = Control(Mutex::new(Vec::new()));
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     work.step().unwrap();
-    let error = novarocks_physical_plan::ExprArenaConstructionError::DuplicateDefinition(
-        novarocks_physical_plan::ExprId::new(u32::MAX),
-    );
+    let error = novarocks_expression_contract::UnitError::Invalid {
+        definition: Some(novarocks_expression_contract::ExprId::new(u32::MAX)),
+        root: Some(novarocks_expression_contract::RootOrdinal::new(0)),
+        message: "definition IDs must be dense".into(),
+    };
     assert!(
-        matches!(namespace::finish::<()>(work,Err(error.into())),Err(ExpressionCodecError::Arena(novarocks_physical_plan::ExprArenaConstructionError::DuplicateDefinition(id))) if id.get()==u32::MAX)
+        matches!(namespace::finish::<()>(work,Err(error.into())),Err(ExpressionCodecError::Unit(novarocks_expression_contract::UnitError::Invalid{definition:Some(id),root:Some(root),ref message})) if id.get()==u32::MAX && root.get()==0 && message=="definition IDs must be dense")
     );
     assert_eq!(*control.0.lock().unwrap(), [0, 1]);
 }

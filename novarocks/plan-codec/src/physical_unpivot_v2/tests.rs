@@ -25,8 +25,8 @@ use crate::{
         ConnectorPayloadProjectionLimits, decode_connector_payloads, encode_connector_payloads,
     },
     physical_expression_v2::{
-        ExpressionProjectionLimits, ExpressionTypeIds, decode_expression_definitions,
-        encode_expression_definitions,
+        ExpressionDefinitionSource, ExpressionProjectionLimits, ExpressionTypeIds,
+        decode_expression_definitions, encode_expression_definitions,
     },
     physical_properties_v2::PhysicalPropertyProjectionLimits,
     physical_type_v2::{TypeProjectionLimits, decode_type_table, encode_type_table_sources},
@@ -39,6 +39,7 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
+use novarocks_expression_contract::{ExprId, RootOrdinal};
 use novarocks_proto_models::physical_control_v2::Empty;
 use novarocks_type_contract::{CompileControlError, FunctionValueType, SemanticParameters};
 use std::sync::{Arc, Mutex};
@@ -192,17 +193,53 @@ fn reference(pool: u32, ordinal: u32) -> p::ConstantReference {
         ordinal,
     }
 }
+pub(crate) fn unit_from_sources(
+    nodes: impl IntoIterator<Item = novarocks_expression_contract::ExprNode>,
+    values: &[p::ValueDef],
+    control: &dyn PureCompileControl,
+) -> novarocks_expression_contract::BoundExprSet {
+    use novarocks_expression_contract::{BoundExprSetBuilder, ExprPort, RootScope, UnitLimits};
+    use novarocks_type_contract::{CompileCheckpoints, EvaluationDemand};
+    let mut builder = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: p::PlanLimits::FROZEN.expression_semantic_depth,
+    });
+    for node in nodes {
+        let demand = if *node.ty.data_type() == DataType::Boolean {
+            EvaluationDemand::TruthOnly
+        } else {
+            EvaluationDemand::Value
+        };
+        let id = builder.add(node.lambda_scope, node.ty, node.kind).unwrap();
+        assert_eq!(id, node.id);
+        builder.root(id, demand, RootScope::Port(0)).unwrap();
+    }
+    let ports = vec![ExprPort {
+        values: values
+            .iter()
+            .map(|value| (value.id, value.ty.clone()))
+            .collect(),
+    }];
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+    let unit = builder
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(std::collections::BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    unit
+}
+
 pub(crate) struct Fixture {
     roots: Vec<(u32, FunctionValueType)>,
     definitions: Vec<p::ValueDef>,
-    arena: p::ExprArena,
+    unit: novarocks_expression_contract::BoundExprSet,
     parameters: SemanticParameters,
     pools: p::ConstantPools,
 }
 impl Fixture {
     pub(crate) fn new() -> Self {
         let ty = FunctionValueType::new(DataType::Int64, true);
-        let definitions = [0, 7, u32::MAX]
+        let definitions: Vec<p::ValueDef> = [0, 7, u32::MAX]
             .into_iter()
             .map(|id| p::ValueDef {
                 id: p::ValueId::new(id),
@@ -253,28 +290,31 @@ impl Fixture {
         );
         pools.insert(p::ConstantPoolId::new(7), pool(&map)).unwrap();
         let nodes = [
-            (0, p::ExprKind::Constant(reference(u32::MAX, 1))),
-            (7, p::ExprKind::Value(p::ValueId::new(0))),
-            (u32::MAX, p::ExprKind::Constant(reference(u32::MAX, 2))),
+            (
+                0,
+                novarocks_expression_contract::ExprKind::Constant(reference(u32::MAX, 1)),
+            ),
+            (
+                1,
+                novarocks_expression_contract::ExprKind::Value(p::ValueId::new(0)),
+            ),
+            (
+                2,
+                novarocks_expression_contract::ExprKind::Constant(reference(u32::MAX, 2)),
+            ),
         ]
         .into_iter()
-        .map(|(id, kind)| p::ExprNode {
-            id: p::ExprId::new(id),
-            owner: p::NodeId::new(u32::MAX),
+        .map(|(id, kind)| novarocks_expression_contract::ExprNode {
+            id: ExprId::new(id),
             lambda_scope: None,
             ty: ty.clone(),
             kind,
         });
-        let arena = p::ExprArena::try_from_definitions_observed(
-            nodes,
-            &p::PlanLimits::default(),
-            &Control::default(),
-        )
-        .unwrap();
+        let unit = unit_from_sources(nodes, &definitions, &Control::default());
         Self {
             roots: vec![(0, ty)],
             definitions,
-            arena,
+            unit,
             parameters: SemanticParameters::try_new([]).unwrap(),
             pools,
         }
@@ -339,18 +379,18 @@ impl Fixture {
         )
         .unwrap();
         let inputs = self
-            .arena
+            .unit
+            .definitions()
             .iter()
-            .map(|(id, _)| ExpressionTypeIds {
-                expr: *id,
+            .map(|node| ExpressionTypeIds {
+                expr: node.id,
                 value_type_id: 0,
                 lambda_parameter_type_ids: &[],
                 function_binding_id: None,
-                aggregate_binding_id: None,
             })
             .collect::<Vec<_>>();
         let expressions = encode_expression_definitions(
-            &self.arena,
+            Some(ExpressionDefinitionSource::from_unit(&self.unit)),
             &inputs,
             &types,
             &functions,
@@ -362,8 +402,10 @@ impl Fixture {
             control,
         )
         .unwrap();
+        let wire_roots = crate::test_constants::wire_roots(&self.unit);
         let read = decode_expression_definitions(
             expressions.as_wire(),
+            &wire_roots,
             &read_values,
             &functions_read,
             &aggregates_read,
@@ -385,6 +427,7 @@ fn property() -> p::PhysicalProperties {
 }
 fn source() -> p::PhysicalNode {
     p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(u32::MAX),
         inputs: Box::from([p::NodeId::new(0)]),
         required_inputs: Box::from([p::passthrough_requirement(&property())]),
@@ -410,7 +453,7 @@ fn source() -> p::PhysicalNode {
                     p::UnpivotValueMapping {
                         input: p::ValueId::new(0),
                         constants: Box::from([
-                            p::UnpivotConstant::Scalar(p::ExprId::new(0)),
+                            p::UnpivotConstant::Scalar(RootOrdinal::new(0)),
                             p::UnpivotConstant::Int32List(reference(0, 1)),
                             p::UnpivotConstant::Utf8Map(reference(7, 1)),
                         ]),
@@ -418,7 +461,7 @@ fn source() -> p::PhysicalNode {
                     p::UnpivotValueMapping {
                         input: p::ValueId::new(7),
                         constants: Box::from([
-                            p::UnpivotConstant::Scalar(p::ExprId::new(u32::MAX)),
+                            p::UnpivotConstant::Scalar(RootOrdinal::new(2)),
                             p::UnpivotConstant::Int32List(reference(0, 1)),
                             p::UnpivotConstant::Utf8Map(reference(7, 1)),
                         ]),
@@ -447,7 +490,7 @@ fn expected() -> wire::PhysicalNode {
     let constants = |id| {
         vec![
             wire::UnpivotConstant {
-                kind: Some(wire::unpivot_constant::Kind::ScalarExprId(id)),
+                kind: Some(wire::unpivot_constant::Kind::ScalarRoot(id)),
             },
             wire::UnpivotConstant {
                 kind: Some(wire::unpivot_constant::Kind::Int32List(
@@ -468,6 +511,7 @@ fn expected() -> wire::PhysicalNode {
         ]
     };
     wire::PhysicalNode {
+        expressions: None,
         id: u32::MAX,
         input_node_ids: vec![0],
         required_inputs: vec![expected_property(true)],
@@ -490,7 +534,7 @@ fn expected() -> wire::PhysicalNode {
                 },
                 wire::UnpivotMapping {
                     input_value_id: Some(7),
-                    constants: constants(u32::MAX),
+                    constants: constants(2),
                 },
             ],
             max_output_rows: u64::MAX,
@@ -659,10 +703,10 @@ fn unpivot_scalar_shape_and_special_selected_addresses_fail_without_reauthoring(
     let fixture = Fixture::new();
     let c = Control::default();
     fixture.with_tokens(&c, |values, expressions, read| {
-        for id in [7, 99] {
+        for id in [1, 99] {
             let mut node = source();
             spec_mut(&mut node).mappings[0].constants[0] =
-                p::UnpivotConstant::Scalar(p::ExprId::new(id));
+                p::UnpivotConstant::Scalar(RootOrdinal::new(id));
             c.arm(None);
             assert!(matches!(
                 encode_unpivot_node(&node, values, expressions, SOURCE, limits()),
@@ -670,7 +714,7 @@ fn unpivot_scalar_shape_and_special_selected_addresses_fail_without_reauthoring(
             ));
             let mut wire = expected();
             wire_spec_mut(&mut wire).mappings[0].constants[0].kind =
-                Some(wire::unpivot_constant::Kind::ScalarExprId(id));
+                Some(wire::unpivot_constant::Kind::ScalarRoot(id));
             c.arm(None);
             assert!(matches!(
                 decode_unpivot_node(&wire, read, SOURCE, limits()),
@@ -823,7 +867,7 @@ fn unpivot_all_seven_caps_exact_boundaries_and_actual_wire_capacity_are_gated() 
         }
         let mut wide = source();
         spec_mut(&mut wide).mappings[0].constants =
-            vec![p::UnpivotConstant::Scalar(p::ExprId::new(0)); 320].into_boxed_slice();
+            vec![p::UnpivotConstant::Scalar(RootOrdinal::new(0)); 320].into_boxed_slice();
         let small_work = UnpivotNodeProjectionLimits {
             max_work: 1024,
             ..limits()
@@ -840,7 +884,7 @@ fn unpivot_all_seven_caps_exact_boundaries_and_actual_wire_capacity_are_gated() 
         let mut wide_wire = expected();
         wire_spec_mut(&mut wide_wire).mappings[0].constants = vec![
             wire::UnpivotConstant {
-                kind: Some(wire::unpivot_constant::Kind::ScalarExprId(0))
+                kind: Some(wire::unpivot_constant::Kind::ScalarRoot(0))
             };
             320
         ];
@@ -879,14 +923,14 @@ fn control_case(
             let mut node = expected();
             if ordinary {
                 wire_spec_mut(&mut node).mappings[0].constants[0].kind =
-                    Some(wire::unpivot_constant::Kind::ScalarExprId(7));
+                    Some(wire::unpivot_constant::Kind::ScalarRoot(1));
             }
             decode_unpivot_node(&node, read, SOURCE, limits()).map(|_| ())
         } else {
             let mut node = source();
             if ordinary {
                 spec_mut(&mut node).mappings[0].constants[0] =
-                    p::UnpivotConstant::Scalar(p::ExprId::new(7));
+                    p::UnpivotConstant::Scalar(RootOrdinal::new(1));
             }
             encode_unpivot_node(&node, values, expressions, SOURCE, limits()).map(|_| ())
         }
@@ -914,7 +958,7 @@ fn unpivot_original_control_every_small_success_and_ordinary_prefix_and_real_qua
     let fixture = Fixture::new();
     let c = Control::default();
     fixture.with_tokens(&c,|values,expressions,read|{
-        let mut node=source();spec_mut(&mut node).mappings[0].constants=vec![p::UnpivotConstant::Scalar(p::ExprId::new(0));320].into_boxed_slice();
+        let mut node=source();spec_mut(&mut node).mappings[0].constants=vec![p::UnpivotConstant::Scalar(RootOrdinal::new(0));320].into_boxed_slice();
         c.arm(None);let(wire,_)=encode_unpivot_node(&node,values,expressions,SOURCE,limits()).unwrap();let trace=c.trace();let at=trace.iter().position(|(_,units)|*units==256).expect("actual source kind loop quantum");
         for cause in CAUSES{c.arm(Some((at,cause.clone())));assert!(matches!(encode_unpivot_node(&node,values,expressions,SOURCE,limits()),Err(Error::Control(actual))if actual==cause));assert_eq!(c.trace(),trace[..=at]);}
         c.arm(None);decode_unpivot_node(&wire,read,SOURCE,limits()).unwrap();assert!(c.trace().iter().any(|(_,units)|*units==256));

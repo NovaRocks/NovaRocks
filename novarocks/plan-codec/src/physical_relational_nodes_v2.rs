@@ -25,6 +25,17 @@ pub use crate::physical_node_v2::{
     NodeProjectionLimits as RelationalNodeProjectionLimits,
 };
 use crate::{
+    physical_aggregate_binding_v2::{
+        MaterializedAggregateBindings, copy_aggregate_binding_observed,
+        preflight_aggregate_binding_copy_counts, preflight_aggregate_binding_copy_counts_in,
+        preflight_aggregate_binding_copy_types, preflight_aggregate_binding_copy_types_in,
+    },
+    physical_binding_v2::{
+        BindingProjectionLimits, MaterializationModel, MaterializedFunctionBinding,
+        MaterializedFunctionBindings, copy_scalar_signature_observed,
+        preflight_scalar_signature_copy_counts, preflight_scalar_signature_copy_counts_in,
+        preflight_scalar_signature_copy_types, preflight_scalar_signature_copy_types_in,
+    },
     physical_expression_v2::{DecodedExpressions, EncodedExpressions},
     physical_node_v2::*,
     physical_properties_v2 as properties,
@@ -39,11 +50,11 @@ fn required(id: Option<u32>, w: &mut CompileCheckpoints<'_>) -> Result<u32, Erro
     id.ok_or_else(|| invalid("relational required reference is absent"))
 }
 fn expression_encode(
-    id: p::ExprId,
+    id: novarocks_expression_contract::RootOrdinal,
     e: &EncodedExpressions<'_, '_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let found = e.expression_observed(id.get(), w)?.is_some();
+    let found = e.root_expression_observed(id.get(), w)?.is_some();
     w.step()?;
     if found {
         Ok(())
@@ -58,7 +69,7 @@ fn expression_decode(
     e: &DecodedExpressions<'_, '_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let found = e.definition_observed(id, w)?.is_some();
+    let found = e.root_definition_observed(id, w)?.is_some();
     w.step()?;
     if found {
         Ok(())
@@ -228,11 +239,16 @@ fn wire_partition_capacity(mode: &wire::SortMode) -> Result<usize, Error> {
     }
 }
 /// O(1) root layout/count facts before variable-length counting or lookups.
-type PhysicalHashCondition = p::HashJoinCondition<Box<[p::JoinKey]>, p::ExprId>;
+type PhysicalHashCondition =
+    p::HashJoinCondition<Box<[p::JoinKey]>, novarocks_expression_contract::RootOrdinal>;
 
 fn physical_join_parts(
     condition: &PhysicalHashCondition,
-) -> (&[p::JoinKey], &[p::JoinKey], Option<p::ExprId>) {
+) -> (
+    &[p::JoinKey],
+    &[p::JoinKey],
+    Option<novarocks_expression_contract::RootOrdinal>,
+) {
     (
         condition.keys(),
         condition.scope_keys().map_or(&[][..], |keys| keys.as_ref()),
@@ -259,11 +275,9 @@ type WireJoinParts<'a> = (&'a [wire::JoinKey], &'a [wire::JoinKey], Option<u32>)
 
 fn wire_join_parts(node: &wire::HashJoinNode) -> Result<WireJoinParts<'_>, Error> {
     match node.condition.as_ref() {
-        Some(wire::hash_join_node::Condition::Ordinary(v)) => {
-            Ok((&v.keys, &[], v.residual_expr_id))
-        }
+        Some(wire::hash_join_node::Condition::Ordinary(v)) => Ok((&v.keys, &[], v.residual_root)),
         Some(wire::hash_join_node::Condition::NullAwareEqual(v)) => {
-            Ok((&v.value_equal_keys, &v.scope_keys, v.eligibility_expr_id))
+            Ok((&v.value_equal_keys, &v.scope_keys, v.eligibility_root))
         }
         None => Err(invalid("hash join condition is absent")),
     }
@@ -304,8 +318,8 @@ fn encode_join_keys(
     let mut output = reserve(keys.len(), w)?;
     for key in keys {
         output.push(wire::JoinKey {
-            left_expr_id: Some(key.left.get()),
-            right_expr_id: Some(key.right.get()),
+            left_root: Some(key.left.get()),
+            right_root: Some(key.right.get()),
             null_safe: key.null_safe,
         });
         w.step()?;
@@ -320,8 +334,8 @@ fn decode_join_keys(
     let mut output = reserve(keys.len(), w)?;
     for key in keys {
         output.push(p::JoinKey {
-            left: p::ExprId::new(required(key.left_expr_id, w)?),
-            right: p::ExprId::new(required(key.right_expr_id, w)?),
+            left: novarocks_expression_contract::RootOrdinal::new(required(key.left_root, w)?),
+            right: novarocks_expression_contract::RootOrdinal::new(required(key.right_root, w)?),
             null_safe: key.null_safe,
         });
         w.step()?;
@@ -361,16 +375,13 @@ fn physical_outer(input: &p::PhysicalNode) -> Result<(usize, usize), Error> {
             ))
         }
         p::NodeKind::Window(v) => Ok((
-            add(
-                add(v.partition_by.len(), v.order_by.len())?,
-                v.expressions.len(),
-            )?,
+            add(add(v.partition_by.len(), v.order_by.len())?, v.calls.len())?,
             add(
                 add(
                     bytes::<p::SortExpr>(v.partition_by.len())?,
                     bytes::<p::SortExpr>(v.order_by.len())?,
                 )?,
-                bytes::<p::WindowExpression>(v.expressions.len())?,
+                bytes::<p::WindowCallSpec>(v.calls.len())?,
             )?,
         )),
         p::NodeKind::SetOp { input_mappings, .. } => Ok((
@@ -418,16 +429,13 @@ fn wire_outer(input: &wire::PhysicalNode) -> Result<(usize, usize), Error> {
             ))
         }
         Some(wire::physical_node::Kind::Window(v)) => Ok((
-            add(
-                add(v.partition_by.len(), v.order_by.len())?,
-                v.expressions.len(),
-            )?,
+            add(add(v.partition_by.len(), v.order_by.len())?, v.calls.len())?,
             add(
                 add(
                     bytes::<wire::SortExpression>(v.partition_by.capacity())?,
                     bytes::<wire::SortExpression>(v.order_by.capacity())?,
                 )?,
-                bytes::<wire::ExpressionOutput>(v.expressions.capacity())?,
+                bytes::<wire::WindowCall>(v.calls.capacity())?,
             )?,
         )),
         Some(wire::physical_node::Kind::SetOperation(v)) => Ok((
@@ -544,12 +552,25 @@ fn prepare_encode(
         p::NodeKind::Window(v) => {
             model.request::<wire::SortExpression>(v.partition_by.len(), 1)?;
             model.request::<wire::SortExpression>(v.order_by.len(), 1)?;
-            model.request::<wire::ExpressionOutput>(v.expressions.len(), 1)?;
-            model.refs = add(model.refs, v.expressions.len())?;
-            add(
-                add(v.partition_by.len(), v.order_by.len())?,
-                v.expressions.len(),
-            )?
+            model.request::<wire::WindowCall>(v.calls.len(), 1)?;
+            model.refs = add(model.refs, v.calls.len())?;
+            let mut occurrences = add(v.partition_by.len(), v.order_by.len())?;
+            for call in &v.calls {
+                let nested = add(call.arguments.len(), call.order_by.len())?;
+                model.items = add(model.items, nested)?;
+                occurrences = add(occurrences, nested)?;
+                known = add(
+                    known,
+                    add(
+                        bytes::<novarocks_expression_contract::RootOrdinal>(call.arguments.len())?,
+                        bytes::<p::SortExpr>(call.order_by.len())?,
+                    )?,
+                )?;
+                model.request::<u32>(call.arguments.len(), 1)?;
+                model.request::<wire::SortExpression>(call.order_by.len(), 1)?;
+                w.step()?;
+            }
+            occurrences
         }
         p::NodeKind::SetOp { input_mappings, .. } => {
             model.request::<wire::ValueIds>(input_mappings.len(), 1)?;
@@ -608,7 +629,7 @@ fn prepare_encode(
         gate(&model, known, &mut parent)?;
         w.step()?;
     }
-    let facts = if let Some(admit) = parent {
+    let facts = if let Some(admit) = parent.as_mut() {
         model.facts_in(source, values.count(), l, admit, w)?
     } else {
         model.facts(source, values.count(), l, w)?
@@ -655,9 +676,20 @@ fn prepare_encode(
             for key in v.partition_by.iter().chain(v.order_by.iter()) {
                 expression_encode(key.expr, expressions, w)?;
             }
-            for output in &v.expressions {
-                expression_encode(output.expression, expressions, w)?;
-                reference(output.output.get(), values, w)?;
+            for call in &v.calls {
+                for root in &call.arguments {
+                    expression_encode(*root, expressions, w)?;
+                }
+                for key in &call.order_by {
+                    expression_encode(key.expr, expressions, w)?;
+                }
+                expressions
+                    .functions()
+                    .scalar_source_id_observed(&call.binding, w)?;
+                if let Some(binding) = &call.aggregate_binding {
+                    expressions.aggregates().source_id_observed(binding, w)?;
+                }
+                reference(call.output.get(), values, w)?;
             }
         }
         p::NodeKind::SetOp { input_mappings, .. } => {
@@ -695,11 +727,14 @@ fn validate_sort(
     let nulls = properties::decode_nulls(input.null_ordering);
     w.step()?;
     nulls?;
-    expression_decode(required(input.expr_id, w)?, e, w)
+    expression_decode(required(input.root_ordinal, w)?, e, w)
 }
 fn prepare_decode(
     input: &wire::PhysicalNode,
     expressions: &DecodedExpressions<'_, '_, '_>,
+    functions: &MaterializedFunctionBindings<'_, '_>,
+    aggregates: &MaterializedAggregateBindings<'_, '_, '_>,
+    binding_limits: BindingProjectionLimits,
     source: usize,
     l: RelationalNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
@@ -774,12 +809,12 @@ fn prepare_decode(
             )?
         }
         Some(wire::physical_node::Kind::NestLoopJoin(v)) => {
-            if v.kind == wire::JoinKind::NullAwareLeftAnti as i32 && v.predicate_expr_id.is_none() {
+            if v.kind == wire::JoinKind::NullAwareLeftAnti as i32 && v.predicate_root.is_none() {
                 return Err(invalid("null-aware nested-loop predicate is absent"));
             }
             model.request::<p::ValueId>(v.null_extended_value_ids.len(), 2)?;
             model.refs = add(model.refs, v.null_extended_value_ids.len())?;
-            usize::from(v.predicate_expr_id.is_some())
+            usize::from(v.predicate_root.is_some())
         }
         Some(wire::physical_node::Kind::Sort(v)) => {
             let partition = wire_partitions(
@@ -794,12 +829,31 @@ fn prepare_decode(
         Some(wire::physical_node::Kind::Window(v)) => {
             model.request::<p::SortExpr>(v.partition_by.len(), 2)?;
             model.request::<p::SortExpr>(v.order_by.len(), 2)?;
-            model.request::<p::WindowExpression>(v.expressions.len(), 2)?;
-            model.refs = add(model.refs, v.expressions.len())?;
-            add(
-                add(v.partition_by.len(), v.order_by.len())?,
-                v.expressions.len(),
-            )?
+            model.request::<p::WindowCallSpec>(v.calls.len(), 2)?;
+            model.refs = add(model.refs, v.calls.len())?;
+            let mut occurrences = add(v.partition_by.len(), v.order_by.len())?;
+            for call in &v.calls {
+                let nested = add(call.argument_roots.len(), call.order_by.len())?;
+                model.items = add(model.items, nested)?;
+                occurrences = add(occurrences, nested)?;
+                known = add(
+                    known,
+                    add(
+                        bytes::<u32>(call.argument_roots.capacity())?,
+                        bytes::<wire::SortExpression>(call.order_by.capacity())?,
+                    )?,
+                )?;
+                model.request::<novarocks_expression_contract::RootOrdinal>(
+                    call.argument_roots.len(),
+                    2,
+                )?;
+                model.request::<p::SortExpr>(call.order_by.len(), 2)?;
+                if call.aggregate_binding_id.is_some() {
+                    model.request::<p::AggregateBinding>(1, 1)?;
+                }
+                w.step()?;
+            }
+            occurrences
         }
         Some(wire::physical_node::Kind::SetOperation(v)) => {
             model.request::<Box<[p::ValueId]>>(v.input_mappings.len(), 2)?;
@@ -854,7 +908,7 @@ fn prepare_decode(
         gate(&model, known, &mut parent)?;
         w.step()?;
     }
-    let facts = if let Some(admit) = parent {
+    let facts = if let Some(admit) = parent.as_mut() {
         model.facts_in(source, values.count(), l, admit, w)?
     } else {
         model.facts(source, values.count(), l, w)?
@@ -869,8 +923,8 @@ fn prepare_decode(
             decode_join_distribution(v.distribution, w)?;
             let (keys, scopes, residual) = wire_join_parts(v)?;
             for key in keys.iter().chain(scopes) {
-                expression_decode(required(key.left_expr_id, w)?, expressions, w)?;
-                expression_decode(required(key.right_expr_id, w)?, expressions, w)?;
+                expression_decode(required(key.left_root, w)?, expressions, w)?;
+                expression_decode(required(key.right_root, w)?, expressions, w)?;
             }
             if let Some(residual) = residual {
                 expression_decode(residual, expressions, w)?;
@@ -882,7 +936,7 @@ fn prepare_decode(
         Some(wire::physical_node::Kind::NestLoopJoin(v)) => {
             decode_join_kind(v.kind, w)?;
             decode_nest_distribution(v.distribution, w)?;
-            if let Some(predicate) = v.predicate_expr_id {
+            if let Some(predicate) = v.predicate_root {
                 expression_decode(predicate, expressions, w)?;
             }
             for id in &v.null_extended_value_ids {
@@ -905,9 +959,17 @@ fn prepare_decode(
             for key in v.partition_by.iter().chain(v.order_by.iter()) {
                 validate_sort(key, expressions, w)?;
             }
-            for output in &v.expressions {
-                expression_decode(required(output.expr_id, w)?, expressions, w)?;
-                reference(required(output.value_id, w)?, values, w)?;
+            for call in &v.calls {
+                for root in &call.argument_roots {
+                    expression_decode(*root, expressions, w)?;
+                }
+                for key in &call.order_by {
+                    validate_sort(key, expressions, w)?;
+                }
+                reference(required(call.output_value_id, w)?, values, w)?;
+                if let Some(frame) = &call.frame {
+                    crate::physical_expression_v2::decode_window_frame(frame)?;
+                }
             }
         }
         Some(wire::physical_node::Kind::SetOperation(v)) => {
@@ -935,8 +997,154 @@ fn prepare_decode(
     {
         wire_property_refs(property, values, w)?;
     }
+    if let Some(wire::physical_node::Kind::Window(window)) = &input.kind {
+        if let Some(parent) = parent {
+            // Reborrow the same callback for this one nested synchronous loan.
+            // It creates no checkpoint, invoice, retained token or authority.
+            let mut forward = |facts: &NodeProjectionFacts| parent(facts);
+            return window_copy_facts(
+                window,
+                expressions,
+                functions,
+                aggregates,
+                WindowCopyProjection {
+                    model,
+                    source,
+                    dependency: known,
+                    limits: l,
+                },
+                binding_limits,
+                Some(&mut forward),
+                w,
+            );
+        }
+        return window_copy_facts(
+            window,
+            expressions,
+            functions,
+            aggregates,
+            WindowCopyProjection {
+                model,
+                source,
+                dependency: known,
+                limits: l,
+            },
+            binding_limits,
+            None,
+            w,
+        );
+    }
     Ok(facts)
 }
+/// Admit every signature container across the real Window group before any
+/// deep type walk. Delegated prefixes retain the containing node's sole gate.
+struct WindowCopyProjection {
+    model: Model,
+    source: usize,
+    dependency: usize,
+    limits: NodeProjectionLimits,
+}
+fn window_copy_facts<'parent>(
+    window: &wire::WindowNode,
+    expressions: &DecodedExpressions<'_, '_, '_>,
+    functions: &MaterializedFunctionBindings<'_, '_>,
+    aggregates: &MaterializedAggregateBindings<'_, '_, '_>,
+    projection: WindowCopyProjection,
+    binding_limits: BindingProjectionLimits,
+    parent: Option<&'parent mut NodeAdmit<'parent>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<NodeProjectionFacts, Error> {
+    let WindowCopyProjection {
+        model,
+        source,
+        dependency,
+        limits,
+    } = projection;
+    let observed = parent.is_some();
+    let mut child = MaterializationModel::for_composition(
+        window.calls.len(),
+        expressions.lookup_work_upper_bound()?,
+        source,
+        dependency,
+    );
+    match parent {
+        Some(parent) => child.compose_in_node_in(
+            model,
+            expressions.values().count(),
+            limits,
+            binding_limits,
+            parent,
+        )?,
+        None => {
+            child.compose_in_node(model, expressions.values().count(), limits, binding_limits)?
+        }
+    }
+    for call in &window.calls {
+        let binding = window_binding(functions, required(call.function_binding_id, work)?, work)?;
+        if observed {
+            preflight_scalar_signature_copy_counts_in(
+                binding,
+                &mut child,
+                binding_limits,
+                &mut |_| Ok(()),
+                work,
+            )?;
+        } else {
+            preflight_scalar_signature_copy_counts(binding, &mut child, binding_limits, work)?;
+        }
+        if let Some(id) = call.aggregate_binding_id {
+            let binding = aggregates
+                .definition_observed(id, work)?
+                .ok_or_else(|| invalid("window aggregate binding is absent"))?;
+            if observed {
+                preflight_aggregate_binding_copy_counts_in(
+                    binding,
+                    &mut child,
+                    binding_limits,
+                    &mut |_| Ok(()),
+                    work,
+                )?;
+            } else {
+                preflight_aggregate_binding_copy_counts(binding, &mut child, binding_limits, work)?;
+            }
+        }
+        work.step()?;
+    }
+    child.node_facts(0, work)?;
+    for call in &window.calls {
+        let binding = window_binding(functions, required(call.function_binding_id, work)?, work)?;
+        if observed {
+            preflight_scalar_signature_copy_types_in(
+                binding,
+                &mut child,
+                binding_limits,
+                &mut |_| Ok(()),
+                work,
+            )?;
+        } else {
+            preflight_scalar_signature_copy_types(binding, &mut child, binding_limits, work)?;
+        }
+        if let Some(id) = call.aggregate_binding_id {
+            let binding = aggregates
+                .definition_observed(id, work)?
+                .ok_or_else(|| invalid("window aggregate binding is absent"))?;
+            if observed {
+                preflight_aggregate_binding_copy_types_in(
+                    binding,
+                    &mut child,
+                    binding_limits,
+                    &mut |_| Ok(()),
+                    work,
+                )?;
+            } else {
+                preflight_aggregate_binding_copy_types(binding, &mut child, binding_limits, work)?;
+            }
+        }
+        work.step()?;
+    }
+    Ok(child.node_facts(mul(2, child.facts.cumulative_work_upper_bound)?, work)?)
+}
+
 pub(crate) fn encode_sorts(
     input: &[p::SortExpr],
     w: &mut CompileCheckpoints<'_>,
@@ -944,7 +1152,7 @@ pub(crate) fn encode_sorts(
     let mut output = reserve(input.len(), w)?;
     for key in input {
         output.push(wire::SortExpression {
-            expr_id: Some(key.expr.get()),
+            root_ordinal: Some(key.expr.get()),
             direction: properties::encode_direction(key.direction),
             null_ordering: properties::encode_nulls(key.null_ordering),
         });
@@ -959,7 +1167,7 @@ pub(crate) fn decode_sorts(
     let mut output = reserve(input.len(), w)?;
     for key in input {
         output.push(p::SortExpr {
-            expr: p::ExprId::new(required(key.expr_id, w)?),
+            expr: novarocks_expression_contract::RootOrdinal::new(required(key.root_ordinal, w)?),
             direction: properties::decode_direction(key.direction)?,
             null_ordering: properties::decode_nulls(key.null_ordering)?,
         });
@@ -1012,6 +1220,7 @@ fn decode_sort_mode(
 }
 fn emit_encode(
     input: &p::PhysicalNode,
+    expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
     l: RelationalNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
@@ -1029,7 +1238,8 @@ fn emit_encode(
                 p::HashJoinCondition::Ordinary { keys, residual } => {
                     wire::hash_join_node::Condition::Ordinary(wire::OrdinaryHashJoinCondition {
                         keys: encode_join_keys(keys, w)?,
-                        residual_expr_id: residual.map(p::ExprId::get),
+                        residual_root: residual
+                            .map(novarocks_expression_contract::RootOrdinal::get),
                     })
                 }
                 p::HashJoinCondition::NullAwareEqual {
@@ -1040,7 +1250,8 @@ fn emit_encode(
                     wire::NullAwareEqualHashJoinCondition {
                         value_equal_keys: encode_join_keys(value_equal_keys, w)?,
                         scope_keys: encode_join_keys(scope_keys, w)?,
-                        eligibility_expr_id: eligibility.map(p::ExprId::get),
+                        eligibility_root: eligibility
+                            .map(novarocks_expression_contract::RootOrdinal::get),
                     },
                 ),
             };
@@ -1060,7 +1271,7 @@ fn emit_encode(
         } => wire::physical_node::Kind::NestLoopJoin(wire::NestLoopJoinNode {
             kind: encode_join_kind(*kind),
             distribution: encode_nest_distribution(*distribution),
-            predicate_expr_id: predicate.map(p::ExprId::get),
+            predicate_root: predicate.map(novarocks_expression_contract::RootOrdinal::get),
             null_extended_value_ids: encode_ids(null_extended, w)?,
         }),
         p::NodeKind::Sort { order_by, mode } => wire::physical_node::Kind::Sort(wire::SortNode {
@@ -1068,18 +1279,41 @@ fn emit_encode(
             mode: Some(encode_sort_mode(mode, w)?),
         }),
         p::NodeKind::Window(v) => {
-            let mut outputs = reserve(v.expressions.len(), w)?;
-            for expression in &v.expressions {
-                outputs.push(wire::ExpressionOutput {
-                    expr_id: Some(expression.expression.get()),
-                    value_id: Some(expression.output.get()),
+            let mut outputs = reserve(v.calls.len(), w)?;
+            for call in &v.calls {
+                let mut argument_roots = reserve(call.arguments.len(), w)?;
+                for root in &call.arguments {
+                    argument_roots.push(root.get());
+                    w.step()?;
+                }
+                outputs.push(wire::WindowCall {
+                    function_binding_id: Some(
+                        expressions
+                            .functions()
+                            .scalar_source_id_observed(&call.binding, w)?,
+                    ),
+                    aggregate_binding_id: call
+                        .aggregate_binding
+                        .as_ref()
+                        .map(|binding| expressions.aggregates().source_id_observed(binding, w))
+                        .transpose()?,
+                    distinct: call.distinct,
+                    argument_roots,
+                    order_by: encode_sorts(&call.order_by, w)?,
+                    frame: call
+                        .frame
+                        .as_ref()
+                        .map(|frame| crate::physical_expression_v2::encode_window_frame(frame, w))
+                        .transpose()?,
+                    ignore_nulls: call.ignore_nulls,
+                    output_value_id: Some(call.output.get()),
                 });
                 w.step()?;
             }
             wire::physical_node::Kind::Window(wire::WindowNode {
                 partition_by: encode_sorts(&v.partition_by, w)?,
                 order_by: encode_sorts(&v.order_by, w)?,
-                expressions: outputs,
+                calls: outputs,
             })
         }
         p::NodeKind::SetOp {
@@ -1120,6 +1354,7 @@ fn emit_encode(
     };
     w.step()?;
     Ok(wire::PhysicalNode {
+        expressions: None,
         id: input.id.get(),
         input_node_ids: inputs,
         required_inputs,
@@ -1128,8 +1363,20 @@ fn emit_encode(
         kind: Some(kind),
     })
 }
+fn window_binding<'a>(
+    functions: &'a MaterializedFunctionBindings<'_, '_>,
+    id: u32,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<&'a novarocks_expression_contract::BoundFunction, Error> {
+    match functions.definition_observed(id, work)? {
+        Some(MaterializedFunctionBinding::Scalar(binding)) => Ok(binding),
+        _ => Err(invalid("window scalar-result binding is absent")),
+    }
+}
 fn emit_decode(
     input: &wire::PhysicalNode,
+    functions: &MaterializedFunctionBindings<'_, '_>,
+    aggregates: &MaterializedAggregateBindings<'_, '_, '_>,
     source: usize,
     l: RelationalNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
@@ -1141,14 +1388,18 @@ fn emit_decode(
                 Some(wire::hash_join_node::Condition::Ordinary(v)) => {
                     p::HashJoinCondition::Ordinary {
                         keys: decode_join_keys(&v.keys, w)?,
-                        residual: v.residual_expr_id.map(p::ExprId::new),
+                        residual: v
+                            .residual_root
+                            .map(novarocks_expression_contract::RootOrdinal::new),
                     }
                 }
                 Some(wire::hash_join_node::Condition::NullAwareEqual(v)) => {
                     p::HashJoinCondition::NullAwareEqual {
                         value_equal_keys: decode_join_keys(&v.value_equal_keys, w)?,
                         scope_keys: decode_join_keys(&v.scope_keys, w)?,
-                        eligibility: v.eligibility_expr_id.map(p::ExprId::new),
+                        eligibility: v
+                            .eligibility_root
+                            .map(novarocks_expression_contract::RootOrdinal::new),
                     }
                 }
                 None => return Err(invalid("hash join condition is absent")),
@@ -1164,7 +1415,9 @@ fn emit_decode(
         Some(wire::physical_node::Kind::NestLoopJoin(v)) => p::NodeKind::NestLoopJoin {
             kind: decode_join_kind(v.kind, w)?,
             distribution: decode_nest_distribution(v.distribution, w)?,
-            predicate: v.predicate_expr_id.map(p::ExprId::new),
+            predicate: v
+                .predicate_root
+                .map(novarocks_expression_contract::RootOrdinal::new),
             null_extended: decode_ids(&v.null_extended_value_ids, w)?,
         },
         Some(wire::physical_node::Kind::Sort(v)) => p::NodeKind::Sort {
@@ -1177,18 +1430,46 @@ fn emit_decode(
             )?,
         },
         Some(wire::physical_node::Kind::Window(v)) => {
-            let mut outputs = reserve(v.expressions.len(), w)?;
-            for output in &v.expressions {
-                outputs.push(p::WindowExpression {
-                    expression: p::ExprId::new(required(output.expr_id, w)?),
-                    output: p::ValueId::new(required(output.value_id, w)?),
+            let mut outputs = reserve(v.calls.len(), w)?;
+            for call in &v.calls {
+                let mut arguments = reserve(call.argument_roots.len(), w)?;
+                for root in &call.argument_roots {
+                    arguments.push(novarocks_expression_contract::RootOrdinal::new(*root));
+                    w.step()?;
+                }
+                let binding = window_binding(functions, required(call.function_binding_id, w)?, w)?;
+                outputs.push(p::WindowCallSpec {
+                    binding: copy_scalar_signature_observed(binding, w)?,
+                    distinct: call.distinct,
+                    arguments: boxed(arguments, w)?,
+                    order_by: decode_sorts(&call.order_by, w)?,
+                    frame: call
+                        .frame
+                        .as_ref()
+                        .map(crate::physical_expression_v2::decode_window_frame)
+                        .transpose()?,
+                    ignore_nulls: call.ignore_nulls,
+                    aggregate_binding: call
+                        .aggregate_binding_id
+                        .map(|id| -> Result<_, Error> {
+                            let binding = aggregates
+                                .definition_observed(id, w)?
+                                .ok_or_else(|| invalid("window aggregate binding is absent"))?;
+                            w.flush()?;
+                            let copied = Box::new(copy_aggregate_binding_observed(binding, w)?);
+                            w.step()?;
+                            w.flush()?;
+                            Ok(copied)
+                        })
+                        .transpose()?,
+                    output: p::ValueId::new(required(call.output_value_id, w)?),
                 });
                 w.step()?;
             }
             p::NodeKind::Window(p::WindowSpec {
                 partition_by: decode_sorts(&v.partition_by, w)?,
                 order_by: decode_sorts(&v.order_by, w)?,
-                expressions: boxed(outputs, w)?,
+                calls: boxed(outputs, w)?,
             })
         }
         Some(wire::physical_node::Kind::SetOperation(v)) => {
@@ -1220,6 +1501,7 @@ fn emit_decode(
     };
     w.step()?;
     Ok(p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(input.id),
         inputs,
         required_inputs,
@@ -1250,8 +1532,14 @@ impl PreparedRelationalNodeEncode<'_, '_, '_, '_, '_> {
             self.values.original_control(),
             self.expressions.original_control()
         ));
-        let result = emit_encode(self.input, self.source, self.limits, &mut work)
-            .map(|node| (node, self.facts));
+        let result = emit_encode(
+            self.input,
+            self.expressions,
+            self.source,
+            self.limits,
+            &mut work,
+        )
+        .map(|node| (node, self.facts));
         finish(work, result)
     }
 
@@ -1267,7 +1555,7 @@ impl PreparedRelationalNodeEncode<'_, '_, '_, '_, '_> {
             ));
         }
         admit(&self.facts)?;
-        let node = emit_encode(self.input, self.source, self.limits, work)?;
+        let node = emit_encode(self.input, self.expressions, self.source, self.limits, work)?;
         Ok((node, self.facts))
     }
 }
@@ -1335,6 +1623,8 @@ pub fn prepare_relational_node_encode_in<'node, 'namespace, 'loan, 'source, 'con
 pub struct PreparedRelationalNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
+    functions: &'namespace MaterializedFunctionBindings<'loan, 'wire>,
+    aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
     source: usize,
     limits: RelationalNodeProjectionLimits,
     facts: RelationalNodeProjectionFacts,
@@ -1346,8 +1636,15 @@ impl PreparedRelationalNodeDecode<'_, '_, '_, '_, '_> {
     pub fn emit(self) -> Result<(p::PhysicalNode, RelationalNodeProjectionFacts), Error> {
         let mut work =
             CompileCheckpoints::try_new(self.expressions.original_control(), CompilePhase::Decode)?;
-        let result = emit_decode(self.input, self.source, self.limits, &mut work)
-            .map(|node| (node, self.facts));
+        let result = emit_decode(
+            self.input,
+            self.functions,
+            self.aggregates,
+            self.source,
+            self.limits,
+            &mut work,
+        )
+        .map(|node| (node, self.facts));
         finish(work, result)
     }
 
@@ -1363,13 +1660,23 @@ impl PreparedRelationalNodeDecode<'_, '_, '_, '_, '_> {
             ));
         }
         admit(&self.facts)?;
-        let node = emit_decode(self.input, self.source, self.limits, work)?;
+        let node = emit_decode(
+            self.input,
+            self.functions,
+            self.aggregates,
+            self.source,
+            self.limits,
+            work,
+        )?;
         Ok((node, self.facts))
     }
 }
 pub fn prepare_relational_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
+    functions: &'namespace MaterializedFunctionBindings<'loan, 'wire>,
+    aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
+    binding_limits: BindingProjectionLimits,
     source_retained_bytes: usize,
     limits: RelationalNodeProjectionLimits,
 ) -> Result<PreparedRelationalNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
@@ -1378,6 +1685,9 @@ pub fn prepare_relational_node_decode<'node, 'namespace, 'loan, 'wire, 'control>
     let result = prepare_decode(
         input,
         expressions,
+        functions,
+        aggregates,
+        binding_limits,
         source_retained_bytes,
         limits,
         &mut work,
@@ -1387,6 +1697,8 @@ pub fn prepare_relational_node_decode<'node, 'namespace, 'loan, 'wire, 'control>
     Ok(PreparedRelationalNodeDecode {
         input,
         expressions,
+        functions,
+        aggregates,
         source: source_retained_bytes,
         limits,
         facts,
@@ -1396,6 +1708,9 @@ pub fn prepare_relational_node_decode<'node, 'namespace, 'loan, 'wire, 'control>
 pub fn prepare_relational_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
+    functions: &'namespace MaterializedFunctionBindings<'loan, 'wire>,
+    aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
+    binding_limits: BindingProjectionLimits,
     source_retained_bytes: usize,
     limits: RelationalNodeProjectionLimits,
     admit: &mut NodeAdmit<'_>,
@@ -1409,6 +1724,9 @@ pub fn prepare_relational_node_decode_in<'node, 'namespace, 'loan, 'wire, 'contr
     let facts = prepare_decode(
         input,
         expressions,
+        functions,
+        aggregates,
+        binding_limits,
         source_retained_bytes,
         limits,
         work,
@@ -1417,6 +1735,8 @@ pub fn prepare_relational_node_decode_in<'node, 'namespace, 'loan, 'wire, 'contr
     Ok(PreparedRelationalNodeDecode {
         input,
         expressions,
+        functions,
+        aggregates,
         source: source_retained_bytes,
         limits,
         facts,
@@ -1441,7 +1761,7 @@ pub fn encode_relational_node(
             &mut work,
             None,
         )?;
-        let node = emit_encode(input, source_retained_bytes, limits, &mut work)?;
+        let node = emit_encode(input, expressions, source_retained_bytes, limits, &mut work)?;
         Ok((node, facts))
     })();
     finish(work, result)
@@ -1449,6 +1769,9 @@ pub fn encode_relational_node(
 pub fn decode_relational_node(
     input: &wire::PhysicalNode,
     expressions: &DecodedExpressions<'_, '_, '_>,
+    functions: &MaterializedFunctionBindings<'_, '_>,
+    aggregates: &MaterializedAggregateBindings<'_, '_, '_>,
+    binding_limits: BindingProjectionLimits,
     source_retained_bytes: usize,
     limits: RelationalNodeProjectionLimits,
 ) -> Result<(p::PhysicalNode, RelationalNodeProjectionFacts), Error> {
@@ -1458,12 +1781,22 @@ pub fn decode_relational_node(
         let facts = prepare_decode(
             input,
             expressions,
+            functions,
+            aggregates,
+            binding_limits,
             source_retained_bytes,
             limits,
             &mut work,
             None,
         )?;
-        let node = emit_decode(input, source_retained_bytes, limits, &mut work)?;
+        let node = emit_decode(
+            input,
+            functions,
+            aggregates,
+            source_retained_bytes,
+            limits,
+            &mut work,
+        )?;
         Ok((node, facts))
     })();
     finish(work, result)

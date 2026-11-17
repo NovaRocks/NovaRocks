@@ -533,7 +533,9 @@ fn materialization_wide_actual_argument_loop_has_256_unit_sample() {
 fn composition_requests_admit_temporary_layout_work_without_inventing_retained_backing() {
     let mut model = Model::for_composition(2, 0, 1000, 1000);
     model.request::<u32>(4, 2).unwrap();
-    model.temporary_request::<u64>(3, 1).unwrap();
+    model
+        .request_layouts(Layout::array::<u64>(3).unwrap(), 1)
+        .unwrap();
     model
         .request_layouts(Layout::from_size_align(64, 8).unwrap(), 3)
         .unwrap();
@@ -589,8 +591,12 @@ fn composition_requests_admit_temporary_layout_work_without_inventing_retained_b
 #[test]
 fn composition_empty_and_overflow_requests_preserve_typed_refusal() {
     let mut model = Model::for_composition(0, 0, 1000, 1000);
-    model.temporary_request::<u8>(0, 2).unwrap();
-    model.temporary_request::<()>(usize::MAX, 2).unwrap();
+    model
+        .request_layouts(Layout::array::<u8>(0).unwrap(), 2)
+        .unwrap();
+    model
+        .request_layouts(Layout::array::<()>(usize::MAX).unwrap(), 2)
+        .unwrap();
     model
         .request_layouts(Layout::new::<()>(), usize::MAX)
         .unwrap();

@@ -231,7 +231,9 @@ impl FailureProjection for crate::physical_expression_v2::ExpressionCodecError {
             Self::Binding(source) => source.failure_fact(),
             Self::Value(source) => source.failure_fact(),
             Self::Constant(source) => source.failure_fact(),
-            Self::Arena(source) => source.failure_fact(),
+            Self::Unit(source) => source.failure_fact(),
+            Self::ConstructedUnit(source) => source.failure_fact(),
+            Self::UnitResource(source) => source.failure_fact(),
             Self::InvalidShape(_) => CodecReason::ExpressionShape.fact(FailureClass::Data),
         }
     }
@@ -259,7 +261,7 @@ impl FailureProjection for crate::physical_control_v2::ControlCodecError {
         match self {
             Self::Control(source) => source.failure_fact(),
             Self::Flow(source) => source.failure_fact(),
-            Self::Roots(source) => source.failure_fact(),
+            Self::Resource(source) => source.failure_fact(),
             Self::InvalidShape(_) => CodecReason::ControlShape.fact(FailureClass::Data),
         }
     }

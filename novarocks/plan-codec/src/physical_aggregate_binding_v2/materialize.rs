@@ -32,7 +32,7 @@ use crate::{
     physical_type_v2::{DecodedTypeTable, clone_value_type_observed},
     physical_value_origin_v2::decode_phase_with,
 };
-use novarocks_physical_plan::BoundFunction;
+use novarocks_expression_contract::BoundFunction;
 use novarocks_type_contract::{
     AggregateStateFormatId, CompileCheckpoints, CompileControlError, CompilePhase, FunctionKind,
     FunctionValueType, PureCompileControl,

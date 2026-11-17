@@ -25,7 +25,7 @@ fn run_owned(
     limits: Limits,
     c: &Control,
     snapshots: &mut Vec<Facts>,
-) -> Result<Vec<(PhysicalCallDefinition, PhysicalCallRequest)>, E> {
+) -> Result<Vec<(PhysicalCallSite, PhysicalCallRequest)>, E> {
     let mut work = CompileCheckpoints::try_new(c, CompilePhase::Decode)?;
     let result = (|| {
         let mut admit = |facts: &Facts| {
@@ -88,14 +88,8 @@ fn caller_request_receiver_retains_original_none_null_lambda_constraint_and_spar
     )
     .unwrap();
     assert_eq!(output.len(), 2);
-    assert_eq!(
-        output[0].0,
-        PhysicalCallDefinition::Expression(ExprId::new(u32::MAX))
-    );
-    assert_eq!(
-        output[1].0,
-        PhysicalCallDefinition::Expression(ExprId::new(0))
-    );
+    assert_eq!(output[0].0, window_site(u32::MAX));
+    assert_eq!(output[1].0, window_site(0));
     let request = &output[0].1;
     assert_eq!(request.logical_argument_count, 2);
     assert_eq!(
@@ -194,8 +188,8 @@ fn caller_request_receiver_final_facts_replay_all_six_axes_and_dictionary_layout
     // One index/output Vec, argument Vec->Box, Lambda Vec->Box and its
     // guarded collection Arc. The normalized FVT owners are cheap clones.
     assert_eq!(final_facts.allocation_requests_upper_bound, 7);
-    let expected = Layout::array::<PhysicalCallDefinition>(1).unwrap().size()
-        + Layout::array::<(PhysicalCallDefinition, PhysicalCallRequest)>(1)
+    let expected = Layout::array::<PhysicalCallSite>(1).unwrap().size()
+        + Layout::array::<(PhysicalCallSite, PhysicalCallRequest)>(1)
             .unwrap()
             .size()
         + 2 * Layout::array::<StaticFunctionArgument>(3).unwrap().size()
@@ -303,6 +297,7 @@ fn caller_request_receiver_root_and_captured_dictionary_numeric_refusal_precedes
             pools: 0,
             raw_work: 0,
             peak_work: 0,
+            output_map_work: 0,
         };
         let mut l = limits();
         l.max_request_bytes = 0;
@@ -377,7 +372,9 @@ fn caller_request_receiver_every_success_and_original_ordinary_callback_has_prim
             1 => assert!(matches!(
                 ordinary,
                 Err(E::Constant(
-                    novarocks_physical_plan::ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::MissingPool(_))
+                    novarocks_physical_plan::ConstantReferenceError::Table(
+                        novarocks_constant_contract::ConstantTableError::MissingPool(_)
+                    )
                 ))
             )),
             2 => assert!(matches!(
@@ -389,7 +386,9 @@ fn caller_request_receiver_every_success_and_original_ordinary_callback_has_prim
             _ => assert!(matches!(
                 ordinary,
                 Err(E::Constant(
-                    novarocks_physical_plan::ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(_))
+                    novarocks_physical_plan::ConstantReferenceError::Table(
+                        novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(_)
+                    )
                 ))
             )),
         }
@@ -446,10 +445,7 @@ fn caller_request_receiver_wide_actual_index_quantum_and_complete_emit_admission
     let output = run_owned(&s, &t, &p, SOURCE, limits(), &c, &mut snapshots).unwrap();
     assert_eq!(output.len(), 320);
     for (actual, expected) in output.iter().zip((0..320).rev()) {
-        assert_eq!(
-            actual.0,
-            PhysicalCallDefinition::Expression(ExprId::new(expected))
-        );
+        assert_eq!(actual.0, window_site(expected));
         assert!(actual.1.arguments.is_empty());
     }
     let baseline = c.trace.lock().unwrap().clone();

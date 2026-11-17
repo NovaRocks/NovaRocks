@@ -25,7 +25,6 @@ use novarocks_type_contract::{
 pub struct ControlProjectionLimits {
     pub max_regions: usize,
     pub max_use_references: usize,
-    pub max_root_bindings: usize,
     pub max_allocation_requests: usize,
     pub max_allocation_request_bytes: usize,
     pub max_coexisting_source_and_request_bytes: usize,
@@ -35,40 +34,53 @@ pub struct ControlProjectionLimits {
 pub struct ControlProjectionFacts {
     pub region_count: usize,
     pub use_reference_count: usize,
-    pub root_binding_count: usize,
     pub allocation_requests_upper_bound: usize,
     pub allocation_request_bytes_upper_bound: usize,
     pub coexisting_source_and_request_bytes_upper_bound: usize,
     pub cumulative_work_upper_bound: usize,
 }
 pub(super) struct Model {
-    pub counts: [usize; 3],
+    pub counts: [usize; 2],
     pub resources: ControlResourceCounter,
     pub future: ControlOwnedResourceFacts,
     pub planned_child: ControlOwnedResourceFacts,
     source: usize,
     limits: Option<ControlProjectionLimits>,
+    input_source: bool,
 }
 impl Model {
-    pub fn new(d: usize, u: usize, r: usize, b: usize, l: ControlProjectionLimits) -> Self {
+    pub fn new(d: usize, u: usize, b: usize, l: ControlProjectionLimits) -> Self {
         Self {
-            counts: [d, u, r],
+            counts: [d, u],
             resources: ControlResourceCounter::default(),
             future: ControlOwnedResourceFacts::default(),
             planned_child: ControlOwnedResourceFacts::default(),
             source: b,
             limits: Some(l),
+            input_source: false,
         }
     }
-    pub fn input_derived(d: usize, u: usize, r: usize, b: usize) -> Self {
+    pub fn input_derived(d: usize, u: usize, b: usize) -> Self {
         Self {
-            counts: [d, u, r],
+            counts: [d, u],
             resources: ControlResourceCounter::default(),
             future: ControlOwnedResourceFacts::default(),
             planned_child: ControlOwnedResourceFacts::default(),
             source: b,
             limits: None,
+            input_source: false,
         }
+    }
+    /// The pure convenience API owns no caller invoice. Its existing input
+    /// walk derives only real DTO header/Vec backing, never a fabricated MAX.
+    pub fn infer_input_source(&mut self) {
+        self.input_source = true;
+    }
+    pub fn receiving_floor(&mut self, known: usize) -> Result<(), ControlCodecError> {
+        if self.input_source {
+            self.source = self.source.max(known);
+        }
+        self.floor(known)
     }
     pub fn facts_with(
         &self,
@@ -94,7 +106,6 @@ impl Model {
         Ok(ControlProjectionFacts {
             region_count: self.counts[0],
             use_reference_count: self.counts[1],
-            root_binding_count: self.counts[2],
             allocation_requests_upper_bound: f.allocation_requests_upper_bound,
             allocation_request_bytes_upper_bound: f.allocation_request_bytes_upper_bound,
             coexisting_source_and_request_bytes_upper_bound: control_resource_add(
@@ -114,7 +125,6 @@ impl Model {
         };
         if f.region_count > l.max_regions
             || f.use_reference_count > l.max_use_references
-            || f.root_binding_count > l.max_root_bindings
             || f.allocation_requests_upper_bound > l.max_allocation_requests
             || f.allocation_request_bytes_upper_bound > l.max_allocation_request_bytes
             || f.coexisting_source_and_request_bytes_upper_bound
@@ -153,7 +163,6 @@ pub(super) fn unbounded() -> ControlProjectionLimits {
     ControlProjectionLimits {
         max_regions: usize::MAX,
         max_use_references: usize::MAX,
-        max_root_bindings: usize::MAX,
         max_allocation_requests: usize::MAX,
         max_allocation_request_bytes: usize::MAX,
         max_coexisting_source_and_request_bytes: usize::MAX,

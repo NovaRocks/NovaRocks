@@ -18,7 +18,7 @@
 use super::*;
 use crate::physical_binding_v2::finish;
 use arrow::datatypes::{DataType, Field};
-use novarocks_physical_plan::LegacyBindingMetadata;
+use novarocks_expression_contract::LegacyBindingMetadata;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionArgumentEvaluation, FunctionFailureBehavior,
     FunctionIntrinsicRowError, FunctionVolatility, PureCompileControl, ValueLogicalType,

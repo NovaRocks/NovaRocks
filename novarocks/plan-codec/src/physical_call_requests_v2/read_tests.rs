@@ -154,10 +154,18 @@ fn zero_policy() -> wire::SourceConstantPolicy {
         max_library_validation_bytes: Some(0),
     }
 }
-fn expression(id: u32) -> wire::CallRequestDefinition {
+// This component fixture declares real relation addresses. It is not a
+// published Fragment or a scalar unit; those closures have separate owners.
+fn window_site(id: u32) -> PhysicalCallSite {
+    PhysicalCallSite::Window {
+        node: novarocks_physical_plan::NodeId::new(id),
+        call: 0,
+    }
+}
+fn window_definition(id: u32) -> wire::CallRequestDefinition {
     wire::CallRequestDefinition {
-        kind: Some(wire::call_request_definition::Kind::ExpressionDefinitionId(
-            id,
+        kind: Some(wire::call_request_definition::Kind::Relational(
+            crate::physical_semantics_v2::encode_call_site(window_site(id)),
         )),
     }
 }
@@ -176,7 +184,7 @@ fn value_argument(
 }
 fn request(id: u32) -> wire::OriginalCallRequest {
     wire::OriginalCallRequest {
-        definition: Some(expression(id)),
+        definition: Some(window_definition(id)),
         arguments: vec![],
         logical_argument_count: Some(0),
         expected_result_value_type_id: None,
@@ -216,7 +224,7 @@ fn execute(
     invoice: usize,
     l: Limits,
     c: &dyn PureCompileControl,
-) -> Result<Vec<(PhysicalCallDefinition, PhysicalCallRequest)>, E> {
+) -> Result<Vec<(PhysicalCallSite, PhysicalCallRequest)>, E> {
     decode_call_requests(prepare_call_requests_decode(
         source, types, pools, invoice, l, c,
     )?)
@@ -260,10 +268,7 @@ fn original_request_decode_requires_present_table_count_and_all_ten_policy_field
         entries: vec![request(0)],
     };
     let decoded = execute(Some(&valid), &t, &p, SOURCE, limits(), &Control::default()).unwrap();
-    assert_eq!(
-        decoded[0].0,
-        PhysicalCallDefinition::Expression(ExprId::new(0))
-    );
+    assert_eq!(decoded[0].0, window_site(0));
     assert_eq!(decoded[0].1.logical_argument_count, 0);
     assert!(decoded[0].1.expected_result_type.is_none());
     assert_eq!(decoded[0].1.constant_policy.max_rows, 0);
@@ -323,6 +328,10 @@ fn original_request_decode_keeps_sparse_definition_namespace_relational_order_an
     let t = types();
     let p = ConstantPools::empty();
     let sites = [
+        PhysicalCallSite::Window {
+            node: novarocks_physical_plan::NodeId::new(7),
+            call: u32::MAX,
+        },
         PhysicalCallSite::Aggregate {
             node: novarocks_physical_plan::NodeId::new(u32::MAX),
             call: 0,
@@ -356,16 +365,10 @@ fn original_request_decode_keeps_sparse_definition_namespace_relational_order_an
         source.entries.push(e);
     }
     let output = execute(Some(&source), &t, &p, SOURCE, limits(), &Control::default()).unwrap();
-    assert_eq!(
-        output[0].0,
-        PhysicalCallDefinition::Expression(ExprId::new(u32::MAX))
-    );
-    assert_eq!(
-        output[1].0,
-        PhysicalCallDefinition::Expression(ExprId::new(0))
-    );
+    assert_eq!(output[0].0, window_site(u32::MAX));
+    assert_eq!(output[1].0, window_site(0));
     for (entry, site) in output[2..].iter().zip(sites) {
-        assert_eq!(entry.0, PhysicalCallDefinition::Relational(site));
+        assert_eq!(entry.0, site);
     }
     let mut duplicate = source.clone();
     duplicate.entries.push(source.entries[0].clone());
@@ -383,21 +386,53 @@ fn original_request_decode_keeps_sparse_definition_namespace_relational_order_an
     let mut bad = source.clone();
     bad.entries[0].definition = Some(wire::CallRequestDefinition {
         kind: Some(wire::call_request_definition::Kind::Relational(
-            sw::CallSite {
-                kind: Some(sw::call_site::Kind::ExpressionUseId(u32::MAX)),
-            },
+            sw::CallSite { kind: None },
         )),
     });
     assert!(matches!(
         execute(Some(&bad), &t, &p, SOURCE, limits(), &Control::default()),
-        Err(E::InvalidShape(_))
+        Err(E::Semantics(
+            crate::physical_semantics_v2::SemanticsCodecError::InvalidShape(
+                "missing call site kind"
+            )
+        ))
     ));
     bad.entries[0].definition.as_mut().unwrap().kind = None;
     assert!(matches!(
         execute(Some(&bad), &t, &p, SOURCE, limits(), &Control::default()),
-        Err(E::InvalidShape(_))
+        Err(E::InvalidShape("call request definition is absent"))
     ));
+    // Scalar request addresses live only inside the real unit grammar.
+    // Its missing local key is a request-format failure, independently of
+    // the nested relation CallSite owner's typed failure above.
+    let raw = vec![wire::UnitCallRequest {
+        definition_id: None,
+        arguments: vec![],
+        logical_argument_count: Some(0),
+        expected_result_value_type_id: None,
+        constant_policy: Some(zero_policy()),
+    }];
+    let c = Control::default();
+    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
+    let error = decode_unit_requests_in::<std::convert::Infallible>(
+        &raw,
+        &t,
+        &p,
+        SOURCE,
+        limits(),
+        &mut |_| Ok(()),
+        None,
+        &mut work,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        E::InvalidShape("unit request definition is absent")
+    ));
+    work.finish().unwrap();
 }
+
 #[test]
 fn original_request_decode_preserves_none_typed_null_cv_ordinal_full_lambda_and_field_arc() {
     let t = types();
@@ -405,7 +440,7 @@ fn original_request_decode_preserves_none_typed_null_cv_ordinal_full_lambda_and_
     let raw = source();
     let c = Control::default();
     let token = prepare_call_requests_decode(Some(&raw), &t, &pools, SOURCE, limits(), &c).unwrap();
-    assert!(std::ptr::eq(token.source, &raw));
+    assert!(std::ptr::eq(token.source, raw.entries.as_slice()));
     assert!(matches!(token.types,CallRequestTypeOwner::Package(source) if std::ptr::eq(source,&t)));
     assert!(std::ptr::eq(token._pools, &pools));
     let output = decode_call_requests(token).unwrap();
@@ -585,8 +620,8 @@ fn original_request_decode_independent_layout_and_all_six_exact_under_limits() {
     let facts = *token.facts();
     // One sparse key Vec and outer output Vec; arguments Vec+Box, four Lambda
     // parameters Vec+Box and their actual guarded collection Arc; FVT clones allocate nothing.
-    let golden = Layout::array::<PhysicalCallDefinition>(1).unwrap().size()
-        + Layout::array::<(PhysicalCallDefinition, PhysicalCallRequest)>(1)
+    let golden = Layout::array::<PhysicalCallSite>(1).unwrap().size()
+        + Layout::array::<(PhysicalCallSite, PhysicalCallRequest)>(1)
             .unwrap()
             .size()
         + 2 * Layout::array::<StaticFunctionArgument>(3).unwrap().size()
@@ -770,8 +805,8 @@ fn original_request_decode_new_argument_resource_at_real_pending_256_never_obser
     // Repeating the same backing under four keys is legal and counted once as
     // a backing floor, while each occupied key remains actual source storage.
     let mut l = limits();
-    l.max_request_bytes = Layout::array::<PhysicalCallDefinition>(42).unwrap().size()
-        + Layout::array::<(PhysicalCallDefinition, PhysicalCallRequest)>(42)
+    l.max_request_bytes = Layout::array::<PhysicalCallSite>(42).unwrap().size()
+        + Layout::array::<(PhysicalCallSite, PhysicalCallRequest)>(42)
             .unwrap()
             .size();
     for cause in CAUSES {

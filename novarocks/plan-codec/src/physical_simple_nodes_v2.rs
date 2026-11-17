@@ -38,11 +38,11 @@ use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 type Error = SimpleNodeCodecError;
 
 fn expression_encode(
-    id: p::ExprId,
+    id: novarocks_expression_contract::RootOrdinal,
     expressions: &EncodedExpressions<'_, '_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let found = expressions.expression_observed(id.get(), w)?.is_some();
+    let found = expressions.root_expression_observed(id.get(), w)?.is_some();
     w.step()?;
     if found {
         Ok(())
@@ -57,7 +57,7 @@ fn expression_decode(
     expressions: &DecodedExpressions<'_, '_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let found = expressions.definition_observed(id, w)?.is_some();
+    let found = expressions.root_definition_observed(id, w)?.is_some();
     w.step()?;
     if found {
         Ok(())
@@ -74,14 +74,18 @@ fn required(id: Option<u32>, w: &mut CompileCheckpoints<'_>) -> Result<u32, Erro
 /// O(1) outer shape facts, before the first variable-length source walk.
 fn physical_outer(input: &p::PhysicalNode) -> Result<(usize, usize), Error> {
     let (items, backing) = match &input.kind {
-        p::NodeKind::Filter { predicates } => {
-            (predicates.len(), bytes::<p::ExprId>(predicates.len())?)
-        }
+        p::NodeKind::Filter { predicates } => (
+            predicates.len(),
+            bytes::<novarocks_expression_contract::RootOrdinal>(predicates.len())?,
+        ),
         p::NodeKind::Project { expressions } => (
             expressions.len(),
-            bytes::<(p::ExprId, p::ValueId)>(expressions.len())?,
+            bytes::<(novarocks_expression_contract::RootOrdinal, p::ValueId)>(expressions.len())?,
         ),
-        p::NodeKind::Values { rows } => (rows.len(), bytes::<Box<[p::ExprId]>>(rows.len())?),
+        p::NodeKind::Values { rows } => (
+            rows.len(),
+            bytes::<Box<[novarocks_expression_contract::RootOrdinal]>>(rows.len())?,
+        ),
         p::NodeKind::WriteLayoutKey { key_inputs, .. } => {
             (key_inputs.len(), bytes::<p::ValueId>(key_inputs.len())?)
         }
@@ -98,16 +102,16 @@ fn physical_outer(input: &p::PhysicalNode) -> Result<(usize, usize), Error> {
 fn wire_outer(input: &wire::PhysicalNode) -> Result<(usize, usize), Error> {
     let (items, backing) = match input.kind.as_ref() {
         Some(wire::physical_node::Kind::Filter(v)) => (
-            v.predicate_expr_ids.len(),
-            bytes::<u32>(v.predicate_expr_ids.capacity())?,
+            v.predicate_roots.len(),
+            bytes::<u32>(v.predicate_roots.capacity())?,
         ),
         Some(wire::physical_node::Kind::Project(v)) => (
             v.expressions.len(),
             bytes::<wire::ExpressionOutput>(v.expressions.capacity())?,
         ),
         Some(wire::physical_node::Kind::Values(v)) => (
-            v.rows.len(),
-            bytes::<wire::ExpressionIds>(v.rows.capacity())?,
+            v.root_rows.len(),
+            bytes::<wire::RootOrdinals>(v.root_rows.capacity())?,
         ),
         Some(wire::physical_node::Kind::WriteLayoutKey(v)) => (
             v.key_input_value_ids.len(),
@@ -123,7 +127,7 @@ fn wire_outer(input: &wire::PhysicalNode) -> Result<(usize, usize), Error> {
         Some(wire::physical_node::Kind::SystemRelation(_))
         | Some(wire::physical_node::Kind::Limit(_)) => (0, 0),
         Some(wire::physical_node::Kind::GenerateSeries(v)) => {
-            (2 + usize::from(v.step_expr_id.is_some()), 0)
+            (2 + usize::from(v.step_root.is_some()), 0)
         }
         _ => return Err(invalid("wire node is outside the simple node family")),
     };
@@ -203,12 +207,15 @@ fn prepare_encode(
             expressions.len()
         }
         p::NodeKind::Values { rows } => {
-            model.request::<wire::ExpressionIds>(rows.len(), 1)?;
+            model.request::<wire::RootOrdinals>(rows.len(), 1)?;
             let mut total = 0;
             for row in rows {
                 total = add(total, row.len())?;
                 model.items = add(model.items, row.len())?;
-                known = add(known, bytes::<p::ExprId>(row.len())?)?;
+                known = add(
+                    known,
+                    bytes::<novarocks_expression_contract::RootOrdinal>(row.len())?,
+                )?;
                 model.request::<u32>(row.len(), 1)?;
                 if parent.is_some() {
                     model.delegated_work = mul(total, expressions.lookup_work_upper_bound()?)?;
@@ -400,22 +407,32 @@ fn prepare_decode(
     decode_header_requests(input, port, &mut model)?;
     let occurrences = match input.kind.as_ref() {
         Some(wire::physical_node::Kind::Filter(v)) => {
-            model.request::<p::ExprId>(v.predicate_expr_ids.len(), 2)?;
-            v.predicate_expr_ids.len()
+            model.request::<novarocks_expression_contract::RootOrdinal>(
+                v.predicate_roots.len(),
+                2,
+            )?;
+            v.predicate_roots.len()
         }
         Some(wire::physical_node::Kind::Project(v)) => {
-            model.request::<(p::ExprId, p::ValueId)>(v.expressions.len(), 2)?;
+            model.request::<(novarocks_expression_contract::RootOrdinal, p::ValueId)>(
+                v.expressions.len(),
+                2,
+            )?;
             model.refs = add(model.refs, v.expressions.len())?;
             v.expressions.len()
         }
         Some(wire::physical_node::Kind::Values(v)) => {
-            model.request::<Box<[p::ExprId]>>(v.rows.len(), 2)?;
+            model.request::<Box<[novarocks_expression_contract::RootOrdinal]>>(
+                v.root_rows.len(),
+                2,
+            )?;
             let mut total = 0;
-            for row in &v.rows {
-                total = add(total, row.expr_ids.len())?;
-                model.items = add(model.items, row.expr_ids.len())?;
-                known = add(known, bytes::<u32>(row.expr_ids.capacity())?)?;
-                model.request::<p::ExprId>(row.expr_ids.len(), 2)?;
+            for row in &v.root_rows {
+                total = add(total, row.ordinals.len())?;
+                model.items = add(model.items, row.ordinals.len())?;
+                known = add(known, bytes::<u32>(row.ordinals.capacity())?)?;
+                model
+                    .request::<novarocks_expression_contract::RootOrdinal>(row.ordinals.len(), 2)?;
                 if parent.is_some() {
                     model.delegated_work = mul(total, expressions.lookup_work_upper_bound()?)?;
                 }
@@ -427,7 +444,7 @@ fn prepare_decode(
             total
         }
         Some(wire::physical_node::Kind::GenerateSeries(v)) => {
-            2 + usize::from(v.step_expr_id.is_some())
+            2 + usize::from(v.step_root.is_some())
         }
         Some(wire::physical_node::Kind::WriteLayoutKey(v)) => {
             model.refs = add(model.refs, add(v.key_input_value_ids.len(), 1)?)?;
@@ -490,28 +507,28 @@ fn prepare_decode(
     }
     match input.kind.as_ref() {
         Some(wire::physical_node::Kind::Filter(v)) => {
-            for id in &v.predicate_expr_ids {
+            for id in &v.predicate_roots {
                 expression_decode(*id, expressions, w)?;
             }
         }
         Some(wire::physical_node::Kind::Project(v)) => {
             for pair in &v.expressions {
-                expression_decode(required(pair.expr_id, w)?, expressions, w)?;
+                expression_decode(required(pair.root_ordinal, w)?, expressions, w)?;
                 reference(required(pair.value_id, w)?, values, w)?;
             }
         }
         Some(wire::physical_node::Kind::Values(v)) => {
-            for row in &v.rows {
-                for expr in &row.expr_ids {
+            for row in &v.root_rows {
+                for expr in &row.ordinals {
                     expression_decode(*expr, expressions, w)?;
                 }
                 w.step()?;
             }
         }
         Some(wire::physical_node::Kind::GenerateSeries(v)) => {
-            expression_decode(required(v.start_expr_id, w)?, expressions, w)?;
-            expression_decode(required(v.stop_expr_id, w)?, expressions, w)?;
-            if let Some(step) = v.step_expr_id {
+            expression_decode(required(v.start_root, w)?, expressions, w)?;
+            expression_decode(required(v.stop_root, w)?, expressions, w)?;
+            if let Some(step) = v.step_root {
                 expression_decode(step, expressions, w)?;
             }
         }
@@ -596,7 +613,10 @@ fn decode_shard_output(
     })
 }
 
-fn encode_expr_ids(input: &[p::ExprId], w: &mut CompileCheckpoints<'_>) -> Result<Vec<u32>, Error> {
+fn encode_root_ordinals(
+    input: &[novarocks_expression_contract::RootOrdinal],
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u32>, Error> {
     let mut output = reserve(input.len(), w)?;
     for id in input {
         output.push(id.get());
@@ -604,13 +624,13 @@ fn encode_expr_ids(input: &[p::ExprId], w: &mut CompileCheckpoints<'_>) -> Resul
     }
     Ok(output)
 }
-fn decode_expr_ids(
+fn decode_root_ordinals(
     input: &[u32],
     w: &mut CompileCheckpoints<'_>,
-) -> Result<Box<[p::ExprId]>, Error> {
+) -> Result<Box<[novarocks_expression_contract::RootOrdinal]>, Error> {
     let mut output = reserve(input.len(), w)?;
     for id in input {
-        output.push(p::ExprId::new(*id));
+        output.push(novarocks_expression_contract::RootOrdinal::new(*id));
         w.step()?;
     }
     boxed(output, w)
@@ -624,13 +644,13 @@ fn emit_encode(
     let (inputs, required_inputs, output_properties, output) = encode_header(input, source, l, w)?;
     let kind = match &input.kind {
         p::NodeKind::Filter { predicates } => wire::physical_node::Kind::Filter(wire::FilterNode {
-            predicate_expr_ids: encode_expr_ids(predicates, w)?,
+            predicate_roots: encode_root_ordinals(predicates, w)?,
         }),
         p::NodeKind::Project { expressions } => {
             let mut output = reserve(expressions.len(), w)?;
             for (expr, value) in expressions {
                 output.push(wire::ExpressionOutput {
-                    expr_id: Some(expr.get()),
+                    root_ordinal: Some(expr.get()),
                     value_id: Some(value.get()),
                 });
                 w.step()?;
@@ -642,12 +662,12 @@ fn emit_encode(
         p::NodeKind::Values { rows } => {
             let mut output = reserve(rows.len(), w)?;
             for row in rows {
-                output.push(wire::ExpressionIds {
-                    expr_ids: encode_expr_ids(row, w)?,
+                output.push(wire::RootOrdinals {
+                    ordinals: encode_root_ordinals(row, w)?,
                 });
                 w.step()?;
             }
-            wire::physical_node::Kind::Values(wire::ValuesNode { rows: output })
+            wire::physical_node::Kind::Values(wire::ValuesNode { root_rows: output })
         }
         p::NodeKind::SystemRelation { data, .. } => {
             if matches!(data, p::SystemRelationData::Deferred) {
@@ -669,9 +689,9 @@ fn emit_encode(
         }),
         p::NodeKind::GenerateSeries { start, stop, step } => {
             wire::physical_node::Kind::GenerateSeries(wire::GenerateSeriesNode {
-                start_expr_id: Some(start.get()),
-                stop_expr_id: Some(stop.get()),
-                step_expr_id: step.map(p::ExprId::get),
+                start_root: Some(start.get()),
+                stop_root: Some(stop.get()),
+                step_root: step.map(novarocks_expression_contract::RootOrdinal::get),
             })
         }
         p::NodeKind::WriteLayoutKey {
@@ -722,6 +742,7 @@ fn emit_encode(
     };
     w.step()?;
     Ok(wire::PhysicalNode {
+        expressions: None,
         id: input.id.get(),
         input_node_ids: inputs,
         required_inputs,
@@ -739,13 +760,16 @@ fn emit_decode(
     let (inputs, required_inputs, output_properties, output) = decode_header(input, source, l, w)?;
     let kind = match input.kind.as_ref() {
         Some(wire::physical_node::Kind::Filter(v)) => p::NodeKind::Filter {
-            predicates: decode_expr_ids(&v.predicate_expr_ids, w)?,
+            predicates: decode_root_ordinals(&v.predicate_roots, w)?,
         },
         Some(wire::physical_node::Kind::Project(v)) => {
             let mut output = reserve(v.expressions.len(), w)?;
             for pair in &v.expressions {
                 output.push((
-                    p::ExprId::new(required(pair.expr_id, w)?),
+                    novarocks_expression_contract::RootOrdinal::new(required(
+                        pair.root_ordinal,
+                        w,
+                    )?),
                     p::ValueId::new(required(pair.value_id, w)?),
                 ));
                 w.step()?;
@@ -755,9 +779,9 @@ fn emit_decode(
             }
         }
         Some(wire::physical_node::Kind::Values(v)) => {
-            let mut output = reserve(v.rows.len(), w)?;
-            for row in &v.rows {
-                output.push(decode_expr_ids(&row.expr_ids, w)?);
+            let mut output = reserve(v.root_rows.len(), w)?;
+            for row in &v.root_rows {
+                output.push(decode_root_ordinals(&row.ordinals, w)?);
                 w.step()?;
             }
             p::NodeKind::Values {
@@ -773,9 +797,11 @@ fn emit_decode(
             offset: v.offset,
         },
         Some(wire::physical_node::Kind::GenerateSeries(v)) => p::NodeKind::GenerateSeries {
-            start: p::ExprId::new(required(v.start_expr_id, w)?),
-            stop: p::ExprId::new(required(v.stop_expr_id, w)?),
-            step: v.step_expr_id.map(p::ExprId::new),
+            start: novarocks_expression_contract::RootOrdinal::new(required(v.start_root, w)?),
+            stop: novarocks_expression_contract::RootOrdinal::new(required(v.stop_root, w)?),
+            step: v
+                .step_root
+                .map(novarocks_expression_contract::RootOrdinal::new),
         },
         Some(wire::physical_node::Kind::WriteLayoutKey(v)) => {
             let mut ids = reserve(v.key_input_value_ids.len(), w)?;
@@ -808,6 +834,7 @@ fn emit_decode(
     };
     w.step()?;
     Ok(p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(input.id),
         inputs,
         required_inputs,

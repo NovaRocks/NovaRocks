@@ -15,13 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::tests::Definitions;
 use super::*;
-use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
-use arrow::datatypes::DataType;
-use novarocks_physical_plan::{
-    BinaryOperator, Distribution, ExprKind, FragmentId, FragmentSink, NodeKind, OutputPort,
-    PhysicalNode, PhysicalProperties, PipelineDopDomain, RowMultiplicity, ValueOrigin, ValueType,
-};
+use novarocks_expression_contract::{BinaryOperator, ExprKind};
 use std::{alloc::Layout, sync::Mutex};
 const B: usize = 4 * 1024 * 1024;
 const CAUSES: [CompileControlError; 3] = [
@@ -58,71 +54,23 @@ fn limits() -> ControlProjectionLimits {
     ControlProjectionLimits {
         max_regions: 1000,
         max_use_references: 10000,
-        max_root_bindings: 1000,
+
         max_allocation_requests: 100000,
         max_allocation_request_bytes: 256 * 1024 * 1024,
         max_coexisting_source_and_request_bytes: 256 * 1024 * 1024,
         max_work: 1_000_000_000,
     }
 }
-fn fixture() -> (Fragment, PhysicalRootUses) {
-    let c = Control::default();
-    let mut b = FragmentBuilder::new(FragmentId::new(741));
-    let node = b.reserve_node_id().unwrap();
-    let ty = ValueType::new(DataType::Boolean, false);
-    let leaf = b.constant(node, ty.clone(), checked::boolean(true));
-    let root = b
-        .add_expression(
-            node,
-            ty.clone(),
-            ExprKind::Binary {
-                op: BinaryOperator::Eq,
-                left: leaf,
-                right: leaf,
-                allow_throw_exception: None,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        )
-        .unwrap();
-    let col = b
-        .add_value(
-            ty,
-            ValueOrigin::NodeOutput {
-                node,
-                output_ordinal: 0,
-            },
-        )
-        .unwrap();
-    b.insert_node_unchecked(PhysicalNode {
-        id: node,
-        inputs: Box::default(),
-        required_inputs: Box::default(),
-        output_properties: PhysicalProperties {
-            distribution: Distribution::Singleton,
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
-        },
-        output: OutputPort {
-            node,
-            columns: Box::from([col]),
-        },
-        kind: NodeKind::Values {
-            rows: Box::from([Box::from([root])]),
-        },
-    })
-    .unwrap();
-    let fragment = b
-        .finish_definition(
-            node,
-            FragmentSink::Noop,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
+fn fixture() -> (Definitions, ExpressionControlFlow<ExprId>) {
+    let mut definitions = Definitions::default();
+    let leaf = definitions.boolean(true);
+    let root = definitions.add(ExprKind::Binary {
+        op: BinaryOperator::Eq,
+        left: leaf,
+        right: leaf,
+        allow_throw_exception: None,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    });
     let region = EvaluationRegionId::new(u32::MAX);
     let inv = |id, definition, args: &[ExpressionUseId]| ExpressionInvocation {
         context: ExpressionEffectContext {
@@ -134,7 +82,7 @@ fn fixture() -> (Fragment, PhysicalRootUses) {
         control: ControlShape::Eager,
         arguments: args.into(),
     };
-    let flow = ExpressionControlFlow::try_new(
+    let flow = definitions.flow(
         vec![ExpressionEvaluationRegion {
             id: region,
             parent: None,
@@ -149,25 +97,8 @@ fn fixture() -> (Fragment, PhysicalRootUses) {
                 &[ExpressionUseId::new(0), ExpressionUseId::new(u32::MAX)],
             ),
         ],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &c,
-    )
-    .unwrap();
-    let roots = PhysicalRootUses::try_new(
-        &fragment,
-        flow,
-        vec![(
-            ExpressionRootSite {
-                node,
-                role: ExpressionRootRole::ValuesCell { row: 0, column: 0 },
-            },
-            ExpressionUseId::new(9),
-        )],
-        &c,
-    )
-    .unwrap();
-    (fragment, roots)
+    );
+    (definitions, flow)
 }
 fn finish<T>(
     out: Result<T, ControlCodecError>,
@@ -184,8 +115,8 @@ type ProjectionRun<T> = (
     Vec<(CompilePhase, u32)>,
 );
 fn encode(
-    f: &Fragment,
-    r: &PhysicalRootUses,
+    _f: &Definitions,
+    r: &ExpressionControlFlow<ExprId>,
     failure: Option<(usize, CompileControlError)>,
 ) -> ProjectionRun<wire::ExpressionControl> {
     let c = Control {
@@ -194,16 +125,16 @@ fn encode(
     };
     let out = (|| {
         let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Encode)?;
-        let out = encode_expression_control_observed(f, r, B, limits(), &mut |_| Ok(()), &mut w);
+        let out = encode_expression_control_observed(r, B, limits(), &mut |_| Ok(()), &mut w);
         finish(out, w)
     })();
     (out, c.trace())
 }
 fn decode(
-    f: &Fragment,
+    f: &Definitions,
     input: &wire::ExpressionControl,
     failure: Option<(usize, CompileControlError)>,
-) -> ProjectionRun<PhysicalRootUses> {
+) -> ProjectionRun<ExpressionControlFlow<ExprId>> {
     let c = Control {
         failure,
         ..Default::default()
@@ -221,28 +152,19 @@ fn complete_control_reuses_original_roots_and_sparse_independent_occurrences() {
     let (f, r) = fixture();
     let (out, trace) = encode(&f, &r, None);
     let (input, facts) = out.unwrap();
-    assert_eq!(input.domains[0].id, u32::MAX);
+    assert_eq!(input.regions[0].id, u32::MAX);
     assert_eq!(
         input.uses.iter().map(|u| u.id).collect::<Vec<_>>(),
         [0, 9, u32::MAX]
     );
     assert_eq!(input.uses[1].argument_use_ids, [0, u32::MAX]);
     assert_eq!(input.uses[0].definition_id, input.uses[2].definition_id);
-    assert_eq!(input.roots[0].use_id, Some(9));
-    assert_eq!(
-        (
-            facts.region_count,
-            facts.use_reference_count,
-            facts.root_binding_count
-        ),
-        (1, 5, 1)
-    );
-    // Actual sender buffers: three top-level Vecs and the ordered two-ID Vec.
-    let payload = Layout::array::<wire::EvaluationDomain>(1).unwrap().size()
+    assert_eq!((facts.region_count, facts.use_reference_count), (1, 5));
+    // Actual sender buffers: two top-level Vecs and the ordered two-ID Vec.
+    let payload = Layout::array::<wire::EvaluationRegion>(1).unwrap().size()
         + Layout::array::<wire::ExpressionUse>(3).unwrap().size()
-        + Layout::array::<wire::RootBinding>(1).unwrap().size()
         + 8;
-    assert!(facts.allocation_requests_upper_bound >= 4);
+    assert!(facts.allocation_requests_upper_bound >= 3);
     assert!(facts.allocation_request_bytes_upper_bound >= payload);
     assert_eq!(
         facts.coexisting_source_and_request_bytes_upper_bound,
@@ -269,7 +191,7 @@ fn every_actual_control_success_and_ordinary_callback_preserves_caller_scope_fir
     for malformed in [false, true] {
         let mut raw = input.clone();
         if malformed {
-            raw.uses[1].domain_id = None;
+            raw.uses[1].region_id = None;
         }
         let baseline = decode(&f, &raw, None);
         assert_eq!(baseline.0.is_ok(), !malformed);
@@ -289,10 +211,10 @@ fn every_actual_control_success_and_ordinary_callback_preserves_caller_scope_fir
     }
 }
 #[test]
-fn original_owned_arc_geometry_and_all_seven_axes_have_independent_refusal_oracles() {
+fn original_owned_arc_geometry_and_all_six_axes_have_independent_refusal_oracles() {
     // The checked flow publishes two guarded map payloads and one guarded
-    // root slice. Independently compute the fields' Arc request geometry;
-    // this does not read the model's answer or change any of the seven caps.
+    // root-use slice derived by the flow owner. Independently compute the
+    // Arc geometry; the retired wire RootBinding buffer is not charged.
     use novarocks_type_contract::{
         ExpressionEvaluationRegion, ExpressionInvocation, ValueTypeStorageLifetime,
         owned_resources::layout::arc_layout,
@@ -332,7 +254,6 @@ fn original_owned_arc_geometry_and_all_seven_axes_have_independent_refusal_oracl
         let exact = ControlProjectionLimits {
             max_regions: g.region_count,
             max_use_references: g.use_reference_count,
-            max_root_bindings: g.root_binding_count,
             max_allocation_requests: g.allocation_requests_upper_bound,
             max_allocation_request_bytes: g.allocation_request_bytes_upper_bound,
             max_coexisting_source_and_request_bytes: g
@@ -357,7 +278,6 @@ fn original_owned_arc_geometry_and_all_seven_axes_have_independent_refusal_oracl
             .map(|(_, f)| f)
         } else {
             encode_expression_control_observed(
-                &f,
                 &r,
                 B,
                 exact,
@@ -383,15 +303,14 @@ fn original_owned_arc_geometry_and_all_seven_axes_have_independent_refusal_oracl
     }
     for direction in [false, true] {
         let g = if direction { decoded } else { golden };
-        for axis in 0..7 {
+        for axis in 0..6 {
             let mut l = limits();
             match axis {
                 0 => l.max_regions = g.region_count - 1,
                 1 => l.max_use_references = g.use_reference_count - 1,
-                2 => l.max_root_bindings = g.root_binding_count - 1,
-                3 => l.max_allocation_requests = g.allocation_requests_upper_bound - 1,
-                4 => l.max_allocation_request_bytes = g.allocation_request_bytes_upper_bound - 1,
-                5 => {
+                2 => l.max_allocation_requests = g.allocation_requests_upper_bound - 1,
+                3 => l.max_allocation_request_bytes = g.allocation_request_bytes_upper_bound - 1,
+                4 => {
                     l.max_coexisting_source_and_request_bytes =
                         g.coexisting_source_and_request_bytes_upper_bound - 1
                 }
@@ -403,7 +322,7 @@ fn original_owned_arc_geometry_and_all_seven_axes_have_independent_refusal_oracl
                 decode_expression_control_observed(&f, &input, B, l, &mut |_| Ok(()), &mut w)
                     .map(|(_, f)| f)
             } else {
-                encode_expression_control_observed(&f, &r, B, l, &mut |_| Ok(()), &mut w)
+                encode_expression_control_observed(&r, B, l, &mut |_| Ok(()), &mut w)
                     .map(|(_, f)| f)
             };
             assert!(matches!(
@@ -443,7 +362,7 @@ fn known_output_headers_win_before_pending_control_and_source_floor_is_ordinary(
     }
     let c = Control::default();
     let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();
-    let out = encode_expression_control_observed(&f, &r, 0, limits(), &mut |_| Ok(()), &mut w);
+    let out = encode_expression_control_observed(&r, 0, limits(), &mut |_| Ok(()), &mut w);
     assert!(matches!(
         out,
         Err(ControlCodecError::InvalidShape(

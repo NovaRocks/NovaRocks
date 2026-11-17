@@ -146,7 +146,7 @@ fn fragment(sink: p::FragmentSink, wide: bool) -> p::Fragment {
     builder
         .add_values(
             p::NodeId::new(0),
-            Box::from([Box::<[p::ExprId]>::default()]),
+            Box::from([Box::<[novarocks_expression_contract::RootOrdinal]>::default()]),
             Box::default(),
         )
         .unwrap();
@@ -173,6 +173,7 @@ fn fragment(sink: p::FragmentSink, wide: bool) -> p::Fragment {
         .unwrap();
     builder
         .insert_node_unchecked(p::PhysicalNode {
+            expressions: None,
             id: root,
             inputs: Box::from([p::NodeId::new(0)]),
             required_inputs: Box::from([property()]),
@@ -1062,6 +1063,7 @@ fn package_envelope_preserves_the_unbound_scalar_root_declaration() {
         )),
     });
     raw.nodes = vec![wire::PhysicalNode {
+        expressions: None,
         id: u32::MAX,
         output: Some(wire::OutputPort {
             node_id: Some(u32::MAX),

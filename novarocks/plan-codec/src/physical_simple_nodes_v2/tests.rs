@@ -25,8 +25,8 @@ use crate::{
         ConnectorPayloadProjectionLimits, decode_connector_payloads, encode_connector_payloads,
     },
     physical_expression_v2::{
-        ExpressionProjectionLimits, ExpressionTypeIds, decode_expression_definitions,
-        encode_expression_definitions,
+        ExpressionDefinitionSource, ExpressionProjectionLimits, ExpressionTypeIds,
+        decode_expression_definitions, encode_expression_definitions,
     },
     physical_properties_v2::PhysicalPropertyProjectionLimits,
     physical_type_v2::{TypeProjectionLimits, decode_type_table, encode_type_table_sources},
@@ -38,6 +38,7 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
+use novarocks_expression_contract::{ExprId, RootOrdinal};
 use novarocks_proto_models::physical_control_v2::Empty;
 use novarocks_type_contract::{
     CompileControlError, FunctionValueType, PureCompileControl, SemanticParameters,
@@ -193,17 +194,54 @@ fn reference(pool: u32, ordinal: u32) -> p::ConstantReference {
         ordinal,
     }
 }
+
+fn unit_from_sources(
+    nodes: impl IntoIterator<Item = novarocks_expression_contract::ExprNode>,
+    values: &[p::ValueDef],
+    control: &dyn PureCompileControl,
+) -> novarocks_expression_contract::BoundExprSet {
+    use novarocks_expression_contract::{BoundExprSetBuilder, ExprPort, RootScope, UnitLimits};
+    use novarocks_type_contract::{CompileCheckpoints, EvaluationDemand};
+    let mut builder = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: p::PlanLimits::FROZEN.expression_semantic_depth,
+    });
+    for node in nodes {
+        let demand = if *node.ty.data_type() == DataType::Boolean {
+            EvaluationDemand::TruthOnly
+        } else {
+            EvaluationDemand::Value
+        };
+        let id = builder.add(node.lambda_scope, node.ty, node.kind).unwrap();
+        assert_eq!(id, node.id);
+        builder.root(id, demand, RootScope::Port(0)).unwrap();
+    }
+    let ports = vec![ExprPort {
+        values: values
+            .iter()
+            .map(|value| (value.id, value.ty.clone()))
+            .collect(),
+    }];
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+    let unit = builder
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(std::collections::BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    unit
+}
+
 struct Fixture {
     roots: Vec<(u32, FunctionValueType)>,
     definitions: Vec<p::ValueDef>,
-    arena: p::ExprArena,
+    unit: novarocks_expression_contract::BoundExprSet,
     parameters: SemanticParameters,
     pools: p::ConstantPools,
 }
 impl Fixture {
     fn new() -> Self {
         let ty = FunctionValueType::new(DataType::Int64, true);
-        let definitions = [0, 7, u32::MAX]
+        let definitions: Vec<p::ValueDef> = [0, 7, u32::MAX]
             .into_iter()
             .map(|id| p::ValueDef {
                 id: p::ValueId::new(id),
@@ -222,28 +260,31 @@ impl Fixture {
             )
             .unwrap();
         let nodes = [
-            (0, p::ExprKind::Constant(reference(u32::MAX, 1))),
-            (7, p::ExprKind::Value(p::ValueId::new(0))),
-            (u32::MAX, p::ExprKind::Constant(reference(u32::MAX, 2))),
+            (
+                0,
+                novarocks_expression_contract::ExprKind::Constant(reference(u32::MAX, 1)),
+            ),
+            (
+                1,
+                novarocks_expression_contract::ExprKind::Value(p::ValueId::new(0)),
+            ),
+            (
+                2,
+                novarocks_expression_contract::ExprKind::Constant(reference(u32::MAX, 2)),
+            ),
         ]
         .into_iter()
-        .map(|(id, kind)| p::ExprNode {
-            id: p::ExprId::new(id),
-            owner: p::NodeId::new(u32::MAX),
+        .map(|(id, kind)| novarocks_expression_contract::ExprNode {
+            id: ExprId::new(id),
             lambda_scope: None,
             ty: ty.clone(),
             kind,
         });
-        let arena = p::ExprArena::try_from_definitions_observed(
-            nodes,
-            &p::PlanLimits::default(),
-            &Control::default(),
-        )
-        .unwrap();
+        let unit = unit_from_sources(nodes, &definitions, &Control::default());
         Self {
             roots: vec![(0, ty)],
             definitions,
-            arena,
+            unit,
             parameters: SemanticParameters::try_new([]).unwrap(),
             pools,
         }
@@ -308,18 +349,18 @@ impl Fixture {
         )
         .unwrap();
         let inputs = self
-            .arena
+            .unit
+            .definitions()
             .iter()
-            .map(|(id, _)| ExpressionTypeIds {
-                expr: *id,
+            .map(|node| ExpressionTypeIds {
+                expr: node.id,
                 value_type_id: 0,
                 lambda_parameter_type_ids: &[],
                 function_binding_id: None,
-                aggregate_binding_id: None,
             })
             .collect::<Vec<_>>();
         let expressions = encode_expression_definitions(
-            &self.arena,
+            Some(ExpressionDefinitionSource::from_unit(&self.unit)),
             &inputs,
             &types,
             &functions,
@@ -331,8 +372,10 @@ impl Fixture {
             control,
         )
         .unwrap();
+        let wire_roots = crate::test_constants::wire_roots(&self.unit);
         let read = decode_expression_definitions(
             expressions.as_wire(),
+            &wire_roots,
             &read_values,
             &functions_read,
             &aggregates_read,
@@ -356,23 +399,23 @@ fn source(at: usize) -> p::PhysicalNode {
     let kind = match at {
         0 => p::NodeKind::Filter {
             predicates: Box::from([
-                p::ExprId::new(u32::MAX),
-                p::ExprId::new(7),
-                p::ExprId::new(0),
-                p::ExprId::new(7),
+                RootOrdinal::new(2),
+                RootOrdinal::new(1),
+                RootOrdinal::new(0),
+                RootOrdinal::new(1),
             ]),
         },
         1 => p::NodeKind::Project {
             expressions: Box::from([
-                (p::ExprId::new(7), p::ValueId::new(u32::MAX)),
-                (p::ExprId::new(0), p::ValueId::new(0)),
-                (p::ExprId::new(7), p::ValueId::new(7)),
+                (RootOrdinal::new(1), p::ValueId::new(u32::MAX)),
+                (RootOrdinal::new(0), p::ValueId::new(0)),
+                (RootOrdinal::new(1), p::ValueId::new(7)),
             ]),
         },
         2 => p::NodeKind::Values {
             rows: Box::from([
-                Box::from([p::ExprId::new(u32::MAX), p::ExprId::new(0)]),
-                Box::from([p::ExprId::new(7), p::ExprId::new(7)]),
+                Box::from([RootOrdinal::new(2), RootOrdinal::new(0)]),
+                Box::from([RootOrdinal::new(1), RootOrdinal::new(1)]),
             ]),
         },
         3 => p::NodeKind::Limit {
@@ -388,14 +431,14 @@ fn source(at: usize) -> p::PhysicalNode {
             offset: 0,
         },
         6 => p::NodeKind::GenerateSeries {
-            start: p::ExprId::new(0),
-            stop: p::ExprId::new(u32::MAX),
+            start: RootOrdinal::new(0),
+            stop: RootOrdinal::new(2),
             step: None,
         },
         7 => p::NodeKind::GenerateSeries {
-            start: p::ExprId::new(u32::MAX),
-            stop: p::ExprId::new(0),
-            step: Some(p::ExprId::new(0)),
+            start: RootOrdinal::new(2),
+            stop: RootOrdinal::new(0),
+            step: Some(RootOrdinal::new(0)),
         },
         8 => p::NodeKind::WriteLayoutKey {
             key_inputs: Box::new([
@@ -408,6 +451,7 @@ fn source(at: usize) -> p::PhysicalNode {
         _ => panic!("unknown fixture"),
     };
     p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(u32::MAX),
         inputs: Box::from([p::NodeId::new(0)]),
         required_inputs: Box::from([p::passthrough_requirement(&property())]),
@@ -439,31 +483,31 @@ fn expected_property(unconstrained: bool) -> wire::PhysicalProperties {
 fn expected(at: usize) -> wire::PhysicalNode {
     let kind = match at {
         0 => wire::physical_node::Kind::Filter(wire::FilterNode {
-            predicate_expr_ids: vec![u32::MAX, 7, 0, 7],
+            predicate_roots: vec![2, 1, 0, 1],
         }),
         1 => wire::physical_node::Kind::Project(wire::ProjectNode {
             expressions: vec![
                 wire::ExpressionOutput {
-                    expr_id: Some(7),
+                    root_ordinal: Some(1),
                     value_id: Some(u32::MAX),
                 },
                 wire::ExpressionOutput {
-                    expr_id: Some(0),
+                    root_ordinal: Some(0),
                     value_id: Some(0),
                 },
                 wire::ExpressionOutput {
-                    expr_id: Some(7),
+                    root_ordinal: Some(1),
                     value_id: Some(7),
                 },
             ],
         }),
         2 => wire::physical_node::Kind::Values(wire::ValuesNode {
-            rows: vec![
-                wire::ExpressionIds {
-                    expr_ids: vec![u32::MAX, 0],
+            root_rows: vec![
+                wire::RootOrdinals {
+                    ordinals: vec![2, 0],
                 },
-                wire::ExpressionIds {
-                    expr_ids: vec![7, 7],
+                wire::RootOrdinals {
+                    ordinals: vec![1, 1],
                 },
             ],
         }),
@@ -480,14 +524,14 @@ fn expected(at: usize) -> wire::PhysicalNode {
             offset: 0,
         }),
         6 => wire::physical_node::Kind::GenerateSeries(wire::GenerateSeriesNode {
-            start_expr_id: Some(0),
-            stop_expr_id: Some(u32::MAX),
-            step_expr_id: None,
+            start_root: Some(0),
+            stop_root: Some(2),
+            step_root: None,
         }),
         7 => wire::physical_node::Kind::GenerateSeries(wire::GenerateSeriesNode {
-            start_expr_id: Some(u32::MAX),
-            stop_expr_id: Some(0),
-            step_expr_id: Some(0),
+            start_root: Some(2),
+            stop_root: Some(0),
+            step_root: Some(0),
         }),
         8 => wire::physical_node::Kind::WriteLayoutKey(wire::WriteLayoutKeyNode {
             key_input_value_ids: vec![7, 7, u32::MAX],
@@ -496,6 +540,7 @@ fn expected(at: usize) -> wire::PhysicalNode {
         _ => panic!("unknown fixture"),
     };
     wire::PhysicalNode {
+        expressions: None,
         id: u32::MAX,
         input_node_ids: vec![0],
         required_inputs: vec![expected_property(true)],
@@ -601,22 +646,22 @@ fn simple_nodes_layout_oracles_count_each_nested_request_without_expression_valu
             let (extra_encode, extra_decode, requests, items, refs) = match at {
                 0 => (
                     4 * std::mem::size_of::<u32>(),
-                    8 * std::mem::size_of::<p::ExprId>(),
+                    8 * std::mem::size_of::<RootOrdinal>(),
                     1,
                     8,
                     3,
                 ),
                 1 => (
                     3 * std::mem::size_of::<wire::ExpressionOutput>(),
-                    6 * std::mem::size_of::<(p::ExprId, p::ValueId)>(),
+                    6 * std::mem::size_of::<(RootOrdinal, p::ValueId)>(),
                     1,
                     7,
                     6,
                 ),
                 2 => (
-                    2 * std::mem::size_of::<wire::ExpressionIds>() + 4 * std::mem::size_of::<u32>(),
-                    4 * std::mem::size_of::<Box<[p::ExprId]>>()
-                        + 8 * std::mem::size_of::<p::ExprId>(),
+                    2 * std::mem::size_of::<wire::RootOrdinals>() + 4 * std::mem::size_of::<u32>(),
+                    4 * std::mem::size_of::<Box<[RootOrdinal]>>()
+                        + 8 * std::mem::size_of::<RootOrdinal>(),
                     3,
                     10,
                     3,
@@ -654,10 +699,10 @@ fn simple_nodes_missing_closed_fields_refs_and_out_of_family_kinds_fail() {
         for at in [0, 1, 2, 6] {
             let mut node = source(at);
             match &mut node.kind {
-                p::NodeKind::Filter { predicates } => predicates[0] = p::ExprId::new(99),
+                p::NodeKind::Filter { predicates } => predicates[0] = RootOrdinal::new(99),
                 p::NodeKind::Project { expressions } => expressions[0].1 = p::ValueId::new(99),
-                p::NodeKind::Values { rows } => rows[0][0] = p::ExprId::new(99),
-                p::NodeKind::GenerateSeries { start, .. } => *start = p::ExprId::new(99),
+                p::NodeKind::Values { rows } => rows[0][0] = RootOrdinal::new(99),
+                p::NodeKind::GenerateSeries { start, .. } => *start = RootOrdinal::new(99),
                 _ => unreachable!(),
             };
             c.arm(None);
@@ -683,7 +728,7 @@ fn simple_nodes_missing_closed_fields_refs_and_out_of_family_kinds_fail() {
             let mut node = expected(1);
             if let Some(wire::physical_node::Kind::Project(project)) = node.kind.as_mut() {
                 if missing_expr {
-                    project.expressions[0].expr_id = None;
+                    project.expressions[0].root_ordinal = None;
                 } else {
                     project.expressions[0].value_id = None;
                 }
@@ -694,9 +739,9 @@ fn simple_nodes_missing_closed_fields_refs_and_out_of_family_kinds_fail() {
             let mut node = expected(6);
             if let Some(wire::physical_node::Kind::GenerateSeries(series)) = node.kind.as_mut() {
                 if missing_start {
-                    series.start_expr_id = None;
+                    series.start_root = None;
                 } else {
-                    series.stop_expr_id = None;
+                    series.stop_root = None;
                 }
             }
             cases.push(node);
@@ -712,10 +757,12 @@ fn simple_nodes_missing_closed_fields_refs_and_out_of_family_kinds_fail() {
         for at in [0, 1, 2, 6] {
             let mut node = expected(at);
             match node.kind.as_mut() {
-                Some(wire::physical_node::Kind::Filter(v)) => v.predicate_expr_ids[0] = 99,
-                Some(wire::physical_node::Kind::Project(v)) => v.expressions[0].expr_id = Some(99),
-                Some(wire::physical_node::Kind::Values(v)) => v.rows[0].expr_ids[0] = 99,
-                Some(wire::physical_node::Kind::GenerateSeries(v)) => v.start_expr_id = Some(99),
+                Some(wire::physical_node::Kind::Filter(v)) => v.predicate_roots[0] = 99,
+                Some(wire::physical_node::Kind::Project(v)) => {
+                    v.expressions[0].root_ordinal = Some(99)
+                }
+                Some(wire::physical_node::Kind::Values(v)) => v.root_rows[0].ordinals[0] = 99,
+                Some(wire::physical_node::Kind::GenerateSeries(v)) => v.start_root = Some(99),
                 _ => unreachable!(),
             }
             cases.push(node);
@@ -790,7 +837,7 @@ fn simple_nodes_both_directions_all_seven_exact_and_one_under_caps_are_required(
         }
         let mut node = expected(2);
         if let Some(wire::physical_node::Kind::Values(values)) = node.kind.as_mut() {
-            values.rows[0].expr_ids.reserve_exact(SOURCE / 2);
+            values.root_rows[0].ordinals.reserve_exact(SOURCE / 2);
         }
         c.arm(None);
         assert!(matches!(
@@ -810,10 +857,10 @@ fn simple_nodes_empty_and_ragged_representation_is_not_a_shadow_fragment_proof()
     let c = Control::default();
     fixture.with_tokens(&c, |values, expressions, read| {
         for rows in [
-            Box::<[Box<[p::ExprId]>]>::default(),
+            Box::<[Box<[RootOrdinal]>]>::default(),
             vec![
-                Box::<[p::ExprId]>::default(),
-                vec![p::ExprId::new(7)].into_boxed_slice(),
+                Box::<[RootOrdinal]>::default(),
+                vec![RootOrdinal::new(1)].into_boxed_slice(),
             ]
             .into_boxed_slice(),
         ] {
@@ -864,7 +911,7 @@ fn simple_nodes_empty_and_ragged_representation_is_not_a_shadow_fragment_proof()
             decode_simple_node(&wire, read, SOURCE, limits()).unwrap().0,
             node
         );
-        // Filter expression 7 is a valid Value leaf, not necessarily a Boolean.
+        // Filter root 1 borrows a valid Value leaf, not necessarily a Boolean.
         // GenerateSeries and Values widths/roles likewise belong to Fragment.
     });
 }
@@ -917,12 +964,12 @@ fn simple_nodes_all_original_control_prefixes_and_nested_work_admission_are_obse
     let fixture = Fixture::new();
     let c = Control::default();
     fixture.with_tokens(&c,|values,expressions,read|{
-        let mut node=source(2);node.kind=p::NodeKind::Values{rows:Box::from([vec![p::ExprId::new(7);320].into_boxed_slice()])};let low=SimpleNodeProjectionLimits{max_work:1024,..limits()};
+        let mut node=source(2);node.kind=p::NodeKind::Values{rows:Box::from([vec![RootOrdinal::new(1);320].into_boxed_slice()])};let low=SimpleNodeProjectionLimits{max_work:1024,..limits()};
         c.arm(None);assert!(matches!(prepare_simple_node_encode(&node,values,expressions,SOURCE,low),Err(Error::Control(CompileControlError::ResourceExhausted))));assert!(!c.trace().iter().any(|(_,units)|*units==256));
-        let mut wire=expected(2);if let Some(wire::physical_node::Kind::Values(v))=wire.kind.as_mut(){v.rows=vec![wire::ExpressionIds{expr_ids:vec![7;320]}];}
+        let mut wire=expected(2);if let Some(wire::physical_node::Kind::Values(v))=wire.kind.as_mut(){v.root_rows=vec![wire::RootOrdinals{ordinals:vec![1;320]}];}
         c.arm(None);assert!(matches!(prepare_simple_node_decode(&wire,read,SOURCE,low),Err(Error::Control(CompileControlError::ResourceExhausted))));assert!(!c.trace().iter().any(|(_,units)|*units==256));
         // 320 real row headers, not a prescan or synthetic callback loop.
-        node.kind=p::NodeKind::Values{rows:vec![Box::<[p::ExprId]>::default();320].into_boxed_slice()};
+        node.kind=p::NodeKind::Values{rows:vec![Box::<[RootOrdinal]>::default();320].into_boxed_slice()};
         c.arm(None);let(wire,_)=encode_simple_node(&node,values,expressions,SOURCE,limits()).unwrap();let trace=c.trace();let at=trace.iter().position(|(_,units)|*units==256).unwrap();
         for cause in CAUSES{c.arm(Some((at,cause.clone())));assert!(matches!(encode_simple_node(&node,values,expressions,SOURCE,limits()),Err(Error::Control(actual))if actual==cause));assert_eq!(c.trace(),trace[..=at]);}
         c.arm(None);decode_simple_node(&wire,read,SOURCE,limits()).unwrap();let trace=c.trace();let at=trace.iter().position(|(_,units)|*units==256).unwrap();

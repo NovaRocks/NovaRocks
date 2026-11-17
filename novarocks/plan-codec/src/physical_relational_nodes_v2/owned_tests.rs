@@ -57,53 +57,153 @@ fn parent_under(f: &NodeProjectionFacts, axis: usize) -> RelationalNodeProjectio
 #[test]
 fn caller_owned_full_family_matches_original_oracles_and_seven_exact_axes() {
     let c = Control::default();
-    Fixture::new().with_tokens(&c, |values, expressions, read| {
-        for (node, wire) in (0..8)
-            .map(|at| (source(at), expected(at)))
-            .collect::<Vec<_>>()
-        {
-            c.arm(None);
-            let (plain, expected_encode) =
-                encode_relational_node(&node, values, expressions, SOURCE, limits()).unwrap();
-            assert_eq!(plain, wire);
-            c.arm(None);
-            let (plain, expected_decode) =
-                decode_relational_node(&wire, read, SOURCE, limits()).unwrap();
-            assert_eq!(plain, node);
+    let window = source(5);
+    Fixture::new().with_tokens(
+        &window,
+        &c,
+        |values, expressions, read, functions, aggregates| {
+            for at in 0..8 {
+                let fallback = source(at);
+                let node = source_ref(at, &window, &fallback);
+                let wire = expected(at);
+                c.arm(None);
+                let (plain, expected_encode) =
+                    encode_relational_node(node, values, expressions, SOURCE, limits()).unwrap();
+                assert_eq!(plain, wire);
+                c.arm(None);
+                let (plain, expected_decode) = decode_relational_node(
+                    &wire,
+                    read,
+                    functions,
+                    aggregates,
+                    binding_limits(),
+                    SOURCE,
+                    limits(),
+                )
+                .unwrap();
+                assert_eq!(&plain, node);
+                for receiving in [false, true] {
+                    let expected = if receiving {
+                        expected_decode
+                    } else {
+                        expected_encode
+                    };
+                    for axis in 0..=7 {
+                        c.arm(None);
+                        let mut work =
+                            CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
+                        let mut last = None;
+                        let mut admit = |f: &NodeProjectionFacts| {
+                            if let Some(old) = last {
+                                for (a, b) in parent_axes(&old).into_iter().zip(parent_axes(f)) {
+                                    assert!(a <= b);
+                                }
+                            }
+                            last = Some(*f);
+                            Ok(())
+                        };
+                        let l = if axis == 7 {
+                            parent_exact(&expected)
+                        } else {
+                            parent_under(&expected, axis)
+                        };
+                        let result = if receiving {
+                            prepare_relational_node_decode_in(
+                                &wire,
+                                read,
+                                functions,
+                                aggregates,
+                                binding_limits(),
+                                SOURCE,
+                                l,
+                                &mut admit,
+                                &mut work,
+                            )
+                            .and_then(|p| p.emit_in(&mut admit, &mut work))
+                            .map(|(actual, f)| {
+                                assert_eq!(&actual, node);
+                                f
+                            })
+                        } else {
+                            prepare_relational_node_encode_in(
+                                node,
+                                values,
+                                expressions,
+                                SOURCE,
+                                l,
+                                &mut admit,
+                                &mut work,
+                            )
+                            .and_then(|p| p.emit_in(&mut admit, &mut work))
+                            .map(|(actual, f)| {
+                                assert_eq!(actual, wire);
+                                f
+                            })
+                        };
+                        let result = finish(work, result);
+                        if axis == 7 {
+                            assert_eq!(result.unwrap(), expected);
+                            assert_eq!(last, Some(expected));
+                        } else {
+                            assert!(matches!(
+                                result,
+                                Err(Error::Control(CompileControlError::ResourceExhausted))
+                            ));
+                        }
+                        assert!(
+                            c.trace()
+                                .iter()
+                                .all(|(phase, _)| *phase == CompilePhase::LowerProgram)
+                        );
+                    }
+                }
+            }
+        },
+    );
+}
+
+#[test]
+fn caller_owned_known_header_and_emit_requests_precede_late_control_and_foreign_work() {
+    let c = Control::default();
+    let window = source(5);
+    Fixture::new().with_tokens(
+        &window,
+        &c,
+        |values, expressions, read, functions, aggregates| {
+            let (node, wire) = (0..8)
+                .map(|at| (source(at), expected(at)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .next()
+                .unwrap();
             for receiving in [false, true] {
-                let expected = if receiving {
-                    expected_decode
-                } else {
-                    expected_encode
-                };
-                for axis in 0..=7 {
-                    c.arm(None);
+                for late in CAUSES {
+                    c.arm(Some((1, late.clone())));
                     let mut work =
                         CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
-                    let mut last = None;
-                    let mut admit = |f: &NodeProjectionFacts| {
-                        if let Some(old) = last {
-                            for (a, b) in parent_axes(&old).into_iter().zip(parent_axes(f)) {
-                                assert!(a <= b);
-                            }
-                        }
-                        last = Some(*f);
+                    for _ in 0..255 {
+                        work.step().unwrap();
+                    }
+                    let mut l = limits();
+                    l.max_allocation_request_bytes = 0;
+                    let mut calls = 0;
+                    let mut admit = |_: &NodeProjectionFacts| {
+                        calls += 1;
                         Ok(())
-                    };
-                    let l = if axis == 7 {
-                        parent_exact(&expected)
-                    } else {
-                        parent_under(&expected, axis)
                     };
                     let result = if receiving {
                         prepare_relational_node_decode_in(
-                            &wire, read, SOURCE, l, &mut admit, &mut work,
+                            &wire,
+                            read,
+                            functions,
+                            aggregates,
+                            binding_limits(),
+                            SOURCE,
+                            l,
+                            &mut admit,
+                            &mut work,
                         )
-                        .and_then(|p| p.emit_in(&mut admit, &mut work))
-                        .map(|(actual, f)| {
-                            assert_eq!(actual, node);
-                            f
-                        })
+                        .map(|_| ())
                     } else {
                         prepare_relational_node_encode_in(
                             &node,
@@ -114,161 +214,104 @@ fn caller_owned_full_family_matches_original_oracles_and_seven_exact_axes() {
                             &mut admit,
                             &mut work,
                         )
-                        .and_then(|p| p.emit_in(&mut admit, &mut work))
-                        .map(|(actual, f)| {
-                            assert_eq!(actual, wire);
-                            f
-                        })
+                        .map(|_| ())
                     };
-                    let result = finish(work, result);
-                    if axis == 7 {
-                        assert_eq!(result.unwrap(), expected);
-                        assert_eq!(last, Some(expected));
-                    } else {
+                    assert!(matches!(
+                        finish(work, result),
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ));
+                    assert_eq!(calls, 0);
+                    assert_eq!(c.trace(), [(CompilePhase::LowerProgram, 0)]);
+                    c.arm(None);
+                    let mut work =
+                        CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
+                    if receiving {
+                        let p = prepare_relational_node_decode_in(
+                            &wire,
+                            read,
+                            functions,
+                            aggregates,
+                            binding_limits(),
+                            SOURCE,
+                            limits(),
+                            &mut |_| Ok(()),
+                            &mut work,
+                        )
+                        .unwrap();
+                        c.arm(Some((0, late)));
                         assert!(matches!(
-                            result,
+                            p.emit_in(
+                                &mut |_| Err(CompileControlError::ResourceExhausted),
+                                &mut work
+                            ),
+                            Err(Error::Control(CompileControlError::ResourceExhausted))
+                        ));
+                    } else {
+                        let p = prepare_relational_node_encode_in(
+                            &node,
+                            values,
+                            expressions,
+                            SOURCE,
+                            limits(),
+                            &mut |_| Ok(()),
+                            &mut work,
+                        )
+                        .unwrap();
+                        c.arm(Some((0, late)));
+                        assert!(matches!(
+                            p.emit_in(
+                                &mut |_| Err(CompileControlError::ResourceExhausted),
+                                &mut work
+                            ),
                             Err(Error::Control(CompileControlError::ResourceExhausted))
                         ));
                     }
-                    assert!(
-                        c.trace()
-                            .iter()
-                            .all(|(phase, _)| *phase == CompilePhase::LowerProgram)
-                    );
+                    assert!(c.trace().is_empty());
                 }
             }
-        }
-    });
-}
-
-#[test]
-fn caller_owned_known_header_and_emit_requests_precede_late_control_and_foreign_work() {
-    let c = Control::default();
-    Fixture::new().with_tokens(&c, |values, expressions, read| {
-        let (node, wire) = (0..8)
-            .map(|at| (source(at), expected(at)))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .next()
-            .unwrap();
-        for receiving in [false, true] {
-            for late in CAUSES {
-                c.arm(Some((1, late.clone())));
-                let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
-                for _ in 0..255 {
-                    work.step().unwrap();
-                }
-                let mut l = limits();
-                l.max_allocation_request_bytes = 0;
-                let mut calls = 0;
-                let mut admit = |_: &NodeProjectionFacts| {
+            c.arm(None);
+            let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
+            let result = prepare_relational_node_encode_in(
+                &node,
+                values,
+                expressions,
+                0,
+                limits(),
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .map(|_| ());
+            assert!(matches!(finish(work, result), Err(Error::InvalidShape(_))));
+            let foreign = Control::default();
+            foreign.arm(None);
+            let mut work =
+                CompileCheckpoints::try_new(&foreign, CompilePhase::LowerProgram).unwrap();
+            let mut calls = 0;
+            let result = prepare_relational_node_encode_in(
+                &node,
+                values,
+                expressions,
+                SOURCE,
+                limits(),
+                &mut |_| {
                     calls += 1;
                     Ok(())
-                };
-                let result = if receiving {
-                    prepare_relational_node_decode_in(&wire, read, SOURCE, l, &mut admit, &mut work)
-                        .map(|_| ())
-                } else {
-                    prepare_relational_node_encode_in(
-                        &node,
-                        values,
-                        expressions,
-                        SOURCE,
-                        l,
-                        &mut admit,
-                        &mut work,
-                    )
-                    .map(|_| ())
-                };
-                assert!(matches!(
-                    finish(work, result),
-                    Err(Error::Control(CompileControlError::ResourceExhausted))
-                ));
-                assert_eq!(calls, 0);
-                assert_eq!(c.trace(), [(CompilePhase::LowerProgram, 0)]);
-                c.arm(None);
-                let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
-                if receiving {
-                    let p = prepare_relational_node_decode_in(
-                        &wire,
-                        read,
-                        SOURCE,
-                        limits(),
-                        &mut |_| Ok(()),
-                        &mut work,
-                    )
-                    .unwrap();
-                    c.arm(Some((0, late)));
-                    assert!(matches!(
-                        p.emit_in(
-                            &mut |_| Err(CompileControlError::ResourceExhausted),
-                            &mut work
-                        ),
-                        Err(Error::Control(CompileControlError::ResourceExhausted))
-                    ));
-                } else {
-                    let p = prepare_relational_node_encode_in(
-                        &node,
-                        values,
-                        expressions,
-                        SOURCE,
-                        limits(),
-                        &mut |_| Ok(()),
-                        &mut work,
-                    )
-                    .unwrap();
-                    c.arm(Some((0, late)));
-                    assert!(matches!(
-                        p.emit_in(
-                            &mut |_| Err(CompileControlError::ResourceExhausted),
-                            &mut work
-                        ),
-                        Err(Error::Control(CompileControlError::ResourceExhausted))
-                    ));
-                }
-                assert!(c.trace().is_empty());
-            }
-        }
-        c.arm(None);
-        let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
-        let result = prepare_relational_node_encode_in(
-            &node,
-            values,
-            expressions,
-            0,
-            limits(),
-            &mut |_| Ok(()),
-            &mut work,
-        )
-        .map(|_| ());
-        assert!(matches!(finish(work, result), Err(Error::InvalidShape(_))));
-        let foreign = Control::default();
-        foreign.arm(None);
-        let mut work = CompileCheckpoints::try_new(&foreign, CompilePhase::LowerProgram).unwrap();
-        let mut calls = 0;
-        let result = prepare_relational_node_encode_in(
-            &node,
-            values,
-            expressions,
-            SOURCE,
-            limits(),
-            &mut |_| {
-                calls += 1;
-                Ok(())
-            },
-            &mut work,
-        )
-        .map(|_| ());
-        assert!(matches!(result, Err(Error::InvalidShape(_))));
-        assert_eq!(calls, 0);
-        assert_eq!(foreign.trace(), [(CompilePhase::LowerProgram, 0)]);
-    });
+                },
+                &mut work,
+            )
+            .map(|_| ());
+            assert!(matches!(result, Err(Error::InvalidShape(_))));
+            assert_eq!(calls, 0);
+            assert_eq!(foreign.trace(), [(CompilePhase::LowerProgram, 0)]);
+        },
+    );
 }
 
 #[test]
 fn caller_owned_all_actual_small_prefixes_and_wide_nested_quantum() {
     let c = Control::default();
-    Fixture::new().with_tokens(&c, |values, expressions, read| {
+    let window = source(5);
+    Fixture::new().with_tokens(&window, &c, |values, expressions, read, functions, aggregates| {
         let (node,wire)=(0..8).map(|at| (source(at), expected(at))).collect::<Vec<_>>().into_iter().next().unwrap();
         let invoke = |receiving:bool,ordinary:bool,stop:Option<(usize,CompileControlError)>| {
             let mut node=node.clone(); let mut wire=wire.clone();
@@ -276,7 +319,7 @@ fn caller_owned_all_actual_small_prefixes_and_wide_nested_quantum() {
             c.arm(stop);
             let mut work=CompileCheckpoints::try_new(&c,CompilePhase::LowerProgram)?;
             let result=if receiving {
-                prepare_relational_node_decode_in(&wire,read,SOURCE,limits(),&mut |_| Ok(()),&mut work).and_then(|p|p.emit_in(&mut |_| Ok(()),&mut work)).map(|_|())
+                prepare_relational_node_decode_in(&wire, read, functions, aggregates, binding_limits(), SOURCE, limits(), &mut |_| Ok(()), &mut work).and_then(|p|p.emit_in(&mut |_| Ok(()),&mut work)).map(|_|())
             } else {
                 prepare_relational_node_encode_in(&node,values, expressions,SOURCE,limits(),&mut |_| Ok(()),&mut work).and_then(|p|p.emit_in(&mut |_| Ok(()),&mut work)).map(|_|())
             }; finish(work,result)
@@ -318,7 +361,7 @@ fn caller_owned_all_actual_small_prefixes_and_wide_nested_quantum() {
             let run=|stop| {
                 c.arm(stop);let mut work=CompileCheckpoints::try_new(&c,CompilePhase::LowerProgram)?;
                 let result=if receiving {
-                    prepare_relational_node_decode_in(&wire,read,SOURCE,limits(),&mut |_|Ok(()),&mut work).and_then(|p|p.emit_in(&mut |_|Ok(()),&mut work)).map(|(actual,_)|assert_eq!(actual,node))
+                    prepare_relational_node_decode_in(&wire, read, functions, aggregates, binding_limits(), SOURCE, limits(), &mut |_|Ok(()), &mut work).and_then(|p|p.emit_in(&mut |_|Ok(()),&mut work)).map(|(actual,_)|assert_eq!(actual,node))
                 } else {
                     prepare_relational_node_encode_in(&node,values, expressions,SOURCE,limits(),&mut |_|Ok(()),&mut work).and_then(|p|p.emit_in(&mut |_|Ok(()),&mut work)).map(|(actual,_)|assert_eq!(actual,wire))
                 };finish(work,result)

@@ -288,13 +288,13 @@ fn caller_owned_all_actual_small_prefixes_and_wide_nested_quantum() {
             }}
         }}
         let mut node = source(2);
-        node.kind = p::NodeKind::Values { rows: vec![vec![p::ExprId::new(7); 320].into_boxed_slice()].into_boxed_slice() };
+        node.kind = p::NodeKind::Values { rows: vec![vec![RootOrdinal::new(1); 320].into_boxed_slice()].into_boxed_slice() };
         // Independent actual first nested request Layout, before any source
         // counting callback: the full node header and the captured child list.
         let captured_bytes = std::mem::size_of::<u32>()
             + std::mem::size_of::<wire::PhysicalProperties>()
             + 3 * std::mem::size_of::<u32>()
-            + std::mem::size_of::<wire::ExpressionIds>() + 320 * std::mem::size_of::<u32>();
+            + std::mem::size_of::<wire::RootOrdinals>() + 320 * std::mem::size_of::<u32>();
         for late in CAUSES {
             c.arm(Some((1, late)));
             let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();

@@ -19,7 +19,15 @@ use super::*;
 use crate::physical_type_v2::{TypeProjectionLimits, encode_type_table_sources};
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field};
+use novarocks_expression_contract::{
+    BoundExprSet, BoundExprSetBuilder, DefinitionControl, ExprId, ExprKind, ExpressionCallClaim,
+    RootScope, UnitLimits, UnitParts,
+};
 use novarocks_physical_plan as p;
+use novarocks_type_contract::{
+    ArgumentControl, CallProofScope, ControlShape, EvaluationDemand, FunctionInstanceState,
+    FunctionNullBehavior, ObservableEffects,
+};
 use novarocks_type_contract::{
     FunctionArgumentEvaluation, FunctionArgumentType, FunctionFailureBehavior, FunctionId,
     FunctionIntrinsicRowError, FunctionKind, FunctionOverloadId, FunctionVolatility,
@@ -133,8 +141,8 @@ fn nested(name: &str) -> FunctionValueType {
         false,
     )
 }
-fn binding(args: Vec<FunctionArgumentType>) -> p::BoundFunction {
-    p::BoundFunction {
+fn binding(args: Vec<FunctionArgumentType>) -> novarocks_expression_contract::BoundFunction {
+    novarocks_expression_contract::BoundFunction {
         function_id: FunctionId::try_new("test/codec-original-request").unwrap(),
         overload: FunctionOverloadId::try_new("test/codec-original-request/v1").unwrap(),
         kind: FunctionKind::Scalar,
@@ -143,7 +151,7 @@ fn binding(args: Vec<FunctionArgumentType>) -> p::BoundFunction {
         ),
         result_type: int(),
 
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: FunctionVolatility::Immutable,
             argument_evaluation: FunctionArgumentEvaluation::Eager,
             failure_behavior: FunctionFailureBehavior::Propagate,
@@ -154,9 +162,77 @@ fn binding(args: Vec<FunctionArgumentType>) -> p::BoundFunction {
 }
 /// Real checked structural source; no installed function/provenance claim.
 pub(crate) struct Fixture {
-    pub(crate) fragment: p::Fragment,
+    pub(crate) unit: BoundExprSet,
     pub(crate) roots: Vec<(u32, FunctionValueType)>,
     pub(crate) pools: ConstantPools,
+}
+fn unit_limits() -> UnitLimits {
+    UnitLimits {
+        expression_semantic_depth: p::PlanLimits::FROZEN.expression_semantic_depth,
+    }
+}
+impl Fixture {
+    fn receiving_parts(&self) -> UnitParts {
+        UnitParts::new(
+            self.unit.ports().into(),
+            self.unit.definitions().into(),
+            self.unit.roots().into(),
+            self.unit.root_use_ids().into(),
+            self.unit.control_flow().clone(),
+            self.unit.claims().clone(),
+            self.unit.requests().clone(),
+        )
+    }
+    fn with_request(mut self, request: PhysicalCallRequest) -> Self {
+        let mut parts = self.unit.into_parts();
+        parts.requests.insert(ExprId::new(0), request);
+        let c = Control::default();
+        let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();
+        self.unit = BoundExprSet::try_from_parts_in(parts, unit_limits(), &mut work).unwrap();
+        work.finish().unwrap();
+        self
+    }
+}
+// Loan the real checked unit to the same generic preflight/emission authors.
+// Only tests isolating a native emission quantum need these split helpers;
+// complete caller-borrowed projections below use encode_unit_requests_in.
+fn prepare_unit_token<'a, 's>(
+    unit: &'a BoundExprSet,
+    types: &'a EncodedTypeTable<'s>,
+    ids: &'a [UnitRequestTypeIds<'a>],
+    pools: &'a ConstantPools,
+    invoice: usize,
+    limits: CallRequestProjectionLimits,
+    control: &'a dyn PureCompileControl,
+) -> Result<PreparedCallRequestsEncode<'a, 's, ExprId>, Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let result = preflight::<std::convert::Infallible, _>(
+        unit.requests(),
+        types,
+        ids,
+        pools,
+        invoice,
+        limits,
+        None,
+        &mut work,
+    )
+    .map_err(ProjectionFailure::without_host)
+    .map(|facts| PreparedCallRequestsEncode {
+        source: unit.requests(),
+        types,
+        type_ids: ids,
+        pools,
+        control,
+        facts,
+    });
+    finish(work, result)
+}
+fn emit_unit_token(
+    token: PreparedCallRequestsEncode<'_, '_, ExprId>,
+) -> Result<Vec<wire::UnitCallRequest>, Error> {
+    let mut work = CompileCheckpoints::try_new(token.control, CompilePhase::Encode)?;
+    let result = emit_core(token, &mut work);
+    finish(work, result)
 }
 pub(crate) fn fixture() -> Fixture {
     fixture_with_reference(p::ConstantReference {
@@ -188,128 +264,136 @@ fn fixture_with_parameters(reference: p::ConstantReference, parameter_count: usi
     pools
         .insert(p::ConstantPoolId::new(u32::MAX), pool)
         .unwrap();
-    let owner = p::NodeId::new(42);
-    let mut builder = p::FragmentBuilder::new(p::FragmentId::new(0));
-    builder
-        .add_values(
-            p::NodeId::new(99),
-            Box::from([Box::default()]),
-            Box::default(),
+    let mut builder = BoundExprSetBuilder::new(unit_limits());
+    let call = builder.reserve().unwrap();
+    let input = builder
+        .add(
+            None,
+            int(),
+            crate::test_constants::insert(&mut pools, crate::test_constants::i64(5)(&int())),
         )
         .unwrap();
-    // Sparse call ID0, independent scoped Lambda body, original order retained.
-    let input = p::ExprId::new(10);
-    let lambda = p::ExprId::new(20);
-    let body = p::ExprId::new(21);
-    let call = p::ExprId::new(0);
-    for node in [
-        p::ExprNode {
-            id: input,
-            owner,
-            ty: int(),
-            lambda_scope: None,
-            kind: crate::test_constants::insert(&mut pools, crate::test_constants::i64(5)(&int())),
-        },
-        p::ExprNode {
-            id: body,
-            owner,
-            ty: int(),
-            lambda_scope: Some(lambda),
-            kind: crate::test_constants::insert(&mut pools, crate::test_constants::i64(9)(&int())),
-        },
-        p::ExprNode {
-            id: lambda,
-            owner,
-            ty: int(),
-            lambda_scope: None,
-            kind: p::ExprKind::Lambda {
-                parameter_types: vec![nested("payload"); parameter_count].into_boxed_slice(),
+    let lambda = builder.reserve().unwrap();
+    let body = builder
+        .add(
+            Some(lambda),
+            int(),
+            crate::test_constants::insert(&mut pools, crate::test_constants::i64(9)(&int())),
+        )
+        .unwrap();
+    let parameters = vec![nested("payload"); parameter_count];
+    builder
+        .insert(
+            lambda,
+            None,
+            int(),
+            ExprKind::Lambda {
+                parameter_types: parameters.clone().into_boxed_slice(),
                 body,
             },
-        },
-        p::ExprNode {
-            id: call,
-            owner,
-            ty: int(),
-            lambda_scope: None,
-            kind: p::ExprKind::FunctionCall {
+        )
+        .unwrap();
+    builder
+        .insert(
+            call,
+            None,
+            int(),
+            ExprKind::FunctionCall {
                 function: binding(vec![
                     FunctionArgumentType::Value(int()),
                     FunctionArgumentType::Value(int()),
                     FunctionArgumentType::Lambda {
                         parameter_types:
                             novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
-                                vec![nested("payload"); parameter_count].into_boxed_slice(),
+                                parameters.clone().into_boxed_slice(),
                             ),
                         result_type: int(),
                     },
                 ]),
-                args: Box::from([input, input, lambda]),
-            },
-        },
-    ] {
-        builder.insert_expression(node).unwrap();
-    }
-    let output = builder
-        .add_value(
-            int(),
-            p::ValueOrigin::Expr {
-                node: owner,
-                expr: call,
+                args: Box::new([input, input, lambda]),
             },
         )
         .unwrap();
     builder
-        .add_project(
-            owner,
-            p::NodeId::new(99),
-            Box::from([(call, output)]),
-            Box::from([output]),
-        )
-        .unwrap();
-    let fragment = builder
-        .finish_definition(
-            owner,
-            p::FragmentSink::Noop,
-            p::PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap()
-        .with_call_requests_observed(
-            vec![(
-                PhysicalCallDefinition::Expression(call),
-                PhysicalCallRequest {
-                    arguments: Box::from([
-                        Argument::Value {
-                            value_type: int(),
-                            constant: None,
-                        },
-                        Argument::Value {
-                            value_type: int(),
-                            constant: Some(reference),
-                        },
-                        Argument::Lambda {
-                            parameter_types:
-                                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
-                                    vec![nested("payload"); parameter_count].into_boxed_slice(),
-                                ),
-                            result_type: int(),
-                        },
-                    ]),
-                    logical_argument_count: 3,
-                    expected_result_type: Some(int()),
-                    constant_policy: data_policy(),
+        .definition_control(
+            call,
+            DefinitionControl {
+                shape: ControlShape::HigherOrder {
+                    body_ordinal: 2,
+                    body_demand: EvaluationDemand::Value,
                 },
-            )],
-            &control,
+                temporal_sources: None,
+            },
         )
         .unwrap();
+    builder
+        .request(
+            call,
+            PhysicalCallRequest {
+                arguments: Box::new([
+                    Argument::Value {
+                        value_type: int(),
+                        constant: None,
+                    },
+                    Argument::Value {
+                        value_type: int(),
+                        constant: Some(reference),
+                    },
+                    Argument::Lambda {
+                        parameter_types:
+                            novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                parameters.into_boxed_slice(),
+                            ),
+                        result_type: int(),
+                    },
+                ]),
+                logical_argument_count: 3,
+                expected_result_type: Some(int()),
+                constant_policy: data_policy(),
+            },
+        )
+        .unwrap();
+    builder
+        .root(call, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let sealed = builder.seal(vec![], &mut work).unwrap();
+    let claims = sealed
+        .uses()
+        .iter()
+        .filter(|(_, i)| i.definition == call)
+        .map(|(&id, i)| {
+            (
+                id,
+                ExpressionCallClaim {
+                    context: i.context,
+                    effects: novarocks_type_contract::CallEffects {
+                        value_stability: FunctionVolatility::Immutable,
+                        own_row_error: FunctionIntrinsicRowError::NoRowError,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        null_behavior: FunctionNullBehavior::CalledOnNull,
+                        argument_control: ArgumentControl::HigherOrder {
+                            body_ordinal: 2,
+                            body_demand: EvaluationDemand::Value,
+                        },
+                        instance_state: FunctionInstanceState::None,
+                        observable_effects: ObservableEffects::NONE,
+                        environment: Box::default(),
+                        proof_scope: CallProofScope::Region(i.context.region),
+                    },
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    temporal_source: None,
+                    regexp_count_pattern_source: None,
+                    to_base64_byte_source: None,
+                },
+            )
+        })
+        .collect();
+    let unit = sealed.finish(claims, &mut work).unwrap();
+    work.finish().unwrap();
     Fixture {
-        fragment,
+        unit,
         roots: vec![
             (0, int()),
             (u32::MAX, nested("payload")),
@@ -318,13 +402,124 @@ fn fixture_with_parameters(reference: p::ConstantReference, parameter_count: usi
         pools,
     }
 }
+fn relation_fixture() -> p::Fragment {
+    let control = Control::default();
+    let mut builder = p::FragmentBuilder::new(p::FragmentId::new(0));
+    let input = p::NodeId::new(99);
+    let node = p::NodeId::new(42);
+    builder
+        .add_values(input, Box::new([Box::default()]), Box::default())
+        .unwrap();
+    let output = builder
+        .add_value(
+            int(),
+            p::ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    let props = p::PhysicalProperties {
+        distribution: p::Distribution::Singleton,
+        row_multiplicity: p::RowMultiplicity::SingleCopy,
+        ordering: Box::default(),
+    };
+    let mut function = binding(vec![]);
+    function.kind = FunctionKind::Window;
+    function
+        .legacy_metadata
+        .as_mut()
+        .unwrap()
+        .intrinsic_row_error = FunctionIntrinsicRowError::NotRowEvaluated;
+    builder
+        .insert_node_unchecked(p::PhysicalNode {
+            id: node,
+            inputs: Box::new([input]),
+            required_inputs: Box::new([props.clone()]),
+            output_properties: props,
+            output: p::OutputPort {
+                node,
+                columns: Box::new([output]),
+            },
+            kind: p::NodeKind::Window(p::WindowSpec {
+                partition_by: Box::default(),
+                order_by: Box::default(),
+                calls: Box::new([p::WindowCallSpec {
+                    binding: function,
+                    distinct: false,
+                    arguments: Box::default(),
+                    order_by: Box::default(),
+                    frame: None,
+                    ignore_nulls: false,
+                    aggregate_binding: None,
+                    output,
+                }]),
+            }),
+            expressions: None,
+        })
+        .unwrap();
+    let fragment = builder
+        .finish_structure(
+            node,
+            p::FragmentSink::Noop,
+            p::PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            p::PlanLimits::FROZEN,
+            &control,
+            p::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
+    let site = PhysicalCallSite::Window { node, call: 0 };
+    let fragment = fragment
+        .with_call_requests_observed(
+            vec![(
+                site,
+                PhysicalCallRequest {
+                    arguments: Box::default(),
+                    logical_argument_count: 0,
+                    expected_result_type: None,
+                    constant_policy: data_policy(),
+                },
+            )],
+            &control,
+        )
+        .unwrap();
+    let context = novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(0),
+    );
+    fragment
+        .with_calls_observed(
+            vec![p::FrozenPhysicalCall {
+                site,
+                context,
+                effects: novarocks_type_contract::CallEffects {
+                    value_stability: FunctionVolatility::Immutable,
+                    own_row_error: FunctionIntrinsicRowError::NotRowEvaluated,
+                    failure_behavior: FunctionFailureBehavior::Propagate,
+                    null_behavior: FunctionNullBehavior::CalledOnNull,
+                    argument_control: ArgumentControl::Window,
+                    instance_state: FunctionInstanceState::WindowPartition,
+                    observable_effects: ObservableEffects::NONE,
+                    environment: Box::default(),
+                    proof_scope: CallProofScope::Relation(context.identity),
+                },
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                materialized_writer_input: None,
+            }],
+            &control,
+        )
+        .unwrap()
+}
 fn project<'a>(
     parameter_ids: &'a [u32],
     arguments: &'a [ArgumentTypeIds<'a>],
-) -> [CallRequestTypeIds<'a>; 1] {
+) -> [UnitRequestTypeIds<'a>; 1] {
     let _ = parameter_ids;
-    [CallRequestTypeIds {
-        definition: PhysicalCallDefinition::Expression(p::ExprId::new(0)),
+    [UnitRequestTypeIds {
+        definition: ExprId::new(0),
         arguments,
         expected_result_type: Some(0),
     }]
@@ -335,7 +530,7 @@ fn run(
     limits: CallRequestProjectionLimits,
     invoice: usize,
     bad_type: bool,
-) -> Result<(wire::FragmentCallRequests, CallRequestProjectionFacts), Error> {
+) -> Result<(Vec<wire::UnitCallRequest>, CallRequestProjectionFacts), Error> {
     let types = encode_type_table_sources(&f.roots, &[], types_limits(), control).unwrap();
     let params = [if bad_type { 7 } else { u32::MAX }];
     let args = [
@@ -348,17 +543,18 @@ fn run(
     ];
     let ids = project(&params, &args);
     control.arm(None);
-    let prepared = prepare_call_requests_encode(
-        f.fragment.call_requests(),
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let result = encode_unit_requests_in(
+        &f.unit,
         &types,
         &ids,
         &f.pools,
         invoice,
         limits,
-        control,
-    )?;
-    let facts = *prepared.facts();
-    Ok((encode_call_requests(prepared)?, facts))
+        &mut |_| Ok(()),
+        &mut work,
+    );
+    finish(work, result)
 }
 #[test]
 fn original_value_none_typed_null_lambda_constraint_and_all_policy_fields_have_independent_wire_oracle()
@@ -366,65 +562,59 @@ fn original_value_none_typed_null_lambda_constraint_and_all_policy_fields_have_i
     let f = fixture();
     let c = Control::default();
     let (actual, facts) = run(&f, &c, limits(), SOURCE, false).unwrap();
-    let expected = wire::FragmentCallRequests {
-        entries: vec![wire::OriginalCallRequest {
-            definition: Some(wire::CallRequestDefinition {
-                kind: Some(wire::call_request_definition::Kind::ExpressionDefinitionId(
-                    0,
+    let expected = vec![wire::UnitCallRequest {
+        definition_id: Some(0),
+        arguments: vec![
+            wire::OriginalFunctionArgument {
+                kind: Some(wire::original_function_argument::Kind::Value(
+                    wire::OriginalValueArgument {
+                        value_type_id: Some(0),
+                        constant: None,
+                    },
                 )),
-            }),
-            arguments: vec![
-                wire::OriginalFunctionArgument {
-                    kind: Some(wire::original_function_argument::Kind::Value(
-                        wire::OriginalValueArgument {
-                            value_type_id: Some(0),
-                            constant: None,
-                        },
-                    )),
-                },
-                wire::OriginalFunctionArgument {
-                    kind: Some(wire::original_function_argument::Kind::Value(
-                        wire::OriginalValueArgument {
-                            value_type_id: Some(0),
-                            constant: Some(wire::ConstantReference {
-                                pool_id: Some(u32::MAX),
-                                row_ordinal: 1,
-                            }),
-                        },
-                    )),
-                },
-                wire::OriginalFunctionArgument {
-                    kind: Some(wire::original_function_argument::Kind::Lambda(
-                        wire::LambdaArgumentType {
-                            parameter_value_type_ids: vec![u32::MAX],
-                            result_value_type_id: Some(0),
-                        },
-                    )),
-                },
-            ],
-            logical_argument_count: Some(3),
-            expected_result_value_type_id: Some(0),
-            constant_policy: Some(wire::SourceConstantPolicy {
-                max_rows: Some(0),
-                max_array_nodes: Some(u64::MAX),
-                max_logical_elements: Some(2),
-                max_retained_buffer_bytes: Some(3),
-                max_type_depth: Some(0),
-                max_type_nodes: Some(5),
-                max_dictionary_depth: Some(u32::MAX),
-                max_metadata_bytes: Some(7),
-                max_library_validation_work: Some(8),
-                max_library_validation_bytes: Some(9),
-            }),
-        }],
-    };
+            },
+            wire::OriginalFunctionArgument {
+                kind: Some(wire::original_function_argument::Kind::Value(
+                    wire::OriginalValueArgument {
+                        value_type_id: Some(0),
+                        constant: Some(wire::ConstantReference {
+                            pool_id: Some(u32::MAX),
+                            row_ordinal: 1,
+                        }),
+                    },
+                )),
+            },
+            wire::OriginalFunctionArgument {
+                kind: Some(wire::original_function_argument::Kind::Lambda(
+                    wire::LambdaArgumentType {
+                        parameter_value_type_ids: vec![u32::MAX],
+                        result_value_type_id: Some(0),
+                    },
+                )),
+            },
+        ],
+        logical_argument_count: Some(3),
+        expected_result_value_type_id: Some(0),
+        constant_policy: Some(wire::SourceConstantPolicy {
+            max_rows: Some(0),
+            max_array_nodes: Some(u64::MAX),
+            max_logical_elements: Some(2),
+            max_retained_buffer_bytes: Some(3),
+            max_type_depth: Some(0),
+            max_type_nodes: Some(5),
+            max_dictionary_depth: Some(u32::MAX),
+            max_metadata_bytes: Some(7),
+            max_library_validation_work: Some(8),
+            max_library_validation_bytes: Some(9),
+        }),
+    }];
     assert_eq!(actual, expected);
     assert_eq!(facts.definition_count, 1);
     assert_eq!(facts.type_reference_count, 5);
     assert_eq!(facts.allocation_requests_upper_bound, 3);
     assert_eq!(
         facts.request_bytes_upper_bound,
-        size_of::<wire::OriginalCallRequest>()
+        size_of::<wire::UnitCallRequest>()
             + 3 * size_of::<wire::OriginalFunctionArgument>()
             + size_of::<u32>()
     );
@@ -531,16 +721,8 @@ fn prefixes(f: &Fixture, bad: bool) {
     ];
     let ids = project(&params, &args);
     baseline.arm(None);
-    let outcome = prepare_call_requests_encode(
-        f.fragment.call_requests(),
-        &types,
-        &ids,
-        &f.pools,
-        SOURCE,
-        limits(),
-        &baseline,
-    )
-    .and_then(encode_call_requests);
+    let outcome = prepare_unit_token(&f.unit, &types, &ids, &f.pools, SOURCE, limits(), &baseline)
+        .and_then(emit_unit_token);
     assert_eq!(outcome.is_err(), bad);
     let trace = baseline.trace();
     assert!(!trace.is_empty());
@@ -548,16 +730,8 @@ fn prefixes(f: &Fixture, bad: bool) {
         for cause in CAUSES {
             let c = Control::default();
             c.arm(Some((at, cause.clone())));
-            let result = prepare_call_requests_encode(
-                f.fragment.call_requests(),
-                &types,
-                &ids,
-                &f.pools,
-                SOURCE,
-                limits(),
-                &c,
-            )
-            .and_then(encode_call_requests);
+            let result = prepare_unit_token(&f.unit, &types, &ids, &f.pools, SOURCE, limits(), &c)
+                .and_then(emit_unit_token);
             assert!(matches!(result,Err(Error::Control(actual)) if actual==cause));
             assert_eq!(c.trace(), trace[..=at]);
         }
@@ -586,21 +760,13 @@ fn ordered_type_source_shape_and_constraint_presence_cannot_be_guessed() {
         let mut ids = project(&params, &args);
         let empty = [];
         match variant {
-            0 => ids[0].definition = PhysicalCallDefinition::Expression(p::ExprId::new(u32::MAX)),
+            0 => ids[0].definition = ExprId::new(u32::MAX),
             1 => ids[0].expected_result_type = None,
             2 => ids[0].arguments = &empty,
             _ => ids[0].arguments = &args[..2],
         }
         assert!(matches!(
-            prepare_call_requests_encode(
-                f.fragment.call_requests(),
-                &types,
-                &ids,
-                &f.pools,
-                SOURCE,
-                limits(),
-                &c
-            ),
+            prepare_unit_token(&f.unit, &types, &ids, &f.pools, SOURCE, limits(), &c),
             Err(Error::InvalidShape(_))
         ));
     }
@@ -608,38 +774,20 @@ fn ordered_type_source_shape_and_constraint_presence_cannot_be_guessed() {
 #[test]
 fn empty_explicit_table_emits_empty_and_wide_actual_value_channels_observe_real_quantum() {
     let c = Control::default();
-    let mut b = p::FragmentBuilder::new(p::FragmentId::new(0));
-    b.add_values(p::NodeId::new(0), Box::default(), Box::default())
-        .unwrap();
-    let empty = b
-        .finish_definition(
-            p::NodeId::new(0),
-            p::FragmentSink::Noop,
-            p::PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
+    let builder = BoundExprSetBuilder::new(unit_limits());
+    let mut setup = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();
+    let empty = builder
+        .seal(vec![], &mut setup)
         .unwrap()
-        .with_call_requests_observed(vec![], &c)
+        .finish(std::collections::BTreeMap::new(), &mut setup)
         .unwrap();
+    setup.finish().unwrap();
     let roots = [];
     let types = encode_type_table_sources(&roots, &[], types_limits(), &c).unwrap();
     c.arm(None);
     let pools = ConstantPools::empty();
-    let token = prepare_call_requests_encode(
-        empty.call_requests(),
-        &types,
-        &[],
-        &pools,
-        SOURCE,
-        limits(),
-        &c,
-    )
-    .unwrap();
-    assert!(encode_call_requests(token).unwrap().entries.is_empty());
+    let token = prepare_unit_token(&empty, &types, &[], &pools, SOURCE, limits(), &c).unwrap();
+    assert!(emit_unit_token(token).unwrap().is_empty());
     // The actual 320-parameter Lambda exists in the checked source and is
     // projected through the complete prepare/emission port. The sampled 256
     // belongs to owned parameter loops, not opaque Arrow/type internals.
@@ -665,8 +813,8 @@ fn empty_explicit_table_emits_empty_and_wide_actual_value_channels_observe_real_
     let mut wide_limits = limits();
     wide_limits.max_work = 1usize << 34;
     setup.arm(None);
-    let token = prepare_call_requests_encode(
-        wide.fragment.call_requests(),
+    let token = prepare_unit_token(
+        &wide.unit,
         &types,
         &ids,
         &wide.pools,
@@ -678,8 +826,8 @@ fn empty_explicit_table_emits_empty_and_wide_actual_value_channels_observe_real_
     // Isolate the actual emission trace, with a fresh unrefused preparation
     // for each sampled primary cause (same original control per instance).
     setup.arm(None);
-    let output = encode_call_requests(token).unwrap();
-    assert!(matches!(&output.entries[0].arguments[2].kind,
+    let output = emit_unit_token(token).unwrap();
+    assert!(matches!(&output[0].arguments[2].kind,
         Some(wire::original_function_argument::Kind::Lambda(value)) if value.parameter_value_type_ids==params));
     let baseline = setup.trace();
     let quantum = baseline
@@ -689,8 +837,8 @@ fn empty_explicit_table_emits_empty_and_wide_actual_value_channels_observe_real_
     for at in [0, quantum, baseline.len() - 1] {
         for cause in CAUSES {
             let c = Control::default();
-            let token = prepare_call_requests_encode(
-                wide.fragment.call_requests(),
+            let token = prepare_unit_token(
+                &wide.unit,
                 &types,
                 &ids,
                 &wide.pools,
@@ -700,9 +848,7 @@ fn empty_explicit_table_emits_empty_and_wide_actual_value_channels_observe_real_
             )
             .unwrap();
             c.arm(Some((at, cause.clone())));
-            assert!(
-                matches!(encode_call_requests(token),Err(Error::Control(actual)) if actual==cause)
-            );
+            assert!(matches!(emit_unit_token(token),Err(Error::Control(actual)) if actual==cause));
             assert_eq!(c.trace(), baseline[..=at]);
         }
     }
@@ -710,28 +856,16 @@ fn empty_explicit_table_emits_empty_and_wide_actual_value_channels_observe_real_
 
 #[test]
 fn two_way_request_component_returns_to_original_fragment_coverage_and_pool_namespace() {
-    use crate::physical_call_requests_v2::{decode_call_requests, prepare_call_requests_decode};
     use crate::physical_type_v2::decode_type_table;
     for has_constraint in [false, true] {
-        let mut f = fixture();
-        let control = Control::default();
-        if !has_constraint {
-            let mut entries: Vec<_> = f
-                .fragment
-                .call_requests()
-                .entries()
-                .iter()
-                .map(|(key, request)| (*key, request.clone()))
-                .collect();
-            entries[0].1.expected_result_type = None;
-            f.fragment = f
-                .fragment
-                .with_call_requests_observed(entries, &control)
-                .unwrap();
-        }
-        let types = encode_type_table_sources(&f.roots, &[], types_limits(), &control).unwrap();
+        let f = fixture();
+        let mut request = f.unit.requests()[&ExprId::new(0)].clone();
+        request.expected_result_type = has_constraint.then(int);
+        let f = f.with_request(request);
+        let c = Control::default();
+        let types = encode_type_table_sources(&f.roots, &[], types_limits(), &c).unwrap();
         let params = [u32::MAX];
-        let args = [
+        let arguments = [
             ArgumentTypeIds::Value(0),
             ArgumentTypeIds::Value(0),
             ArgumentTypeIds::Lambda {
@@ -739,85 +873,68 @@ fn two_way_request_component_returns_to_original_fragment_coverage_and_pool_name
                 result: 0,
             },
         ];
-        let mut ids = project(&params, &args);
+        let mut ids = project(&params, &arguments);
         ids[0].expected_result_type = has_constraint.then_some(0);
-        let wire = encode_call_requests(
-            prepare_call_requests_encode(
-                f.fragment.call_requests(),
-                &types,
-                &ids,
-                &f.pools,
-                SOURCE,
-                limits(),
-                &control,
-            )
-            .unwrap(),
+        let wire = emit_unit_token(
+            prepare_unit_token(&f.unit, &types, &ids, &f.pools, SOURCE, limits(), &c).unwrap(),
         )
         .unwrap();
-        // Independent data checks precede the two-way correspondence check.
         assert_eq!(
-            wire.entries[0].expected_result_value_type_id,
+            wire[0].expected_result_value_type_id,
             has_constraint.then_some(0)
         );
-        let decoded_types = decode_type_table(types.as_wire(), types_limits(), &control).unwrap();
-        let entries = decode_call_requests(
-            prepare_call_requests_decode(
-                Some(&wire),
-                &decoded_types,
-                &f.pools,
-                SOURCE,
-                limits(),
-                &control,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let decoded_types = decode_type_table(types.as_wire(), types_limits(), &c).unwrap();
+        let decode = |raw: &Vec<wire::UnitCallRequest>| {
+            let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
+            let (requests, _, _) =
+                super::super::read::decode_unit_requests_in::<std::convert::Infallible>(
+                    raw,
+                    &decoded_types,
+                    &f.pools,
+                    SOURCE,
+                    limits(),
+                    &mut |_| Ok(()),
+                    None,
+                    &mut work,
+                )
+                .map_err(ProjectionFailure::without_host)
+                .unwrap();
+            work.finish().unwrap();
+            requests
+        };
+        let entries = decode(&wire);
         assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].0,
-            PhysicalCallDefinition::Expression(p::ExprId::new(0))
-        );
+        let request = &entries[&ExprId::new(0)];
         assert!(matches!(
-            &entries[0].1.arguments[0],
+            &request.arguments[0],
             Argument::Value { constant: None, .. }
         ));
         let Argument::Value {
             constant: Some(reference),
             ..
-        } = &entries[0].1.arguments[1]
+        } = &request.arguments[1]
         else {
-            panic!("the original typed NULL reference must remain Some");
+            panic!("the original typed NULL reference must remain Some")
         };
         assert_eq!(reference.pool.get(), u32::MAX);
         assert_eq!(reference.ordinal, 1);
-        assert_eq!(entries[0].1.constant_policy, data_policy());
-        let checked = f
-            .fragment
-            .clone()
-            .with_call_requests_observed(entries, &control)
-            .unwrap();
-        assert_eq!(checked.call_requests(), f.fragment.call_requests());
-        // A shape-valid request component cannot authorize a foreign definition.
+        assert_eq!(request.constant_policy, data_policy());
+        let mut parts = f.receiving_parts();
+        parts.requests = entries;
+        let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();
+        let checked = BoundExprSet::try_from_parts_in(parts, unit_limits(), &mut work).unwrap();
+        work.finish().unwrap();
+        assert_eq!(checked.requests(), f.unit.requests());
         let mut foreign = wire.clone();
-        foreign.entries[0].definition.as_mut().unwrap().kind = Some(
-            wire::call_request_definition::Kind::ExpressionDefinitionId(7),
-        );
-        let entries = decode_call_requests(
-            prepare_call_requests_decode(
-                Some(&foreign),
-                &decoded_types,
-                &f.pools,
-                SOURCE,
-                limits(),
-                &control,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        foreign[0].definition_id = Some(7);
+        let mut parts = f.receiving_parts();
+        parts.requests = decode(&foreign);
+        let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();
+        let error = BoundExprSet::try_from_parts_in(parts, unit_limits(), &mut work).unwrap_err();
         assert!(
-            matches!(f.fragment.clone().with_call_requests_observed(entries, &control),
-            Err(p::CallRequestError::MissingDefinition(PhysicalCallDefinition::Expression(id))) if id.get() == 0)
+            matches!(error,novarocks_expression_contract::UnitError::Invalid{definition:Some(id),message,..} if id==ExprId::new(0)&&message=="function definition lacks its original request")
         );
+        work.finish().unwrap();
     }
 }
 

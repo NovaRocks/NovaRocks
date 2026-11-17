@@ -822,7 +822,7 @@ impl<'source> PackageTypeSourceSink<'source, TypeViewError> for Capture<'source,
                 };
                 if previous.occurrence.owner != occurrence.owner
                     || previous.occurrence.channel != PackageTypeChannel::Value
-                    || !matches!(occurrence.owner, PackageTypeOwner::Expression(_))
+                    || !matches!(occurrence.owner, PackageTypeOwner::Expression { .. })
                     || occurrence.channel != PackageTypeChannel::CastTarget
                 {
                     return Err(TypeViewError::InvalidSource(

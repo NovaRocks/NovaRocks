@@ -274,7 +274,6 @@ pub fn encode_limits() -> PackageEncodeLimits {
         control: ControlProjectionLimits {
             max_regions: 100_000,
             max_use_references: 1_000_000,
-            max_root_bindings: 1_000_000,
             max_allocation_requests: 1_000_000,
             max_allocation_request_bytes: REQUEST,
             max_coexisting_source_and_request_bytes: COEXIST,

@@ -20,7 +20,8 @@
 //! installed owners, a decoder, or a formal MEM allocation grant.
 
 use crate::physical_type_v2::{EncodedTypeTable, TypeCodecError};
-use novarocks_physical_plan::{BoundFunction, BoundTableFunction};
+use novarocks_expression_contract::BoundFunction;
+use novarocks_physical_plan::BoundTableFunction;
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
@@ -274,6 +275,22 @@ impl<'loan, 'source> EncodedFunctionBindings<'loan, 'source> {
     /// If the source is intentionally aliased by multiple definitions, the
     /// first original ascending ID is sufficient for the same exact signature.
     /// The caller admits count-sized work and owns this scope's entry/tail.
+    pub(crate) fn scalar_source_id_observed(
+        &self,
+        source: &BoundFunction,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, BindingCodecError> {
+        for input in self.inputs {
+            let same = matches!(input.source, BindingSource::Scalar(actual) if std::ptr::eq(actual, source));
+            work.step()?;
+            if same {
+                return Ok(input.id);
+            }
+        }
+        Err(BindingCodecError::InvalidShape(
+            "scalar-result signature is not from this emission",
+        ))
+    }
     pub(crate) fn table_source_id_observed(
         &self,
         source: &BoundTableFunction,

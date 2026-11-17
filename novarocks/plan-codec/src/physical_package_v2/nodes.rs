@@ -418,6 +418,9 @@ pub(super) fn prepare_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
             PreparedNodeDecode::Relational(prepare_relational_node_decode_in(
                 input,
                 context.expressions,
+                context.functions,
+                context.aggregates,
+                limits.binding,
                 source_retained_bytes,
                 limits.node,
                 admit,

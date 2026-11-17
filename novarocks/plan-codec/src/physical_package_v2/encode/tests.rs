@@ -95,7 +95,7 @@ fn whole_sender_emits_every_component_of_actual_checked_packages() {
         assert_eq!(out.plan_version.len(), 16, "{name}");
         assert!(out.required.is_some(), "{name}");
         assert!(out.types.is_some(), "{name}");
-        assert!(out.expression_control.is_some(), "{name}");
+        assert!(out.source_constant_policy.is_some(), "{name}");
         assert!(out.calls.is_some(), "{name}");
         assert!(out.pruning.is_some(), "{name}");
         assert!(out.parameters.is_some(), "{name}");
@@ -108,11 +108,31 @@ fn whole_sender_emits_every_component_of_actual_checked_packages() {
         assert_eq!(fragment.id, original.id().get(), "{name}");
         assert_eq!(fragment.nodes.len(), original.nodes().len(), "{name}");
         assert_eq!(fragment.values.len(), original.values().len(), "{name}");
-        assert_eq!(
-            fragment.expressions.len(),
-            original.expressions().len(),
-            "{name}"
-        );
+        for node in &fragment.nodes {
+            match (
+                node.expressions.as_ref(),
+                original.unit(p::NodeId::new(node.id)),
+            ) {
+                (None, None) => {}
+                (Some(unit), Some(source)) => {
+                    assert_eq!(unit.definitions.len(), source.definitions().len(), "{name}");
+                    assert_eq!(unit.roots.len(), source.roots().len(), "{name}");
+                    assert_eq!(unit.ports.len(), source.ports().len(), "{name}");
+                    assert_eq!(unit.requests.len(), source.requests().len(), "{name}");
+                    assert_eq!(
+                        unit.control.as_ref().unwrap().uses.len(),
+                        source.control_flow().uses().len(),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        unit.claims.as_ref().unwrap().entries.len(),
+                        source.claims().len(),
+                        "{name}"
+                    );
+                }
+                _ => panic!("{name}: node unit presence differs from its exact author"),
+            }
+        }
         assert_eq!(
             fragment.call_requests.as_ref().unwrap().entries.len(),
             original.call_requests().entries().len(),
@@ -202,6 +222,7 @@ fn whole_package_preserves_declared_keyed_assertion_violation() {
             .clone();
         let id = u32::MAX - 1;
         assertion.id = id;
+        assertion.expressions = None;
         assertion.input_node_ids = vec![source];
         assertion.required_inputs = vec![assertion.output_properties.clone().unwrap()];
         assertion.output.as_mut().unwrap().node_id = Some(id);

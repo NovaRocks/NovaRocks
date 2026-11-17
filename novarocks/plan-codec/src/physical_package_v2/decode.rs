@@ -82,8 +82,8 @@ use crate::{
         prepare_schemas_decode_with_creator_in,
     },
     physical_semantics_v2::{
-        ParameterProjectionLimits, SemanticsCodecError, decode_frozen_calls_observed,
-        decode_frozen_pruning_observed, prepare_semantic_parameters_decode_observed_in,
+        ParameterProjectionLimits, SemanticsCodecError, decode_frozen_pruning_observed,
+        prepare_semantic_parameters_decode_observed_in,
     },
     physical_type_v2::{
         PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError,
@@ -656,6 +656,7 @@ fn decode_fragment_package_factory_core<
     funding: &mut Option<&mut dyn crate::physical_type_v2::PackageTypeFundingScope<H>>,
 ) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
     let plan_limits = limits.admission.plan_limits;
+    let mut unit_totals = super::unit_totals::UnitProjectionTotals::default();
 
     // L0: generated-layout byte admission, then the original Prost verdict.
     let prepared = prepare_package_wire_in(raw, model, limits.wire, &mut |_| Ok(()), work)?;
@@ -691,9 +692,8 @@ fn decode_fragment_package_factory_core<
 
     // Mandatory singular components have no default.
     let fragment_wire = required(wire_package.fragment.as_ref(), "package fragment is absent")?;
-    let control_wire = required(
-        wire_package.expression_control.as_ref(),
-        "package expression control is absent",
+    let statement_constant_policy = crate::physical_call_requests_v2::decode_source_policy(
+        wire_package.source_constant_policy.as_ref(),
     )?;
     let calls_wire = required(
         wire_package.calls.as_ref(),
@@ -900,16 +900,17 @@ fn decode_fragment_package_factory_core<
         )?
         .emit_observed_in(&mut |_| Ok(()), work)?
     };
-    invoice = invoice.max(if factory.is_some() {
-        // Completed actual constructor upper is numerical source provenance,
-        // not a grant or an exact retained-byte ledger. It includes the new
-        // scopes/loan holders once, on the unchanged namespace model.
-        schemas
-            .facts()
-            .coexisting_source_and_request_bytes_upper_bound
-    } else {
-        schemas.retained_invoice_floor()?
-    });
+    // The same original invoice must cover both actual construction-holder
+    // provenance and the namespace's own necessary inline/output floor. Empty
+    // schema lists still retain their real decoded namespace header.
+    invoice = invoice.max(schemas.retained_invoice_floor()?);
+    if factory.is_some() {
+        invoice = invoice.max(
+            schemas
+                .facts()
+                .coexisting_source_and_request_bytes_upper_bound,
+        );
+    }
     let public_source_schemas = if let Some(factory) = factory {
         decode_public_source_schemas_with_factory_in(
             &wire_package.public_source_schemas,
@@ -1049,7 +1050,8 @@ fn decode_fragment_package_factory_core<
         (prepared.materialize_in(&mut |_| Ok(()), work)?, requests)
     };
     invoice = add(add(invoice, pool_requests)?, size_of_val(&pools))?;
-    let (requests, request_storage) = if let Some(creator) = creation.as_deref_mut() {
+    let (requests, request_storage, request_facts) = if let Some(creator) = creation.as_deref_mut()
+    {
         let prepared = prepare_call_requests_decode_with_creator_in(
             fragment_wire.call_requests.as_ref(),
             CallRequestTypeOwner::Package(&types),
@@ -1059,7 +1061,10 @@ fn decode_fragment_package_factory_core<
             creator,
             work,
         )?;
-        decode_call_requests_with_creator_in::<H>(prepared, work)?.into_parts()
+        let facts = *prepared.facts();
+        let (requests, storage) =
+            decode_call_requests_with_creator_in::<H>(prepared, work)?.into_parts();
+        (requests, storage, facts)
     } else {
         let prepared = prepare_call_requests_decode_in(
             fragment_wire.call_requests.as_ref(),
@@ -1070,11 +1075,14 @@ fn decode_fragment_package_factory_core<
             &mut |_| Ok(()),
             work,
         )?;
+        let facts = *prepared.facts();
         (
             decode_call_requests_in(prepared, &mut |_| Ok(()), work)?,
             ValueTypeStorageLifetime::pure(),
+            facts,
         )
     };
+    unit_totals.requests_commit(&request_facts, limits.requests)?;
     let (cuts, _) = decode_fragment_cuts_observed(
         cuts_wire,
         &types,
@@ -1097,7 +1105,7 @@ fn decode_fragment_package_factory_core<
     // L3-L5: every loan of values, parameters and pools ends with this block.
     // Headers and the expression namespace precede the materializations whose
     // laws add only their own outputs to those borrowed floors.
-    let (arena, mut nodes, result) = {
+    let (mut nodes, result) = {
         let function_headers = prepare_function_binding_headers_in(
             &wire_package.function_bindings,
             &types,
@@ -1120,19 +1128,6 @@ fn decode_fragment_package_factory_core<
             work,
         )?;
         invoice = invoice.max(aggregate_headers.retained_invoice_floor()?);
-        let expressions = decode_expression_definitions_in(
-            &fragment_wire.expressions,
-            &values,
-            &function_headers,
-            &aggregate_headers,
-            &parameters,
-            &pools,
-            invoice,
-            limits.expressions,
-            &mut |_| Ok(()),
-            work,
-        )?;
-        invoice = invoice.max(expressions.retained_floor_observed(work)?);
         let function_token = prepare_function_bindings_materialization_in(
             &function_headers,
             invoice,
@@ -1182,22 +1177,6 @@ fn decode_fragment_package_factory_core<
         } else {
             invoice.max(aggregates.retained_invoice_floor()?)
         };
-        let materialized = materialize_expressions_in(
-            prepare_expression_materialization_in(
-                &expressions,
-                &functions,
-                &aggregates,
-                &plan_limits,
-                invoice,
-                limits.expressions,
-                &mut |_| Ok(()),
-                work,
-            )?,
-            &mut |_| Ok(()),
-            work,
-        )?;
-        invoice = invoice.max(materialized.retained_invoice_floor()?);
-        let arena = materialized.into_arena();
         let result_source = add(
             invoice,
             result_port_backing(wire_package.result.as_ref(), work)?,
@@ -1211,12 +1190,6 @@ fn decode_fragment_package_factory_core<
             work,
         )?
         .emit_in(&mut |_| Ok(()), work)?;
-        let context = NodeDecodeContext {
-            expressions: &expressions,
-            relations: &relations,
-            functions: &functions,
-            aggregates: &aggregates,
-        };
         let dispatch = NodeDispatchLimits {
             node: limits.node,
             binding: limits.bindings,
@@ -1226,9 +1199,251 @@ fn decode_fragment_package_factory_core<
         admit_count(fragment_wire.nodes.len(), plan_limits.fragment_nodes)?;
         let mut nodes = BTreeMap::new();
         for input in &fragment_wire.nodes {
-            let (node, _) =
+            let raw_unit = input.expressions.as_ref();
+            if let Some(unit) = raw_unit {
+                unit_totals.roots(unit.roots.len())?;
+            }
+            let expressions = decode_expression_definitions_in(
+                crate::physical_expression_v2::ExpressionDefinitionInput::new(
+                    raw_unit.map_or(&[], |unit| unit.definitions.as_slice()),
+                    raw_unit.map_or(&[], |unit| unit.roots.as_slice()),
+                ),
+                &values,
+                &function_headers,
+                &aggregate_headers,
+                &parameters,
+                &pools,
+                invoice,
+                limits.expressions,
+                &mut |facts| unit_totals.expressions_prefix(facts, limits.expressions, false),
+                work,
+            )?;
+            unit_totals.expressions_commit(expressions.facts(), limits.expressions, false)?;
+            invoice = invoice.max(expressions.retained_floor_observed(work)?);
+            let materialization = prepare_expression_materialization_in(
+                &expressions,
+                &functions,
+                &aggregates,
+                &plan_limits,
+                invoice,
+                limits.expressions,
+                &mut |facts| unit_totals.expressions_prefix(facts, limits.expressions, true),
+                work,
+            )?;
+            if let Some(creator) = creation.as_deref_mut() {
+                // The sole materialization author has admitted every actual
+                // dense-node and child-payload request before its first copy.
+                // Unit validation borrows these inputs and never pays them again.
+                creator
+                    .observe_opaque_upper_bound(
+                        materialization
+                            .facts()
+                            .new_allocation_request_bytes_upper_bound,
+                    )
+                    .map_err(ProjectionFailure::<PackageDecodeError, H>::Host)?;
+            }
+            let materialized = materialize_expressions_in(
+                materialization,
+                &mut |facts| unit_totals.expressions_prefix(facts, limits.expressions, true),
+                work,
+            )?;
+            unit_totals.expressions_commit(materialized.facts(), limits.expressions, true)?;
+            invoice = invoice.max(materialized.retained_invoice_floor()?);
+            let context = NodeDecodeContext {
+                expressions: &expressions,
+                relations: &relations,
+                functions: &functions,
+                aggregates: &aggregates,
+            };
+            let (mut node, _) =
                 prepare_node_decode_in(input, &context, invoice, dispatch, &mut |_| Ok(()), work)?
                     .emit_in(&mut |_| Ok(()), work)?;
+            if let Some(raw_unit) = raw_unit {
+                let header_facts = super::unit_headers::decode(
+                    raw_unit,
+                    invoice,
+                    limits.node,
+                    &mut |_| Ok(()),
+                    creation.as_deref_mut(),
+                    work,
+                )
+                .map_err(|error| match error {
+                    ProjectionFailure::Codec(error) => {
+                        ProjectionFailure::Codec(PackageDecodeError::from(error))
+                    }
+                    ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
+                })?;
+                invoice = add(invoice, header_facts.allocation_request_bytes_upper_bound)?;
+                let definitions = materialized.into_definitions();
+                let control_wire = required(
+                    raw_unit.control.as_ref(),
+                    "unit expression control is absent",
+                )?;
+                let (flow, flow_facts) = if let Some(creator) = creation.as_deref_mut() {
+                    crate::physical_control_v2::decode_expression_control_with_creator_observed_in(
+                        &definitions,
+                        control_wire,
+                        invoice,
+                        limits.control,
+                        &mut |facts| unit_totals.control_prefix(facts, limits.control),
+                        creator,
+                        factory,
+                        work,
+                    )
+                    .map_err(|error| match error {
+                        ProjectionFailure::Codec(error) => {
+                            ProjectionFailure::Codec(PackageDecodeError::from(error))
+                        }
+                        ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
+                    })?
+                } else {
+                    decode_expression_control_observed(
+                        &definitions,
+                        control_wire,
+                        invoice,
+                        limits.control,
+                        &mut |facts| unit_totals.control_prefix(facts, limits.control),
+                        work,
+                    )?
+                };
+                unit_totals.control_commit(&flow_facts, limits.control)?;
+                invoice = add(invoice, flow_facts.allocation_request_bytes_upper_bound)?;
+                let (claims, claim_facts) =
+                    crate::physical_semantics_v2::decode_expression_claims_in(
+                        required(raw_unit.claims.as_ref(), "unit scalar claims are absent")?,
+                        invoice,
+                        limits.node,
+                        &mut |facts| unit_totals.semantics_prefix(facts, limits.node),
+                        creation.as_deref_mut(),
+                        work,
+                    )
+                    .map_err(|error| match error {
+                        ProjectionFailure::Codec(error) => {
+                            ProjectionFailure::Codec(PackageDecodeError::from(error))
+                        }
+                        ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
+                    })?;
+                unit_totals.semantics_commit(&claim_facts, limits.node)?;
+                invoice = add(invoice, claim_facts.allocation_request_bytes_upper_bound)?;
+                let (requests, storage, request_facts) =
+                    crate::physical_call_requests_v2::decode_unit_requests_in(
+                        &raw_unit.requests,
+                        &types,
+                        &pools,
+                        invoice,
+                        limits.requests,
+                        &mut |facts| unit_totals.requests_prefix(facts, limits.requests),
+                        creation.as_deref_mut(),
+                        work,
+                    )
+                    .map_err(|error| match error {
+                        ProjectionFailure::Codec(error) => {
+                            ProjectionFailure::Codec(PackageDecodeError::from(error))
+                        }
+                        ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
+                    })?;
+                unit_totals.requests_commit(&request_facts, limits.requests)?;
+                invoice = add(invoice, request_facts.request_bytes_upper_bound)?;
+                let mut ports = Vec::new();
+                ports
+                    .try_reserve_exact(raw_unit.ports.len())
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                for port in &raw_unit.ports {
+                    let mut inputs = Vec::new();
+                    inputs
+                        .try_reserve_exact(port.values.len())
+                        .map_err(|_| CompileControlError::ResourceExhausted)?;
+                    for input in &port.values {
+                        let ty = types
+                            .value_type(required(input.value_type_id, "unit input type is absent")?)
+                            .ok_or(PackageDecodeError::Invalid("unit input type is unknown"))?;
+                        inputs.push((
+                            p::ValueId::new(required(
+                                input.value_id,
+                                "unit input ValueId is absent",
+                            )?),
+                            crate::physical_type_v2::clone_value_type_observed(ty, work)?,
+                        ));
+                        work.step()?;
+                    }
+                    work.flush()?;
+                    let values = inputs.into_boxed_slice();
+                    work.step()?;
+                    work.flush()?;
+                    ports.push(novarocks_expression_contract::ExprPort { values });
+                    work.step()?;
+                }
+                let mut roots = Vec::new();
+                let mut root_uses = Vec::new();
+                roots
+                    .try_reserve_exact(raw_unit.roots.len())
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                root_uses
+                    .try_reserve_exact(raw_unit.roots.len())
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                for root in &raw_unit.roots {
+                    let scope = match root
+                        .scope
+                        .as_ref()
+                        .and_then(|scope| scope.kind.as_ref())
+                        .ok_or(PackageDecodeError::Invalid("unit root scope is absent"))?
+                    {
+                        wire::root_scope::Kind::Port(port) => {
+                            novarocks_expression_contract::RootScope::Port(*port)
+                        }
+                        wire::root_scope::Kind::AllPorts(_) => {
+                            novarocks_expression_contract::RootScope::AllPorts
+                        }
+                    };
+                    roots.push(novarocks_expression_contract::ExprRoot {
+                        definition: p::ExprId::new(required(
+                            root.definition_id,
+                            "unit root definition is absent",
+                        )?),
+                        demand: crate::physical_control_v2::decode_demand(root.demand)?,
+                        scope,
+                    });
+                    root_uses.push(novarocks_type_contract::ExpressionUseId::new(required(
+                        root.use_id,
+                        "unit root use is absent",
+                    )?));
+                    work.step()?;
+                }
+                work.flush()?;
+                let parts = novarocks_expression_contract::UnitParts::new(
+                    ports.into_boxed_slice(),
+                    definitions,
+                    roots.into_boxed_slice(),
+                    root_uses.into_boxed_slice(),
+                    flow,
+                    claims,
+                    requests,
+                )
+                .with_storage_lifetime(storage)
+                .map_err(ExpressionCodecError::from)?;
+                work.step()?;
+                work.flush()?;
+                let (unit, construction_facts) = super::unit_creation::construct(
+                    parts,
+                    novarocks_expression_contract::UnitLimits {
+                        expression_semantic_depth: plan_limits.expression_semantic_depth,
+                    },
+                    invoice,
+                    limits.node,
+                    &mut unit_totals,
+                    creation.as_deref_mut(),
+                    factory,
+                    work,
+                )?;
+                invoice = add(
+                    invoice,
+                    construction_facts.allocation_request_bytes_upper_bound,
+                )?;
+                work.flush()?;
+                node.expressions = Some(std::sync::Arc::new(unit));
+                work.step()?;
+                work.flush()?;
+            }
             insert_unique(
                 &mut nodes,
                 node.id,
@@ -1237,7 +1452,7 @@ fn decode_fragment_package_factory_core<
                 work,
             )?;
         }
-        (arena, nodes, result)
+        (nodes, result)
     };
 
     // L6: all namespace loans have ended; move the owned values out.
@@ -1289,7 +1504,6 @@ fn decode_fragment_package_factory_core<
             id: envelope.id,
             root: envelope.root,
             values,
-            expressions: arena,
             nodes,
             sink: envelope.sink,
             summaries: envelope.summaries,
@@ -1307,23 +1521,17 @@ fn decode_fragment_package_factory_core<
     };
 
     // L8: components whose membership is the final Fragment.
-    let (expression_uses, _) = decode_expression_control_observed(
-        &fragment,
-        control_wire,
-        invoice,
-        limits.control,
-        &mut |_| Ok(()),
-        work,
-    )?;
-    let (calls, _) = decode_frozen_calls_observed(
-        &fragment,
-        &expression_uses,
+    let (calls, call_facts) = crate::physical_semantics_v2::decode_frozen_call_entries_observed(
         calls_wire,
         invoice,
         limits.node,
-        &mut |_| Ok(()),
+        &mut |facts| unit_totals.semantics_prefix(facts, limits.node),
         work,
     )?;
+    unit_totals.semantics_commit(&call_facts, limits.node)?;
+    let fragment = fragment
+        .with_calls_in(calls, &mut |_| Ok(()), work)
+        .map_err(SemanticsCodecError::from)?;
     let (pruning, _) = decode_frozen_pruning_observed(
         fragment.id(),
         pruning_wire,
@@ -1337,11 +1545,10 @@ fn decode_fragment_package_factory_core<
     let package = p::FragmentPackage::try_new_in(
         p::FragmentPackageInput {
             constants: pools,
+            statement_constant_policy,
             version: metadata.version,
             required: metadata.required,
             fragment,
-            expression_uses,
-            calls,
             pruning,
             cuts,
             result,

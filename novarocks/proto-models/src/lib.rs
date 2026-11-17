@@ -82,7 +82,7 @@ pub mod physical_package_v2 {
     pub use super::call_request::{
         CallRequestDefinition, ConstantReference, FragmentCallRequests, IpcCompression,
         IpcConstantPool, LambdaArgumentType, OriginalCallRequest, OriginalFunctionArgument,
-        OriginalValueArgument, SourceConstantPolicy, call_request_definition,
+        OriginalValueArgument, SourceConstantPolicy, UnitCallRequest, call_request_definition,
         original_function_argument,
     };
     include!(concat!(

@@ -34,7 +34,7 @@ use novarocks_functions::{
     AggregateCallContract, AggregateKernelPhase, FunctionArgumentType, FunctionCallContract,
     FunctionResultType, PreparedAggregateHandle, PreparedHigherOrderKernel, PreparedPureKernel,
     PreparedScalarKernel, PreparedTableKernel, PreparedWindowKernel, PureCallSpecialization,
-    PureImplementationDeclaration, PurePreparationSource, ScopedExpressionEffects,
+    PureImplementationDeclaration, PurePreparationSource, ScopedCallEffects,
 };
 #[cfg(test)]
 use novarocks_type_contract::ValueSchemaCreation;
@@ -142,7 +142,7 @@ impl ProgramResolvedCall {
     pub fn implementation(&self) -> &PureImplementationDeclaration {
         self.specialization.implementation()
     }
-    pub fn effects(&self) -> ScopedExpressionEffects {
+    pub fn effects(&self) -> ScopedCallEffects {
         self.specialization.effects()
     }
     pub fn state_template(&self) -> ProgramStateTemplate<'_> {
@@ -191,6 +191,7 @@ pub enum ProgramResolvedCallsError {
     WrongContext,
     InvalidRegion,
     SharedUse,
+    DuplicateRelationCall,
     WrongControl,
     WrongArguments,
     WrongBody,
@@ -440,13 +441,7 @@ impl ProgramResolvedCalls {
                 let call = pending
                     .remove(&site)
                     .ok_or(ProgramResolvedCallsError::MissingSite(site))?;
-                validate_relational_context(
-                    &snapshot,
-                    &call,
-                    &mut relational_ids,
-                    &mut temporary,
-                    &mut work,
-                )?;
+                validate_relational_context(&call, &mut relational_ids, &mut temporary, &mut work)?;
                 validate(&call, &mut work)?;
                 retained.before_tree_insert::<ProgramResolvedCallsError,
                     ProgramCallSite, ProgramResolvedCall>(checked.len(), &mut work)?;
@@ -703,7 +698,9 @@ fn validate_expression(
     let flow = &snapshot.flows()[&occurrence.arena];
     let invocation = &flow.uses()[&occurrence.use_id];
     let call = token.call_contract();
-    if call.context() != invocation.context || token.effects().context() != invocation.context {
+    if call.context() != invocation.context.into()
+        || token.effects().context() != invocation.context.into()
+    {
         return Err(ProgramResolvedCallsError::WrongContext);
     }
     if !call
@@ -855,32 +852,27 @@ fn validate_expression(
 }
 
 fn validate_relational_context<H>(
-    snapshot: &ProgramRootControlBindings,
     token: &PureCallSpecialization,
-    ids: &mut BTreeSet<ExpressionUseId>,
+    ids: &mut BTreeSet<novarocks_type_contract::RelationCallId>,
     temporary: &mut ProgramCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramCreationFailure<ProgramResolvedCallsError, H>> {
     let context = token.call_contract().context();
-    if context.demand != EvaluationDemand::Value || token.effects().context() != context {
+    let relation = context
+        .relation()
+        .filter(|context| context.is_call())
+        .ok_or(ProgramResolvedCallsError::WrongContext)?;
+    if token.effects().context() != context {
         return Err(ProgramResolvedCallsError::WrongContext.into());
     }
-    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-    if !flow.uses().contains_key(&context.use_id) && !ids.contains(&context.use_id) {
-        temporary.before_tree_insert::<ProgramResolvedCallsError, ExpressionUseId, ()>(
-            ids.len(),
-            work,
-        )?;
+    // Relation identities are independent of every expression unit. A token
+    // names this actual call role, never an expression use or its region.
+    let id = relation.identity.call;
+    if !ids.contains(&id) {
+        temporary.before_tree_insert::<ProgramResolvedCallsError, novarocks_type_contract::RelationCallId, ()>(ids.len(), work)?;
     }
-    if flow.uses().contains_key(&context.use_id) || !ids.insert(context.use_id) {
-        return Err(ProgramResolvedCallsError::SharedUse.into());
-    }
-    let domain = flow
-        .regions()
-        .get(&context.region)
-        .ok_or(ProgramResolvedCallsError::InvalidRegion)?;
-    if domain.parent.is_some() || domain.guard.is_some() {
-        return Err(ProgramResolvedCallsError::InvalidRegion.into());
+    if !ids.insert(id) {
+        return Err(ProgramResolvedCallsError::DuplicateRelationCall.into());
     }
     Ok(())
 }

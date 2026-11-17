@@ -38,11 +38,24 @@ message OriginalCallRequest {
 }
 
 message CallRequestDefinition {
+  reserved 1;
+  reserved "expression_definition_id";
   oneof kind {
-    uint32 expression_definition_id = 1; // ExprId, never ExpressionUseId.
+
     // Only relational variants are legal; ExpressionUseId must be refused.
     novarocks.physical_semantics_v2.CallSite relational = 2;
   }
+}
+
+
+// The unit owns this local definition key; argument facts use the same shared
+// grammar, type table, constant pool namespace and sender policy as relations.
+message UnitCallRequest {
+  optional uint32 definition_id = 1;
+  repeated OriginalFunctionArgument arguments = 2;
+  optional uint32 logical_argument_count = 3;
+  optional uint32 expected_result_value_type_id = 4;
+  SourceConstantPolicy constant_policy = 5;
 }
 
 message OriginalFunctionArgument {

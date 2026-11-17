@@ -17,7 +17,7 @@
 
 use super::*;
 use arrow::datatypes::DataType;
-use novarocks_physical_plan::{ConstantPoolId, ConstantReference, NodeId, ValueType};
+use novarocks_physical_plan::{ConstantPoolId, ConstantReference, ValueType};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, SemanticParameterId,
 };
@@ -49,13 +49,11 @@ fn ids<'a>(lambda_parameter_type_ids: &'a [u32]) -> PreparedExpressionIds<'a> {
         root_carrier_type_id: Some(u32::MAX),
         lambda_parameter_type_ids,
         function_binding_id: Some(0),
-        aggregate_binding_id: None,
     }
 }
 fn node(kind: ExprKind) -> ExprNode {
     ExprNode {
         id: ExprId::new(u32::MAX),
-        owner: NodeId::new(0),
         lambda_scope: None,
         ty: ValueType::new(DataType::Int64, true),
         kind,
@@ -77,7 +75,7 @@ fn kind_projection_preserves_sparse_constant_ids_and_every_operator() {
             pool: ConstantPoolId::new(u32::MAX),
             ordinal: 0,
         })),
-        Kind::Literal(wire::ConstantReference {
+        Kind::Constant(wire::ConstantReference {
             pool_id: Some(u32::MAX),
             row_ordinal: 0,
         })
@@ -136,7 +134,7 @@ fn kind_projection_preserves_sparse_constant_ids_and_every_operator() {
 }
 
 #[test]
-fn ordered_ids_case_lambda_and_window_vocabulary_are_not_canonicalized() {
+fn ordered_ids_case_and_lambda_vocabulary_are_not_canonicalized() {
     use wire::expression_definition::Kind;
     let ordered: Box<[ExprId]> =
         Box::from([ExprId::new(u32::MAX), ExprId::new(0), ExprId::new(u32::MAX)]);
@@ -196,16 +194,28 @@ fn ordered_ids_case_lambda_and_window_vocabulary_are_not_canonicalized() {
             wire::window_bound::Kind::UnboundedPreceding(physical_control_v2::Empty {}),
         ),
         (
-            WindowBound::Preceding(ExprId::new(0)),
-            wire::window_bound::Kind::PrecedingExprId(0),
+            WindowBound::Preceding(ConstantReference {
+                pool: ConstantPoolId::new(0),
+                ordinal: 0,
+            }),
+            wire::window_bound::Kind::Preceding(wire::ConstantReference {
+                pool_id: Some(0),
+                row_ordinal: 0,
+            }),
         ),
         (
             WindowBound::CurrentRow,
             wire::window_bound::Kind::CurrentRow(physical_control_v2::Empty {}),
         ),
         (
-            WindowBound::Following(ExprId::new(u32::MAX)),
-            wire::window_bound::Kind::FollowingExprId(u32::MAX),
+            WindowBound::Following(ConstantReference {
+                pool: ConstantPoolId::new(u32::MAX),
+                ordinal: u32::MAX,
+            }),
+            wire::window_bound::Kind::Following(wire::ConstantReference {
+                pool_id: Some(u32::MAX),
+                row_ordinal: u32::MAX,
+            }),
         ),
         (
             WindowBound::UnboundedFollowing,
@@ -238,7 +248,10 @@ fn ordered_ids_case_lambda_and_window_vocabulary_are_not_canonicalized() {
                 &WindowFrame {
                     units,
                     start: WindowBound::CurrentRow,
-                    end: WindowBound::Following(ExprId::new(0)),
+                    end: WindowBound::Following(ConstantReference {
+                        pool: ConstantPoolId::new(0),
+                        ordinal: 0,
+                    }),
                     exclusion,
                 },
                 &mut work,

@@ -368,7 +368,6 @@ fn encode_fragment_package_structural_in<'s>(
     let function_inputs = arguments.function_inputs_in(&mut budget, work)?;
     let aggregate_inputs = bindings.aggregate_inputs_in(&mut budget, work)?;
     let provider_inputs = providers.prepare_inputs_in(&mut budget, work)?;
-    let expression_ids = definitions.expressions_in(&mut budget, work)?;
     let request_arguments = definitions.request_arguments_in(&mut budget, work)?;
     let request_ids = request_arguments.request_type_ids_in(&mut budget, work)?;
     let mut writer_ids = Vec::new();
@@ -390,6 +389,7 @@ fn encode_fragment_package_structural_in<'s>(
     // upper bound and inline header join every later invoice once
     // (conservative: temporary requests are included).
     let requested = Cell::new(0usize);
+    let mut unit_totals = super::unit_totals::UnitProjectionTotals::default();
     macro_rules! seen {
         ($field:ident) => {
             &mut |f: &_| {
@@ -520,32 +520,22 @@ fn encode_fragment_package_structural_in<'s>(
         work,
     )?;
     source = grow(source, &requested, &values)?;
-    let expressions = prepare_expression_definitions_in(
-        fragment.expressions(),
-        &expression_ids,
-        &types,
-        &functions,
-        &aggregates,
-        package.parameters(),
-        package.constants(),
-        source,
-        l.expressions,
-        seen!(new_allocation_request_bytes_upper_bound),
-        work,
-    )?
-    .emit_in(seen!(new_allocation_request_bytes_upper_bound), work)?;
-    source = grow(source, &requested, &expressions)?;
-    let call_requests = prepare_call_requests_encode_in(
+    let call_requests_token = prepare_call_requests_encode_in(
         fragment.call_requests(),
         &types,
         &request_ids,
         package.constants(),
         source,
         l.requests,
-        seen!(request_bytes_upper_bound),
+        &mut |facts: &crate::physical_call_requests_v2::CallRequestProjectionFacts| {
+            unit_totals.requests_prefix(facts, l.requests)?;
+            requested.set(requested.get().max(facts.request_bytes_upper_bound));
+            Ok(())
+        },
         work,
-    )?
-    .emit_in(seen!(request_bytes_upper_bound), work)?;
+    )?;
+    unit_totals.requests_commit(call_requests_token.facts(), l.requests)?;
+    let call_requests = call_requests_token.emit_in(seen!(request_bytes_upper_bound), work)?;
     source = grow(source, &requested, &call_requests)?;
     let (envelope, _) = prepare_fragment_envelope_encode_in(
         fragment,
@@ -562,11 +552,6 @@ fn encode_fragment_package_structural_in<'s>(
         relation: l.relations,
         writer_schema: l.writer_schema,
     };
-    let context = NodeEncodeContext {
-        values: &values,
-        expressions: &expressions,
-        relations: &relations,
-    };
     let mut nodes = Vec::new();
     nodes
         .try_reserve_exact(fragment.nodes().len())
@@ -576,7 +561,50 @@ fn encode_fragment_package_structural_in<'s>(
         std::mem::size_of::<wire::PhysicalNode>() * nodes.capacity(),
     )?;
     for (node, ids) in fragment.nodes().values().zip(writer_ids) {
-        let (encoded, _) = prepare_node_encode_in(
+        let expression_ids = definitions.expressions_in(node.id, &mut budget, work)?;
+        let expressions = prepare_expression_definitions_in(
+            node.expressions
+                .as_deref()
+                .map(crate::physical_expression_v2::ExpressionDefinitionSource::from_unit),
+            &expression_ids,
+            &types,
+            &functions,
+            &aggregates,
+            package.parameters(),
+            package.constants(),
+            source,
+            l.expressions,
+            &mut |facts: &crate::physical_expression_v2::ExpressionNamespaceWriteFacts| {
+                unit_totals.expressions_prefix(facts, l.expressions, false)?;
+                requested.set(
+                    requested
+                        .get()
+                        .max(facts.new_allocation_request_bytes_upper_bound),
+                );
+                Ok(())
+            },
+            work,
+        )?
+        .emit_in(
+            &mut |facts: &crate::physical_expression_v2::ExpressionNamespaceWriteFacts| {
+                unit_totals.expressions_prefix(facts, l.expressions, false)?;
+                requested.set(
+                    requested
+                        .get()
+                        .max(facts.new_allocation_request_bytes_upper_bound),
+                );
+                Ok(())
+            },
+            work,
+        )?;
+        unit_totals.expressions_commit(expressions.facts(), l.expressions, false)?;
+        source = grow(source, &requested, &expressions)?;
+        let context = NodeEncodeContext {
+            values: &values,
+            expressions: &expressions,
+            relations: &relations,
+        };
+        let (mut encoded, _) = prepare_node_encode_in(
             node,
             &context,
             ids,
@@ -586,26 +614,154 @@ fn encode_fragment_package_structural_in<'s>(
             work,
         )?
         .emit_in(seen!(allocation_request_bytes_upper_bound), work)?;
+        if let Some(unit) = node.expressions.as_deref() {
+            unit_totals.roots(unit.roots().len())?;
+            let _ = super::unit_headers::encode(
+                unit,
+                source,
+                l.node,
+                seen!(allocation_request_bytes_upper_bound),
+                work,
+            )?;
+            source = add(source, requested.replace(0))?;
+            let unit_request_ids =
+                request_arguments.unit_request_type_ids_in(node.id, &mut budget, work)?;
+            let mut ports = Vec::new();
+            ports
+                .try_reserve_exact(unit.ports().len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            for (port, input) in unit.ports().iter().enumerate() {
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(input.values.len())
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                for (ordinal, (value, ty)) in input.values.iter().enumerate() {
+                    let value_type_id = views.value_root_for_in(
+                        super::type_sources::PackageTypeOccurrence {
+                            fragment: fragment.id(),
+                            owner: super::type_sources::PackageTypeOwner::UnitPort {
+                                node: node.id,
+                                port,
+                                ordinal,
+                            },
+                            channel: super::type_sources::PackageTypeChannel::Value,
+                        },
+                        ty,
+                        &mut budget,
+                        work,
+                    )?;
+                    values.push(wire::ExpressionInput {
+                        value_id: Some(value.get()),
+                        value_type_id: Some(value_type_id),
+                    });
+                    work.step()?;
+                }
+                ports.push(wire::ExpressionPort { values });
+                work.step()?;
+            }
+            let mut roots = Vec::new();
+            roots
+                .try_reserve_exact(unit.roots().len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            for (root, use_id) in unit.roots().iter().zip(unit.root_use_ids()) {
+                let kind = match root.scope {
+                    novarocks_expression_contract::RootScope::Port(port) => {
+                        wire::root_scope::Kind::Port(port)
+                    }
+                    novarocks_expression_contract::RootScope::AllPorts => {
+                        wire::root_scope::Kind::AllPorts(
+                            novarocks_proto_models::physical_control_v2::Empty {},
+                        )
+                    }
+                };
+                roots.push(wire::ExpressionRoot {
+                    definition_id: Some(root.definition.get()),
+                    demand: crate::physical_control_v2::encode_demand(root.demand),
+                    scope: Some(wire::RootScope { kind: Some(kind) }),
+                    use_id: Some(use_id.get()),
+                });
+                work.step()?;
+            }
+            let (control, control_facts) = encode_expression_control_observed(
+                unit.control_flow(),
+                source,
+                l.control,
+                &mut |facts: &crate::physical_control_v2::ControlProjectionFacts| {
+                    unit_totals.control_prefix(facts, l.control)?;
+                    requested.set(
+                        requested
+                            .get()
+                            .max(facts.allocation_request_bytes_upper_bound),
+                    );
+                    Ok(())
+                },
+                work,
+            )?;
+            unit_totals.control_commit(&control_facts, l.control)?;
+            source = grow(source, &requested, &control)?;
+            let (claims, claim_facts) = crate::physical_semantics_v2::encode_expression_claims_in(
+                unit,
+                source,
+                l.node,
+                &mut |facts: &crate::physical_node_v2::NodeProjectionFacts| {
+                    unit_totals.semantics_prefix(facts, l.node)?;
+                    requested.set(
+                        requested
+                            .get()
+                            .max(facts.allocation_request_bytes_upper_bound),
+                    );
+                    Ok(())
+                },
+                work,
+            )?;
+            unit_totals.semantics_commit(&claim_facts, l.node)?;
+            source = grow(source, &requested, &claims)?;
+            let (requests, request_facts) =
+                crate::physical_call_requests_v2::encode_unit_requests_in(
+                    unit,
+                    &types,
+                    &unit_request_ids,
+                    package.constants(),
+                    source,
+                    l.requests,
+                    &mut |facts: &crate::physical_call_requests_v2::CallRequestProjectionFacts| {
+                        unit_totals.requests_prefix(facts, l.requests)?;
+                        requested.set(requested.get().max(facts.request_bytes_upper_bound));
+                        Ok(())
+                    },
+                    work,
+                )?;
+            unit_totals.requests_commit(&request_facts, l.requests)?;
+            source = grow(source, &requested, &requests)?;
+            encoded.expressions = Some(wire::ExpressionUnit {
+                ports,
+                definitions: expressions.into_wire(),
+                roots,
+                control: Some(control),
+                claims: Some(claims),
+                requests,
+            });
+        }
         // Each emitted node stays live in the output table.
         source = add(source, requested.replace(0))?;
         nodes.push(encoded);
     }
-    let (expression_control, _) = encode_expression_control_observed(
-        fragment,
-        package.expression_uses(),
-        source,
-        l.control,
-        seen!(allocation_request_bytes_upper_bound),
-        work,
-    )?;
-    source = grow(source, &requested, &expression_control)?;
-    let (calls, _) = encode_frozen_calls_observed(
+    let (calls, call_facts) = encode_frozen_calls_observed(
         package.calls(),
         source,
         l.node,
-        seen!(allocation_request_bytes_upper_bound),
+        &mut |facts: &crate::physical_node_v2::NodeProjectionFacts| {
+            unit_totals.semantics_prefix(facts, l.node)?;
+            requested.set(
+                requested
+                    .get()
+                    .max(facts.allocation_request_bytes_upper_bound),
+            );
+            Ok(())
+        },
         work,
     )?;
+    unit_totals.semantics_commit(&call_facts, l.node)?;
     source = grow(source, &requested, &calls)?;
     let (pruning, _) = encode_frozen_pruning_observed(
         package.pruning(),
@@ -688,7 +844,6 @@ fn encode_fragment_package_structural_in<'s>(
         work,
     )?;
     // Namespaces borrow earlier ones; release them in reverse dependency order.
-    let expressions = expressions.into_wire();
     let values = values.into_wire();
     let aggregate_bindings = aggregates.into_wire();
     let function_bindings = functions.into_wire();
@@ -706,7 +861,6 @@ fn encode_fragment_package_structural_in<'s>(
             id: envelope.id,
             root_node_id: Some(envelope.root_node_id),
             values,
-            expressions,
             nodes,
             sink: Some(envelope.sink),
             summaries: envelope.summaries,
@@ -725,7 +879,9 @@ fn encode_fragment_package_structural_in<'s>(
         provider_payloads,
         read_references,
         relations,
-        expression_control: Some(expression_control),
+        source_constant_policy: Some(crate::physical_call_requests_v2::encode_source_policy(
+            package.statement_constant_policy(),
+        )),
         calls: Some(calls),
         pruning: Some(pruning),
         parameters: Some(parameters),

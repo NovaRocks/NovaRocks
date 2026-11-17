@@ -470,7 +470,16 @@ fn absent_required_components_are_refused_without_defaults() {
     type PackageMutation = fn(&mut wire::FragmentPackage);
     let cases: [(&str, PackageMutation); 7] = [
         ("fragment", |d| d.fragment = None),
-        ("expression_control", |d| d.expression_control = None),
+        ("expression_control", |d| {
+            d.fragment
+                .as_mut()
+                .unwrap()
+                .nodes
+                .iter_mut()
+                .find_map(|node| node.expressions.as_mut())
+                .unwrap()
+                .control = None;
+        }),
         ("calls", |d| d.calls = None),
         ("pruning", |d| d.pruning = None),
         ("parameters", |d| d.parameters = None),
@@ -579,63 +588,12 @@ fn caller_control_cause_stays_primary_across_the_receiver() {
 }
 
 /// Every checked package of one plan that reads and writes nothing: eager
-/// root uses in one domain, no calls and an explicit empty pruning table.
+/// node-local units already sealed by its author and explicit empty pruning tables.
 fn plan_packages(plan: &p::PhysicalPlan) -> BTreeMap<p::FragmentId, p::FragmentPackage> {
-    use novarocks_type_contract::{
-        ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
-        ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    };
     let setup = Control::default();
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (id, fragment) in plan.fragments() {
-        let roots = p::PhysicalExpressionRoots::try_new(fragment, &setup).unwrap();
-        let bindings = roots
-            .sites()
-            .iter()
-            .enumerate()
-            .map(|(ordinal, (site, _))| (*site, ExpressionUseId::new(ordinal as u32)))
-            .collect::<Vec<_>>();
-        let invocations = roots
-            .sites()
-            .iter()
-            .enumerate()
-            .map(|(ordinal, (_, root))| ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id: ExpressionUseId::new(ordinal as u32),
-                    region: EvaluationRegionId::new(0),
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            })
-            .collect::<Vec<_>>();
-        let domains = if invocations.is_empty() {
-            vec![]
-        } else {
-            vec![ExpressionEvaluationRegion {
-                id: EvaluationRegionId::new(0),
-                parent: None,
-                guard: None,
-            }]
-        };
-        let flow = ExpressionControlFlow::try_new(
-            domains,
-            invocations,
-            fragment.expressions(),
-            CompilePhase::Validate,
-            &setup,
-        )
-        .unwrap();
-        let actual = p::PhysicalRootUses::try_new(fragment, flow, bindings, &setup).unwrap();
-        calls.insert(
-            *id,
-            p::FrozenFragmentCalls::try_new(fragment, &actual, vec![], &setup).unwrap(),
-        );
-        uses.insert(*id, actual);
+    for id in plan.fragments().keys() {
         pruning.insert(
             *id,
             p::FrozenFragmentPruning::try_new(*id, vec![], &setup).unwrap(),
@@ -657,8 +615,6 @@ fn plan_packages(plan: &p::PhysicalPlan) -> BTreeMap<p::FragmentId, p::FragmentP
         plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &setup,
