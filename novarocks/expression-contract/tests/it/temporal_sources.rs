@@ -332,3 +332,169 @@ fn original_unsealed_unit_loans_temporal_sources_before_control_construction() {
         }
     }
 }
+
+fn assert_immediate_source_trace<T: std::fmt::Debug + PartialEq>(
+    original: impl Fn(&Control) -> Result<T, SourceError>,
+    borrowed: impl Fn(&Control) -> Result<T, SourceError>,
+    expected: T,
+) {
+    let control = Control::default();
+    assert_eq!(original(&control).unwrap(), expected);
+    let trace = control.trace.lock().unwrap().clone();
+    let control = Control::default();
+    assert_eq!(borrowed(&control).unwrap(), expected);
+    assert_eq!(*control.trace.lock().unwrap(), trace);
+    for at in 0..trace.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for run in [
+                &original as &dyn Fn(&Control) -> Result<T, SourceError>,
+                &borrowed,
+            ] {
+                let control = Control {
+                    trace: Mutex::default(),
+                    refuse: Some((at, cause.clone())),
+                };
+                assert!(
+                    matches!(run(&control), Err(SourceError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
+}
+
+#[test]
+fn unsealed_regexp_source_keeps_checked_literal_dynamic_and_original_control() {
+    use novarocks_expression_contract::*;
+    use novarocks_type_contract::RegexpCountPatternSource;
+    let ty = ValueType::new(DataType::Utf8, true);
+    let (_pools, reference) = super::support::null_source(&ty);
+    let mut draft = BoundExprSetBuilder::new(super::support::limits());
+    let text = draft
+        .add(None, ty.clone(), ExprKind::Value(ValueId::new(0)))
+        .unwrap();
+    let literal = draft
+        .add(None, ty.clone(), ExprKind::Constant(reference))
+        .unwrap();
+    let dynamic = draft
+        .add(None, ty, ExprKind::Value(ValueId::new(1)))
+        .unwrap();
+    let stored: Vec<_> = draft.definitions().cloned().collect();
+    for (pattern, expected) in [
+        (
+            literal,
+            RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent,
+        ),
+        (dynamic, RegexpCountPatternSource::Dynamic),
+    ] {
+        let args = [text, pattern];
+        let run = |borrowed: bool, control: &Control| {
+            let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+            let result = if borrowed {
+                regexp_count_pattern_source_from_lookup_observed(
+                    |id| draft.definition(id),
+                    &args,
+                    &mut work,
+                )
+            } else {
+                regexp_count_pattern_source_observed(&stored, &args, &mut work)
+            };
+            work.finish_result(result, SourceError::Control)
+        };
+        assert_immediate_source_trace(
+            |control| run(false, control),
+            |control| run(true, control),
+            expected,
+        );
+    }
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    assert!(matches!(
+        regexp_count_pattern_source_from_lookup_observed(
+            |_| panic!("invalid arity cannot borrow a definition"),
+            &[],
+            &mut work,
+        ),
+        Err(SourceError::Invalid(
+            "regexp_count source requires two arguments"
+        ))
+    ));
+    assert!(matches!(
+        regexp_count_pattern_source_from_lookup_observed(|_| None, &[text, literal], &mut work,),
+        Err(SourceError::Invalid(
+            "regexp_count pattern definition is absent"
+        ))
+    ));
+}
+
+#[test]
+fn unsealed_base64_source_keeps_actual_immediate_identity_and_original_control() {
+    use novarocks_expression_contract::*;
+    use novarocks_type_contract::{FunctionArgumentType, ToBase64ByteSource};
+    let ty = ValueType::new(DataType::Utf8, true);
+    let mut draft = BoundExprSetBuilder::new(super::support::limits());
+    let value = draft
+        .add(None, ty.clone(), ExprKind::Value(ValueId::new(0)))
+        .unwrap();
+    let decoded = draft
+        .add(
+            None,
+            ty.clone(),
+            ExprKind::FunctionCall {
+                function: super::support::function(
+                    "builtin.scalar/from_base64/v1",
+                    vec![FunctionArgumentType::Value(ty.clone())],
+                    ty,
+                ),
+                args: Box::from([value]),
+            },
+        )
+        .unwrap();
+    let stored: Vec<_> = draft.definitions().cloned().collect();
+    for (argument, expected) in [
+        (value, ToBase64ByteSource::Ordinary),
+        (decoded, ToBase64ByteSource::NativeV1EncryptionLatin1),
+    ] {
+        let args = [argument];
+        let run = |borrowed: bool, control: &Control| {
+            let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+            let result = if borrowed {
+                to_base64_byte_source_from_lookup_observed(
+                    |id| draft.definition(id),
+                    &args,
+                    &mut work,
+                )
+            } else {
+                to_base64_byte_source_observed(&stored, &args, &mut work)
+            };
+            work.finish_result(result, SourceError::Control)
+        };
+        assert_immediate_source_trace(
+            |control| run(false, control),
+            |control| run(true, control),
+            expected,
+        );
+    }
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    assert!(matches!(
+        to_base64_byte_source_from_lookup_observed(
+            |_| panic!("invalid arity cannot borrow a definition"),
+            &[],
+            &mut work,
+        ),
+        Err(SourceError::Invalid(
+            "to_base64 source requires one argument"
+        ))
+    ));
+    assert!(matches!(
+        to_base64_byte_source_from_lookup_observed(|_| None, &[decoded], &mut work,),
+        Err(SourceError::Invalid(
+            "to_base64 source definition is absent"
+        ))
+    ));
+}

@@ -356,17 +356,24 @@ pub fn regexp_count_pattern_source_observed(
     args: &[ExprId],
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<novarocks_type_contract::RegexpCountPatternSource, TemporalSourceProjectionError> {
+    regexp_count_pattern_source_from_lookup_observed(|id| arena.get(id.get() as usize), args, work)
+}
+
+/// Borrow the actual unsealed definitions through the same immediate-source
+/// author. The caller's observation, identities and source lifetime are kept.
+pub fn regexp_count_pattern_source_from_lookup_observed<'source>(
+    definition: impl Fn(ExprId) -> Option<&'source ExprNode>,
+    args: &[ExprId],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<novarocks_type_contract::RegexpCountPatternSource, TemporalSourceProjectionError> {
     if args.len() != 2 {
         return Err(TemporalSourceProjectionError::Invalid(
             "regexp_count source requires two arguments",
         ));
     }
-    let pattern =
-        arena
-            .get((args[1]).get() as usize)
-            .ok_or(TemporalSourceProjectionError::Invalid(
-                "regexp_count pattern definition is absent",
-            ))?;
+    let pattern = definition(args[1]).ok_or(TemporalSourceProjectionError::Invalid(
+        "regexp_count pattern definition is absent",
+    ))?;
     work.step()?;
     novarocks_type_contract::RegexpCountPatternSource::from_native_v1_emitted_shape(
         &pattern.ty,
@@ -381,17 +388,24 @@ pub fn to_base64_byte_source_observed(
     args: &[ExprId],
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<novarocks_type_contract::ToBase64ByteSource, TemporalSourceProjectionError> {
+    to_base64_byte_source_from_lookup_observed(|id| arena.get(id.get() as usize), args, work)
+}
+
+/// Borrow the actual unsealed definitions through the same immediate-source
+/// author. The caller's observation, identities and source lifetime are kept.
+pub fn to_base64_byte_source_from_lookup_observed<'source>(
+    definition: impl Fn(ExprId) -> Option<&'source ExprNode>,
+    args: &[ExprId],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<novarocks_type_contract::ToBase64ByteSource, TemporalSourceProjectionError> {
     if args.len() != 1 {
         return Err(TemporalSourceProjectionError::Invalid(
             "to_base64 source requires one argument",
         ));
     }
-    let child =
-        arena
-            .get((args[0]).get() as usize)
-            .ok_or(TemporalSourceProjectionError::Invalid(
-                "to_base64 source definition is absent",
-            ))?;
+    let child = definition(args[0]).ok_or(TemporalSourceProjectionError::Invalid(
+        "to_base64 source definition is absent",
+    ))?;
     work.step()?;
     if child.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
         || *child.ty.data_type() != DataType::Utf8
