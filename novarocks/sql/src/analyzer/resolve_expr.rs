@@ -8080,6 +8080,380 @@ mod tests {
     }
 
     #[test]
+    fn string_doublepipe_candidates_keep_analyzer_types_and_original_bound_children() {
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+
+        // The nullable and required STRING declarations represent c8 and c20
+        // in aggregate/sql/compressed_key.sql, not a guessed carrier domain.
+        for (profile, nullable, prefix, left_source, right_source, from) in [
+            ("literal", false, "", "'DHL'", "','", ""),
+            (
+                "required_string",
+                false,
+                "",
+                "k",
+                "','",
+                " FROM unary_input",
+            ),
+            ("nullable_string", true, "", "k", "','", " FROM unary_input"),
+            (
+                "coalesce",
+                true,
+                "",
+                "coalesce(k,'')",
+                "coalesce(k,',')",
+                " FROM unary_input",
+            ),
+            (
+                "inner_cast",
+                false,
+                "",
+                "CAST(v AS STRING)",
+                "CAST(7 AS STRING)",
+                " FROM unary_input",
+            ),
+            (
+                "cte_grouping",
+                true,
+                "WITH g AS (SELECT k AS s FROM unary_input GROUP BY k) ",
+                "s",
+                "','",
+                " FROM g",
+            ),
+        ] {
+            let catalog = UnaryInputCatalog {
+                key_type: DataType::Utf8,
+                nullable,
+                logical_type: None,
+            };
+            let control = crate::compiler::SqlCompileControl::unbounded();
+            let expected = FunctionValueType::new(DataType::Boolean, true);
+            let mut declarations = Vec::new();
+            for explicit in [false, true] {
+                let boolean = if explicit {
+                    format!("(CAST({left_source} AS BOOLEAN) OR CAST({right_source} AS BOOLEAN))")
+                } else {
+                    format!("{left_source} || {right_source}")
+                };
+                let sql = format!(
+                    "{prefix}SELECT {boolean} AS boolean_result, {left_source} AS source_left, {right_source} AS source_right{from}"
+                );
+                let statements = novarocks_parser::parse(&sql)
+                    .unwrap_or_else(|error| panic!("{profile}: {sql}: {error:?}"));
+                let [ast::Statement::Query(query)] = statements.as_slice() else {
+                    panic!("actual query");
+                };
+                let (resolved, registry, _) = super::super::analyze(query, &catalog, "default")
+                    .unwrap_or_else(|error| panic!("{profile}: {sql}: {error:?}"));
+                let QueryBody::Select(select) = &resolved.body else {
+                    panic!("actual SELECT");
+                };
+                assert_eq!(select.projection.len(), 3, "{profile}");
+                assert_eq!(resolved.output_columns.len(), 3, "{profile}");
+                for (actual, output) in select.projection.iter().zip(&resolved.output_columns) {
+                    assert_eq!(actual.expr.value_type, output.value_type, "{profile}");
+                    assert_eq!(
+                        actual.output_column_id, output.column_id,
+                        "same query output binding"
+                    );
+                }
+                assert_eq!(
+                    select.projection[0].field_name.as_deref(),
+                    Some("boolean_result")
+                );
+                assert_eq!(
+                    select.projection[0].expr.value_type, expected,
+                    "{profile}: {sql}"
+                );
+                let boolean = if explicit {
+                    let ExprKind::Nested(inner) = &select.projection[0].expr.kind else {
+                        panic!("the candidate's own outer parentheses");
+                    };
+                    assert_eq!(inner.value_type, expected);
+                    inner.as_ref()
+                } else {
+                    &select.projection[0].expr
+                };
+                let ExprKind::BinaryOp {
+                    left,
+                    right,
+                    op: BinOp::Or,
+                    decimal_overflow_policy,
+                } = &boolean.kind
+                else {
+                    panic!("actual Boolean OR binding");
+                };
+                assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
+                for (operand, original) in [left.as_ref(), right.as_ref()]
+                    .into_iter()
+                    .zip(&select.projection[1..])
+                {
+                    assert_eq!(operand.value_type, expected, "{profile}");
+                    let ExprKind::Cast {
+                        expr,
+                        target,
+                        array_failure_mode,
+                        decimal_overflow_policy,
+                    } = &operand.kind
+                    else {
+                        panic!("one actual String-to-Boolean conversion per source");
+                    };
+                    assert_eq!(*target, DataType::Boolean);
+                    assert_eq!(*array_failure_mode, None);
+                    assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
+                    assert_eq!(
+                        expr.value_type, original.expr.value_type,
+                        "complete original child declaration"
+                    );
+                    assert!(
+                        crate::analysis::expr_identity::typed_expr_semantically_eq(
+                            expr,
+                            &original.expr,
+                            &control,
+                        )
+                        .unwrap(),
+                        "{profile}: source ColumnId, full FVT, call binding and ordered arguments"
+                    );
+                    if let ExprKind::FunctionCall { args, binding, .. } = &expr.kind {
+                        let ExprKind::FunctionCall {
+                            args: expected_args,
+                            binding: expected_binding,
+                            ..
+                        } = &original.expr.kind
+                        else {
+                            panic!("same original bound source call");
+                        };
+                        assert_eq!(binding, expected_binding);
+                        assert_eq!(args.len(), expected_args.len());
+                        assert_eq!(
+                            args.len(),
+                            2,
+                            "the coalesce source keeps both original operands"
+                        );
+                        let novarocks_functions::FunctionResultType::Scalar(result) =
+                            &binding.selected.result_type
+                        else {
+                            panic!("source scalar result");
+                        };
+                        assert_eq!(result, &expr.value_type);
+                    }
+                }
+                if profile == "required_string" || profile == "nullable_string" {
+                    assert_eq!(
+                        select.projection[1].expr.value_type,
+                        FunctionValueType::new(DataType::Utf8, nullable)
+                    );
+                    let ExprKind::ColumnRef {
+                        column_id, column, ..
+                    } = &select.projection[1].expr.kind
+                    else {
+                        panic!("actual catalog input");
+                    };
+                    assert_eq!(column, "k");
+                    let Some(crate::analysis::Relation::Scan(scan)) = &select.from else {
+                        panic!("actual source scan");
+                    };
+                    assert_eq!(*column_id, scan.column_ids[1]);
+                    assert_eq!(scan.table.columns[1].name, "k");
+                    assert_eq!(scan.table.columns[1].nullable, nullable);
+                    assert_eq!(scan.table.columns[1].logical_type, None);
+                }
+                if profile == "cte_grouping" {
+                    assert_eq!(registry.entries.len(), 1);
+                    let entry = &registry.entries[0];
+                    let QueryBody::Select(producer) = &entry.resolved_query.body else {
+                        panic!("actual grouped CTE producer");
+                    };
+                    assert_eq!(producer.group_by.len(), 1);
+                    assert!(producer.has_aggregation);
+                    assert!(
+                        crate::analysis::expr_identity::typed_expr_semantically_eq(
+                            &producer.group_by[0],
+                            &producer.projection[0].expr,
+                            &control,
+                        )
+                        .unwrap()
+                    );
+                    let Some(crate::analysis::Relation::CTEConsume {
+                        cte_id,
+                        output_columns,
+                        producer_column_ids,
+                        ..
+                    }) = &select.from
+                    else {
+                        panic!("actual grouped CTE consume");
+                    };
+                    assert_eq!(*cte_id, entry.id);
+                    assert_eq!(
+                        producer_column_ids.as_slice(),
+                        &[entry.output_columns[0].column_id]
+                    );
+                    assert_eq!(
+                        output_columns[0].value_type,
+                        entry.output_columns[0].value_type
+                    );
+                    let ExprKind::ColumnRef { column_id, .. } = &select.projection[1].expr.kind
+                    else {
+                        panic!("actual consume source");
+                    };
+                    assert_eq!(*column_id, output_columns[0].column_id);
+                }
+                declarations.push((
+                    resolved.output_columns[0].value_type.clone(),
+                    select.projection[1].expr.value_type.clone(),
+                    select.projection[2].expr.value_type.clone(),
+                ));
+            }
+            assert_eq!(
+                declarations[0], declarations[1],
+                "{profile}: cross-tree complete declarations, not factory ID numbers"
+            );
+        }
+    }
+
+    #[test]
+    fn string_doublepipe_candidate_context_constants_reloan_only_actual_occurrences() {
+        use crate::compiler::materialized_values::MaterializedSourceBorrow;
+        use arrow::array::{Array, StringArray};
+        use novarocks_functions::ConstantPool;
+        use novarocks_type_contract::{CompilePhase, FunctionValueType};
+        use std::sync::Arc;
+
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let source_type = FunctionValueType::new(DataType::Utf8, false);
+        let field = Arc::new(
+            arrow::datatypes::Field::new("original_string", DataType::Utf8, false).with_metadata(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    "doublepipe_original_source".to_string(),
+                )]),
+            ),
+        );
+        let pool = ConstantPool::try_new(
+            field.clone(),
+            source_type.clone(),
+            StringArray::from(vec!["unused", "DHL"]).to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let value = pool.value(1).unwrap();
+        for (explicit, sql) in [
+            (false, "SELECT 'DHL' || 'DHL'"),
+            (
+                true,
+                "SELECT (CAST('DHL' AS BOOLEAN) OR CAST('DHL' AS BOOLEAN))",
+            ),
+        ] {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let other_statements = novarocks_parser::parse(sql).unwrap();
+            fn projection(query: &ast::Query) -> &ast::Expr {
+                let ast::SetExpr::Select(select) = query.body.as_ref() else {
+                    panic!("select");
+                };
+                let ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
+                    panic!("projection");
+                };
+                &column.expression
+            }
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query");
+            };
+            let [ast::Statement::Query(other_query)] = other_statements.as_slice() else {
+                panic!("other query");
+            };
+            fn original_leaf(expression: &ast::Expr, explicit: bool) -> &ast::Expr {
+                if explicit {
+                    let ast::Expr::LegacyParenthesized(nested) = expression else {
+                        panic!("outer parentheses");
+                    };
+                    let ast::Expr::Logical(logical) = nested.expression.as_ref() else {
+                        panic!("actual OR");
+                    };
+                    assert_eq!(logical.terms.len(), 2);
+                    let ast::Expr::Cast(cast) = &logical.terms[0] else {
+                        panic!("actual CAST");
+                    };
+                    &cast.expression
+                } else {
+                    let ast::Expr::Binary(binary) = expression else {
+                        panic!("actual legacy binary");
+                    };
+                    assert_eq!(
+                        binary.operator,
+                        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::StringConcat)
+                    );
+                    binary.left.as_ref()
+                }
+            }
+            let expression = projection(query);
+            let source = original_leaf(expression, explicit);
+            assert!(matches!(source, ast::Expr::Literal(_)));
+            let cloned_source = source.clone();
+            // This original context-borrow port trusts the caller's actual
+            // query-member reference; it does not validate membership itself.
+            let mut owned = MaterializedSourceBorrow::empty(query);
+            owned
+                .insert_context_constant(source, value.clone(), &control)
+                .unwrap();
+            assert!(owned.view().constant_at(source).is_some());
+            assert!(owned.view().constant_at(&cloned_source).is_none());
+            assert!(
+                owned
+                    .view()
+                    .constant_at(original_leaf(projection(other_query), explicit))
+                    .is_none()
+            );
+            assert!(owned.view().constant_at(expression).is_none());
+            let mut context = logical_context(&control);
+            context.materialized_values = Some(owned.view());
+            let scope = context.new_scope();
+            let actual = context.analyze_expr(expression, &scope).unwrap();
+            assert_eq!(
+                actual.value_type,
+                FunctionValueType::new(DataType::Boolean, true)
+            );
+            let boolean = if explicit {
+                let ExprKind::Nested(inner) = &actual.kind else {
+                    panic!("candidate parentheses");
+                };
+                inner.as_ref()
+            } else {
+                &actual
+            };
+            let ExprKind::BinaryOp {
+                left,
+                right,
+                op: BinOp::Or,
+                ..
+            } = &boolean.kind
+            else {
+                panic!("OR");
+            };
+            let ExprKind::Cast { expr: child, .. } = &left.kind else {
+                panic!("original source cast");
+            };
+            let ExprKind::Constant(retained) = &child.kind else {
+                panic!("original source CV");
+            };
+            assert_eq!(child.value_type, source_type);
+            assert_eq!(retained.value_type(), &source_type);
+            assert_eq!(retained.ordinal(), 1);
+            assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
+            assert!(Arc::ptr_eq(retained.pool().field_ref(), &field));
+            assert_eq!(retained.field().metadata(), field.metadata());
+            assert!(!retained.field().metadata().is_empty());
+            let ExprKind::Cast { expr: sibling, .. } = &right.kind else {
+                panic!("unloaned sibling conversion");
+            };
+            assert!(
+                matches!(&sibling.kind, ExprKind::Literal(LiteralValue::String(text)) if text == "DHL")
+            );
+        }
+    }
+
+    #[test]
     fn implicit_boolean_or_preserves_successful_null_cast_obligations() {
         for sql in [
             "select 'DHL' || ',' || 'BARIAN'",
