@@ -3708,6 +3708,7 @@ dependencies = [
  "arrow-schema",
  "bytes",
  "novarocks-connector-contract",
+ "novarocks-constant-contract",
  "novarocks-execution-contract",
  "novarocks-expression",
  "novarocks-expression-contract",

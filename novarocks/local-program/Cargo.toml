@@ -28,6 +28,7 @@ sha2.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
+novarocks-constant-contract.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = []
