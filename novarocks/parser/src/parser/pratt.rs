@@ -241,11 +241,36 @@ fn prefix_binding(kind: &TokenKind) -> Option<PrefixBinding> {
         .find(|binding| binding.token.matches(kind))
 }
 
+/// One direct parser result and two explicitly authored source ranges.
+#[derive(Debug)]
+pub(super) struct ParsedExpression {
+    pub(super) expression: Expr,
+    pub(super) syntax_span: Span,
+    pub(super) legacy_metadata_span: Span,
+}
+impl ParsedExpression {
+    fn authored(expression: Expr, syntax_span: Span, legacy_metadata_span: Span) -> Self {
+        Self {
+            expression,
+            syntax_span,
+            legacy_metadata_span,
+        }
+    }
+    fn into_call_argument(self) -> crate::ast::CallArgument {
+        crate::ast::CallArgument {
+            name: None,
+            value: self.expression,
+            span: self.legacy_metadata_span,
+        }
+    }
+}
+
 pub(super) struct PrattParser<'source, 'tokens> {
     source: &'source str,
     tokens: &'tokens [Token],
     boundary_span: Span,
     position: usize,
+    last_syntax_end: usize,
     pending_type_gt: Option<Span>,
     allow_table_function_named_arguments: bool,
     function_call_depth: usize,
@@ -272,6 +297,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             tokens,
             boundary_span,
             position: 0,
+            last_syntax_end: boundary_span.start(),
             pending_type_gt: None,
             allow_table_function_named_arguments: false,
             function_call_depth: 0,
@@ -284,8 +310,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     }
 
     /// `expression ::= prefix-expression { infix-operator prefix-expression }`
-    pub(super) fn parse(mut self) -> Result<Expr, ParseError> {
-        let expression = self.parse_binding_power(0)?;
+    pub(super) fn parse(self) -> Result<Expr, ParseError> {
+        self.parse_spanned().map(|parsed| parsed.expression)
+    }
+
+    pub(super) fn parse_spanned(mut self) -> Result<ParsedExpression, ParseError> {
+        let expression = self.parse_binding_power_frame(0)?;
         self.skip_trivia();
         if self.is_end() {
             Ok(expression)
@@ -296,36 +326,50 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
     }
 
-    /// `expression ::= prefix-expression { infix-operator expression }`
-    #[recursive::recursive]
+    /// Consume a value when its caller does not author another source range.
     fn parse_binding_power(&mut self, minimum_precedence: u8) -> Result<Expr, ParseError> {
+        self.parse_binding_power_frame(minimum_precedence)
+            .map(|parsed| parsed.expression)
+    }
+
+    /// Keep grammar ranges local to the invocation that authored them.
+    #[recursive::recursive]
+    fn parse_binding_power_frame(
+        &mut self,
+        minimum_precedence: u8,
+    ) -> Result<ParsedExpression, ParseError> {
         self.skip_trivia();
         let prefix_start = self.position;
         let mut left = self.parse_prefix_expression()?;
-
+        let mut extendable_logical = None;
         loop {
             self.skip_trivia();
             if self.current_is_symbol(Symbol::Arrow)
-                && self.arrow_starts_lambda(&left, prefix_start)
+                && self.arrow_starts_lambda(&left.expression, prefix_start)
             {
-                let parameters = Self::lambda_parameters(&left)
+                let parameters = Self::lambda_parameters(&left.expression)
                     .expect("arrow_starts_lambda only accepts identifier parameters");
-                let start = left.span().start();
                 self.advance();
                 self.skip_trivia();
-                let body = self.parse_binding_power(0)?;
-                let span = Span::new(start, body.span().end());
-                left = Expr::Lambda(AstBox::new(LambdaExpr {
-                    arguments: parameters
-                        .into_iter()
-                        .map(|name| LambdaArgumentDeclaration {
-                            span: name.span,
-                            name,
-                        })
-                        .collect(),
-                    body,
+                let body = self.parse_binding_power_frame(0)?;
+                let syntax_span = left.syntax_span.cover(body.syntax_span);
+                let span = left.legacy_metadata_span.cover(body.legacy_metadata_span);
+                left = ParsedExpression::authored(
+                    Expr::Lambda(AstBox::new(LambdaExpr {
+                        arguments: parameters
+                            .into_iter()
+                            .map(|name| LambdaArgumentDeclaration {
+                                span: name.span,
+                                name,
+                            })
+                            .collect(),
+                        body: body.expression,
+                        span,
+                    })),
+                    syntax_span,
                     span,
-                }));
+                );
+                extendable_logical = None;
                 continue;
             }
             if self.current_is_symbol(Symbol::LBracket)
@@ -334,10 +378,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 || self.current_is_symbol(Symbol::Dot)
             {
                 left = self.parse_postfix_access(left)?;
+                extendable_logical = None;
                 continue;
             }
             if minimum_precedence <= COMPARISON_PRECEDENCE && self.starts_comparison_special() {
                 left = self.parse_comparison_special(left)?;
+                extendable_logical = None;
                 continue;
             }
             let Some(binding) = self.current().and_then(|token| infix_binding(&token.kind)) else {
@@ -346,65 +392,71 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             if binding.precedence < minimum_precedence {
                 break;
             }
-
             let predicate_start = self.current_span().start();
             self.advance();
-            // Incrementing the minimum implements left associativity for every
-            // current table entry. A right-associative future entry can carry a
-            // distinct right binding power without changing this parser shape.
-            let right = self.parse_binding_power(binding.precedence + 1)?;
-            let span = Span::new(left.span().start(), right.span().end());
-            left = match binding.operator {
+            let right = self.parse_binding_power_frame(binding.precedence + 1)?;
+            let syntax_span = left.syntax_span.cover(right.syntax_span);
+            let span = left.legacy_metadata_span.cover(right.legacy_metadata_span);
+            let next_logical = match binding.operator {
+                InfixOperator::Logical(operator) => Some(operator),
+                _ => None,
+            };
+            let expression = match binding.operator {
                 InfixOperator::Comparison(operator) => {
-                    let predicate_span = Span::new(predicate_start, right.span().end());
                     Expr::Predicated(AstBox::new(PredicatedExpr {
-                        value: left,
+                        value: left.expression,
                         predicate: Predicate::Comparison(ComparisonPredicate {
                             operator,
-                            right,
-                            span: predicate_span,
+                            right: right.expression,
+                            span: Span::new(predicate_start, right.legacy_metadata_span.end()),
                         }),
                         span,
                     }))
                 }
-                InfixOperator::NullSafeEqual => {
-                    let predicate_span = Span::new(predicate_start, right.span().end());
-                    Expr::Predicated(AstBox::new(PredicatedExpr {
-                        value: left,
-                        predicate: Predicate::DistinctFrom(DistinctFromPredicate {
-                            negated: true,
-                            right,
-                            span: predicate_span,
-                        }),
-                        span,
-                    }))
-                }
+                InfixOperator::NullSafeEqual => Expr::Predicated(AstBox::new(PredicatedExpr {
+                    value: left.expression,
+                    predicate: Predicate::DistinctFrom(DistinctFromPredicate {
+                        negated: true,
+                        right: right.expression,
+                        span: Span::new(predicate_start, right.legacy_metadata_span.end()),
+                    }),
+                    span,
+                })),
                 InfixOperator::Binary(operator) => Expr::Binary(BinaryExpr {
-                    left: crate::ast::AstBox::new(left),
-                    operator: operator,
-                    right: crate::ast::AstBox::new(right),
-                    span: span,
+                    left: AstBox::new(left.expression),
+                    operator,
+                    right: AstBox::new(right.expression),
+                    span,
                 }),
-                InfixOperator::Logical(operator) => match left {
-                    Expr::Logical(mut logical) if logical.operator == operator => {
-                        logical.terms.push(right);
+                InfixOperator::Logical(operator) => {
+                    if extendable_logical == Some(operator) {
+                        let Expr::Logical(mut logical) = left.expression else {
+                            unreachable!("this frame authored its open logical chain")
+                        };
+                        logical.terms.push(right.expression);
                         logical.span = span;
                         Expr::Logical(logical)
+                    } else {
+                        Expr::Logical(LogicalExpr {
+                            operator,
+                            terms: vec![left.expression, right.expression].into(),
+                            span,
+                        })
                     }
-                    left => Expr::Logical(LogicalExpr {
-                        operator,
-                        terms: vec![left, right].into(),
-                        span,
-                    }),
-                },
+                }
             };
+            left = ParsedExpression::authored(expression, syntax_span, span);
+            extendable_logical = next_logical;
         }
-
         Ok(left)
     }
 
-    fn parse_postfix_access(&mut self, base: Expr) -> Result<Expr, ParseError> {
-        let start = base.span().start();
+    fn parse_postfix_access(
+        &mut self,
+        base: ParsedExpression,
+    ) -> Result<ParsedExpression, ParseError> {
+        let start = base.legacy_metadata_span.start();
+        let syntax_start = base.syntax_span.start();
         if self.current_is_symbol(Symbol::LBracket) {
             self.advance();
             self.skip_trivia();
@@ -416,11 +468,16 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             let end = self.current_span().end();
             self.advance();
             self.skip_trivia();
-            return Ok(Expr::Subscript(AstBox::new(crate::ast::SubscriptExpr {
-                base,
-                index,
-                span: Span::new(start, end),
-            })));
+            let span = Span::new(start, end);
+            return Ok(ParsedExpression::authored(
+                Expr::Subscript(AstBox::new(crate::ast::SubscriptExpr {
+                    base: base.expression,
+                    index,
+                    span,
+                })),
+                Span::new(syntax_start, end),
+                span,
+            ));
         }
         if self.current_is_symbol(Symbol::Dot) {
             self.advance();
@@ -435,39 +492,50 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 return Err(self.unexpected("field name after '.'"));
             }
             let field = self.parse_identifier(token.span);
-            return Ok(Expr::Dereference(AstBox::new(DereferenceExpr {
-                span: Span::new(start, field.span.end()),
-                base,
-                field: Some(field),
-            })));
+            let span = Span::new(start, field.span.end());
+            let syntax_span = Span::new(syntax_start, field.span.end());
+            return Ok(ParsedExpression::authored(
+                Expr::Dereference(AstBox::new(DereferenceExpr {
+                    span,
+                    base: base.expression,
+                    field: Some(field),
+                })),
+                syntax_span,
+                span,
+            ));
         }
         self.advance();
         self.skip_trivia();
-        let path = self.parse_binding_power(UNARY_ARITHMETIC_PRECEDENCE + 1)?;
-        let span = Span::new(start, path.span().end());
+        let path = self.parse_binding_power_frame(UNARY_ARITHMETIC_PRECEDENCE + 1)?;
+        let span = Span::new(start, path.legacy_metadata_span.end());
+        let syntax_span = Span::new(syntax_start, path.syntax_span.end());
         // This is the old producer's uniform semantic bridge, not the
         // AstBuilder result for the reserved Trino JSON_QUERY grammar.
-        Ok(Expr::FunctionCall(AstBox::new(FunctionCall {
-            name: ObjectName {
-                parts: vec![Ident {
-                    value: "json_query".to_owned(),
-                    quoted: false,
+        Ok(ParsedExpression::authored(
+            Expr::FunctionCall(AstBox::new(FunctionCall {
+                name: ObjectName {
+                    parts: vec![Ident {
+                        value: "json_query".to_owned(),
+                        quoted: false,
+                        span: crate::SYNTHETIC,
+                    }],
                     span: crate::SYNTHETIC,
-                }],
-                span: crate::SYNTHETIC,
-            },
-            arguments: [base, path]
-                .into_iter()
-                .map(|value| crate::build::call_argument(value, None))
-                .collect(),
-            distinct: false,
-            order_by: None,
-            filter: None,
-            null_treatment: None,
-            window: None,
-            processing_mode: None,
+                },
+                arguments: [base, path]
+                    .into_iter()
+                    .map(ParsedExpression::into_call_argument)
+                    .collect(),
+                distinct: false,
+                order_by: None,
+                filter: None,
+                null_treatment: None,
+                window: None,
+                processing_mode: None,
+                span,
+            })),
+            syntax_span,
             span,
-        })))
+        ))
     }
 
     fn arrow_starts_lambda(&self, left: &Expr, prefix_start: usize) -> bool {
@@ -589,7 +657,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     || self.peek_keyword(1, Keyword::Similar)))
     }
 
-    fn parse_comparison_special(&mut self, left: Expr) -> Result<Expr, ParseError> {
+    fn parse_comparison_special(
+        &mut self,
+        left: ParsedExpression,
+    ) -> Result<ParsedExpression, ParseError> {
         let start = self.current_span().start();
         let negated = if self.current_is_keyword(Keyword::Not) {
             self.advance();
@@ -607,15 +678,15 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
             self.advance();
             self.skip_trivia();
-            let max = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
-            let span = Span::new(start, max.span().end());
-            return Ok(predicate_node(
+            let max = self.parse_binding_power_frame(COMPARISON_PRECEDENCE + 1)?;
+            let span = Span::new(start, max.legacy_metadata_span.end());
+            return Ok(self.predicate_node(
                 left,
                 Predicate::Between(BetweenPredicate {
                     negated,
                     symmetry: None,
                     min,
-                    max,
+                    max: max.expression,
                     span,
                 }),
             ));
@@ -632,7 +703,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             if self.query_follows() {
                 let (query, span) = self.parse_subquery_body(list_start)?;
                 let predicate_span = Span::new(start, span.end());
-                return Ok(predicate_node(
+                return Ok(self.predicate_node(
                     left,
                     Predicate::In(InPredicate {
                         negated,
@@ -666,7 +737,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 values: values.into(),
                 span: Span::new(list_start, end),
             }));
-            return Ok(predicate_node(
+            return Ok(self.predicate_node(
                 left,
                 Predicate::In(InPredicate {
                     negated,
@@ -688,23 +759,24 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 self.advance();
                 self.skip_trivia();
             }
-            let pattern = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+            let pattern = self.parse_binding_power_frame(COMPARISON_PRECEDENCE + 1)?;
             let escape = if self.current_is_keyword(Keyword::Escape) {
                 self.advance();
                 self.skip_trivia();
-                Some(self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?)
+                Some(self.parse_binding_power_frame(COMPARISON_PRECEDENCE + 1)?)
             } else {
                 None
             };
-            let end = escape
-                .as_ref()
-                .map_or_else(|| pattern.span().end(), |v| v.span().end());
-            return Ok(predicate_node(
+            let end = escape.as_ref().map_or_else(
+                || pattern.legacy_metadata_span.end(),
+                |v| v.legacy_metadata_span.end(),
+            );
+            return Ok(self.predicate_node(
                 left,
                 Predicate::Like(LikePredicate {
                     negated,
-                    pattern,
-                    escape,
+                    pattern: pattern.expression,
+                    escape: escape.map(|value| value.expression),
                     span: Span::new(start, end),
                 }),
             ));
@@ -730,13 +802,13 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 }
                 self.advance();
                 self.skip_trivia();
-                let right = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
-                let span = Span::new(start, right.span().end());
-                return Ok(predicate_node(
+                let right = self.parse_binding_power_frame(COMPARISON_PRECEDENCE + 1)?;
+                let span = Span::new(start, right.legacy_metadata_span.end());
+                return Ok(self.predicate_node(
                     left,
                     Predicate::DistinctFrom(DistinctFromPredicate {
                         negated,
-                        right,
+                        right: right.expression,
                         span,
                     }),
                 ));
@@ -773,19 +845,21 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 }
             };
             self.advance();
-            return Ok(predicate_node(left, predicate));
+            return Ok(self.predicate_node(left, predicate));
         }
         Err(self.unexpected("comparison special form"))
     }
 
     /// `prefix-expression ::= unary-operator expression | primary-expression`
-    fn parse_prefix_expression(&mut self) -> Result<Expr, ParseError> {
+    fn parse_prefix_expression(&mut self) -> Result<ParsedExpression, ParseError> {
         self.skip_trivia();
+        let begin = self.position;
         if self.current_is_keyword(Keyword::Not) && self.peek_keyword(1, Keyword::Exists) {
             let start = self.current_span().start();
             self.advance();
             self.skip_trivia();
-            return self.parse_exists_expression(start, true);
+            let expression = self.parse_exists_expression(start, true)?;
+            return Ok(self.full_expression(begin, expression));
         }
         if let Some(binding) = self.current().and_then(|token| prefix_binding(&token.kind)) {
             let start = self.current_span().start();
@@ -804,26 +878,34 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     literal_span,
                 )?;
                 self.advance();
-                return Ok(Expr::Literal(Literal {
-                    kind,
-                    span: literal_span,
-                }));
+                return Ok(self.full_expression(
+                    begin,
+                    Expr::Literal(Literal {
+                        kind,
+                        span: literal_span,
+                    }),
+                ));
             }
-            let expression = self.parse_binding_power(binding.precedence)?;
-            let span = Span::new(start, expression.span().end());
-            return Ok(Expr::Unary(UnaryExpr {
-                operator: binding.operator,
-                expression: crate::ast::AstBox::new(expression),
-                span: span,
-            }));
+            let expression = self.parse_binding_power_frame(binding.precedence)?;
+            let span = Span::new(start, expression.legacy_metadata_span.end());
+            return Ok(ParsedExpression::authored(
+                Expr::Unary(UnaryExpr {
+                    operator: binding.operator,
+                    expression: crate::ast::AstBox::new(expression.expression),
+                    span: span,
+                }),
+                self.syntax_extent(begin),
+                span,
+            ));
         }
 
         self.parse_primary_expression()
     }
 
     /// `primary-expression ::= literal | identifier [ function-call ] | "(" expression ")"`
-    fn parse_primary_expression(&mut self) -> Result<Expr, ParseError> {
+    fn parse_primary_expression(&mut self) -> Result<ParsedExpression, ParseError> {
         self.skip_trivia();
+        let begin = self.position;
         if self.current_is_word("ARRAY") && self.peek_nontrivia_is_symbol(1, Symbol::Lt) {
             let start = self.current_span().start();
             let array_type = self.parse_type_name()?;
@@ -839,49 +921,60 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 return Err(self.unexpected("'[' after ARRAY element type"));
             }
             let expression = self.parse_array_expression(self.current_span())?;
-            let span = Span::new(start, expression.span().end());
+            let span = Span::new(start, self.consumed_syntax_end());
             // The source type belongs to the outer CAST. ARRAY inference sees
             // the original children without a target context.
-            return Ok(Expr::Cast(AstBox::new(CastExpr {
-                expression,
-                data_type: array_type,
-                safe: false,
+            return Ok(ParsedExpression::authored(
+                Expr::Cast(AstBox::new(CastExpr {
+                    expression,
+                    data_type: array_type,
+                    safe: false,
+                    span,
+                })),
+                self.syntax_extent(begin),
                 span,
-            })));
+            ));
         }
         if self.current_is_word("MAP") && self.peek_nontrivia_is_symbol(1, Symbol::LBrace) {
             let start = self.current_span().start();
             self.advance();
             self.skip_trivia();
-            return self.parse_map_expression(start);
+            let expression = self.parse_map_expression(start)?;
+            return Ok(self.full_expression(begin, expression));
         }
         if self.current_is_word("ROW") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
-            return self.parse_row_expression();
+            let expression = self.parse_row_expression()?;
+            return Ok(self.full_expression(begin, expression));
         }
         if self.current_is_word("POSITION")
             && self.peek_nontrivia_is_symbol(1, Symbol::LParen)
             && self.position_special_form_follows()
         {
-            return self.parse_position_expression();
+            let expression = self.parse_position_expression()?;
+            return Ok(self.full_expression(begin, expression));
         }
         if self.current_is_word("NORMALIZE") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
-            return self.parse_normalize_expression();
+            let expression = self.parse_normalize_expression()?;
+            return Ok(self.full_expression(begin, expression));
         }
         if self.current_is_word("SUBSTRING") && self.substring_special_form_follows() {
-            return self.parse_substring_expression();
+            let expression = self.parse_substring_expression()?;
+            return Ok(self.full_expression(begin, expression));
         }
         if self.current_is_word("EXTRACT") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
-            return self.parse_extract_expression();
+            let expression = self.parse_extract_expression()?;
+            return Ok(self.full_expression(begin, expression));
         }
         if (self.current_is_word("DATETIME")
             || self.current_is_word("JSON")
             || self.current_is_word("DECIMAL"))
             && self.peek_nontrivia_is_string(1)
         {
-            return self.parse_typed_string_expression();
+            let expression = self.parse_typed_string_expression()?;
+            return Ok(self.full_expression(begin, expression));
         }
         let token = self.current().cloned();
-        match token {
+        let expression = match token {
             Some(Token {
                 kind: TokenKind::Number,
                 span,
@@ -975,12 +1068,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             Some(Token {
                 kind: TokenKind::Ident | TokenKind::QuotedIdent,
                 span,
-            }) => self.parse_identifier_or_function_call(span),
+            }) => return self.parse_identifier_or_function_call(span),
             Some(Token {
                 kind: TokenKind::Keyword(keyword),
                 span,
             }) if keyword_class(keyword) == crate::KeywordClass::NonReserved => {
-                self.parse_identifier_or_function_call(span)
+                return self.parse_identifier_or_function_call(span);
             }
             Some(Token {
                 kind: TokenKind::Symbol(Symbol::LParen),
@@ -989,13 +1082,14 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             Some(Token {
                 kind: TokenKind::Symbol(Symbol::LParen),
                 span,
-            }) => self.parse_nested_expression(span),
+            }) => return self.parse_nested_expression(span),
             Some(Token {
                 kind: TokenKind::Symbol(Symbol::LBracket),
                 span,
             }) => self.parse_array_expression(span),
             _ => Err(self.unexpected("expression")),
-        }
+        }?;
+        Ok(self.full_expression(begin, expression))
     }
 
     fn parse_interval_expression(&mut self) -> Result<Expr, ParseError> {
@@ -1152,11 +1246,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
             self.advance();
             self.skip_trivia();
-            let result = self.parse_binding_power(0)?;
-            let span = Span::new(when_start, result.span().end());
+            let result = self.parse_binding_power_frame(0)?;
+            let span = Span::new(when_start, result.legacy_metadata_span.end());
             when_clauses.push(WhenClause {
                 match_value: WhenMatch::Operand(condition),
-                result,
+                result: result.expression,
                 span,
             });
         }
@@ -1325,14 +1419,14 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.skip_trivia();
         // Preserve the original TABLE named-argument nesting boundary.
         self.function_call_depth += 1;
-        let needle = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+        let needle = self.parse_binding_power_frame(COMPARISON_PRECEDENCE + 1)?;
         self.skip_trivia();
         if !self.current_is_keyword(Keyword::In) {
             return Err(self.unexpected("IN in POSITION"));
         }
         self.advance();
         self.skip_trivia();
-        let haystack = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+        let haystack = self.parse_binding_power_frame(COMPARISON_PRECEDENCE + 1)?;
         self.skip_trivia();
         if !self.current_is_symbol(Symbol::RParen) {
             return Err(self.unexpected("')' after POSITION"));
@@ -1360,7 +1454,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.skip_trivia();
         // Preserve the original TABLE named-argument nesting boundary.
         self.function_call_depth += 1;
-        let value = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+        let value = self.parse_binding_power_frame(COMPARISON_PRECEDENCE + 1)?;
         self.skip_trivia();
         let form = if self.current_is_symbol(Symbol::Comma) {
             self.advance();
@@ -1393,10 +1487,14 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let span = Span::new(start, end);
         // The generated literal's pinned location is the whole context's
         // start, for explicit and absent forms; there is no source string.
-        let form = Expr::Literal(Literal {
-            kind: LiteralKind::String(form),
+        let form = ParsedExpression::authored(
+            Expr::Literal(Literal {
+                kind: LiteralKind::String(form),
+                span,
+            }),
             span,
-        });
+            span,
+        );
         Ok(ordinary_special_call(
             "normalize",
             true,
@@ -1414,19 +1512,19 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
         self.advance();
         self.skip_trivia();
-        let value = self.parse_binding_power(0)?;
+        let value = self.parse_binding_power_frame(0)?;
         self.skip_trivia();
         if !self.current_is_keyword(Keyword::From) {
             return Err(self.unexpected("FROM in SUBSTRING"));
         }
         self.advance();
         self.skip_trivia();
-        let start_position = self.parse_binding_power(0)?;
+        let start_position = self.parse_binding_power_frame(0)?;
         self.skip_trivia();
         let length = if self.current_is_keyword(Keyword::For) {
             self.advance();
             self.skip_trivia();
-            Some(self.parse_binding_power(0)?)
+            Some(self.parse_binding_power_frame(0)?)
         } else {
             None
         };
@@ -1452,7 +1550,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             },
             arguments: arguments
                 .into_iter()
-                .map(|value| crate::build::call_argument(value, None))
+                .map(ParsedExpression::into_call_argument)
                 .collect(),
             processing_mode: None,
             distinct: false,
@@ -1590,7 +1688,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     }
 
     /// `function-call ::= object-name "(" [ expression { "," expression } ] ")"`
-    fn parse_identifier_or_function_call(&mut self, span: Span) -> Result<Expr, ParseError> {
+    fn parse_identifier_or_function_call(
+        &mut self,
+        span: Span,
+    ) -> Result<ParsedExpression, ParseError> {
+        let begin = self.position;
         let first = self.parse_identifier(span);
         let mut end = first.span.end();
         let mut parts = vec![first];
@@ -1619,14 +1721,14 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             let mut parts = name.parts.into_iter();
             let mut expression = Expr::Identifier(parts.next().expect("nonempty name"));
             for field in parts {
-                let span = expression.span().cover(field.span);
+                let span = Span::new(span.start(), field.span.end());
                 expression = Expr::Dereference(AstBox::new(DereferenceExpr {
                     base: expression,
                     field: Some(field),
                     span,
                 }));
             }
-            return Ok(expression);
+            return Ok(self.full_expression(begin, expression));
         }
 
         self.advance();
@@ -1655,15 +1757,19 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 if self.current_is_symbol(Symbol::Star) {
                     let star = self.current_span();
                     self.advance();
-                    arguments.push(Expr::Identifier(Ident {
-                        value: "*".to_owned(),
-                        quoted: false,
-                        span: star,
-                    }));
+                    arguments.push(ParsedExpression::authored(
+                        Expr::Identifier(Ident {
+                            value: "*".to_owned(),
+                            quoted: false,
+                            span: star,
+                        }),
+                        star,
+                        star,
+                    ));
                 } else if allow_named_arguments && self.table_function_named_argument_ahead() {
                     arguments.push(self.parse_table_function_named_argument()?);
                 } else {
-                    arguments.push(self.parse_binding_power(0)?);
+                    arguments.push(self.parse_binding_power_frame(0)?);
                 }
                 self.skip_trivia();
                 if null_treatment.is_none() {
@@ -1692,8 +1798,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             self.advance();
             self.skip_trivia();
             loop {
-                let expr = self.parse_binding_power(0)?;
-                let mut item_end = expr.span().end();
+                let expr = self.parse_binding_power_frame(0)?;
+                let mut item_end = expr.legacy_metadata_span.end();
                 let asc = if self.current_is_keyword(Keyword::Asc) {
                     item_end = self.current_span().end();
                     self.advance();
@@ -1727,8 +1833,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     None
                 };
                 order_items.push(SortItem {
-                    span: Span::new(expr.span().start(), item_end),
-                    sort_key: expr,
+                    span: Span::new(expr.legacy_metadata_span.start(), item_end),
+                    sort_key: expr.expression,
                     ordering: if asc == Some(false) {
                         SortOrdering::Descending
                     } else {
@@ -1759,7 +1865,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let separator = if self.current_is_word("SEPARATOR") {
             self.advance();
             self.skip_trivia();
-            Some(self.parse_binding_power(0)?)
+            Some(self.parse_binding_power_frame(0)?)
         } else {
             None
         };
@@ -1787,7 +1893,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
             self.advance();
             self.skip_trivia();
-            let filter = self.parse_binding_power(0)?;
+            let filter = self.parse_binding_power_frame(0)?;
             self.skip_trivia();
             if !self.current_is_symbol(Symbol::RParen) {
                 return Err(self.unexpected("')' after FILTER"));
@@ -1823,7 +1929,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             || {
                 filter
                     .as_ref()
-                    .map_or_else(|| end, |value| value.span().end())
+                    .map_or_else(|| end, |value| value.legacy_metadata_span.end())
             },
             |window| window.span().end(),
         );
@@ -1862,7 +1968,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 // The current grammar has no RUNNING/FINAL producer. P05
                 // checks that mode at this same stage before constructing a node.
                 else if filter.is_some() { Some(("a control expression without FILTER","FILTER")) }
-                else if arguments.iter().any(|value| matches!(value,Expr::Binary(binary) if binary.operator==BinaryOperator::Legacy(crate::ast::legacy::BinaryOperator::NamedArgument))) { Some(("positional control-expression arguments","named argument")) }
+                else if arguments.iter().any(|value| matches!(&value.expression,Expr::Binary(binary) if binary.operator==BinaryOperator::Legacy(crate::ast::legacy::BinaryOperator::NamedArgument))) { Some(("positional control-expression arguments","named argument")) }
                 else if separator.is_some() { Some(("a control expression without SEPARATOR","SEPARATOR")) }
                 else { None };
             if let Some((expected, found)) = metadata_error {
@@ -1874,9 +1980,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
             // The pinned builder visits ORDER BY but does not retain it for
             // these five nodes; ALL likewise carries no distinct fact.
-            return Ok(match special {
+            let expression = match special {
                 "if" => {
-                    let mut values = arguments.into_iter();
+                    let mut values = arguments.into_iter().map(|value| value.expression);
                     Expr::If(AstBox::new(crate::ast::IfExpr {
                         condition: values.next().expect("checked IF arity"),
                         true_value: values.next().expect("checked IF arity"),
@@ -1885,7 +1991,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     }))
                 }
                 "nullif" => {
-                    let mut values = arguments.into_iter();
+                    let mut values = arguments.into_iter().map(|value| value.expression);
                     Expr::NullIf(AstBox::new(crate::ast::NullIfExpr {
                         first: values.next().expect("checked NULLIF arity"),
                         second: values.next().expect("checked NULLIF arity"),
@@ -1893,19 +1999,34 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     }))
                 }
                 "coalesce" => Expr::Coalesce(AstBox::new(crate::ast::CoalesceExpr {
-                    operands: arguments.into(),
+                    operands: arguments
+                        .into_iter()
+                        .map(|value| value.expression)
+                        .collect(),
                     span: call_span,
                 })),
                 "try" => Expr::Try(AstBox::new(crate::ast::TryExpr {
-                    inner: arguments.into_iter().next().expect("checked TRY arity"),
+                    inner: arguments
+                        .into_iter()
+                        .next()
+                        .expect("checked TRY arity")
+                        .expression,
                     span: call_span,
                 })),
                 "format" => Expr::Format(AstBox::new(crate::ast::FormatExpr {
-                    arguments: arguments.into(),
+                    arguments: arguments
+                        .into_iter()
+                        .map(|value| value.expression)
+                        .collect(),
                     span: call_span,
                 })),
                 _ => unreachable!("recognized control expression"),
-            });
+            };
+            return Ok(ParsedExpression::authored(
+                expression,
+                self.syntax_extent(begin),
+                call_span,
+            ));
         }
         // Erase the legacy clause only after its complete source shape is
         // admitted. Ordinary calls remain raw for SQL policy preparation.
@@ -1944,20 +2065,24 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         } else {
             name
         };
-        Ok(Expr::FunctionCall(AstBox::new(FunctionCall {
-            name,
-            arguments: arguments
-                .into_iter()
-                .map(|value| crate::build::call_argument(value, None))
-                .collect(),
-            processing_mode: None,
-            distinct,
-            order_by,
-            filter,
-            null_treatment,
-            window,
-            span: Span::new(span.start(), span_end),
-        })))
+        Ok(ParsedExpression::authored(
+            Expr::FunctionCall(AstBox::new(FunctionCall {
+                name,
+                arguments: arguments
+                    .into_iter()
+                    .map(ParsedExpression::into_call_argument)
+                    .collect(),
+                processing_mode: None,
+                distinct,
+                order_by,
+                filter: filter.map(|value| value.expression),
+                null_treatment,
+                window,
+                span: Span::new(span.start(), span_end),
+            })),
+            self.syntax_extent(begin),
+            call_span,
+        ))
     }
 
     fn table_function_named_argument_ahead(&self) -> bool {
@@ -1967,7 +2092,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         ) && self.peek_nontrivia_is_symbol(1, Symbol::FatArrow)
     }
 
-    fn parse_table_function_named_argument(&mut self) -> Result<Expr, ParseError> {
+    fn parse_table_function_named_argument(&mut self) -> Result<ParsedExpression, ParseError> {
         let start = self.current_span().start();
         let name = self.parse_identifier(self.current_span());
         self.skip_trivia();
@@ -1976,14 +2101,18 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
         self.advance();
         self.skip_trivia();
-        let value = self.parse_binding_power(0)?;
-        let span = Span::new(start, value.span().end());
-        Ok(Expr::Binary(BinaryExpr {
-            left: crate::ast::AstBox::new(Expr::Identifier(name)),
-            operator: BinaryOperator::Legacy(crate::ast::legacy::BinaryOperator::NamedArgument),
-            right: crate::ast::AstBox::new(value),
-            span: span,
-        }))
+        let value = self.parse_binding_power_frame(0)?;
+        let span = Span::new(start, value.legacy_metadata_span.end());
+        Ok(ParsedExpression::authored(
+            Expr::Binary(BinaryExpr {
+                left: crate::ast::AstBox::new(Expr::Identifier(name)),
+                operator: BinaryOperator::Legacy(crate::ast::legacy::BinaryOperator::NamedArgument),
+                right: crate::ast::AstBox::new(value.expression),
+                span: span,
+            }),
+            Span::new(start, value.syntax_span.end()),
+            span,
+        ))
     }
 
     fn parse_window_specification(&mut self) -> Result<WindowSpecification, ParseError> {
@@ -2034,8 +2163,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             self.advance();
             self.skip_trivia();
             loop {
-                let expr = self.parse_binding_power(0)?;
-                let mut item_end = expr.span().end();
+                let expr = self.parse_binding_power_frame(0)?;
+                let mut item_end = expr.legacy_metadata_span.end();
                 let asc = if self.current_is_keyword(Keyword::Asc) {
                     item_end = self.current_span().end();
                     self.advance();
@@ -2068,9 +2197,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 } else {
                     None
                 };
-                let span = Span::new(expr.span().start(), item_end);
+                let span = Span::new(expr.legacy_metadata_span.start(), item_end);
                 order_items.push(SortItem {
-                    sort_key: expr,
+                    sort_key: expr.expression,
                     ordering: if asc == Some(false) {
                         SortOrdering::Descending
                     } else {
@@ -2214,17 +2343,20 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     }
 
     /// `nested-expression ::= "(" expression ")" | "(" expression { "," expression } ")"`
-    fn parse_nested_expression(&mut self, opening_span: Span) -> Result<Expr, ParseError> {
+    fn parse_nested_expression(
+        &mut self,
+        opening_span: Span,
+    ) -> Result<ParsedExpression, ParseError> {
         self.advance();
         self.skip_trivia();
-        let first = self.parse_binding_power(0)?;
+        let first = self.parse_binding_power_frame(0)?;
         self.skip_trivia();
         if self.current_is_symbol(Symbol::Comma) {
             let mut expressions = vec![first];
             while self.current_is_symbol(Symbol::Comma) {
                 self.advance();
                 self.skip_trivia();
-                expressions.push(self.parse_binding_power(0)?);
+                expressions.push(self.parse_binding_power_frame(0)?);
                 self.skip_trivia();
             }
             if !self.current_is_symbol(Symbol::RParen) {
@@ -2232,27 +2364,37 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
             let end = self.current_span().end();
             self.advance();
-            return Ok(Expr::Row(RowExpr {
-                fields: expressions
-                    .into_iter()
-                    .map(|expression| RowField {
-                        span: expression.span(),
-                        name: None,
-                        expression,
-                    })
-                    .collect(),
-                span: Span::new(opening_span.start(), end),
-            }));
+            let span = Span::new(opening_span.start(), end);
+            return Ok(ParsedExpression::authored(
+                Expr::Row(RowExpr {
+                    fields: expressions
+                        .into_iter()
+                        .map(|expression| RowField {
+                            span: expression.legacy_metadata_span,
+                            name: None,
+                            expression: expression.expression,
+                        })
+                        .collect(),
+                    span,
+                }),
+                span,
+                span,
+            ));
         }
         if !self.current_is_symbol(Symbol::RParen) {
             return Err(self.unexpected("')'"));
         }
         let end = self.current_span().end();
         self.advance();
-        Ok(Expr::LegacyParenthesized(LegacyParenthesizedExpr {
-            expression: crate::ast::AstBox::new(first),
-            span: Span::new(opening_span.start(), end),
-        }))
+        let span = Span::new(opening_span.start(), end);
+        Ok(ParsedExpression::authored(
+            Expr::LegacyParenthesized(LegacyParenthesizedExpr {
+                expression: crate::ast::AstBox::new(first.expression),
+                span,
+            }),
+            span,
+            span,
+        ))
     }
 
     fn parse_array_expression(&mut self, opening_span: Span) -> Result<Expr, ParseError> {
@@ -2301,11 +2443,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.function_call_depth += 1;
         let mut fields = AstVec::new();
         loop {
-            let expression = self.parse_binding_power(0)?;
+            let expression = self.parse_binding_power_frame(0)?;
             fields.push(RowField {
                 name: None,
-                span: expression.span(),
-                expression,
+                span: expression.legacy_metadata_span,
+                expression: expression.expression,
             });
             self.skip_trivia();
             if !self.current_is_symbol(Symbol::Comma) {
@@ -2331,16 +2473,16 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.skip_trivia();
         let mut arguments = AstVec::new();
         while !self.current_is_symbol(Symbol::RBrace) {
-            let key = self.parse_binding_power(0)?;
+            let key = self.parse_binding_power_frame(0)?;
             self.skip_trivia();
             if !self.current_is_symbol(Symbol::Colon) {
                 return Err(self.unexpected("':' after map key"));
             }
             self.advance();
             self.skip_trivia();
-            let value = self.parse_binding_power(0)?;
-            arguments.push(crate::build::call_argument(key, None));
-            arguments.push(crate::build::call_argument(value, None));
+            let value = self.parse_binding_power_frame(0)?;
+            arguments.push(key.into_call_argument());
+            arguments.push(value.into_call_argument());
             self.skip_trivia();
             if !self.current_is_symbol(Symbol::Comma) {
                 break;
@@ -2391,6 +2533,37 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             return Ok(span.start() + 1);
         }
         Err(self.unexpected("'>' after type parameters"))
+    }
+
+    fn predicate_node(&self, value: ParsedExpression, predicate: Predicate) -> ParsedExpression {
+        let syntax_span = Span::new(value.syntax_span.start(), self.consumed_syntax_end());
+        let span = value.legacy_metadata_span.cover(predicate.span());
+        ParsedExpression::authored(
+            Expr::Predicated(AstBox::new(PredicatedExpr {
+                value: value.expression,
+                predicate,
+                span,
+            })),
+            syntax_span,
+            span,
+        )
+    }
+
+    fn consumed_syntax_end(&self) -> usize {
+        self.last_syntax_end
+    }
+    fn syntax_extent(&self, begin: usize) -> Span {
+        let start = self.tokens[begin..self.position]
+            .iter()
+            .find(|token| !matches!(token.kind, TokenKind::Trivia(_) | TokenKind::End))
+            .expect("a successful expression consumed its first syntax token")
+            .span
+            .start();
+        Span::new(start, self.consumed_syntax_end())
+    }
+    fn full_expression(&self, begin: usize, expression: Expr) -> ParsedExpression {
+        let extent = self.syntax_extent(begin);
+        ParsedExpression::authored(expression, extent, extent)
     }
 
     fn current(&self) -> Option<&Token> {
@@ -2453,7 +2626,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     }
 
     fn advance(&mut self) {
-        if self.current().is_some() {
+        if let Some(token) = self.current() {
+            if !matches!(token.kind, TokenKind::Trivia(_) | TokenKind::End) {
+                self.last_syntax_end = token.span.end();
+            }
             self.position += 1;
         }
     }
@@ -2557,10 +2733,10 @@ pub(super) fn parse_table_function_expression(
     source: &str,
     tokens: &[Token],
     boundary_span: Span,
-) -> Result<Expr, ParseError> {
+) -> Result<ParsedExpression, ParseError> {
     PrattParser::bounded(source, tokens, boundary_span)
         .with_table_function_named_arguments()
-        .parse()
+        .parse_spanned()
 }
 
 fn unescape_string(text: &str, quote: char) -> String {
@@ -2703,8 +2879,9 @@ mod tests {
             .iter()
             .position(|token| token.span == boundary)
             .unwrap();
-        let expression =
-            super::parse_table_function_expression(source, &tokens[..end], boundary).unwrap();
+        let expression = super::parse_table_function_expression(source, &tokens[..end], boundary)
+            .unwrap()
+            .expression;
         let Expr::FunctionCall(call) = expression else {
             panic!("original table call")
         };
@@ -3005,22 +3182,204 @@ mod tests {
             ));
         }
     }
-}
+    #[test]
+    fn parsed_ranges_keep_filter_legacy_endpoints_inside_arguments_and_binary_operands() {
+        use super::PrattParser;
+        use crate::{Span, ast::Expr, lex};
+        for source in [
+            "agg(2) FILTER (WHERE (TRUE))",
+            "1 + agg(2) FILTER (WHERE (TRUE))",
+        ] {
+            let tokens = lex(source).unwrap();
+            let parsed = PrattParser::new(source, &tokens).parse_spanned().unwrap();
+            let selected_end = source.find("(TRUE)").unwrap() + "(TRUE)".len();
+            assert_eq!(parsed.syntax_span, Span::new(0, source.len()));
+            assert_eq!(parsed.legacy_metadata_span, Span::new(0, selected_end));
+            assert_eq!(parsed.expression.span(), Span::new(0, selected_end));
+            let call = match &parsed.expression {
+                Expr::FunctionCall(call) => call,
+                Expr::Binary(binary) => {
+                    assert_eq!(binary.left.span(), Span::new(0, 1));
+                    let Expr::FunctionCall(call) = binary.right.as_ref() else {
+                        panic!("the actual RHS is the filtered call")
+                    };
+                    call
+                }
+                _ => panic!("the source is one call or an addition"),
+            };
+            assert_eq!(
+                call.span,
+                Span::new(source.find("agg").unwrap(), selected_end)
+            );
+            assert_eq!(
+                call.filter.as_ref().unwrap().span(),
+                Span::new(source.find("(TRUE)").unwrap(), selected_end)
+            );
+        }
+        let source = "f(agg(2) FILTER (WHERE (TRUE)))";
+        let tokens = lex(source).unwrap();
+        let parsed = PrattParser::new(source, &tokens).parse_spanned().unwrap();
+        let Expr::FunctionCall(outer) = &parsed.expression else {
+            panic!("outer call")
+        };
+        let selected_end = source.find("(TRUE)").unwrap() + "(TRUE)".len();
+        assert_eq!(outer.span, Span::new(0, source.len()));
+        assert_eq!(
+            outer.arguments[0].span,
+            Span::new(source.find("agg").unwrap(), selected_end)
+        );
+        let Expr::FunctionCall(inner) = &outer.arguments[0].value else {
+            panic!("actual filtered argument")
+        };
+        assert_eq!(inner.span, outer.arguments[0].span);
+        let source = "agg(2) IGNORE NULLS";
+        let tokens = lex(source).unwrap();
+        let parsed = PrattParser::new(source, &tokens).parse_spanned().unwrap();
+        assert_eq!(parsed.syntax_span, Span::new(0, source.len()));
+        assert_eq!(parsed.legacy_metadata_span, Span::new(0, "agg(2)".len()));
+        assert_eq!(parsed.expression.span(), parsed.legacy_metadata_span);
+        let source = "agg((2)) FILTER (WHERE (TRUE)) OVER (ORDER BY (3))";
+        let tokens = lex(source).unwrap();
+        let parsed = PrattParser::new(source, &tokens).parse_spanned().unwrap();
+        assert_eq!(parsed.syntax_span, Span::new(0, source.len()));
+        assert_eq!(parsed.legacy_metadata_span, parsed.syntax_span);
+        let Expr::FunctionCall(call) = &parsed.expression else {
+            panic!("window call")
+        };
+        assert_eq!(call.span, Span::new(0, source.len()));
+        let value_start = source.find("(2)").unwrap();
+        assert_eq!(
+            call.arguments[0].span,
+            Span::new(value_start, value_start + 3)
+        );
+        let crate::ast::Window::Specification(window) = call.window.as_ref().unwrap() else {
+            panic!("OVER specification")
+        };
+        let key_start = source.find("(3)").unwrap();
+        assert_eq!(
+            window.order_by.as_ref().unwrap().items[0].span,
+            Span::new(key_start, key_start + 3)
+        );
+    }
 
-fn predicate_node(value: Expr, predicate: Predicate) -> Expr {
-    let span = value.span().cover(predicate.span());
-    Expr::Predicated(AstBox::new(PredicatedExpr {
-        value,
-        predicate,
-        span,
-    }))
+    #[test]
+    fn parser_frames_keep_logical_grouping_and_all_current_parenthesis_nodes() {
+        use crate::ast::{Expr, LogicalOperator};
+        for (source, terms, grouped) in [
+            ("a OR b OR c", 3, None),
+            ("(a OR b) OR c", 2, Some(0)),
+            ("a OR (b OR c)", 2, Some(1)),
+        ] {
+            let tree = parse_expression(source, &lex(source).unwrap()).unwrap();
+            let Expr::Logical(logical) = &tree else {
+                panic!("logical source")
+            };
+            assert_eq!(logical.operator, LogicalOperator::Or);
+            assert_eq!(logical.terms.len(), terms);
+            if let Some(index) = grouped {
+                let Expr::LegacyParenthesized(group) = &logical.terms[index] else {
+                    panic!("the old grouping remains materialized")
+                };
+                let Expr::Logical(inner) = group.expression.as_ref() else {
+                    panic!("ordered inner logical chain")
+                };
+                assert_eq!(inner.operator, LogicalOperator::Or);
+                assert_eq!(inner.terms.len(), 2);
+            }
+        }
+        let source = "((1 + 2))";
+        let tree = parse_expression(source, &lex(source).unwrap()).unwrap();
+        let Expr::LegacyParenthesized(outer) = tree else {
+            panic!("outer parentheses remain")
+        };
+        assert_eq!(outer.span, crate::Span::new(0, source.len()));
+        let Expr::LegacyParenthesized(inner) = outer.expression.as_ref() else {
+            panic!("inner parentheses remain")
+        };
+        assert_eq!(inner.span, crate::Span::new(1, source.len() - 1));
+        let Expr::Binary(sum) = inner.expression.as_ref() else {
+            panic!("original arithmetic child")
+        };
+        assert_eq!(sum.left.span(), crate::Span::new(2, 3));
+        assert_eq!(sum.right.span(), crate::Span::new(6, 7));
+    }
+
+    #[test]
+    fn parsed_metadata_retains_lambda_predicate_case_sort_and_row_source_ranges() {
+        use crate::{Span, ast::Expr};
+        let source = "f((x) -> (x + 1), (a) BETWEEN (1) AND (2), CASE WHEN (a) THEN (3) ELSE (4) END ORDER BY (b)) OVER (PARTITION BY (p) ORDER BY (w))";
+        let tree = parse_expression(source, &lex(source).unwrap()).unwrap();
+        let Expr::FunctionCall(call) = &tree else {
+            panic!("one actual function call")
+        };
+        for (index, fragment) in [
+            "(x) -> (x + 1)",
+            "(a) BETWEEN (1) AND (2)",
+            "CASE WHEN (a) THEN (3) ELSE (4) END",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let start = source.find(fragment).unwrap();
+            assert_eq!(
+                call.arguments[index].span,
+                Span::new(start, start + fragment.len())
+            );
+        }
+        let Expr::Lambda(lambda) = &call.arguments[0].value else {
+            panic!("original lambda")
+        };
+        assert_eq!(lambda.span, call.arguments[0].span);
+        let Expr::Predicated(predicate) = &call.arguments[1].value else {
+            panic!("original predicate")
+        };
+        assert_eq!(predicate.span, call.arguments[1].span);
+        let Expr::SearchedCase(case) = &call.arguments[2].value else {
+            panic!("original CASE")
+        };
+        let fragment = "WHEN (a) THEN (3)";
+        let start = source.find(fragment).unwrap();
+        assert_eq!(
+            case.when_clauses[0].span,
+            Span::new(start, start + fragment.len())
+        );
+        let key_start = source.find("(b)").unwrap();
+        assert_eq!(
+            call.order_by.as_ref().unwrap().items[0].span,
+            Span::new(key_start, key_start + 3)
+        );
+        let crate::ast::Window::Specification(window) = call.window.as_ref().unwrap() else {
+            panic!("actual OVER specification")
+        };
+        let key_start = source.find("(w)").unwrap();
+        assert_eq!(
+            window.order_by.as_ref().unwrap().items[0].span,
+            Span::new(key_start, key_start + 3)
+        );
+        let source = "ROW((1), ((2)))";
+        let tree = parse_expression(source, &lex(source).unwrap()).unwrap();
+        let Expr::Row(row) = tree else {
+            panic!("real ROW constructor")
+        };
+        for (index, fragment) in ["(1)", "((2))"].iter().enumerate() {
+            let start = source.find(fragment).unwrap();
+            assert_eq!(
+                row.fields[index].span,
+                Span::new(start, start + fragment.len())
+            );
+            assert!(matches!(
+                row.fields[index].expression,
+                Expr::LegacyParenthesized(_)
+            ));
+        }
+    }
 }
 
 /// The final ordinary FunctionCall directly owns the original producer children.
 fn ordinary_special_call(
     name: &'static str,
     quoted: bool,
-    arguments: Vec<Expr>,
+    arguments: Vec<ParsedExpression>,
     span: Span,
 ) -> Expr {
     Expr::FunctionCall(AstBox::new(FunctionCall {
@@ -3034,7 +3393,7 @@ fn ordinary_special_call(
         },
         arguments: arguments
             .into_iter()
-            .map(|value| crate::build::call_argument(value, None))
+            .map(ParsedExpression::into_call_argument)
             .collect(),
         distinct: false,
         order_by: None,

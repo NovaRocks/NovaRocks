@@ -56,7 +56,9 @@ enum SelectHintValue {
 
 use super::{
     StatementParser,
-    pratt::{PrattParser, parse_table_function_expression, parse_window_specification},
+    pratt::{
+        ParsedExpression, PrattParser, parse_table_function_expression, parse_window_specification,
+    },
 };
 
 pub(super) fn parse(
@@ -407,7 +409,7 @@ fn parse_select(
         None
     };
     let selection = if parser.consume_if_word("WHERE") {
-        Some(parse_expression_until(
+        Some(parse_expression_until_spanned(
             parser,
             query_clause_words(),
             &[Symbol::Semicolon, Symbol::RParen],
@@ -422,7 +424,7 @@ fn parse_select(
         None
     };
     let having = if parser.consume_if_word("HAVING") {
-        Some(parse_expression_until(
+        Some(parse_expression_until_spanned(
             parser,
             query_clause_words(),
             &[Symbol::Semicolon, Symbol::RParen],
@@ -431,7 +433,7 @@ fn parse_select(
         None
     };
     let qualify = if parser.consume_if_word("QUALIFY") {
-        Some(parse_expression_until(
+        Some(parse_expression_until_spanned(
             parser,
             query_clause_words(),
             &[Symbol::Semicolon, Symbol::RParen],
@@ -460,17 +462,19 @@ fn parse_select(
                     |window| window.span.end(),
                 )
             },
-            |expr| expr.span().end(),
+            |expr| expr.legacy_metadata_span.end(),
         );
     Ok((
         Select {
             distinct: distinct,
             projection: projection.into(),
             from: from,
-            selection: selection,
+            selection: selection.map(|parsed| parsed.expression),
             group_by: group_by,
-            having: having,
-            legacy: crate::ast::legacy::SelectExtensions { qualify },
+            having: having.map(|parsed| parsed.expression),
+            legacy: crate::ast::legacy::SelectExtensions {
+                qualify: qualify.map(|parsed| parsed.expression),
+            },
             windows: windows.into(),
             modifiers: Default::default(),
             span: Span::new(start, end),
@@ -689,11 +693,11 @@ fn parse_projection(
             } else {
                 implicit_alias
             };
-            let span = alias
-                .as_ref()
-                .map_or(expr.span(), |alias| expr.span().cover(alias.span));
+            let span = alias.as_ref().map_or(expr.legacy_metadata_span, |alias| {
+                expr.legacy_metadata_span.cover(alias.span)
+            });
             items.push(SelectItem::SingleColumn(AstBox::new(SingleColumn {
-                expression: expr,
+                expression: expr.expression,
                 alias,
                 span,
             })));
@@ -760,10 +764,10 @@ fn parse_projection_expression(
     parser: &mut StatementParser<'_, '_>,
     words: &[&str],
     symbols: &[Symbol],
-) -> Result<(Expr, Option<crate::ast::Ident>), crate::ParseError> {
+) -> Result<(ParsedExpression, Option<crate::ast::Ident>), crate::ParseError> {
     let begin = parser.position;
     let end = expression_end(parser, words, symbols);
-    let full = parse_expression_range(parser, begin, end);
+    let full = parse_expression_range_spanned(parser, begin, end);
     if let Ok(expression) = full {
         parser.position = end;
         parser.skip_trivia();
@@ -779,7 +783,7 @@ fn parse_projection_expression(
             )
         })
         .ok_or_else(|| parser.unexpected("expression"))?;
-    let expression = parse_expression_range(parser, begin, alias_index)?;
+    let expression = parse_expression_range_spanned(parser, begin, alias_index)?;
     parser.position = alias_index;
     parser.skip_trivia();
     let alias = parser.parse_ident()?;
@@ -806,13 +810,16 @@ fn parse_from(parser: &mut StatementParser<'_, '_>) -> Result<Relation, crate::P
             let criteria = if let Some(span) = natural {
                 Some(JoinCriteria::Natural(NaturalJoin { span }))
             } else if parser.consume_if_word("ON") {
-                let expression = parse_expression_until(
+                let expression = parse_expression_until_spanned(
                     parser,
                     join_or_query_clause_words(),
                     &[Symbol::Comma, Symbol::Semicolon, Symbol::RParen],
                 )?;
-                let span = expression.span();
-                Some(JoinCriteria::On(JoinOn { expression, span }))
+                let span = expression.legacy_metadata_span;
+                Some(JoinCriteria::On(JoinOn {
+                    expression: expression.expression,
+                    span,
+                }))
             } else if parser.consume_if_word("USING") {
                 let start = parser.consume_symbol(Symbol::LParen)?.start();
                 let mut columns = vec![parser.parse_ident()?];
@@ -946,7 +953,7 @@ fn parse_table_factor(parser: &mut StatementParser<'_, '_>) -> Result<Relation, 
         let expr = parse_table_function_expression_until(parser, &[], &[Symbol::RParen])?;
         let end = parser.consume_symbol(Symbol::RParen)?.end();
         let relation = old_table_function(
-            expr,
+            expr.expression,
             lateral,
             crate::ast::legacy::TableFunctionSyntax::TableWrapper,
             Span::new(start, end),
@@ -958,11 +965,11 @@ fn parse_table_factor(parser: &mut StatementParser<'_, '_>) -> Result<Relation, 
     if parser.current_is_symbol(Symbol::LParen) {
         let end = table_function_end(parser)?;
         let expr = parse_table_function_expression_range(parser, function_start, end)?;
-        let span = Span::new(start, expr.span().end());
+        let span = Span::new(start, expr.legacy_metadata_span.end());
         parser.position = end;
         parser.skip_trivia();
         let relation = old_table_function(
-            expr,
+            expr.expression,
             lateral,
             crate::ast::legacy::TableFunctionSyntax::BareCall,
             span,
@@ -1088,14 +1095,14 @@ fn parse_table_version(
     Ok(Some(QueryPeriod {
         range_type: kind,
         start: None,
-        span: Span::new(start, value.span().end()),
-        end: Some(AstBox::new(value)),
+        span: Span::new(start, value.legacy_metadata_span.end()),
+        end: Some(AstBox::new(value.expression)),
     }))
 }
 
 fn parse_atomic_expression(
     parser: &mut StatementParser<'_, '_>,
-) -> Result<Expr, crate::ParseError> {
+) -> Result<ParsedExpression, crate::ParseError> {
     let begin = parser.position;
     let mut end = begin;
     let mut significant = 0usize;
@@ -1116,7 +1123,7 @@ fn parse_atomic_expression(
     if significant == 0 {
         return Err(parser.unexpected("table version expression"));
     }
-    let expression = parse_expression_range(parser, begin, end)?;
+    let expression = parse_expression_range_spanned(parser, begin, end)?;
     parser.position = end;
     parser.skip_trivia();
     Ok(expression)
@@ -1284,14 +1291,14 @@ fn parse_group_by(parser: &mut StatementParser<'_, '_>) -> Result<GroupBy, crate
     loop {
         // Preserve the old expression grammar. A Row expression is not evidence
         // that the source authored a multi-column groupingSet production.
-        let expression = parse_expression_until(
+        let expression = parse_expression_until_spanned(
             parser,
             query_clause_words(),
             &[Symbol::Comma, Symbol::Semicolon, Symbol::RParen],
         )?;
-        let span = expression.span();
+        let span = expression.legacy_metadata_span;
         elements.push(GroupingElement::Simple(SimpleGroupBy {
-            columns: vec![expression].into(),
+            columns: vec![expression.expression].into(),
             span,
         }));
         if !parser.consume_if_symbol(Symbol::Comma) {
@@ -1335,7 +1342,7 @@ fn parse_order_by(
 ) -> Result<OrderBy, crate::ParseError> {
     let mut items = Vec::new();
     loop {
-        let expr = parse_expression_until(
+        let expr = parse_expression_until_spanned(
             parser,
             &[
                 "ASC",
@@ -1350,7 +1357,7 @@ fn parse_order_by(
             ],
             &[Symbol::Comma, Symbol::Semicolon, Symbol::RParen],
         )?;
-        let mut item_end = expr.span().end();
+        let mut item_end = expr.legacy_metadata_span.end();
         let asc = if parser.current_is_word("ASC") {
             item_end = parser.consume_word("ASC")?.end();
             Some(true)
@@ -1373,9 +1380,9 @@ fn parse_order_by(
         } else {
             None
         };
-        let span = Span::new(expr.span().start(), item_end);
+        let span = Span::new(expr.legacy_metadata_span.start(), item_end);
         items.push(SortItem {
-            sort_key: expr,
+            sort_key: expr.expression,
             ordering: if asc == Some(false) {
                 SortOrdering::Descending
             } else {
@@ -1451,20 +1458,20 @@ fn parse_row_count(
         let span = parser.consume_word("ALL")?;
         return Ok(Expr::AllRows(AllRows { span }));
     }
-    let node = parse_expression_until(parser, words, symbols)?;
+    let node = parse_expression_until_spanned(parser, words, symbols)?;
     if matches!(
-        &node,
+        &node.expression,
         Expr::Literal(Literal {
             kind: LiteralKind::Long { .. },
             ..
         }) | Expr::Parameter(_)
     ) {
-        return Ok(node);
+        return Ok(node.expression);
     }
     Err(crate::ParseError::UnexpectedToken {
         expected: "an integer row count",
         found: "a non-long row-count expression".to_owned(),
-        span: node.span(),
+        span: node.legacy_metadata_span,
     })
 }
 
@@ -1475,7 +1482,7 @@ fn parse_values(parser: &mut StatementParser<'_, '_>) -> Result<Values, crate::P
         let row_start = parser.consume_symbol(Symbol::LParen)?.start();
         let mut row = Vec::new();
         loop {
-            row.push(parse_expression_until(
+            row.push(parse_expression_until_spanned(
                 parser,
                 &[],
                 &[Symbol::Comma, Symbol::RParen],
@@ -1490,8 +1497,8 @@ fn parse_values(parser: &mut StatementParser<'_, '_>) -> Result<Values, crate::P
                 .into_iter()
                 .map(|expression| RowField {
                     name: None,
-                    span: expression.span(),
-                    expression,
+                    span: expression.legacy_metadata_span,
+                    expression: expression.expression,
                 })
                 .collect(),
             span: Span::new(row_start, end),
@@ -1510,12 +1517,20 @@ fn parse_expression_until(
     words: &[&str],
     symbols: &[Symbol],
 ) -> Result<Expr, crate::ParseError> {
+    parse_expression_until_spanned(parser, words, symbols).map(|parsed| parsed.expression)
+}
+
+fn parse_expression_until_spanned(
+    parser: &mut StatementParser<'_, '_>,
+    words: &[&str],
+    symbols: &[Symbol],
+) -> Result<ParsedExpression, crate::ParseError> {
     let begin = parser.position;
     let end = expression_end(parser, words, symbols);
     if end == begin {
         return Err(parser.unexpected("expression"));
     }
-    let expression = parse_expression_range(parser, begin, end)?;
+    let expression = parse_expression_range_spanned(parser, begin, end)?;
     parser.position = end;
     parser.skip_trivia();
     Ok(expression)
@@ -1580,23 +1595,23 @@ fn is_distinct_from_separator(
     token_is_word(parser, token, "IS")
 }
 
-fn parse_expression_range(
+fn parse_expression_range_spanned(
     parser: &StatementParser<'_, '_>,
     begin: usize,
     end: usize,
-) -> Result<Expr, crate::ParseError> {
+) -> Result<ParsedExpression, crate::ParseError> {
     let boundary = parser
         .tokens
         .get(end)
         .map_or(parser.boundary_span, |token| token.span);
-    PrattParser::bounded(parser.source, &parser.tokens[begin..end], boundary).parse()
+    PrattParser::bounded(parser.source, &parser.tokens[begin..end], boundary).parse_spanned()
 }
 
 fn parse_table_function_expression_until(
     parser: &mut StatementParser<'_, '_>,
     words: &[&str],
     symbols: &[Symbol],
-) -> Result<Expr, crate::ParseError> {
+) -> Result<ParsedExpression, crate::ParseError> {
     let begin = parser.position;
     let end = expression_end(parser, words, symbols);
     if end == begin {
@@ -1612,7 +1627,7 @@ fn parse_table_function_expression_range(
     parser: &StatementParser<'_, '_>,
     begin: usize,
     end: usize,
-) -> Result<Expr, crate::ParseError> {
+) -> Result<ParsedExpression, crate::ParseError> {
     let boundary = parser
         .tokens
         .get(end)
