@@ -765,6 +765,10 @@ pub(crate) fn validate_binary_types<'a, H>(
             same_inputs
                 && *output.ty.data_type() == DataType::Boolean
                 && nullability_widens(output.ty.nullable())
+                // A Null carrier produces SQL NULL even when the source's
+                // outer declaration is required. TruthOnly cannot erase it.
+                && (output.ty.nullable()
+                    || (*left.ty.data_type()!=DataType::Null && *right.ty.data_type()!=DataType::Null))
         }
         crate::BinaryOperator::EqForNull => {
             same_inputs && *output.ty.data_type() == DataType::Boolean && !output.ty.nullable()

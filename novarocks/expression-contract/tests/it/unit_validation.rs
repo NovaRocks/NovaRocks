@@ -841,3 +841,65 @@ fn deciding_boolean_source_uses_the_actual_pool_and_preserves_every_control_pref
         }
     }
 }
+
+#[test]
+fn ordinary_comparisons_keep_successful_null_even_for_required_null_carriers() {
+    for op in [
+        BinaryOperator::Eq,
+        BinaryOperator::NotEq,
+        BinaryOperator::Lt,
+        BinaryOperator::LtEq,
+        BinaryOperator::Gt,
+        BinaryOperator::GtEq,
+        BinaryOperator::EqForNull,
+    ] {
+        for demand in [EvaluationDemand::Value, EvaluationDemand::TruthOnly] {
+            for nullable in [false, true] {
+                let source = ValueType::new(DataType::Null, false);
+                let mut b = BoundExprSetBuilder::new(limits());
+                let input = b
+                    .add(None, source.clone(), ExprKind::Value(ValueId::new(7)))
+                    .unwrap();
+                let comparison = b
+                    .add(
+                        None,
+                        boolean(nullable),
+                        ExprKind::Binary {
+                            left: input,
+                            right: input,
+                            op,
+                            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                            allow_throw_exception: None,
+                        },
+                    )
+                    .unwrap();
+                b.root(comparison, demand, RootScope::Port(0)).unwrap();
+                let result = no_calls(
+                    b,
+                    vec![ExprPort {
+                        values: Box::new([(ValueId::new(7), source.clone())]),
+                    }],
+                    &Control::good(),
+                );
+                let accepted = if op == BinaryOperator::EqForNull {
+                    !nullable
+                } else {
+                    nullable
+                };
+                if accepted {
+                    let unit = result.unwrap();
+                    assert_eq!(unit.definition(input).unwrap().ty, source);
+                    assert_eq!(unit.definition(comparison).unwrap().ty, boolean(nullable));
+                    assert_eq!(unit.roots()[0].demand, demand);
+                } else {
+                    let error=result.expect_err("NULL carrier cannot lose successful NULL, while null-safe equality is required Boolean");
+                    assert!(
+                        matches!(&error,UnitError::Invalid{definition:Some(id),message,..} if *id==comparison && message.contains("binary expression types are inconsistent with its operator")),
+                        "{op:?}/{demand:?}/{nullable}: {error}"
+                    );
+                    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+                }
+            }
+        }
+    }
+}
