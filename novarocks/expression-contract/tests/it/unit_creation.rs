@@ -154,7 +154,7 @@ fn read(
     work.finish().map_err(UnitConstructionFailure::Control)?;
     Ok(unit)
 }
-fn graph() -> BoundExprSet {
+fn graph_input() -> (BoundExprSetBuilder, Vec<ExprPort>) {
     let mut b = BoundExprSetBuilder::new(limits());
     let mut ports = Vec::new();
     let mut leaves = Vec::new();
@@ -192,7 +192,11 @@ fn graph() -> BoundExprSet {
         b.root(root, EvaluationDemand::Value, RootScope::AllPorts)
             .unwrap();
     }
-    no_calls(b, ports, &Control::good()).unwrap()
+    (b, ports)
+}
+fn graph() -> BoundExprSet {
+    let (builder, ports) = graph_input();
+    no_calls(builder, ports, &Control::good()).unwrap()
 }
 fn call_unit(environment: bool) -> BoundExprSet {
     let mut b = BoundExprSetBuilder::new(limits());
@@ -261,7 +265,7 @@ fn call_unit(environment: bool) -> BoundExprSet {
     work.finish().unwrap();
     unit
 }
-fn temporal_unit() -> BoundExprSet {
+fn temporal_input() -> (BoundExprSetBuilder, Vec<ExprPort>) {
     let mut b = BoundExprSetBuilder::new(limits());
     let leaf = b
         .add(None, integer(false), ExprKind::Value(ValueId::new(4)))
@@ -321,14 +325,19 @@ fn temporal_unit() -> BoundExprSet {
     .unwrap();
     b.root(call, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
-    let sealed = b
-        .seal(
-            vec![ExprPort {
-                values: Box::new([(ValueId::new(4), integer(false))]),
-            }],
-            &mut work,
-        )
-        .unwrap();
+    work.finish().unwrap();
+    (
+        b,
+        vec![ExprPort {
+            values: Box::new([(ValueId::new(4), integer(false))]),
+        }],
+    )
+}
+fn temporal_unit() -> BoundExprSet {
+    let (builder, ports) = temporal_input();
+    let c = Control::good();
+    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();
+    let sealed = builder.seal(ports, &mut work).unwrap();
     let id = sealed.root_use_ids()[0];
     let mut claim = claim(
         sealed.uses()[&id].context,
@@ -862,7 +871,9 @@ fn original_numeric_observer_precedes_each_creator_and_preserves_its_own_refusal
                 Event {
                     scope: match storage {
                         UnitConstructionStorage::Temporary => ScopeKind::Temporary,
-                        UnitConstructionStorage::Diagnostic => ScopeKind::Retained,
+                        UnitConstructionStorage::Diagnostic | UnitConstructionStorage::Retained => {
+                            ScopeKind::Retained
+                        }
                     },
                     request,
                     completed_checkpoints: 0,
@@ -948,4 +959,306 @@ fn original_numeric_observer_precedes_each_creator_and_preserves_its_own_refusal
     .unwrap();
     work.finish().unwrap();
     assert_eq!(observed, events.lock().unwrap().len());
+}
+
+// The source builder and port buffers are constructed before this operation.
+// Recording actual new requests does not acquire product capacity.
+fn produce(
+    builder: BoundExprSetBuilder,
+    ports: Vec<ExprPort>,
+    temporary: &mut Scope,
+    retained: &mut Scope,
+    control: &Control,
+) -> Result<SealedUnit, UnitConstructionFailure<HostRefusal>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let sealed = builder.seal_with_creator_in(ports, temporary, retained, &mut work)?;
+    work.finish()?;
+    Ok(sealed)
+}
+
+#[test]
+fn producer_funds_new_control_and_temporal_storage_and_preserves_every_host_refusal() {
+    for input in [graph_input, temporal_input] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut temporary, scratch) = Scope::new(ScopeKind::Temporary, events.clone(), None);
+        let (mut retained, output) = Scope::new(ScopeKind::Retained, events.clone(), None);
+        let (builder, ports) = input();
+        let sealed = produce(
+            builder,
+            ports,
+            &mut temporary,
+            &mut retained,
+            &Control::good(),
+        )
+        .unwrap();
+        let trace = events.lock().unwrap().clone();
+        for kind in [ScopeKind::Temporary, ScopeKind::Retained] {
+            for exact in [false, true] {
+                assert!(
+                    trace.iter().any(|event| event.scope == kind
+                        && matches!(event.request, Request::Exact(..)) == exact),
+                    "both actual scopes fund their own explicit and opaque backing"
+                );
+            }
+        }
+        assert!(
+            sealed
+                .uses()
+                .values()
+                .any(|use_| !use_.arguments.is_empty())
+        );
+        let flow = sealed.control_flow().clone();
+        let root = sealed.root_use_ids()[0];
+        let actual_arguments = flow.uses()[&root].arguments.as_ptr();
+        drop(temporary);
+        drop(retained);
+        assert!(
+            scratch.upgrade().is_none(),
+            "published success releases actual scratch"
+        );
+        assert!(output.upgrade().is_some());
+        drop(sealed);
+        assert!(
+            output.upgrade().is_some(),
+            "independent Flow keeps original argument Boxes and maps funded"
+        );
+        assert_eq!(flow.uses()[&root].arguments.as_ptr(), actual_arguments);
+        let alias = flow.clone();
+        drop(flow);
+        assert!(output.upgrade().is_some());
+        drop(alias);
+        assert!(
+            output.upgrade().is_none(),
+            "refund follows the last actual alias exit"
+        );
+        for stop in 0..trace.len() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let (mut temporary, _) = Scope::new(ScopeKind::Temporary, events.clone(), Some(stop));
+            let (mut retained, _) = Scope::new(ScopeKind::Retained, events.clone(), Some(stop));
+            let (builder, ports) = input();
+            let error = produce(
+                builder,
+                ports,
+                &mut temporary,
+                &mut retained,
+                &Control::good(),
+            )
+            .err()
+            .expect("the actual creator must refuse");
+            assert!(
+                matches!(error, UnitConstructionFailure::Creator(HostRefusal(actual)) if actual == stop)
+            );
+            assert_eq!(error.failure_fact(), HostRefusal(stop).failure_fact());
+            assert_eq!(*events.lock().unwrap(), trace[..=stop]);
+        }
+    }
+}
+
+#[test]
+fn producer_keeps_every_original_control_prefix_and_no_later_creator_callback() {
+    let control = Arc::new(Control::good());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (mut temporary, _) = Scope::new(ScopeKind::Temporary, events.clone(), None);
+    let (mut retained, _) = Scope::new(ScopeKind::Retained, events.clone(), None);
+    temporary.control = Some(control.clone());
+    retained.control = Some(control.clone());
+    let (builder, ports) = temporal_input();
+    produce(builder, ports, &mut temporary, &mut retained, &control).unwrap();
+    let checkpoints = control.trace();
+    let creator = events.lock().unwrap().clone();
+    assert!(
+        checkpoints
+            .iter()
+            .all(|&(phase, units)| phase == CompilePhase::LowerProgram && units <= 256)
+    );
+    for at in 0..checkpoints.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Arc::new(Control::at(at, cause.clone()));
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let (mut temporary, _) = Scope::new(ScopeKind::Temporary, events.clone(), None);
+            let (mut retained, _) = Scope::new(ScopeKind::Retained, events.clone(), None);
+            temporary.control = Some(control.clone());
+            retained.control = Some(control.clone());
+            let (builder, ports) = temporal_input();
+            assert!(
+                matches!(produce(builder,ports,&mut temporary,&mut retained,&control),Err(UnitConstructionFailure::Control(actual)) if actual==cause)
+            );
+            assert_eq!(control.trace(), checkpoints[..=at]);
+            let expected: Vec<_> = creator
+                .iter()
+                .filter(|event| event.completed_checkpoints <= at)
+                .cloned()
+                .collect();
+            assert_eq!(*events.lock().unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn producer_single_scope_retains_real_output_and_original_source_without_a_new_scope() {
+    let source = Arc::new(Hold);
+    let source_weak = Arc::downgrade(&source);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (mut scope, output) = Scope::new(ScopeKind::Single, events.clone(), None);
+    let (builder, ports) = graph_input();
+    let builder = builder
+        .with_storage_lifetime(ValueTypeStorageLifetime::held(source))
+        .unwrap();
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+    let sealed = builder
+        .seal_with_single_creator_in(ports, &mut scope, &mut work)
+        .unwrap();
+    let unit = sealed.finish(BTreeMap::new(), &mut work).unwrap();
+    work.finish().unwrap();
+    let flow = unit.control_flow().clone();
+    let parts = unit.into_parts();
+    drop(scope);
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| e.scope == ScopeKind::Single)
+    );
+    assert!(source_weak.upgrade().is_some());
+    assert!(output.upgrade().is_some());
+    drop(parts);
+    assert!(
+        source_weak.upgrade().is_none(),
+        "the moved source belongs to original unit data"
+    );
+    assert!(
+        output.upgrade().is_some(),
+        "the separately escaping Flow owns its newly built backing"
+    );
+    drop(flow);
+    assert!(output.upgrade().is_none());
+}
+
+#[test]
+fn producer_rejection_retains_its_actual_diagnostic_and_not_scratch() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (mut temporary, scratch) = Scope::new(ScopeKind::Temporary, events.clone(), None);
+    let (mut retained, diagnostic) = Scope::new(ScopeKind::Retained, events, None);
+    let mut builder = BoundExprSetBuilder::new(limits());
+    builder.reserve().unwrap();
+    let error = produce(
+        builder,
+        vec![],
+        &mut temporary,
+        &mut retained,
+        &Control::good(),
+    )
+    .err()
+    .expect("unfilled original reservation");
+    assert!(
+        matches!(&error,UnitConstructionFailure::Owner(cause) if matches!(cause.cause(),UnitError::Invalid{definition:Some(id),message,..} if id.get()==0 && message=="reserved definition was not filled"))
+    );
+    drop(temporary);
+    drop(retained);
+    assert!(scratch.upgrade().is_none());
+    assert!(diagnostic.upgrade().is_some());
+    drop(error);
+    assert!(diagnostic.upgrade().is_none());
+}
+
+fn authored_source(
+    scope: &mut Scope,
+    control: &Control,
+) -> Result<BoundExprSetBuilder, UnitConstructionFailure<HostRefusal>> {
+    let mut builder = BoundExprSetBuilder::new(limits());
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    for ordinal in 0..12 {
+        let kind = ExprKind::Value(ValueId::new(ordinal * 19));
+        let id = if ordinal == 0 {
+            let id = builder.reserve_with_creator_in(scope, &mut work)?;
+            builder.insert(id, None, integer(false), kind).unwrap();
+            id
+        } else {
+            builder.add_with_creator_in(None, integer(false), kind, scope, &mut work)?
+        };
+        let root = builder.root_with_creator_in(
+            id,
+            EvaluationDemand::Value,
+            RootScope::Port(0),
+            scope,
+            &mut work,
+        )?;
+        assert_eq!(id.get(), ordinal);
+        assert_eq!(root.get(), ordinal);
+    }
+    work.finish()?;
+    Ok(builder)
+}
+
+#[test]
+fn original_source_buffers_borrow_actual_growth_and_keep_each_creator_and_control_refusal() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (mut scope, source) = Scope::new(ScopeKind::Single, events.clone(), None);
+    let control = Arc::new(Control::good());
+    scope.control = Some(control.clone());
+    let builder = authored_source(&mut scope, &control).unwrap();
+    assert_eq!(builder.len(), 12);
+    assert_eq!(builder.roots().len(), 12);
+    for ordinal in 0..12 {
+        assert!(
+            matches!(builder.definition(ExprId::new(ordinal)).unwrap().kind,ExprKind::Value(id) if id.get()==ordinal*19)
+        );
+    }
+    let trace = events.lock().unwrap().clone();
+    let checkpoints = control.trace();
+    // Twelve pushes cross several real amortized growths in each original
+    // buffer. Spare capacity is reused; one push is not one allocation.
+    assert!(trace.len() > 2 && trace.len() < 24);
+    assert!(trace.iter().all(
+        |event| event.scope == ScopeKind::Single && matches!(event.request, Request::Exact(..))
+    ));
+    drop(scope);
+    assert!(source.upgrade().is_some());
+    drop(builder);
+    assert!(source.upgrade().is_none());
+    for stop in 0..trace.len() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut scope, source) = Scope::new(ScopeKind::Single, events.clone(), Some(stop));
+        let control = Arc::new(Control::good());
+        scope.control = Some(control.clone());
+        let error = authored_source(&mut scope, &control)
+            .err()
+            .expect("original creator refusal");
+        assert!(
+            matches!(error,UnitConstructionFailure::Creator(HostRefusal(actual)) if actual==stop)
+        );
+        assert_eq!(*events.lock().unwrap(), trace[..=stop]);
+        drop(scope);
+        assert!(source.upgrade().is_none());
+    }
+    for at in 0..checkpoints.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let (mut scope, source) = Scope::new(ScopeKind::Single, events.clone(), None);
+            let control = Arc::new(Control::at(at, cause.clone()));
+            scope.control = Some(control.clone());
+            assert!(
+                matches!(authored_source(&mut scope,&control),Err(UnitConstructionFailure::Control(actual)) if actual==cause)
+            );
+            assert_eq!(control.trace(), checkpoints[..=at]);
+            let expected: Vec<_> = trace
+                .iter()
+                .filter(|event| event.completed_checkpoints <= at)
+                .cloned()
+                .collect();
+            assert_eq!(*events.lock().unwrap(), expected);
+            drop(scope);
+            assert!(source.upgrade().is_none());
+        }
+    }
 }

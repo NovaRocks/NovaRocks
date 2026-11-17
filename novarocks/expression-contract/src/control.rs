@@ -16,14 +16,17 @@
 // under the License.
 
 //! The sole local invocation/region expansion from authenticated definition facts.
-use crate::{DefinitionControl, ExprId, ExprKind, ExprNode, ExprRoot, UnitError};
+use crate::unit_creation::{UnitValidationCreation, ValidationFailure};
+use crate::{DefinitionControl, ExprId, ExprKind, ExprNode, ExprRoot};
+use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, ControlShape, EvaluationDemand, EvaluationRegionId,
-    ExpressionControlFlow, ExpressionControlFlowError, ExpressionDefinitionMembership,
-    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    MAX_CONTROL_DEFINITIONS, MAX_CONTROL_DEPTH, MAX_CONTROL_USE_REFERENCES, RegionGuard,
-    TemporalSourceOccurrence, TemporalSourcePlan, control_argument_semantics,
+    CompileCheckpoints, ControlShape, EvaluationDemand, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionControlFlowError, ExpressionDefinitionMembership, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, MAX_CONTROL_DEFINITIONS,
+    MAX_CONTROL_DEPTH, MAX_CONTROL_USE_REFERENCES, RegionGuard, TemporalSourceOccurrence,
+    TemporalSourcePlan, control_argument_semantics,
 };
+use std::alloc::Layout;
 use std::collections::BTreeMap;
 
 pub(crate) struct Membership<'a>(pub(crate) &'a [ExprNode]);
@@ -42,17 +45,18 @@ pub(crate) struct DerivedControl {
     pub(crate) root_uses: Box<[ExpressionUseId]>,
     pub(crate) temporal_sources: BTreeMap<ExpressionUseId, TemporalSourcePlan<ExprId>>,
 }
-struct Author<'s, 'w, 'c> {
+struct Author<'s, 'w, 'c, 'a, 'scope, H> {
     definitions: &'s [ExprNode],
     controls: &'s BTreeMap<ExprId, DefinitionControl>,
     work: &'w mut CompileCheckpoints<'c>,
+    creation: &'a mut UnitValidationCreation<'scope, H>,
     regions: Vec<ExpressionEvaluationRegion>,
     uses: Vec<ExpressionInvocation<ExprId>>,
     temporal_sources: BTreeMap<ExpressionUseId, TemporalSourcePlan<ExprId>>,
     references: usize,
 }
-impl Author<'_, '_, '_> {
-    fn reference(&mut self) -> Result<(), UnitError> {
+impl<'s, H> Author<'s, '_, '_, '_, '_, H> {
+    fn reference(&mut self) -> Result<(), ValidationFailure<'s, H>> {
         if self.references == MAX_CONTROL_USE_REFERENCES {
             return Err(ExpressionControlFlowError::TooManyItems.into());
         }
@@ -64,14 +68,12 @@ impl Author<'_, '_, '_> {
         &mut self,
         parent: Option<EvaluationRegionId>,
         guard: Option<RegionGuard>,
-    ) -> Result<EvaluationRegionId, UnitError> {
+    ) -> Result<EvaluationRegionId, ValidationFailure<'s, H>> {
         if self.regions.len() == MAX_CONTROL_DEFINITIONS {
             return Err(ExpressionControlFlowError::TooManyItems.into());
         }
         let id = EvaluationRegionId::new(self.regions.len() as u32);
-        self.regions
-            .try_reserve(1)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.creation.reserve_push(&mut self.regions, self.work)?;
         self.regions
             .push(ExpressionEvaluationRegion { id, parent, guard });
         self.work.step()?;
@@ -83,7 +85,7 @@ impl Author<'_, '_, '_> {
         region: EvaluationRegionId,
         demand: EvaluationDemand,
         depth: usize,
-    ) -> Result<ExpressionUseId, UnitError> {
+    ) -> Result<ExpressionUseId, ValidationFailure<'s, H>> {
         if depth > MAX_CONTROL_DEPTH {
             return Err(ExpressionControlFlowError::TooDeep.into());
         }
@@ -92,21 +94,25 @@ impl Author<'_, '_, '_> {
             .definitions
             .get(definition.get() as usize)
             .ok_or_else(|| {
-                UnitError::invalid(Some(definition), None, "invocation definition is absent")
+                ValidationFailure::invalid(
+                    Some(definition),
+                    None,
+                    "invocation definition is absent",
+                )
             })?;
         self.work.step()?;
         let (shape, sources) = if let Some(shape) = node.kind.intrinsic_control_shape()? {
             (shape, None)
         } else {
             let facts = self.controls.get(&definition).ok_or_else(|| {
-                UnitError::invalid(
+                ValidationFailure::invalid(
                     Some(definition),
                     None,
                     "invoked function lacks authenticated definition control",
                 )
             })?;
             let ExprKind::FunctionCall { args, .. } = &node.kind else {
-                return Err(UnitError::invalid(
+                return Err(ValidationFailure::invalid(
                     Some(definition),
                     None,
                     "definition control names a non-call",
@@ -115,14 +121,15 @@ impl Author<'_, '_, '_> {
             match (facts.shape, &facts.temporal_sources) {
                 (ControlShape::TemporalSource(shape), Some(sources)) => {
                     self.work.flush()?;
-                    let actual = crate::temporal_source_definitions_observed(
+                    let actual = crate::temporal_source::temporal_source_definitions_for_unit(
                         shape.kind(),
                         self.definitions,
                         args,
+                        self.creation,
                         self.work,
                     )?;
                     if sources != &actual || sources.facts.shape() != shape {
-                        return Err(UnitError::invalid(
+                        return Err(ValidationFailure::invalid(
                             Some(definition),
                             None,
                             "temporal construction facts differ from actual definitions",
@@ -131,7 +138,7 @@ impl Author<'_, '_, '_> {
                     (facts.shape, Some(sources))
                 }
                 (ControlShape::TemporalSource(_), None) | (_, Some(_)) => {
-                    return Err(UnitError::invalid(
+                    return Err(ValidationFailure::invalid(
                         Some(definition),
                         None,
                         "temporal construction facts do not match control shape",
@@ -141,9 +148,7 @@ impl Author<'_, '_, '_> {
             }
         };
         let id = ExpressionUseId::new(self.uses.len() as u32);
-        self.uses
-            .try_reserve(1)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.creation.reserve_push(&mut self.uses, self.work)?;
         self.uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
@@ -158,9 +163,8 @@ impl Author<'_, '_, '_> {
         let mut children = Vec::new();
         if let Some(sources) = sources {
             self.work.flush()?;
-            children
-                .try_reserve_exact(sources.definitions.len())
-                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            self.creation
+                .reserve(&mut children, sources.definitions.len(), self.work)?;
             self.work.flush()?;
             for &child in &sources.definitions {
                 self.reference()?;
@@ -170,17 +174,14 @@ impl Author<'_, '_, '_> {
         } else if !matches!(shape, ControlShape::TypeOnly | ControlShape::NoArguments) {
             node.kind.invocation_references_observed(|child| {
                 self.reference()?;
-                children
-                    .try_reserve(1)
-                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                self.creation.reserve_push(&mut children, self.work)?;
                 children.push(child);
-                Ok::<_, UnitError>(())
+                Ok::<_, ValidationFailure<'s, H>>(())
             })?;
         }
         let mut arguments = Vec::new();
-        arguments
-            .try_reserve_exact(children.len())
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.creation
+            .reserve_retained(&mut arguments, children.len(), self.work)?;
         for (ordinal, child) in children.iter().enumerate() {
             let (child_demand, guard) =
                 control_argument_semantics(shape, children.len(), ordinal, demand)?;
@@ -196,9 +197,8 @@ impl Author<'_, '_, '_> {
         if let Some(sources) = sources {
             let mut occurrences = Vec::new();
             self.work.flush()?;
-            occurrences
-                .try_reserve_exact(arguments.len())
-                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            self.creation
+                .reserve_retained(&mut occurrences, arguments.len(), self.work)?;
             self.work.flush()?;
             let roles = sources.facts.shape().roles();
             for (ordinal, (&definition, &use_id)) in
@@ -206,7 +206,11 @@ impl Author<'_, '_, '_> {
             {
                 occurrences.push(TemporalSourceOccurrence {
                     role: roles[ordinal].ok_or_else(|| {
-                        UnitError::invalid(Some(definition), None, "temporal source role is absent")
+                        ValidationFailure::invalid(
+                            Some(definition),
+                            None,
+                            "temporal source role is absent",
+                        )
                     })?,
                     definition,
                     use_id,
@@ -214,42 +218,54 @@ impl Author<'_, '_, '_> {
                 self.work.step()?;
             }
             self.work.flush()?;
+            // This exact owned clone belongs to the retained source plan;
+            // the independent authentication copy above remains scratch.
+            self.creation.request_retained(
+                Layout::array::<novarocks_type_contract::TemporalCastKind>(
+                    sources.facts.cast_chain().len(),
+                )
+                .map_err(|_| LayoutResourceError::Arithmetic)?,
+                self.work,
+            )?;
             let plan = TemporalSourcePlan {
                 facts: sources.facts.clone(),
-                sources: occurrences.into_boxed_slice(),
+                sources: self.creation.boxed_retained(occurrences, self.work)?,
             };
             self.work.flush()?;
             plan.validate_structure().map_err(|_| {
-                UnitError::invalid(
+                ValidationFailure::invalid(
                     Some(definition),
                     None,
                     "temporal invocation grammar is invalid",
                 )
             })?;
             self.work.flush()?;
-            self.temporal_sources.insert(id, plan);
+            self.creation
+                .map_insert_retained(&mut self.temporal_sources, id, plan, self.work)?;
             self.work.flush()?;
         }
-        self.uses[id.get() as usize].arguments = arguments.into_boxed_slice();
+        self.uses[id.get() as usize].arguments =
+            self.creation.boxed_retained(arguments, self.work)?;
         self.work.step()?;
         Ok(id)
     }
 }
-/// Pure construction owns no host capacity. The caller admits source/header
-/// allocations and retains their original lifetime; observations grant nothing.
-pub(crate) fn derive(
-    definitions: &[ExprNode],
+/// The single expansion author accepts either no creator or the enclosing
+/// caller's actual scopes. Input definitions/facts remain borrowed sources.
+pub(crate) fn derive_created_in<'source, H>(
+    definitions: &'source [ExprNode],
     roots: &[ExprRoot],
-    controls: &BTreeMap<ExprId, DefinitionControl>,
+    controls: &'source BTreeMap<ExprId, DefinitionControl>,
+    creation: &mut UnitValidationCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<DerivedControl, UnitError> {
+) -> Result<DerivedControl, ValidationFailure<'source, H>> {
     for &id in controls.keys() {
         work.step()?;
         if !definitions
             .get(id.get() as usize)
             .is_some_and(|node| matches!(node.kind, ExprKind::FunctionCall { .. }))
         {
-            return Err(UnitError::invalid(
+            return Err(ValidationFailure::invalid(
                 Some(id),
                 None,
                 "definition control is not attached to a function definition",
@@ -260,6 +276,7 @@ pub(crate) fn derive(
         definitions,
         controls,
         work,
+        creation,
         regions: Vec::new(),
         uses: Vec::new(),
         temporal_sources: BTreeMap::new(),
@@ -269,9 +286,9 @@ pub(crate) fn derive(
     for root in roots {
         let region = author.region(None, None)?;
         let use_id = author.invocation(root.definition, region, root.demand, 1)?;
-        root_uses
-            .try_reserve(1)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        author
+            .creation
+            .reserve_push_retained(&mut root_uses, author.work)?;
         root_uses.push(use_id);
         author.work.step()?;
     }
@@ -281,17 +298,9 @@ pub(crate) fn derive(
         temporal_sources,
         ..
     } = author;
-    // This is the same pure-source constructor as existing neutral flow. The
-    // parent hook observes finite header facts and mints no allocation grant.
-    let flow = ExpressionControlFlow::try_new_in(
-        regions,
-        uses,
-        &Membership(definitions),
-        &mut |_| Ok(()),
-        work,
-    )?;
+    let flow = creation.flow(regions, uses, &Membership(definitions), work)?;
     work.flush()?;
-    let root_uses = root_uses.into_boxed_slice();
+    let root_uses = creation.boxed_retained(root_uses, work)?;
     work.flush()?;
     Ok(DerivedControl {
         flow,

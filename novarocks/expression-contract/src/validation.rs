@@ -26,19 +26,6 @@ use novarocks_type_contract::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) fn reserve<T>(
-    output: &mut Vec<T>,
-    additional: usize,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), UnitError> {
-    work.flush()?;
-    output
-        .try_reserve_exact(additional)
-        .map_err(|_| CompileControlError::ResourceExhausted)?;
-    work.step()?;
-    work.flush()?;
-    Ok(())
-}
 fn filled<'a, H, T>(
     count: usize,
     mut make: impl FnMut() -> T,

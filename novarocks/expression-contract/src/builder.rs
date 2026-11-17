@@ -28,6 +28,36 @@ use novarocks_type_contract::{
 };
 use std::collections::{BTreeMap, btree_map::Entry};
 
+fn reserve_source<T, H>(
+    out: &mut Vec<T>,
+    mut created: Option<(
+        &mut crate::unit_creation::UnitValidationCreation<'_, H>,
+        &mut CompileCheckpoints<'_>,
+    )>,
+) -> Result<(), crate::unit_creation::UnitAllocationFailure<H>> {
+    if let Some((creation, work)) = created.as_mut() {
+        creation.reserve_push_retained(out, work)
+    } else {
+        out.try_reserve(1).map_err(|_| {
+            crate::unit_creation::UnitAllocationFailure::Control(
+                CompileControlError::ResourceExhausted,
+            )
+        })
+    }
+}
+fn pure_source_error(
+    error: crate::unit_creation::UnitAllocationFailure<std::convert::Infallible>,
+) -> UnitError {
+    match error {
+        crate::unit_creation::UnitAllocationFailure::Control(e) => e.into(),
+        crate::unit_creation::UnitAllocationFailure::Creator(never)
+        | crate::unit_creation::UnitAllocationFailure::Observer(never) => match never {},
+        crate::unit_creation::UnitAllocationFailure::Resource(_) => {
+            CompileControlError::ResourceExhausted.into()
+        }
+    }
+}
+
 pub struct BoundExprSetBuilder {
     limits: UnitLimits,
     definitions: Vec<Option<ExprNode>>,
@@ -82,18 +112,71 @@ impl BoundExprSetBuilder {
     /// Reserve before a lambda body is authored. IDs remain dense; insertion
     /// order need not be topological. The caller admits these source buffers.
     pub fn reserve(&mut self) -> Result<ExprId, UnitError> {
+        let id = self.next_definition_id()?;
+        reserve_source::<_, std::convert::Infallible>(&mut self.definitions, None)
+            .map_err(pure_source_error)?;
+        self.definitions.push(None);
+        Ok(id)
+    }
+    fn next_definition_id(&self) -> Result<ExprId, UnitError> {
         if self.definitions.len() == novarocks_type_contract::MAX_CONTROL_DEFINITIONS {
             return Err(novarocks_type_contract::ExpressionControlFlowError::TooManyItems.into());
         }
-        let id = ExprId::new(
+        Ok(ExprId::new(
             u32::try_from(self.definitions.len())
                 .map_err(|_| CompileControlError::ResourceExhausted)?,
-        );
-        self.definitions
-            .try_reserve(1)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        ))
+    }
+    /// Request this author's actual new definition-buffer extent before growth.
+    /// The supplied scope is retained even when a later operation refuses.
+    pub fn reserve_with_creator_in<H>(
+        &mut self,
+        scope: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ExprId, crate::UnitConstructionFailure<H>> {
+        let mut creation = crate::unit_creation::UnitValidationCreation::single(scope);
+        let id = self
+            .next_definition_id()
+            .map_err(|error| creation.finish_error(error.into(), work))?;
+        self.retain_source_storage(&mut creation, work)?;
+        reserve_source(&mut self.definitions, Some((&mut creation, work)))
+            .map_err(|error| creation.finish_error(error.into(), work))?;
         self.definitions.push(None);
         Ok(id)
+    }
+    pub fn add_with_creator_in<H>(
+        &mut self,
+        lambda_scope: Option<ExprId>,
+        ty: crate::ValueType,
+        kind: ExprKind,
+        scope: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ExprId, crate::UnitConstructionFailure<H>> {
+        let id = self.reserve_with_creator_in(scope, work)?;
+        self.insert_source(id, lambda_scope, ty, kind)
+            .map_err(|message| {
+                let mut creation = crate::unit_creation::UnitValidationCreation::single(scope);
+                creation.finish_error(
+                    crate::unit_creation::ValidationFailure::invalid(Some(id), None, message),
+                    work,
+                )
+            })?;
+        Ok(id)
+    }
+    fn retain_source_storage<H>(
+        &mut self,
+        creation: &mut crate::unit_creation::UnitValidationCreation<'_, H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), crate::UnitConstructionFailure<H>> {
+        self.storage = creation
+            .retained_storage()
+            .retaining_observed(&self.storage, |layout| {
+                creation.request_retained(layout, work)
+            })
+            .map_err(|error: crate::unit_creation::UnitAllocationFailure<H>| {
+                creation.finish_error(error.into(), work)
+            })?;
+        Ok(())
     }
     pub fn add(
         &mut self,
@@ -112,19 +195,22 @@ impl BoundExprSetBuilder {
         ty: crate::ValueType,
         kind: ExprKind,
     ) -> Result<(), UnitError> {
-        let slot = self.definitions.get_mut(id.get() as usize).ok_or_else(|| {
-            UnitError::invalid(
-                Some(id),
-                None,
-                "definition ID was not reserved by this builder",
-            )
-        })?;
+        self.insert_source(id, lambda_scope, ty, kind)
+            .map_err(|message| UnitError::invalid(Some(id), None, message))
+    }
+    fn insert_source(
+        &mut self,
+        id: ExprId,
+        lambda_scope: Option<ExprId>,
+        ty: crate::ValueType,
+        kind: ExprKind,
+    ) -> Result<(), &'static str> {
+        let slot = self
+            .definitions
+            .get_mut(id.get() as usize)
+            .ok_or("definition ID was not reserved by this builder")?;
         if slot.is_some() {
-            return Err(UnitError::invalid(
-                Some(id),
-                None,
-                "definition ID was already filled",
-            ));
+            return Err("definition ID was already filled");
         }
         *slot = Some(ExprNode {
             id,
@@ -143,9 +229,32 @@ impl BoundExprSetBuilder {
         let ordinal = RootOrdinal::new(
             u32::try_from(self.roots.len()).map_err(|_| CompileControlError::ResourceExhausted)?,
         );
-        self.roots
-            .try_reserve(1)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        reserve_source::<_, std::convert::Infallible>(&mut self.roots, None)
+            .map_err(pure_source_error)?;
+        self.roots.push(ExprRoot {
+            definition,
+            demand,
+            scope,
+        });
+        Ok(ordinal)
+    }
+    /// Source roots use the same original ordinal/order and actual buffer
+    /// author as the pure entry, with the caller's real storage request port.
+    pub fn root_with_creator_in<H>(
+        &mut self,
+        definition: ExprId,
+        demand: EvaluationDemand,
+        scope: RootScope,
+        creator: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<RootOrdinal, crate::UnitConstructionFailure<H>> {
+        let ordinal = RootOrdinal::new(
+            u32::try_from(self.roots.len()).map_err(|_| CompileControlError::ResourceExhausted)?,
+        );
+        let mut creation = crate::unit_creation::UnitValidationCreation::single(creator);
+        self.retain_source_storage(&mut creation, work)?;
+        reserve_source(&mut self.roots, Some((&mut creation, work)))
+            .map_err(|error| creation.finish_error(error.into(), work))?;
         self.roots.push(ExprRoot {
             definition,
             demand,
@@ -194,30 +303,100 @@ impl BoundExprSetBuilder {
             definitions: &mut self.definitions,
         }
     }
-    /// Borrow the original work scope. No new entry, phase or footer is made.
+    /// Borrow the original work scope without a runtime creator. The enclosing
+    /// pure producer remains responsible for its source/header allocations.
     pub fn seal(
         self,
         ports: Vec<ExprPort>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<SealedUnit, UnitError> {
+        let mut creation =
+            crate::unit_creation::UnitValidationCreation::<std::convert::Infallible>::pure();
+        self.seal_created_in(ports, &mut creation, work)
+            .map_err(crate::unit_creation::pure_error)
+    }
+    /// Construct through the original validation and control-expansion authors,
+    /// borrowing actual scratch and retained storage. Input builder/port buffers
+    /// already belong to the caller; only new construction is requested here.
+    pub fn seal_with_creator_in<H>(
+        self,
+        ports: Vec<ExprPort>,
+        temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        retained: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<SealedUnit, crate::UnitConstructionFailure<H>> {
+        let mut creation = crate::unit_creation::UnitValidationCreation::new(temporary, retained);
+        self.seal_created_in(ports, &mut creation, work)
+    }
+    /// One existing caller scope may conservatively own both kinds of storage.
+    /// Its lifetime is retained by the unit and by independently escaping Flow
+    /// backing; no new scope, factory, grant or control entry is opened.
+    pub fn seal_with_single_creator_in<H>(
+        self,
+        ports: Vec<ExprPort>,
+        scope: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<SealedUnit, crate::UnitConstructionFailure<H>> {
+        let mut creation = crate::unit_creation::UnitValidationCreation::single(scope);
+        self.seal_created_in(ports, &mut creation, work)
+    }
+    fn seal_created_in<H>(
+        self,
+        ports: Vec<ExprPort>,
+        creation: &mut crate::unit_creation::UnitValidationCreation<'_, H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<SealedUnit, crate::UnitConstructionFailure<H>> {
+        use crate::unit_creation::{UnitAllocationFailure, ValidationFailure};
         let mut definitions = Vec::new();
-        crate::validation::reserve(&mut definitions, self.definitions.len(), work)?;
+        creation
+            .reserve_retained(&mut definitions, self.definitions.len(), work)
+            .map_err(|error| creation.finish_error(error.into(), work))?;
         for (ordinal, definition) in self.definitions.into_iter().enumerate() {
             definitions.push(definition.ok_or_else(|| {
-                UnitError::invalid(
-                    Some(ExprId::new(ordinal as u32)),
-                    None,
-                    "reserved definition was not filled",
+                creation.finish_error(
+                    ValidationFailure::invalid(
+                        Some(ExprId::new(ordinal as u32)),
+                        None,
+                        "reserved definition was not filled",
+                    ),
+                    work,
                 )
             })?);
             work.step()?;
         }
-        crate::validation::validate(&ports, &definitions, &self.roots, self.limits, work)?;
-        let derived = crate::control::derive(&definitions, &self.roots, &self.controls, work)?;
+        crate::validation::validate_core(
+            &ports,
+            &definitions,
+            &self.roots,
+            self.limits,
+            creation,
+            work,
+        )
+        .map_err(|error| creation.finish_error(error, work))?;
+        let derived = crate::control::derive_created_in(
+            &definitions,
+            &self.roots,
+            &self.controls,
+            creation,
+            work,
+        )
+        .map_err(|error| creation.finish_error(error, work))?;
         work.flush()?;
-        let definitions = definitions.into_boxed_slice();
-        let ports = ports.into_boxed_slice();
-        let roots = self.roots.into_boxed_slice();
+        let definitions = creation
+            .boxed_retained(definitions, work)
+            .map_err(|error| creation.finish_error(error.into(), work))?;
+        let ports = creation
+            .boxed_retained(ports, work)
+            .map_err(|error| creation.finish_error(error.into(), work))?;
+        let roots = creation
+            .boxed_retained(self.roots, work)
+            .map_err(|error| creation.finish_error(error.into(), work))?;
+        let storage = creation
+            .retained_storage()
+            .retaining_observed(&self.storage, |layout| {
+                creation.request_retained(layout, work)
+            })
+            .map_err(|error: UnitAllocationFailure<H>| creation.finish_error(error.into(), work))?;
         work.flush()?;
         Ok(SealedUnit {
             ports,
@@ -227,7 +406,7 @@ impl BoundExprSetBuilder {
             control: derived.flow,
             temporal_sources: derived.temporal_sources,
             requests: self.requests,
-            storage: self.storage,
+            storage,
         })
     }
 }

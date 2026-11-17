@@ -16,7 +16,8 @@
 // under the License.
 
 //! Borrow the enclosing caller's actual scratch and diagnostic storage ports.
-//! No scope, quota, entry, footer, source copy or success hold is created here.
+//! No scope, quota, entry or footer is created here. Receiving borrows scratch
+//! and diagnostics; producing additionally retains actual newly built storage.
 use crate::{ExprId, RootOrdinal, UnitError};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, ExpressionUseId, ValueSchemaCreationScope,
@@ -55,6 +56,7 @@ impl std::error::Error for ConstructedUnitError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnitConstructionStorage {
     Temporary,
+    Retained,
     Diagnostic,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -270,13 +272,6 @@ impl<'a, H> UnitValidationCreation<'a, H> {
             observer: None,
         }
     }
-    fn temporary_scope(&mut self) -> Option<&mut (dyn ValueSchemaCreationScope<H> + 'a)> {
-        match &mut self.scopes {
-            UnitValidationScopes::Pure => None,
-            UnitValidationScopes::Separate { temporary, .. } => Some(&mut **temporary),
-            UnitValidationScopes::Single(scope) => Some(&mut **scope),
-        }
-    }
     pub(crate) fn with_observer(
         mut self,
         observer: &'a mut dyn FnMut(UnitConstructionRequest) -> Result<(), H>,
@@ -298,25 +293,172 @@ impl<'a, H> UnitValidationCreation<'a, H> {
         layout: Layout,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), UnitAllocationFailure<H>> {
+        self.request_for(UnitConstructionStorage::Temporary, layout, work)
+    }
+    pub(crate) fn request_retained(
+        &mut self,
+        layout: Layout,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), UnitAllocationFailure<H>> {
+        self.request_for(UnitConstructionStorage::Retained, layout, work)
+    }
+    fn allocation_scope(
+        &mut self,
+        storage: UnitConstructionStorage,
+    ) -> Option<&mut (dyn ValueSchemaCreationScope<H> + 'a)> {
+        match (&mut self.scopes, storage) {
+            (UnitValidationScopes::Pure, _) => None,
+            (
+                UnitValidationScopes::Separate { temporary, .. },
+                UnitConstructionStorage::Temporary,
+            ) => Some(&mut **temporary),
+            (UnitValidationScopes::Separate { retained, .. }, _) => Some(&mut **retained),
+            (UnitValidationScopes::Single(scope), _) => Some(&mut **scope),
+        }
+    }
+    fn request_for(
+        &mut self,
+        storage: UnitConstructionStorage,
+        layout: Layout,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), UnitAllocationFailure<H>> {
         if layout.size() == 0 {
             return Ok(());
         }
         if self.observer.is_some() || !matches!(self.scopes, UnitValidationScopes::Pure) {
             work.flush()?;
         }
-        self.observe(UnitConstructionRequest::Exact {
-            storage: UnitConstructionStorage::Temporary,
-            layout,
-        })?;
-        if let Some(scope) = self.temporary_scope() {
+        self.observe(UnitConstructionRequest::Exact { storage, layout })?;
+        if let Some(scope) = self.allocation_scope(storage) {
             scope
                 .request_layout(layout)
                 .map_err(UnitAllocationFailure::Creator)?;
         }
         Ok(())
     }
+    pub(crate) fn retained_storage(&self) -> ValueTypeStorageLifetime {
+        match &self.scopes {
+            UnitValidationScopes::Pure => ValueTypeStorageLifetime::pure(),
+            UnitValidationScopes::Separate { retained, .. } => retained.storage_lifetime(),
+            UnitValidationScopes::Single(scope) => scope.storage_lifetime(),
+        }
+    }
+    /// Raw invocation argument Boxes were constructed in this same retained
+    /// scope. The original flow constructor gives every escaping Arc that
+    /// actual scope lifetime, including those moved Boxes.
+    pub(crate) fn flow<'source>(
+        &mut self,
+        regions: Vec<novarocks_type_contract::ExpressionEvaluationRegion>,
+        uses: Vec<novarocks_type_contract::ExpressionInvocation<ExprId>>,
+        definitions: &impl novarocks_type_contract::ExpressionDefinitionMembership<ExprId>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<novarocks_type_contract::ExpressionControlFlow<ExprId>, ValidationFailure<'source, H>>
+    {
+        use novarocks_type_contract::{
+            ExpressionControlCreationFailure as F, ExpressionControlFlow,
+        };
+        let result = match &mut self.scopes {
+            UnitValidationScopes::Pure => {
+                return ExpressionControlFlow::try_new_in(
+                    regions,
+                    uses,
+                    definitions,
+                    &mut |_| Ok(()),
+                    work,
+                )
+                .map_err(ValidationFailure::from);
+            }
+            UnitValidationScopes::Separate {
+                temporary,
+                retained,
+            } => ExpressionControlFlow::try_new_with_creator_in(
+                regions,
+                uses,
+                definitions,
+                &mut **temporary,
+                &mut **retained,
+                work,
+            ),
+            UnitValidationScopes::Single(scope) => {
+                ExpressionControlFlow::try_new_with_single_creator_in(
+                    regions,
+                    uses,
+                    definitions,
+                    &mut **scope,
+                    work,
+                )
+            }
+        };
+        result.map_err(|error| match error {
+            F::Control(e) => ValidationFailure::Control(e),
+            F::Creator(e) => ValidationFailure::Creator(e),
+            F::Resource(e) => ValidationFailure::Resource(e),
+            F::Owner(e) => e.into(),
+        })
+    }
+    pub(crate) fn reserve_push<T>(
+        &mut self,
+        out: &mut Vec<T>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), UnitAllocationFailure<H>> {
+        self.reserve_push_for(UnitConstructionStorage::Temporary, out, work)
+    }
+    pub(crate) fn reserve_push_retained<T>(
+        &mut self,
+        out: &mut Vec<T>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), UnitAllocationFailure<H>> {
+        self.reserve_push_for(UnitConstructionStorage::Retained, out, work)
+    }
+    fn reserve_push_for<T>(
+        &mut self,
+        storage: UnitConstructionStorage,
+        out: &mut Vec<T>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), UnitAllocationFailure<H>> {
+        work.flush()?;
+        // Use the locked original Vec author, never infer private RawVec
+        // geometry or replace amortized growth with one allocation per item.
+        if self.observer.is_some() || !matches!(self.scopes, UnitValidationScopes::Pure) {
+            let facts = novarocks_type_contract::owned_resources::vec::push_growth(out).map_err(
+                |error| match error {
+                    novarocks_type_contract::ControlResourceError::Control(cause) => {
+                        UnitAllocationFailure::Control(cause)
+                    }
+                    novarocks_type_contract::ControlResourceError::SourceModel(_) => {
+                        UnitAllocationFailure::Resource(LayoutResourceError::SourceModel)
+                    }
+                },
+            )?;
+            if let Some(layout) = facts.requested_backing {
+                self.request_for(storage, layout, work)?;
+            }
+        }
+        out.try_reserve(1)
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        work.step()?;
+        work.flush()?;
+        Ok(())
+    }
     pub(crate) fn reserve<T>(
         &mut self,
+        out: &mut Vec<T>,
+        additional: usize,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), UnitAllocationFailure<H>> {
+        self.reserve_for(UnitConstructionStorage::Temporary, out, additional, work)
+    }
+    pub(crate) fn reserve_retained<T>(
+        &mut self,
+        out: &mut Vec<T>,
+        additional: usize,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), UnitAllocationFailure<H>> {
+        self.reserve_for(UnitConstructionStorage::Retained, out, additional, work)
+    }
+    fn reserve_for<T>(
+        &mut self,
+        storage: UnitConstructionStorage,
         out: &mut Vec<T>,
         additional: usize,
         work: &mut CompileCheckpoints<'_>,
@@ -328,7 +470,7 @@ impl<'a, H> UnitValidationCreation<'a, H> {
                 .checked_add(additional)
                 .ok_or(LayoutResourceError::Arithmetic)?;
             let layout = Layout::array::<T>(target).map_err(|_| LayoutResourceError::Arithmetic)?;
-            self.request(layout, work)?;
+            self.request_for(storage, layout, work)?;
         }
         out.try_reserve_exact(additional)
             .map_err(|_| CompileControlError::ResourceExhausted)?;
@@ -341,9 +483,25 @@ impl<'a, H> UnitValidationCreation<'a, H> {
         out: Vec<T>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Box<[T]>, UnitAllocationFailure<H>> {
+        self.boxed_for(UnitConstructionStorage::Temporary, out, work)
+    }
+    pub(crate) fn boxed_retained<T>(
+        &mut self,
+        out: Vec<T>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Box<[T]>, UnitAllocationFailure<H>> {
+        self.boxed_for(UnitConstructionStorage::Retained, out, work)
+    }
+    fn boxed_for<T>(
+        &mut self,
+        storage: UnitConstructionStorage,
+        out: Vec<T>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Box<[T]>, UnitAllocationFailure<H>> {
         work.flush()?;
         if out.capacity() != out.len() && !out.is_empty() && std::mem::size_of::<T>() != 0 {
-            self.request(
+            self.request_for(
+                storage,
                 Layout::array::<T>(out.len()).map_err(|_| LayoutResourceError::Arithmetic)?,
                 work,
             )?;
@@ -367,6 +525,7 @@ impl<'a, H> UnitValidationCreation<'a, H> {
     }
     fn before_tree<K, V>(
         &mut self,
+        storage: UnitConstructionStorage,
         count: usize,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), UnitAllocationFailure<H>> {
@@ -400,11 +559,8 @@ impl<'a, H> UnitValidationCreation<'a, H> {
         };
         if facts.request_bytes_upper_bound != 0 {
             work.flush()?;
-            self.observe(UnitConstructionRequest::Opaque {
-                storage: UnitConstructionStorage::Temporary,
-                facts,
-            })?;
-            if let Some(scope) = self.temporary_scope() {
+            self.observe(UnitConstructionRequest::Opaque { storage, facts })?;
+            if let Some(scope) = self.allocation_scope(storage) {
                 scope
                     .observe_opaque_upper_bound(facts.request_bytes_upper_bound)
                     .map_err(UnitAllocationFailure::Creator)?;
@@ -421,7 +577,7 @@ impl<'a, H> UnitValidationCreation<'a, H> {
         let existing = out.contains(&key);
         work.step()?;
         if !existing {
-            self.before_tree::<K, ()>(out.len(), work)?;
+            self.before_tree::<K, ()>(UnitConstructionStorage::Temporary, out.len(), work)?;
         }
         Ok(out.insert(key))
     }
@@ -435,7 +591,21 @@ impl<'a, H> UnitValidationCreation<'a, H> {
         let existing = out.contains_key(&key);
         work.step()?;
         if !existing {
-            self.before_tree::<K, V>(out.len(), work)?;
+            self.before_tree::<K, V>(UnitConstructionStorage::Temporary, out.len(), work)?;
+        }
+        Ok(out.insert(key, value))
+    }
+    pub(crate) fn map_insert_retained<K: Ord + Copy, V>(
+        &mut self,
+        out: &mut BTreeMap<K, V>,
+        key: K,
+        value: V,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<V>, UnitAllocationFailure<H>> {
+        let existing = out.contains_key(&key);
+        work.step()?;
+        if !existing {
+            self.before_tree::<K, V>(UnitConstructionStorage::Retained, out.len(), work)?;
         }
         Ok(out.insert(key, value))
     }
