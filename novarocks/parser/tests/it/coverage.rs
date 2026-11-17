@@ -17,6 +17,23 @@
 
 use novarocks_parser::trino_lexer::lex;
 use novarocks_parser::trino_token::TokenKind;
+use std::borrow::Cow;
+
+/// Loads SQL bytes that cannot fit in one TSV cell, including dollar-body LF.
+pub(super) fn sample(raw: &str) -> Cow<'_, str> {
+    match raw.strip_prefix("@file:") {
+        None => Cow::Borrowed(raw),
+        Some(relative) => {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/it")
+                .join(relative);
+            Cow::Owned(
+                std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display())),
+            )
+        }
+    }
+}
 
 #[test]
 fn lexical_rule_samples_match_their_token_kind_and_reject_neighbours() {
@@ -51,21 +68,21 @@ fn grammar_sample_tokens_reconstruct_the_complete_input() {
     {
         let fields: Vec<_> = line.split('\t').collect();
         assert_eq!(fields.len(), 10, "{line}");
-        let source = fields[5];
-        if !matches!(fields[0], "alternative" | "optional") || source.is_empty() {
+        if !matches!(fields[0], "alternative" | "optional") || fields[5].is_empty() {
             continue;
         }
+        let source = sample(fields[5]);
         if fields[7] == "syntax-error" {
-            assert!(lex(source).is_err(), "{}: {source}", fields[1]);
+            assert!(lex(&source).is_err(), "{}: {source}", fields[1]);
             continue;
         }
         let tokens =
-            lex(source).unwrap_or_else(|error| panic!("{}: {source}: {error:?}", fields[1]));
+            lex(&source).unwrap_or_else(|error| panic!("{}: {source}: {error:?}", fields[1]));
         let reconstructed: String = tokens
             .iter()
             .map(|token| &source[token.span.start()..token.span.end()])
             .collect();
-        assert_eq!(reconstructed, source, "{}", fields[1]);
+        assert_eq!(reconstructed, source.as_ref(), "{}", fields[1]);
         for adjacent in tokens.windows(2) {
             assert_eq!(adjacent[0].span.end(), adjacent[1].span.start());
         }

@@ -65,7 +65,7 @@ fn advanced_relation_coverage_including_original_formatter_gaps_roundtrips() {
             || fields[1] == "relationPrimary"
                 && matches!(fields[3], "nearest" | "tableFunctionInvocation")
         {
-            roundtrip(fields[5]);
+            roundtrip(&super::coverage::sample(fields[5]));
             checked += 1;
         }
     }
@@ -262,7 +262,7 @@ fn copartition_coverage_witnesses_reach_real_clause_fields_and_keep_alias_diagno
         if fields.len() != 10 || fields[1] != "copartitionTables" {
             continue;
         }
-        let query = roundtrip(fields[5]);
+        let query = roundtrip(&super::coverage::sample(fields[5]));
         let call = invocation(&query);
         assert_eq!(call.arguments.len(), 1);
         assert!(matches!(

@@ -28,11 +28,12 @@ mod parameters;
 mod pattern;
 mod query;
 mod relation;
+mod routine;
 mod special;
 mod types;
 mod window;
 
-use crate::ast::{Expr, Fold, Query, TypeName};
+use crate::ast::{Expr, Fold, FunctionSpecification, Query, TypeName};
 use crate::trino_token::{Token, TokenKind};
 use crate::{ParserError, Span, trino_lexer};
 use failure::GrammarError;
@@ -125,4 +126,14 @@ pub fn parse_type(source: &str) -> Result<TypeName, ParserError> {
     let data_type = parser.parse_type()?;
     parser.finish()?;
     Ok(data_type)
+}
+
+/// Parses the standalone functionSpecification grammar, without a query wrapper.
+pub fn parse_function_specification(source: &str) -> Result<FunctionSpecification, ParserError> {
+    let mut parser = Parser::new(source)?;
+    let function = parser.parse_function_specification()?;
+    parser.finish()?;
+    Ok(parser
+        .parameter_numbers()
+        .fold_function_specification(function))
 }

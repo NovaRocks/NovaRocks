@@ -381,7 +381,7 @@ fn trino_advanced_relation_reference_coverage_acceptance() {
             || (columns[1] == "relationPrimary"
                 && matches!(columns[3], "nearest" | "tableFunctionInvocation"))
         {
-            query(columns[5]);
+            query(&super::coverage::sample(columns[5]));
             count += 1;
         }
     }

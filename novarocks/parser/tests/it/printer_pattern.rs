@@ -366,7 +366,7 @@ fn printer_pattern_reference_coverage_all_queries_strictly_roundtrip() {
     for line in include_str!("grammar-coverage.tsv").lines() {
         let columns = line.split('\t').collect::<Vec<_>>();
         if columns.len() == 10 && columns[7] == "accept" && rules.contains(&columns[1]) {
-            roundtrip(columns[5]);
+            roundtrip(&super::coverage::sample(columns[5]));
             count += 1;
         }
     }

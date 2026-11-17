@@ -651,7 +651,7 @@ fn every_existing_json_grammar_coverage_sample_reaches_the_new_query_parser() {
             !fields[5].is_empty(),
             "unfilled JSON grammar sample: {line}"
         );
-        parse_query(fields[5]).unwrap_or_else(|error| {
+        parse_query(&super::coverage::sample(fields[5])).unwrap_or_else(|error| {
             panic!(
                 "{} alternative {} clause {}: {}: {error:?}",
                 fields[1], fields[2], fields[4], fields[5]

@@ -65,24 +65,32 @@ impl Parser<'_> {
 
     #[recursive::recursive]
     pub(super) fn parse_root_query(&mut self) -> Result<Query, ParserError> {
+        let start = self.current().span;
+        let parameter_start = self.next_parameter;
+        let mut functions = Vec::new();
         if self.at_keyword(Keyword::With)
             && self.peek(1).kind == TokenKind::Keyword(Keyword::Function)
             && self.is_identifier(2)
         {
-            return Err(self.error("inline function specification (next parser slice)"));
+            self.bump();
+            loop {
+                functions.push(self.parse_function_specification()?);
+                if self.eat_symbol(Symbol::Comma).is_none() {
+                    break;
+                }
+            }
         }
-        let parameter_start = self.next_parameter;
-        let query = self.parse_query()?;
+        let functions_end = self.next_parameter;
+        let mut query = self.parse_query()?;
         let parameter_end = self.next_parameter;
-        // This slice has no inline function declarations. Keep the actual
-        // rootQuery visit boundary explicit for the shared parameter author.
+        // AstBuilder constructs the query before visiting its earlier-text
+        // function declarations. Preserve each child's committed event order.
         self.reorder_parameter_groups(
             parameter_start,
-            &[
-                parameter_start..parameter_end,
-                parameter_start..parameter_start,
-            ],
+            &[functions_end..parameter_end, parameter_start..functions_end],
         );
+        query.functions = functions.into();
+        query.span = self.span_since(start);
         Ok(query)
     }
 

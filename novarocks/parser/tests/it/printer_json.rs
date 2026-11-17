@@ -78,7 +78,7 @@ fn every_existing_json_coverage_sample_roundtrips_through_the_typed_printer() {
             continue;
         }
         assert!(!fields[5].is_empty(), "unfilled JSON sample: {line}");
-        query_roundtrip(fields[5]);
+        query_roundtrip(&super::coverage::sample(fields[5]));
         checked += 1;
     }
     assert_eq!(checked, 104, "the bound JSON sample obligations changed");

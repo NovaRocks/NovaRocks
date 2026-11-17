@@ -414,3 +414,29 @@ fn trino_query_first_slice_roundtrips_preserve_all_syntax_facts() {
         assert!(syntax_eq_query(&first, &second), "{sql}\n{rendered}");
     }
 }
+
+#[test]
+fn relation_parentheses_distinguish_query_wrappers_from_an_inner_alias() {
+    let aliased = query("SELECT * FROM ((SELECT 1) AS x)");
+    let SetExpr::Select(select) = aliased.body.as_ref() else {
+        panic!()
+    };
+    let Some(Relation::Aliased(alias)) = &select.from else {
+        panic!()
+    };
+    assert_eq!(alias.alias.value, "x");
+    assert!(
+        matches!(alias.relation.as_ref(), Relation::TableSubquery(value) if matches!(value.query.body.as_ref(), SetExpr::Select(_)))
+    );
+    let nested = query("SELECT * FROM ((SELECT 1))");
+    let SetExpr::Select(select) = nested.body.as_ref() else {
+        panic!()
+    };
+    assert!(
+        matches!(&select.from, Some(Relation::TableSubquery(value)) if matches!(value.query.body.as_ref(), SetExpr::Query(_)))
+    );
+    for original in [aliased, nested] {
+        let printed = trino_printer::print_query(&original);
+        assert!(syntax_eq_query(&original, &query(&printed)), "{printed}");
+    }
+}

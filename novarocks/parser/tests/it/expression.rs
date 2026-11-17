@@ -239,3 +239,72 @@ fn long_or_chain_is_one_ordered_multiterm_node() {
             .all(|term| matches!(term, Expr::Identifier(name) if name.value == "a"))
     );
 }
+
+#[test]
+fn parenthesized_query_and_expression_alternatives_preserve_the_complete_context() {
+    let Expr::Subquery(outer) = parse_expression("((SELECT 1))").unwrap() else {
+        panic!()
+    };
+    assert!(matches!(outer.query.body.as_ref(), SetExpr::Query(_)));
+    let Expr::Binary(sum) = parse_expression("((SELECT 1)+1)").unwrap() else {
+        panic!()
+    };
+    assert_eq!(sum.operator, BinaryOperator::Add);
+    assert!(
+        matches!(sum.left.as_ref(), Expr::Subquery(value) if matches!(value.query.body.as_ref(), SetExpr::Select(_)))
+    );
+    assert!(matches!(
+        sum.right.as_ref(),
+        Expr::Literal(Literal {
+            kind: LiteralKind::Long {
+                parsed_value: 1,
+                ..
+            },
+            ..
+        })
+    ));
+    for (source, list_expected) in [
+        ("a IN ((SELECT 1))", true),
+        ("a IN ((SELECT 1), 2)", true),
+        ("a IN (SELECT 1)", false),
+        ("a IN ((SELECT 1) UNION SELECT 2)", false),
+    ] {
+        let expression = parse_expression(source).unwrap();
+        let Expr::Predicated(predicated) = &expression else {
+            panic!()
+        };
+        let Predicate::In(predicate) = &predicated.predicate else {
+            panic!()
+        };
+        if list_expected {
+            let Expr::InList(list) = &predicate.value_list else {
+                panic!("{source}")
+            };
+            assert!(
+                matches!(&list.values[0], Expr::Subquery(value) if matches!(value.query.body.as_ref(), SetExpr::Select(_)))
+            );
+        } else {
+            assert!(
+                matches!(predicate.value_list, Expr::Subquery(_)),
+                "{source}"
+            );
+        }
+        let printed = novarocks_parser::trino_printer::print_expression(&expression);
+        assert!(
+            expression.syntax_eq(&parse_expression(&printed).unwrap()),
+            "{source} -> {printed}"
+        );
+    }
+    struct Parameters(Vec<usize>);
+    impl Visit for Parameters {
+        fn visit_parameter(&mut self, parameter: &Parameter) {
+            self.0.push(parameter.position);
+        }
+    }
+    for source in ["((SELECT ?)+?)", "a IN ((SELECT ?) UNION SELECT ?)"] {
+        let expression = parse_expression(source).unwrap();
+        let mut parameters = Parameters(Vec::new());
+        parameters.visit_expr(&expression);
+        assert_eq!(parameters.0, vec![0, 1], "{source}");
+    }
+}

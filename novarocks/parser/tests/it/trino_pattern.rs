@@ -426,7 +426,7 @@ fn trino_pattern_related_coverage_rows_use_the_actual_new_query_entry() {
             index + 1
         );
         assert!(
-            trino_parser::parse_query(columns[5]).is_ok(),
+            trino_parser::parse_query(&super::coverage::sample(columns[5])).is_ok(),
             "coverage line {}: {}",
             index + 1,
             columns[5]

@@ -15,5 +15,5 @@ novarocks-user-error.workspace = true
 doctest = false
 
 [package.metadata.novarocks.test]
-runtime-inputs = ["tests/sql/correctness/**/*.sql"]
+runtime-inputs = ["tests/sql/correctness/**/*.sql", "novarocks/parser/tests/it/coverage-sql/*.sql"]
 env-inputs = []

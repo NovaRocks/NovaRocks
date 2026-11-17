@@ -7,9 +7,6 @@ impl Writer {
         if matches!(value.body.as_ref(), SetExpr::Select(_)) && !value.modifiers.is_empty() {
             unsupported("query-level modifiers on a direct Select body");
         }
-        if !value.functions.is_empty() {
-            unsupported("WITH FUNCTION/routine specifications");
-        }
         if !value.session_properties.is_empty() {
             self.text("WITH SESSION ");
             for (index, property) in value.session_properties.iter().enumerate() {
@@ -19,6 +16,16 @@ impl Writer {
                 self.name(&property.name);
                 self.text(" = ");
                 self.expression(&property.value);
+            }
+            self.character(' ');
+        }
+        if !value.functions.is_empty() {
+            self.text("WITH ");
+            for (index, function) in value.functions.iter().enumerate() {
+                if index != 0 {
+                    self.text(", ");
+                }
+                self.function_specification(function);
             }
             self.character(' ');
         }

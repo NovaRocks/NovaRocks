@@ -410,23 +410,32 @@ impl Parser<'_> {
         }
         self.expect_keyword(K::In)?;
         let open = self.expect_symbol(S::LParen)?;
-        let value_list = if self.query_head() {
-            let query = self.parse_query()?;
-            self.expect_symbol(S::RParen)?;
-            Expr::Subquery(SubqueryExpr {
-                query: AstBox::new(query),
-                span: self.span_since(open),
-            })
-        } else {
+        let checkpoint = self.checkpoint();
+        // inList precedes inSubquery. A scalar subquery can itself be the
+        // first real expression in the list; require the entire alternative.
+        let list = (|| {
             let mut values = vec![self.parse_expression()?];
             while self.eat_symbol(S::Comma).is_some() {
                 values.push(self.parse_expression()?);
             }
             self.expect_symbol(S::RParen)?;
-            Expr::InList(AstBox::new(InListExpr {
+            Ok::<_, ParserError>(Expr::InList(AstBox::new(InListExpr {
                 values: values.into(),
                 span: self.span_since(open),
-            }))
+            })))
+        })();
+        let value_list = match list {
+            Ok(list) => list,
+            Err(ParserError::Syntax(_)) => {
+                self.restore(checkpoint);
+                let query = self.parse_query()?;
+                self.expect_symbol(S::RParen)?;
+                Expr::Subquery(SubqueryExpr {
+                    query: AstBox::new(query),
+                    span: self.span_since(open),
+                })
+            }
+            Err(error @ ParserError::Construction(_)) => return Err(error),
         };
         Ok(Predicate::In(InPredicate {
             negated,
@@ -436,9 +445,14 @@ impl Parser<'_> {
     }
 
     fn query_head(&self) -> bool {
+        // This is only a cheap exclusion of impossible query starts. Complete
+        // query+closing-parenthesis matching still selects the alternative.
+        let mut tokens = self.tokens[self.position..]
+            .iter()
+            .filter(|token| !matches!(token.kind, T::Trivia(_) | T::Symbol(S::LParen)));
         matches!(
-            self.peek(0).kind,
-            T::Keyword(K::Select | K::With | K::Values | K::Table)
+            tokens.next().map(|token| token.kind),
+            Some(T::Keyword(K::Select | K::With | K::Values | K::Table))
         )
     }
 
@@ -593,13 +607,29 @@ impl Parser<'_> {
             }
             T::Symbol(S::LParen) => {
                 self.bump();
-                if self.query_head() {
-                    let query = self.parse_query()?;
-                    self.expect_symbol(S::RParen)?;
-                    Expr::Subquery(SubqueryExpr {
-                        query: AstBox::new(query),
-                        span: self.span_since(start),
-                    })
+                let subquery = if self.query_head() {
+                    let checkpoint = self.checkpoint();
+                    let query = (|| {
+                        let query = self.parse_query()?;
+                        self.expect_symbol(S::RParen)?;
+                        Ok::<_, ParserError>(query)
+                    })();
+                    match query {
+                        Ok(query) => Some(Expr::Subquery(SubqueryExpr {
+                            query: AstBox::new(query),
+                            span: self.span_since(start),
+                        })),
+                        Err(ParserError::Syntax(_)) => {
+                            self.restore(checkpoint);
+                            None
+                        }
+                        Err(error @ ParserError::Construction(_)) => return Err(error),
+                    }
+                } else {
+                    None
+                };
+                if let Some(subquery) = subquery {
+                    subquery
                 } else if self.lambda_arguments_ahead() {
                     let mut arguments = Vec::new();
                     if !self.at_symbol(S::RParen) {

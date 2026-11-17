@@ -11,6 +11,7 @@ mod json;
 mod literal_type;
 mod pattern;
 mod query;
+mod routine;
 mod special;
 
 pub fn print_query(query: &Query) -> String {
@@ -26,6 +27,12 @@ pub fn print_expression(expression: &Expr) -> String {
 pub fn print_type(data_type: &TypeName) -> String {
     let mut writer = Writer::default();
     writer.data_type(data_type);
+    writer.output
+}
+
+pub fn print_function_specification(function: &FunctionSpecification) -> String {
+    let mut writer = Writer::default();
+    writer.function_specification(function);
     writer.output
 }
 

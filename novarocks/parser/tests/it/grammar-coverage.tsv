@@ -7,7 +7,7 @@ alternative	standaloneExpression	1		0	SELECT 1	supported	accept	reviewed-grammar
 alternative	standalonePathSpecification	1		0		pending-p09		pending-p09	none
 alternative	standaloneType	1		0	SELECT CAST(NULL AS integer)	supported	accept	reviewed-grammar-path	none
 alternative	standaloneRowPattern	1		0	SELECT * FROM t MATCH_RECOGNIZE (PATTERN (x) DEFINE x AS true)	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	standaloneFunctionSpecification	1		0		pending-p09		pending-p09	none
+alternative	standaloneFunctionSpecification	1		0	@file:coverage-sql/routine-standalone.sql	supported	accept	reviewed-grammar-path	none
 alternative	statement	1	statementDefault	0		pending-p09		pending-p09	none
 alternative	statement	2	use	0		pending-p09		pending-p09	none
 alternative	statement	3	use	0		pending-p09		pending-p09	none
@@ -819,50 +819,50 @@ alternative	pathElement	1	qualifiedArgument	0		pending-p09		pending-p09	none
 alternative	pathElement	2	unqualifiedArgument	0		pending-p09		pending-p09	none
 optional	pathSpecification	1		1		pending-p09		pending-p09	none
 alternative	pathSpecification	1		0		pending-p09		pending-p09	none
-optional	functionSpecification	1		1		pending-p09		pending-p09	none
-alternative	functionSpecification	1		0		pending-p09		pending-p09	none
-alternative	functionDefinition	1		0		pending-p09		pending-p09	none
-optional	functionDeclaration	1		1		pending-p09		pending-p09	none
-optional	functionDeclaration	1		2		pending-p09		pending-p09	none
-alternative	functionDeclaration	1		0		pending-p09		pending-p09	none
-optional	parameterDeclaration	1		1		pending-p09		pending-p09	none
-alternative	parameterDeclaration	1		0		pending-p09		pending-p09	none
-alternative	returnsClause	1		0		pending-p09		pending-p09	none
-alternative	routineCharacteristic	1	languageCharacteristic	0		pending-p09		pending-p09	none
-optional	routineCharacteristic	2		1		pending-p09		pending-p09	none
-alternative	routineCharacteristic	2	deterministicCharacteristic	0		pending-p09		pending-p09	none
-alternative	routineCharacteristic	3	returnsNullOnNullInputCharacteristic	0		pending-p09		pending-p09	none
-alternative	routineCharacteristic	4	calledOnNullInputCharacteristic	0		pending-p09		pending-p09	none
-alternative	routineCharacteristic	5	securityCharacteristic	0		pending-p09		pending-p09	none
-alternative	routineCharacteristic	6	commentCharacteristic	0		pending-p09		pending-p09	none
-alternative	routineCharacteristic	7	propertiesCharacteristic	0		pending-p09		pending-p09	none
-alternative	controlStatement	1	returnStatement	0		pending-p09		pending-p09	none
-alternative	controlStatement	2	assignmentStatement	0		pending-p09		pending-p09	none
-optional	controlStatement	3		1		pending-p09		pending-p09	none
-alternative	controlStatement	3	simpleCaseStatement	0		pending-p09		pending-p09	none
-optional	controlStatement	4		1		pending-p09		pending-p09	none
-alternative	controlStatement	4	searchedCaseStatement	0		pending-p09		pending-p09	none
-optional	controlStatement	5		1		pending-p09		pending-p09	none
-optional	controlStatement	5		2		pending-p09		pending-p09	none
-alternative	controlStatement	5	ifStatement	0		pending-p09		pending-p09	none
-alternative	controlStatement	6	iterateStatement	0		pending-p09		pending-p09	none
-alternative	controlStatement	7	leaveStatement	0		pending-p09		pending-p09	none
-optional	controlStatement	8		1		pending-p09		pending-p09	none
-optional	controlStatement	8		2		pending-p09		pending-p09	none
-alternative	controlStatement	8	compoundStatement	0		pending-p09		pending-p09	none
-optional	controlStatement	9		1		pending-p09		pending-p09	none
-alternative	controlStatement	9	loopStatement	0		pending-p09		pending-p09	none
-optional	controlStatement	10		1		pending-p09		pending-p09	none
-alternative	controlStatement	10	whileStatement	0		pending-p09		pending-p09	none
-optional	controlStatement	11		1		pending-p09		pending-p09	none
-alternative	controlStatement	11	repeatStatement	0		pending-p09		pending-p09	none
-alternative	caseStatementWhenClause	1		0		pending-p09		pending-p09	none
-alternative	elseIfClause	1		0		pending-p09		pending-p09	none
-alternative	elseClause	1		0		pending-p09		pending-p09	none
-optional	variableDeclaration	1		1		pending-p09		pending-p09	none
-optional	variableDeclaration	1		2		pending-p09		pending-p09	none
-alternative	variableDeclaration	1		0		pending-p09		pending-p09	none
-alternative	sqlStatementList	1		0		pending-p09		pending-p09	none
+optional	functionSpecification	1		1	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+alternative	functionSpecification	1		0	@file:coverage-sql/routine-return.sql	supported	accept	reviewed-grammar-path	none
+alternative	functionDefinition	1		0	@file:coverage-sql/routine-external.sql	supported	accept	reviewed-grammar-path	none
+optional	functionDeclaration	1		1	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
+optional	functionDeclaration	1		2	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
+alternative	functionDeclaration	1		0	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
+optional	parameterDeclaration	1		1	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
+alternative	parameterDeclaration	1		0	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
+alternative	returnsClause	1		0	@file:coverage-sql/routine-return.sql	supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	1	languageCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+optional	routineCharacteristic	2		1	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	2	deterministicCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	3	returnsNullOnNullInputCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	4	calledOnNullInputCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	5	securityCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	6	commentCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	7	propertiesCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	1	returnStatement	0	@file:coverage-sql/routine-return.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	2	assignmentStatement	0	@file:coverage-sql/routine-assignment.sql	supported	accept	reviewed-grammar-path	none
+optional	controlStatement	3		1	@file:coverage-sql/routine-simple-case.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	3	simpleCaseStatement	0	@file:coverage-sql/routine-simple-case.sql	supported	accept	reviewed-grammar-path	none
+optional	controlStatement	4		1	@file:coverage-sql/routine-searched-case.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	4	searchedCaseStatement	0	@file:coverage-sql/routine-searched-case.sql	supported	accept	reviewed-grammar-path	none
+optional	controlStatement	5		1	@file:coverage-sql/routine-if.sql	supported	accept	reviewed-grammar-path	none
+optional	controlStatement	5		2	@file:coverage-sql/routine-if.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	5	ifStatement	0	@file:coverage-sql/routine-if.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	6	iterateStatement	0	@file:coverage-sql/routine-loop.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	7	leaveStatement	0	@file:coverage-sql/routine-loop.sql	supported	accept	reviewed-grammar-path	none
+optional	controlStatement	8		1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
+optional	controlStatement	8		2	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	8	compoundStatement	0	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
+optional	controlStatement	9		1	@file:coverage-sql/routine-loop.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	9	loopStatement	0	@file:coverage-sql/routine-loop.sql	supported	accept	reviewed-grammar-path	none
+optional	controlStatement	10		1	@file:coverage-sql/routine-while.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	10	whileStatement	0	@file:coverage-sql/routine-while.sql	supported	accept	reviewed-grammar-path	none
+optional	controlStatement	11		1	@file:coverage-sql/routine-repeat.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	11	repeatStatement	0	@file:coverage-sql/routine-repeat.sql	supported	accept	reviewed-grammar-path	none
+alternative	caseStatementWhenClause	1		0	@file:coverage-sql/routine-simple-case.sql	supported	accept	reviewed-grammar-path	none
+alternative	elseIfClause	1		0	@file:coverage-sql/routine-if.sql	supported	accept	reviewed-grammar-path	none
+alternative	elseClause	1		0	@file:coverage-sql/routine-if.sql	supported	accept	reviewed-grammar-path	none
+optional	variableDeclaration	1		1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
+optional	variableDeclaration	1		2	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
+alternative	variableDeclaration	1		0	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
+alternative	sqlStatementList	1		0	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
 alternative	privilege	1		0		pending-p09		pending-p09	none
 alternative	privilege	2		0		pending-p09		pending-p09	none
 alternative	privilege	3		0		pending-p09		pending-p09	none
@@ -2302,19 +2302,19 @@ alternative	explainOption	2		g1.b4		pending-p09		pending-p09	none
 alternative	transactionMode	2		g1.b1		pending-p09		pending-p09	none
 alternative	transactionMode	2		g1.b2		pending-p09		pending-p09	none
 alternative	pathSpecification	1		g1.b1		pending-p09		pending-p09	none
-alternative	functionSpecification	1		g1.b1		pending-p09		pending-p09	none
-alternative	functionSpecification	1		g1.b2		pending-p09		pending-p09	none
-alternative	functionDeclaration	1		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	functionDeclaration	1		g1.b1		pending-p09		pending-p09	none
-alternative	routineCharacteristic	5		g1.b1		pending-p09		pending-p09	none
-alternative	routineCharacteristic	5		g1.b2		pending-p09		pending-p09	none
-alternative	routineCharacteristic	7		g1.b1		pending-p09		pending-p09	none
-alternative	controlStatement	8		g1.b1		pending-p09		pending-p09	none
-alternative	controlStatement	9		g1.b1		pending-p09		pending-p09	none
-alternative	controlStatement	10		g1.b1		pending-p09		pending-p09	none
-alternative	controlStatement	11		g1.b1		pending-p09		pending-p09	none
-alternative	variableDeclaration	1		g1.b1		pending-p09		pending-p09	none
-alternative	variableDeclaration	1		g2.b1		pending-p09		pending-p09	none
-alternative	sqlStatementList	1		g1.b1		pending-p09		pending-p09	none
+alternative	functionSpecification	1		g1.b1	@file:coverage-sql/routine-return.sql	supported	accept	reviewed-grammar-path	none
+alternative	functionSpecification	1		g1.b2	@file:coverage-sql/routine-external.sql	supported	accept	reviewed-grammar-path	none
+alternative	functionDeclaration	1		g1.b1.g1.b1	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
+alternative	functionDeclaration	1		g1.b1	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	5		g1.b1	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	5		g1.b2	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	7		g1.b1	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	8		g1.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	9		g1.b1	@file:coverage-sql/routine-loop.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	10		g1.b1	@file:coverage-sql/routine-while.sql	supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	11		g1.b1	@file:coverage-sql/routine-repeat.sql	supported	accept	reviewed-grammar-path	none
+alternative	variableDeclaration	1		g1.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
+alternative	variableDeclaration	1		g2.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
+alternative	sqlStatementList	1		g1.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
 alternative	grantObject	1		g1.b1		pending-p09		pending-p09	none
 alternative	qualifiedName	1		g1.b1	DESC x . x	supported	accept	reviewed-grammar-path	none
