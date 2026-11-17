@@ -82,6 +82,12 @@ pub enum NativeEffect {
     AbandonReservation {
         identity: QualificationIdentity,
     },
+    /// Mechanical local admission close authorized by the original Core facts.
+    /// This is neither a Worker close nor an ACK/consumer/Source exit receipt.
+    SealRootRead {
+        activation: AttemptActivationIdentity,
+        sealed: novarocks_execution_contract::root_lifetime::RootReadSealed,
+    },
     FinishResources {
         activation: AttemptActivationIdentity,
     },
@@ -285,6 +291,7 @@ impl LogicalEffect {
             | LogicalEffectBody::Native(
                 NativeEffect::CancelQualification { .. }
                 | NativeEffect::AbandonReservation { .. }
+                | NativeEffect::SealRootRead { .. }
                 | NativeEffect::FinishResources { .. }
                 | NativeEffect::AbandonResources { .. }
                 | NativeEffect::ConvergeDormant { .. }

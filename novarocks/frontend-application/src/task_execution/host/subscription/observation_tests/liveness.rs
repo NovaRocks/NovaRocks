@@ -181,7 +181,14 @@ impl Driver {
                         EffectBody::Publish(Publication::ProtocolBatch(_)) => {
                             PublicationApplied::ProtocolBatch { published: true }
                         }
-                        EffectBody::Publish(Publication::RootStatus(_)) => {
+                        EffectBody::Port(message)
+                            if matches!(
+                                message.body,
+                                novarocks_attempt_protocol::port_output::AttemptToLogicalBody::RootStatus(
+                                    _
+                                )
+                            ) =>
+                        {
                             PublicationApplied::RootStatus
                         }
                         EffectBody::AdjustReadWindow(_) => return None,

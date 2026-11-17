@@ -23,16 +23,14 @@ use crate::control_runtime::{
     actor::{FrontendActor, FrontendEffect, FrontendInput},
     host::PreparedEffectJob,
 };
-use novarocks_attempt_protocol::{
-    effect::EffectBody, input::AttemptInput, port_projection::project_logical_message,
-};
+use novarocks_attempt_protocol::port_output::AttemptToLogicalBody as ApBody;
+use novarocks_attempt_protocol::{effect::EffectBody, input::AttemptInput};
 use novarocks_control_runtime::actor_turn::{
     ActorFailureProof, ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket,
 };
 use novarocks_control_runtime_core::identity::InputId;
 use novarocks_coordination_contract::{
     AttemptActionId, AttemptActivationIdentity, AttemptAuthorizationRef, AttemptRequestToken,
-    AttemptToLogicalBody as ApBody,
     logical_port::{
         AttemptToLogical, AttemptToLogicalBody, LogicalToAttempt, LogicalToAttemptBody,
     },
@@ -77,7 +75,7 @@ pub(crate) enum RequestError {
 #[must_use = "A refused insertion still owns the original job and exit credential"]
 pub(crate) struct RequestInsertRefusal {
     pub(crate) error: RequestError,
-    pub(crate) job: PreparedEffectJob,
+    pub(crate) _job: PreparedEffectJob,
 }
 impl fmt::Debug for RequestInsertRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -90,8 +88,8 @@ impl fmt::Debug for RequestInsertRefusal {
 #[must_use = "Retain the rejected original reply and any projected passive input"]
 pub(crate) struct RequestReplyRefusal {
     pub(crate) error: RequestError,
-    pub(crate) reply: LogicalToAttempt,
-    pub(crate) projected: Option<FrontendInput>,
+    pub(crate) _reply: LogicalToAttempt,
+    pub(crate) _projected: Option<FrontendInput>,
 }
 
 // The underlying job's original ExitObligation checks actual exit. This wrapper
@@ -119,7 +117,9 @@ pub(crate) struct AttemptRequests {
 }
 #[must_use = "The replied original job still requires controlled capture disposal and actual exit"]
 pub(crate) struct RepliedRequestObligation {
+    #[cfg(test)]
     pub(crate) token: AttemptRequestToken,
+    #[cfg(test)]
     pub(crate) reply_input: InputId,
     pub(crate) job: PreparedEffectJob,
 }
@@ -129,7 +129,9 @@ pub(crate) struct RepliedRequestObligation {
 #[must_use = "Retire the same original failed-AP request job through its real exit owner"]
 pub(crate) struct FailedAttemptRequestObligation {
     pub(crate) token: AttemptRequestToken,
+    #[cfg(test)]
     pub(crate) action: AttemptActionId,
+    #[cfg(test)]
     pub(crate) reply_input: Option<InputId>,
     pub(crate) job: PreparedEffectJob,
 }
@@ -171,8 +173,14 @@ impl AttemptRequests {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
     pub(crate) fn has_capacity(&self) -> bool {
-        let state = self.lock();
-        !state.closed && state.rows.len() < self.capacity.get()
+        let mut state = self.lock();
+        let available = !state.closed && state.rows.len() < self.capacity.get();
+        if !state.closed && !available {
+            // Serialize Full observation with the original row removal. The
+            // same AP Source is woken by release_if_empty when credit returns.
+            state.host_waiting = true;
+        }
+        available
     }
     pub(crate) fn is_empty(&self) -> bool {
         self.lock().rows.is_empty()
@@ -216,7 +224,7 @@ impl AttemptRequests {
         })();
         let expected = match checked {
             Ok(expected) => expected,
-            Err(error) => return Err(RequestInsertRefusal { error, job }),
+            Err(error) => return Err(RequestInsertRefusal { error, _job: job }),
         };
         let mut state = self.lock();
         let error = if state.closed {
@@ -224,12 +232,13 @@ impl AttemptRequests {
         } else if state.rows.contains_key(&expected.token) {
             Some(RequestError::DuplicateToken)
         } else if state.rows.len() == self.capacity.get() {
+            state.host_waiting = true;
             Some(RequestError::Full)
         } else {
             None
         };
         if let Some(error) = error {
-            return Err(RequestInsertRefusal { error, job });
+            return Err(RequestInsertRefusal { error, _job: job });
         }
         {
             let mut retained = self.retained.lock().unwrap_or_else(|p| p.into_inner());
@@ -252,6 +261,7 @@ impl AttemptRequests {
     }
     /// Only before handoff, while the caller still owns its unaccepted source
     /// ticket, may it undo insertion. A replied or loaned row never rolls back.
+    #[cfg(test)]
     pub(crate) fn take_unpublished(&self, token: AttemptRequestToken) -> Option<PreparedEffectJob> {
         let job = {
             let mut state = self.lock();
@@ -303,7 +313,9 @@ impl AttemptRequests {
                     .expect("same failed AP request row");
                 FailedAttemptRequestObligation {
                     token,
+                    #[cfg(test)]
                     action: original.descriptor.action,
+                    #[cfg(test)]
                     reply_input: original.reply_input,
                     job: original
                         .job
@@ -365,8 +377,8 @@ impl AttemptRequests {
             Err(error) => {
                 return Err(RequestReplyRefusal {
                     error,
-                    reply,
-                    projected: None,
+                    _reply: reply,
+                    _projected: None,
                 });
             }
         };
@@ -375,14 +387,12 @@ impl AttemptRequests {
             Err(error) => {
                 return Err(RequestReplyRefusal {
                     error,
-                    reply,
-                    projected: None,
+                    _reply: reply,
+                    _projected: None,
                 });
             }
         };
-        let projected = FrontendInput::Attempt(Box::new(AttemptInput::Port(
-            project_logical_message(&reply),
-        )));
+        let projected = FrontendInput::Attempt(Box::new(AttemptInput::Port(reply.clone())));
         // The prior origin read grants no permission. This kernel operation
         // rechecks the CURRENT LP ticket and fills the original AP event in
         // one publication transaction, preserving the original result author.
@@ -399,8 +409,8 @@ impl AttemptRequests {
             }
             Err((error, projected)) => Err(RequestReplyRefusal {
                 error: RequestError::Runtime(error),
-                reply,
-                projected: Some(projected),
+                _reply: reply,
+                _projected: Some(projected),
             }),
         }
     }
@@ -451,12 +461,10 @@ impl AttemptRequests {
                 token: descriptor.token, authorization, result: Err(failure.clone()),
             },
         };
-        let projected = FrontendInput::Attempt(Box::new(AttemptInput::Port(
-            project_logical_message(&LogicalToAttempt {
-                activation: self.activation,
-                body,
-            }),
-        )));
+        let projected = FrontendInput::Attempt(Box::new(AttemptInput::Port(LogicalToAttempt {
+            activation: self.activation,
+            body,
+        })));
         let input = loan
             .job
             .as_mut()
@@ -507,14 +515,16 @@ impl AttemptRequests {
                 state.host_waiting = true;
                 return None;
             }
-            let reply_input = row.reply_input?;
+            let _reply_input = row.reply_input?;
             let mut row = state
                 .rows
                 .remove(&token)
                 .expect("same original replied job");
             RepliedRequestObligation {
+                #[cfg(test)]
                 token,
-                reply_input,
+                #[cfg(test)]
+                reply_input: _reply_input,
                 job: row.job.take().expect("same retained original request job"),
             }
         };
@@ -602,8 +612,6 @@ fn original_descriptor(job: &PreparedEffectJob) -> Result<Descriptor, RequestErr
             authorization,
             ..
         } => (token, RequestKind::EstablishSettlement(authorization)),
-        // DetachEstablish has no logical equivalent. It is explicitly rejected
-        // until P12 removes the legacy guard workflow, never silently dropped.
         _ => return Err(RequestError::WrongRequest),
     };
     Ok(Descriptor {
@@ -688,3 +696,7 @@ fn same_ticket_reply(ticket: &EffectTicket<FrontendEffect>, reply: &LogicalToAtt
 
 #[cfg(test)]
 pub(super) mod tests;
+
+// Share the same real two-actor fixture with the original transport carrier.
+#[cfg(test)]
+pub(in crate::task_execution::host) use tests::support as test_support;

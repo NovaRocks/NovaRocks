@@ -38,6 +38,20 @@ pub(crate) fn source_count(scans: usize, participations: usize) -> Result<NonZer
     NonZeroUsize::new(count).ok_or(WorkError::InvalidConfig("empty Native Source cohort"))
 }
 
+/// Independent pointees retained by one original cohort-admission position.
+/// The enclosing Native capture already owns the inline fields. WC's original
+/// fixed proposal service owns its request/receipt arrays; the AP observation
+/// author separately funds SubscriptionSource and generation allocations.
+#[cfg(test)]
+pub(crate) fn process_source_backing_layouts() -> Result<[std::alloc::Layout; 2], WorkError> {
+    let cohort =
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            Mutex<Option<SourceCohort>>,
+        >())
+        .map_err(|_| WorkError::ArithmeticOverflow)?;
+    Ok([cohort, JointProposalSlotWait::metadata_layouts().1])
+}
+
 /// Borrow the same positive lease; cloning this alias grants no new position.
 /// The final alias retains every unused position until its actual owner exits.
 #[derive(Clone)]

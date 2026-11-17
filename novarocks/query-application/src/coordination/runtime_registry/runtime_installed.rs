@@ -18,9 +18,11 @@
 //! Registry custody of one FE-runtime registration and one ordered Registry
 //! source. Borrowed waiter cancellation never drops the original send future.
 use super::*;
+#[cfg(test)]
+use crate::api::logical_runtime::LogicalHostFact;
 use crate::api::logical_runtime::{
     InstalledLogicalExecution as InstalledRuntime, LogicalExit, LogicalFactSource, LogicalFuture,
-    LogicalHostFact, LogicalJoinReadiness, LogicalSourceClosed,
+    LogicalJoinReadiness, LogicalSourceClosed,
 };
 use std::{
     collections::VecDeque,
@@ -29,6 +31,7 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub(super) enum RuntimeReplyValue {
+    #[cfg(test)]
     Fact,
     Readiness(LogicalJoinReadiness),
 }
@@ -49,6 +52,7 @@ impl RuntimeReply {
     }
 }
 enum Command {
+    #[cfg(test)]
     Fact(LogicalHostFact),
     Readiness(bool),
 }
@@ -197,6 +201,7 @@ impl RuntimeCarrier {
         }
         reply
     }
+    #[cfg(test)]
     pub(super) fn enqueue_fact(&self, fact: LogicalHostFact) -> Arc<RuntimeReply> {
         self.enqueue(Command::Fact(fact))
     }
@@ -233,19 +238,24 @@ impl RuntimeCarrier {
                 state.polling = true;
                 Some(pending)
             } else if let Some(queued) = state.queue.pop_front() {
-                let mut source = state.source.take().expect("one original Registry source");
+                let source = state.source.take().expect("one original Registry source");
                 let installed = self.installed.clone();
                 let future = Box::pin(async move {
-                    let result = match queued.command {
+                    match queued.command {
+                        #[cfg(test)]
                         Command::Fact(fact) => {
-                            source.send(fact).await.map(|()| RuntimeReplyValue::Fact)
+                            let mut source = source;
+                            let result = source.send(fact).await.map(|()| RuntimeReplyValue::Fact);
+                            (source, result)
                         }
-                        Command::Readiness(close) => installed
-                            .join_readiness(close)
-                            .await
-                            .map(RuntimeReplyValue::Readiness),
-                    };
-                    (source, result)
+                        Command::Readiness(close) => {
+                            let result = installed
+                                .join_readiness(close)
+                                .await
+                                .map(RuntimeReplyValue::Readiness);
+                            (source, result)
+                        }
+                    }
                 });
                 state.polling = true;
                 Some(PendingSend {
@@ -396,6 +406,7 @@ impl RuntimeCarrier {
                 state.closed = true;
                 Poll::Ready(Err(closed))
             }
+            #[cfg(test)]
             Ok(RuntimeReplyValue::Fact) => unreachable!("typed natural-retirement reply"),
         }
     }
@@ -425,6 +436,7 @@ impl RuntimeCarrier {
         let reply = self.enqueue_readiness(close);
         match self.wait_reply(&reply).await? {
             RuntimeReplyValue::Readiness(value) => Ok(value),
+            #[cfg(test)]
             RuntimeReplyValue::Fact => unreachable!("original typed readiness reply"),
         }
     }
@@ -458,19 +470,38 @@ impl RuntimeCarrier {
         .await
     }
     pub(super) async fn wait_ingress(self: Arc<Self>) {
-        let ready = self.readiness(true).await;
-        if ready == Ok(LogicalJoinReadiness::Ready) {
-            return;
-        }
-        // Waiting/closed is never interpreted as readiness. Only this original
-        // registration's actual Scope exit can complete the remaining wait.
+        let mut waiting_epoch = None;
+        let mut source_closed = false;
         loop {
             let changed = self.wake.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             tokio::select! {
                 biased;
-                _ = std::future::poll_fn(|cx| self.poll_exit(cx)) => return,
+                progress = std::future::poll_fn(|cx| {
+                    // Register the SAME physical-exit/protocol-progress observer
+                    // before sampling its epoch, including the first query.
+                    if self.poll_exit(cx).is_ready() {
+                        return Poll::Ready(None);
+                    }
+                    let epoch = self.wake.epoch.load(Ordering::Acquire);
+                    if !source_closed && waiting_epoch != Some(epoch) {
+                        Poll::Ready(Some(epoch))
+                    } else {
+                        Poll::Pending
+                    }
+                }) => {
+                    let Some(epoch) = progress else { return };
+                    waiting_epoch = Some(epoch);
+                    match self.readiness(true).await {
+                        Ok(LogicalJoinReadiness::Ready) => return,
+                        Ok(LogicalJoinReadiness::WaitingForConvergence) => {},
+                        Err(_) => source_closed = true,
+                    }
+                    // Only RuntimeProgressWake advances this epoch. The query's
+                    // own reply and local queue wakes cannot busy-poll a false
+                    // result. A real transition during the query is retained.
+                },
                 _ = &mut changed => {},
             }
         }

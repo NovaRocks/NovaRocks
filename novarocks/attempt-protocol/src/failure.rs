@@ -105,7 +105,7 @@ pub enum AttemptFailure {
     /// history with QA's independent typed exhausted-budget reply. The original
     /// host error remains retained; kind/class/text cannot infer this fact.
     EstablishReplayExhausted {
-        original: HostProjectedFailure,
+        original: novarocks_coordination_contract::ExecutionFailure,
         participation: ParticipationRef,
         operation_id: TaskOperationId,
     },

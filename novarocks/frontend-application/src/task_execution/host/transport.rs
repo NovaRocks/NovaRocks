@@ -36,6 +36,7 @@ mod establish_material;
 mod execute;
 mod failure_abort;
 mod granted_inputs;
+mod port_jobs;
 mod prepare;
 mod process_observation;
 mod proposal_wait;
@@ -72,7 +73,7 @@ pub(crate) use covered::{
 pub(crate) use effect_source::{
     AttemptFailureBinding, AttemptSendSource, AttemptTransportExecutor, AttemptTransportSource,
 };
-pub(crate) use establish_material::AttemptEstablishMaterial;
+pub(crate) use establish_material::{AttemptEstablishMaterial, EstablishMaterialPreparation};
 pub(crate) use failure_abort::{
     FailureAbortAttempt, FailureResidualPort, NativeFailureCleanup, PreparedSingleSend,
     SingleSendContext, SingleSendError, SingleSendResult,
@@ -87,8 +88,6 @@ pub(crate) use queued_job::BoundQueue;
 #[cfg(test)]
 pub(crate) use quote::original_run_for_factory;
 pub(crate) use quote::{SourceLayouts, original_run, queued_input as queued_input_quote};
-#[cfg(test)]
-pub(crate) use receipt_input::NativeReceiptError;
 pub(crate) use receipt_input::NativeReceiptInput;
 pub(in crate::task_execution::host) use releases::TransportReleases;
 pub(crate) use send::BoundSend;

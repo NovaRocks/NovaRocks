@@ -15,14 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Two-core host endpoints. Production composition switches atomically in P12.
-#![expect(
-    dead_code,
-    reason = "P12 composes the approved two-core endpoints into the original host"
-)]
+//! Final two-core endpoints bound to the original registered logical/attempt pair.
 pub(crate) mod abort;
 pub(crate) mod control;
 pub(crate) mod facts;
+pub(crate) mod local_exit;
 pub(crate) mod requests;
 pub(crate) mod root_control;
 
@@ -61,7 +58,17 @@ pub(crate) enum PortDeliveryError {
 }
 impl std::fmt::Display for PortDeliveryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "original two-core endpoint rejected delivery: {self:?}")
+        match self {
+            Self::Request(error) => {
+                write!(f, "original two-core request delivery failed: {error:?}")
+            }
+            Self::Control(error) => write!(f, "original two-core control delivery failed: {error}"),
+            Self::Abort(error) => write!(f, "original two-core Abort delivery failed: {error:?}"),
+            original => write!(
+                f,
+                "original two-core endpoint rejected delivery: {original:?}"
+            ),
+        }
     }
 }
 impl std::error::Error for PortDeliveryError {}
@@ -70,7 +77,7 @@ impl std::error::Error for PortDeliveryError {}
 #[must_use = "Retain all original endpoints when pair binding is refused"]
 pub(crate) struct PortBindingRefusal {
     pub(crate) error: PortDeliveryError,
-    pub(crate) original: Box<AttemptPortEndpoints>,
+    pub(crate) _original: Box<AttemptPortEndpoints>,
 }
 impl std::fmt::Debug for PortBindingRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -113,10 +120,18 @@ impl AttemptPortEndpoints {
         if !valid {
             return Err(PortBindingRefusal {
                 error: PortDeliveryError::ForeignPair,
-                original: Box::new(original),
+                _original: Box::new(original),
             });
         }
         Ok(Arc::new(original))
+    }
+    pub(crate) fn bind_observation(
+        &self,
+        original: &Arc<crate::query_execution::logical_binding::OriginalAttemptObservation>,
+    ) -> Result<(), PortDeliveryError> {
+        self.control
+            .bind_observation(original)
+            .map_err(PortDeliveryError::Control)
     }
     pub(crate) fn startup(&self) -> super::startup::AttemptStartup {
         self.startup.clone()
@@ -134,26 +149,48 @@ impl AttemptPortEndpoints {
     /// publish a port occurrence. Neither terminal status nor sender Drop is
     /// this physical producer proof. Scope removal remains a separate fact.
     pub(crate) fn original_producer_exited(&self) {
-        self.facts.close_admission();
-        self.producer_exited.store(true, Ordering::Release);
+        if !self.producer_exited.swap(true, Ordering::AcqRel) {
+            self.facts.original_producer_exited();
+        }
+    }
+    pub(crate) fn abort_participation_count(&self) -> usize {
+        self.abort.participation_count()
+    }
+    pub(crate) fn retire_ready_abort_occurrence_after(
+        &self,
+        after: Option<novarocks_execution_contract::ParticipationRef>,
+    ) -> Result<
+        Option<(novarocks_execution_contract::ParticipationRef, bool)>,
+        novarocks_control_runtime::actor_turn::ActorTurnError,
+    > {
+        self.abort.retire_ready_occurrence_after(after)
+    }
+    pub(crate) fn abort_retirement(&self) -> abort::AbortIngressRetirement {
+        self.abort.retirement()
     }
     pub(crate) fn producer_exited(&self) -> bool {
         self.producer_exited.load(Ordering::Acquire)
     }
-    pub(crate) fn publish_owner_failed_stop(
+    pub(crate) fn publish_owner_failed_control(
         &self,
+        runtime: &ActorRuntime<FrontendActor>,
         session: &mut novarocks_control_runtime::publication::FailurePublicationSession<
             FrontendActor,
         >,
         failure: &novarocks_coordination_contract::ExecutionFailure,
+        command: control::ConvergenceCommand,
     ) -> Result<control::OwnerFailedStopReceipt, PortDeliveryError> {
-        if !self.startup.ready_for(&self.attempt) {
+        if !self.startup.initialized_for(&self.attempt) {
             return Err(PortDeliveryError::StartupPending);
         }
+        self.control
+            .publish_owner_failed_convergence(runtime, session, command)
+            .map_err(PortDeliveryError::Control)?;
         self.control
             .publish_owner_failed_stop(session, failure)
             .map_err(PortDeliveryError::Control)
     }
+
     pub(crate) fn deliver(
         &self,
         runtime: &ActorRuntime<FrontendActor>,
@@ -166,7 +203,7 @@ impl AttemptPortEndpoints {
         if matches!(
             original.body,
             LogicalToAttemptBody::Stop { .. } | LogicalToAttemptBody::Abort { .. }
-        ) && !self.startup.ready_for(&self.attempt)
+        ) && !self.startup.initialized_for(&self.attempt)
         {
             return Err(PortDeliveryError::StartupPending);
         }

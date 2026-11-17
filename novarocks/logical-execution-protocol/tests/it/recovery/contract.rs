@@ -442,7 +442,7 @@ impl RecoveryFixture {
             effect.action,
             ActionResult::Native(NativeFact::AttemptActivated {
                 activation: a,
-                root: Some(original_root),
+                root: self.f.declared_read_root(original_root),
             }),
         );
         (a, inherited_admissions)

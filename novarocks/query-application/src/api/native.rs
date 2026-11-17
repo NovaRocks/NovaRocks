@@ -35,7 +35,6 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use novarocks_execution_contract::ParticipationRef;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 pub use novarocks_workload_control::CancellationView;
 use novarocks_workload_control::WorkId;
@@ -44,11 +43,10 @@ use super::ExecutionSchedulingFacts;
 use super::{QueryExecutionError, QueryExecutionErrorKind, StatementNativeHealthFailure};
 use crate::admitted_query_context::QueryResultCapacityBinding;
 use crate::coordination::{
-    AbortParticipationEffectPort, AcceptedRootStatusSource, AttemptSchedule, NativeAttemptDrive,
-    ReplacementQualificationEffectPort, ReplacementWorkerAdmissionEvidence,
+    AttemptSchedule, ReplacementQualificationEffectPort, ReplacementWorkerAdmissionEvidence,
 };
 use crate::preparation::FrozenExecutionDescription;
-use novarocks_coordination_contract::{AttemptActivationIdentity, RecoveryMode};
+use novarocks_coordination_contract::RecoveryMode;
 
 /// Runtime failure while opening the role-local Native execution session.
 ///
@@ -223,7 +221,7 @@ pub trait LogicalExecutionNativePort: fmt::Debug + Send + Sync + 'static {
 /// ```
 pub struct NativeLogicalExecutionSeed {
     plan: crate::api::PlanSeal,
-    aborts: Arc<dyn AbortParticipationEffectPort>,
+    runtime: Option<crate::api::LogicalRuntimeComposition>,
     replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
     attempts: Box<dyn NativeAttemptPreparationPort>,
 }
@@ -243,13 +241,12 @@ impl NativeLogicalExecutionSeed {
     /// substitute a caller-declared plan seal.
     pub(crate) fn issue(
         plan: crate::api::PlanSeal,
-        aborts: Arc<dyn AbortParticipationEffectPort>,
         replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
         attempts: impl NativeAttemptPreparationPort,
     ) -> Self {
         Self {
             plan,
-            aborts,
+            runtime: None,
             replacements,
             attempts: Box::new(attempts),
         }
@@ -257,6 +254,14 @@ impl NativeLogicalExecutionSeed {
 
     pub(crate) const fn plan(&self) -> crate::api::PlanSeal {
         self.plan
+    }
+
+    pub(crate) fn bind_runtime(&mut self, runtime: crate::api::LogicalRuntimeComposition) {
+        assert!(
+            self.runtime.is_none(),
+            "one original logical runtime composition"
+        );
+        self.runtime = Some(runtime);
     }
 }
 
@@ -283,11 +288,6 @@ pub type NativeAttemptActivationFuture<'a> = Pin<
     >,
 >;
 
-/// Borrowed execution future polled while the supervisor retains the active
-/// Native owner.
-pub type NativeAttemptRunFuture<'a> =
-    Pin<Box<dyn Future<Output = NativeAttemptTerminal> + Send + 'a>>;
-
 /// Borrowed convergence future for a dormant Native owner.
 /// It resolves only after every resource the owner may have made live has
 /// converged. Dropping the future or catching a poll panic leaves the owner
@@ -297,204 +297,15 @@ pub type NativeAttemptRunFuture<'a> =
 pub type NativeAttemptConvergenceFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), StatementNativeHealthFailure>> + Send + 'a>>;
 
-/// Positive evidence which closes one exact active participation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeParticipationConvergence {
-    participation: ParticipationRef,
-    kind: NativeParticipationConvergenceKind,
-}
-
-impl NativeParticipationConvergence {
-    pub const fn never_established(participation: ParticipationRef) -> Self {
-        Self {
-            participation,
-            kind: NativeParticipationConvergenceKind::NeverEstablished,
-        }
-    }
-
-    pub const fn worker_stopped_and_participation_fenced(participation: ParticipationRef) -> Self {
-        Self {
-            participation,
-            kind: NativeParticipationConvergenceKind::WorkerStoppedAndParticipationFenced,
-        }
-    }
-
-    pub const fn worker_process_replaced(participation: ParticipationRef) -> Self {
-        Self {
-            participation,
-            kind: NativeParticipationConvergenceKind::WorkerProcessReplaced,
-        }
-    }
-
-    pub const fn participation(self) -> ParticipationRef {
-        self.participation
-    }
-
-    pub const fn kind(self) -> NativeParticipationConvergenceKind {
-        self.kind
-    }
-}
-
-/// Why the residual responsibility for one exact participation may be retired.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NativeParticipationConvergenceKind {
-    NeverEstablished,
-    WorkerStoppedAndParticipationFenced,
-    WorkerProcessReplaced,
-}
-
-/// Closed convergence facts returned by an active Native owner.
-///
-/// `AllWorkersStoppedAndContextsFenced` is the compact form for owners which
-/// positively observed the whole attempt drain. The per-participation form is used
-/// when an exact process replacement closes only part of an attempt. An
-/// never-established participation has no Worker task or participation responsibility.
-/// An unobservable Worker is deliberately not representable as convergence.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NativeAttemptConvergence {
-    AllWorkersStoppedAndParticipationsFenced,
-    Participations(Box<[NativeParticipationConvergence]>),
-}
-
-impl NativeAttemptConvergence {
-    pub const fn all_workers_stopped_and_participations_fenced() -> Self {
-        Self::AllWorkersStoppedAndParticipationsFenced
-    }
-
-    pub fn participations(
-        participations: impl Into<Box<[NativeParticipationConvergence]>>,
-    ) -> Self {
-        Self::Participations(participations.into())
-    }
-}
-
-/// An immutable failure already accepted by one original actor activation.
-/// It confers no authority and is constructed only inside Query Application.
-#[derive(Clone, Debug)]
-pub(crate) struct AcceptedAttemptFailure {
-    pub(crate) activation: AttemptActivationIdentity,
-    pub(crate) input: crate::execution_error::ExecutionFailureInput,
-}
-
-/// Borrowed convergence future for an active Native owner. Resolution carries
-/// local closure plus remote evidence or finite tracking termination. No caller
-/// may time out/drop this whole future and infer local exit. An unprovable exit
-/// returns a typed health failure while the original owner remains supervised.
-/// The original remote-observation budget is frozen at the Native terminal
-/// cut, before cleanup/handoff may yield. It never times out local holders.
-/// Reentry may only keep or shorten that deadline (for real role shutdown),
-/// never refresh it. Started operations and closure receipts remain in this
-/// same owner when its borrowed future is dropped and reentered.
-#[derive(Clone)]
-pub struct NativeActiveConvergenceRequest {
-    cancellation: CancellationView,
-    absolute_remote_deadline: std::time::Instant,
-    computation_ready: Option<super::ComputationReadyToken>,
-    streamed_success: Option<AttemptActivationIdentity>,
-    accepted_failure: Option<AcceptedAttemptFailure>,
-}
-impl NativeActiveConvergenceRequest {
-    pub fn new(
-        cancellation: CancellationView,
-        absolute_remote_deadline: std::time::Instant,
-    ) -> Self {
-        Self {
-            cancellation,
-            absolute_remote_deadline,
-            computation_ready: None,
-            streamed_success: None,
-            accepted_failure: None,
-        }
-    }
-    pub fn cancellation(&self) -> &CancellationView {
-        &self.cancellation
-    }
-    pub const fn remote_observation_deadline(&self) -> std::time::Instant {
-        self.absolute_remote_deadline
-    }
-
-    /// The actor's original accepted computation fact. This is neither a
-    /// Native Task success declaration nor permission to publish output.
-    pub const fn computation_ready(&self) -> Option<super::ComputationReadyToken> {
-        self.computation_ready
-    }
-
-    /// The original logical actor accepted the streamed result for this activation.
-    pub const fn streamed_success(&self) -> Option<AttemptActivationIdentity> {
-        self.streamed_success
-    }
-
-    /// The original actor-accepted failure for this exact active attempt.
-    pub fn accepted_failure(&self) -> Option<&crate::execution_error::ExecutionFailureInput> {
-        self.accepted_failure.as_ref().map(|failure| &failure.input)
-    }
-
-    pub fn accepted_failure_activation(&self) -> Option<AttemptActivationIdentity> {
-        self.accepted_failure
-            .as_ref()
-            .map(|failure| failure.activation)
-    }
-
-    pub(crate) fn with_accepted_failure(mut self, failure: Option<AcceptedAttemptFailure>) -> Self {
-        self.accepted_failure = failure;
-        self
-    }
-
-    pub(crate) fn with_streamed_success(
-        mut self,
-        activation: Option<AttemptActivationIdentity>,
-    ) -> Self {
-        self.streamed_success = activation;
-        self
-    }
-
-    pub(crate) fn with_computation_ready(
-        mut self,
-        token: Option<super::ComputationReadyToken>,
-    ) -> Self {
-        self.computation_ready = token;
-        self
-    }
-
-    pub(crate) fn with_remote_observation_deadline(mut self, deadline: std::time::Instant) -> Self {
-        self.absolute_remote_deadline = self.absolute_remote_deadline.min(deadline);
-        self
-    }
-}
-
-/// Both variants require original FE-local holders to have actually exited or
-/// returned caller capabilities to their same pre-existing process records.
-/// Unknown is only the end of remote tracking, never WorkerStopped/RF evidence.
-#[derive(Clone, Debug)]
-pub enum NativeActiveConvergenceClosure {
-    Evidence(NativeAttemptConvergence),
-    RemoteTrackingEnded {
-        exact_participations: Box<[ParticipationRef]>,
-    },
-}
-
-pub type NativeActiveAttemptConvergenceFuture<'a> = Pin<
-    Box<
-        dyn Future<
-                Output = Result<
-                    NativeActiveConvergenceClosure,
-                    super::StatementNativeHealthFailure,
-                >,
-            > + Send
-            + 'a,
-    >,
->;
-
 /// Move-only role owner for a prepared attempt that has not started any Task.
 ///
 /// Before binding, the owner has no asynchronous convergence responsibility.
-/// The query supervisor calls `activate` only after the logical actor is
-/// atomically installed. The borrowed future leaves this owner in the
-/// supervisor even when polling panics; the supervisor then runs its original
-/// `converge` once, retaining both owner and cause as unproven after a panic.
-/// Successful activation transfers all asynchronous responsibility to
-/// the returned active owner and leaves the dormant owner synchronously
-/// drop-safe.
+/// The Native executor calls `activate` after the logical runtime is installed.
+/// The borrowed future leaves this same owner in original custody through
+/// Pending and unwind. Activation installs the attempt's original Source;
+/// successful return carries only activation facts and a root binding. The
+/// installed Source retains live resources and actual asynchronous exit. The
+/// dormant owner's original `converge` handles incomplete preparation once.
 pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
     /// Only the controlled role adapter can supply a live, exact placement preference.
     /// It is absent from ordinary builds and never travels on the Native wire.
@@ -525,6 +336,7 @@ pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
 
     fn activate<'a>(
         &'a mut self,
+        activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         schedule: &'a AttemptSchedule,
         replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
         cancellation: CancellationView,
@@ -536,68 +348,10 @@ pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
     ) -> NativeAttemptConvergenceFuture<'a>;
 }
 
-/// Opaque role owner for an attempt whose Native work may now be live.
-///
-/// Query Application retains the same owner while borrowed run/converge
-/// futures are polled. Its original runtime registration retains custody until
-/// actual local closure plus exact remote evidence/tracking termination. A
-/// typed unprovable exit or converge panic keeps that same Box and obligation
-/// under process supervision until explicit process exit.
-pub trait ActiveNativeAttemptOwner: fmt::Debug + Send + 'static {
-    /// Only local installed work and resources. Remote closure is independently
-    /// authored by the attempt/registry protocol and cannot be inferred here.
-    fn finish_installed<'a>(
-        &'a mut self,
-        _request: NativeActiveConvergenceRequest,
-    ) -> NativeAttemptConvergenceFuture<'a> {
-        Box::pin(async {
-            Err(StatementNativeHealthFailure::actual_exit_unproven(
-                "native owner has no installed local exit binding",
-                Arc::new(QueryExecutionError::new(
-                    QueryExecutionErrorKind::InvalidRequest,
-                    "native owner has no installed local exit binding",
-                )),
-            ))
-        })
-    }
-
-    /// Waits for the original already-installed attempt work. Protocol terminal
-    /// facts go directly between cores; this wait cannot reconstruct a driver.
-    fn run_installed<'a>(
-        &'a mut self,
-        _cancellation: CancellationView,
-    ) -> NativeAttemptRunFuture<'a> {
-        Box::pin(async {
-            use novarocks_coordination_contract::{
-                ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
-            };
-            use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
-            NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
-                ExecutionFailureInput::new(
-                    QueryFailureReason::PreparationProtocol.failure_fact(),
-                    SafeDetail::truncating("native owner has no installed work exit binding"),
-                    ExecutionFailureSite::Coordinator,
-                ),
-            ))
-        })
-    }
-
-    fn run<'a>(
-        &'a mut self,
-        drive: &'a NativeAttemptDrive,
-        cancellation: CancellationView,
-    ) -> NativeAttemptRunFuture<'a>;
-
-    fn converge<'a>(
-        &'a mut self,
-        request: NativeActiveConvergenceRequest,
-    ) -> NativeActiveAttemptConvergenceFuture<'a>;
-}
-
-/// Accepted active Native owner. Wrapper construction keeps role-local owner
-/// details out of coordination while preserving a single move-only owner.
+/// Passive return from the original attempt installation. Live resources and
+/// asynchronous responsibilities remain with the original installed Source.
 pub struct ActivatedNativeAttempt {
-    owner: Box<dyn ActiveNativeAttemptOwner>,
+    activation: novarocks_coordination_contract::AttemptActivationIdentity,
     rows: Option<NativeRowsAttemptRuntime>,
 }
 
@@ -605,85 +359,127 @@ impl fmt::Debug for ActivatedNativeAttempt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ActivatedNativeAttempt")
+            .field("activation", &self.activation)
             .field("has_rows_runtime", &self.rows.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl ActivatedNativeAttempt {
-    pub fn completion(owner: impl ActiveNativeAttemptOwner) -> Self {
+    pub const fn completion(
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    ) -> Self {
         Self {
-            owner: Box::new(owner),
+            activation,
             rows: None,
         }
     }
 
-    /// Rows relayed as Backend-encoded root items, without decode.
+    /// Return the same root binding without granting a new read or Work owner.
     pub fn relayed_rows(
-        owner: impl ActiveNativeAttemptOwner,
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
         binding: crate::coordination::RootRelayBinding,
-        statuses: AcceptedRootStatusSource,
     ) -> Self {
         Self {
-            owner: Box::new(owner),
-            rows: Some(NativeRowsAttemptRuntime { binding, statuses }),
+            activation,
+            rows: Some(NativeRowsAttemptRuntime { binding }),
         }
+    }
+
+    pub(crate) const fn activation(
+        &self,
+    ) -> novarocks_coordination_contract::AttemptActivationIdentity {
+        self.activation
+    }
+
+    pub(crate) fn rows(&self) -> Option<&NativeRowsAttemptRuntime> {
+        self.rows.as_ref()
     }
 
     pub(crate) fn into_parts(
         self,
     ) -> (
-        Box<dyn ActiveNativeAttemptOwner>,
+        novarocks_coordination_contract::AttemptActivationIdentity,
         Option<NativeRowsAttemptRuntime>,
     ) {
-        (self.owner, self.rows)
+        (self.activation, self.rows)
     }
 }
 
-/// Move-only role runtime for the exact root result stream of one activated
-/// attempt. Native retains transport and Task status internals; the query
-/// supervisor receives only the closed pump inputs it owns.
+/// The original move-only row binding, with status facts supplied by AP ports.
 pub(crate) struct NativeRowsAttemptRuntime {
     pub(crate) binding: crate::coordination::RootRelayBinding,
-    pub(crate) statuses: AcceptedRootStatusSource,
 }
 
-/// Typed activation failure. The supervisor still retains the exact dormant
-/// owner and must consume it through `converge`.
+/// Activation may return a domain refusal or report that its original local
+/// resources have no proven exit. The latter is process health, never a Task
+/// failure, and must reach original custody before the borrowed Future drops.
 pub struct NativeAttemptActivationFailure {
-    failure: NativeAttemptPreparationFailure,
+    kind: NativeActivationFailureKind,
+}
+
+enum NativeActivationFailureKind {
+    Domain(NativeAttemptPreparationFailure),
+    LocalExitUnproven(StatementNativeHealthFailure),
 }
 
 impl fmt::Debug for NativeAttemptActivationFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Formatting a health cause may execute foreign code.
         formatter
             .debug_struct("NativeAttemptActivationFailure")
-            .field("failure", &self.failure)
+            .field("failure", &self.failure())
+            .field(
+                "local_exit_unproven",
+                &matches!(self.kind, NativeActivationFailureKind::LocalExitUnproven(_)),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl NativeAttemptActivationFailure {
     pub const fn new(failure: NativeAttemptPreparationFailure) -> Self {
-        Self { failure }
+        Self {
+            kind: NativeActivationFailureKind::Domain(failure),
+        }
     }
 
-    pub const fn failure(&self) -> &NativeAttemptPreparationFailure {
-        &self.failure
+    pub const fn local_exit_unproven(failure: StatementNativeHealthFailure) -> Self {
+        Self {
+            kind: NativeActivationFailureKind::LocalExitUnproven(failure),
+        }
     }
 
-    pub(crate) fn into_failure(self) -> NativeAttemptPreparationFailure {
-        self.failure
+    pub const fn failure(&self) -> Option<&NativeAttemptPreparationFailure> {
+        match &self.kind {
+            NativeActivationFailureKind::Domain(original) => Some(original),
+            NativeActivationFailureKind::LocalExitUnproven(_) => None,
+        }
     }
-}
 
-/// Physical terminal observed while the supervisor still owns the active
-/// attempt. The owner must subsequently be consumed through `converge`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum NativeAttemptTerminal {
-    Completed,
-    Failed(NativeAttemptPreparationFailure),
+    pub(crate) fn into_result(
+        self,
+    ) -> Result<NativeAttemptPreparationFailure, StatementNativeHealthFailure> {
+        match self.kind {
+            NativeActivationFailureKind::Domain(original) => Ok(original),
+            NativeActivationFailureKind::LocalExitUnproven(original) => Err(original),
+        }
+    }
+
+    pub(crate) fn into_query_error(
+        self,
+        reported: &mut Option<DormantConvergenceFailure>,
+    ) -> QueryExecutionError {
+        match self.into_result() {
+            Ok(original) => original.error().clone(),
+            Err(original) => {
+                let detail = original.detail();
+                assert!(reported.is_none(), "one original dormant health refusal");
+                *reported = Some(DormantConvergenceFailure::Reported(original));
+                QueryExecutionError::new(QueryExecutionErrorKind::Failed, detail)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -868,7 +664,7 @@ impl LogicalNativeOpenRequest {
         }
         Ok(LogicalNativeSession {
             ticket: self.ticket,
-            aborts: self.seed.aborts,
+            runtime: self.seed.runtime,
             replacements: self.seed.replacements,
             attempts: Some(NativeAttemptPreparationState {
                 port: self.seed.attempts,
@@ -937,7 +733,7 @@ impl LogicalNativeOpenRequest {
 #[derive(Debug)]
 pub struct LogicalNativeSession {
     ticket: Arc<LogicalNativeTicket>,
-    aborts: Arc<dyn AbortParticipationEffectPort>,
+    runtime: Option<crate::api::LogicalRuntimeComposition>,
     replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
     attempts: Option<NativeAttemptPreparationState>,
     pending_work: Option<NativeAttemptPreparationWork>,
@@ -988,6 +784,23 @@ impl LogicalNativeOpenAcceptance {
 }
 
 impl LogicalNativeSession {
+    pub(crate) fn take_runtime_composition(
+        &mut self,
+    ) -> Result<
+        (
+            crate::api::LogicalRuntimeComposition,
+            Option<Arc<dyn ReplacementQualificationEffectPort>>,
+        ),
+        QueryExecutionError,
+    > {
+        let runtime = self.runtime.take().ok_or_else(|| {
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "the original request has no logical runtime composition",
+            )
+        })?;
+        Ok((runtime, self.replacements.take()))
+    }
     /// Observes the SAME pending preparation allocation; no owner is cloned or
     /// reconstructed and absence alone does not prove the work has exited.
     pub(crate) fn pending_prepared_present(&self) -> bool {
@@ -1228,16 +1041,6 @@ impl LogicalNativeSession {
         let prepared = self.pending_work.as_mut().unwrap().prepared.take().unwrap();
         self.pending_work.take();
         Ok(prepared)
-    }
-
-    pub(crate) fn abort_effect_port(&self) -> Arc<dyn AbortParticipationEffectPort> {
-        Arc::clone(&self.aborts)
-    }
-
-    pub(crate) fn replacement_effect_port(
-        &self,
-    ) -> Option<Arc<dyn ReplacementQualificationEffectPort>> {
-        self.replacements.as_ref().map(Arc::clone)
     }
 }
 
@@ -1488,6 +1291,7 @@ impl fmt::Debug for NativeDormantCustody {
 pub(crate) type DormantActivationParts<'a> = (
     &'a mut (dyn DormantNativeAttemptOwner + 'static),
     &'a mut Option<Box<dyn std::any::Any + Send>>,
+    &'a mut Option<DormantConvergenceFailure>,
 );
 
 impl NativeDormantCustody {
@@ -1502,7 +1306,11 @@ impl NativeDormantCustody {
         if self.retiring || self.has_failure() || self.convergence_completed {
             return None;
         }
-        Some((self.owner.as_mut()?.as_mut(), &mut self.activation_panic))
+        Some((
+            self.owner.as_mut()?.as_mut(),
+            &mut self.activation_panic,
+            &mut self.convergence_failure,
+        ))
     }
     /// An activation panic still permits the original cleanup once. A typed
     /// health failure or poll panic in cleanup forbids restarting that source.
@@ -1532,6 +1340,7 @@ impl NativeDormantCustody {
             || self.convergence_failure.is_some()
             || self.convergence_unproven
     }
+    #[cfg(test)]
     pub(crate) fn activation_panic(&self) -> Option<&(dyn std::any::Any + Send)> {
         self.activation_panic.as_deref()
     }
@@ -1753,8 +1562,7 @@ mod tests {
         FragmentSchedulingFacts, PlanScanIdentity, QueryExecutionKind, ScanSchedulingFacts,
     };
     use crate::coordination::{
-        PermanentlyBackpressuredAbortEffectPort, ReplacementQualificationEffectAdmission,
-        ReplacementQualificationRequest,
+        ReplacementQualificationEffectAdmission, ReplacementQualificationRequest,
     };
     use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
     use crate::preparation::{
@@ -1785,31 +1593,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct ActiveDormant(u8);
-
-    impl ActiveNativeAttemptOwner for ActiveDormant {
-        fn run<'a>(
-            &'a mut self,
-            _drive: &'a NativeAttemptDrive,
-            _cancellation: CancellationView,
-        ) -> NativeAttemptRunFuture<'a> {
-            let _tag = self.0;
-            Box::pin(async { NativeAttemptTerminal::Completed })
-        }
-
-        fn converge<'a>(
-            &'a mut self,
-            _request: NativeActiveConvergenceRequest,
-        ) -> NativeActiveAttemptConvergenceFuture<'a> {
-            Box::pin(async {
-                Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
-                ))
-            })
-        }
-    }
-
     impl DormantNativeAttemptOwner for Dormant {
         fn poll_bind_qualification(
             &mut self,
@@ -1826,11 +1609,12 @@ mod tests {
 
         fn activate<'a>(
             &'a mut self,
+            _activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
             _schedule: &'a AttemptSchedule,
             _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
-            Box::pin(async move { Ok(ActivatedNativeAttempt::completion(ActiveDormant(self.tag))) })
+            Box::pin(async move { Ok(ActivatedNativeAttempt::completion(_activation_identity)) })
         }
 
         fn converge<'a>(
@@ -1883,16 +1667,10 @@ mod tests {
 
     fn seed_for_description(
         description: &FrozenExecutionDescription,
-        aborts: Arc<dyn AbortParticipationEffectPort>,
         replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
         attempts: impl NativeAttemptPreparationPort,
     ) -> NativeLogicalExecutionSeed {
-        NativeLogicalExecutionSeed::issue(
-            description.plan_identity(),
-            aborts,
-            replacements,
-            attempts,
-        )
+        NativeLogicalExecutionSeed::issue(description.plan_identity(), replacements, attempts)
     }
 
     struct Governance {
@@ -1956,12 +1734,7 @@ mod tests {
             Arc::clone(&description),
             scope.id(),
             scope.cancellation().unwrap(),
-            seed_for_description(
-                description.as_ref(),
-                PermanentlyBackpressuredAbortEffectPort::shared(),
-                replacements,
-                NoopPreparationPort,
-            ),
+            seed_for_description(description.as_ref(), replacements, NoopPreparationPort),
         );
         (governance, request, acceptance)
     }
@@ -1981,12 +1754,7 @@ mod tests {
             Arc::clone(&description),
             scope.id(),
             scope.cancellation().unwrap(),
-            seed_for_description(
-                description.as_ref(),
-                PermanentlyBackpressuredAbortEffectPort::shared(),
-                None,
-                NoopPreparationPort,
-            ),
+            seed_for_description(description.as_ref(), None, NoopPreparationPort),
         );
         (governance, request, acceptance)
     }
@@ -2090,7 +1858,6 @@ mod tests {
         let second_description = description(RecoveryMode::NoRecovery);
         let foreign_seed = NativeLogicalExecutionSeed::issue(
             second_description.plan_identity(),
-            PermanentlyBackpressuredAbortEffectPort::shared(),
             None,
             NoopPreparationPort,
         );
@@ -2168,7 +1935,6 @@ mod tests {
 
     #[tokio::test]
     async fn mutable_attempt_port_preserves_work_description_and_exact_ticket() {
-        let aborts = PermanentlyBackpressuredAbortEffectPort::shared();
         let replacements = BackpressuredReplacementPort::shared();
         let description = description(RecoveryMode::RestartAttemptBeforeVisibility);
         let (_governance, open, open_acceptance) = issue_with_seed(
@@ -2176,15 +1942,13 @@ mod tests {
             Arc::clone(&description),
             seed_for_description(
                 description.as_ref(),
-                Arc::clone(&aborts),
                 Some(Arc::clone(&replacements)),
                 EchoPreparationPort { calls: 0 },
             ),
         );
         let mut session = open_acceptance.accept(open.bind().unwrap()).unwrap();
-        assert!(Arc::ptr_eq(&session.abort_effect_port(), &aborts));
         assert!(Arc::ptr_eq(
-            &session.replacement_effect_port().unwrap(),
+            session.replacements.as_ref().unwrap(),
             &replacements
         ));
 
@@ -2197,6 +1961,57 @@ mod tests {
         assert_eq!(parts.eligible_backends.as_ref(), prepared_inputs());
     }
 
+    #[tokio::test]
+    async fn each_attempt_preparation_keeps_the_original_completed_plan_and_description() {
+        #[derive(Debug)]
+        struct SamePlanPreparation {
+            plan: Arc<novarocks_physical_plan::PhysicalPlan>,
+            description: Arc<FrozenExecutionDescription>,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl NativeAttemptPreparationPort for SamePlanPreparation {
+            fn prepare_in<'a>(
+                &'a mut self,
+                work: &'a mut NativeAttemptPreparationWork,
+            ) -> NativeAttemptPreparationFuture<'a> {
+                assert!(std::ptr::eq(work.description(), self.description.as_ref()));
+                assert!(Arc::ptr_eq(
+                    work.description().completed_candidate().plan(),
+                    &self.plan
+                ));
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // This preparation component declares no Native task or I/O.
+                work.stage_fixture_owner(Dormant::new(9, prepared_inputs()));
+                Box::pin(async move { work.bind_staged(scheduling_over(&[])).map_err(Into::into) })
+            }
+        }
+        let description = description(RecoveryMode::RestartAttemptBeforeVisibility);
+        let plan = description.completed_candidate().plan().clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seed = seed_for_description(
+            description.as_ref(),
+            Some(BackpressuredReplacementPort::shared()),
+            SamePlanPreparation {
+                plan: plan.clone(),
+                description: description.clone(),
+                calls: calls.clone(),
+            },
+        );
+        let (_governance, open, acceptance) = issue_with_seed(execution(1, 1), description, seed);
+        let mut session = acceptance.accept(open.bind().unwrap()).unwrap();
+        for attempt in [2, 3] {
+            let (request, acceptance) = session.issue_attempt(execution(1, attempt)).unwrap();
+            assert!(Arc::ptr_eq(
+                request.description().completed_candidate().plan(),
+                &plan
+            ));
+            let prepared = session.prepare(request).await.unwrap();
+            let original = acceptance.accept(prepared).unwrap();
+            assert_eq!(original.execution, execution(1, attempt));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn session_bind_requires_the_recovery_modes_exact_port_shape() {
         let no_recovery_description = description(RecoveryMode::NoRecovery);
@@ -2205,7 +2020,6 @@ mod tests {
             Arc::clone(&no_recovery_description),
             seed_for_description(
                 no_recovery_description.as_ref(),
-                PermanentlyBackpressuredAbortEffectPort::shared(),
                 Some(BackpressuredReplacementPort::shared()),
                 NoopPreparationPort,
             ),
@@ -2219,12 +2033,7 @@ mod tests {
         let (_governance, recoverable, _) = issue_with_seed(
             execution(2, 1),
             Arc::clone(&recoverable_description),
-            seed_for_description(
-                recoverable_description.as_ref(),
-                PermanentlyBackpressuredAbortEffectPort::shared(),
-                None,
-                NoopPreparationPort,
-            ),
+            seed_for_description(recoverable_description.as_ref(), None, NoopPreparationPort),
         );
         assert!(matches!(
             recoverable.bind(),
@@ -2360,6 +2169,7 @@ mod tests {
             }
             fn activate<'a>(
                 &'a mut self,
+                _activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
                 _schedule: &'a AttemptSchedule,
                 _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
                 _cancellation: CancellationView,
@@ -2535,7 +2345,6 @@ mod tests {
         let description = description(RecoveryMode::NoRecovery);
         let seed = seed_for_description(
             &description,
-            PermanentlyBackpressuredAbortEffectPort::shared(),
             None,
             ObservedPreparationPort {
                 calls: Arc::clone(&calls),
@@ -2624,6 +2433,7 @@ mod tests {
 
         fn activate<'a>(
             &'a mut self,
+            _activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
             _schedule: &'a AttemptSchedule,
             _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: CancellationView,

@@ -26,3 +26,7 @@ pub(crate) mod write;
 
 #[cfg(all(test, novarocks_dev_controls))]
 pub(crate) mod test_fixture;
+
+#[cfg(all(test, novarocks_dev_controls))]
+#[path = "statistics_component_tests.rs"]
+mod statistics_consumer_tests;

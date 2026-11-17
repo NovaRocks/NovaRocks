@@ -46,7 +46,11 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CleanupScript {
     Healthy,
+    OrdinaryActivationRefusal,
     ReportedFailure,
+    PollAndFutureDropPanic,
+    ReportedFailureAndFutureDropPanic,
+    BindingPollPanic,
     ConvergenceDropPanic,
     OwnerDropPanic,
 }
@@ -59,11 +63,14 @@ struct Counts {
     preparation_raw_drops: AtomicUsize,
     bind_calls: AtomicUsize,
     activate_calls: AtomicUsize,
+    activation_future_drops: AtomicUsize,
     convergence_factories: AtomicUsize,
     convergence_polls: AtomicUsize,
     convergence_future_drops: AtomicUsize,
     owner_drops: AtomicUsize,
     cleanup_raw_drops: AtomicUsize,
+    poll_raw_drops: AtomicUsize,
+    health_drops: AtomicUsize,
 }
 #[derive(Debug)]
 struct RawOriginal {
@@ -77,19 +84,28 @@ impl Drop for RawOriginal {
             self.counts
                 .preparation_raw_drops
                 .fetch_add(1, Ordering::SeqCst);
+        } else if self.label == "original dormant convergence poll"
+            || self.label == "original qualification binding poll"
+        {
+            self.counts.poll_raw_drops.fetch_add(1, Ordering::SeqCst);
         } else {
             self.counts.cleanup_raw_drops.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
 #[derive(Debug)]
-struct OriginalHealth(QueryExecutionId);
+struct OriginalHealth(QueryExecutionId, Arc<Counts>);
 impl fmt::Display for OriginalHealth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("original dormant health source")
     }
 }
 impl Error for OriginalHealth {}
+impl Drop for OriginalHealth {
+    fn drop(&mut self) {
+        self.1.health_drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug)]
 struct OriginalDormant {
@@ -109,15 +125,27 @@ impl DormantNativeAttemptOwner for OriginalDormant {
         _: &mut Context<'_>,
     ) -> Poll<Result<(), NativeAttemptActivationFailure>> {
         self.counts.bind_calls.fetch_add(1, Ordering::SeqCst);
+        if self.script == CleanupScript::BindingPollPanic {
+            std::panic::panic_any(RawOriginal {
+                execution: self.execution,
+                label: "original qualification binding poll",
+                counts: self.counts.clone(),
+            });
+        }
         panic!("cleanup must not bind a new qualification");
     }
     fn activate<'a>(
         &'a mut self,
+        activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         _: &'a AttemptSchedule,
         _: Option<Box<[crate::coordination::ReplacementWorkerAdmissionEvidence]>>,
         _: CancellationView,
     ) -> NativeAttemptActivationFuture<'a> {
         self.counts.activate_calls.fetch_add(1, Ordering::SeqCst);
+        if self.script == CleanupScript::OrdinaryActivationRefusal {
+            assert_eq!(activation_identity.execution(), self.execution);
+            return Box::pin(activation_refusal::RefusalFuture::new(self.counts.clone()));
+        }
         panic!("cleanup must not activate the original dormant owner");
     }
     fn converge<'a>(&'a mut self, _: CancellationView) -> NativeAttemptConvergenceFuture<'a> {
@@ -165,14 +193,26 @@ impl Future for OriginalConvergence {
             .counts
             .convergence_polls
             .fetch_add(1, Ordering::SeqCst);
-        Poll::Ready(if original.script == CleanupScript::ReportedFailure {
-            Err(StatementNativeHealthFailure::actual_exit_unproven(
-                "original dormant reported failure",
-                original.health.clone(),
-            ))
-        } else {
-            Ok(())
-        })
+        if original.script == CleanupScript::PollAndFutureDropPanic {
+            std::panic::panic_any(RawOriginal {
+                execution: original.execution,
+                label: "original dormant convergence poll",
+                counts: original.counts.clone(),
+            });
+        }
+        Poll::Ready(
+            if matches!(
+                original.script,
+                CleanupScript::ReportedFailure | CleanupScript::ReportedFailureAndFutureDropPanic
+            ) {
+                Err(StatementNativeHealthFailure::actual_exit_unproven(
+                    "original dormant reported failure",
+                    original.health.clone(),
+                ))
+            } else {
+                Ok(())
+            },
+        )
     }
 }
 impl Drop for OriginalConvergence {
@@ -180,7 +220,20 @@ impl Drop for OriginalConvergence {
         self.counts
             .convergence_future_drops
             .fetch_add(1, Ordering::SeqCst);
-        if self.script == CleanupScript::ConvergenceDropPanic && self.polled {
+        if matches!(
+            self.script,
+            CleanupScript::ConvergenceDropPanic
+                | CleanupScript::PollAndFutureDropPanic
+                | CleanupScript::ReportedFailureAndFutureDropPanic
+        ) && self.polled
+        {
+            if self.script == CleanupScript::ReportedFailureAndFutureDropPanic {
+                assert_eq!(
+                    Arc::strong_count(&self.health),
+                    4,
+                    "the returned original health is retained before its future Drop"
+                );
+            }
             std::panic::panic_any(RawOriginal {
                 execution: self.execution,
                 label: "original dormant convergence future Drop",
@@ -194,6 +247,7 @@ struct OriginalPreparation {
     owner: Option<Box<dyn DormantNativeAttemptOwner>>,
     scheduling: Option<ExecutionSchedulingFacts>,
     counts: Arc<Counts>,
+    panic_after_success: bool,
 }
 impl NativeAttemptPreparationPort for OriginalPreparation {
     fn prepare_in<'a>(
@@ -211,6 +265,7 @@ impl NativeAttemptPreparationPort for OriginalPreparation {
             execution,
             counts: self.counts.clone(),
             ready: false,
+            panic_after_success: self.panic_after_success,
         })
     }
 }
@@ -228,6 +283,7 @@ struct OriginalPreparationFuture<'a> {
     execution: QueryExecutionId,
     counts: Arc<Counts>,
     ready: bool,
+    panic_after_success: bool,
 }
 impl Future for OriginalPreparationFuture<'_> {
     type Output = Result<(), crate::api::NativeAttemptPreparationError>;
@@ -256,7 +312,7 @@ impl Drop for OriginalPreparationFuture<'_> {
         self.counts
             .preparation_future_drops
             .fetch_add(1, Ordering::SeqCst);
-        if self.ready {
+        if self.ready && self.panic_after_success {
             std::panic::panic_any(RawOriginal {
                 execution: self.execution,
                 label: "original preparation future Drop",
@@ -306,7 +362,7 @@ impl Fixture {
     async fn new(script: CleanupScript) -> Self {
         let execution = original_execution();
         let counts = Arc::new(Counts::default());
-        let health = Arc::new(OriginalHealth(execution));
+        let health = Arc::new(OriginalHealth(execution, counts.clone()));
         let control = WorkloadControl::try_new(
             WorkloadConfig::default(),
             ResourceConfig {
@@ -352,7 +408,6 @@ impl Fixture {
         );
         let seed = NativeLogicalExecutionSeed::issue(
             description.plan_identity(),
-            crate::coordination::PermanentlyBackpressuredAbortEffectPort::shared(),
             None,
             OriginalPreparation {
                 owner: Some(Box::new(OriginalDormant {
@@ -364,6 +419,7 @@ impl Fixture {
                 })),
                 scheduling: Some(scheduling),
                 counts: counts.clone(),
+                panic_after_success: true,
             },
         );
         let (open, accepted) = LogicalNativeOpenRequest::issue(
@@ -374,9 +430,7 @@ impl Fixture {
             seed,
         );
         let session = accepted.accept(open.bind().unwrap()).unwrap();
-        let registry = crate::coordination::LogicalExecutionRuntimeRegistry::new(
-            tokio::runtime::Handle::current(),
-        );
+        let registry = crate::coordination::LogicalExecutionRuntimeRegistry::new();
         let mut reservation = registry
             .reserve(execution, schedule.participations().to_vec())
             .unwrap();
@@ -393,6 +447,8 @@ impl Fixture {
             ..OriginalNativePreparation::default()
         }));
         let native = NativeExecutor::new(
+            None,
+            Arc::new(super::UnboundInstalledAttemptPort),
             body.clone(),
             Weak::new(),
             registry.handle(),
@@ -493,6 +549,35 @@ impl Fixture {
             panic!("the original uninstalled registry must actually retire: {error:?}");
         }
         let root = original.root.take().unwrap();
+        root.business.release();
+        root.owner.complete();
+    }
+
+    /// Explicit disposal of this task-free component probe. This does not
+    /// report a successful Native, AP Scope, remote participation or Work exit.
+    async fn dispose_probe(mut self) {
+        let OriginalFixture {
+            native,
+            body,
+            registry,
+            reservation,
+            root,
+            _control,
+            ..
+        } = self.original.take().unwrap();
+        assert!(matches!(
+            native
+                .as_ref()
+                .unwrap()
+                .execute(NativeEffect::RetirePreparation)
+                .await,
+            NativeFact::Applied
+        ));
+        drop(native);
+        drop(body);
+        drop(reservation);
+        assert!(registry.unwrap().shutdown().is_ok());
+        let root = root.unwrap();
         root.business.release();
         root.owner.complete();
     }
@@ -777,3 +862,219 @@ async fn actual_dormant_owner_drop_panic_stays_unknown_and_is_not_repeated_or_re
     f.assert_preparation_cause();
     f.retain_unknown();
 }
+
+async fn assert_normal_dormant_dual_failure(script: CleanupScript) {
+    let f = Fixture::new(script).await;
+    let address = f.pending_address().await;
+    let counts = f.counts.clone();
+    assert!(
+        f.native()
+            .adopt_pending_preparation_for_cleanup(f.execution)
+            .await
+            .unwrap()
+    );
+    let effect = NativeEffect::ConvergeDormant {
+        execution: f.execution,
+        remote_deadline: MonotonicInstant::from_origin(std::time::Duration::from_secs(5)),
+    };
+    let NativeFact::Failed { failure, .. } = f.native().execute(effect.clone()).await else {
+        panic!("the same failed original cannot report DormantConverged");
+    };
+    let health = f.health.clone();
+    let causes = f.native().causes(f.execution, 6);
+    let poll_address = {
+        let primary = causes.primary.lock().unwrap();
+        if script == CleanupScript::PollAndFutureDropPanic {
+            let raw = primary
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<RawOriginal>()
+                .unwrap();
+            assert_eq!(raw.execution, f.execution);
+            assert_eq!(raw.label, "original dormant convergence poll");
+            Some(raw as *const RawOriginal as usize)
+        } else {
+            assert!(primary.is_none());
+            None
+        }
+    };
+    let drop_address = {
+        let cleanup = causes.cleanup.lock().unwrap();
+        let raw = cleanup
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<RawOriginal>()
+            .unwrap();
+        assert_eq!(raw.execution, f.execution);
+        assert_eq!(raw.label, "original dormant convergence future Drop");
+        raw as *const RawOriginal as usize
+    };
+    {
+        let mut body = f.body.lock().await;
+        assert_eq!(body.dormant.owner_address_for_cleanup(), Some(address));
+        if script == CleanupScript::ReportedFailureAndFutureDropPanic {
+            let original = body.dormant.convergence_failure().unwrap();
+            assert!(std::ptr::eq(
+                original.cause().downcast_ref::<OriginalHealth>().unwrap(),
+                health.as_ref()
+            ));
+            assert_eq!(original.detail(), "original dormant reported failure");
+            assert_eq!(failure.error.message(), original.detail());
+            assert!(body.dormant.convergence_panic().is_none());
+        }
+        assert!(
+            body.dormant.convergence_parts().is_none(),
+            "the failed original convergence must be unavailable before any retry"
+        );
+        assert!(body.dormant.retire().is_err());
+        assert!(!body.dormant.convergence_completed());
+    }
+    let NativeFact::Failed { failure, .. } = f.native().execute(effect).await else {
+        panic!("a repeat cannot erase the original failed convergence");
+    };
+    if script == CleanupScript::ReportedFailureAndFutureDropPanic {
+        assert_eq!(failure.error.message(), "original dormant reported failure");
+    }
+    assert_eq!(counts.convergence_factories.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.convergence_polls.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.convergence_future_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.owner_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.poll_raw_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.cleanup_raw_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.health_drops.load(Ordering::SeqCst), 0);
+    assert!(f.native().lock().cleaned_dormant_execution.is_none());
+    assert_eq!(
+        f.body.lock().await.dormant.owner_address_for_cleanup(),
+        Some(address)
+    );
+    assert_eq!(
+        causes.primary.lock().unwrap().as_ref().map(|raw| {
+            raw.downcast_ref::<RawOriginal>().unwrap() as *const RawOriginal as usize
+        }),
+        poll_address
+    );
+    assert_eq!(
+        causes
+            .cleanup
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<RawOriginal>()
+            .unwrap() as *const RawOriginal as usize,
+        drop_address
+    );
+    f.assert_preparation_cause();
+    drop(causes);
+    f.dispose_probe().await;
+    assert_eq!(counts.owner_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.cleanup_raw_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        counts.poll_raw_drops.load(Ordering::SeqCst),
+        usize::from(poll_address.is_some())
+    );
+    assert_eq!(counts.preparation_raw_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.health_drops.load(Ordering::SeqCst), 0);
+    drop(health);
+    assert_eq!(counts.health_drops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn normal_dormant_poll_and_same_future_drop_failure_keep_both_originals_without_retry() {
+    assert_normal_dormant_dual_failure(CleanupScript::PollAndFutureDropPanic).await;
+}
+
+#[tokio::test]
+async fn normal_dormant_reported_and_same_future_drop_failure_keep_original_typed_cause_without_retry()
+ {
+    assert_normal_dormant_dual_failure(CleanupScript::ReportedFailureAndFutureDropPanic).await;
+}
+
+#[tokio::test]
+async fn original_binding_poll_panic_survives_same_owner_normal_convergence_and_refuses_retirement()
+{
+    let f = Fixture::new(CleanupScript::BindingPollPanic).await;
+    let address = f.pending_address().await;
+    let counts = f.counts.clone();
+    assert!(
+        f.native()
+            .adopt_pending_preparation_for_cleanup(f.execution)
+            .await
+            .unwrap()
+    );
+    let schedule = f.native().lock().prepared[&f.execution].schedule.clone();
+    let cancellation = f
+        .root
+        .as_ref()
+        .unwrap()
+        .owner
+        .scope()
+        .cancellation()
+        .unwrap();
+    let binding_causes = f.native().causes(f.execution, 3);
+    let raw_address = {
+        let mut body = f.body.lock().await;
+        for _ in 0..2 {
+            assert!(
+                bind_original_schedule(
+                    &mut body.dormant,
+                    &schedule,
+                    &cancellation,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                    &binding_causes,
+                )
+                .await
+                .is_err()
+            );
+        }
+        let raw = body
+            .dormant
+            .activation_panic()
+            .unwrap()
+            .downcast_ref::<RawOriginal>()
+            .unwrap();
+        assert_eq!(raw.execution, f.execution);
+        assert_eq!(raw.label, "original qualification binding poll");
+        raw as *const RawOriginal as usize
+    };
+    assert!(!binding_causes.failed());
+    assert_eq!(counts.bind_calls.load(Ordering::SeqCst), 1);
+    for _ in 0..2 {
+        assert!(matches!(
+            f.native()
+                .execute(NativeEffect::ConvergeDormant {
+                    execution: f.execution,
+                    remote_deadline: MonotonicInstant::ORIGIN,
+                })
+                .await,
+            NativeFact::Failed { .. }
+        ));
+    }
+    {
+        let mut body = f.body.lock().await;
+        assert_eq!(body.dormant.owner_address_for_cleanup(), Some(address));
+        assert_eq!(
+            body.dormant
+                .activation_panic()
+                .unwrap()
+                .downcast_ref::<RawOriginal>()
+                .unwrap() as *const RawOriginal as usize,
+            raw_address
+        );
+        assert!(body.dormant.convergence_completed());
+        assert!(body.dormant.retire().is_err());
+    }
+    assert_eq!(counts.convergence_factories.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.convergence_polls.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.convergence_future_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.activate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.owner_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.poll_raw_drops.load(Ordering::SeqCst), 0);
+    drop(binding_causes);
+    drop(cancellation);
+    f.dispose_probe().await;
+    assert_eq!(counts.owner_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.poll_raw_drops.load(Ordering::SeqCst), 1);
+}
+
+mod activation_refusal;

@@ -588,46 +588,16 @@ fn schedule_for(execution: QueryExecutionId) -> AttemptSchedule {
 }
 #[derive(Debug)]
 struct DormantFixture {
+    observed_activation: Option<Arc<Mutex<Option<AttemptActivationIdentity>>>>,
     factory_panic: bool,
     future_drop_panic: bool,
-    active_drops: Arc<AtomicUsize>,
+    activation_calls: Arc<AtomicUsize>,
+    received: Option<Arc<AtomicBool>>,
     gate: Option<tokio::sync::oneshot::Receiver<()>>,
 }
-#[derive(Debug)]
-struct ActiveFixture(Arc<AtomicUsize>);
-impl Drop for ActiveFixture {
-    fn drop(&mut self) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-}
-impl crate::api::ActiveNativeAttemptOwner for ActiveFixture {
-    fn finish_installed<'a>(
-        &'a mut self,
-        _: crate::api::NativeActiveConvergenceRequest,
-    ) -> crate::api::NativeAttemptConvergenceFuture<'a> {
-        Box::pin(async { Ok(()) })
-    }
-    fn run<'a>(
-        &'a mut self,
-        _: &'a crate::coordination::NativeAttemptDrive,
-        _: CancellationView,
-    ) -> crate::api::NativeAttemptRunFuture<'a> {
-        Box::pin(async { NativeAttemptTerminal::Completed })
-    }
-    fn converge<'a>(
-        &'a mut self,
-        _: crate::api::NativeActiveConvergenceRequest,
-    ) -> crate::api::NativeActiveAttemptConvergenceFuture<'a> {
-        Box::pin(async {
-            Ok(crate::api::NativeActiveConvergenceClosure::Evidence(
-                crate::api::NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(
-                ),
-            ))
-        })
-    }
-}
 struct ActivationFuture {
-    active: Option<crate::api::ActivatedNativeAttempt>,
+    output: Option<crate::api::ActivatedNativeAttempt>,
+    received: Option<Arc<AtomicBool>>,
     drop_panic: bool,
     gate: Option<tokio::sync::oneshot::Receiver<()>>,
 }
@@ -641,11 +611,19 @@ impl Future for ActivationFuture {
             }
             self.gate.take();
         }
-        Poll::Ready(Ok(self.active.take().unwrap()))
+        Poll::Ready(Ok(self.output.take().unwrap()))
     }
 }
 impl Drop for ActivationFuture {
     fn drop(&mut self) {
+        if self.output.is_none()
+            && let Some(received) = &self.received
+        {
+            assert!(
+                received.load(Ordering::SeqCst),
+                "original return reaches its canonical slot before Future Drop"
+            );
+        }
         assert!(!self.drop_panic, "activation future destructor panic");
     }
 }
@@ -662,15 +640,27 @@ impl crate::api::DormantNativeAttemptOwner for DormantFixture {
     }
     fn activate<'a>(
         &'a mut self,
+        activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         _: &'a AttemptSchedule,
         _: Option<Box<[crate::coordination::ReplacementWorkerAdmissionEvidence]>>,
         _: CancellationView,
     ) -> crate::api::NativeAttemptActivationFuture<'a> {
+        if let Some(observed) = &self.observed_activation {
+            assert!(
+                observed
+                    .lock()
+                    .unwrap()
+                    .replace(activation_identity)
+                    .is_none()
+            );
+        }
+        self.activation_calls.fetch_add(1, Ordering::SeqCst);
         assert!(!self.factory_panic, "dormant activation factory panic");
         Box::pin(ActivationFuture {
-            active: Some(crate::api::ActivatedNativeAttempt::completion(
-                ActiveFixture(Arc::clone(&self.active_drops)),
+            output: Some(crate::api::ActivatedNativeAttempt::completion(
+                activation_identity,
             )),
+            received: self.received.clone(),
             drop_panic: self.future_drop_panic,
             gate: self.gate.take(),
         })
@@ -683,19 +673,256 @@ impl crate::api::DormantNativeAttemptOwner for DormantFixture {
     }
 }
 #[tokio::test]
+async fn activation_health_reaches_original_custody_before_future_drop_without_a_task_failure() {
+    struct OriginalHealth(Arc<AtomicUsize>);
+    impl std::fmt::Debug for OriginalHealth {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!("activation metadata must not format its opaque health cause")
+        }
+    }
+    impl std::fmt::Display for OriginalHealth {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original source-close health")
+        }
+    }
+    impl Error for OriginalHealth {}
+    impl Drop for OriginalHealth {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct HealthFuture {
+        original: Option<crate::api::StatementNativeHealthFailure>,
+        received: Arc<AtomicBool>,
+        drop_panic: bool,
+    }
+    impl Future for HealthFuture {
+        type Output =
+            Result<crate::api::ActivatedNativeAttempt, crate::api::NativeAttemptActivationFailure>;
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            let failure = crate::api::NativeAttemptActivationFailure::local_exit_unproven(
+                self.original.take().unwrap(),
+            );
+            assert!(failure.failure().is_none());
+            let _ = format!("{failure:?}");
+            Poll::Ready(Err(failure))
+        }
+    }
+    impl Drop for HealthFuture {
+        fn drop(&mut self) {
+            assert!(
+                self.received.load(Ordering::SeqCst),
+                "same reported health was stored before original F Drop"
+            );
+            if self.drop_panic {
+                panic!("secondary original activation Future Drop panic");
+            }
+        }
+    }
+    #[derive(Debug)]
+    struct HealthDormant {
+        original: Option<crate::api::StatementNativeHealthFailure>,
+        received: Arc<AtomicBool>,
+        factories: Arc<AtomicUsize>,
+        bindings: Arc<AtomicUsize>,
+        binding: bool,
+        convergences: Arc<AtomicUsize>,
+        drop_panic: bool,
+    }
+    impl crate::api::DormantNativeAttemptOwner for HealthDormant {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            &[]
+        }
+        fn poll_bind_qualification(
+            &mut self,
+            _: &AttemptSchedule,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            assert!(self.binding, "activation fixture never binds qualification");
+            self.bindings.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Err(
+                crate::api::NativeAttemptActivationFailure::local_exit_unproven(
+                    self.original.take().unwrap(),
+                ),
+            ))
+        }
+        fn activate<'a>(
+            &'a mut self,
+            identity: AttemptActivationIdentity,
+            _: &'a AttemptSchedule,
+            _: Option<Box<[crate::coordination::ReplacementWorkerAdmissionEvidence]>>,
+            _: CancellationView,
+        ) -> crate::api::NativeAttemptActivationFuture<'a> {
+            assert!(
+                !self.binding,
+                "qualification fixture never starts activation"
+            );
+            assert_eq!(identity, activation());
+            self.factories.fetch_add(1, Ordering::SeqCst);
+            Box::pin(HealthFuture {
+                original: self.original.take(),
+                received: self.received.clone(),
+                drop_panic: self.drop_panic,
+            })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            _: CancellationView,
+        ) -> crate::api::NativeAttemptConvergenceFuture<'a> {
+            self.convergences.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+    for (binding, drop_panic) in [(false, false), (false, true), (true, false)] {
+        let (_control, work) = cancellation_work();
+        let schedule = schedule();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let cause = Arc::new(OriginalHealth(drops.clone()));
+        let original = crate::api::StatementNativeHealthFailure::actual_exit_unproven(
+            "original empty-source close remains unproven",
+            cause.clone(),
+        );
+        let received = Arc::new(AtomicBool::new(false));
+        let factories = Arc::new(AtomicUsize::new(0));
+        let bindings = Arc::new(AtomicUsize::new(0));
+        let convergences = Arc::new(AtomicUsize::new(0));
+        let mut custody = crate::api::NativeDormantCustody::test_owner(HealthDormant {
+            original: Some(original),
+            received: received.clone(),
+            factories: factories.clone(),
+            bindings: bindings.clone(),
+            binding,
+            convergences: convergences.clone(),
+            drop_panic,
+        });
+        let causes = FutureCauses::default();
+        let mut safe = None;
+        if binding {
+            safe = Some(
+                bind_original_schedule(
+                    &mut custody,
+                    &schedule,
+                    &work.owner.scope().cancellation().unwrap(),
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    &causes,
+                )
+                .await
+                .expect_err("same original binding reports local health"),
+            );
+        } else {
+            let (owner, panic, reported) = custody.activation_parts().unwrap();
+            let future = start_activation(
+                owner,
+                activation(),
+                &schedule,
+                None,
+                work.owner.scope().cancellation().unwrap(),
+                panic,
+            )
+            .unwrap();
+            assert_eq!(
+                poll_original(future, &causes, None, None, |result| {
+                    let failure = result.unwrap_err();
+                    safe = Some(failure.into_query_error(reported));
+                    received.store(true, Ordering::SeqCst);
+                })
+                .await,
+                Ok(())
+            );
+        }
+        let original = custody
+            .convergence_failure()
+            .expect("same fixed original Reported slot");
+        assert!(std::ptr::eq(
+            original.cause().downcast_ref::<OriginalHealth>().unwrap(),
+            cause.as_ref()
+        ));
+        assert_eq!(
+            original.detail(),
+            "original empty-source close remains unproven"
+        );
+        assert!(custody.activation_panic().is_none());
+        assert_eq!(causes.failed(), drop_panic);
+        let safe = safe.unwrap();
+        assert_eq!(safe.kind(), QueryExecutionErrorKind::Failed);
+        assert!(safe.execution_failure().is_none());
+        assert!(report(safe).original_attempt_failure.is_none());
+        assert_eq!(factories.load(Ordering::SeqCst), usize::from(!binding));
+        assert_eq!(bindings.load(Ordering::SeqCst), usize::from(binding));
+        assert!(custody.activation_parts().is_none());
+        assert!(custody.convergence_parts().is_none());
+        assert!(custody.retire().is_err());
+        assert_eq!(convergences.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        // These fixture objects own no actual provider/Scope work. Explicit
+        // probe disposition is not an original Native resource-exit receipt.
+        drop(custody);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(cause);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn exact_issued_activation_reaches_the_original_dormant_factory() {
+    let (_control, work) = cancellation_work();
+    let schedule = schedule();
+    let observed = Arc::new(Mutex::new(None));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut custody = crate::api::NativeDormantCustody::test_owner(DormantFixture {
+        observed_activation: Some(observed.clone()),
+        factory_panic: false,
+        future_drop_panic: false,
+        activation_calls: calls.clone(),
+        received: None,
+        gate: None,
+    });
+    let (owner, original, _original_health) = custody.activation_parts().unwrap();
+    let future = start_activation(
+        owner,
+        activation(),
+        &schedule,
+        None,
+        work.owner.scope().cancellation().unwrap(),
+        original,
+    )
+    .unwrap();
+    let causes = FutureCauses::default();
+    let mut output = None;
+    assert_eq!(
+        poll_original(future, &causes, None, None, |result| output =
+            Some(result.unwrap()))
+        .await,
+        Ok(())
+    );
+    assert_eq!(*observed.lock().unwrap(), Some(activation()));
+    assert_eq!(activation().generation(), 23);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!causes.failed() && custody.activation_panic().is_none());
+    let output = output.expect("same original activation output");
+    assert_eq!(output.activation(), activation());
+    assert!(output.rows().is_none());
+    drop(output);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    custody.retire().unwrap();
+}
+#[tokio::test]
 async fn dormant_factory_panic_stays_in_original_custody_before_passive_fact() {
     let (_control, work) = cancellation_work();
     let schedule = schedule();
-    let drops = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
     let mut custody = crate::api::NativeDormantCustody::test_owner(DormantFixture {
+        observed_activation: None,
         factory_panic: true,
         future_drop_panic: false,
-        active_drops: Arc::clone(&drops),
+        activation_calls: Arc::clone(&calls),
+        received: None,
         gate: None,
     });
-    let (owner, original) = custody.activation_parts().unwrap();
+    let (owner, original, _original_health) = custody.activation_parts().unwrap();
     let error = match start_activation(
         owner,
+        activation(),
         &schedule,
         None,
         work.owner.scope().cancellation().unwrap(),
@@ -714,22 +941,39 @@ async fn dormant_factory_panic_stays_in_original_custody_before_passive_fact() {
         error.execution_failure().unwrap().fact(),
         QueryFailureReason::NativeFuturePanicked.failure_fact()
     );
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
 async fn successful_native_output_survives_original_activation_future_drop_panic() {
     let (_control, work) = cancellation_work();
     let schedule = schedule();
-    let drops = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let received = Arc::new(AtomicBool::new(false));
+    let mut registry = crate::coordination::LogicalExecutionRuntimeRegistry::new();
+    let handle = registry.handle();
+    let (registration, issued, scripted_exit) =
+        crate::coordination::runtime_registry::runtime_tests::install_native_component_runtime(
+            &handle,
+            execution(1),
+            schedule.participations().to_vec(),
+        );
+    let original_activation =
+        AttemptActivationIdentity::from_parts(issued.actor().get(), execution(1), 23);
+    let reservation = handle
+        .reserve_active_native_owner(&registration, execution(1), schedule.participations())
+        .unwrap();
     let mut custody = crate::api::NativeDormantCustody::test_owner(DormantFixture {
+        observed_activation: None,
         factory_panic: false,
         future_drop_panic: true,
-        active_drops: Arc::clone(&drops),
+        activation_calls: Arc::clone(&calls),
+        received: Some(received.clone()),
         gate: None,
     });
-    let (owner, original) = custody.activation_parts().unwrap();
+    let (owner, original, _original_health) = custody.activation_parts().unwrap();
     let future = start_activation(
         owner,
+        original_activation,
         &schedule,
         None,
         work.owner.scope().cancellation().unwrap(),
@@ -740,7 +984,8 @@ async fn successful_native_output_survives_original_activation_future_drop_panic
     let mut pending = None;
     assert_eq!(
         poll_original(future, &causes, None, None, |result| {
-            pending = Some(PendingNativeActivation::new(result.unwrap()));
+            reservation.receive_activated_in(&mut pending, result.unwrap());
+            received.store(true, Ordering::SeqCst);
         })
         .await,
         Ok(())
@@ -750,13 +995,21 @@ async fn successful_native_output_survives_original_activation_future_drop_panic
         pending.is_some(),
         "same original successful activation is retained before F Drop"
     );
-    assert_eq!(
-        drops.load(Ordering::SeqCst),
-        0,
-        "original active owner has not been lost during unwind"
-    );
+    assert!(received.load(Ordering::SeqCst));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(handle.active_native_custody_count(), 1);
+    reservation
+        .stage_activated_in(original_activation, schedule.root(), &mut pending)
+        .unwrap();
+    assert!(pending.as_ref().unwrap().staged_slot_address().is_some());
+    drop(reservation);
+    assert_eq!(handle.active_native_custody_count(), 1);
+    // No Native/AP Source exits in this scripted registration component.
+    // Keep the successful return unresolved until explicit process disposal.
+    registry.abandon_for_process_exit();
     drop(pending);
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop(scripted_exit);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
 async fn original_cancellation_is_observed_before_polling_preparation() {
@@ -860,19 +1113,22 @@ async fn cancellation_cut_survives_pending_activation_and_is_inherited_on_late_r
     let schedule = schedule();
     let view = work.owner.scope().cancellation().unwrap();
     let (release, gate) = tokio::sync::oneshot::channel();
-    let drops = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
     let mut custody = crate::api::NativeDormantCustody::test_owner(DormantFixture {
+        observed_activation: None,
         factory_panic: false,
         future_drop_panic: false,
-        active_drops: Arc::clone(&drops),
+        activation_calls: Arc::clone(&calls),
+        received: None,
         gate: Some(gate),
     });
-    let (owner, original) = custody.activation_parts().unwrap();
-    let future = start_activation(owner, &schedule, None, view.clone(), original).unwrap();
+    let (owner, original, _original_health) = custody.activation_parts().unwrap();
+    let future =
+        start_activation(owner, activation(), &schedule, None, view.clone(), original).unwrap();
     let causes = FutureCauses::default();
     let mut pending = None;
     let mut activating = Box::pin(poll_original(future, &causes, None, None, |value| {
-        pending = Some(PendingNativeActivation::new(value.unwrap()));
+        pending = Some(value.unwrap());
     }));
     let mut context = Context::from_waker(futures::task::noop_waker_ref());
     assert!(activating.as_mut().poll(&mut context).is_pending());
@@ -900,9 +1156,11 @@ async fn cancellation_cut_survives_pending_activation_and_is_inherited_on_late_r
         storage.inherited_terminal_cut(activation()),
         Some((cut, deadline))
     );
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(pending.as_ref().unwrap().activation(), activation());
+    assert!(pending.as_ref().unwrap().rows().is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     drop(pending);
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 #[test]
 fn pending_terminal_cut_requires_original_activation_and_never_renews() {
@@ -1027,32 +1285,32 @@ fn backend_failure() -> novarocks_coordination_contract::ExecutionFailure {
     ))
 }
 #[test]
-fn ordinary_backend_terminal_failure_does_not_become_native_run_veto() {
+fn original_ap_failure_and_successful_native_startup_remain_independent() {
     let failure = backend_failure();
     let original = failure.input().clone();
-    match project_run_terminal(
-        activation(),
-        Some(NativeAttemptTerminal::Failed(failure)),
-        false,
-    ) {
-        NativeFact::Failed { execution, failure } => {
-            assert_eq!(execution, activation().execution());
-            assert_eq!(failure.original_attempt_failure.as_deref(), Some(&original));
-            assert_eq!(failure.error.execution_failure(), Some(&original));
-        }
-        _ => panic!("ordinary AP terminal must not be projected as NativeRunFailed"),
-    }
+    let port_failure = FailureReport::from_attempt(&failure);
+    assert!(matches!(
+        project_start_result(activation(), Some(Ok(NativeAttemptStartupOutcome::Ready)), false),
+        NativeFact::RunCompleted { activation: actual } if actual == activation()
+    ));
+    assert_eq!(
+        port_failure.original_attempt_failure.as_deref(),
+        Some(&original)
+    );
+    assert_eq!(port_failure.error.execution_failure(), Some(&original));
 }
 #[tokio::test]
 async fn actual_native_run_poll_panic_is_an_independent_veto() {
-    let future = Box::pin(std::future::poll_fn(|_| -> Poll<NativeAttemptTerminal> {
-        panic!("original native run poll panic")
-    }));
+    let future = Box::pin(std::future::poll_fn(
+        |_| -> Poll<Result<NativeAttemptStartupOutcome, QueryExecutionError>> {
+            panic!("original native run poll panic")
+        },
+    ));
     let causes = FutureCauses::default();
-    let mut terminal = None;
-    let result = poll_original(future, &causes, None, None, |value| terminal = Some(value)).await;
+    let mut returned = None;
+    let result = poll_original(future, &causes, None, None, |value| returned = Some(value)).await;
     assert_eq!(result, Err(WaitFailure::Panicked));
-    match project_run_terminal(activation(), terminal, result.is_err() || causes.failed()) {
+    match project_start_result(activation(), returned, result.is_err() || causes.failed()) {
         NativeFact::NativeRunFailed {
             activation: actual,
             failure,
@@ -1067,21 +1325,173 @@ async fn actual_native_run_poll_panic_is_an_independent_veto() {
     }
 }
 #[test]
-fn secondary_native_run_drop_panic_veto_keeps_returned_attempt_failure() {
+fn secondary_native_run_drop_panic_veto_keeps_returned_original_error() {
     let failure = backend_failure();
     let original = failure.input().clone();
-    match project_run_terminal(
-        activation(),
-        Some(NativeAttemptTerminal::Failed(failure)),
-        true,
-    ) {
+    match project_start_result(activation(), Some(Err(failure.error().clone())), true) {
         NativeFact::NativeRunFailed { failure, .. } => {
-            assert_eq!(failure.original_attempt_failure.as_deref(), Some(&original))
+            assert_eq!(failure.original_attempt_failure.as_deref(), Some(&original));
+            assert_eq!(failure.error.execution_failure(), Some(&original));
         }
         _ => panic!(
             "independent destructor failure is a veto without replacing the returned original cause"
         ),
     }
+}
+
+#[tokio::test]
+async fn protocol_closed_startup_callback_keeps_the_separate_ap_backend_loss_recoverable() {
+    for backend_first in [false, true] {
+        let original = backend_failure();
+        let mut ap_failure = backend_first.then(|| FailureReport::from_attempt(&original));
+        let causes = FutureCauses::default();
+        let mut returned = None;
+        let actual_callback = Box::pin(std::future::ready(Ok::<_, QueryExecutionError>(
+            NativeAttemptStartupOutcome::ClosedByProtocol,
+        )));
+        assert_eq!(
+            poll_original(actual_callback, &causes, None, None, |value| returned =
+                Some(value))
+            .await,
+            Ok(())
+        );
+        assert!(!causes.failed());
+        assert!(matches!(
+            project_start_result(activation(), returned, causes.failed()),
+            NativeFact::RunCompleted { activation: actual } if actual == activation()
+        ));
+        let report = ap_failure.get_or_insert_with(|| FailureReport::from_attempt(&original));
+        assert_eq!(
+            report.original_attempt_failure.as_deref(),
+            Some(original.input())
+        );
+        assert_eq!(report.error.execution_failure(), Some(original.input()));
+        assert_eq!(
+            original.input().fact(),
+            QueryFailureReason::BackendLost.failure_fact()
+        );
+        assert_eq!(
+            original.input().site(),
+            ExecutionFailureSite::Backend {
+                process: root().backend_process_id()
+            }
+        );
+        assert_eq!(
+            original.class(),
+            novarocks_coordination_contract::AttemptFailureClass::RecoverableInfrastructure
+        );
+        assert!(report.pre_ready_replacement.is_none());
+    }
+}
+
+#[test]
+fn protocol_closed_startup_does_not_downgrade_errors_missing_results_or_supervision_failure() {
+    let original = backend_failure();
+    for supervision_failed in [false, true] {
+        match project_start_result(
+            activation(),
+            Some(Err(original.error().clone())),
+            supervision_failed,
+        ) {
+            NativeFact::NativeRunFailed {
+                activation: actual,
+                failure,
+            } => {
+                assert_eq!(actual, activation());
+                assert_eq!(failure.error.execution_failure(), Some(original.input()));
+                assert_eq!(
+                    failure.original_attempt_failure.as_deref(),
+                    Some(original.input())
+                );
+            }
+            _ => panic!("an explicit original startup error remains a Native veto"),
+        }
+    }
+    for (result, supervision_failed, expected) in [
+        (
+            None,
+            false,
+            QueryFailureReason::ResultProtocol.failure_fact(),
+        ),
+        (
+            None,
+            true,
+            QueryFailureReason::NativeFuturePanicked.failure_fact(),
+        ),
+        (
+            Some(Ok(NativeAttemptStartupOutcome::ClosedByProtocol)),
+            true,
+            QueryFailureReason::NativeFuturePanicked.failure_fact(),
+        ),
+        (
+            Some(Ok(NativeAttemptStartupOutcome::Ready)),
+            true,
+            QueryFailureReason::NativeFuturePanicked.failure_fact(),
+        ),
+    ] {
+        match project_start_result(activation(), result, supervision_failed) {
+            NativeFact::NativeRunFailed {
+                activation: actual,
+                failure,
+            } => {
+                assert_eq!(actual, activation());
+                assert_eq!(failure.error.execution_failure().unwrap().fact(), expected);
+            }
+            _ => panic!("a normal callback outcome cannot erase an independent failure"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn protocol_closed_startup_keeps_an_independent_original_future_drop_panic() {
+    struct ClosedFuture {
+        received: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Future for ClosedFuture {
+        type Output = Result<NativeAttemptStartupOutcome, QueryExecutionError>;
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(Ok(NativeAttemptStartupOutcome::ClosedByProtocol))
+        }
+    }
+    impl Drop for ClosedFuture {
+        fn drop(&mut self) {
+            assert!(self.received.load(Ordering::SeqCst));
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            panic!("original startup close future Drop panic");
+        }
+    }
+    let received = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let future = Box::pin(ClosedFuture {
+        received: received.clone(),
+        drops: drops.clone(),
+    });
+    let causes = FutureCauses::default();
+    let mut returned = None;
+    let polled = poll_original(future, &causes, None, None, |value| {
+        returned = Some(value);
+        received.store(true, Ordering::SeqCst);
+    })
+    .await;
+    assert_eq!(polled, Ok(()));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(causes.primary.lock().unwrap().is_none());
+    assert_eq!(
+        causes
+            .cleanup
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<&str>(),
+        Some(&"original startup close future Drop panic")
+    );
+    assert!(matches!(
+        project_start_result(activation(), returned, polled.is_err() || causes.failed()),
+        NativeFact::NativeRunFailed { activation: actual, failure }
+            if actual == activation() && failure.error.execution_failure().unwrap().fact() == QueryFailureReason::NativeFuturePanicked.failure_fact()
+    ));
 }
 
 #[derive(Debug)]
@@ -1112,6 +1522,7 @@ impl crate::api::DormantNativeAttemptOwner for BindingFixture {
     }
     fn activate<'a>(
         &'a mut self,
+        _activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         _: &'a AttemptSchedule,
         _: Option<Box<[crate::coordination::ReplacementWorkerAdmissionEvidence]>>,
         _: CancellationView,
@@ -1597,6 +2008,319 @@ impl crate::api::InternalComputationConsumer for ScriptedOriginalConsumer {
 }
 
 struct ConsumerFacts(tokio::sync::mpsc::UnboundedSender<crate::api::LogicalHostFact>);
+
+async fn original_consumer_tail_for_join_fixture(
+    owner: &Arc<super::super::consumer::ConsumerExecutor>,
+    source: &Arc<OriginalLogicalExit>,
+    activation: AttemptActivationIdentity,
+    root: TaskIdentity,
+    activity: crate::admitted_query_context::ResultCapacityActivityLease,
+    consumer: Arc<dyn crate::api::InternalComputationConsumer>,
+) -> Arc<OriginalTailSlot> {
+    let input = owner.bind_internal(activation, root).unwrap();
+    let exit = input.supervise_exit().await.unwrap();
+    Arc::new(OriginalTailSlot {
+        activation,
+        root,
+        kind: OriginalTailKind::Consumer,
+        state: Mutex::new(OriginalTailState {
+            phase: TailPhase::Claimed,
+            input: Some(OriginalTailInput::Consumer(Box::new(
+                OriginalConsumerStart {
+                    consumer,
+                    activation: input,
+                    exit,
+                    activity: None,
+                },
+            ))),
+            ack_result: None,
+            ack_failure: None,
+            consumer_result: None,
+            activity: Some(activity),
+            cleanup_returned: false,
+            join_failure: None,
+        }),
+        causes: FutureCauses::default(),
+        original_exit: Arc::downgrade(source),
+    })
+}
+fn consumer_owner_for_join_fixture() -> Arc<super::super::consumer::ConsumerExecutor> {
+    Arc::new(
+        super::super::consumer::ConsumerExecutor::new_internal(
+            novarocks_logical_execution_protocol::start::RootCarrier {
+                kind: novarocks_result_contract::RootOutputKind::CountOnly,
+                client_rows: None,
+            },
+            crate::api::PlanSeal::Version(
+                novarocks_physical_plan::PlanVersionId::try_new([37; 16]).unwrap(),
+            ),
+            std::num::NonZeroUsize::MIN,
+            None,
+        )
+        .unwrap(),
+    )
+}
+#[derive(Debug)]
+struct AttemptConsumerJoinCause {
+    activation: AttemptActivationIdentity,
+    drops: Arc<AtomicUsize>,
+}
+impl Drop for AttemptConsumerJoinCause {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+#[derive(Debug)]
+struct HeldAttemptConsumerForJoin {
+    activation: AttemptActivationIdentity,
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    drops: Arc<AtomicUsize>,
+}
+impl crate::api::InternalComputationConsumer for HeldAttemptConsumerForJoin {
+    fn begin_local_close(&self) {}
+    fn poll_local_closed(
+        &self,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+        Poll::Ready(Ok(()))
+    }
+    fn consume(
+        &self,
+        original: crate::api::InternalConsumerActivation,
+    ) -> crate::api::InternalConsumerFuture {
+        let entered = self.entered.lock().unwrap().take().unwrap();
+        let gate = self.gate.lock().unwrap().take().unwrap();
+        let activation = self.activation;
+        let drops = self.drops.clone();
+        Box::pin(async move {
+            let _original = original;
+            entered.send(()).unwrap();
+            gate.await.unwrap();
+            std::panic::panic_any(AttemptConsumerJoinCause { activation, drops });
+        })
+    }
+}
+#[tokio::test]
+async fn original_old_and_successor_consumer_causes_stay_separate_through_their_actual_joins() {
+    let (control, mut driver, work, stage, payload, binding) = owned_consumer_computation();
+    let capacity = work.owner.scope().result_capacity().unwrap();
+    let cut = binding.streamed_computation_cut_handle().unwrap();
+    let source = OriginalLogicalExit::new();
+    let owner = consumer_owner_for_join_fixture();
+    let mut originals = Vec::new();
+    for offset in 0..2 {
+        let identity = AttemptActivationIdentity::from_parts(
+            activation().actor().get(),
+            execution(offset + 1),
+            activation().generation() + offset,
+        );
+        let task = TaskIdentity::new(
+            identity.execution(),
+            root().stage_id(),
+            root().task_id(),
+            root().backend_process_id(),
+        );
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let slot = original_consumer_tail_for_join_fixture(
+            &owner,
+            &source,
+            identity,
+            task,
+            cut.begin_consumer_activity().unwrap(),
+            Arc::new(HeldAttemptConsumerForJoin {
+                activation: identity,
+                entered: Mutex::new(Some(entered)),
+                gate: Mutex::new(Some(gate)),
+                drops: drops.clone(),
+            }),
+        )
+        .await;
+        let (future, joined) = OriginalTailWorkObligation { slot: slot.clone() }.into_future();
+        let task = tokio::spawn(future);
+        entry.await.unwrap();
+        originals.push((slot, Some(joined), task, Some(release), drops));
+    }
+    // This component owns no Native producer; both actual consumer activities
+    // still independently retain the same paid computation until their Joins.
+    cut.native_body_exited().unwrap();
+    drive_paid_native_fixture(&mut driver);
+    let mut positions = Vec::new();
+    let mut exact_causes = Vec::new();
+    for index in 0..2 {
+        originals[index].3.take().unwrap().send(()).unwrap();
+        let result = (&mut originals[index].2).await;
+        let joined = originals[index].1.take().unwrap();
+        receive_tail_join(
+            &joined.slot,
+            result.map_err(|original| Arc::new(original) as OriginalJoinFailure),
+        )
+        .unwrap();
+        drop(joined);
+        drive_paid_native_fixture(&mut driver);
+        positions.push(capacity.snapshot().held_positions[2]);
+        let slot = &originals[index].0;
+        exact_causes.push(
+            slot.causes
+                .primary
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|cause| cause.downcast_ref::<AttemptConsumerJoinCause>())
+                .is_some_and(|cause| {
+                    cause.activation == slot.activation
+                        && Arc::ptr_eq(&cause.drops, &originals[index].4)
+                }),
+        );
+        if index == 0 {
+            assert!(originals[1].0.causes.primary.lock().unwrap().is_none());
+            assert_eq!(originals[1].0.lock().phase, TailPhase::Running);
+        }
+    }
+    let drops = [originals[0].4.clone(), originals[1].4.clone()];
+    let retained = [
+        drops[0].load(Ordering::SeqCst),
+        drops[1].load(Ordering::SeqCst),
+    ];
+    drop(originals); // Explicit disposition of the same original raw causes.
+    drop((owner, source, cut, binding, payload));
+    stage.complete();
+    work.business.release();
+    work.owner.complete();
+    drive_paid_native_fixture(&mut driver);
+    assert_eq!(positions, [1, 0]);
+    assert_eq!(exact_causes, [true, true]);
+    assert_eq!(retained, [0, 0]);
+    assert_eq!(
+        [
+            drops[0].load(Ordering::SeqCst),
+            drops[1].load(Ordering::SeqCst)
+        ],
+        [1, 1]
+    );
+    assert_eq!(control.snapshot().result_windows.held_positions[2], 0);
+}
+
+struct OpaqueConsumerReceiptForJoin {
+    window: Mutex<Option<novarocks_workload_control::ResultWindowAlias>>,
+    cause_drops: Arc<AtomicUsize>,
+}
+impl fmt::Debug for OpaqueConsumerReceiptForJoin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpaqueConsumerReceiptForJoin")
+            .finish_non_exhaustive()
+    }
+}
+impl Drop for OpaqueConsumerReceiptForJoin {
+    fn drop(&mut self) {
+        drop(self.window.lock().unwrap().take());
+        std::panic::panic_any(AttemptConsumerJoinCause {
+            activation: activation(),
+            drops: self.cause_drops.clone(),
+        });
+    }
+}
+impl crate::api::InternalComputationConsumer for OpaqueConsumerReceiptForJoin {
+    fn begin_local_close(&self) {}
+    fn poll_local_closed(
+        &self,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+        Poll::Ready(Ok(()))
+    }
+    fn consume(
+        &self,
+        original: crate::api::InternalConsumerActivation,
+    ) -> crate::api::InternalConsumerFuture {
+        Box::pin(async move {
+            drop(original);
+            Ok(())
+        })
+    }
+}
+#[tokio::test]
+async fn opaque_consumer_receipt_join_cause_survives_actual_p1_release_until_original_health_disposal()
+ {
+    let (control, mut driver, work, stage, payload, binding) = owned_consumer_computation();
+    let capacity = work.owner.scope().result_capacity().unwrap();
+    let cut = binding.streamed_computation_cut_handle().unwrap();
+    let source = OriginalLogicalExit::new();
+    let owner = consumer_owner_for_join_fixture();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let slot = original_consumer_tail_for_join_fixture(
+        &owner,
+        &source,
+        activation(),
+        root(),
+        cut.begin_consumer_activity().unwrap(),
+        Arc::new(OpaqueConsumerReceiptForJoin {
+            window: Mutex::new(Some(binding.try_window_alias().unwrap())),
+            cause_drops: drops.clone(),
+        }),
+    )
+    .await;
+    let (future, joined) = OriginalTailWorkObligation { slot: slot.clone() }.into_future();
+    cut.native_body_exited().unwrap();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let mut original_task = tokio::spawn(async move {
+        released.await.expect("same original Join probe release");
+        future.await;
+    });
+    let mut cancelled_wait = Box::pin(std::future::poll_fn(|cx| {
+        Pin::new(&mut original_task).poll(cx)
+    }));
+    assert!(futures::poll!(&mut cancelled_wait).is_pending());
+    drop(cancelled_wait); // Cancel only the borrow, never the original task.
+    drive_paid_native_fixture(&mut driver);
+    assert_eq!(capacity.snapshot().held_positions[2], 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    release.send(()).unwrap();
+    let original_join = (&mut original_task).await;
+    // Stabilize the genuine result before disposing the completed handle.
+    drop(original_task);
+    let actual_panic = original_join.as_ref().is_err_and(|cause| cause.is_panic());
+    drive_paid_native_fixture(&mut driver);
+    let before_join = capacity.snapshot().held_positions[2];
+    receive_tail_join(
+        &joined.slot,
+        original_join.map_err(|original| Arc::new(original) as OriginalJoinFailure),
+    )
+    .unwrap();
+    drop(joined);
+    drive_paid_native_fixture(&mut driver);
+    let after_join = capacity.snapshot().held_positions[2];
+    let actual_original = slot
+        .lock()
+        .join_failure
+        .as_ref()
+        .and_then(|cause| cause.downcast_ref::<tokio::task::JoinError>())
+        .is_some_and(|cause| cause.is_panic());
+    let health: Arc<dyn Error + Send + Sync> = slot.clone();
+    drop(slot);
+    let retained = drops.load(Ordering::SeqCst);
+    let unhandled = source.has_unhandled_failure();
+    let retained_health = Arc::clone(&health);
+    drop(health);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "the same original health alias still owns the genuine JoinError"
+    );
+    drop(retained_health); // Explicit process-exit disposition, never a positive close.
+    drop((owner, source, cut, binding, payload));
+    stage.complete();
+    work.business.release();
+    work.owner.complete();
+    drive_paid_native_fixture(&mut driver);
+    assert!(actual_panic && actual_original && unhandled);
+    assert_eq!((before_join, after_join), (1, 0));
+    assert_eq!(retained, 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(control.snapshot().result_windows.held_positions[2], 0);
+}
+
 impl crate::api::LogicalFactSource for ConsumerFacts {
     fn id(&self) -> novarocks_logical_execution_protocol::LogicalSourceId {
         novarocks_logical_execution_protocol::LogicalSourceId::new(std::num::NonZeroU64::MIN)
@@ -1714,7 +2438,7 @@ async fn assert_original_consumer_script(mode: ConsumerScript) {
     cut.native_body_exited().unwrap();
     drive_paid_native_fixture(&mut driver);
     assert_eq!(capacity.snapshot().held_positions[2], 1);
-    future.await;
+    let actual_join = tokio::spawn(future).await;
     let expected = if mode.factory_panics() || mode.poll_panics() {
         consumer_panic()
     } else {
@@ -1832,9 +2556,13 @@ async fn assert_original_consumer_script(mode: ConsumerScript) {
     drop(cleanup);
     assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
     assert_eq!(cleanup_drops.load(Ordering::SeqCst), 0);
-    // This is the exact join-receipt seam, not a credentialed FA Join test.
-    // A reported Join cannot certify an F destructor which did not return.
-    receive_tail_join(&joined.slot, Ok(())).unwrap();
+    // Consume the same actual Tokio Join. This is not a credentialed FA
+    // task test, and Join cannot certify an F destructor which did not return.
+    receive_tail_join(
+        &joined.slot,
+        actual_join.map_err(|original| Arc::new(original) as OriginalJoinFailure),
+    )
+    .unwrap();
     assert!(Arc::ptr_eq(&joined.slot, &slot));
     drop(joined);
     drive_paid_native_fixture(&mut driver);
@@ -1972,7 +2700,6 @@ async fn retire_preparation_keeps_real_reply_transport_and_consumer_aliases_unti
     );
     let seed = NativeLogicalExecutionSeed::issue(
         description.plan_identity(),
-        crate::coordination::PermanentlyBackpressuredAbortEffectPort::shared(),
         None,
         RetiringOriginalPreparation {
             drops: Arc::clone(&drops),
@@ -2027,9 +2754,7 @@ async fn retire_preparation_keeps_real_reply_transport_and_consumer_aliases_unti
     );
     assert!(consumer_entered.load(Ordering::SeqCst));
     drop(window);
-    let mut registry = crate::coordination::LogicalExecutionRuntimeRegistry::new(
-        tokio::runtime::Handle::current(),
-    );
+    let mut registry = crate::coordination::LogicalExecutionRuntimeRegistry::new();
     let handle = registry.handle();
     let mut reservation = handle.reserve(execution(1), vec![]).unwrap();
     let registration = reservation.runtime_registration();
@@ -2043,6 +2768,8 @@ async fn retire_preparation_keeps_real_reply_transport_and_consumer_aliases_unti
         ..OriginalNativePreparation::default()
     }));
     let original = NativeExecutor::new(
+        None,
+        Arc::new(super::UnboundInstalledAttemptPort),
         Arc::clone(&body),
         Weak::new(),
         handle,
@@ -2133,30 +2860,19 @@ async fn cleanup_adopts_actual_completed_activation_without_reissuing_and_keeps_
         }
         fn activate<'a>(
             &'a mut self,
+            _activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
             schedule: &'a AttemptSchedule,
             admissions: Option<Box<[crate::coordination::ReplacementWorkerAdmissionEvidence]>>,
             cancellation: CancellationView,
         ) -> crate::api::NativeAttemptActivationFuture<'a> {
-            self.inner.activate(schedule, admissions, cancellation)
+            self.inner
+                .activate(_activation_identity, schedule, admissions, cancellation)
         }
         fn converge<'a>(
             &'a mut self,
             _: CancellationView,
         ) -> crate::api::NativeAttemptConvergenceFuture<'a> {
             panic!("adopted output cleanup must not re-run dormant convergence");
-        }
-    }
-    #[derive(Debug)]
-    struct NoAbort(tokio::sync::watch::Sender<u64>);
-    impl crate::coordination::AbortParticipationEffectPort for NoAbort {
-        fn subscribe_capacity(&self) -> tokio::sync::watch::Receiver<u64> {
-            self.0.subscribe()
-        }
-        fn try_reserve(
-            &self,
-            _: crate::coordination::AbortParticipationIssueIdentity,
-        ) -> crate::coordination::AbortParticipationEffectAdmission {
-            panic!("this original fixture never issued a remote admission");
         }
     }
     for dormant_drop_panic in [false, true] {
@@ -2169,54 +2885,30 @@ async fn cleanup_adopts_actual_completed_activation_without_reissuing_and_keeps_
         work.business.release();
         let schedule = Arc::new(schedule());
         let source = OriginalLogicalExit::new();
-        let drops = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
         source.native.lock().await.dormant =
             crate::api::NativeDormantCustody::test_owner(DropDormant {
                 inner: DormantFixture {
+                    observed_activation: None,
                     factory_panic: false,
                     future_drop_panic: !dormant_drop_panic,
-                    active_drops: drops.clone(),
+                    activation_calls: calls.clone(),
+                    received: None,
                     gate: None,
                 },
                 panic_drop: dormant_drop_panic,
             });
-        let mut registry =
-            std::mem::ManuallyDrop::new(crate::coordination::LogicalExecutionRuntimeRegistry::new(
-                tokio::runtime::Handle::current(),
-            ));
-        let mut reserved = registry
-            .reserve_with_original_exit(
-                execution(1),
-                schedule.participations().to_vec(),
-                Some(source.clone()),
-            )
-            .unwrap();
-        let registration = reserved.runtime_registration();
-        let initial_activation = AttemptActivationIdentity::from_parts(
-            reserved.actor_instance().get(),
-            execution(1),
-            23,
+        let mut registry = std::mem::ManuallyDrop::new(
+            crate::coordination::LogicalExecutionRuntimeRegistry::new(),
         );
-        let (capacity, _) = tokio::sync::watch::channel(0);
-        let config = crate::coordination::LogicalExecutionActorConfig::single_attempt_completion(
-            execution(1),
-            novarocks_coordination_contract::ExecutionEffect::None,
-            std::num::NonZeroUsize::new(4).unwrap(),
-            schedule.participations().to_vec(),
-            std::num::NonZeroUsize::new(2).unwrap(),
-            std::num::NonZeroUsize::new(2).unwrap(),
-            work.owner,
-            stage,
-        )
-        .unwrap()
-        .with_abort_participation_effect_port(
-            Arc::new(NoAbort(capacity)),
-            std::num::NonZeroUsize::new(2).unwrap(),
+        let (registration, issued, scripted_exit) = crate::coordination::runtime_registry::runtime_tests::install_native_component_runtime_for_original(
+            &registry.handle(), execution(1), schedule.participations().to_vec(), Some(source.clone()),
         );
-        let installed = reserved.spawn_and_install(config).unwrap();
-        let (_legacy_registration, initializing, output) = installed.into_parts();
-        let _output = output.into_output();
+        let initial_activation =
+            AttemptActivationIdentity::from_parts(issued.actor().get(), execution(1), 23);
         let native = NativeExecutor::new(
+            None,
+            Arc::new(super::UnboundInstalledAttemptPort),
             source.native.clone(),
             Arc::downgrade(&source),
             registry.handle(),
@@ -2246,9 +2938,9 @@ async fn cleanup_adopts_actual_completed_activation_without_reissuing_and_keeps_
             .pending_activated
             .as_ref()
             .unwrap()
-            .staged_owner_address()
+            .staged_slot_address()
             .unwrap();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(registry.active_native_custody_count(), 1);
         let pending_inventory = native.cleanup_inventory().unwrap();
         assert_eq!(pending_inventory.initial_activation, initial_activation);
@@ -2284,12 +2976,8 @@ async fn cleanup_adopts_actual_completed_activation_without_reissuing_and_keeps_
             .unwrap()
             .owner
             .clone();
-        assert_eq!(
-            active.lock().await.as_mut() as *mut dyn crate::api::ActiveNativeAttemptOwner as *mut ()
-                as usize,
-            address
-        );
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(active.lock().await.slot_address(), address);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             native.adopt_pending_activation_for_cleanup().await.unwrap(),
             None
@@ -2327,39 +3015,26 @@ async fn cleanup_adopts_actual_completed_activation_without_reissuing_and_keeps_
             native.has_unhandled_failure(),
             "original poll/Drop cause remains present after adoption"
         );
-        // ActiveFixture has no local asynchronous resource; the fixture-only
-        // finish binding below supplies only that original local wait.
-        let mut owner = active.lock().await;
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        let finished = owner
-            .as_mut()
-            .finish_installed(crate::api::NativeActiveConvergenceRequest::new(
-                cancellation,
-                std::time::Instant::now(),
-            ))
-            .await;
-        assert!(finished.is_ok());
-        owner.retire_local();
-        drop(owner);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert_eq!(registry.active_native_custody_count(), 0);
+        assert_eq!(registry.active_native_custody_count(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!native.cleanup_inventory().unwrap().active[0].resources_exited);
         assert!(native.has_unhandled_failure());
         assert_eq!(
             source.native.lock().await.dormant.drop_unproven(),
             dormant_drop_panic
         );
-        registry
-            .actor(&registration)
-            .unwrap()
-            .initialization_failed(initializing)
-            .await
-            .unwrap();
         drop(active);
         drop(native);
-        // This source intentionally retains an original raw Drop failure.
-        // Local resource cleanup is not whole-query health/admission evidence.
+        assert_eq!(registry.active_native_custody_count(), 1);
+        assert!(registry.process_health().is_some());
+        // The registry seam supplied no actual FA Source/Native exit. Its
+        // unresolved original return is disposed only for this process probe.
         registry.abandon_for_process_exit();
+        drop(scripted_exit);
         drop(std::mem::ManuallyDrop::into_inner(registry));
+        stage.release();
+        work.owner.complete();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -2539,5 +3214,629 @@ fn qualification_cancel_keeps_original_resources_and_abandon_transfers_them_befo
         drop(storage);
         assert_eq!(abandons.load(Ordering::SeqCst), 1);
         assert_eq!(finishes.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[path = "tests/read_seal.rs"]
+mod read_seal;
+
+// Same production wait used by NativeExecutor::prepare; no Native/AP exit or
+// replacement admission is authored by this physical wait component.
+#[tokio::test(start_paused = true)]
+async fn already_polled_original_preparation_keeps_its_first_deadline_cancel_reason_and_actual_drop()
+ {
+    #[derive(Clone, Copy, Debug)]
+    enum Finish {
+        RepeatedDeadline,
+        Requested,
+        DeadlineReason,
+        Released,
+    }
+    struct OriginalPending {
+        release: Arc<AtomicBool>,
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        received: Arc<AtomicBool>,
+    }
+    impl Future for OriginalPending {
+        type Output = u64;
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<u64> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.release.load(Ordering::SeqCst) {
+                Poll::Ready(41)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+    impl Drop for OriginalPending {
+        fn drop(&mut self) {
+            if self.release.load(Ordering::SeqCst) {
+                assert!(
+                    self.received.load(Ordering::SeqCst),
+                    "same output is captured before original F Drop"
+                );
+            }
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct OriginalOwners {
+        control: Option<novarocks_workload_control::WorkloadControl>,
+        work: Option<novarocks_workload_control::RootWork>,
+    }
+    struct KeepWhole(Option<Box<OriginalOwners>>);
+    impl Drop for KeepWhole {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                static ORIGINALS: std::sync::OnceLock<Mutex<Vec<Box<dyn std::any::Any + Send>>>> =
+                    std::sync::OnceLock::new();
+                if let Some(original) = self.0.take() {
+                    ORIGINALS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(original);
+                }
+            }
+        }
+    }
+    for finish in [
+        Finish::RepeatedDeadline,
+        Finish::Requested,
+        Finish::DeadlineReason,
+        Finish::Released,
+    ] {
+        let (control, work) = cancellation_work();
+        let mut keep = KeepWhole(Some(Box::new(OriginalOwners {
+            control: Some(control),
+            work: Some(work),
+        })));
+        let original = keep.0.as_deref_mut().unwrap();
+        let scope = original.work.as_ref().unwrap().owner.scope();
+        let cancellation = scope.cancellation().unwrap();
+        let first_deadline = tokio::time::Instant::now() + Duration::from_secs(50);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let causes = FutureCauses::default();
+        let mut returns = Vec::new();
+        for ordinal in 0..if matches!(finish, Finish::RepeatedDeadline) {
+            2
+        } else {
+            1
+        } {
+            let release = Arc::new(AtomicBool::new(false));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let received = Arc::new(AtomicBool::new(false));
+            let future = Box::pin(OriginalPending {
+                release: release.clone(),
+                polls: polls.clone(),
+                drops: drops.clone(),
+                received: received.clone(),
+            });
+            let mut actual_wait = Box::pin(poll_original(
+                future,
+                &causes,
+                Some(&cancellation),
+                Some(first_deadline),
+                |value| {
+                    received.store(true, Ordering::SeqCst);
+                    returns.push(value);
+                },
+            ));
+            assert!(
+                futures::poll!(actual_wait.as_mut()).is_pending(),
+                "{finish:?} ordinal {ordinal}"
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), ordinal);
+            let expected = match finish {
+                Finish::RepeatedDeadline if ordinal == 0 => {
+                    tokio::time::advance(Duration::from_secs(20)).await;
+                    release.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+                Finish::RepeatedDeadline => {
+                    assert_eq!(
+                        first_deadline.duration_since(tokio::time::Instant::now()),
+                        Duration::from_secs(30)
+                    );
+                    tokio::time::advance(Duration::from_secs(30)).await;
+                    Err(WaitFailure::Deadline)
+                }
+                Finish::Requested | Finish::DeadlineReason => {
+                    let reason = if matches!(finish, Finish::Requested) {
+                        CancellationReason::Requested
+                    } else {
+                        CancellationReason::DeadlineExceeded
+                    };
+                    original
+                        .work
+                        .as_ref()
+                        .unwrap()
+                        .owner
+                        .cancellation_requester()
+                        .request(reason.clone())
+                        .unwrap();
+                    original
+                        .work
+                        .as_ref()
+                        .unwrap()
+                        .owner
+                        .cancellation_requester()
+                        .request(CancellationReason::Requested)
+                        .unwrap();
+                    assert_eq!(cancellation.reason(), Some(reason.clone()));
+                    Err(WaitFailure::Cancelled(reason))
+                }
+                Finish::Released => {
+                    tokio::time::advance(Duration::from_secs(20)).await;
+                    assert!(tokio::time::Instant::now() < first_deadline);
+                    release.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            };
+            let succeeded = expected.is_ok();
+            assert_eq!(actual_wait.await, expected, "{finish:?} ordinal {ordinal}");
+            assert_eq!(
+                received.load(Ordering::SeqCst),
+                succeeded,
+                "only an actual Ready output is transferred"
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), ordinal + 1);
+            assert_eq!(received.load(Ordering::SeqCst), succeeded);
+            assert_eq!(polls.load(Ordering::SeqCst), if succeeded { 2 } else { 1 });
+        }
+        assert_eq!(
+            returns,
+            if matches!(finish, Finish::RepeatedDeadline | Finish::Released) {
+                vec![41]
+            } else {
+                Vec::new()
+            }
+        );
+        assert!(
+            !causes.failed(),
+            "ordinary expiry/cancel is not raw panic health"
+        );
+        drop(cancellation);
+        let work = original.work.take().unwrap();
+        work.business.release();
+        while let Some(control) = original.control.as_ref().unwrap().next_control() {
+            control.acknowledge();
+        }
+        work.owner.complete_after_terminal_cancel_settled();
+        scope.wait_released().await;
+        assert_eq!(
+            original
+                .control
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .root_responsibilities,
+            0
+        );
+        original.control.as_ref().unwrap().close_admission();
+        if let Err(failure) = original.control.take().unwrap().shutdown() {
+            let (error, control) = failure.into_parts();
+            original.control = Some(control);
+            panic!("same original wait component refused actual shutdown: {error}");
+        }
+    }
+}
+
+#[test]
+fn missing_rows_runtime_keeps_original_query_6_execution_presentation_without_task_location() {
+    use crate::execution_error::ExecutionFailurePresentation;
+    // The same pure author is invoked by the public Core's initial/successor
+    // activation-result sequences. Presentation remains QA-owned.
+    let error = novarocks_logical_execution_protocol::failure::missing_rows_runtime();
+    assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+    let input = error.execution_failure().unwrap();
+    assert_eq!(
+        input.fact(),
+        QueryFailureReason::ResultProtocol.failure_fact()
+    );
+    assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+    assert_eq!(
+        input.user_error().phase(),
+        novarocks_user_error::ErrorPhase::Execution
+    );
+    assert_eq!(input.user_error().location(), None);
+    assert_eq!(
+        error.message(),
+        "Native activated a row execution without its root result runtime"
+    );
+}
+
+// Original passive-return custody tier. Both exact execution ordinals use the
+// SAME production activation/receive/stage/retire methods. This component does
+// not issue qualification permission or manufacture an AP/Native exit receipt.
+#[tokio::test]
+async fn initial_and_successor_rows_stay_in_same_original_return_slot_after_dormant_drop_panics() {
+    use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass};
+    struct OriginalReadPort {
+        drops: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+    }
+    impl BoundedRootReadPort for OriginalReadPort {
+        fn read(
+            &self,
+            _: novarocks_execution_contract::root_result::RootResultRead,
+            _: novarocks_workload_control::ResultWindowAlias,
+        ) -> LogicalFuture<
+            'static,
+            Result<crate::api::RetainedRootReply, crate::coordination::RootResultFetchFailure>,
+        > {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            panic!("return-custody test must not issue Root IO");
+        }
+        fn seal(
+            &self,
+            _: novarocks_execution_contract::root_lifetime::RootReadSealed,
+        ) -> Result<(), QueryExecutionError> {
+            panic!("return-custody test must not fabricate read close");
+        }
+    }
+    impl Drop for OriginalReadPort {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct OriginalDormantDrop {
+        ordinal: u64,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for OriginalDormantDrop {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct OriginalRowsDormant {
+        binding: Option<crate::coordination::RootRelayBinding>,
+        calls: Arc<AtomicUsize>,
+        owner_drops: Arc<AtomicUsize>,
+        raw_drops: Arc<AtomicUsize>,
+        ordinal: u64,
+    }
+    impl std::fmt::Debug for OriginalRowsDormant {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("OriginalRowsDormant")
+        }
+    }
+    impl Drop for OriginalRowsDormant {
+        fn drop(&mut self) {
+            self.owner_drops.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(OriginalDormantDrop {
+                ordinal: self.ordinal,
+                drops: self.raw_drops.clone(),
+            });
+        }
+    }
+    impl crate::api::DormantNativeAttemptOwner for OriginalRowsDormant {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            &[]
+        }
+        fn poll_bind_qualification(
+            &mut self,
+            _: &AttemptSchedule,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            panic!("physical return test never claims qualification");
+        }
+        fn activate<'a>(
+            &'a mut self,
+            activation: AttemptActivationIdentity,
+            _: &'a AttemptSchedule,
+            _: Option<Box<[crate::coordination::ReplacementWorkerAdmissionEvidence]>>,
+            _: CancellationView,
+        ) -> crate::api::NativeAttemptActivationFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let same_binding = self.binding.take().unwrap();
+            Box::pin(async move {
+                Ok(crate::api::ActivatedNativeAttempt::relayed_rows(
+                    activation,
+                    same_binding,
+                ))
+            })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            _: CancellationView,
+        ) -> crate::api::NativeAttemptConvergenceFuture<'a> {
+            panic!("a dormant destructor panic cannot restart cleanup");
+        }
+    }
+    struct Originals {
+        control: Option<novarocks_workload_control::WorkloadControl>,
+        work: Option<novarocks_workload_control::RootWork>,
+        window: Option<novarocks_workload_control::ResultWindowGrant>,
+        registry: Option<crate::coordination::LogicalExecutionRuntimeRegistry>,
+        source: Option<Arc<OriginalLogicalExit>>,
+        reservation: Option<crate::coordination::NativeActivationReservationObligation>,
+        scripted_exit: Option<Box<dyn FnOnce() + Send>>,
+        causes: FutureCauses,
+    }
+    struct KeepWhole(Option<Box<Originals>>);
+    impl Drop for KeepWhole {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                static ORIGINALS: std::sync::OnceLock<Mutex<Vec<Box<dyn std::any::Any + Send>>>> =
+                    std::sync::OnceLock::new();
+                if let Some(original) = self.0.take() {
+                    ORIGINALS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(original);
+                }
+            }
+        }
+    }
+    for ordinal in [1, 2] {
+        let control = novarocks_workload_control::WorkloadControl::try_new(
+            novarocks_workload_control::WorkloadConfig::default(),
+            novarocks_workload_control::ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 12,
+                per_scope_bytes: 1 << 18,
+            },
+        )
+        .unwrap();
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        let work = control
+            .try_begin_root(novarocks_workload_control::WorkRequest::new(
+                novarocks_workload_control::WorkClass::Query,
+            ))
+            .unwrap();
+        let scope = work.owner.scope();
+        let window = capacity
+            .try_acquire(&scope, ResultWindowClass::Client)
+            .unwrap();
+        let registry = crate::coordination::LogicalExecutionRuntimeRegistry::new();
+        let source = OriginalLogicalExit::new();
+        let initial_schedule = schedule();
+        let (registration, issued, scripted_exit) = crate::coordination::runtime_registry::runtime_tests::install_native_component_runtime_for_original(
+            &registry.handle(), execution(1), initial_schedule.participations().to_vec(), Some(source.clone()),
+        );
+        // One initial Registry registration; the second return has the SAME
+        // logical actor/query and its distinct original attempt/generation.
+        let original_facts = crate::api::ExecutionSchedulingFacts {
+            topological_fragment_order: vec![1],
+            execution_anchor_fragment_id: 1,
+            fragments: vec![crate::api::FragmentSchedulingFacts {
+                fragment_id: 1,
+                placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+                scans: vec![],
+            }],
+            edges: vec![],
+        };
+        let exact_schedule = build_attempt_schedule(
+            execution(ordinal),
+            initial_schedule.participations()[0].frontend_process_id(),
+            &[initial_schedule.root().backend_process_id()],
+            &original_facts,
+            #[cfg(novarocks_dev_controls)]
+            Ok(None),
+        )
+        .unwrap();
+        assert_eq!(
+            exact_schedule.participations()[0].frontend_process_id(),
+            initial_schedule.participations()[0].frontend_process_id()
+        );
+        let expected = AttemptActivationIdentity::from_parts(
+            issued.actor().get(),
+            execution(ordinal),
+            22 + ordinal,
+        );
+        let reservation = registry
+            .handle()
+            .reserve_active_native_owner(
+                &registration,
+                expected.execution(),
+                exact_schedule.participations(),
+            )
+            .unwrap();
+        let port_drops = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let port = Arc::new(OriginalReadPort {
+            drops: port_drops.clone(),
+            reads: reads.clone(),
+        });
+        let exact_port = Arc::downgrade(&port);
+        let address = Arc::as_ptr(&port) as usize;
+        let binding = crate::coordination::RootRelayBinding {
+            port,
+            frontier: crate::coordination::RootRelayFrontier::new(
+                exact_schedule.root(),
+                novarocks_result_contract::RootProfileId::V1,
+                novarocks_result_contract::RootOutputKind::ClientRows,
+                Some(
+                    novarocks_result_contract::ClientRowProfile::try_new(
+                        novarocks_result_contract::RootProfileV1::SEGMENT_BYTES,
+                        1 << 20,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap(),
+            window: window.retain_alias(),
+            max_wait: Duration::from_millis(1),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let owner_drops = Arc::new(AtomicUsize::new(0));
+        let raw_drops = Arc::new(AtomicUsize::new(0));
+        source.native.lock().await.dormant =
+            crate::api::NativeDormantCustody::test_owner(OriginalRowsDormant {
+                binding: Some(binding),
+                calls: calls.clone(),
+                owner_drops: owner_drops.clone(),
+                raw_drops: raw_drops.clone(),
+                ordinal,
+            });
+        let mut keep = KeepWhole(Some(Box::new(Originals {
+            control: Some(control),
+            work: Some(work),
+            window: Some(window),
+            registry: Some(registry),
+            source: Some(source.clone()),
+            reservation: Some(reservation),
+            scripted_exit: Some(Box::new(scripted_exit)),
+            causes: FutureCauses::default(),
+        })));
+        let original = keep.0.as_deref_mut().unwrap();
+        {
+            let mut body = source.native.lock().await;
+            let OriginalNativePreparation {
+                dormant,
+                pending_activated,
+                ..
+            } = &mut *body;
+            let (owner, raw_activation, _) = dormant.activation_parts().unwrap();
+            let future = start_activation(
+                owner,
+                expected,
+                &exact_schedule,
+                None,
+                scope.cancellation().unwrap(),
+                raw_activation,
+            )
+            .unwrap();
+            assert_eq!(
+                poll_original(future, &original.causes, None, None, |result| {
+                    original
+                        .reservation
+                        .as_ref()
+                        .unwrap()
+                        .receive_activated_in(pending_activated, result.unwrap());
+                })
+                .await,
+                Ok(())
+            );
+            original
+                .reservation
+                .as_ref()
+                .unwrap()
+                .stage_activated_in(expected, exact_schedule.root(), pending_activated)
+                .unwrap();
+            assert_eq!(
+                pending_activated.as_ref().unwrap().staged_execution(),
+                Some(expected.execution())
+            );
+            assert!(
+                pending_activated
+                    .as_ref()
+                    .unwrap()
+                    .staged_slot_address()
+                    .is_some()
+            );
+            let raw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dormant.retire()))
+                .expect_err("actual original dormant destructor panics");
+            original.causes.retain(raw, false);
+            assert!(dormant.drop_unproven());
+            assert!(dormant.activation_parts().is_none());
+            assert_eq!(
+                dormant.retire(),
+                Err(()),
+                "the same unproven destructor cannot be retried"
+            );
+            assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
+        }
+        drop(original.window.take());
+        drop(original.reservation.take());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(port_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            exact_port.upgrade().map(|p| Arc::as_ptr(&p) as usize),
+            Some(address)
+        );
+        assert_eq!(capacity.snapshot().held_positions[0], 1);
+        assert_eq!(
+            original
+                .causes
+                .primary
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<OriginalDormantDrop>()
+                .unwrap()
+                .ordinal,
+            ordinal
+        );
+        assert_eq!(raw_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            original
+                .registry
+                .as_ref()
+                .unwrap()
+                .active_native_custody_count(),
+            1
+        );
+        assert!(
+            original
+                .registry
+                .as_mut()
+                .unwrap()
+                .shutdown_until(Instant::now())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            source
+                .native
+                .lock()
+                .await
+                .pending_activated
+                .as_ref()
+                .unwrap()
+                .staged_execution(),
+            Some(expected.execution())
+        );
+        assert_eq!(
+            port_drops.load(Ordering::SeqCst),
+            0,
+            "failed shutdown is not the original rows disposition"
+        );
+        assert_eq!(
+            owner_drops.load(Ordering::SeqCst),
+            1,
+            "unproven original destructor is never retried"
+        );
+        // Task-free component process disposition only. No scripted Runtime
+        // exit closure is called and no Native/AP Scope exit is asserted.
+        original
+            .registry
+            .as_mut()
+            .unwrap()
+            .abandon_for_process_exit();
+        drop(source.native.lock().await.pending_activated.take());
+        assert_eq!(
+            port_drops.load(Ordering::SeqCst),
+            1,
+            "same original Source rows are destroyed exactly once"
+        );
+        assert!(exact_port.upgrade().is_none());
+        assert_eq!(capacity.snapshot().held_positions[0], 0);
+        assert_eq!(raw_drops.load(Ordering::SeqCst), 0);
+        drop(original.causes.primary.lock().unwrap().take());
+        assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
+        drop(original.scripted_exit.take());
+        drop(original.source.take());
+        drop(source);
+        drop(original.registry.take());
+        let work = original.work.take().unwrap();
+        work.business.release();
+        work.owner.complete();
+        scope.wait_released().await;
+        original.control.as_ref().unwrap().close_admission();
+        if let Err(failure) = original.control.take().unwrap().shutdown() {
+            let (error, control) = failure.into_parts();
+            original.control = Some(control);
+            panic!("original return-custody component refused physical shutdown: {error}");
+        }
     }
 }

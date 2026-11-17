@@ -20,7 +20,6 @@ use super::*;
 use crate::task_execution::intent::TaskOperationQueuePermit;
 #[cfg(test)]
 use crate::task_execution::intent::{TaskOperationQueuePreparation, TaskOperationQueueRequest};
-use novarocks_resource_contract::ExistingOwnerRetentionPin;
 #[cfg(test)]
 use novarocks_workload_control::joint_admission::JointLane;
 use novarocks_workload_control::{
@@ -60,20 +59,6 @@ impl TaskOperationQueuePermit for NativeInputQueuePermit {
     }
     fn native_dispatch_input(&self) -> Option<&NativeQueuedInputGrant> {
         self.input.as_ref()
-    }
-    fn native_input_retention(&self) -> Result<Option<ExistingOwnerRetentionPin>, WorkError> {
-        self.input
-            .as_ref()
-            .ok_or(WorkError::Released)?
-            .retain_payload()
-            .map(Some)
-            .map_err(|error| match error {
-                novarocks_resource_contract::RetentionPinError::Released => WorkError::Released,
-                novarocks_resource_contract::RetentionPinError::Conflict => WorkError::Conflict,
-                novarocks_resource_contract::RetentionPinError::Overflow => {
-                    WorkError::ArithmeticOverflow
-                }
-            })
     }
 }
 struct OriginalQueueCleanupFailure {
@@ -119,10 +104,19 @@ fn metadata(bytes: usize) -> Result<std::num::NonZeroU64, WorkError> {
         .ok_or(WorkError::Conflict)
 }
 pub(crate) fn queued_header_quote(payload: usize) -> Result<NativeQueuedInputQuote, WorkError> {
-    let bytes = Layout::new::<NativeInputQueuePermit>()
-        .size()
-        .checked_add(crate::task_execution::dispatch::queued_operation_layout().size())
-        .ok_or(WorkError::ArithmeticOverflow)?;
+    // The actual fixture batch owns two exact-capacity resident vectors.
+    // Charge their real element types plus this original paid permit Box;
+    // no retired dispatcher row, DTO bytes or synthetic carrier is priced.
+    let bytes = crate::task_execution::intent::DispatchBatch::queued_entry_layouts()
+        .into_iter()
+        .try_fold(
+            Layout::new::<NativeInputQueuePermit>().size(),
+            |bytes, entry| {
+                bytes
+                    .checked_add(entry.size())
+                    .ok_or(WorkError::ArithmeticOverflow)
+            },
+        )?;
     Ok(NativeQueuedInputQuote::for_original_native_input(
         metadata(bytes)?,
         u64::try_from(payload).map_err(|_| WorkError::ArithmeticOverflow)?,
@@ -150,12 +144,6 @@ pub(crate) fn queued_intent_quote(
     // Immutable original content already has its own creator/retention owner.
     // Enqueue clones only those existing aliases. DTO/encoding copies belong
     // to the later actual action quote, not to an encoded-length byte guess.
-    queued_header_quote(0)
-}
-#[cfg(test)]
-pub(crate) fn queued_update_quote(
-    _update: &novarocks_execution::task_execution::TaskDomainUpdate,
-) -> Result<NativeQueuedInputQuote, WorkError> {
     queued_header_quote(0)
 }
 

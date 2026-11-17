@@ -95,14 +95,17 @@ impl AttemptFactBank {
         }
         if !slot.closed && slot.position.is_none() {
             state.slots[role.index()].failure_waiting = true;
+            state.slots[role.index()].attempt_waiting = true;
             return Ok(None);
         }
         if slot.submitted.is_some() || slot.prepared.is_some() {
+            state.slots[role.index()].attempt_waiting = true;
             return Ok(None);
         }
         if let Some(position) = slot.position.as_ref()
             && position.in_flight()?.is_some()
         {
+            state.slots[role.index()].attempt_waiting = true;
             return Ok(None);
         }
         let mut failed = self
@@ -117,6 +120,7 @@ impl AttemptFactBank {
             // partial bindings installed their prepaid-Work cell at construction.
             let Some(original) = state.slots[0].position.as_ref() else {
                 state.slots[0].failure_waiting = true;
+                state.slots[0].attempt_waiting = true;
                 return Ok(None);
             };
             failed.cell = Some(
@@ -238,8 +242,67 @@ impl FailedReceiverRetirementObligation<'_> {
             failed.retiring = false;
             failed.retired = true;
         }
-        self.bank.changed.notify_one();
+        self.bank.notify_change();
         Ok(())
+    }
+}
+
+impl super::FactPositionLoanObligation {
+    /// Convert the still-unsubmitted original position after its exact receiver
+    /// failed. This Source already holds the sole producer loan. Use that SAME
+    /// paid position to bind the passive cell, without waiting on an unrelated
+    /// Lifecycle reader loan or releasing the current AP ticket.
+    pub(crate) fn into_failed_receiver(
+        self,
+        runtime: &ActorRuntime<FrontendActor>,
+        proof: &ActorFailureProof,
+    ) -> Result<FailedReceiverLoanObligation, (ActorTurnError, Self)> {
+        if !proof.registration().same_registration(&self.bank.logical)
+            || self.submitted.is_some()
+            || self.prepared.is_some()
+        {
+            return Err((ActorTurnError::PublicationTargetMismatch, self));
+        }
+        let bound = (|| {
+            let state = self.bank.lock();
+            let mut failed = self
+                .bank
+                .failed_receiver
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if state.producer_exited || failed.retired || failed.retiring || failed.loaned {
+                return Err(ActorTurnError::InputAuthorMismatch);
+            }
+            if failed.cell.is_none() {
+                failed.cell = Some(
+                    runtime
+                        .receiver_failed_snapshot_for(
+                            self.position
+                                .as_ref()
+                                .expect("same unsubmitted original position"),
+                            &self.bank.attempt,
+                            Arc::new(FailedReceiverFact::default()),
+                        )
+                        .map_err(|(error, _)| error)?,
+                );
+            }
+            if failed.reader.is_none() {
+                failed.reader = failed.cell.as_ref().map(|cell| cell.reader());
+            }
+            failed.loaned = true;
+            Ok(FailedReceiverLoanObligation {
+                bank: self.bank.clone(),
+                role: self.role,
+                cell: failed.cell.take(),
+            })
+        })();
+        match bound {
+            Ok(original) => {
+                drop(self);
+                Ok(original)
+            }
+            Err(error) => Err((error, self)),
+        }
     }
 }
 
@@ -252,6 +315,41 @@ pub(crate) struct FailedReceiverLoanObligation {
     cell: Option<ReceiverFailedSnapshotObligation<FailedReceiverFact>>,
 }
 impl FailedReceiverLoanObligation {
+    pub(crate) fn publish_root_reply_now(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        failure: &ActorFailureProof,
+        message: AttemptToLogical,
+    ) -> Result<RootReplyFactHandoff, FactPublishRefusal> {
+        let valid = matches!(&ticket.effect, FrontendEffect::Attempt(effect) if same_root_reply(effect, &message));
+        if !valid {
+            return Err(FactPublishRefusal {
+                error: FactError::WrongMessage,
+                message,
+            });
+        }
+        self.publish_now(runtime, ticket, failure, message)?;
+        Ok(root_reply_handoff(self.bank.activation, ticket))
+    }
+    pub(crate) fn publish_root_status_now(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        failure: &ActorFailureProof,
+        message: AttemptToLogical,
+    ) -> Result<RootStatusFactReceipt, FactPublishRefusal> {
+        if !is_root_status_fact(ticket)
+            || !matches!(message.body, AttemptToLogicalBody::RootStatus(_))
+        {
+            return Err(FactPublishRefusal {
+                error: FactError::WrongMessage,
+                message,
+            });
+        }
+        self.publish_now(runtime, ticket, failure, message)?;
+        Ok(root_status_receipt(self.bank.activation, ticket))
+    }
     pub(crate) fn publish_now(
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
@@ -276,20 +374,7 @@ impl FailedReceiverLoanObligation {
             let FrontendEffect::Attempt(effect) = &ticket.effect else {
                 return Err(FactError::WrongMessage);
             };
-            let original = match &effect.protocol.body {
-                novarocks_attempt_protocol::effect::EffectBody::Port(original)
-                | novarocks_attempt_protocol::effect::EffectBody::EstablishAuthorization {
-                    request: original,
-                    ..
-                } => original,
-                _ => return Err(FactError::WrongMessage),
-            };
-            if original.activation != message.activation
-                || original.action != message.action
-                || effect.protocol.id != message.action
-            {
-                return Err(FactError::WrongMessage);
-            }
+            let original = checked_original_message(effect, self.bank.activation, &message)?;
             let completion = exact_original_completion(original, &message)?;
             if let Some(receipt) = &completion
                 && self
@@ -308,6 +393,7 @@ impl FailedReceiverLoanObligation {
             Err(error) => return Err(FactPublishRefusal { error, message }),
         };
         let cell = self.cell.as_ref().expect("original failed-receiver loan");
+        let observation = self.bank.prepare_observation(&message);
         let previous = cell.read();
         let completion = completion.or_else(|| previous.completion.clone());
         let next = Arc::new(FailedReceiverFact {
@@ -322,6 +408,9 @@ impl FailedReceiverLoanObligation {
                 self.bank
                     .retain_failed_receiver_completion(&original)
                     .expect("same original committed completion");
+                if let Some(original) = observation {
+                    original.committed();
+                }
                 drop(old);
                 Ok(())
             }
@@ -407,18 +496,18 @@ impl Drop for FailedReceiverLoanObligation {
             state.loaned = false;
         }
         wake_returned(|| {
-            self.bank.changed.notify_one();
+            self.bank.notify_change();
             self.bank.logical_wake.wake_by_ref();
             self.bank.attempt_wake.wake_by_ref();
         });
     }
 }
 
-fn exact_original_completion<F>(
-    original: &novarocks_coordination_contract::AttemptToLogical<F>,
+pub(super) fn exact_original_completion<F>(
+    original: &novarocks_attempt_protocol::port_output::AttemptToLogical<F>,
     message: &AttemptToLogical,
 ) -> Result<Option<OriginalAttemptCompletionReceipt>, FactError> {
-    use novarocks_coordination_contract::AttemptToLogicalBody as Original;
+    use novarocks_attempt_protocol::port_output::AttemptToLogicalBody as Original;
     match (&original.body, &message.body) {
         (
             Original::ConvergenceProgress {

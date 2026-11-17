@@ -14,10 +14,10 @@
 // specific language governing permissions and limitations
 // under the License.
 use super::*;
+use crate::port_output::{AbortIssueSettlement, AttemptToLogical, AttemptToLogicalBody};
 use novarocks_coordination_contract::{
-    AbortIssueSettlement, AttemptActionId, AttemptActivationIdentity, AttemptRequestToken,
-    AttemptToLogical, AttemptToLogicalBody, ExecutionFailure, SelectedTaskTermination,
-    logical_port as lp,
+    AttemptActionId, AttemptActivationIdentity, AttemptRequestToken, ExecutionFailure,
+    SelectedTaskTermination, logical_port as lp,
 };
 use novarocks_execution_contract::{
     ParticipationReceipt, ParticipationState, TaskFailure, TaskIdentity, TerminationDetail,
@@ -243,14 +243,17 @@ fn roundtrip_failure(original: ExecutionFailure) {
             failure: original.clone(),
         },
     };
-    let projected = project_logical_message(&message);
+    let crate::input::AttemptInput::Port(projected) = crate::input::AttemptInput::Port(message)
+    else {
+        unreachable!()
+    };
     let novarocks_coordination_contract::LogicalToAttemptBody::Stop { failure, .. } =
         projected.body
     else {
         unreachable!()
     };
     assert_eq!(
-        project_failure(&failure, &mut |_| panic!(
+        project_failure(&AttemptFailure::Logical(failure.clone()), &mut |_| panic!(
             "passive logical cause must not mint or resolve a HostRef"
         ))
         .unwrap(),
@@ -259,9 +262,9 @@ fn roundtrip_failure(original: ExecutionFailure) {
     let returned = AttemptToLogical {
         activation: a,
         action: action(11),
-        body: AttemptToLogicalBody::AttemptTerminal(
-            novarocks_coordination_contract::AttemptTerminal::Failed(failure),
-        ),
+        body: AttemptToLogicalBody::AttemptTerminal(crate::port_output::AttemptTerminal::Failed(
+            AttemptFailure::Logical(failure),
+        )),
     };
     let passive = project_attempt_message(
         &returned,
@@ -325,7 +328,7 @@ fn logical_replacement_witness_roundtrips_with_same_definitive_input() {
     roundtrip_failure(original);
 }
 #[test]
-fn reverse_budget_and_settlement_failures_keep_exact_passive_author_and_token() {
+fn direct_budget_and_settlement_inputs_keep_exact_passive_author_and_token() {
     let (a, _, _) = identity();
     let token = AttemptRequestToken::new(NonZeroU64::new(19).unwrap());
     let original = ExecutionFailure::from_input(failure_input(
@@ -342,9 +345,12 @@ fn reverse_budget_and_settlement_failures_keep_exact_passive_author_and_token() 
             )),
         },
     };
-    let reverse = project_logical_message(&passive);
+    let crate::input::AttemptInput::Port(reverse) = crate::input::AttemptInput::Port(passive)
+    else {
+        unreachable!()
+    };
     assert!(
-        matches!(reverse.body,novarocks_coordination_contract::LogicalToAttemptBody::AuthorizationReply{token:actual,decision:Err(novarocks_coordination_contract::AttemptAuthorizationFailure::EstablishBudgetExhausted(AttemptFailure::Logical(error)))}if actual==token&&error==original)
+        matches!(reverse.body,novarocks_coordination_contract::LogicalToAttemptBody::AuthorizationReply{token:actual,decision:Err(novarocks_coordination_contract::AttemptAuthorizationFailure::EstablishBudgetExhausted(error))}if actual==token&&error==original)
     );
     let authorization =
         novarocks_coordination_contract::AttemptAuthorizationRef::new(NonZeroU64::new(23).unwrap());
@@ -356,12 +362,15 @@ fn reverse_budget_and_settlement_failures_keep_exact_passive_author_and_token() 
             result: Err(original.clone()),
         },
     };
-    let reverse = project_logical_message(&passive);
+    let crate::input::AttemptInput::Port(reverse) = crate::input::AttemptInput::Port(passive)
+    else {
+        unreachable!()
+    };
     assert_eq!(reverse.activation, a);
     let novarocks_coordination_contract::LogicalToAttemptBody::EstablishSettlementReply {
         token: actual_token,
         authorization: actual_authorization,
-        result: Err(AttemptFailure::Logical(error)),
+        result: Err(error),
     } = reverse.body
     else {
         panic!("same original settlement rejection");
@@ -371,7 +380,7 @@ fn reverse_budget_and_settlement_failures_keep_exact_passive_author_and_token() 
     assert_eq!(error, original);
 }
 #[test]
-fn missing_original_establish_and_obsolete_detach_are_explicit_not_guessed() {
+fn missing_original_establish_is_explicit_not_guessed() {
     let (a, p, op) = identity();
     let token = AttemptRequestToken::new(NonZeroU64::new(19).unwrap());
     let message = AttemptToLogical {
@@ -379,7 +388,7 @@ fn missing_original_establish_and_obsolete_detach_are_explicit_not_guessed() {
         action: action(12),
         body: AttemptToLogicalBody::AuthorizationRequest {
             token,
-            request: novarocks_coordination_contract::AttemptAuthorization::Establish {
+            request: crate::port_output::AttemptAuthorization::Establish {
                 participation: p,
                 operation_id: op,
             },
@@ -394,28 +403,6 @@ fn missing_original_establish_and_obsolete_detach_are_explicit_not_guessed() {
             participation: p,
             operation_id: op
         }
-    );
-    let detached = AttemptToLogical {
-        activation: a,
-        action: action(13),
-        body: AttemptToLogicalBody::DetachEstablish {
-            token,
-            authorization: novarocks_coordination_contract::AttemptAuthorizationRef::new(
-                NonZeroU64::new(17).unwrap(),
-            ),
-            participation: p,
-            operation_id: op,
-        },
-    };
-    assert_eq!(
-        project_attempt_message(
-            &detached,
-            &mut |_| None,
-            &mut |_, _| None,
-            &mut |_, _, _| None
-        )
-        .unwrap_err(),
-        PortProjectionError::UnsupportedDetachEstablish
     );
 }
 
@@ -523,7 +510,7 @@ fn establish_projection_requires_the_same_original_full_immutable_request_facts(
         action: action(70),
         body: AttemptToLogicalBody::AuthorizationRequest {
             token,
-            request: novarocks_coordination_contract::AttemptAuthorization::Establish {
+            request: crate::port_output::AttemptAuthorization::Establish {
                 participation: p,
                 operation_id: op,
             },

@@ -273,7 +273,6 @@ impl InputAuthor {
 pub struct ActorFailureProof {
     registration: ActorRegistration,
     failed_epoch: Generation,
-    failed_at: Tick,
     ledger: crate::transaction::RuntimeLedger,
 }
 impl ActorFailureProof {
@@ -285,11 +284,6 @@ impl ActorFailureProof {
     }
     pub const fn failed_epoch(&self) -> Generation {
         self.failed_epoch
-    }
-    /// The original failure turn's immutable time. Reading or cloning this
-    /// proof cannot renew a remote-observation budget.
-    pub const fn failed_at(&self) -> Tick {
-        self.failed_at
     }
     pub(crate) fn validate_consumer(
         &self,
@@ -313,7 +307,6 @@ impl std::fmt::Debug for ActorFailureProof {
             .field("registration", &self.registration)
             .field("initial_epoch", &self.initial_epoch())
             .field("failed_epoch", &self.failed_epoch)
-            .field("failed_at", &self.failed_at)
             .finish_non_exhaustive()
     }
 }
@@ -500,7 +493,6 @@ struct Inbox<A: Actor> {
     failure_input: Option<InputId>,
     failure: Option<ManuallyDrop<Box<dyn Any + Send>>>,
     last_progress: Tick,
-    failed_at: Option<Tick>,
     failure_publication: Option<FailurePublicationRecord>,
     failure_action_watermark: u64,
 }
@@ -2128,6 +2120,9 @@ impl<A: Actor> FailurePublicationSession<A> {
         if !Arc::ptr_eq(&destination.origin, &target.origin) {
             return Err((ActorTurnError::EffectTicketOriginMismatch, value));
         }
+        // Diagnostic clocks are foreign callbacks, just as on normal fills.
+        // Sample before taking either inbox or the ledger lock.
+        let observed = self.runtime.shared.observation.now();
         // All two-inbox transactions use the same ActorId lock order.
         let result = if self.actor < target.actor {
             let mut source_inbox = source.inbox.lock().expect("source actor inbox lock");
@@ -2136,6 +2131,7 @@ impl<A: Actor> FailurePublicationSession<A> {
                 (&source, &mut source_inbox),
                 (&destination, &mut target_inbox, target.standing_input_id),
                 author,
+                observed,
                 value,
             )
         } else {
@@ -2145,6 +2141,7 @@ impl<A: Actor> FailurePublicationSession<A> {
                 (&source, &mut source_inbox),
                 (&destination, &mut target_inbox, target.standing_input_id),
                 author,
+                observed,
                 value,
             )
         };
@@ -2167,6 +2164,7 @@ impl<A: Actor> FailurePublicationSession<A> {
         source: (&ActorCell<A>, &mut Inbox<A>),
         target: (&ActorCell<A>, &mut Inbox<A>, StandingInputId),
         author: Option<&InputAuthor>,
+        observed: Option<Tick>,
         value: A::Input,
     ) -> Result<InputId, (ActorTurnError, A::Input)> {
         let target_scope = target.0.scope.current_scope();
@@ -2206,14 +2204,10 @@ impl<A: Actor> FailurePublicationSession<A> {
             Ok(checked) => checked,
             Err(error) => return Err((error, value)),
         };
-        let input = target.1.fill_standing_input(
-            target.2,
-            failed,
-            author,
-            &mut ledger,
-            self.runtime.shared.observation.now(),
-            value,
-        )?;
+        let input =
+            target
+                .1
+                .fill_standing_input(target.2, failed, author, &mut ledger, observed, value)?;
         source.1.failure_action_watermark = action.get();
         self.runtime.shared.record(|| HistoryFact::FailurePublication {
             target: source.0.history_target(),
@@ -2836,7 +2830,6 @@ impl<A: Actor> ActorRuntime<A> {
                     failure_input: None,
                     failure: None,
                     last_progress: Tick(0),
-                    failed_at: None,
                     failure_publication: None,
                     failure_action_watermark: 0,
                 }),
@@ -3682,7 +3675,6 @@ impl<A: Actor> ActorRuntime<A> {
                             .next()
                             .ok_or(ActorTurnError::IdentityExhausted)?;
                         inbox.failed = true;
-                        inbox.failed_at = Some(now);
                         self.close_metadata_waiters_locked(&node, &mut inbox);
                         inbox.failure = Some(ManuallyDrop::new(payload));
                         inbox
@@ -3711,7 +3703,6 @@ impl<A: Actor> ActorRuntime<A> {
                     let generation = execution_scope.fail()?;
                     inbox.generation = generation;
                     inbox.failed = true;
-                    inbox.failed_at = Some(now);
                     self.close_metadata_waiters_locked(&node, &mut inbox);
                     inbox.failure = Some(ManuallyDrop::new(payload));
                     let supervisor_input = inbox
@@ -5681,9 +5672,6 @@ impl<A: Actor> ActorRuntime<A> {
         Ok(ActorFailureProof {
             registration: registration.clone(),
             failed_epoch: inbox.generation,
-            failed_at: inbox
-                .failed_at
-                .expect("original failure fence records its immutable time"),
             ledger: node.scope.current_scope().runtime.clone(),
         })
     }

@@ -19,7 +19,6 @@
 //! Logical decisions arrive as effects; no domain completeness rule lives here.
 
 use crate::api::*;
-use crate::coordination::LogicalExecutionActorError;
 use futures::{FutureExt, future::Shared};
 use novarocks_coordination_contract::{
     AttemptActivationIdentity, AttemptComputationCut, MonotonicInstant, QueryFailureReason,
@@ -185,10 +184,29 @@ struct Pending {
     activation: AttemptActivationIdentity,
     reply: Reply,
 }
-struct Completion {
+struct StartReply {
     requester: WorkCancellationRequester,
     reply: Option<oneshot::Sender<Result<ExecutionOutputObligation, QueryExecutionError>>>,
     published: Option<Result<(), QueryExecutionError>>,
+}
+type StartHandoff = (
+    oneshot::Sender<Result<ExecutionOutputObligation, QueryExecutionError>>,
+    WorkCancellationRequester,
+);
+impl StartReply {
+    fn reserve_success(&mut self) -> Result<Option<StartHandoff>, QueryExecutionError> {
+        match &self.published {
+            Some(Err(error)) => return Err(error.clone()),
+            Some(Ok(())) => return Ok(None),
+            None => {}
+        }
+        let reply = self
+            .reply
+            .take()
+            .ok_or_else(|| protocol("original statement start reply is absent"))?;
+        self.published = Some(Ok(()));
+        Ok(Some((reply, self.requester.clone())))
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ClientEndPublication {
@@ -214,7 +232,7 @@ struct State {
     end_slots: BTreeMap<Key, ConsumerSlot>,
     retired_end: BTreeSet<Key>,
     segments: BTreeMap<Key, SegmentState>,
-    completion: Option<Completion>,
+    start_reply: Option<StartReply>,
     supervision: Option<QueryExecutionError>,
     client_end_publication: ClientEndPublication,
 }
@@ -293,12 +311,33 @@ impl ConsumerExecutor {
         original_reply: oneshot::Sender<Result<ExecutionOutputObligation, QueryExecutionError>>,
     ) -> Self {
         let owner = Self::new(None, None, None, false, None, None, None, None, None);
-        owner.lock().completion = Some(Completion {
+        owner.lock().start_reply = Some(StartReply {
             requester,
             reply: Some(original_reply),
             published: None,
         });
         owner
+    }
+    /// Bind the statement's SAME original reply before the carrier starts.
+    /// Rows/Ready publication owns this reply; installation owns no success.
+    pub(in crate::coordination) fn with_start_reply(
+        self,
+        requester: WorkCancellationRequester,
+        reply: oneshot::Sender<Result<ExecutionOutputObligation, QueryExecutionError>>,
+    ) -> Self {
+        {
+            let mut state = self.lock();
+            assert!(
+                self.carrier.is_some() && state.start_reply.is_none() && !state.exposed,
+                "one original unexposed row/Ready start reply"
+            );
+            state.start_reply = Some(StartReply {
+                requester,
+                reply: Some(reply),
+                published: None,
+            });
+        }
+        self
     }
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -332,7 +371,7 @@ impl ConsumerExecutor {
                 end_slots: BTreeMap::new(),
                 retired_end: BTreeSet::new(),
                 segments: BTreeMap::new(),
-                completion: None,
+                start_reply: None,
                 supervision: None,
                 client_end_publication: ClientEndPublication::Owed,
             }),
@@ -342,6 +381,23 @@ impl ConsumerExecutor {
     }
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Read the SAME success fixed before its original watch/oneshot tail.
+    /// Owner failure seals later Ready publication under this same State lock;
+    /// a pending Native RecordReady poll cannot erase an already promised cut.
+    pub fn original_ready_promise(
+        &self,
+        activation: AttemptActivationIdentity,
+    ) -> Result<Option<ComputationReadyToken>, QueryExecutionError> {
+        let original = self
+            .lock()
+            .internal
+            .get(&key(activation))
+            .and_then(|row| row.ready_issued);
+        if original.is_some_and(|cut| cut.activation() != activation) {
+            return Err(protocol("original Ready promise has a foreign activation"));
+        }
+        Ok(original)
     }
     /// Latch the exact original owner failure separately from normal business
     /// failure. Actual Ready/completion/End handoffs remain immutable. This
@@ -357,7 +413,7 @@ impl ConsumerExecutor {
                 .filter(|original| original.ready_issued.is_none())
                 .map(|original| InternalFailureNotice::reserve(original, error.clone()))
                 .collect::<Vec<_>>();
-            let completion = state.completion.as_mut().and_then(|original| {
+            let completion = state.start_reply.as_mut().and_then(|original| {
                 if original.published.is_none() {
                     original.published = Some(Err(error.clone()));
                     original.reply.take()
@@ -490,7 +546,7 @@ impl ConsumerExecutor {
             let _ = liveness.await;
         }) as LogicalFuture<'static, ()>)
             .shared();
-        let (ready, receiver) = watch::channel(None);
+        let (ready, _) = watch::channel(None);
         state.internal.insert(
             key(activation),
             Internal {
@@ -506,11 +562,7 @@ impl ConsumerExecutor {
                 end_delivery: None,
             },
         );
-        Ok(InternalConsumerActivation {
-            stream,
-            source,
-            ready: receiver,
-        })
+        Ok(InternalConsumerActivation { stream, source })
     }
     pub(crate) async fn register_internal(
         &self,
@@ -1074,6 +1126,16 @@ impl ConsumerExecutor {
             return Err(error.clone());
         }
         let accepted = ComputationReadyToken::from_runtime_cut(cut);
+        let start = state
+            .start_reply
+            .as_mut()
+            .map(StartReply::reserve_success)
+            .transpose()?
+            .flatten();
+        let i = state
+            .internal
+            .get_mut(&key(cut.activation))
+            .expect("validated original internal source");
         i.ready_issued = Some(accepted);
         let ready = i.ready.clone();
         let p = state
@@ -1087,6 +1149,11 @@ impl ConsumerExecutor {
         ready.send_replace(Some(Ok(accepted)));
         if let Reply::Ready(reply) = p.reply {
             let _ = reply.send(Ok(accepted));
+        }
+        if let Some((reply, requester)) = start {
+            let _ = reply.send(Ok(ExecutionOutputObligation::computation_ready(
+                requester, accepted,
+            )));
         }
         Ok(())
     }
@@ -1194,15 +1261,41 @@ impl ConsumerExecutor {
                                 "original output was already exposed or is absent",
                             ));
                         }
+                        let publication = state
+                            .start_reply
+                            .as_mut()
+                            .map(StartReply::reserve_success)
+                            .transpose()?
+                            .flatten()
+                            .map(|(reply, requester)| {
+                                let stream =
+                                    state.output.take().expect("validated original stream");
+                                (
+                                    reply,
+                                    ExecutionOutputObligation::new(
+                                        requester,
+                                        ExecutionOutput::Rows(stream),
+                                    ),
+                                )
+                            });
                         state.exposed = true;
+                        drop(state);
+                        if let Some((reply, output)) = publication {
+                            let _ = reply.send(Ok(output));
+                        }
                         Ok(ConsumerFact::OutputExposed)
                     }
                     ConsumerEffect::PublishCompletion => {
+                        if self.carrier.is_some() {
+                            return Err(protocol(
+                                "row or Internal Ready output cannot be published as completion",
+                            ));
+                        }
                         let mut state = self.lock();
                         if let Some(error) = &state.supervision {
                             return Err(error.clone());
                         }
-                        let original = state.completion.as_mut().ok_or_else(|| {
+                        let original = state.start_reply.as_mut().ok_or_else(|| {
                             protocol("completion publication has no original completion reply")
                         })?;
                         if let Some(Err(error)) = &original.published {
@@ -1254,7 +1347,7 @@ impl ConsumerExecutor {
                             if let Some(error) = &state.supervision {
                                 return Err(error.clone());
                             }
-                            let completion = state.completion.as_mut().and_then(|original| {
+                            let completion = state.start_reply.as_mut().and_then(|original| {
                                 if original.published.is_none() {
                                     original.published = Some(Err(error.clone()));
                                     original.reply.take()
@@ -1344,6 +1437,40 @@ pub(crate) struct RuntimeReadyPort {
     owner: Weak<ConsumerExecutor>,
     seal: Arc<InternalConsumerSeal>,
 }
+enum ConsumerExitRegistrationRefusal {
+    OwnerClosed,
+    OriginalActivationMissing,
+    InvalidOriginal,
+}
+impl ConsumerExitRegistrationRefusal {
+    fn into_error(self) -> QueryExecutionError {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        let (code, observed_stop, detail) = match self {
+            Self::OwnerClosed => (50, true, "logical execution actor mailbox is closed"),
+            Self::OriginalActivationMissing => (
+                52,
+                false,
+                "attempt authority names a different logical execution",
+            ),
+            Self::InvalidOriginal => (57, false, "logical execution actor invariant was violated"),
+        };
+        let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
+        let fact = if observed_stop {
+            FailureFact::stop_observation(reason)
+        } else {
+            FailureFact::new(FailureClass::Invariant, reason)
+        };
+        QueryExecutionError::from_execution(
+            novarocks_coordination_contract::ExecutionFailureInput::new(
+                fact,
+                SafeDetail::truncating(detail),
+                novarocks_coordination_contract::ExecutionFailureSite::Coordinator,
+            ),
+        )
+    }
+}
 impl RuntimeReadyPort {
     pub(crate) fn origin(&self) -> &InternalConsumerSeal {
         &self.seal
@@ -1400,18 +1527,20 @@ impl RuntimeReadyPort {
     pub(crate) async fn supervise_exit(
         &self,
         receiver: oneshot::Receiver<Result<(), QueryExecutionError>>,
-    ) -> Result<(), LogicalExecutionActorError> {
+    ) -> Result<(), QueryExecutionError> {
         let owner = self
             .owner
             .upgrade()
-            .ok_or(LogicalExecutionActorError::MailboxClosed)?;
+            .ok_or_else(|| ConsumerExitRegistrationRefusal::OwnerClosed.into_error())?;
         let mut state = owner.lock();
         let i = state
             .internal
             .get_mut(&key(self.seal.activation))
-            .ok_or(LogicalExecutionActorError::WrongExecution)?;
+            .ok_or_else(|| {
+                ConsumerExitRegistrationRefusal::OriginalActivationMissing.into_error()
+            })?;
         if !Arc::ptr_eq(&i.seal, &self.seal) || i.exit.is_some() {
-            return Err(LogicalExecutionActorError::InvariantViolation);
+            return Err(ConsumerExitRegistrationRefusal::InvalidOriginal.into_error());
         }
         i.exit = Some(
             (Box::pin(async move { receiver.await.ok() })

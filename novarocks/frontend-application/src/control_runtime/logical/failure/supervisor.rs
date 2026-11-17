@@ -48,6 +48,7 @@ use novarocks_types::QueryExecutionId;
 use std::sync::Arc;
 
 pub(in crate::control_runtime::logical) struct LogicalFailureSupervisor {
+    pub(in crate::control_runtime::logical) retain_diagnostics: bool,
     pub(in crate::control_runtime::logical) runtime: ActorRuntime<FrontendActor>,
     pub(in crate::control_runtime::logical) registration: ActorRegistration,
     pub(in crate::control_runtime::logical) ticket: Arc<EffectTicket<FrontendEffect>>,
@@ -57,14 +58,16 @@ pub(in crate::control_runtime::logical) struct LogicalFailureSupervisor {
     pub(in crate::control_runtime::logical) progress: Arc<LogicalFailureProgressObligation>,
     pub(in crate::control_runtime::logical) failure: Arc<LogicalInfrastructureFailure>,
 }
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Job {
     Registry,
     Adopt,
+    SealRead(AttemptActivationIdentity),
     Active(AttemptActivationIdentity),
     Dormant(QueryExecutionId),
     Cancel(QueryExecutionId),
 }
+#[derive(Debug)]
 struct Remote {
     activation: AttemptActivationIdentity,
     positive: bool,
@@ -79,6 +82,11 @@ impl LogicalFailureSupervisor {
         }
     }
     async fn run_original(&mut self) -> Result<(), QueryExecutionError> {
+        #[cfg(test)]
+        self.failure.observe_cut_for_fixture(self.cut, true);
+        #[cfg(test)]
+        self.failure
+            .observe_cleanup_for_fixture("claim original publication".to_owned());
         let mut session = self
             .runtime
             .claim_failure_publication(&self.ticket)
@@ -91,6 +99,9 @@ impl LogicalFailureSupervisor {
                 .clone(),
         );
         if let Some(originals) = &self.originals {
+            #[cfg(test)]
+            self.failure
+                .observe_cleanup_for_fixture("notify original application owners".to_owned());
             originals.begin_failure(error.clone());
         }
         let mut jobs: FuturesUnordered<
@@ -101,6 +112,7 @@ impl LogicalFailureSupervisor {
         let mut remote: Vec<Remote> = Vec::new();
         let mut stopped = Vec::new();
         let mut local_unproven = false;
+        let mut adoption_unproven = false;
         let changes = self.links.changes();
         let fixed_deadline = self
             .originals
@@ -139,12 +151,14 @@ impl LogicalFailureSupervisor {
                 {
                     watches.push(Box::pin(async move {
                         let mut startup = endpoint.startup();
-                        let _original_status = startup.wait_ready().await;
+                        let _original_status = startup.wait_initialized().await;
                         Some(endpoint.activation())
                     }));
                 }
             }
-            self.service_requests(&mut session, &failure, &endpoints, &mut stopped)?;
+            // Keep original reply rejection live while the same Native body
+            // completes/adopts its activation. No failed Core is consulted.
+            self.service_requests(&mut session, &failure, &endpoints, &mut stopped, &[])?;
             let mut deadline = None;
             if let Some(originals) = &self.originals {
                 let native = originals;
@@ -172,6 +186,65 @@ impl LogicalFailureSupervisor {
                     }));
                 }
                 let inventory = native.cleanup_inventory()?;
+                #[cfg(test)]
+                self.failure.observe_cleanup_for_fixture(format!(
+                    "inspect original endpoints={}, active={:?}, stopped={stopped:?}",
+                    endpoints.len(),
+                    inventory.active
+                ));
+                {
+                    let mut controls_ready = Vec::new();
+                    for endpoint in &endpoints {
+                        let active = inventory
+                            .active
+                            .iter()
+                            .find(|row| row.activation == endpoint.activation());
+                        if let Some(row) = active
+                            && let Some(root) = row.read_root
+                            && !row.read_sealed
+                        {
+                            // The atomic Native close waits on the SAME
+                            // in-flight callback when present, without calling
+                            // it again. Do not wait for its header retirement:
+                            // that may itself need this child's convergence.
+                            let key = Job::SealRead(row.activation);
+                            if !issued.contains(&key) {
+                                let mut read=novarocks_execution_contract::root_lifetime::RootReadConvergence::new(root);
+                                // The SAME retained failed-owner proof is this
+                                // local termination author; it proves no remote
+                                // close, read future exit or delivery settlement.
+                                let sealed = read.seal_terminated();
+                                let activation = row.activation;
+                                let native = native.clone();
+                                issued.push(key);
+                                jobs.push(Box::pin(async move {
+                                    let result=match native.execute_native(NativeEffect::SealRootRead {activation,sealed}).await {
+                                        NativeFact::Applied=>Ok(()),
+                                        NativeFact::Failed {failure,..}|NativeFact::NativeRunFailed {failure,..}=>Err(failure.error),
+                                        _=>Err(QueryExecutionError::new(novarocks_coordination_contract::QueryExecutionErrorKind::InvalidRequest,"original read close returned another Native fact")),
+                                    };
+                                    (key,result)
+                                }));
+                            }
+                            continue;
+                        }
+                        if active.is_none()
+                            && (!completed.contains(&Job::Adopt) || adoption_unproven)
+                        {
+                            // A late original activation may still own its row.
+                            // Absence before the stable body loan is not proof.
+                            continue;
+                        }
+                        controls_ready.push(endpoint.activation());
+                    }
+                    self.service_requests(
+                        &mut session,
+                        &failure,
+                        &endpoints,
+                        &mut stopped,
+                        &controls_ready,
+                    )?;
+                }
                 let governor = originals.governance();
                 remember_completed(&mut remote, &governor.cleanup_inventory())?;
                 for row in governor.cleanup_inventory() {
@@ -241,12 +314,19 @@ impl LogicalFailureSupervisor {
                             kind: row.kind,
                         }
                     };
+                    #[cfg(test)]
+                    self.failure.observe_cleanup_for_fixture(format!(
+                        "await original governance {effect:?}"
+                    ));
                     governance_applied(governor.execute(effect).await)?;
                 }
                 // Active resources require an immutable original remote
                 // disposition; an empty/terminal mailbox never supplies one.
                 for row in &inventory.active {
                     let key = Job::Active(row.activation);
+                    if row.read_root.is_some() && !row.read_sealed {
+                        continue;
+                    }
                     if issued.contains(&key)
                         || governor.cleanup_inventory().iter().any(|original| {
                             original.activation == row.activation
@@ -398,10 +478,12 @@ impl LogicalFailureSupervisor {
             if rescan {
                 continue;
             }
+            #[cfg(test)]
+            self.failure.observe_cleanup_for_fixture(format!("await original events: issued={issued:?}, completed={completed:?}, remote={remote:?}, stopped={stopped:?}, local_unproven={local_unproven}, adoption_unproven={adoption_unproven}"));
             tokio::select! {
                 biased;
                 result = jobs.next(), if !jobs.is_empty() => { if let Some((key, result)) = result {
-                    if let Err(error) = result { self.failure.retain_typed(error); local_unproven = true; }
+                    if let Err(error) = result { if key==Job::Adopt { adoption_unproven=true; } self.failure.retain_typed(error); local_unproven = true; }
                     completed.push(key);
                 } },
                 () = &mut changed => (),
@@ -474,6 +556,7 @@ impl LogicalFailureSupervisor {
         failure: &ExecutionFailure,
         endpoints: &[Arc<AttemptPortEndpoints>],
         stopped: &mut Vec<AttemptActivationIdentity>,
+        controls_ready: &[AttemptActivationIdentity],
     ) -> Result<(), QueryExecutionError> {
         if let Some(originals) = &self.originals {
             while originals.fail_one_pending_request() {}
@@ -499,14 +582,32 @@ impl LogicalFailureSupervisor {
                     }
                 }
             }
-            if stopped.contains(&endpoint.activation()) {
+            if stopped.contains(&endpoint.activation())
+                || !controls_ready.contains(&endpoint.activation())
+            {
                 continue;
             }
-            if self.runtime.failure_proof_for(endpoint.attempt()).is_ok() {
+            if self.links.actual_child_exited(endpoint.activation())
+                || self.runtime.failure_proof_for(endpoint.attempt()).is_ok()
+            {
                 stopped.push(endpoint.activation());
                 continue;
             }
-            match endpoint.publish_owner_failed_stop(session, failure) {
+            let ready = self
+                .originals
+                .as_ref()
+                .map(|originals| originals.computation_cut(endpoint.activation()))
+                .transpose()?
+                .flatten();
+            let command = crate::task_execution::host::port::control::ConvergenceCommand {
+                mode: novarocks_coordination_contract::AttemptConvergenceMode::Cleanup,
+                remote_deadline: ready.map_or(self.cut.remote_deadline, |cut| {
+                    self.cut.remote_deadline.min(cut.convergence_deadline)
+                }),
+                computation_ready: ready,
+                retain_diagnostics: self.retain_diagnostics,
+            };
+            match endpoint.publish_owner_failed_control(&self.runtime, session, failure, command) {
                 Ok(_) => stopped.push(endpoint.activation()),
                 Err(PortDeliveryError::StartupPending) => (),
                 Err(error) => {

@@ -480,8 +480,10 @@ fn observation_fixture(
 ) -> (
     Fixture,
     novarocks_execution_contract::ParticipationRef,
-    novarocks_coordination_contract::AttemptAuthorizationRef,
-    novarocks_execution_contract::TaskOperationId,
+    Option<(
+        novarocks_coordination_contract::AttemptAuthorizationRef,
+        novarocks_execution_contract::TaskOperationId,
+    )>,
     novarocks_coordination_contract::ExecutionFailure,
 ) {
     use novarocks_coordination_contract::{
@@ -498,16 +500,10 @@ fn observation_fixture(
     let mut f = Fixture::with_start(initial);
     f.begin();
     let ticket = grant(&mut f, p, 1, Duration::from_secs(1));
-    let (reference, op) = issue(&mut f, p, ticket, 1);
-    if observed {
-        settle(
-            &mut f,
-            reference,
-            p,
-            op,
-            AttemptIssueSettlement::TransportOwned,
-        )
-        .unwrap();
+    // An authoritative reply itself crosses the conservative send boundary.
+    // The negative case genuinely has no parent Establish authorization.
+    let issued = if observed {
+        let (reference, op) = issue(&mut f, p, ticket, 1);
         settle(
             &mut f,
             reference,
@@ -516,7 +512,10 @@ fn observation_fixture(
             AttemptIssueSettlement::TransportUnknown,
         )
         .unwrap();
-    }
+        Some((reference, op))
+    } else {
+        None
+    };
     let input = ExecutionFailureInput::new(
         FailureFact::new(
             FailureClass::Invariant,
@@ -529,7 +528,7 @@ fn observation_fixture(
             kind: OperationKind::CreateTask,
         },
     );
-    (f, p, reference, op, ExecutionFailure::from_input(input))
+    (f, p, issued, ExecutionFailure::from_input(input))
 }
 
 #[test]
@@ -539,7 +538,7 @@ fn pre_ready_query_requires_current_recovery_policy_and_observed_exact_parent() 
         (RecoveryMode::RestartAttemptBeforeVisibility, false, false),
         (RecoveryMode::NoRecovery, true, false),
     ] {
-        let (mut f, _, _, _, refusal) = observation_fixture(mode, observed);
+        let (mut f, _, _, refusal) = observation_fixture(mode, observed);
         let original = refusal.input().clone();
         let (_, allowed) = observation_query(&mut f, refusal.clone());
         assert_eq!(allowed, expected);
@@ -556,8 +555,9 @@ fn pre_ready_query_requires_current_recovery_policy_and_observed_exact_parent() 
 
 #[test]
 fn late_parent_refusal_closes_only_the_original_pre_ready_watch_and_requery_refuses() {
-    let (mut f, p, reference, op, refusal) =
+    let (mut f, p, issued, refusal) =
         observation_fixture(RecoveryMode::RestartAttemptBeforeVisibility, true);
+    let (reference, op) = issued.expect("same original parent authorization");
     let (token, allowed) = observation_query(&mut f, refusal.clone());
     assert!(allowed);
     settle(
@@ -596,7 +596,7 @@ fn cancellation_closes_pre_ready_permission_without_replacing_the_accepted_origi
     use novarocks_logical_execution_protocol::cancel::{
         LogicalCancellationReason, cancellation_decision,
     };
-    let (mut f, p, _, _, mut refusal) =
+    let (mut f, p, _, mut refusal) =
         observation_fixture(RecoveryMode::RestartAttemptBeforeVisibility, true);
     let original = refusal.input().clone();
     let witness = PreReadyProcessReplacementWitness::try_new(
@@ -634,4 +634,55 @@ fn cancellation_closes_pre_ready_permission_without_replacing_the_accepted_origi
         f.core.facts().conclusion(),
         Some(LogicalConclusion::Cancelled)
     );
+}
+
+#[test]
+fn original_authorization_reply_already_accepts_real_worker_and_transport_settlements() {
+    // The real AP has no rich guard or TransportOwned callback. Each fresh
+    // reply must already be conservatively charged before any later fact.
+    for settlement in [
+        AttemptIssueSettlement::Worker(OperationOutcome::Accepted),
+        AttemptIssueSettlement::TransportUnknown,
+        AttemptIssueSettlement::PreWorkerRejected,
+        AttemptIssueSettlement::DefinitelyUnsent,
+    ] {
+        let (mut f, roster) = with_roster(1);
+        let p = roster[0];
+        let ticket = grant(&mut f, p, 1, Duration::from_secs(10));
+        let (authorization, op) = issue(&mut f, p, ticket, 1);
+        settle(&mut f, authorization, p, op, settlement).unwrap();
+        no_finish(&f);
+    }
+}
+
+#[test]
+fn original_authorization_reply_survives_revocation_without_another_handoff_event() {
+    let (mut f, roster) = with_roster(1);
+    let p = roster[0];
+    let ticket = grant(&mut f, p, 1, Duration::from_secs(10));
+    let (authorization, op) = issue(&mut f, p, ticket, 1);
+    f.send(LogicalInput::Cancelled(
+        novarocks_logical_execution_protocol::cancel::LogicalCancellationReason::Requested,
+    ));
+    // No synthetic TransportOwned message intervenes. Revocation rejects new
+    // permission but preserves this issued operation and its real late reply.
+    settle(
+        &mut f,
+        authorization,
+        p,
+        op,
+        AttemptIssueSettlement::Worker(OperationOutcome::Accepted),
+    )
+    .unwrap();
+    assert!(
+        authorize(
+            &mut f,
+            AttemptAuthorization::ReauthorizeEstablish {
+                participation: p,
+                operation_id: op
+            }
+        )
+        .is_err()
+    );
+    no_finish(&f);
 }

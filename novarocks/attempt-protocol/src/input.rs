@@ -458,13 +458,17 @@ pub struct AttemptInputClaim {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the original prepaid input retains the complete bounded executor fact inline without another allocation"
+)]
 pub enum AttemptInput {
     /// The original paid first step installs the initial Native preference.
     Bootstrap,
     /// The original drive is bound and all permanent Sources are installed.
     StartProtocol,
     Executor(ExecutorFact),
-    Port(LogicalToAttempt<AttemptFailure>),
+    Port(LogicalToAttempt),
     Membership(MembershipView),
     CapacityReleased,
     Timer,

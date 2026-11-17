@@ -107,6 +107,10 @@ enum Receiving {
     Taken(ComputationReadyToken),
 }
 struct Holder {
+    #[cfg(test)]
+    decoded_end: std::sync::OnceLock<RootResultEnd>,
+    #[cfg(test)]
+    stream_failure: std::sync::OnceLock<QueryExecutionError>,
     receiving: Mutex<Receiving>,
     cpu: Arc<DomainCpuCustody>,
 }
@@ -175,6 +179,17 @@ pub(crate) struct ReadyStatisticsComputation {
 }
 
 impl StatisticsComputationOutput {
+    /// Passive observation only: the actual CPU EOF and checked End receipt
+    /// have both completed. Reading this never polls or advances any Work.
+    #[cfg(test)]
+    pub(crate) fn decoded_end_for_fixture(&self) -> Option<RootResultEnd> {
+        self.holder.decoded_end.get().copied()
+    }
+    #[cfg(test)]
+    pub(crate) fn stream_failure_for_fixture(&self) -> Option<QueryExecutionError> {
+        self.holder.stream_failure.get().cloned()
+    }
+
     pub(crate) fn take_ready(
         &mut self,
         token: ComputationReadyToken,
@@ -276,6 +291,10 @@ fn construct(
         )?,
     };
     let holder = Arc::new(Holder {
+        #[cfg(test)]
+        decoded_end: std::sync::OnceLock::new(),
+        #[cfg(test)]
+        stream_failure: std::sync::OnceLock::new(),
         receiving: Mutex::new(Receiving::Vacant),
         cpu,
     });
@@ -465,6 +484,11 @@ impl InternalComputationConsumer for DecodedComputationConsumer {
                 // ACK EOF before waiting for all Tasks. This unblocks the
                 // original relay so the same Native driver can observe status.
                 let decoded_end = end.complete().await?;
+                #[cfg(test)]
+                holder
+                    .decoded_end
+                    .set(original_end)
+                    .expect("one original checked End receipt");
                 if let Some(statistics) = statistics.as_mut() {
                     wait_statistics(
                         statistics,
@@ -472,6 +496,8 @@ impl InternalComputationConsumer for DecodedComputationConsumer {
                         binding,
                         &cancellation,
                         &mut stream,
+                        #[cfg(test)]
+                        holder.as_ref(),
                     )
                     .await?;
                     // This second actual CPU receipt validates complete artifact
@@ -485,6 +511,8 @@ impl InternalComputationConsumer for DecodedComputationConsumer {
                         binding,
                         &cancellation,
                         &mut stream,
+                        #[cfg(test)]
+                        holder.as_ref(),
                     )
                     .await?;
                 }
@@ -545,6 +573,7 @@ async fn wait_statistics(
     binding: Binding,
     cancellation: &QueryCancellationView,
     stream: &mut InternalResultStream,
+    #[cfg(test)] observed: &Holder,
 ) -> Result<(), QueryExecutionError> {
     loop {
         if let Some(changes) = protocol
@@ -556,6 +585,8 @@ async fn wait_statistics(
                 .map_err(|_| domain_error("statistics Task facts have a foreign provenance"))?;
         }
         if let Some(error) = stream.current_failure() {
+            #[cfg(test)]
+            let _ = observed.stream_failure.set(error.clone());
             return Err(error);
         }
         let awaiting_origin = if let Some(selected) = tracker.selected_failure() {
@@ -579,7 +610,11 @@ async fn wait_statistics(
         }
         let changes = tokio::select! {
             biased;
-            error = stream.failure() => return Err(error),
+            error = stream.failure() => {
+                #[cfg(test)]
+                let _ = observed.stream_failure.set(error.clone());
+                return Err(error);
+            },
             reason = cancellation.cancelled() => return Err(cancelled(reason)),
             changes = protocol.changed(binding.activation, binding.root, binding.plan) =>
                 changes.map_err(|_| domain_error("statistics Task fact publisher exited before completion"))?,

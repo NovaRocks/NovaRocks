@@ -556,6 +556,38 @@ fn ready_handoff_retains_the_exact_full_cut_before_observation_or_actual_exit() 
         LogicalEffectBody::Consumer(ConsumerEffect::PublishReady { cut: original, .. })
             if *original == cut
     )));
+    assert!(!has_begin_convergence(&f));
+    assert!(!has_read_seal(&f));
+    let relay=f.take(|body| matches!(body,LogicalEffectBody::Relay(RelayEffect::Start {activation:a}) if *a==activation(1)));
+    f.result(
+        relay.action,
+        ActionResult::Relay(RelayFact::EndRelayed {
+            activation: activation(1),
+            root: root(1),
+            end: end(0, 27),
+        }),
+    );
+    let seal = f.take(|body| {
+        matches!(
+            body,
+            LogicalEffectBody::Native(NativeEffect::SealRootRead { .. })
+        )
+    });
+    let LogicalEffectBody::Native(NativeEffect::SealRootRead {
+        activation: a,
+        sealed,
+    }) = &seal.body
+    else {
+        unreachable!()
+    };
+    assert_eq!(*a, activation(1));
+    assert_eq!(sealed.task(), root(1));
+    assert_eq!(f.core.facts().ready_cut(), Some(cut));
+    assert!(!has_begin_convergence(&f));
+    // Physical action exit is independent from its successful callback result.
+    f.exit(seal.action);
+    assert!(!has_begin_convergence(&f));
+    f.result(seal.action, ActionResult::Native(NativeFact::Applied));
     assert!(f.effects.iter().any(|e| matches!(
         &e.body,
         LogicalEffectBody::AttemptPort(p)
@@ -566,5 +598,96 @@ fn ready_handoff_retains_the_exact_full_cut_before_observation_or_actual_exit() 
             } if *original == cut && *remote_deadline == cut.convergence_deadline)
     )));
     assert!(!f.core.facts().original_internal_consumer_exited());
+    assert!(!f.core.facts().protocol_join_ready());
+}
+
+fn has_begin_convergence(f: &Fixture) -> bool {
+    f.effects.iter().any(|effect|matches!(&effect.body,LogicalEffectBody::AttemptPort(message) if matches!(message.body,LogicalToAttemptBody::BeginConvergence {..})))
+}
+fn has_read_seal(f: &Fixture) -> bool {
+    f.effects.iter().any(|effect| {
+        matches!(
+            &effect.body,
+            LogicalEffectBody::Native(NativeEffect::SealRootRead { .. })
+        )
+    })
+}
+#[test]
+fn original_stopped_relay_is_not_a_normal_end_or_ack_handoff() {
+    let mut f = accepted();
+    let cut = f.core.facts().ready_cut().unwrap();
+    let relay = f.take(|body| matches!(body, LogicalEffectBody::Relay(RelayEffect::Start { .. })));
+    f.ack(
+        relay.action,
+        ActionResult::Relay(RelayFact::Stopped {
+            activation: activation(1),
+            all_deliveries_settled: true,
+        }),
+    );
+    assert_eq!(f.core.facts().ready_cut(), Some(cut));
+    assert!(!has_read_seal(&f));
+    assert!(!has_begin_convergence(&f));
+    assert!(!f.core.facts().protocol_join_ready());
+}
+#[test]
+fn original_end_handoff_never_manufactures_missing_root_finished() {
+    let mut f = pending();
+    let relay = f.take(|body| matches!(body, LogicalEffectBody::Relay(RelayEffect::Start { .. })));
+    f.ack(
+        relay.action,
+        ActionResult::Relay(RelayFact::EndRelayed {
+            activation: activation(1),
+            root: root(1),
+            end: end(0, 27),
+        }),
+    );
+    assert!(f.core.facts().ready_cut().is_none());
+    assert!(!has_read_seal(&f));
+    assert!(!has_begin_convergence(&f));
+    f.finished_root();
+    assert!(!has_read_seal(&f));
+    f.seal();
+    assert!(f.core.facts().ready_cut().is_some());
+    assert!(has_read_seal(&f));
+    assert!(!has_begin_convergence(&f));
+}
+#[test]
+fn original_read_close_refusal_preserves_ready_and_is_not_actual_exit() {
+    let mut f = accepted();
+    let cut = f.core.facts().ready_cut().unwrap();
+    let relay = f.take(|body| matches!(body, LogicalEffectBody::Relay(RelayEffect::Start { .. })));
+    f.ack(
+        relay.action,
+        ActionResult::Relay(RelayFact::EndRelayed {
+            activation: activation(1),
+            root: root(1),
+            end: end(0, 27),
+        }),
+    );
+    let seal = f.take(|body| {
+        matches!(
+            body,
+            LogicalEffectBody::Native(NativeEffect::SealRootRead { .. })
+        )
+    });
+    let error = original_error();
+    f.result(
+        seal.action,
+        ActionResult::Native(NativeFact::Failed {
+            execution: activation(1).execution(),
+            failure: FailureReport {
+                error: error.clone(),
+                original_attempt_failure: None,
+                pre_ready_replacement: None,
+            },
+        }),
+    );
+    assert_eq!(f.core.facts().ready_cut(), Some(cut));
+    assert_eq!(
+        f.core.facts().conclusion(),
+        Some(LogicalConclusion::ComputationReady)
+    );
+    assert!(f.effects.iter().any(|effect|matches!(&effect.body,LogicalEffectBody::SupervisionFailed(original) if *original==error)));
+    assert!(!has_begin_convergence(&f));
     assert!(!f.core.facts().protocol_join_ready());
 }

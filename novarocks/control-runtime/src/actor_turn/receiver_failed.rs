@@ -33,7 +33,13 @@ impl<A: Actor> ActorRuntime<A> {
         let checked = (|| {
             self.validate_registration(sender)?;
             let receiver = position.original_node()?;
-            if !Arc::ptr_eq(&self.shared, &position.runtime.shared) || sender.actor == receiver.id {
+            if !Arc::ptr_eq(&self.shared, &position.runtime.shared)
+                || sender.actor == receiver.id
+                || !Arc::ptr_eq(
+                    &sender.publication_scope().runtime.shared,
+                    &receiver.scope.current_scope().runtime.shared,
+                )
+            {
                 return Err(ActorTurnError::PublicationTargetMismatch);
             }
             let inbox = receiver.inbox.lock().expect("receiver inbox lock");
@@ -79,6 +85,10 @@ impl<A: Actor> ActorRuntime<A> {
             failure.validate_consumer(failure.registration(), &work.scope().runtime)?;
             let inbox = receiver.inbox.lock().expect("receiver inbox lock");
             if sender.actor == receiver.id
+                || !Arc::ptr_eq(
+                    &sender.publication_scope().runtime.shared,
+                    &work.scope().runtime.shared,
+                )
                 || !receiver.scope.current_scope().same_scope(work.scope())
                 || !Arc::ptr_eq(&receiver.origin, &failure.registration.origin)
                 || !inbox.failed

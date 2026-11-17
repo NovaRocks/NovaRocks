@@ -42,12 +42,13 @@ pub(super) enum InletFailureCause {
     Kernel(ActorTurnError),
 }
 /// The original rejected passive input goes to the Source's already-paid
-/// failure custodian. It is never queued or replayed by this inlet.
+/// failure custodian. It is never queued or replayed by this inlet. The
+/// exact fields remain retained with that raw packet, without a second decision.
 pub(super) struct InletFailure {
-    pub(super) source: LogicalSourceId,
-    pub(super) expected: LogicalSourceKind,
-    pub(super) cause: InletFailureCause,
-    pub(super) original: FrontendInput,
+    pub(super) _source: LogicalSourceId,
+    pub(super) _expected: LogicalSourceKind,
+    pub(super) _cause: InletFailureCause,
+    pub(super) _original: FrontendInput,
 }
 pub(super) type InletFailureCallback = Arc<dyn Fn(InletFailure) + Send + Sync>;
 
@@ -168,10 +169,10 @@ impl Shared {
         self.close();
         if report {
             (self.fail_owner)(InletFailure {
-                source: self.source,
-                expected: self.kind,
-                cause,
-                original,
+                _source: self.source,
+                _expected: self.kind,
+                _cause: cause,
+                _original: original,
             });
         }
     }
@@ -1064,10 +1065,10 @@ mod tests {
         {
             let failures = f.failures.lock().unwrap();
             assert_eq!(failures.len(), 1);
-            assert_eq!(failures[0].source, source());
-            assert_eq!(failures[0].expected, LogicalSourceKind::Snapshot);
-            assert_eq!(failures[0].cause, InletFailureCause::WrongKind);
-            assert!(matches!(&failures[0].original,
+            assert_eq!(failures[0]._source, source());
+            assert_eq!(failures[0]._expected, LogicalSourceKind::Snapshot);
+            assert_eq!(failures[0]._cause, InletFailureCause::WrongKind);
+            assert!(matches!(&failures[0]._original,
                 FrontendInput::Logical(input) if matches!(input.as_ref(),
                     LogicalInput::Cancelled(
                         novarocks_logical_execution_protocol::cancel::LogicalCancellationReason::Requested
@@ -1103,10 +1104,10 @@ mod tests {
             let failures = f.failures.lock().unwrap();
             assert_eq!(failures.len(), 1);
             assert_eq!(
-                failures[0].cause,
+                failures[0]._cause,
                 InletFailureCause::Kernel(ActorTurnError::StandingInputBusy)
             );
-            assert!(matches!(&failures[0].original,
+            assert!(matches!(&failures[0]._original,
                 FrontendInput::Logical(input) if matches!(input.as_ref(),
                     LogicalInput::Snapshot { token, .. } if token.get() == 2)
             ));

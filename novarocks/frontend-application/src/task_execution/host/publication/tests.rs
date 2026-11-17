@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[path = "tests/current_covered_recovery.rs"]
+mod current_covered_recovery;
+
 use super::*;
 use crate::task_execution::protocol_facts::AttemptProtocolFactsReceiver;
 use novarocks_attempt_protocol::publication::{ProtocolPublication, ProtocolTaskChange};
@@ -30,14 +33,13 @@ pub(in crate::task_execution::host) fn fixture() -> (
     TaskIdentity,
     PlanSeal,
 ) {
-    // Reuse the real application-bound graph before any Task or lifecycle work.
-    let round = crate::task_execution::tests::manifest_unstarted_regression_fixture();
-    let graph = round.execution().graph();
+    // Reuse the SAME frozen graph without constructing a retired round owner.
+    let graph = crate::task_execution::graph_manifest_tests::unstarted_chain_graph();
     let root = graph.root_identity();
     let plan = PlanSeal::Version(PlanVersionId::try_new([192; 16]).unwrap());
     let (protocol, receiver) = AttemptProtocolFactsPublisher::for_graph(
         plan,
-        graph,
+        &graph,
         &BTreeSet::new(),
         &PerKind {
             write_counts: None,
@@ -49,7 +51,6 @@ pub(in crate::task_execution::host) fn fixture() -> (
     (
         PublicationRecord {
             activation,
-            root: None,
             protocol,
             profile: None,
             diagnostic_records: None,
@@ -175,7 +176,7 @@ fn protocol_publication_preserves_typed_error_without_readmodel_mutation() {
     );
     assert!(matches!(
         result,
-        Err(PublicationError::Protocol(TaskExecutionError::Schedule(_)))
+        Err(PublicationError::Protocol(original)) if matches!(*original, TaskExecutionError::Schedule(_))
     ));
     assert!(
         receiver
@@ -210,29 +211,34 @@ fn final_info_publication_checks_original_profile_before_resolving_a_reference()
 
 #[tokio::test]
 async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell() {
+    use crate::control_runtime::logical::adapter::{LogicalEffectEnvelope, LogicalHostEffect};
     use crate::{
         control_runtime::{
             actor::{FrontendActor, FrontendEffect, FrontendInput, TestActor},
             transport_withdrawal::AttemptEffectEnvelope,
         },
-        task_execution::{
-            bridge::root_control::{PendingRootControls, RootControlRequests, reply_kind},
-            host::{
-                adapter::descriptor,
-                failure_publication::FailurePublications,
-                observations::{
-                    MetadataRetirementRefusal, ObservationBudget, ObservationError,
-                    ObservationMetadataLayout, ObservationMetadataObligation,
-                    OrderedObservationInput, RootControlBinding, StreamKey,
-                    credits::{OBSERVATION_WINDOW_BYTES, ObservationCredits},
-                    host_turn::OrderedObservationHost,
-                    read_progress::ReadProgressInput,
-                    source::{BoundObservationSource, ObservationMetadataAuthor},
-                    tests::ManualClock,
+        task_execution::host::{
+            adapter::descriptor,
+            observations::{
+                MetadataRetirementRefusal, ObservationBudget, ObservationError,
+                ObservationMetadataLayout, ObservationMetadataObligation, OrderedObservationInput,
+                RootControlBinding, StreamKey,
+                credits::{OBSERVATION_WINDOW_BYTES, ObservationCredits},
+                host_turn::OrderedObservationHost,
+                read_progress::ReadProgressInput,
+                source::{BoundObservationSource, ObservationMetadataAuthor},
+                tests::ManualClock,
+            },
+            port::{
+                control::{
+                    ControlBinding, ControlPositions, PortControlError, SourcePublishedSlot,
                 },
+                facts::{AttemptFactBank, FactRole},
+                root_control::RootControlRequests,
             },
         },
     };
+    use novarocks_attempt_protocol::port_output::{AttemptToLogical, AttemptToLogicalBody};
     use novarocks_attempt_protocol::{
         effect::{AttemptEffect, EffectBody, EffectClass},
         input::{
@@ -242,21 +248,28 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
     use novarocks_control_runtime::{
         actor::{ActorConfig, ActorStep},
         actor_turn::ActorRuntime,
+        completion::ReportSlot,
         obligation::OwnedPositionObligation,
+        reported_work::ReportedWork,
         transaction::RuntimeLedger,
     };
     use novarocks_control_runtime_core::{
         capacity::ReservationResources,
-        effect::EffectKind,
-        identity::{ActorId, Generation, Tick},
+        completion::ConsumerKind,
+        effect::{EffectKind, EffectState},
+        identity::{ActionId, ActorId, ConsumerId, Generation, ScopedWorkRef, Tick},
         mailbox::{InputClass, InputEnvelope},
         owned_storage::{OwnedSlotKind, OwnedSlotNeed},
         scope::{WorkAdmission, WorkKind},
     };
     use novarocks_coordination_contract::{
-        AttemptActionId, AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody,
+        AttemptActionId, AttemptRequestToken, LogicalToAttempt, LogicalToAttemptBody,
     };
     use novarocks_execution_contract::ParticipationRef;
+    use novarocks_logical_execution_protocol::{
+        LogicalActionId,
+        effect::{LogicalEffect, LogicalEffectBody},
+    };
     use novarocks_types::FrontendProcessId;
     use std::{
         future::ready,
@@ -321,6 +334,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
             value: FrontendInput,
             step: &mut ActorStep<'_, FrontendEffect>,
         ) {
+            assert!(step.charge(1));
             let FrontendInput::Attempt(input) = value else {
                 panic!("original root input")
             };
@@ -368,6 +382,44 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         }
     }
 
+    // SAME LP financial Work emits the original root commands, then receives
+    // the AP facts on three separately prepaid standing positions.
+    struct LogicalActor {
+        next: Arc<Mutex<Option<FrontendEffect>>>,
+        seen: Arc<Mutex<Vec<novarocks_coordination_contract::logical_port::AttemptToLogical>>>,
+        work: ScopedWorkRef,
+    }
+    impl TestActor for LogicalActor {
+        fn handle(
+            &mut self,
+            _: Tick,
+            envelope: InputEnvelope,
+            value: FrontendInput,
+            step: &mut ActorStep<'_, FrontendEffect>,
+        ) {
+            assert!(step.charge(1));
+            match value {
+                FrontendInput::Test(_) => {
+                    assert_eq!(envelope.class, InputClass::Control);
+                    let original = self.next.lock().unwrap().take().unwrap();
+                    step.effect(descriptor(1, self.work, EffectKind::Cleanup), original)
+                        .unwrap();
+                }
+                FrontendInput::Logical(input) => {
+                    let novarocks_logical_execution_protocol::input::LogicalInput::AttemptPort(
+                        message,
+                    ) = *input
+                    else {
+                        panic!("only the original AP reply enters this LP fixture");
+                    };
+                    assert_eq!(envelope.class, InputClass::Lifecycle);
+                    self.seen.lock().unwrap().push(*message);
+                }
+                _ => panic!("unexpected original LP input"),
+            }
+        }
+    }
+
     let budget = ObservationBudget {
         queued_frames: 1,
         total_positions: 3,
@@ -393,7 +445,8 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
                 budget.byte_window().unwrap(),
                 OwnedSlotNeed {
                     work_headers: 1,
-                    inputs: budget.total_positions,
+                    // Existing observation/read roles plus three final port roles.
+                    inputs: budget.total_positions + 3,
                     captures: 1,
                     ..Default::default()
                 },
@@ -407,7 +460,16 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
     let (mut control, mut control_payer) = bridge
         .reserve_next(
             generation,
-            ReservationResources::work_only(),
+            ReservationResources::new(
+                Default::default(),
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    // Two LP command triggers, three AP fact roles, one original
+                    // ordered Control input targeted at the AP.
+                    inputs: 6,
+                    ..Default::default()
+                },
+            ),
             WorkKind::Settlement,
             WorkAdmission::External,
         )
@@ -429,22 +491,108 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
                 max_batches: 4,
                 max_effects_per_step: 1,
                 max_dependencies_per_effect: 0,
-                turn_budget: 8,
-                max_step_work: 1,
+                turn_budget: 12,
+                max_step_work: 2,
             },
         )
         .unwrap_or_else(|_| panic!("original root actor"));
-    let (mut publication, _, root, _) = fixture();
-    let (sender, status, pending_controls) = PendingRootControls::project(root);
+    let (publication, _, root, _) = fixture();
     let activation = publication.activation;
+    let publisher = AttemptPublicationOwner::new(publication, None);
+    let next = Arc::new(Mutex::new(None));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let logical = runtime
+        .register_bound(
+            source,
+            bridge.clone(),
+            FrontendActor::Test(Box::new(LogicalActor {
+                next: next.clone(),
+                seen: received.clone(),
+                work: control.reference(),
+            })),
+            ActorConfig {
+                mailbox: [8; 4],
+                max_batches: 4,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 12,
+                max_step_work: 2,
+            },
+        )
+        .unwrap_or_else(|_| panic!("original LP financial author"));
     let binding =
         RootControlBinding::for_registered_source(registration.clone(), activation, root).unwrap();
-    let failure = Arc::new(FailurePublications::new(
-        registration.clone(),
+    let requests = RootControlRequests::new(binding.clone());
+    publisher.bind_port_root(requests.clone());
+    assert!(publisher.matches_root(&binding));
+    let facts = AttemptFactBank::reserve(
+        &runtime,
+        &logical,
+        &registration,
         activation,
-        &scope,
-    ));
-    let requests = RootControlRequests::new(binding.clone(), failure);
+        &control,
+        Waker::noop().clone(),
+        Waker::noop().clone(),
+    )
+    .unwrap();
+    let mut triggers = (0..2)
+        .map(|_| {
+            runtime
+                .reserve_admitted_input_for(
+                    &logical,
+                    registration.actor(),
+                    InputClass::Control,
+                    &control,
+                )
+                .unwrap()
+                .into_standing_input()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let commands = [
+        LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::TerminalControlDemand {
+                token: AttemptRequestToken::new(NonZeroU64::new(1).unwrap()),
+                root,
+            },
+        },
+        LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::SealRequest {
+                token: AttemptRequestToken::new(NonZeroU64::new(2).unwrap()),
+            },
+        },
+    ];
+    // Emit BOTH original tickets before accepting any observation prefix.
+    // Looking for a later LP ticket must not accidentally consume that prefix.
+    let mut command_tickets = Vec::new();
+    for (index, command) in commands.iter().enumerate() {
+        *next.lock().unwrap() = Some(FrontendEffect::Logical(Arc::new(LogicalEffectEnvelope {
+            reservation: control_payer.id(),
+            body: LogicalHostEffect::Protocol(Box::new(LogicalEffect {
+                action: LogicalActionId::new(NonZeroU64::new(index as u64 + 1).unwrap()),
+                body: LogicalEffectBody::AttemptPort(Box::new(command.clone())),
+            })),
+        })));
+        let input = triggers[index]
+            .fill(FrontendInput::Test(index as u64))
+            .unwrap();
+        for _ in 0..8 {
+            if runtime
+                .effect_inventory(source, input, None, 1)
+                .is_ok_and(|rows| !rows.is_empty())
+            {
+                break;
+            }
+            assert!(runtime.poll_one(Tick(1)).unwrap());
+        }
+        command_tickets.push(Some(
+            runtime
+                .take_effect(source, input, ActionId::new(1).unwrap())
+                .unwrap(),
+        ));
+    }
     let participant = ParticipationRef::new(
         root.query_execution_id(),
         FrontendProcessId::new_v7(),
@@ -487,11 +635,63 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         Waker::from(wakes.clone()),
     )
     .unwrap_or_else(|_| panic!("original ordered root Source"));
-    assert_eq!(
-        pending_controls.bind(ingress.root_binding(), &requests),
-        Err(ObservationError::Closed)
-    );
-    requests.bind_ingress(&ingress);
+    let different_binding =
+        RootControlBinding::for_registered_source(registration.clone(), activation, root).unwrap();
+    let foreign_requests = RootControlRequests::new(different_binding);
+    assert!(matches!(
+        foreign_requests.bind_ingress(&ingress),
+        Err(PortControlError::ForeignPair)
+    ));
+    requests.bind_ingress(&ingress).unwrap();
+    assert!(matches!(
+        requests.bind_ingress(&ingress),
+        Err(PortControlError::ForeignPair)
+    ));
+    let observer = ConsumerId::new(1).unwrap();
+    let (storage_work, mut storage_payer) = bridge
+        .reserve_child_next(
+            generation,
+            control_payer.id(),
+            ReservationResources::new(
+                Default::default(),
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    completions: 1,
+                    captures: 1,
+                    ..Default::default()
+                },
+            ),
+            WorkKind::Settlement,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    let storage_header = storage_work.retirement_observer();
+    let report = ReportSlot::reserve_next(
+        &mut storage_payer,
+        generation,
+        1,
+        [(observer, ConsumerKind::Observer)],
+    )
+    .unwrap();
+    let storage = ReportedWork::try_new(storage_work, storage_payer, report).unwrap();
+    let (slot, mut reader) = SourcePublishedSlot::bind(
+        &runtime,
+        ControlBinding {
+            lp: logical.clone(),
+            ap: registration.clone(),
+            activation,
+            positions: ControlPositions {
+                stop: reserve(InputClass::Control, &observations),
+                convergence: reserve(InputClass::Control, &observations),
+                changed: reserve(InputClass::Ordinary, &observations),
+            },
+            storage,
+            observer,
+            roots: requests.clone(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("same original paid root reader: {error:?}"));
     let ordered_host = OrderedObservationHost::new(ingress.clone());
     let key = StreamKey {
         participation: participant,
@@ -526,36 +726,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         ingress.retire_stream(key),
         Err(ObservationError::UnknownStream)
     );
-    assert!(status.begin_terminal_control_request().is_err());
-    let different_binding =
-        RootControlBinding::for_registered_source(registration.clone(), activation, root).unwrap();
-    assert_eq!(
-        pending_controls.bind(&different_binding, &requests),
-        Err(ObservationError::InvalidRootControl)
-    );
-    pending_controls
-        .bind(ingress.root_binding(), &requests)
-        .unwrap();
-    assert_eq!(
-        pending_controls.bind(ingress.root_binding(), &requests),
-        Err(ObservationError::Busy)
-    );
-    sender
-        .publish_attempt_observation(
-            TaskStatus::try_new(
-                root,
-                TaskStatusVersion::new(1).unwrap(),
-                TaskState::Finished,
-                None,
-                TaskOutputFacts::new(true),
-            )
-            .unwrap(),
-            AcceptedAttemptFailure::None,
-        )
-        .unwrap();
-    publication.root = Some(sender);
-
-    for seal in [false, true] {
+    for (index, seal) in [false, true].into_iter().enumerate() {
         let prefix_key = StreamKey {
             generation: NonZeroU64::new(2).unwrap(),
             ..key
@@ -595,16 +766,35 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
                 )
                 .unwrap();
         }
-        let mut reply = if seal {
-            status.begin_success_seal_request()
-        } else {
-            status.begin_terminal_control_request()
+        let original_command = command_tickets[index].take().unwrap();
+        slot.commit(&runtime, &original_command, &commands[index])
+            .unwrap();
+        assert_eq!(
+            runtime
+                .effect_inventory(source, original_command.input, None, 1)
+                .unwrap()[0]
+                .1,
+            EffectState::Published
+        );
+        runtime.effect_completed(original_command).unwrap();
+        assert!(triggers[index].retire_ready_after_exit().unwrap());
+        reader.begin_pass();
+        for _ in 0..4 {
+            let progress = reader.progress_ordered(5).unwrap();
+            if !progress.more {
+                break;
+            }
         }
-        .unwrap();
-        assert!(status.begin_terminal_control_request().is_err());
+        // Only the actual writer drives the already committed original row.
+        // The Seal remains behind the accepted observation's FIFO prefix.
+        ingress.drive().unwrap();
+        assert!(matches!(
+            requests.close_after_exit(),
+            Err(PortControlError::UnsettledRoot)
+        ));
         if seal {
             // This Seal has been accepted behind an actual observation. A
-            // close request must fence new QA calls while leaving this FIFO
+            // close request must fence new root materialization while leaving this FIFO
             // prefix and the already accepted Seal runnable.
             ordered_host.fence_root_controls();
             assert!(!ordered_host.ready_for_close());
@@ -641,38 +831,149 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         let EffectBody::Port(port) = &effect.protocol.body else {
             panic!("original root reply port")
         };
-        let (token, _) = reply_kind(&port.body).unwrap();
-        requests
-            .commit_reply(&runtime, &ticket, Arc::new(port.clone()), None)
+        let original = effect.clone();
+        let projected = novarocks_attempt_protocol::port_projection::project_attempt_message(
+            port,
+            &mut |_| None,
+            &mut |_, _| None,
+            &mut |_, _, _| None,
+        )
+        .unwrap();
+        let (token, reply_is_seal) = match &projected.body {
+            novarocks_coordination_contract::logical_port::AttemptToLogicalBody::SealResult { token, result } => {
+                let AttemptToLogicalBody::SealResult { result: Ok(before), .. } = &port.body else {
+                    panic!("same original Seal result");
+                };
+                assert!(Arc::ptr_eq(before, result.as_ref().unwrap()));
+                (*token, true)
+            }
+            novarocks_coordination_contract::logical_port::AttemptToLogicalBody::TerminalControlResult { token, result } => {
+                assert!(result.is_ok()); (*token, false)
+            }
+            _ => panic!("exact original root reply"),
+        };
+        assert_eq!(reply_is_seal, seal);
+        assert_eq!(
+            token,
+            match &commands[index].body {
+                LogicalToAttemptBody::SealRequest { token }
+                | LogicalToAttemptBody::TerminalControlDemand { token, .. } => *token,
+                _ => unreachable!(),
+            }
+        );
+        assert_eq!(
+            runtime.effect_inventory(actor, input, None, 1).unwrap(),
+            vec![(action.clone(), EffectState::Started)],
+            "the original AP reply ticket is started before its actual LP fact handoff"
+        );
+        let mut loan = facts.try_loan(FactRole::Lifecycle).unwrap();
+        let handoff = loan
+            .publish_root_reply_now(&runtime, &ticket, projected.clone())
             .unwrap();
-        assert!(matches!(
-            reply.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
+        drop(loan);
+        assert_eq!(
+            runtime.effect_inventory(actor, input, None, 1).unwrap(),
+            vec![(action.clone(), EffectState::Started)],
+            "the exact handed-off reply still awaits its original physical completion"
+        );
+        assert_eq!(
+            received.lock().unwrap().len(),
+            index,
+            "actual fact handoff does not await or pretend LP consumption"
+        );
+        assert!(
+            matches!(
+                requests.close_after_exit(),
+                Err(PortControlError::UnsettledRoot)
+            ),
+            "actual handoff alone cannot acknowledge the exact root-command row"
+        );
         runtime.effect_completed(ticket).unwrap();
+        assert_eq!(
+            runtime.effect_inventory(actor, input, None, 1).unwrap(),
+            vec![(action, EffectState::Completed)],
+            "only actual completion finishes the same original AP reply effect"
+        );
         runtime.retire_input(actor, input).unwrap();
+        let retirement_wakes = wakes.0.load(Ordering::SeqCst);
         ingress.root_control_processed(input).unwrap();
         ingress.input_retired(input).unwrap();
-        let wake_count = wakes.0.load(Ordering::SeqCst);
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > retirement_wakes,
+            "actual original ordered input retirement wakes its same Source"
+        );
         if seal {
             let retained = scope.snapshot().unwrap().storage;
-            assert!(!ordered_host.ready_for_close());
+            assert!(matches!(
+                requests.close_after_exit(),
+                Err(PortControlError::UnsettledRoot)
+            ));
             assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
             assert_eq!(scope.snapshot().unwrap().storage, retained);
             assert_eq!(used_bytes(), budget.total_bytes as u64);
         }
-        requests.deliver(token, &mut publication).unwrap();
-        reply.await.unwrap().unwrap();
+        let receipt = requests
+            .acknowledge_fact_handoff(handoff)
+            .unwrap_or_else(|_| panic!("same original root fact handoff"));
+        assert!(
+            !requests.reply_delivered(&projected).unwrap(),
+            "exact row acknowledges once"
+        );
+        let ack = publisher
+            .acknowledge_root_reply(&original, receipt)
+            .unwrap();
+        match ack {
+            Some((
+                AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                    effect,
+                    result: Ok(novarocks_attempt_protocol::input::PublicationApplied::SealResult),
+                }),
+                None,
+            )) => {
+                assert!(seal);
+                assert_eq!(effect, original.protocol.id);
+            }
+            None => assert!(!seal, "Terminal has no invented publication ACK"),
+            _ => panic!("only a real Seal handoff can construct its original ACK"),
+        }
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+        let got = received.lock().unwrap()[index].clone();
+        assert_eq!(got.activation, activation);
+        assert_eq!(got.action, projected.action);
+        match (got.body, &projected.body) {
+            (novarocks_coordination_contract::logical_port::AttemptToLogicalBody::SealResult { token: a, result: Ok(a_result) },
+             novarocks_coordination_contract::logical_port::AttemptToLogicalBody::SealResult { token: b, result: Ok(b_result) }) => {
+                assert_eq!(a, *b); assert!(Arc::ptr_eq(&a_result, b_result));
+            }
+            (novarocks_coordination_contract::logical_port::AttemptToLogicalBody::TerminalControlResult { token: a, result: Ok(()) },
+             novarocks_coordination_contract::logical_port::AttemptToLogicalBody::TerminalControlResult { token: b, result: Ok(()) }) => assert_eq!(a, *b),
+            _ => panic!("same one original reply payload reached LP"),
+        }
+        assert!(facts.progress(3, false, false).unwrap().progressed);
         if seal {
-            assert!(wakes.0.load(Ordering::SeqCst) > wake_count);
-            assert!(status.begin_terminal_control_request().is_err());
             assert!(ordered_host.ready_for_close());
         }
     }
-    assert!(
-        publication.root.is_none(),
-        "success moved the original publisher"
+    assert_eq!(
+        received.lock().unwrap().len(),
+        2,
+        "one actual reply for each original root command"
     );
+    assert!(command_tickets.iter().all(Option::is_none));
+    slot.close_publication();
+    assert!(!storage_header.is_retired());
+    assert!(reader.close_after_exit(&runtime).unwrap());
+    assert!(
+        storage_header.is_retired(),
+        "same reader report/Work/header really retired"
+    );
+    facts.close_admission();
+    facts.original_producer_exited();
+    assert!(facts.progress(3, true, false).unwrap().complete);
+    assert!(facts.is_closed());
+    for trigger in &mut triggers {
+        trigger.close_after_exit().unwrap();
+    }
     let original_storage = scope.snapshot().unwrap().storage;
     assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
     assert_eq!(
@@ -688,16 +989,20 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         (&mut observations, &mut positions, &scope),
         (&mut control, &mut control_payer, &bridge),
     ] {
+        let original_header = work.retirement_observer();
+        assert!(!original_header.is_retired());
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
         payer.finish().unwrap();
         owner.close_external().unwrap();
         ledger.reap_scope_ready(owner.id(), 16).unwrap();
+        assert!(original_header.is_retired());
     }
     while let Some(turn) = runtime.claim_host_actor() {
         turn.release(false).unwrap();
     }
     runtime.remove_actor(actor).unwrap();
+    runtime.remove_actor(source).unwrap();
     ledger.remove_scope(scope.id()).unwrap();
     ledger.remove_scope(bridge.id()).unwrap();
     assert!(runtime.is_empty() && ledger.is_empty());

@@ -64,7 +64,9 @@ use tokio::sync::watch;
 
 #[path = "subscription/failure.rs"]
 mod failure;
-pub(crate) use failure::{OriginalSubscriptionFailure, SubscriptionFailureRecord};
+#[cfg(test)]
+pub(crate) use failure::OriginalSubscriptionFailure;
+pub(crate) use failure::SubscriptionFailureRecord;
 
 #[path = "subscription/native_io.rs"]
 mod native_io;
@@ -495,6 +497,21 @@ impl<A: Actor> SubscriptionSource<A> {
             .get(&generation)
             .map(|record| record.applied.clone())
             .ok_or(SubscriptionSourceError::UnknownGeneration)
+    }
+    /// Observe the SAME original generation stop view, never a result or
+    /// future-exit guarantee. A missing record remains an explicit refusal.
+    #[cfg(test)]
+    pub(crate) fn generation_stop_requested_for_fixture(
+        &self,
+        generation: NonZeroU64,
+    ) -> Result<bool, SubscriptionSourceError> {
+        let state = self.state.lock().expect("covered original Source");
+        let record = state
+            .jobs
+            .get(&generation)
+            .ok_or(SubscriptionSourceError::UnknownGeneration)?;
+        let requested = *record.stop.borrow();
+        Ok(requested)
     }
     pub(crate) fn close_generation(
         &self,

@@ -385,3 +385,79 @@ fn cancellation_discards_unissued_qualification_but_converges_the_real_prepared_
 pub(crate) mod contract;
 #[path = "recovery/scenarios.rs"]
 mod scenarios;
+#[path = "recovery/startup_outcome.rs"]
+mod startup_outcome;
+#[path = "recovery/topology.rs"]
+mod topology;
+
+#[test]
+fn required_successor_rows_root_missing_fences_its_exact_activation_before_io() {
+    let mut f = recovering();
+    let (identity, operation_id) = prepared(&mut f);
+    let successor = AttemptActivationIdentity::from_parts(
+        identity.actor.get(),
+        identity.replacement,
+        identity.generation,
+    );
+    assert_ne!(successor, activation(1));
+    let reserve = f.take(|body| {
+        matches!(
+            body,
+            LogicalEffectBody::Native(NativeEffect::ActivateReservation { .. })
+        )
+    });
+    f.ack(
+        reserve.action,
+        ActionResult::Native(NativeFact::ReservationActivated {
+            identity,
+            operation_id,
+        }),
+    );
+    let register = f.take(|body| {
+        matches!(body,
+        LogicalEffectBody::Governance(GovernanceEffect::RegisterObligation { activation: a, .. })
+            if *a == successor)
+    });
+    f.ack(
+        register.action,
+        ActionResult::Governance(GovernanceFact::ObligationRegistered {
+            activation: successor,
+            kind: ObligationKind::RunningWork,
+        }),
+    );
+    let issued = f.take(|body| {
+        matches!(body,
+        LogicalEffectBody::Native(NativeEffect::ActivateAttempt { activation: a, .. })
+            if *a == successor)
+    });
+    assert_eq!(f.core.facts().current_activation(), Some(successor));
+    assert_eq!(f.core.facts().attempts_started(), 2);
+    f.result(
+        issued.action,
+        ActionResult::Native(NativeFact::AttemptActivated {
+            activation: successor,
+            root: None,
+        }),
+    );
+    super::phase::assert_missing_rows_preserves_typed_failure_and_closing(
+        &mut f,
+        successor,
+        issued.action,
+    );
+    assert!(!f.effects.iter().any(|effect| matches!(effect.body,
+        LogicalEffectBody::Native(NativeEffect::RunAttempt { activation: a })
+        | LogicalEffectBody::Relay(RelayEffect::Start { activation: a })
+            if a == successor)));
+    assert_eq!(
+        f.core
+            .facts()
+            .attempts()
+            .find(|a| a.activation == activation(1))
+            .unwrap()
+            .accepted_failure,
+        Some(failure().input())
+    );
+    // No third attempt, retry, read/ACK, Scope exit or actual Native resource
+    // retirement is inferred by this typed logical-failure input sequence.
+    assert_eq!(f.core.facts().attempts_started(), 2);
+}

@@ -29,7 +29,7 @@ use crate::{
 };
 use novarocks_attempt_protocol::{
     input::AttemptInput,
-    port_projection::{AbortReceiptFact, abort_worker_closure, project_logical_message},
+    port_projection::{AbortReceiptFact, abort_worker_closure},
 };
 use novarocks_control_runtime::actor_turn::{
     ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket, StandingInputObligation,
@@ -69,12 +69,16 @@ impl ClosedParticipations {
     ) -> Self {
         Self { rows, epoch }
     }
+    pub(crate) fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.rows, &other.rows) && self.epoch.same_channel(&other.epoch)
+    }
     pub(crate) fn rows(&self) -> Arc<Mutex<BTreeSet<ParticipationRef>>> {
         self.rows.clone()
     }
     pub(crate) fn epoch(&self) -> watch::Sender<u64> {
         self.epoch.clone()
     }
+    #[cfg(test)]
     pub(crate) fn contains(&self, participation: ParticipationRef) -> bool {
         self.rows.lock().unwrap().contains(&participation)
     }
@@ -135,6 +139,13 @@ impl AttemptAbortIngress {
                     .author()
                     .is_ok_and(|author| registration.matches_input_author(&author)),
                 "original AP Control position author"
+            );
+            #[cfg(test)]
+            eprintln!(
+                "original Abort input binding: lp={:?}, ap={:?}, activation={activation:?}, participation={participation:?}, standing={:?}",
+                owner.actor(),
+                registration.actor(),
+                position.id(),
             );
             assert!(
                 slots
@@ -213,22 +224,60 @@ impl AttemptAbortIngress {
             .unwrap()
             .take()
             .ok_or(AbortPortError::PositionLoaned)?;
-        let loan = PositionLoan {
+        let mut loan = PositionLoan {
             slot,
             position: Some(position),
         };
-        let position = loan.position.as_ref().unwrap();
-        // The same previous occurrence may already be terminal; this probe
-        // never waits, acknowledges an unconsumed input or invents Work exit.
-        position
-            .retire_ready_after_exit()
-            .map_err(AbortPortError::Runtime)?;
-        let input = FrontendInput::Attempt(Box::new(AttemptInput::Port(project_logical_message(
-            message,
-        ))));
-        runtime
-            .fill_from_effect(ticket, position, input)
-            .map_err(|(error, _)| AbortPortError::Runtime(error))
+        let result = (|| {
+            let position = loan.position.as_ref().unwrap();
+            // The same previous occurrence may already be terminal; this probe
+            // never waits, acknowledges an unconsumed input or invents Work exit.
+            position
+                .retire_ready_after_exit()
+                .map_err(AbortPortError::Runtime)?;
+            let input =
+                FrontendInput::Attempt(Box::new(AttemptInput::Port(message.as_ref().clone())));
+            runtime
+                .fill_from_effect(ticket, position, input)
+                .map_err(|(error, _)| AbortPortError::Runtime(error))
+        })();
+        // AP can consume and finish its finite scan before this physical loan
+        // returns. Restore and notify even when this delivery was refused: an
+        // older original occurrence may still need its retirement visit.
+        loan.restore_and_notify(runtime, &self.registration)
+            .expect("the original standing keeps its same AP registration live");
+        result
+    }
+    pub(crate) fn participation_count(&self) -> usize {
+        self.slots.len()
+    }
+    /// Visit one member of the SAME immutable roster. Return only this original
+    /// submitted occurrence after actual Core/effect/reservation retirement;
+    /// keep its standing role and Abort intake alive for a later original call.
+    pub(crate) fn retire_ready_occurrence_after(
+        &self,
+        after: Option<ParticipationRef>,
+    ) -> Result<Option<(ParticipationRef, bool)>, ActorTurnError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let next = after
+            .and_then(|after| self.slots.range((Excluded(after), Unbounded)).next())
+            .or_else(|| self.slots.first_key_value());
+        let Some((&participation, slot)) = next else {
+            return Ok(None);
+        };
+        // Do not take a PositionLoan here: a concurrent original LP delivery
+        // must not see a new PositionLoaned refusal from a retirement visit.
+        // This standing-only kernel path releases pure header metadata and
+        // wakes the fixed CR Condvar; no input payload/foreign callback runs.
+        // LP delivery drops kernel locks before taking this same short gate.
+        let position = slot.position.lock().unwrap();
+        let Some(original) = position.as_ref() else {
+            return Ok(Some((participation, false)));
+        };
+        let retired = original.in_flight()?.is_some() && original.retire_ready_after_exit()?;
+        Ok(Some((participation, retired)))
     }
     pub(crate) fn close_external(&self) {
         self.closed.store(true, Ordering::Release);
@@ -260,6 +309,26 @@ impl AttemptAbortIngress {
 struct PositionLoan<'a> {
     slot: &'a Slot,
     position: Option<Position>,
+}
+impl PositionLoan<'_> {
+    fn restore_and_notify(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        registration: &ActorRegistration,
+    ) -> Result<(), ActorTurnError> {
+        let position = self
+            .position
+            .take()
+            .expect("same original Abort Control loan");
+        let mut slot = self.slot.position.lock().unwrap();
+        assert!(
+            slot.replace(position).is_none(),
+            "same original Abort Control loan returns once"
+        );
+        // The same short gate excludes final role closure between restoration
+        // and this fixed scheduler/Condvar mark. No foreign waker runs here.
+        runtime.notify_host_actor(registration)
+    }
 }
 impl Drop for PositionLoan<'_> {
     fn drop(&mut self) {
@@ -336,6 +405,10 @@ impl AbortReceiptSlot {
             closed,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn original_for_test(&self) -> Option<&OperationAcknowledgement> {
+        self.original.get()
+    }
     pub(crate) fn record(
         &self,
         original: &OperationAcknowledgement,
@@ -384,6 +457,9 @@ impl AbortReceiptTable {
             activation,
             slots: Mutex::new(BTreeMap::new()),
         }
+    }
+    pub(crate) fn matches_activation(&self, activation: AttemptActivationIdentity) -> bool {
+        self.activation == activation
     }
     pub(crate) fn register(&self, slot: &Arc<AbortReceiptSlot>) -> Result<(), AbortReceiptError> {
         if slot.participation.query_execution_id() != self.activation.execution() {

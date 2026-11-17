@@ -28,7 +28,8 @@ use novarocks_logical_execution_protocol::{
 };
 use novarocks_query_application::api::logical_runtime::{
     InstalledLogicalExecution, LogicalExit, LogicalFactSource, LogicalFuture, LogicalHostFact,
-    LogicalJoinReadiness, LogicalSourceClosed, LogicalSourceKind, LogicalSourceRefusal,
+    LogicalJoinReadiness, LogicalRegistryCommit, LogicalSourceClosed, LogicalSourceKind,
+    LogicalSourceRefusal,
 };
 use std::{
     future::poll_fn,
@@ -85,6 +86,7 @@ pub(super) struct LogicalInstalledState {
     progress_waiter: Mutex<Option<Waker>>,
     failure_actor: Mutex<Option<LogicalFailureBinding>>,
     registry_close: Mutex<Option<LogicalIngressCloseObserver>>,
+    registry_committed: AtomicBool,
     pub(super) requested_close: AtomicU8,
     pub(super) retirable: AtomicBool,
     owner_failed_observation_stop: AtomicBool,
@@ -115,6 +117,7 @@ impl LogicalInstalledState {
             progress_waiter: Mutex::new(None),
             failure_actor: Mutex::new(None),
             registry_close: Mutex::new(None),
+            registry_committed: AtomicBool::new(false),
             requested_close: AtomicU8::new(0),
             retirable: AtomicBool::new(false),
             owner_failed_observation_stop: AtomicBool::new(false),
@@ -122,6 +125,15 @@ impl LogicalInstalledState {
             host,
             failure,
         })
+    }
+    pub(super) fn registry_is_committed(&self) -> bool {
+        self.registry_committed.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    pub(super) fn start_direct_source_fixture(&self) {
+        // The private direct-Source fixture deliberately scripts the Native
+        // Registry boundary. It does not claim a real Registry commit.
+        assert!(!self.registry_committed.swap(true, Ordering::AcqRel));
     }
     pub(super) fn bind_failure_actor(
         &self,
@@ -272,6 +284,17 @@ impl LogicalFactSource for WeakSource {
     }
 }
 impl InstalledLogicalExecution for LogicalInstalledState {
+    fn registry_committed(&self, original: LogicalRegistryCommit) {
+        assert!(
+            original.matches(self),
+            "Registry commit belongs to the same installed carrier"
+        );
+        assert!(
+            !self.registry_committed.swap(true, Ordering::AcqRel),
+            "one original Registry commit"
+        );
+        self.host.wake_by_ref();
+    }
     fn source(
         &self,
         kind: LogicalSourceKind,

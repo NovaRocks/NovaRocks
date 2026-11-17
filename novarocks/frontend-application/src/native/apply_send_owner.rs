@@ -107,8 +107,6 @@ impl JoinFacts {
     }
 }
 mod canonical_reply;
-#[cfg(test)]
-pub(crate) use canonical_reply::canonical_dispatch_rejection_fixture;
 pub(crate) use canonical_reply::{CanonicalAcknowledgement, OriginalReplyPublisher};
 use canonical_reply::{OriginalNativeAcceptance, ReservationBacking};
 type OriginalFuture = Pin<Box<dyn Future<Output = ()> + Send>>;

@@ -56,6 +56,7 @@ struct State {
     activation_exited: bool,
     child: Option<ScopeId>,
     child_exit: Option<LogicalFuture<'static, Result<(), tokio::sync::watch::error::RecvError>>>,
+    child_exit_observer: Option<tokio::sync::watch::Receiver<bool>>,
     child_exited: bool,
     endpoints: Option<Arc<AttemptPortEndpoints>>,
     input_author_closed: bool,
@@ -78,13 +79,23 @@ pub(crate) struct LogicalAttemptLinks {
 pub(super) struct LogicalAttemptCleanupRow {
     pub(super) activation: Option<AttemptActivationIdentity>,
     pub(super) endpoints: Option<Arc<AttemptPortEndpoints>>,
-    pub(super) borrowed: bool,
     pub(super) activation_exited: bool,
-    pub(super) child_present: bool,
-    pub(super) child_exited: bool,
-    pub(super) retired: bool,
 }
 impl LogicalAttemptLinks {
+    /// Validate the SAME borrowed allocation; copied identities/indexes never
+    /// authorize binding metadata to a different logical inventory.
+    pub(crate) fn matches_loan(
+        &self,
+        original: &AttemptActivationLinkLoan,
+        activation: AttemptActivationIdentity,
+    ) -> bool {
+        self.slots.get(original.index).is_some_and(|slot| {
+            Arc::ptr_eq(slot, &original.slot) && {
+                let state = slot.state.lock().unwrap();
+                state.borrowed && !state.retired && state.activation == Some(activation)
+            }
+        })
+    }
     pub(super) fn cleanup_row_count(&self) -> usize {
         self.slots.len()
     }
@@ -93,11 +104,7 @@ impl LogicalAttemptLinks {
         LogicalAttemptCleanupRow {
             activation: state.activation,
             endpoints: state.endpoints.clone(),
-            borrowed: state.borrowed,
             activation_exited: state.activation_exited,
-            child_present: state.child.is_some(),
-            child_exited: state.child_exited,
-            retired: state.retired,
         }
     }
     pub(crate) fn new(count: usize, wake: Waker, failure: FailureReporter) -> Arc<Self> {
@@ -115,6 +122,7 @@ impl LogicalAttemptLinks {
                             activation_exited: false,
                             child: None,
                             child_exit: None,
+                            child_exit_observer: None,
                             child_exited: false,
                             endpoints: None,
                             input_author_closed: false,
@@ -136,6 +144,27 @@ impl LogicalAttemptLinks {
     /// itself indefinitely. Every notification runs outside the custody locks.
     pub(crate) fn changes(&self) -> Arc<Notify> {
         self.changes.clone()
+    }
+    /// Observe this SAME bound HostExit even before the parent Source gets its
+    /// next progress turn. Missing routing or a disconnected false watch is
+    /// not exit, and this says nothing about any remote participation.
+    pub(super) fn actual_child_exited(&self, activation: AttemptActivationIdentity) -> bool {
+        let Some(index) = self
+            .routes
+            .lock()
+            .unwrap()
+            .get(&Self::key(activation))
+            .copied()
+        else {
+            return false;
+        };
+        let state = self.slots[index].state.lock().unwrap();
+        state.activation == Some(activation)
+            && (state.child_exited
+                || state
+                    .child_exit_observer
+                    .as_ref()
+                    .is_some_and(|exit| *exit.borrow()))
     }
     /// Called only with the same actual ActivateAttempt step's reported parent.
     pub(super) fn issue(
@@ -226,11 +255,17 @@ impl LogicalAttemptLinks {
         &self,
         index: usize,
         failed: bool,
+        rescan: bool,
     ) -> Result<Option<crate::task_execution::host::port::facts::FactProgress>, ActorTurnError>
     {
         let endpoints = self.slots[index].state.lock().unwrap().endpoints.clone();
         endpoints
-            .map(|e| e.facts.progress(1, e.producer_exited(), failed))
+            .map(|e| {
+                if rescan {
+                    e.facts.request_rescan();
+                }
+                e.facts.progress(1, e.producer_exited(), failed)
+            })
             .transpose()
     }
     pub(super) fn input_author_closed(&self, index: usize) {
@@ -350,6 +385,44 @@ pub(crate) struct AttemptActivationLinkLoan {
     original: Option<ActivationLinkFundingObligation>,
 }
 impl AttemptActivationLinkLoan {
+    pub(crate) fn matches_child_registration(
+        &self,
+        activation: AttemptActivationIdentity,
+        registration: &ActorRegistration,
+    ) -> bool {
+        let state = self.slot.state.lock().unwrap();
+        state.activation == Some(activation) && state.child == Some(registration.scope_id())
+    }
+    pub(crate) fn matches_registered(
+        &self,
+        activation: AttemptActivationIdentity,
+        registration: &ActorRegistration,
+        exit: &HostExit,
+    ) -> bool {
+        self.matches_child_registration(activation, registration) && exit.matches(registration)
+    }
+    /// Confirm an already committed SAME exit binding after a notification
+    /// boundary. The polling future can be temporarily loaned to its parent;
+    /// the original watch channel remains the stable receiving receipt.
+    #[cfg(test)]
+    pub(crate) fn has_bound_host_exit(
+        &self,
+        activation: AttemptActivationIdentity,
+        registration: &ActorRegistration,
+        exit: &HostExit,
+    ) -> bool {
+        if !self.matches_registered(activation, registration, exit) {
+            return false;
+        }
+        let original = exit.observe_actual_exit();
+        self.slot
+            .state
+            .lock()
+            .unwrap()
+            .child_exit_observer
+            .as_ref()
+            .is_some_and(|bound| bound.same_channel(&original))
+    }
     pub(crate) fn index(&self) -> usize {
         self.index
     }
@@ -369,8 +442,12 @@ impl AttemptActivationLinkLoan {
             state.storage_issued = true;
         }
         let original = self.original.as_ref().expect("same live link loan");
+        // An already-issued Native activation can still bind this SAME
+        // settlement reader after its original logical Scope failed. This
+        // derives no new Business link and uses only that Scope's actual epoch.
+        let generation = original.work.scope().snapshot()?.generation;
         let guard = original.work.scope().reserve_child_next(
-            GENERATION,
+            generation,
             original.payer.id(),
             ReservationResources::new(
                 ResourceVector::default(),
@@ -441,8 +518,12 @@ impl AttemptActivationLinkLoan {
             Some(registration.scope_id()),
             "same funded child Scope"
         );
-        assert!(state.child_exit.is_none(), "one original AP registration");
+        assert!(
+            state.child_exit_observer.is_none(),
+            "one original AP registration"
+        );
         let mut exited = exit.observe_actual_exit();
+        state.child_exit_observer = Some(exited.clone());
         state.child_exit = Some(Box::pin(async move {
             exited.wait_for(|removed| *removed).await.map(|_| ())
         }));

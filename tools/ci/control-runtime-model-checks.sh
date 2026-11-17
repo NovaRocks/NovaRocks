@@ -46,8 +46,6 @@ while [[ $# -gt 0 ]]; do
 done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
-source "$repo_root/tools/ci/lib/build_capabilities.sh"
-ci_set_default_build_jobs
 export CARGO_NET_OFFLINE=true RUSTUP_AUTO_INSTALL=0
 # Cargo's encoded flag override would otherwise suppress --cfg loom.
 if [[ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]]; then

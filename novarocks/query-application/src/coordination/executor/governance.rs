@@ -110,6 +110,32 @@ pub struct GovernanceExecutor {
 }
 
 impl GovernanceExecutor {
+    /// Installation refused before publishing a Source or issuing any action.
+    /// This settles only the original uninstalled control owner; original
+    /// Native preparation/body exit remains with its independent fixed source.
+    pub(in crate::coordination) fn close_uninstalled(&self) -> Result<(), QueryExecutionError> {
+        let (owner, stage) = {
+            let mut state = self.lock();
+            if state.completed
+                || state.completion_in_flight
+                || !state.obligations.is_empty()
+                || !state.registering.is_empty()
+                || !state.settling.is_empty()
+                || state.owner.is_none()
+                || state.stage.is_none()
+            {
+                return Err(protocol_failure(
+                    "uninstalled governance already issued work",
+                ));
+            }
+            state.completed = true;
+            (state.owner.take().unwrap(), state.stage.take().unwrap())
+        };
+        drop(stage);
+        owner.complete_after_terminal_cancel_settled();
+        Ok(())
+    }
+
     pub fn new(
         identity: QueryId,
         actor: LogicalExecutionActorId,

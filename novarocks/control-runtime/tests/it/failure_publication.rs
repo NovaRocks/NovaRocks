@@ -140,6 +140,14 @@ fn fixture_with_before_failure<T>(
     start_cleanup: bool,
     before_failure: impl FnOnce(&ActorRuntime<FailingActor>, &WorkObligation, &RuntimeLedger) -> T,
 ) -> (Fixture, T) {
+    fixture_with_observation_before_failure(start_cleanup, Default::default(), before_failure)
+}
+
+fn fixture_with_observation_before_failure<T>(
+    start_cleanup: bool,
+    observation: novarocks_control_runtime::observation::RuntimeObservation,
+    before_failure: impl FnOnce(&ActorRuntime<FailingActor>, &WorkObligation, &RuntimeLedger) -> T,
+) -> (Fixture, T) {
     let history = HistoryCapture::new(256);
     let ledger = RuntimeLedger::with_history(vector(2), history.clone());
     let scope = ledger.open_scope_next(None, generation()).unwrap();
@@ -167,7 +175,7 @@ fn fixture_with_before_failure<T>(
     if start_cleanup {
         cleanup.start().unwrap();
     }
-    let runtime = ActorRuntime::with_history(history.clone());
+    let runtime = ActorRuntime::with_observation(Some(history.clone()), observation);
     runtime
         .register_supervised_bound(
             aid(),
@@ -926,7 +934,7 @@ fn failure_session_fills_only_original_negative_roles_and_preserves_the_reply_au
 }
 
 #[test]
-fn original_failure_proof_time_does_not_follow_later_observation_turns() {
+fn original_failure_proof_identity_does_not_follow_later_observation_turns() {
     let f = std::mem::ManuallyDrop::new(fixture(true));
     let session = f
         .runtime
@@ -934,17 +942,24 @@ fn original_failure_proof_time_does_not_follow_later_observation_turns() {
         .unwrap();
     let registration = session.registration().clone();
     let proof = f.runtime.failure_proof_for(&registration).unwrap();
-    assert_eq!(proof.failed_at(), Tick(2));
+    assert!(proof.registration().same_registration(&registration));
+    assert_eq!(proof.initial_epoch(), generation());
+    assert_eq!(proof.failed_epoch(), generation().next().unwrap());
     f.runtime.advance_time(Tick(1000), 8).unwrap();
     let observed = f.runtime.failure_proof_for(&registration).unwrap();
-    assert_eq!(observed.failed_at(), proof.failed_at());
+    assert!(
+        observed
+            .registration()
+            .same_registration(proof.registration())
+    );
+    assert_eq!(observed.initial_epoch(), proof.initial_epoch());
     assert_eq!(observed.failed_epoch(), proof.failed_epoch());
     session.finish().unwrap();
     drain(std::mem::ManuallyDrop::into_inner(f));
 }
 
 #[test]
-fn failure_time_is_fenced_before_the_original_supervisor_hook_finishes() {
+fn failure_proof_is_fenced_before_the_original_supervisor_hook_finishes() {
     struct Hook {
         entered: std::sync::mpsc::Sender<()>,
         release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -1004,21 +1019,35 @@ fn failure_time_is_fenced_before_the_original_supervisor_hook_finishes() {
         .unwrap()
         .fill(())
         .unwrap();
-    std::thread::scope(|threads| {
+    let fenced = std::thread::scope(|threads| {
         let worker = threads.spawn(|| runtime.poll_one(Tick(43)).unwrap());
         observed
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         let proof = runtime.failure_proof_for(&registration).unwrap();
-        assert_eq!(proof.failed_at(), Tick(43));
-        assert_eq!(
-            runtime.snapshot(aid()).unwrap().last_progress,
-            Tick(0),
-            "supervisor publication has not updated the ordinary progress diagnostic"
+        assert!(proof.registration().same_registration(&registration));
+        assert_eq!(proof.initial_epoch(), generation());
+        assert_eq!(proof.failed_epoch(), generation().next().unwrap());
+        assert!(runtime.snapshot(aid()).unwrap().failed);
+        assert!(
+            runtime
+                .committed_batches(aid(), None, 1)
+                .unwrap()
+                .is_empty(),
+            "the original supervisor hook has not committed its batch"
         );
         release.send(()).unwrap();
         assert!(worker.join().unwrap());
+        proof
     });
+    let completed = runtime.failure_proof_for(&registration).unwrap();
+    assert!(
+        completed
+            .registration()
+            .same_registration(fenced.registration())
+    );
+    assert_eq!(completed.initial_epoch(), fenced.initial_epoch());
+    assert_eq!(completed.failed_epoch(), fenced.failed_epoch());
     let FailureSourceState::ClosedPending(supervisor) =
         runtime.failure_source_state(aid()).unwrap()
     else {
@@ -1026,7 +1055,12 @@ fn failure_time_is_fenced_before_the_original_supervisor_hook_finishes() {
     };
     runtime.retire_input(aid(), supervisor).unwrap();
     runtime.retire_input(aid(), input).unwrap();
-    drop(runtime.take_failure_payload(aid()).unwrap());
+    let original_panic = runtime.take_failure_payload(aid()).unwrap().unwrap();
+    assert_eq!(
+        original_panic.downcast_ref::<&'static str>(),
+        Some(&"controlled original failure before supervisor publication")
+    );
+    drop(original_panic);
     while let Some(turn) = runtime.claim_host_actor() {
         turn.release(false).unwrap();
     }
@@ -1362,5 +1396,313 @@ fn failed_publisher_uses_its_original_failure_session_for_failed_receiver_custod
     f.runtime.remove_actor(sender).unwrap();
     f.ledger.remove_scope(scope.id()).unwrap();
     receiver_session.finish().unwrap();
+    drain(std::mem::ManuallyDrop::into_inner(f));
+}
+
+struct PassiveSender {
+    registration: novarocks_control_runtime::actor_turn::ActorRegistration,
+    scope: ScopeHandle,
+    work: WorkObligation,
+    capacity: ReservationObligation,
+    quota: ResourceVector,
+}
+impl PassiveSender {
+    fn new(
+        runtime: &ActorRuntime<FailingActor>,
+        ledger: &RuntimeLedger,
+        actor: ActorId,
+        quota: ResourceVector,
+    ) -> Self {
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (mut work, capacity) = scope
+            .reserve_next(
+                generation(),
+                work_resources(quota.clone()),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        work.start().unwrap();
+        let registration = runtime
+            .register_bound(
+                actor,
+                scope.clone(),
+                FailingActor(work.reference()),
+                ActorConfig {
+                    mailbox: [2; 4],
+                    max_batches: 2,
+                    max_effects_per_step: 1,
+                    max_dependencies_per_effect: 0,
+                    max_step_work: 1,
+                    turn_budget: 8,
+                },
+            )
+            .unwrap();
+        Self {
+            registration,
+            scope,
+            work,
+            capacity,
+            quota,
+        }
+    }
+    fn finish(&mut self, runtime: &ActorRuntime<FailingActor>, ledger: &RuntimeLedger) {
+        let actor = self.registration.actor();
+        self.work.body_exited().unwrap();
+        self.work.captures_exited().unwrap();
+        self.capacity.release_quota(&self.quota).unwrap();
+        self.capacity.finish().unwrap();
+        self.scope.close_external().unwrap();
+        assert_eq!(ledger.reap_scope_ready(self.scope.id(), 1).unwrap(), 1);
+        runtime.close_actor_admission(actor).unwrap();
+        runtime.close_timer_source(actor).unwrap();
+        while let Some(turn) = runtime.claim_host_actor() {
+            turn.release(false).unwrap();
+        }
+        runtime.seal_actor(actor).unwrap();
+        runtime.remove_actor(actor).unwrap();
+        ledger.remove_scope(self.scope.id()).unwrap();
+    }
+}
+
+#[test]
+fn failed_receiver_work_rejects_a_foreign_sender_ledger_before_acquiring_its_original_pin() {
+    let (f, (foreign_ledger, foreign_sender, same_ledger_sender)) =
+        fixture_with_before_failure(true, |runtime, original, ledger| {
+            let foreign_ledger = RuntimeLedger::new(vector(1));
+            let foreign_sender = PassiveSender::new(
+                runtime,
+                &foreign_ledger,
+                ActorId::new(2).unwrap(),
+                vector(1),
+            );
+            assert_eq!(foreign_sender.scope.id(), original.scope().id());
+            assert_eq!(foreign_sender.work.id(), original.id());
+            let same_ledger_sender = PassiveSender::new(
+                runtime,
+                ledger,
+                ActorId::new(3).unwrap(),
+                ResourceVector::default(),
+            );
+            (foreign_ledger, foreign_sender, same_ledger_sender)
+        });
+    let f = std::mem::ManuallyDrop::new(f);
+    let mut foreign_sender = std::mem::ManuallyDrop::new(foreign_sender);
+    let mut same_ledger_sender = std::mem::ManuallyDrop::new(same_ledger_sender);
+    let session = f
+        .runtime
+        .claim_failure_publication(f.initial.as_ref().unwrap())
+        .unwrap();
+    let proof = f.runtime.failure_proof_for(session.registration()).unwrap();
+    // A same-ledger bind proves that the SAME original receiver Work is live
+    // despite its failed Scope. The foreign-ledger refusal cannot be vacuous.
+    let positive = f
+        .runtime
+        .receiver_failed_snapshot_for_admitted_work(
+            &proof,
+            &same_ledger_sender.registration,
+            &f.business,
+            Arc::new(41_u64),
+        )
+        .unwrap();
+    assert_eq!(*positive.retire(), 41);
+    assert!(
+        !f.ledger
+            .unresolved_work()
+            .contains(&(f.scope.id(), f.business.id()))
+    );
+    let initial = Arc::new(43_u64);
+    match f.runtime.receiver_failed_snapshot_for_admitted_work(
+        &proof,
+        &foreign_sender.registration,
+        &f.business,
+        initial.clone(),
+    ) {
+        Err((ActorTurnError::PublicationTargetMismatch, returned)) => {
+            assert!(Arc::ptr_eq(&returned, &initial))
+        }
+        Ok(unexpected) => {
+            let _original_unknown = std::mem::ManuallyDrop::new(unexpected);
+            panic!(
+                "foreign sender ledger must be rejected before borrowing the receiver Work header"
+            );
+        }
+        Err((error, _)) => panic!("foreign ledger returned the wrong typed refusal: {error:?}"),
+    }
+    foreign_sender.finish(&f.runtime, &foreign_ledger);
+    assert!(foreign_ledger.is_empty());
+    same_ledger_sender.finish(&f.runtime, &f.ledger);
+    drop(std::mem::ManuallyDrop::into_inner(foreign_sender));
+    drop(std::mem::ManuallyDrop::into_inner(same_ledger_sender));
+    session.finish().unwrap();
+    drain(std::mem::ManuallyDrop::into_inner(f));
+    // drain requires the original receiver ledger to be actually empty. A
+    // leaked pin from either bind would keep its same original Work resident.
+}
+
+#[derive(Default)]
+struct ReentrantClock {
+    armed: std::sync::atomic::AtomicBool,
+    calls: AtomicUsize,
+    locked: AtomicUsize,
+    snapshots: AtomicUsize,
+    target: std::sync::Mutex<Option<ReentrantClockTarget>>,
+}
+struct ReentrantClockTarget {
+    runtime: ActorRuntime<FailingActor>,
+    source: novarocks_control_runtime::actor_turn::ActorRegistration,
+    receiver: novarocks_control_runtime::actor_turn::ActorRegistration,
+    ledger: RuntimeLedger,
+}
+impl novarocks_control_runtime::actor_turn::Clock for ReentrantClock {
+    fn now(&self) -> Tick {
+        if !self.armed.load(Ordering::SeqCst) {
+            return Tick(7);
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let binding = self.target.lock().unwrap();
+        let target = binding.as_ref().unwrap();
+        let source = target
+            .runtime
+            .try_effect_inventory_observation(&target.source, None)
+            .unwrap();
+        let receiver = target
+            .runtime
+            .try_effect_inventory_observation(&target.receiver, None)
+            .unwrap();
+        let ledger = target
+            .ledger
+            .try_capacity_dimensions([DimensionId::new(1).unwrap()])
+            .unwrap();
+        if source.is_none() || receiver.is_none() || ledger.is_none() {
+            // This actual nonblocking observation makes the regression finite
+            // even in the old implementation. Busy is failure, never success.
+            self.locked.fetch_add(1, Ordering::SeqCst);
+            return Tick(7);
+        }
+        // This test arms the clock only for one synchronous publication on
+        // this thread. Once the original try reads succeeded there is no
+        // concurrent owner that could intervene before these actual reads.
+        assert!(
+            target
+                .runtime
+                .snapshot(target.source.actor())
+                .unwrap()
+                .failed
+        );
+        assert!(
+            !target
+                .runtime
+                .snapshot(target.receiver.actor())
+                .unwrap()
+                .failed
+        );
+        assert_eq!(target.ledger.used(DimensionId::new(1).unwrap()), 2);
+        self.snapshots.fetch_add(1, Ordering::SeqCst);
+        Tick(7)
+    }
+}
+
+#[test]
+fn negative_standing_publication_observes_its_clock_outside_both_inboxes_and_the_ledger() {
+    let clock = Arc::new(ReentrantClock::default());
+    let observation =
+        novarocks_control_runtime::observation::RuntimeObservation::new(Some(clock.clone()));
+    let (f, receiver_originals) =
+        fixture_with_observation_before_failure(true, observation, |runtime, _, ledger| {
+            let scope = ledger.open_scope_next(None, generation()).unwrap();
+            let (mut work, capacity) = scope
+                .reserve_next(
+                    generation(),
+                    ReservationResources::new(
+                        ResourceVector::default(),
+                        OwnedSlotNeed {
+                            work_headers: 1,
+                            inputs: 1,
+                            ..Default::default()
+                        },
+                    ),
+                    WorkKind::Settlement,
+                    WorkAdmission::External,
+                )
+                .unwrap()
+                .bind(WorkKind::Settlement)
+                .unwrap();
+            work.start().unwrap();
+            let receiver_id = ActorId::new(2).unwrap();
+            let receiver = runtime
+                .register_bound(
+                    receiver_id,
+                    scope.clone(),
+                    FailingActor(work.reference()),
+                    ActorConfig {
+                        mailbox: [2; 4],
+                        max_batches: 2,
+                        max_effects_per_step: 1,
+                        max_dependencies_per_effect: 0,
+                        max_step_work: 1,
+                        turn_budget: 8,
+                    },
+                )
+                .unwrap();
+            let role = runtime
+                .reserve_admitted_input_for(&receiver, aid(), InputClass::Control, &work)
+                .unwrap()
+                .into_standing_input()
+                .unwrap();
+            (scope, work, capacity, role, receiver)
+        });
+    let f = std::mem::ManuallyDrop::new(f);
+    let mut receiver_originals = std::mem::ManuallyDrop::new(receiver_originals);
+    let (scope, work, capacity, role, receiver) = &mut *receiver_originals;
+    let mut session = f
+        .runtime
+        .claim_failure_publication(f.initial.as_ref().unwrap())
+        .unwrap();
+    *clock.target.lock().unwrap() = Some(ReentrantClockTarget {
+        runtime: f.runtime.clone(),
+        source: session.registration().clone(),
+        receiver: receiver.clone(),
+        ledger: f.ledger.clone(),
+    });
+    let original_author = role.author().unwrap();
+    clock.armed.store(true, Ordering::SeqCst);
+    let published = session.fill_standing(role, Some(&original_author), 42);
+    clock.armed.store(false, Ordering::SeqCst);
+    // Break the actual observer alias before retirement. The clock retains
+    // no runtime, Source or Work after this original synchronous call.
+    clock.target.lock().unwrap().take();
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(clock.locked.load(Ordering::SeqCst), 0);
+    assert_eq!(clock.snapshots.load(Ordering::SeqCst), 1);
+    let input = published.unwrap();
+    assert_eq!(role.in_flight().unwrap(), Some(input));
+    assert_eq!(
+        role.input_author(input).unwrap().work(),
+        original_author.work()
+    );
+    assert!(f.runtime.poll_one(Tick(3)).unwrap());
+    let ticket = f
+        .runtime
+        .take_effect(receiver.actor(), input, action(1))
+        .unwrap();
+    assert_eq!(ticket.effect, 42);
+    f.runtime.effect_completed(ticket).unwrap();
+    assert!(role.retire_ready_after_exit().unwrap());
+    role.close_after_exit().unwrap();
+    work.body_exited().unwrap();
+    work.captures_exited().unwrap();
+    capacity.finish().unwrap();
+    scope.close_external().unwrap();
+    assert_eq!(f.ledger.reap_scope_ready(scope.id(), 1).unwrap(), 1);
+    while let Some(turn) = f.runtime.claim_host_actor() {
+        turn.release(false).unwrap();
+    }
+    f.runtime.remove_actor(receiver.actor()).unwrap();
+    f.ledger.remove_scope(scope.id()).unwrap();
+    drop(std::mem::ManuallyDrop::into_inner(receiver_originals));
+    session.finish().unwrap();
     drain(std::mem::ManuallyDrop::into_inner(f));
 }

@@ -26,6 +26,7 @@ use crate::{
         ReplacementQualificationFailure,
     },
 };
+use novarocks_coordination_contract::{AttemptFailureClass, ExecutionFailureSite};
 use novarocks_types::AttemptId;
 
 impl LogicalExecutionCore {
@@ -48,6 +49,9 @@ impl LogicalExecutionCore {
             // its receiver wakes after the real failure or a successor cut.
             return Ok(());
         }
+        // Only an originating report authorizes local terminated read close.
+        // Pending-root/withdrawal Stop and StopObservation never reach here.
+        self.attempt_mut(activation)?.read_termination_authorized = true;
         if self.state.conclusion().is_some() || self.state.current_activation() != Some(activation)
         {
             return Ok(());
@@ -139,11 +143,18 @@ impl LogicalExecutionCore {
             self.conclude_setup_failure(Self::preparation_expired(), failure.error().clone());
             return Ok(());
         }
-        let topology = failure
-            .pre_ready_replacement()
-            .map_or(SuccessorTopology::LiveSnapshot, |w| {
-                SuccessorTopology::ExcludeProcess(w.participation().backend_process_id())
-            });
+        // Originating backend loss excludes that exact process even without
+        // a pre-ready replacement witness. Other sites invent no exclusion.
+        let topology = failure.pre_ready_replacement().map_or_else(
+            || match (failure.class(), failure.input().site()) {
+                (
+                    AttemptFailureClass::RecoverableInfrastructure,
+                    ExecutionFailureSite::Backend { process },
+                ) => SuccessorTopology::ExcludeProcess(process),
+                _ => SuccessorTopology::LiveSnapshot,
+            },
+            |w| SuccessorTopology::ExcludeProcess(w.participation().backend_process_id()),
+        );
         self.recovery = Some(Recovery {
             failed: activation,
             replacement,

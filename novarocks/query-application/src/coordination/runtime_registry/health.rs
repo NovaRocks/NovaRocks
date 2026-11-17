@@ -178,6 +178,7 @@ impl LogicalExecutionHealth {
         Some(LogicalExecutionHealthNotification(Arc::clone(&self.0)))
     }
 
+    #[cfg(test)]
     pub(crate) fn record_supervision_join_failure(&self, error: tokio::task::JoinError) {
         if error.is_panic() {
             self.record_supervision_panic(error.into_panic());
@@ -186,19 +187,6 @@ impl LogicalExecutionHealth {
                 "logical execution supervision task exited before actual local closure",
                 Arc::new(error),
             ));
-        }
-    }
-    pub(crate) fn record_root_ack_join_failure(&self, error: tokio::task::JoinError) {
-        if error.is_panic() {
-            self.record_health(
-                "optional root ACK task panicked after actual local exit",
-                Some(error.into_panic()),
-            );
-        } else {
-            self.record_health_cause(
-                "optional root ACK task was cancelled after actual local exit",
-                Arc::new(error),
-            );
         }
     }
     pub(crate) fn record_unproven_exit(&self, failure: StatementNativeHealthFailure) {

@@ -22,9 +22,8 @@ pub(super) use originals::LogicalFailureOriginals;
 mod progress;
 use super::work::{FailureReporter, RawFailure};
 use crate::control_runtime::actor::{FrontendActor, FrontendInput};
-use novarocks_control_runtime::actor_turn::{
-    ActorFailureProof, ActorTurnError, StandingInputObligation,
-};
+use novarocks_control_runtime::actor_turn::{ActorTurnError, StandingInputObligation};
+use novarocks_control_runtime_core::identity::Tick;
 use novarocks_coordination_contract::{
     ExecutionFailureInput, ExecutionFailureSite, MonotonicInstant, QueryExecutionError,
 };
@@ -46,14 +45,14 @@ use std::{
 };
 pub(super) use supervisor::LogicalFailureSupervisor;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct LogicalFailureCut {
     pub(super) cut: MonotonicInstant,
     pub(super) remote_deadline: MonotonicInstant,
 }
 impl LogicalFailureCut {
-    pub(super) fn from_original(proof: &ActorFailureProof, budget: Duration) -> Self {
-        let cut = MonotonicInstant::from_origin(Duration::from_nanos(proof.failed_at().0));
+    pub(super) fn from_host(now: Tick, budget: Duration) -> Self {
+        let cut = MonotonicInstant::from_origin(Duration::from_nanos(now.0));
         Self {
             cut,
             remote_deadline: cut.saturating_add(budget),
@@ -67,6 +66,10 @@ pub(super) struct LogicalInfrastructureFailure {
     marker: Mutex<Option<StandingInputObligation<FrontendActor>>>,
     published: AtomicBool,
     wake: Waker,
+    #[cfg(test)]
+    cleanup_observation: Mutex<Option<String>>,
+    #[cfg(test)]
+    cleanup_cuts: Mutex<(Option<LogicalFailureCut>, Option<LogicalFailureCut>)>,
 }
 impl fmt::Debug for LogicalInfrastructureFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -89,6 +92,10 @@ impl LogicalInfrastructureFailure {
             marker: Mutex::new(Some(marker)),
             published: AtomicBool::new(false),
             wake,
+            #[cfg(test)]
+            cleanup_observation: Mutex::new(None),
+            #[cfg(test)]
+            cleanup_cuts: Mutex::new((None, None)),
         })
     }
     pub(super) fn reporter(self: &Arc<Self>) -> FailureReporter {
@@ -144,6 +151,40 @@ impl LogicalInfrastructureFailure {
         self.wake.wake_by_ref();
         published
             .unwrap_or_else(|(error, _)| panic!("original test fault source refused: {error:?}"));
+    }
+    #[cfg(test)]
+    pub(super) fn observe_cleanup_for_fixture(&self, value: String) {
+        *self.cleanup_observation.lock().unwrap() = Some(value);
+    }
+    #[cfg(test)]
+    pub(super) fn observe_cut_for_fixture(&self, cut: LogicalFailureCut, job_started: bool) {
+        let mut cuts = self.cleanup_cuts.lock().unwrap();
+        if job_started {
+            cuts.1 = Some(cut);
+        } else {
+            cuts.0 = Some(cut);
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn cuts_for_fixture(
+        &self,
+    ) -> (Option<LogicalFailureCut>, Option<LogicalFailureCut>) {
+        *self.cleanup_cuts.lock().unwrap()
+    }
+    #[cfg(test)]
+    pub(super) fn original_diagnostic_for_fixture(&self) -> String {
+        let typed = self.error.lock().unwrap().clone();
+        let raw = self.originals.lock().unwrap().iter().map(|original| {
+            let original: &dyn std::any::Any = original.as_ref();
+            if let Some(value) = original.downcast_ref::<&'static str>() { return (*value).to_owned(); }
+            if let Some(value) = original.downcast_ref::<String>() { return value.clone(); }
+            if let Some(value) = original.downcast_ref::<ActorTurnError>() { return format!("{value:?}"); }
+            if let Some(value) = original.downcast_ref::<QueryExecutionError>() { return format!("{value:?}"); }
+            if let Some(value) = original.downcast_ref::<novarocks_logical_execution_protocol::effect::LogicalEffectBody>() { return format!("{value:?}"); }
+            format!("retained original type {:?}", original.type_id())
+        }).collect::<Vec<_>>();
+        let cleanup = self.cleanup_observation.lock().unwrap().clone();
+        format!("typed={typed:?}, raw={raw:?}, cleanup_observation={cleanup:?}")
     }
     pub(super) fn failed(&self) -> bool {
         self.published.load(Ordering::Acquire)

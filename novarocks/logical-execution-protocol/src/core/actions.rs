@@ -45,6 +45,9 @@ impl LogicalExecutionCore {
                 NativeEffect::AbandonReservation { identity } => {
                     NativeAction::AbandonReservation(*identity)
                 }
+                NativeEffect::SealRootRead { activation, .. } => {
+                    NativeAction::SealRead(*activation)
+                }
                 NativeEffect::FinishResources { activation }
                 | NativeEffect::AbandonResources { activation } => {
                     NativeAction::Resources(*activation)
@@ -129,6 +132,32 @@ impl LogicalExecutionCore {
             }
             (ActionTag::Relay(expected), ActionResult::Relay(fact)) => match fact {
                 RelayFact::Applied => {}
+                RelayFact::EndRelayed {
+                    activation,
+                    root,
+                    end,
+                } => {
+                    if expected != activation {
+                        return Err(CoreFault::ForeignActivation);
+                    }
+                    if self.visibility.root(activation) != Some(root)
+                        || self
+                            .visibility
+                            .end(activation)
+                            .is_none_or(|summary| summary.end != end)
+                    {
+                        return Err(CoreFault::UnexpectedInput);
+                    }
+                    let attempt = self.attempt_mut(activation)?;
+                    if attempt
+                        .relay_end_handoff
+                        .is_some_and(|original| original != end)
+                    {
+                        return Err(CoreFault::UnexpectedInput);
+                    }
+                    attempt.relay_end_handoff = Some(end);
+                    attempt.convergence.observe_relay_stopped(true);
+                }
                 RelayFact::Stopped {
                     activation,
                     all_deliveries_settled,

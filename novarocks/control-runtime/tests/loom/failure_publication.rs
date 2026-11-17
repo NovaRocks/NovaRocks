@@ -177,3 +177,5 @@ fn actual_cleanup_body_exit_and_actual_snapshot_swap_have_one_gate_order() {
         assert!(ledger.is_empty());
     });
 }
+
+mod original_handoffs;

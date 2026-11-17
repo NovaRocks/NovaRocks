@@ -19,7 +19,6 @@ use crate::{
     task_execution::operation::OperationDispatchResult,
 };
 use novarocks_attempt_protocol::{
-    failure::AttemptFailure,
     input::SendGeneration,
     port_projection::{AbortProjectionError, project_abort_settlement},
 };
@@ -80,11 +79,12 @@ fn acknowledgement(
         AckPayload::Participation(ParticipationReceipt::new(part(11), state)),
     )
 }
-type Received = Arc<Mutex<Vec<novarocks_coordination_contract::LogicalToAttempt<AttemptFailure>>>>;
+type Received = Arc<Mutex<Vec<novarocks_coordination_contract::LogicalToAttempt>>>;
 struct Carrier {
     work: ScopedWorkRef,
     reservation: ReservationId,
     received: Received,
+    hold_received_effect: bool,
 }
 impl TestActor for Carrier {
     fn handle(
@@ -126,6 +126,20 @@ impl TestActor for Carrier {
                     panic!("original Abort Control port input");
                 };
                 self.received.lock().unwrap().push(port);
+                if self.hold_received_effect {
+                    // A real kernel financial effect, not a Worker/Abort RPC
+                    // success or physical Job exit. It must settle separately.
+                    step.effect(
+                        EffectDescriptor {
+                            id: ActionId::new(1).unwrap(),
+                            work: self.work,
+                            kind: EffectKind::Settlement,
+                            dependencies: Vec::new(),
+                        },
+                        FrontendEffect::Test { value: 1 },
+                    )
+                    .unwrap();
+                }
             }
             _ => panic!("unexpected input in original Abort carrier fixture"),
         }
@@ -147,6 +161,9 @@ struct OriginalFixture {
 }
 impl OriginalFixture {
     fn new() -> Self {
+        Self::with_received_effect(false)
+    }
+    fn with_received_effect(hold_received_effect: bool) -> Self {
         let ledger = RuntimeLedger::new(ResourceVector::default());
         let runtime = ActorRuntime::new();
         let received = Arc::new(Mutex::new(Vec::new()));
@@ -179,6 +196,7 @@ impl OriginalFixture {
                         work: work.reference(),
                         reservation: payer.id(),
                         received: received.clone(),
+                        hold_received_effect: id == 2 && hold_received_effect,
                     })),
                     ActorConfig {
                         mailbox: [8; 4],
@@ -462,16 +480,16 @@ fn exact_physical_generation_can_project_old_worker_closure_without_losing_newer
             ParticipationState::Aborting,
         ))
         .unwrap();
-    let port = novarocks_coordination_contract::AttemptToLogical {
+    let port = novarocks_attempt_protocol::port_output::AttemptToLogical {
         activation: activation(),
         action: action(31),
-        body: novarocks_coordination_contract::AttemptToLogicalBody::AbortSettlement {
+        body: novarocks_attempt_protocol::port_output::AttemptToLogicalBody::AbortSettlement {
             abort_action: action(21),
             generation: action(6),
             receipt_generation: Some(action(5)),
             participation: part(11),
             operation_id: key(5).operation,
-            settlement: novarocks_coordination_contract::AbortIssueSettlement::Worker(
+            settlement: novarocks_attempt_protocol::port_output::AbortIssueSettlement::Worker(
                 OperationOutcome::Accepted,
             ),
         },
@@ -522,4 +540,173 @@ fn pair_binding_rejects_foreign_actual_registrations_with_equal_public_numbers()
     foreign.complete(ticket);
     first.close();
     foreign.close();
+}
+
+#[test]
+fn normal_abort_occurrence_retirement_waits_for_real_consumption_and_effects_and_keeps_same_role() {
+    let f = Fixture {
+        original: Some(OriginalFixture::with_received_effect(true)),
+    };
+    let ticket = f.ticket(f.lp.actor.actor(), 1);
+    let input = f.ingress.deliver(&f.runtime, &ticket).unwrap();
+    let role = f
+        .runtime
+        .input_custody(f.ap.actor.actor(), input)
+        .unwrap()
+        .unwrap()
+        .standing_input_id
+        .unwrap();
+    f.complete(ticket);
+    assert_eq!(
+        f.ingress.retire_ready_occurrence_after(None).unwrap(),
+        Some((part(11), false)),
+        "a queued actual Abort input cannot be returned"
+    );
+    assert!(
+        f.runtime
+            .input_custody(f.ap.actor.actor(), input)
+            .unwrap()
+            .is_some()
+    );
+    assert!(f.received.lock().unwrap().is_empty());
+    assert!(f.runtime.poll_one(Tick(0)).unwrap());
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+    assert!(matches!(
+        f.runtime.input_retirement_status(f.ap.actor.actor(), input),
+        Err(ActorTurnError::EffectsRemain)
+    ));
+    let held = f
+        .runtime
+        .take_effect(f.ap.actor.actor(), input, ActionId::new(1).unwrap())
+        .unwrap();
+    assert_eq!(
+        f.ingress.retire_ready_occurrence_after(None).unwrap(),
+        Some((part(11), false)),
+        "an actually consumed input still owes its original financial effect"
+    );
+    f.runtime.effect_completed(held).unwrap();
+    assert_eq!(
+        f.ingress.retire_ready_occurrence_after(None).unwrap(),
+        Some((part(11), true))
+    );
+    assert!(
+        f.runtime
+            .input_custody(f.ap.actor.actor(), input)
+            .unwrap()
+            .is_none()
+    );
+    let original = f
+        .runtime
+        .standing_input_inventory(f.ap.actor.actor(), None, 16)
+        .unwrap();
+    assert!(
+        original
+            .iter()
+            .any(|row| row.standing_input_id == role && row.in_flight.is_none())
+    );
+    assert!(!f.ingress.closed.load(Ordering::Acquire));
+    assert_eq!(
+        f.ingress
+            .retire_ready_occurrence_after(Some(part(11)))
+            .unwrap(),
+        Some((part(11), false)),
+        "an idle standing is retained without inventing retirement progress"
+    );
+    let ticket = f.ticket(f.lp.actor.actor(), 2);
+    let next = f.ingress.deliver(&f.runtime, &ticket).unwrap();
+    assert_ne!(next, input);
+    assert_eq!(
+        f.runtime
+            .input_custody(f.ap.actor.actor(), next)
+            .unwrap()
+            .unwrap()
+            .standing_input_id,
+        Some(role)
+    );
+    f.complete(ticket);
+    assert!(f.runtime.poll_one(Tick(0)).unwrap());
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+    let held = f
+        .runtime
+        .take_effect(f.ap.actor.actor(), next, ActionId::new(1).unwrap())
+        .unwrap();
+    f.runtime.effect_completed(held).unwrap();
+    assert_eq!(
+        f.ingress
+            .retire_ready_occurrence_after(Some(part(11)))
+            .unwrap(),
+        Some((part(11), true))
+    );
+    f.close();
+}
+
+#[test]
+fn returning_the_original_abort_position_wakes_its_exhausted_retirement_pass() {
+    let f = Fixture {
+        original: Some(OriginalFixture::with_received_effect(true)),
+    };
+    let ticket = f.ticket(f.lp.actor.actor(), 1);
+    let FrontendEffect::Logical(envelope) = &ticket.effect else {
+        panic!("same original logical effect");
+    };
+    let LogicalHostEffect::Protocol(effect) = &envelope.body else {
+        panic!("same original protocol effect");
+    };
+    let LogicalEffectBody::AttemptPort(message) = &effect.body else {
+        panic!("same original Abort message");
+    };
+    let slot = f.ingress.slots.get(&part(11)).unwrap();
+    let position = slot.position.lock().unwrap().take().unwrap();
+    let mut loan = PositionLoan {
+        slot,
+        position: Some(position),
+    };
+    let input = f
+        .runtime
+        .fill_from_effect(
+            &ticket,
+            loan.position.as_ref().unwrap(),
+            FrontendInput::Attempt(Box::new(AttemptInput::Port(message.as_ref().clone()))),
+        )
+        .unwrap_or_else(|_| panic!("the same original Abort input is queued"));
+    f.complete(ticket);
+    assert!(f.runtime.poll_one(Tick(0)).unwrap());
+    let effect = f
+        .runtime
+        .take_effect(f.ap.actor.actor(), input, ActionId::new(1).unwrap())
+        .unwrap();
+    f.runtime.effect_completed(effect).unwrap();
+    assert!(
+        f.runtime
+            .input_retirement_status(f.ap.actor.actor(), input)
+            .is_ok()
+    );
+    assert_eq!(
+        f.ingress.retire_ready_occurrence_after(None).unwrap(),
+        Some((part(11), false)),
+        "the real ready occurrence cannot be returned while its position is loaned"
+    );
+    // Consume the prior actual notifications after that blocked finite visit.
+    // This component hosts the kernel directly; no Source or Worker exit is claimed.
+    for _ in 0..4 {
+        let Some(turn) = f.runtime.claim_host_actor() else {
+            break;
+        };
+        turn.release(false).unwrap();
+    }
+    assert!(f.runtime.claim_host_actor().is_none());
+    loan.restore_and_notify(&f.runtime, &f.ap.actor).unwrap();
+    let turn = f
+        .runtime
+        .claim_host_actor()
+        .expect("actual position return wakes its same AP");
+    assert!(turn.was_notified());
+    assert!(turn.registration().same_registration(&f.ap.actor));
+    assert_eq!(
+        f.ingress.retire_ready_occurrence_after(None).unwrap(),
+        Some((part(11), true))
+    );
+    turn.release(false).unwrap();
+    drop(loan);
+    f.close();
 }

@@ -75,9 +75,120 @@ fn normal_completion_uses_the_task_boundary_and_emits_no_abort_or_stop() {
     );
 }
 
-#[test]
-fn unused_preparation_retires_while_the_original_active_cleanup_is_still_held() {
-    let mut f = completed();
+#[derive(Clone, Copy, Debug)]
+enum OriginalTerminal {
+    Success,
+    Cancel,
+    AttemptFailure,
+    ActivationFailure,
+    ActivationPanic,
+    CompletionFailure,
+    CompletionPanic,
+}
+
+fn original_early_retirement(terminal: OriginalTerminal) {
+    use novarocks_coordination_contract::{ExecutionFailure, QueryFailureReason};
+    use novarocks_logical_execution_protocol::{
+        cancel::LogicalCancellationReason, failure::query_failure,
+    };
+    let activation_refused = matches!(
+        terminal,
+        OriginalTerminal::ActivationFailure | OriginalTerminal::ActivationPanic
+    );
+    let panic = matches!(
+        terminal,
+        OriginalTerminal::ActivationPanic | OriginalTerminal::CompletionPanic
+    );
+    let error = query_failure(
+        if panic {
+            QueryFailureReason::NativeFuturePanicked
+        } else {
+            QueryFailureReason::PreparationProtocol
+        },
+        "original early retirement failure",
+    );
+    let original = ExecutionFailure::from_input(error.execution_failure().unwrap().clone());
+    let mut f = if matches!(terminal, OriginalTerminal::Success) {
+        completed()
+    } else {
+        Fixture::new(LogicalOutputMode::CompletionOnly)
+    };
+    if activation_refused {
+        f.send(LogicalInput::Started);
+        let register = f.take(|body| {
+            matches!(
+                body,
+                LogicalEffectBody::Governance(GovernanceEffect::RegisterObligation { .. })
+            )
+        });
+        f.ack(
+            register.action,
+            ActionResult::Governance(GovernanceFact::ObligationRegistered {
+                activation: activation(1),
+                kind: ObligationKind::RunningWork,
+            }),
+        );
+        let activate = f.take(|body| {
+            matches!(
+                body,
+                LogicalEffectBody::Native(NativeEffect::ActivateAttempt { .. })
+            )
+        });
+        f.ack(
+            activate.action,
+            ActionResult::Native(NativeFact::Failed {
+                execution: activation(1).execution(),
+                failure: FailureReport::from_attempt(&original),
+            }),
+        );
+        assert!(f.run.is_none());
+        assert_eq!(f.core.facts().failure(), Some(&error));
+    } else if !matches!(terminal, OriginalTerminal::Success) {
+        f.begin();
+        match terminal {
+            OriginalTerminal::Cancel => f.send(LogicalInput::Cancelled(
+                LogicalCancellationReason::ClientCancelRequested,
+            )),
+            OriginalTerminal::AttemptFailure => f.port(AttemptToLogicalBody::AttemptTerminal(
+                AttemptTerminal::Failed(original.clone()),
+            )),
+            OriginalTerminal::CompletionFailure | OriginalTerminal::CompletionPanic => {
+                let run = f.run.take().unwrap();
+                let fact = if panic {
+                    NativeFact::NativeRunFailed {
+                        activation: activation(1),
+                        failure: FailureReport {
+                            error: error.clone(),
+                            original_attempt_failure: None,
+                            pre_ready_replacement: None,
+                        },
+                    }
+                } else {
+                    NativeFact::Failed {
+                        execution: activation(1).execution(),
+                        failure: FailureReport::from_attempt(&original),
+                    }
+                };
+                f.ack(run, ActionResult::Native(fact));
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(
+        f.core.facts().conclusion(),
+        Some(match terminal {
+            OriginalTerminal::Success => LogicalConclusion::Succeeded,
+            OriginalTerminal::Cancel => LogicalConclusion::Cancelled,
+            _ => LogicalConclusion::Failed,
+        }),
+        "{terminal:?}"
+    );
+    if !matches!(
+        terminal,
+        OriginalTerminal::Success | OriginalTerminal::Cancel
+    ) {
+        assert_eq!(f.core.facts().failure(), Some(&error), "{terminal:?}");
+    }
     let preparation = f.take(|b| {
         matches!(
             b,
@@ -96,11 +207,38 @@ fn unused_preparation_retires_while_the_original_active_cleanup_is_still_held() 
             GovernanceEffect::ReleaseExecutionStage | GovernanceEffect::CompleteWorkOwner
         )
     )));
-    assert!(f.effects.iter().any(|e| matches!(
-        e.body,
+    assert!(f.effects.iter().any(|effect| matches!(
+        effect.body,
         LogicalEffectBody::Governance(GovernanceEffect::ResolveObligation { .. })
     )));
+    if activation_refused {
+        assert!(!f.core.facts().attempts().next().unwrap().activated);
+        // Initial dormant cleanup uses FinishResources after the original
+        // obligation resolves; ConvergeDormant belongs to unused successors.
+        assert!(!f.effects.iter().any(|effect| matches!(
+            effect.body,
+            LogicalEffectBody::Native(NativeEffect::RunAttempt { .. })
+        )));
+    }
 }
+
+#[test]
+fn unused_preparation_retires_while_the_original_active_cleanup_is_still_held() {
+    // Public Core inputs only. The separate Native executor test retains real
+    // original reply/transport/consumer aliases and their physical destructors.
+    for terminal in [
+        OriginalTerminal::Success,
+        OriginalTerminal::Cancel,
+        OriginalTerminal::AttemptFailure,
+        OriginalTerminal::ActivationFailure,
+        OriginalTerminal::ActivationPanic,
+        OriginalTerminal::CompletionFailure,
+        OriginalTerminal::CompletionPanic,
+    ] {
+        original_early_retirement(terminal);
+    }
+}
+
 #[test]
 fn a_governance_result_does_not_substitute_for_actual_action_exit() {
     let mut f = completed();
@@ -323,6 +461,11 @@ fn cancellation_discards_a_queued_relay_before_any_relay_work_was_issued() {
         LogicalEffectBody::Relay(RelayEffect::Start { .. } | RelayEffect::Stop { .. })
     )));
     assert!(!f.core.facts().attempts().next().unwrap().relay_started);
+    assert!(!f.effects.iter().any(|e| matches!(
+        e.body,
+        LogicalEffectBody::Governance(GovernanceEffect::ResolveObligation { .. })
+    )));
+    f.acknowledge_original_read_close(activation(1));
     assert!(f.effects.iter().any(|e| matches!(
         e.body,
         LogicalEffectBody::Governance(GovernanceEffect::ResolveObligation { .. })

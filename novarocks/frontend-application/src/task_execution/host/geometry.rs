@@ -32,9 +32,10 @@ use novarocks_control_runtime_core::{identity::ScopeId, mailbox::InputClass};
 use novarocks_task_codec::TransportBudget;
 use std::num::{NonZeroU64, NonZeroUsize};
 
-/// One causal reply each for QA, process observation, publication, payload
-/// release, read confirmation and subscription control (AttemptTransportBinding).
-const CALL_SOURCES: usize = 6;
+/// Each original outbound port family owns an independent causal/Join role.
+/// The five other purposes are process observation, publication, payload
+/// release, read confirmation and subscription control.
+const CALL_SOURCES: usize = super::port::facts::FactRole::ALL.len() + 5;
 const OVERFLOW: &str = "attempt host geometry overflows";
 
 #[derive(Debug)]
@@ -142,9 +143,10 @@ impl AttemptHostGeometry {
         .ok_or(OVERFLOW)?;
         // Control is one Abort per participant plus root, Stop and BeginConvergence.
         let control = participants.get().checked_add(3).ok_or(OVERFLOW)?;
-        // Ordinary is one read-progress role per participant plus membership
-        // and capacity. Split also owns its independent delivery and profile.
-        let ordinary = sum([participants.get(), 2, split_ordinary]).ok_or(OVERFLOW)?;
+        // Ordinary is one read-progress role per participant plus membership,
+        // capacity and the original LP permission-change notification. Split
+        // also owns its independent delivery and profile.
+        let ordinary = sum([participants.get(), 3, split_ordinary]).ok_or(OVERFLOW)?;
         // CR owns one Timer occurrence. Its builtin IsolateScope failure
         // input and batch are funded independently by supervised registration.
         let mut mailbox = [0; InputClass::ALL.len()];
@@ -334,11 +336,11 @@ mod tests {
 
         assert_eq!(geometry.admission_results, [96, 60]);
         assert_eq!(geometry.send_results, [96, 60]);
-        assert_eq!(geometry.transport_joins, 329);
-        // 658 causal positions, 2412 send reports, 7 standing, 3 split callbacks.
-        assert_eq!(geometry.sources.mailbox, [3080, 6, 7, 1]);
+        assert_eq!(geometry.transport_joins, 331);
+        // 662 causal positions, 2412 send reports, 7 standing, 3 split callbacks.
+        assert_eq!(geometry.sources.mailbox, [3084, 6, 8, 1]);
         let config = geometry.config_with_core_floor(1).unwrap();
-        assert_eq!(config.max_batches, 3094);
+        assert_eq!(config.max_batches, 3099);
         assert_eq!(config.max_step_work, 261);
         assert_eq!(config.turn_budget, 1048);
         assert_eq!(config.max_effects_per_step, OUTPUT_UNITS);
@@ -377,8 +379,8 @@ mod tests {
         let second = geometry(2).unwrap();
         assert_eq!(first.admission_results, [4, 6]);
         assert_eq!(first.send_results, [4, 6]);
-        assert_eq!(first.transport_joins, 28);
-        assert_eq!(first.sources.mailbox, [96, 5, 4, 1]);
+        assert_eq!(first.transport_joins, 30);
+        assert_eq!(first.sources.mailbox, [100, 5, 5, 1]);
         assert!(first.sources.membership.0 < second.sources.actor.0);
         assert!(geometry(u64::MAX).is_err());
     }

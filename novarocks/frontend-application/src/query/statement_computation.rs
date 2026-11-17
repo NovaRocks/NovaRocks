@@ -454,6 +454,16 @@ pub(crate) struct StatementComputation<A: StatementComputationAssembly> {
     observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 impl<A: StatementComputationAssembly> StatementComputation<A> {
+    pub(crate) fn poll_supervision_failure(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Option<QueryExecutionError> {
+        poll_original_supervision_failure(
+            self.original.exit.as_mut(),
+            self.exit_receipt.as_mut(),
+            cx,
+        )
+    }
     pub(crate) fn new(
         root: WorkScope,
         initial: InitialComputationReservation,
@@ -842,6 +852,17 @@ pub(crate) struct StatementNativeTail {
     failed: bool,
 }
 impl StatementNativeTail {
+    pub(crate) fn supervision_observation(
+        &self,
+    ) -> Option<novarocks_query_application::api::LogicalOwnerFailureObservation> {
+        original_supervision_observation(self.exit.as_ref(), self.receipt.as_ref())
+    }
+    pub(crate) fn poll_supervision_failure(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Option<QueryExecutionError> {
+        poll_original_supervision_failure(self.exit.as_mut(), self.receipt.as_mut(), cx)
+    }
     pub(crate) fn poll_exit(
         &mut self,
         cx: &mut Context<'_>,
@@ -876,6 +897,37 @@ impl StatementNativeTail {
         (self.busy || self.failed).then(|| self.health.clone())
     }
 }
+fn original_supervision_observation(
+    exit: Option<&novarocks_query_application::api::LogicalExecutionExitObserver>,
+    receipt: Option<
+        &Result<novarocks_query_application::api::LogicalExecutionExitReceipt, QueryExecutionError>,
+    >,
+) -> Option<novarocks_query_application::api::LogicalOwnerFailureObservation> {
+    exit.and_then(|original| original.owner_failure_observation())
+        .or_else(|| {
+            receipt
+                .and_then(|result| result.as_ref().ok())
+                .map(|original| original.owner_failure_observation())
+        })
+}
+fn poll_original_supervision_failure(
+    exit: Option<&mut novarocks_query_application::api::LogicalExecutionExitObserver>,
+    receipt: Option<
+        &mut Result<
+            novarocks_query_application::api::LogicalExecutionExitReceipt,
+            QueryExecutionError,
+        >,
+    >,
+    cx: &mut Context<'_>,
+) -> Option<QueryExecutionError> {
+    if let Some(original) = exit {
+        return original.poll_owner_failure(cx);
+    }
+    receipt
+        .and_then(|result| result.as_mut().ok())
+        .and_then(|original| original.poll_owner_failure(cx))
+}
+
 #[derive(Debug)]
 struct SourceExitUnproven;
 impl std::fmt::Display for SourceExitUnproven {

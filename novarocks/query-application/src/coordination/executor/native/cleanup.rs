@@ -31,8 +31,11 @@ impl LogicalOwnerFailureObserver {
         let Some(original) = self.original.upgrade() else {
             return false;
         };
-        original.retain_owner_failure_silent(error);
+        let first = original.retain_owner_failure_silent(error);
         original.notify();
+        if first {
+            original.notify_owner_failure();
+        }
         true
     }
 }
@@ -61,6 +64,10 @@ pub struct NativeCleanupPreparation {
 #[derive(Clone, Copy, Debug)]
 pub struct NativeCleanupActive {
     pub activation: AttemptActivationIdentity,
+    /// Passive facts from the same retained port, never a new read capability.
+    pub read_root: Option<novarocks_execution_contract::TaskIdentity>,
+    pub read_closing: bool,
+    pub read_sealed: bool,
     pub resources_exited: bool,
     pub adopted: bool,
     pub dormant_retired: bool,
@@ -491,6 +498,9 @@ impl NativeExecutor {
                 })?;
             active.push(NativeCleanupActive {
                 activation,
+                read_root: row.read.as_ref().map(|read| read.root),
+                read_closing: row.read.as_ref().is_some_and(|read| read.closing),
+                read_sealed: row.read.as_ref().is_some_and(|read| read.sealed),
                 resources_exited: row.resources_exited,
                 adopted: row.cleanup_adopted,
                 dormant_retired: row.dormant_retired_for_cleanup,

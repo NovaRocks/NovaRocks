@@ -76,11 +76,9 @@ pub(crate) enum LogicalActorFailure {
     Infrastructure,
     #[cfg(test)]
     InjectedCoreTurn,
-    #[expect(
-        dead_code,
-        reason = "P11 projects this exact retained Core fault without reading failed state"
-    )]
-    Protocol(novarocks_logical_execution_protocol::CoreFault),
+    Protocol {
+        _original: novarocks_logical_execution_protocol::CoreFault,
+    },
 }
 
 pub(crate) struct LogicalActor {
@@ -146,6 +144,18 @@ impl LogicalActor {
         // Core traversal/effect selection and actual ActorStep emission both
         // cost units. Keep one output and two units for a committed readiness
         // transition. No callback shares a mutable ActorStep with Core.
+        #[cfg(test)]
+        let original_input_kind = match &value {
+            LogicalInput::ActionResult { action, result } => format!(
+                "ActionResult({action:?},{:?})",
+                std::mem::discriminant(result)
+            ),
+            LogicalInput::ActionExited { action } => format!("ActionExited({action:?})"),
+            LogicalInput::AttemptPort(port) => {
+                format!("AttemptPort({:?})", std::mem::discriminant(&port.body))
+            }
+            other => format!("{:?}", std::mem::discriminant(other)),
+        };
         let initial = (step.remaining().saturating_sub(2) / 2).min(OUTPUT_UNITS - 1);
         let mut budget = Budget {
             remaining: initial,
@@ -158,12 +168,41 @@ impl LogicalActor {
             &mut budget,
             &mut out,
         ) {
-            std::panic::panic_any(LogicalActorFailure::Protocol(error));
+            std::panic::panic_any(LogicalActorFailure::Protocol { _original: error });
         }
         assert!(
             step.charge(budget.initial - budget.remaining),
             "reserved logical core work fits its real step"
         );
+        #[cfg(test)]
+        if self.core.facts().conclusion().is_some() {
+            let facts = self.core.facts();
+            eprintln!(
+                "original LP completion facts: query={:?}, input={original_input_kind}, phase={:?}, conclusion={:?}, consumer_exited={}, outstanding={}, join_ready={}, ingress_closed={}, attempts={:?}, outputs={:?}",
+                facts.identity(),
+                facts.phase(),
+                facts.conclusion(),
+                facts.original_internal_consumer_exited(),
+                facts.outstanding_actions(),
+                facts.protocol_join_ready(),
+                facts.ingress_closed(),
+                facts
+                    .attempts()
+                    .map(|attempt| (
+                        attempt.activation,
+                        attempt.all_participations_closed,
+                        attempt.remote_tracking_ended,
+                        attempt.cleanup_complete,
+                        attempt.cleanup_path,
+                        attempt.remote_deadline
+                    ))
+                    .collect::<Vec<_>>(),
+                out.0
+                    .iter()
+                    .map(|effect| (effect.action, std::mem::discriminant(&effect.body)))
+                    .collect::<Vec<_>>(),
+            );
+        }
         let notice_id = out
             .0
             .iter()

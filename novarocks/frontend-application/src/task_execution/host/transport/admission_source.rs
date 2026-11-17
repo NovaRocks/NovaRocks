@@ -359,10 +359,6 @@ impl AdmissionSource {
             .map(TaskExecutionError::preparation_input)
     }
 
-    pub(crate) fn take_failure(&mut self, failure: HostFailureRef) -> Option<TaskExecutionError> {
-        self.failures.lock().unwrap().remove(&failure)
-    }
-
     fn payload_ref(payload: QueuedInputPayload) -> Option<PayloadRef> {
         match payload {
             QueuedInputPayload::NewCreation(payload)
@@ -918,13 +914,13 @@ mod tests {
     use novarocks_task_codec::{TransportBudget, TransportMessageLimits};
 
     fn operation(queued_bytes: usize) -> OperationIntent {
-        let fixture = crate::task_execution::tests::manifest_unstarted_regression_fixture();
+        let graph = crate::task_execution::graph_manifest_tests::unstarted_chain_graph();
         OperationIntent::CreateTask {
             envelope: OperationEnvelope::with_default_wait(
                 TaskOperationId::new_v7(),
                 OperationKind::CreateTask,
             ),
-            identity: fixture.execution().graph().root_identity(),
+            identity: graph.root_identity(),
             creation: PayloadRef(NonZeroU64::MIN),
             queued_bytes,
         }

@@ -17,7 +17,6 @@
 
 //! Bind the pure AttemptCore to the original FE actor turn and work authors.
 
-use super::failure_bridge::PendingFailureBridge;
 use super::failure_lifecycle::FailureLifecycle;
 use super::failure_publication::{FailureContext, FailurePublications};
 use super::failure_supervisor::FailureSupervisor;
@@ -47,10 +46,7 @@ use crate::{
             NativeTransportCapacity, TransportCapacityLane, TransportCapacityRefusal,
         },
     },
-    task_execution::{
-        bridge::{control::AttemptOwnerControls, root_control::RootControlRequests},
-        host::custody::TransportRetirements,
-    },
+    task_execution::host::custody::TransportRetirements,
 };
 use novarocks_attempt_protocol::{
     AttemptCore, Core, InputSelection,
@@ -119,6 +115,7 @@ pub(crate) struct AttemptActorRegistration {
     transport_source: ActorId,
     subscription_source: ActorId,
     qa_source: ActorId,
+    owner_source: ActorId,
     process_source: ActorId,
     publication_source: ActorId,
     capacity_source: ActorId,
@@ -135,9 +132,12 @@ pub(crate) struct AttemptActorRegistration {
     root_control: RootControlBinding,
     ordered_host: Option<OrderedObservationHost>,
     ordered_bound: bool,
+    #[cfg(test)]
+    fixture_observation_budget: Option<ObservationBudget>,
     read_progress_roles: Option<Vec<ReadProgressInput>>,
     startup_reserved: bool,
     abort_bound: bool,
+    controls_bound: bool,
     config: ActorConfig,
     binding: Arc<OnceLock<AttemptBinding>>,
 }
@@ -167,13 +167,18 @@ struct AttemptBinding {
 pub(crate) struct PreparedAttemptHost {
     pub(crate) binding: HostBinding,
     pub(crate) startup: AttemptStartup,
-    pub(crate) controls: AttemptOwnerControls,
     pub(crate) membership: MembershipRegistration,
-    pub(crate) failure: PendingFailureBridge,
-    pub(crate) terminal: Arc<crate::task_execution::bridge::terminal::TerminalOutbox>,
+}
+/// The same two original Lifecycle roles, reserved once before endpoints bind.
+#[must_use = "Install or retain the original startup and local-exit positions"]
+pub(crate) struct PreparedAttemptStartup {
+    source: AttemptStartupSource,
+    pub(crate) witness: AttemptStartup,
+    local_exit: super::port::local_exit::LocalExitInputObligation,
 }
 type AttemptHostPreparationRefusal = (
     AttemptRegistrationError,
+    PreparedAttemptStartup,
     AttemptCapacitySource,
     MembershipRegistration,
     Box<dyn EffectSource>,
@@ -183,8 +188,8 @@ type AttemptHostPreparationRefusal = (
 pub(crate) struct AttemptTransportBinding {
     pub(crate) retirement: TransportRetirements,
     pub(crate) admission: super::transport::AdmissionSource,
-    pub(crate) qa: super::transport::AttemptCallSource,
-    pub(crate) abort: Arc<crate::task_execution::bridge::abort::AbortSettlementOwner>,
+    pub(crate) ports: [super::transport::AttemptCallSource; 3],
+    pub(crate) port_binding: AttemptPortSourceBinding,
     pub(crate) process: super::transport::AttemptCallSource,
     pub(crate) publication: super::transport::AttemptCallSource,
     pub(crate) release: super::transport::AttemptCallSource,
@@ -197,6 +202,29 @@ pub(crate) struct AttemptTransportBinding {
     pub(crate) next_payload: NonZeroU64,
     pub(crate) executor: super::transport::ActorTransportExecutor,
     pub(crate) failure: FailureSupervisor,
+}
+
+/// Original owned endpoint/custody objects consumed by the one AP Source.
+/// The LP inventory and activation link are borrowed separately at assembly;
+/// a typed refusal therefore returns every owned object without retaining a
+/// borrowed constructor frame or losing the Native pending originals.
+pub(crate) struct AttemptPortSourceBinding {
+    pub(crate) endpoints: Arc<super::port::AttemptPortEndpoints>,
+    pub(crate) establish: Arc<super::transport::AttemptEstablishMaterial>,
+    pub(crate) receipts: Arc<super::port::abort::AbortReceiptTable>,
+    pub(crate) reader: super::port::control::ControlReaderObligation,
+    pub(crate) residual: super::failure_residual::FailureResidualReceiveObligation,
+    pub(crate) residual_sink: Box<dyn super::transport::FailureResidualPort>,
+    pub(crate) observation:
+        Arc<crate::query_execution::logical_binding::OriginalAttemptObservation>,
+}
+
+/// Borrow the same endpoint pair, activation link and original Source inputs.
+/// This assembly context creates no registration, Work or capacity authority.
+pub(crate) struct AttemptHostOriginals<'a> {
+    pub(crate) logical: &'a crate::query_execution::logical_binding::BoundLogicalPorts,
+    pub(crate) link: &'a crate::control_runtime::logical::links::AttemptActivationLinkLoan,
+    pub(crate) inputs: crate::query_execution::native_execution_adapter::AttemptSourceInputs<'a>,
 }
 
 pub(crate) struct PreparedNativeSubscriptions {
@@ -420,29 +448,164 @@ impl AttemptActorRegistration {
         .map_err(AttemptRegistrationError::Runtime)
     }
 
-    /// The original QA reply position is separate from Native admission and
-    /// observation credits. Only one original QA request can be in flight.
-    pub(crate) fn prepare_qa_source(
+    /// Each fixed port family has its own result position. Its producer is
+    /// the SAME frozen LP actor, so current-ticket replies pass the kernel's
+    /// cross-owner forwarding check and the AP core's exact source check.
+    pub(crate) fn prepare_port_sources(
         &self,
         runtime: &ActorRuntime<FrontendActor>,
+        logical: &ActorRegistration,
         parent: &WorkObligation,
         payer: &ReservationObligation,
         observer: novarocks_control_runtime_core::identity::ConsumerId,
-        bridge: crate::task_execution::bridge::qa::AttemptQaBridge,
-    ) -> Result<super::transport::AttemptCallSource, AttemptRegistrationError> {
-        if bridge.activation() != self.root_control.activation() {
+    ) -> Result<[super::transport::AttemptCallSource; 3], AttemptRegistrationError> {
+        let binding = self
+            .binding
+            .get()
+            .ok_or(AttemptRegistrationError::InvalidConfig(
+                "port Sources require their original attempt binding",
+            ))?;
+        if logical.actor() != self.qa_source
+            || logical.actor() != self.owner_source
+            || logical.same_registration(&self.original)
+        {
             return Err(AttemptRegistrationError::InvalidConfig(
-                "QA Source belongs to another original activation",
+                "port result producer differs from the frozen original logical actor",
             ));
         }
-        self.prepare_call_source(
-            runtime,
-            parent,
-            payer,
-            observer,
-            self.qa_source,
-            super::transport::AttemptCallOwner::Qa(Arc::new(tokio::sync::Mutex::new(bridge))),
-        )
+        if !self.scope.same_scope(parent.scope())
+            || !payer.belongs_to_bound_work(&self.scope, parent.id())
+        {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "port Sources belong to another original attempt",
+            ));
+        }
+        let mut positions = Vec::with_capacity(super::port::facts::FactRole::ALL.len());
+        for _ in super::port::facts::FactRole::ALL {
+            match CausalInputObligation::reserve_admitted(
+                runtime,
+                &self.original,
+                logical.actor(),
+                InputClass::Lifecycle,
+                parent,
+            ) {
+                Ok(position) => positions.push(position),
+                Err(error) => {
+                    for mut original in positions {
+                        original
+                            .close_after_exit()
+                            .expect("original unpublished port result position");
+                    }
+                    return Err(AttemptRegistrationError::Runtime(error));
+                }
+            }
+        }
+        let mut positions = positions.into_iter();
+        Ok(super::port::facts::FactRole::ALL.map(|role| {
+            super::transport::AttemptCallSource::new(
+                parent,
+                payer,
+                binding.generation,
+                observer,
+                super::transport::AttemptCallOwner::LogicalPort(role),
+                positions
+                    .next()
+                    .expect("one original position per port family"),
+            )
+        }))
+    }
+
+    pub(crate) fn prepare_port_controls(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        logical: &ActorRegistration,
+        work: &WorkObligation,
+    ) -> Result<super::port::control::ControlPositions, AttemptRegistrationError> {
+        self.validate_port_owner(runtime, logical, work)?;
+        if self.controls_bound {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "original controls are already bound",
+            ));
+        }
+        let mut positions = Vec::with_capacity(3);
+        for class in [
+            InputClass::Control,
+            InputClass::Control,
+            InputClass::Ordinary,
+        ] {
+            match self.reserve_standing(runtime, logical.actor(), class, work) {
+                Ok(position) => positions.push(position),
+                Err(error) => {
+                    for mut position in positions {
+                        position
+                            .close_after_exit()
+                            .expect("unpublished original port control");
+                    }
+                    return Err(AttemptRegistrationError::Runtime(error));
+                }
+            }
+        }
+        self.controls_bound = true;
+        let mut positions = positions.into_iter();
+        Ok(super::port::control::ControlPositions {
+            stop: positions.next().unwrap(),
+            convergence: positions.next().unwrap(),
+            changed: positions.next().unwrap(),
+        })
+    }
+    pub(crate) fn prepare_port_abort(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        logical: &ActorRegistration,
+        work: &WorkObligation,
+    ) -> Result<Arc<super::port::abort::AttemptAbortIngress>, AttemptRegistrationError> {
+        self.validate_port_owner(runtime, logical, work)?;
+        if self.abort_bound {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "original Abort roles are already bound",
+            ));
+        }
+        let mut positions = Vec::with_capacity(self.failure_members.len());
+        for member in &*self.failure_members {
+            match self.reserve_standing(runtime, logical.actor(), InputClass::Control, work) {
+                Ok(position) => positions.push((member.participation, position)),
+                Err(error) => {
+                    for (_, mut position) in positions {
+                        position
+                            .close_after_exit()
+                            .expect("unpublished original Abort control");
+                    }
+                    return Err(AttemptRegistrationError::Runtime(error));
+                }
+            }
+        }
+        self.abort_bound = true;
+        Ok(Arc::new(super::port::abort::AttemptAbortIngress::new(
+            logical.clone(),
+            self.original.clone(),
+            self.root_control.activation(),
+            positions,
+        )))
+    }
+    fn validate_port_owner(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        logical: &ActorRegistration,
+        work: &WorkObligation,
+    ) -> Result<(), AttemptRegistrationError> {
+        runtime
+            .validate_registration(logical)
+            .map_err(AttemptRegistrationError::Runtime)?;
+        if logical.actor() != self.owner_source
+            || logical.actor() != self.qa_source
+            || logical.matches_scope(&self.scope)
+            || !self.scope.same_scope(work.scope())
+        {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "original logical owner differs from the frozen port pair",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn prepare_process_source(
@@ -769,89 +932,65 @@ impl AttemptActorRegistration {
         Ok(positions)
     }
 
-    pub(crate) fn prepare_abort_ingress(
+    pub(crate) fn prepare_startup(
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
-        work: &WorkObligation,
-        capacity: tokio::sync::watch::Sender<u64>,
-        worker_closed: Option<
-            Arc<dyn Fn(novarocks_execution_contract::ParticipationRef) + Send + Sync>,
-        >,
-    ) -> Result<crate::task_execution::bridge::abort::AttemptAbortIngress, ActorTurnError> {
-        if self.abort_bound || !self.scope.same_scope(work.scope()) {
-            return Err(ActorTurnError::InputAuthorMismatch);
+        startup_work: &WorkObligation,
+    ) -> Result<PreparedAttemptStartup, ActorTurnError> {
+        if self.startup_reserved || !self.scope.same_scope(startup_work.scope()) {
+            return Err(ActorTurnError::InvalidConfig);
         }
-        let mut positions = Vec::with_capacity(self.failure_members.len());
-        for member in &*self.failure_members {
-            match self.reserve_standing(runtime, self.original.actor(), InputClass::Control, work) {
-                Ok(position) => positions.push((member.participation, position)),
-                Err(error) => {
-                    for (_, mut position) in positions {
-                        position
-                            .close_after_exit()
-                            .expect("unpublished Abort Control position");
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        self.abort_bound = true;
-        Ok(
-            crate::task_execution::bridge::abort::AttemptAbortIngress::new(
-                self.original.clone(),
-                self.root_control.activation(),
-                positions,
-                capacity,
-                worker_closed,
-            ),
-        )
-    }
-
-    fn prepare_owner_controls(
-        &self,
-        runtime: &ActorRuntime<FrontendActor>,
-        work: &WorkObligation,
-    ) -> Result<AttemptOwnerControls, ActorTurnError> {
-        let mut stop =
-            self.reserve_standing(runtime, self.original.actor(), InputClass::Control, work)?;
-        let convergence = match self.reserve_standing(
+        let mut input = self.reserve_standing(
             runtime,
             self.original.actor(),
-            InputClass::Control,
-            work,
+            InputClass::Lifecycle,
+            startup_work,
+        )?;
+        let local_exit = match self.reserve_standing(
+            runtime,
+            self.original.actor(),
+            InputClass::Lifecycle,
+            startup_work,
         ) {
             Ok(position) => position,
             Err(error) => {
-                stop.close_after_exit().expect("unpublished Stop position");
+                input
+                    .close_after_exit()
+                    .expect("unpublished startup position");
                 return Err(error);
             }
         };
-        Ok(AttemptOwnerControls::new(
-            self.root_control.activation(),
-            stop,
-            convergence,
-        ))
+        let (source, witness) = AttemptStartupSource::new(self.original.clone(), input);
+        let local_exit = super::port::local_exit::LocalExitInputObligation::new(
+            self.original.clone(),
+            local_exit,
+        );
+        self.startup_reserved = true;
+        Ok(PreparedAttemptStartup {
+            source,
+            witness,
+            local_exit,
+        })
     }
 
     pub(crate) fn prepare_host(
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
         startup_work: &WorkObligation,
+        startup: PreparedAttemptStartup,
         capacity: AttemptCapacitySource,
         membership: MembershipRegistration,
         source: Box<dyn EffectSource>,
         executor: &Arc<dyn EffectExecutor>,
         transport: AttemptTransportBinding,
+        originals: AttemptHostOriginals<'_>,
     ) -> Result<PreparedAttemptHost, AttemptHostPreparationRefusal> {
-        let transient_calls = [
-            &transport.qa,
-            &transport.process,
-            &transport.publication,
-            &transport.release,
-            &transport.read_confirmation,
-            &transport.subscription_control,
-        ]
-        .len();
+        let AttemptHostOriginals {
+            logical,
+            link,
+            inputs: originals,
+        } = originals;
+        let transient_calls = transport.ports.len() + 5;
         let required_joins = transport
             .admission
             .idle_positions()
@@ -866,7 +1005,13 @@ impl AttemptActorRegistration {
             .and_then(|count| count.checked_add(transient_calls))
             .and_then(|count| count.checked_add(transport.subscriptions.participants()))
             .and_then(|count| count.checked_add(transport.pumps.capacity()));
-        if self.startup_reserved
+        let endpoints = &transport.port_binding.endpoints;
+        if !self.startup_reserved
+            || !self.controls_bound
+            || !self.abort_bound
+            || !startup.source.matches(&self.original)
+            || !startup.witness.matches_registration(&self.original)
+            || !startup.local_exit.matches(&self.original)
             || !self.ordered_bound
             || self.read_progress_roles.is_none()
             || !membership
@@ -878,9 +1023,14 @@ impl AttemptActorRegistration {
                 Arc::ptr_eq(&binding.capacity_registrant, &capacity.registrant)
             })
             || !self.scope.same_scope(startup_work.scope())
-            || !transport
-                .abort
-                .matches(&self.original, self.root_control.activation())
+            || !logical.runtime.same_runtime(runtime)
+            || !logical
+                .links
+                .matches_loan(link, self.root_control.activation())
+            || !endpoints.attempt().same_registration(&self.original)
+            || !endpoints.logical().same_registration(&logical.registration)
+            || endpoints.activation() != self.root_control.activation()
+            || originals.activation() != self.root_control.activation()
             || !transport
                 .subscriptions
                 .matches(&self.original, self.subscription_source)
@@ -895,78 +1045,25 @@ impl AttemptActorRegistration {
         {
             return Err((
                 AttemptRegistrationError::InvalidConfig(
-                    "attempt startup requires its original bound Sources and Work",
+                    "attempt startup requires its original two-core Sources and Work",
                 ),
+                startup,
                 capacity,
                 membership,
                 source,
                 transport,
             ));
         }
-        let mut input = match self.reserve_standing(
-            runtime,
-            self.original.actor(),
-            InputClass::Lifecycle,
-            startup_work,
-        ) {
-            Ok(input) => input,
-            Err(error) => {
-                return Err((
-                    AttemptRegistrationError::Runtime(error),
-                    capacity,
-                    membership,
-                    source,
-                    transport,
-                ));
-            }
-        };
-        let mut local_exit = match self.reserve_standing(
-            runtime,
-            self.original.actor(),
-            InputClass::Lifecycle,
-            startup_work,
-        ) {
-            Ok(position) => position,
-            Err(error) => {
-                input
-                    .close_after_exit()
-                    .expect("unpublished startup position");
-                return Err((
-                    AttemptRegistrationError::Runtime(error),
-                    capacity,
-                    membership,
-                    source,
-                    transport,
-                ));
-            }
-        };
-        let mut controls = match self.prepare_owner_controls(runtime, startup_work) {
-            Ok(controls) => controls,
-            Err(error) => {
-                local_exit
-                    .close_after_exit()
-                    .expect("unpublished local exit position");
-                input
-                    .close_after_exit()
-                    .expect("unpublished startup position");
-                return Err((
-                    AttemptRegistrationError::Runtime(error),
-                    capacity,
-                    membership,
-                    source,
-                    transport,
-                ));
-            }
-        };
-        let owner_controls = controls
-            .bind_host(self.original.clone())
-            .with_local_exit(local_exit);
-        self.startup_reserved = true;
+        let PreparedAttemptStartup {
+            source: startup_source,
+            witness: startup,
+            local_exit,
+        } = startup;
         let AttemptTransportBinding {
             retirement,
             admission,
-            mut qa,
-            abort,
+            ports,
+            port_binding,
             process,
             publication,
             release,
@@ -980,25 +1077,21 @@ impl AttemptActorRegistration {
             executor: native,
             failure,
         } = transport;
-        let terminal = crate::task_execution::bridge::terminal::TerminalOutbox::new(
-            self.root_control.activation(),
-        );
-        qa.install_terminal(terminal.clone());
-        qa.install_abort(abort.clone());
-        let (failure_bridge, residual) = PendingFailureBridge::new(
-            self.original.clone(),
-            self.root_control.activation(),
-            self.failure_members.clone(),
-            self.failure_publications.clone(),
-        );
-        let (abort_drain, abort_retirement) = tokio::sync::oneshot::channel();
+        let AttemptPortSourceBinding {
+            endpoints,
+            establish,
+            receipts,
+            reader,
+            residual,
+            residual_sink,
+            observation,
+        } = port_binding;
         let cleanup = super::transport::NativeFailureCleanup::new(
             send.contexts.clone(),
             failure.reservation_id(),
             native.0.clone(),
-            residual,
-        )
-        .with_abort_drain(abort.clone(), abort_drain);
+            residual_sink,
+        );
         let ordered_host = self
             .ordered_host
             .take()
@@ -1008,7 +1101,61 @@ impl AttemptActorRegistration {
                     .take()
                     .expect("original progress roles"),
             );
-        let (startup_source, startup) = AttemptStartupSource::new(self.original.clone(), input);
+        let [lifecycle, authorization, replacement] = ports;
+        // No typed preflight follows this move. The same pending M/Ready and
+        // rich captures now belong to the actual Source, including on a later
+        // whole HostBinding registration refusal.
+        let originals = originals.take();
+        let source = super::transport::AttemptTransportSource::new(
+            runtime.clone(),
+            self.original.clone(),
+            self.native_source,
+            self.scope.clone(),
+            admission,
+            [
+                Some(lifecycle),
+                Some(authorization),
+                Some(replacement),
+                Some(process),
+                Some(publication),
+                Some(release),
+                Some(read_confirmation),
+                Some(subscription_control),
+            ],
+            Some(subscriptions),
+            send,
+            (
+                FailureContext {
+                    lifecycle: self
+                        .failure_lifecycle
+                        .take()
+                        .expect("original failure lifecycle"),
+                    publications: self.failure_publications.clone(),
+                },
+                super::transport::AttemptFailureBinding {
+                    supervisor: failure,
+                    port: Box::new(cleanup),
+                },
+            ),
+            source,
+        )
+        .with_releases(native.0.clone(), retirement.host_waker())
+        .with_pumps(pumps, diagnostics, next_payload)
+        .with_failure_residual(residual, self.root_control.activation())
+        .with_ports(
+            endpoints,
+            establish,
+            self.compatibility,
+            receipts,
+            reader,
+            logical,
+            link,
+        )
+        .with_original_observation(observation);
+        let source = match originals {
+            Some(originals) => source.with_native_originals(originals),
+            None => source,
+        };
         Ok(PreparedAttemptHost {
             binding: HostBinding {
                 scope: self.scope.clone(),
@@ -1019,45 +1166,10 @@ impl AttemptActorRegistration {
                 startup: Some(startup_source),
                 capacity: Some(capacity),
                 membership: None,
-                owner_controls: Some(owner_controls),
+
+                local_exit: Some(local_exit),
                 ordered_observations: Some(ordered_host),
-                source: Box::new(
-                    super::transport::AttemptTransportSource::new(
-                        runtime.clone(),
-                        self.original.clone(),
-                        self.native_source,
-                        self.scope.clone(),
-                        admission,
-                        [
-                            Some(qa),
-                            Some(process),
-                            Some(publication),
-                            Some(release),
-                            Some(read_confirmation),
-                            Some(subscription_control),
-                        ],
-                        Some(subscriptions),
-                        send,
-                        (
-                            FailureContext {
-                                lifecycle: self
-                                    .failure_lifecycle
-                                    .take()
-                                    .expect("original failure lifecycle"),
-                                publications: self.failure_publications.clone(),
-                            },
-                            super::transport::AttemptFailureBinding {
-                                supervisor: failure,
-                                port: Box::new(cleanup),
-                                abort_drain: Some(abort_retirement),
-                            },
-                        ),
-                        source,
-                    )
-                    .with_releases(native.0.clone(), retirement.host_waker())
-                    .with_abort_retirement(&abort, retirement.host_waker())
-                    .with_pumps(pumps, diagnostics, next_payload),
-                ),
+                source: Box::new(source),
                 executor: Arc::new(super::transport::AttemptTransportExecutor {
                     native,
                     other: executor.clone(),
@@ -1065,19 +1177,12 @@ impl AttemptActorRegistration {
                 transport: Some(retirement),
             },
             startup,
-            controls,
             membership,
-            failure: failure_bridge,
-            terminal,
         })
     }
 
     pub(crate) fn root_control_binding(&self) -> &RootControlBinding {
         &self.root_control
-    }
-
-    pub(crate) fn failure_publications(&self) -> &Arc<FailurePublications> {
-        &self.failure_publications
     }
 
     pub(crate) fn bind_membership(
@@ -1147,7 +1252,14 @@ impl AttemptActorRegistration {
     pub(crate) fn observation_resources(
         participants: usize,
     ) -> Result<ReservationResources, ObservationError> {
-        let budget = ObservationBudget::for_task_attempt();
+        Self::observation_resources_with_budget(ObservationBudget::for_task_attempt(), participants)
+    }
+
+    // This is the same quote and original reservation recipe for both callers.
+    pub(in crate::task_execution::host) fn observation_resources_with_budget(
+        budget: ObservationBudget,
+        participants: usize,
+    ) -> Result<ReservationResources, ObservationError> {
         let backing = ObservationBackingQuote::new(budget, participants)?;
         let quota = budget
             .byte_window()
@@ -1163,14 +1275,30 @@ impl AttemptActorRegistration {
         ))
     }
 
+    /// Freeze only a fixture's pure layout before any original Source binds.
+    /// This grants no quota; the SAME funding must already contain this quote.
+    #[cfg(test)]
+    pub(in crate::task_execution::host) fn freeze_observation_budget_for_fixture(
+        &mut self,
+        budget: ObservationBudget,
+    ) {
+        assert!(
+            !self.ordered_bound
+                && self.read_progress_roles.is_none()
+                && self.fixture_observation_budget.is_none(),
+            "freeze before the original Source binds"
+        );
+        self.fixture_observation_budget = Some(budget);
+    }
+
     /// Assemble the attempt's real credits, stream publishers, and canonical
     /// QA request owner before the shared writer is published.
-    pub(crate) fn bind_observation_source(
+    pub(crate) fn bind_observation_source<T: super::observations::source::RootControlProjection>(
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
         backing: ObservationSourceBacking<'_>,
         root_control_work: &WorkObligation,
-        requests: &Arc<RootControlRequests>,
+        requests: &Arc<T>,
         clock: Arc<dyn MonotonicClock>,
         progress: Waker,
     ) -> Result<OrderedObservationInput<FrontendActor>, ObservationError> {
@@ -1182,6 +1310,8 @@ impl AttemptActorRegistration {
             return Err(ObservationError::InvalidRootControl);
         }
         let budget = ObservationBudget::for_task_attempt();
+        #[cfg(test)]
+        let budget = self.fixture_observation_budget.unwrap_or(budget);
         let quote = ObservationBackingQuote::new(budget, self.failure_members.len())?;
         let metadata = PaidObservationMetadata::take_from(
             quote,
@@ -1231,7 +1361,7 @@ impl AttemptActorRegistration {
             progress,
         ) {
             Ok(ingress) => {
-                requests.bind_ingress(&ingress);
+                requests.bind_ingress(&ingress)?;
                 Ok(ingress)
             }
             Err(error) => {
@@ -1566,6 +1696,7 @@ impl AttemptActor {
             transport_source,
             subscription_source,
             qa_source,
+            owner_source: owner,
             process_source,
             publication_source,
             capacity_source,
@@ -1584,9 +1715,12 @@ impl AttemptActor {
             root_control,
             ordered_host: None,
             ordered_bound: false,
+            #[cfg(test)]
+            fixture_observation_budget: None,
             read_progress_roles: None,
             startup_reserved: false,
             abort_bound: false,
+            controls_bound: false,
             config,
             binding,
         })
@@ -1637,6 +1771,26 @@ impl AttemptActor {
             !matches!(input, AttemptInput::StartProtocol) || self.binding.get().is_some(),
             "attempt Sources are bound before starting protocol"
         );
+        tracing::debug!(
+            actor = ?self.actor,
+            now = now.0,
+            control = ?self.core.control_phase(),
+            claim = ?claim,
+            input_kind = ?std::mem::discriminant(&input),
+            executor_kind = ?match &input {
+                AttemptInput::Executor(fact) => Some(std::mem::discriminant(fact)),
+                _ => None,
+            },
+            publication_result = ?match &input {
+                AttemptInput::Executor(novarocks_attempt_protocol::input::ExecutorFact::PublicationApplied { effect, result }) => Some((*effect, result.is_ok())),
+                _ => None,
+            },
+            port_kind = ?match &input {
+                AttemptInput::Port(port) => Some(std::mem::discriminant(&port.body)),
+                _ => None,
+            },
+            "attempt original control input"
+        );
         let mut context = TurnContext {
             step,
             scope: &self.scope,
@@ -1655,6 +1809,18 @@ impl AttemptActor {
             .unwrap_or_else(|error| {
                 std::panic::panic_any(AttemptFailure::TaskProtocol(Box::new(error)))
             });
+        tracing::debug!(
+            actor = ?self.actor,
+            now = now.0,
+            control = ?self.core.control_phase(),
+            selection = ?result.selection,
+            next_deadline = ?self.core.next_deadline(),
+            stopped = result.stop_producing,
+            effect = ?result.effect.as_ref().map(|effect| (effect.id, effect.class, std::mem::discriminant(&effect.body))),
+            abort_settlement = ?result.abort_settlement.as_ref().map(|effect| effect.id),
+            notice_action = ?result.notice_action,
+            "attempt original control output"
+        );
         if result.stop_producing {
             context.step.stop_producing();
         }
@@ -1737,6 +1903,14 @@ pub(crate) fn input_class(input: &AttemptInput) -> InputClass {
             | ExecutorFact::PumpTaskUpdate { .. }
             | ExecutorFact::SplitProfile { .. },
         ) => InputClass::Ordinary,
+        AttemptInput::Port(port)
+            if matches!(
+                &port.body,
+                LogicalToAttemptBody::PreReadyReplacementChanged { .. }
+            ) =>
+        {
+            InputClass::Ordinary
+        }
         AttemptInput::Port(port)
             if matches!(
                 &port.body,
@@ -1862,8 +2036,8 @@ impl TurnContext<'_, '_> {
                 EffectClass::Reply => {
                     let author = match &effect.body {
                         EffectBody::Port(port) if matches!(port.body,
-                            novarocks_coordination_contract::AttemptToLogicalBody::SealResult { .. }
-                            | novarocks_coordination_contract::AttemptToLogicalBody::TerminalControlResult { .. }
+                            novarocks_attempt_protocol::port_output::AttemptToLogicalBody::SealResult { .. }
+                            | novarocks_attempt_protocol::port_output::AttemptToLogicalBody::TerminalControlResult { .. }
                         ) => binding.root_control.reply_author().expect("original root-control reply author"),
                         _ => &authors.reply,
                     };

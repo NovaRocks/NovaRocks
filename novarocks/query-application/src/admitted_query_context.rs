@@ -250,9 +250,6 @@ impl StreamedComputationProducer {
     }
 }
 impl StreamedComputationCutHandle {
-    pub(crate) fn is_for_scope(&self, scope: &WorkScope) -> bool {
-        self.scope.id() == scope.id()
-    }
     pub(crate) fn same_source(&self, other: &Self) -> bool {
         std::sync::Weak::ptr_eq(&self.activity, &other.activity)
     }

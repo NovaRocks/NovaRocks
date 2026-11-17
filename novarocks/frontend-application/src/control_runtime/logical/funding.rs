@@ -29,7 +29,6 @@ use novarocks_control_runtime::{
 };
 use novarocks_control_runtime_core::{
     capacity::{ReservationResources, ResourceVector},
-    completion::ConsumerKind,
     identity::{ConsumerId, Generation, ReservationId},
     owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
@@ -122,13 +121,6 @@ impl SourceFundingObligation {
             .expect("arm original logical root for its installed host");
         Ok(false)
     }
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "P12 installer composition owns this pre-publication rollback path"
-        )
-    )]
     pub(super) fn retire_unpublished(mut self) {
         self.exit()
             .expect("unpublished logical root has no body or captures");
@@ -229,13 +221,6 @@ impl LogicalFundingObligation {
         }
         Ok(false)
     }
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "P12 installer composition owns this pre-publication rollback path"
-        )
-    )]
     pub(super) fn retire_unpublished(mut self, ledger: &RuntimeLedger) {
         if let Some(root) = self.root.take() {
             root.retire_unpublished();
@@ -250,12 +235,10 @@ pub(super) fn reported_step(guard: StepRegistration, kind: WorkKind) -> Reported
     let (work, mut payer) = guard
         .bind(kind)
         .expect("original logical purpose binds its reserved kind");
-    let report = ReportSlot::reserve_next(
-        &mut payer,
-        GENERATION,
-        1,
-        [(OBSERVER, ConsumerKind::Observer)],
-    )
-    .expect("original logical purpose owns its report position");
+    // The Work and its report position are already admitted. Bind the local
+    // exit observer atomically in the SAME Scope's actual epoch; this grants
+    // no start/publication authority and remains valid across owner failure.
+    let report = ReportSlot::reserve_exit_observer_for_admitted(&mut payer, OBSERVER)
+        .expect("original logical purpose owns its report position");
     ReportedWork::try_new(work, payer, report).expect("same original logical work/report/captures")
 }

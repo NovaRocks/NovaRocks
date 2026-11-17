@@ -18,13 +18,11 @@
 //! Frozen protocol facts and original payload ownership from one bound manifest.
 
 use super::{
-    bridge::{qa::AttemptQaBridge, root_control::PendingRootControls},
     creation::PricedTaskCreation,
     error::TaskExecutionError,
     graph::{TaskGraph, TaskPlanSource, build_task_graph_from_manifest},
-    host::transport::{AttemptEstablishMaterial, FrozenSendRequests},
+    host::transport::{AttemptEstablishMaterial, EstablishMaterialPreparation, FrozenSendRequests},
     protocol_facts::{AttemptProtocolFactsPublisher, AttemptProtocolFactsReceiver},
-    sources::ParticipationEstablishSource,
 };
 use crate::{
     control_runtime::membership::FrozenMember, query_execution::artifact::TaskManifestBinding,
@@ -36,16 +34,13 @@ use novarocks_attempt_protocol::{
     start::{AttemptSources, AttemptStart, FrozenAttemptPlan, PayloadRef},
 };
 use novarocks_coordination_contract::{
-    AttemptActivation, AttemptCompletionPolicy, AttemptInheritedAdmission, AttemptLifecyclePolicy,
-    MonotonicInstant,
+    AttemptActivation, AttemptActivationIdentity, AttemptAuthorizationLimits,
+    AttemptCompletionPolicy, AttemptInheritedAdmission, AttemptLifecyclePolicy, MonotonicInstant,
 };
 use novarocks_execution_contract::BackendProcessDescriptor;
 use novarocks_execution_contract::{AdmissionEpochCapability, ParticipationRef, TaskIdentity};
 use novarocks_query_application::api::PlanSeal;
-use novarocks_query_application::coordination::{
-    AcceptedRootStatusSender, AcceptedRootStatusSource, NativeAttemptDrive,
-    ReplacementWorkerAdmissionEvidence,
-};
+use novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence;
 use novarocks_result_contract::PerKind;
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::{BackendProcessId, NativeCompatibilityId};
@@ -148,14 +143,9 @@ impl ManifestAttemptInputs {
             &self.writers,
             &self.summary_sources,
         )?;
-        let (root_sender, root_status, root_controls) =
-            PendingRootControls::project(self.graph.root_identity());
         Ok(PreparedManifestAttempt {
             inputs: self,
             publications: ManifestPublications {
-                root_sender,
-                root_status: Some(root_status),
-                root_controls,
                 protocol,
                 protocol_facts: Some(protocol_facts),
             },
@@ -164,9 +154,6 @@ impl ManifestAttemptInputs {
 }
 
 pub(crate) struct ManifestPublications {
-    pub(crate) root_sender: AcceptedRootStatusSender,
-    pub(crate) root_status: Option<AcceptedRootStatusSource>,
-    pub(crate) root_controls: Arc<PendingRootControls>,
     pub(in crate::task_execution) protocol: AttemptProtocolFactsPublisher,
     pub(crate) protocol_facts: Option<AttemptProtocolFactsReceiver>,
 }
@@ -194,17 +181,39 @@ pub(crate) struct AttemptPlanPolicy {
 }
 
 pub(crate) struct AttemptActivationInputs<'a> {
-    pub(crate) drive: &'a NativeAttemptDrive,
+    pub(crate) identity: AttemptActivationIdentity,
+    pub(crate) authorization_limits: AttemptAuthorizationLimits,
     pub(crate) replacement_admissions: Option<&'a [ReplacementWorkerAdmissionEvidence]>,
     pub(crate) ids: IdSeed,
     pub(crate) initial_now: MonotonicInstant,
-    pub(crate) sources: AttemptSources,
     pub(crate) retain_diagnostics: bool,
     pub(crate) observe_dev_root: bool,
     pub(crate) observe_lifecycle_diagnostics: bool,
 }
 
+/// The original Native values are fully projected before an AP Scope opens.
+/// Binding real paid sources below performs only concrete metadata moves.
 pub(crate) struct AttemptManifestProjection {
+    start: FrozenManifestStart,
+    members: Arc<[FrozenMember]>,
+    #[cfg(test)]
+    backends: Arc<[BackendProcessDescriptor]>,
+    publications: ManifestPublications,
+    creations: BTreeMap<PayloadRef, PricedTaskCreation>,
+    requests: FrozenSendRequests,
+    establish: Arc<AttemptEstablishMaterial>,
+}
+
+struct FrozenManifestStart {
+    activation: AttemptActivation,
+    plan: FrozenAttemptPlan,
+    ids: IdSeed,
+    initial_now: MonotonicInstant,
+    observe_dev_root: bool,
+    observe_lifecycle_diagnostics: bool,
+}
+
+pub(crate) struct BoundAttemptManifestProjection {
     pub(crate) start: AttemptStart,
     pub(crate) members: Arc<[FrozenMember]>,
     #[cfg(test)]
@@ -212,16 +221,51 @@ pub(crate) struct AttemptManifestProjection {
     pub(crate) publications: ManifestPublications,
     pub(crate) creations: BTreeMap<PayloadRef, PricedTaskCreation>,
     pub(crate) requests: FrozenSendRequests,
-    pub(crate) qa: AttemptQaBridge,
+    pub(crate) establish: Arc<AttemptEstablishMaterial>,
 }
 
 impl AttemptManifestProjection {
+    pub(crate) fn pumps(&self) -> &[(PayloadRef, PumpKind)] {
+        &self.start.plan.pumps
+    }
+
+    pub(crate) fn bind_sources(self, sources: AttemptSources) -> BoundAttemptManifestProjection {
+        let Self {
+            start,
+            members,
+            #[cfg(test)]
+            backends,
+            publications,
+            creations,
+            requests,
+            establish,
+        } = self;
+        BoundAttemptManifestProjection {
+            start: AttemptStart {
+                activation: start.activation,
+                plan: start.plan,
+                ids: start.ids,
+                initial_now: start.initial_now,
+                sources,
+                observe_dev_root: start.observe_dev_root,
+                observe_lifecycle_diagnostics: start.observe_lifecycle_diagnostics,
+            },
+            members,
+            #[cfg(test)]
+            backends,
+            publications,
+            creations,
+            requests,
+            establish,
+        }
+    }
+
     /// Move the already bound graph's creation seeds and retain the Establish
     /// backing with one payload identity sequence. Core receives only the
     /// frozen protocol projection.
     pub(crate) fn from_prepared_manifest(
         prepared: PreparedManifestAttempt,
-        establish: &dyn ParticipationEstablishSource,
+        establish: &mut EstablishMaterialPreparation,
         activation: AttemptActivationInputs<'_>,
         policy: AttemptPlanPolicy,
         pumps: Box<[(PayloadRef, PumpKind)]>,
@@ -240,7 +284,12 @@ impl AttemptManifestProjection {
             backends,
             ..
         } = prepared.inputs;
-        let identity = activation.drive.identity();
+        let identity = activation.identity;
+        if activation.authorization_limits.activation != identity {
+            return Err(TaskExecutionError::Schedule(
+                "attempt authorization limits differ from the exact activation".into(),
+            ));
+        }
         if identity.execution() != graph.execution_id() {
             return Err(TaskExecutionError::Schedule(
                 "attempt projection differs from the original bound manifest".into(),
@@ -278,16 +327,12 @@ impl AttemptManifestProjection {
             .collect::<Result<_, _>>()?;
         let mut next = *next_payload;
         let (graph, creations) = graph.into_attempt_graph(&mut next)?;
-        let (establish_material, establish) = AttemptEstablishMaterial::project(
-            establish,
-            members.iter().map(|member| member.participation),
-            &mut next,
-        )?;
+        let (establish_material, establish) = establish.take_material(&mut next)?;
         let establish = Arc::new(establish);
         let windows = super::intent::NativeRequestWindows::for_transport(transport)
             .map_err(TaskExecutionError::Schedule)?;
         let message_limits = transport.message_limits();
-        let start = AttemptStart {
+        let start = FrozenManifestStart {
             activation: AttemptActivation {
                 identity,
                 policy: AttemptLifecyclePolicy {
@@ -298,7 +343,7 @@ impl AttemptManifestProjection {
             },
             plan: FrozenAttemptPlan {
                 graph,
-                authorization_limits: activation.drive.authorization_limits(),
+                authorization_limits: activation.authorization_limits,
                 writers,
                 summary_sources,
                 compatibility,
@@ -330,7 +375,6 @@ impl AttemptManifestProjection {
             },
             ids: activation.ids,
             initial_now: activation.initial_now,
-            sources: activation.sources,
             observe_dev_root: activation.observe_dev_root,
             observe_lifecycle_diagnostics: activation.observe_lifecycle_diagnostics,
         };
@@ -343,7 +387,7 @@ impl AttemptManifestProjection {
             publications: prepared.publications,
             creations,
             requests: FrozenSendRequests::with_establish(establish.clone()),
-            qa: AttemptQaBridge::new(Arc::new(activation.drive.clone()), compatibility, establish),
+            establish,
         })
     }
 }

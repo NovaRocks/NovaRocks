@@ -358,3 +358,149 @@ fn completion_only_delivery_request_cannot_open_a_stream_or_delay_task_completio
         Some(LogicalConclusion::Succeeded)
     );
 }
+
+#[test]
+fn required_initial_rows_root_missing_fences_before_native_run_or_relay_start() {
+    for output in [
+        LogicalOutputMode::ResultStream,
+        LogicalOutputMode::InternalResultStream,
+    ] {
+        let mut f = Fixture::new(output);
+        f.send(LogicalInput::Started);
+        let register = f.take(|body| {
+            matches!(
+                body,
+                LogicalEffectBody::Governance(GovernanceEffect::RegisterObligation { .. })
+            )
+        });
+        f.ack(
+            register.action,
+            ActionResult::Governance(GovernanceFact::ObligationRegistered {
+                activation: activation(1),
+                kind: ObligationKind::RunningWork,
+            }),
+        );
+        if let Some(index) = f.effects.iter().position(|effect| {
+            matches!(
+                effect.body,
+                LogicalEffectBody::Consumer(ConsumerEffect::ExposeOutput { .. })
+            )
+        }) {
+            let expose = f.effects.remove(index);
+            f.ack(
+                expose.action,
+                ActionResult::Consumer(ConsumerFact::OutputExposed),
+            );
+        }
+        let issued = f.take(|body| {
+            matches!(body,
+            LogicalEffectBody::Native(NativeEffect::ActivateAttempt { activation: a, .. })
+                if *a == activation(1))
+        });
+        assert_eq!(f.core.facts().current_activation(), Some(activation(1)));
+        assert_eq!(f.core.facts().attempts_started(), 1);
+        f.result(
+            issued.action,
+            ActionResult::Native(NativeFact::AttemptActivated {
+                activation: activation(1),
+                root: None,
+            }),
+        );
+        assert_missing_rows_preserves_typed_failure_and_closing(
+            &mut f,
+            activation(1),
+            issued.action,
+        );
+        assert_ne!(f.core.facts().phase(), LogicalPhase::Running(activation(1)));
+        assert!(!f.effects.iter().any(|effect| matches!(effect.body,
+            LogicalEffectBody::Native(NativeEffect::RunAttempt { activation: a })
+            | LogicalEffectBody::Relay(RelayEffect::Start { activation: a })
+                if a == activation(1))));
+        // This sequence supplies only passive public Core inputs. Actual
+        // Native return/F/Source exit remains the physical owner's obligation.
+    }
+}
+
+pub(super) fn assert_missing_rows_preserves_typed_failure_and_closing(
+    f: &mut Fixture,
+    activation: AttemptActivationIdentity,
+    original_activate: LogicalActionId,
+) {
+    use novarocks_coordination_contract::{ExecutionFailureSite, QueryExecutionErrorKind};
+    let expected = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        QueryFailureReason::ResultProtocol.failure_fact(),
+        SafeDetail::truncating("Native activated a row execution without its root result runtime"),
+        ExecutionFailureSite::Coordinator,
+    ));
+    assert_eq!(f.core.facts().conclusion(), Some(LogicalConclusion::Failed));
+    assert_eq!(f.core.facts().failure(), Some(&expected));
+    assert_eq!(
+        f.core.facts().failure().unwrap().kind(),
+        QueryExecutionErrorKind::Failed
+    );
+    let facts = f
+        .core
+        .facts()
+        .attempts()
+        .find(|a| a.activation == activation)
+        .unwrap();
+    assert!(
+        facts.activated,
+        "the original successful activation/return remains real"
+    );
+    assert!(!facts.relay_started && !facts.cleanup_complete);
+    assert!(f.effects.iter().any(|effect| matches!(&effect.body,
+        LogicalEffectBody::Consumer(ConsumerEffect::PublishFailure(error)) if error == &expected)));
+    assert!(!f.effects.iter().any(|effect| matches!(effect.body,
+        LogicalEffectBody::Native(NativeEffect::RunAttempt { activation: a })
+        | LogicalEffectBody::Relay(RelayEffect::Start { activation: a }) if a == activation)));
+    // The absent read runtime cannot manufacture a close operation or a
+    // native exit. The existing terminal cut still belongs to this activation.
+    assert!(!f.effects.iter().any(|effect| matches!(effect.body,
+        LogicalEffectBody::Native(NativeEffect::SealRootRead { activation: a, .. }) if a == activation)));
+    let cut = f.take(|body| matches!(body,
+        LogicalEffectBody::Native(NativeEffect::RecordTerminalCut { activation: a, .. }) if *a == activation));
+    f.ack(cut.action, ActionResult::Native(NativeFact::Applied));
+    assert!(f.effects.iter().any(|effect| matches!(&effect.body,
+        LogicalEffectBody::AttemptPort(message) if message.activation == activation && matches!(message.body,
+            LogicalToAttemptBody::BeginConvergence { mode: novarocks_coordination_contract::AttemptConvergenceMode::Cleanup, .. }))));
+    assert!(!f.effects.iter().any(|effect| matches!(effect.body,
+        LogicalEffectBody::Native(NativeEffect::FinishResources { activation: a }) if a == activation)));
+    f.exit(original_activate);
+    // The existing public fixtures have an explicitly empty frozen roster.
+    // This supplied AP fact does not claim an actual Native/AP Scope exited.
+    f.send(LogicalInput::AttemptPort(Box::new(AttemptToLogical {
+        activation,
+        action: AttemptActionId::new(std::num::NonZeroU64::new(9_036).unwrap()),
+        body: AttemptToLogicalBody::ConvergenceProgress {
+            local_exited: true,
+            closure: Some(std::sync::Arc::new(
+                novarocks_coordination_contract::AttemptConvergenceClosure::Evidence(Vec::new()),
+            )),
+            lifecycle_runtime_filters: None,
+        },
+    })));
+    let resolve = f.take(|body| matches!(body,
+        LogicalEffectBody::Governance(GovernanceEffect::ResolveObligation { activation: a, kind: ObligationKind::RunningWork }) if *a == activation));
+    f.result(
+        resolve.action,
+        ActionResult::Governance(GovernanceFact::ObligationResolved {
+            activation,
+            kind: ObligationKind::RunningWork,
+        }),
+    );
+    assert!(!f.effects.iter().any(|effect| matches!(effect.body,
+        LogicalEffectBody::Native(NativeEffect::FinishResources { activation: a }) if a == activation)));
+    f.exit(resolve.action);
+    assert!(f.effects.iter().any(|effect| matches!(effect.body,
+        LogicalEffectBody::Native(NativeEffect::FinishResources { activation: a }) if a == activation)));
+    assert!(
+        !f.core
+            .facts()
+            .attempts()
+            .find(|a| a.activation == activation)
+            .unwrap()
+            .cleanup_complete
+    );
+    assert_eq!(f.core.facts().failure(), Some(&expected));
+}

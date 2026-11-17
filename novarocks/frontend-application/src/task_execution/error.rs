@@ -28,16 +28,16 @@ use std::fmt;
 use std::time::Duration;
 
 #[cfg(test)]
-use crate::task_execution::{
-    operation::OperationDispatchResult, status_validation::FinalInfoDisagreement,
-};
+use crate::task_execution::operation::OperationDispatchResult;
 #[cfg(test)]
-use novarocks_coordination_contract::StatusObservation;
+use novarocks_attempt_protocol::status_validation::FinalInfoDisagreement;
+#[cfg(test)]
+use novarocks_execution::task_execution::IdentityMismatch;
+use novarocks_execution::task_execution::{DescriptorError, RequestError};
+#[cfg(test)]
 use novarocks_execution::task_execution::{
-    DescriptorError, DomainConflict, OperationKind, ParticipationRef, RequestError, TaskOperationId,
+    DomainConflict, OperationKind, ParticipationRef, TaskOperationId,
 };
-#[cfg(test)]
-use novarocks_execution::task_execution::{ExchangeEdgeId, IdentityMismatch, TaskState};
 use novarocks_types::identity::BackendProcessId;
 
 /// Why a task-status subscription can no longer represent its frozen
@@ -70,10 +70,6 @@ pub enum TaskExecutionError {
     #[cfg(test)]
     Execution(novarocks_query_application::execution_error::ExecutionFailureInput),
     SplitAssignment(crate::query_execution::split_assignment::SplitAssignmentDriverError),
-    /// The original logical owner refused this operation; preserve its reason
-    /// and normal stop observation instead of reconstructing it from text.
-    Actor(novarocks_query_application::coordination::LogicalExecutionActorError),
-    Establish(novarocks_query_application::coordination::EstablishIssueError),
     /// The static schedule cannot be turned into a legal task graph.
     Schedule(String),
     /// A descriptor built from the static schedule is not a legal value.
@@ -95,13 +91,7 @@ pub enum TaskExecutionError {
     /// replay authorization while every Worker outcome remained unknown. The
     /// whole-attempt recovery owner must observe whether this exact process
     /// was replaced before deciding a successor schedule.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the legacy test driver is removed in the cutover commit"
-        )
-    )]
+    #[cfg(test)]
     PreReadyEstablishTransportUnknown {
         backend: BackendProcessId,
     },
@@ -109,13 +99,7 @@ pub enum TaskExecutionError {
     /// attempt is unusable, but only the whole-attempt recovery owner may
     /// decide whether independently observed process replacement permits a
     /// successor schedule.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the legacy test driver is removed in the cutover commit"
-        )
-    )]
+    #[cfg(test)]
     PreReadyEstablishRejected {
         participation: ParticipationRef,
         operation_id: TaskOperationId,
@@ -126,13 +110,6 @@ pub enum TaskExecutionError {
     /// one that is already settled.
     #[cfg(test)]
     UnknownOperation,
-    /// An acknowledgement carried the wrong receipt shape for its operation.
-    #[cfg(test)]
-    MissingReceipt(OperationKind),
-    /// A Worker receipt did not settle the immutable domain intent that this
-    /// query coordinator released.
-    #[cfg(test)]
-    DomainReceipt(String),
     /// A receipt addressed a different task, stage, query, or process.
     #[cfg(test)]
     Identity(IdentityMismatch),
@@ -143,40 +120,14 @@ pub enum TaskExecutionError {
     /// The three task domains are advanced by unrelated producers, so a
     /// conflict that reports only its kind costs a cluster run just to learn
     /// which producer to look at.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the legacy test driver is removed in the cutover commit"
-        )
-    )]
+    #[cfg(test)]
     DomainRegression {
         domain: &'static str,
         token: String,
         conflict: DomainConflict,
     },
-    /// An edge-open decision repeats an edge this owner already opened.
-    #[cfg(test)]
-    EdgeAlreadyOpened(ExchangeEdgeId),
-    /// A published status snapshot cannot be reconciled with what this owner
-    /// already holds.
-    #[cfg(test)]
-    Observation(StatusObservation),
-    /// A task reached a state the protocol does not allow from its current
-    /// one.
-    #[cfg(test)]
-    IllegalTaskTransition {
-        from: TaskState,
-        to: TaskState,
-    },
     /// A backend answered an operation with an outcome that fails the attempt.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the legacy test driver is removed in the cutover commit"
-        )
-    )]
+    #[cfg(test)]
     OperationFailed {
         participation: ParticipationRef,
         operation_id: TaskOperationId,
@@ -217,15 +168,6 @@ pub enum CapacityBound {
     /// This query's queued operations for one backend.
     #[cfg(test)]
     QueryBackendOperations { limit: usize },
-    /// This query's queued bytes for one backend.
-    #[cfg(test)]
-    QueryBackendBytes { limit: usize },
-    /// Queued operations across every backend of this query.
-    #[cfg(test)]
-    BackendOperations { limit: usize },
-    /// Queued bytes across every backend of this query.
-    #[cfg(test)]
-    BackendBytes { limit: usize },
     /// Tasks in one participation.
     TasksPerParticipation { limit: usize },
     /// Active tasks this query places on one backend.
@@ -236,21 +178,6 @@ pub enum CapacityBound {
     },
     /// One operation's queue-side carrier.
     OperationBytes { limit: usize, actual: usize },
-    /// Edge-open versions one producer task can mint.
-    ///
-    /// A task mints one per edge-open decision and never reuses one, so this
-    /// bound is the version space itself. It fails closed rather than wrapping
-    /// because a wrapped version would claim to be the request that opened a
-    /// different edge set.
-    #[cfg(test)]
-    EdgeOpenVersions { limit: u32 },
-}
-
-#[cfg(test)]
-impl CapacityBound {
-    pub const fn as_operation_outcome(self) -> OperationOutcome {
-        OperationOutcome::ResourceExhausted
-    }
 }
 
 /// Facts belong to the exact FE bound that refused this request. A numeric
@@ -271,33 +198,6 @@ impl novarocks_execution_contract::failure::FailureProjection for CapacityBound 
                 None,
                 u64::try_from(limit).ok(),
             ),
-            #[cfg(test)]
-            Self::QueryBackendBytes { limit } => (
-                41,
-                Some(S::Request),
-                Some(S::Query),
-                D::Bytes,
-                None,
-                u64::try_from(limit).ok(),
-            ),
-            #[cfg(test)]
-            Self::BackendOperations { limit } => (
-                42,
-                Some(S::Request),
-                Some(S::Query),
-                D::Items,
-                None,
-                u64::try_from(limit).ok(),
-            ),
-            #[cfg(test)]
-            Self::BackendBytes { limit } => (
-                43,
-                Some(S::Request),
-                Some(S::Query),
-                D::Bytes,
-                None,
-                u64::try_from(limit).ok(),
-            ),
             // Participation and query-on-one-backend cardinalities have no exact
             // ResourceScope word. They are not a Task or Process measurement.
             Self::TasksPerParticipation { limit } => {
@@ -314,15 +214,6 @@ impl novarocks_execution_contract::failure::FailureProjection for CapacityBound 
                 D::Bytes,
                 u64::try_from(actual).ok(),
                 u64::try_from(limit).ok(),
-            ),
-            #[cfg(test)]
-            Self::EdgeOpenVersions { limit } => (
-                49,
-                Some(S::Task),
-                Some(S::Task),
-                D::Items,
-                None,
-                Some(u64::from(limit)),
             ),
         };
         FailureFact::new(
@@ -350,17 +241,6 @@ impl fmt::Display for CapacityBound {
                 formatter,
                 "queued operations for one backend of this query reached {limit}"
             ),
-            #[cfg(test)]
-            Self::QueryBackendBytes { limit } => write!(
-                formatter,
-                "queued bytes for one backend of this query reached {limit}"
-            ),
-            #[cfg(test)]
-            Self::BackendOperations { limit } => {
-                write!(formatter, "queued operations reached {limit}")
-            }
-            #[cfg(test)]
-            Self::BackendBytes { limit } => write!(formatter, "queued bytes reached {limit}"),
             Self::TasksPerParticipation { limit } => {
                 write!(formatter, "tasks in one participation reached {limit}")
             }
@@ -373,10 +253,6 @@ impl fmt::Display for CapacityBound {
                 formatter,
                 "operation requires {actual} bytes, limit is {limit}"
             ),
-            #[cfg(test)]
-            Self::EdgeOpenVersions { limit } => {
-                write!(formatter, "edge-open versions for one task reached {limit}")
-            }
         }
     }
 }
@@ -388,14 +264,6 @@ impl fmt::Display for TaskExecutionError {
             Self::Execution(input) => formatter.write_str(input.detail().as_str()),
             Self::SplitAssignment(error) => write!(formatter, "split assignment failed: {error}"),
             Self::Workload(error) => std::fmt::Display::fmt(error, formatter),
-            Self::Actor(error) => write!(
-                formatter,
-                "logical execution actor refused Task protocol work: {error}"
-            ),
-            Self::Establish(error) => write!(
-                formatter,
-                "logical execution actor Establish gate failed: {error}"
-            ),
             Self::Schedule(detail) => write!(
                 formatter,
                 "static schedule is not schedulable as a task graph: {detail}"
@@ -417,10 +285,12 @@ impl fmt::Display for TaskExecutionError {
                 formatter,
                 "{kind} operation {operation_id} waited {waited:?} in the frontend queue and expired before transport acceptance"
             ),
+            #[cfg(test)]
             Self::PreReadyEstablishTransportUnknown { backend } => write!(
                 formatter,
                 "EstablishParticipation for backend {backend} exhausted its exact replay budget with unknown Worker outcomes"
             ),
+            #[cfg(test)]
             Self::PreReadyEstablishRejected {
                 participation,
                 operation_id,
@@ -435,18 +305,8 @@ impl fmt::Display for TaskExecutionError {
                 formatter.write_str("acknowledgement names an operation this owner did not send")
             }
             #[cfg(test)]
-            Self::MissingReceipt(kind) => {
-                write!(formatter, "{kind} was accepted without its receipt")
-            }
-            #[cfg(test)]
-            Self::DomainReceipt(detail) => {
-                write!(
-                    formatter,
-                    "task domain receipt does not settle its intent: {detail}"
-                )
-            }
-            #[cfg(test)]
             Self::Identity(mismatch) => write!(formatter, "task protocol receipt {mismatch}"),
+            #[cfg(test)]
             Self::DomainRegression {
                 domain,
                 token,
@@ -458,17 +318,6 @@ impl fmt::Display for TaskExecutionError {
                 )
             }
             #[cfg(test)]
-            Self::EdgeAlreadyOpened(edge) => {
-                write!(formatter, "exchange edge {edge} was already opened")
-            }
-            #[cfg(test)]
-            Self::Observation(observation) => {
-                write!(formatter, "published status is not usable: {observation:?}")
-            }
-            #[cfg(test)]
-            Self::IllegalTaskTransition { from, to } => {
-                write!(formatter, "task state {from} may not become {to}")
-            }
             Self::OperationFailed {
                 kind, rejection, ..
             } => match rejection.detail() {
@@ -501,8 +350,6 @@ impl std::error::Error for TaskExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Workload(error) => Some(error),
-            Self::Actor(error) => Some(error),
-            Self::Establish(error) => Some(error),
             _ => None,
         }
     }
@@ -565,8 +412,15 @@ impl TaskExecutionError {
     pub(crate) fn preparation_input(
         &self,
     ) -> novarocks_query_application::execution_error::ExecutionFailureInput {
+        // Borrow the original retained error before its intentionally compact
+        // safe projection. This test-only diagnostic neither moves its owner
+        // nor changes the canonical client failure.
+        #[cfg(test)]
+        eprintln!("original TaskExecutionError before safe preparation projection: {self:?}");
+        use novarocks_execution_contract::SafeDetail;
         use novarocks_execution_contract::failure::FailureProjection;
-        use novarocks_execution_contract::{SafeDetail, operation::OperationResult};
+        #[cfg(test)]
+        use novarocks_execution_contract::operation::OperationResult;
         use novarocks_query_application::execution_error::{
             ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
         };
@@ -595,61 +449,52 @@ impl TaskExecutionError {
                     )
                 });
             }
-            Self::Actor(error) => {
-                return ExecutionFailureInput::new(
-                    error.failure_fact(),
-                    error.safe_detail(),
-                    ExecutionFailureSite::Coordinator,
-                );
-            }
-            Self::Establish(error) => {
-                return ExecutionFailureInput::new(
-                    error.failure_fact(),
-                    error.safe_detail(),
-                    ExecutionFailureSite::Coordinator,
-                );
-            }
             _ => {}
         }
-        let operation = match self {
-            Self::OperationFailed {
-                participation,
-                operation_id,
-                kind,
-                rejection,
-            } => Some((*participation, *operation_id, *kind, rejection)),
-            Self::PreReadyEstablishRejected {
-                participation,
-                operation_id,
-                rejection,
-            } => Some((
-                *participation,
-                *operation_id,
-                OperationKind::UpdateParticipation,
-                rejection,
-            )),
-            _ => None,
-        };
-        if let Some((participation, operation_id, kind, rejection)) = operation {
-            let site = ExecutionFailureSite::Operation {
-                participation,
-                operation_id,
-                kind,
+        #[cfg(test)]
+        {
+            let operation = match self {
+                Self::OperationFailed {
+                    participation,
+                    operation_id,
+                    kind,
+                    rejection,
+                } => Some((*participation, *operation_id, *kind, rejection)),
+                Self::PreReadyEstablishRejected {
+                    participation,
+                    operation_id,
+                    rejection,
+                } => Some((
+                    *participation,
+                    *operation_id,
+                    OperationKind::UpdateParticipation,
+                    rejection,
+                )),
+                _ => None,
             };
-            return match rejection {
-                OperationResult::DomainFailure { failure, .. } => {
-                    ExecutionFailureInput::new(failure.fact(), failure.detail().clone(), site)
-                }
-                OperationResult::Verdict {
-                    outcome, detail, ..
-                } => ExecutionFailureInput::new(
-                    novarocks_attempt_protocol::port_projection::operation_failure_fact(*outcome),
-                    detail.clone().unwrap_or_else(|| {
-                        SafeDetail::truncating(&format!("{kind} returned {outcome:?}"))
-                    }),
-                    site,
-                ),
-            };
+            if let Some((participation, operation_id, kind, rejection)) = operation {
+                let site = ExecutionFailureSite::Operation {
+                    participation,
+                    operation_id,
+                    kind,
+                };
+                return match rejection {
+                    OperationResult::DomainFailure { failure, .. } => {
+                        ExecutionFailureInput::new(failure.fact(), failure.detail().clone(), site)
+                    }
+                    OperationResult::Verdict {
+                        outcome, detail, ..
+                    } => ExecutionFailureInput::new(
+                        novarocks_attempt_protocol::port_projection::operation_failure_fact(
+                            *outcome,
+                        ),
+                        detail.clone().unwrap_or_else(|| {
+                            SafeDetail::truncating(&format!("{kind} returned {outcome:?}"))
+                        }),
+                        site,
+                    ),
+                };
+            }
         }
         let (reason, site) = match self {
             Self::Capacity(bound) => {
@@ -694,8 +539,12 @@ impl TaskExecutionError {
                 QueryFailureReason::BackendLost,
                 ExecutionFailureSite::Backend { process: *backend },
             ),
-            Self::PreReadyEstablishTransportUnknown { backend }
-            | Self::ParticipantUnobservable {
+            #[cfg(test)]
+            Self::PreReadyEstablishTransportUnknown { backend } => (
+                QueryFailureReason::ObservationLost,
+                ExecutionFailureSite::Backend { process: *backend },
+            ),
+            Self::ParticipantUnobservable {
                 backend,
                 state: ParticipantObservationFailure::Transport(_),
             } => (
@@ -723,6 +572,7 @@ impl TaskExecutionError {
                     ExecutionFailureSite::Coordinator,
                 );
             }
+            #[cfg(test)]
             Self::DomainRegression { conflict, .. } => {
                 return ExecutionFailureInput::new(
                     conflict.failure_fact(),
@@ -1198,26 +1048,6 @@ mod capacity_projection_tests {
                 .preparation_input()
                 .fact(),
             request.failure_fact()
-        );
-    }
-}
-
-#[cfg(test)]
-mod actor_gate_failure_carry_tests {
-    use super::*;
-    use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
-    #[test]
-    fn an_expired_actor_activation_keeps_its_original_stop_fact() {
-        let original =
-            novarocks_query_application::coordination::LogicalExecutionActorError::WrongPhase;
-        let error = TaskExecutionError::Actor(original);
-        let input = error.preparation_input();
-        assert_eq!(input.fact(), original.failure_fact());
-        assert_eq!(input.detail(), &original.safe_detail());
-        assert_eq!(input.fact().evidence(), FailureEvidence::StopObservation);
-        assert_eq!(
-            input.attempt_class(),
-            novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure
         );
     }
 }

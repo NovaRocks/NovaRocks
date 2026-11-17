@@ -17,4 +17,5 @@
 
 //! Test-only facade over the original FE process and logical/attempt owners.
 pub(crate) use crate::control_runtime::logical::test_fixtures::*;
+pub(crate) mod facts;
 pub(crate) mod history;

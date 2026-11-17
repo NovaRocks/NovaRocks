@@ -20,14 +20,14 @@ use crate::task_execution::host::observations::{
     ObservationBudget,
     tests::{Bank, ManualClock},
 };
+use crate::task_execution::host::port::root_control::RootControlRequests;
 use crate::task_execution::intent::OperationAcknowledgement;
 use novarocks_attempt_protocol::{
-    AttemptStep,
-    capacity::{QueueStage, ReservationToken, StepContext},
-    config::{CoordinationBudgets, DispatchLane, FrozenTransportLimits},
-    effect::{AttemptEffect, EffectClass, Publication},
+    capacity::QueueStage,
+    config::{CoordinationBudgets, FrozenTransportLimits},
+    effect::Publication,
     ids::IdSeed,
-    input::{AttemptSourceCut, PublicationApplied, QueuedInputGrantRef, SendGeneration},
+    input::{PublicationApplied, SendGeneration},
     start::{
         AttemptSources, FrozenAttemptPlan, FrozenCreation, FrozenEstablish, FrozenTask,
         FrozenTaskGraph, PayloadRef,
@@ -40,17 +40,15 @@ use novarocks_control_runtime_core::{
     scope::WorkAdmission,
 };
 use novarocks_coordination_contract::{
-    AbortIssueSettlement, AttemptActionId, AttemptActivation, AttemptActivationIdentity,
-    AttemptAuthorizationLimits, AttemptCompletionPolicy, AttemptLifecyclePolicy, AttemptToLogical,
-    AttemptToLogicalBody, LogicalToAttemptBody,
+    AttemptActionId, AttemptActivation, AttemptActivationIdentity, AttemptAuthorizationLimits,
+    AttemptCompletionPolicy, AttemptLifecyclePolicy, LogicalToAttemptBody,
 };
 use novarocks_execution_contract::{AdmissionEpochCapability, OperationKind};
 use novarocks_types::NativeCompatibilityId;
 use std::num::NonZeroUsize;
 
 pub(crate) fn start() -> AttemptStart {
-    let legacy = crate::task_execution::tests::manifest_unstarted_regression_fixture();
-    let graph = legacy.execution().graph();
+    let graph = crate::task_execution::graph_manifest_tests::unstarted_chain_graph();
     let root = graph.root_identity();
     let original = graph.task(root.task_id()).unwrap();
     let participation = original.participation();
@@ -154,500 +152,6 @@ pub(crate) fn start() -> AttemptStart {
     }
 }
 
-struct AbortQueueStage {
-    full: bool,
-    attempts: usize,
-}
-
-impl StepContext for AbortQueueStage {
-    fn charge(&mut self, _: usize) -> bool {
-        true
-    }
-
-    fn reserve_queue_stage(
-        &mut self,
-        lane: DispatchLane,
-        control: bool,
-        _: BackendProcessId,
-        records: usize,
-        _: usize,
-    ) -> QueueStage {
-        assert_eq!(lane, DispatchLane::Lifecycle);
-        assert!(control);
-        assert_eq!(records, 1);
-        self.attempts += 1;
-        if self.full {
-            QueueStage::ProcessFull
-        } else {
-            QueueStage::Granted(ReservationToken(positive(39)))
-        }
-    }
-}
-
-pub(in crate::task_execution) struct OriginalAbortCore {
-    core: Core,
-    sources: AttemptSources,
-    now: MonotonicInstant,
-    queue_residence: Duration,
-    ordinal: u64,
-    queue: AbortQueueStage,
-}
-
-impl OriginalAbortCore {
-    pub(in crate::task_execution) fn new(
-        mut start: AttemptStart,
-        inbox: &crate::task_execution::host::custody::tests::WithdrawalInbox,
-        activation: AttemptActivationIdentity,
-    ) -> Self {
-        start.activation.identity = activation;
-        start.plan.authorization_limits.activation = activation;
-        // The isolated runtime's external Source owns the original Native report.
-        std::mem::swap(&mut start.sources.native, &mut start.sources.publication);
-        let sources = start.sources;
-        assert_eq!(sources.actor.0.get(), inbox.registration().actor().get());
-        assert_eq!(sources.native.0.get(), inbox.source().get());
-        let mut original = Self {
-            sources,
-            now: start.initial_now,
-            queue_residence: start.plan.transport.frontend_queue_residence(),
-            core: <Core as AttemptCore>::new(start).unwrap(),
-            ordinal: 100,
-            queue: AbortQueueStage {
-                full: false,
-                attempts: 0,
-            },
-        };
-        original.step(sources.actor, AttemptInput::Bootstrap, None);
-        original
-    }
-
-    fn step(
-        &mut self,
-        source: AttemptSourceId,
-        input: AttemptInput,
-        original_input: Option<InputId>,
-    ) -> AttemptStep {
-        self.ordinal += 1;
-        let input_id = AttemptInputId(positive(original_input.map_or(self.ordinal, InputId::get)));
-        self.core
-            .handle(
-                self.now,
-                AttemptInputClaim {
-                    source,
-                    input: input_id,
-                    native_cut: Some(AttemptSourceCut {
-                        source: self.sources.native,
-                        tail: (source == self.sources.native).then_some(input_id),
-                    }),
-                    selected_cut: Some(AttemptSourceCut {
-                        source: self.sources.observation,
-                        tail: None,
-                    }),
-                },
-                input,
-                &mut self.queue,
-            )
-            .unwrap()
-    }
-
-    fn timer(&mut self) -> AttemptStep {
-        self.step(self.sources.actor, AttemptInput::Timer, None)
-    }
-
-    fn advance(&mut self, mut step: AttemptStep) -> AttemptStep {
-        for _ in 0..24 {
-            if let Some(effect) = &step.effect {
-                if matches!(
-                    effect.body,
-                    EffectBody::Publish(Publication::ProtocolBatch(_))
-                ) {
-                    step = self.step(
-                        self.sources.publication,
-                        AttemptInput::Executor(ExecutorFact::PublicationApplied {
-                            effect: effect.id,
-                            result: Ok(PublicationApplied::ProtocolBatch { published: true }),
-                        }),
-                        None,
-                    );
-                    continue;
-                }
-                return step;
-            }
-            if step.round_result.is_some() || step.abort_settlement.is_some() {
-                return step;
-            }
-            assert!(
-                matches!(step.selection, InputSelection::Only(source)
-                    if source == self.sources.actor || source == self.sources.observation)
-                    || step.selection == InputSelection::Prefer(self.sources.native)
-            );
-            step = self.timer();
-        }
-        panic!("the original Abort continuation did not reach its next cut");
-    }
-
-    fn finish_round(&mut self) -> AttemptStep {
-        let step = self.timer();
-        self.advance(step)
-    }
-
-    pub(in crate::task_execution) fn admit(
-        &mut self,
-        input: InputId,
-        original: novarocks_coordination_contract::LogicalToAttempt<AttemptFailure>,
-        grant_position: u64,
-        queue_full: bool,
-    ) -> SendKey {
-        let LogicalToAttemptBody::Abort { request, .. } = &original.body else {
-            panic!("original QA Abort Control input");
-        };
-        let operation = request.envelope().operation_id();
-        let submitted = self.step(
-            self.sources.actor,
-            AttemptInput::Port(original),
-            Some(input),
-        );
-        let admitted = self.advance(submitted);
-        let Some(AttemptEffect {
-            id: admission,
-            class: EffectClass::Settlement,
-            body:
-                EffectBody::AdmitQueuedInput {
-                    operation: intent,
-                    generation,
-                    lane: DispatchLane::Lifecycle,
-                    ..
-                },
-        }) = admitted.effect
-        else {
-            panic!("exact Abort queue admission");
-        };
-        assert_eq!(intent.operation_id(), operation);
-        assert_eq!(admission, generation.admission_effect());
-        assert_eq!(self.finish_round().round_result, Some(Ok(())));
-
-        let grant = QueuedInputGrantRef::new(positive(grant_position), generation, 1);
-        self.queue.full = queue_full;
-        let stage_attempts = self.queue.attempts;
-        let granted = self.step(
-            self.sources.transport,
-            AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
-                operation,
-                grant,
-                queued_bytes: intent.queued_bytes(),
-            }),
-            None,
-        );
-        let staged = self.advance(granted);
-        assert!(self.queue.attempts > stage_attempts);
-        if queue_full {
-            assert!(
-                staged.effect.is_none(),
-                "the denied replay stays in the dispatcher"
-            );
-            assert_eq!(staged.round_result, Some(Ok(())));
-        } else {
-            assert!(matches!(
-                staged.effect,
-                Some(AttemptEffect {
-                    class: EffectClass::Settlement,
-                    body: EffectBody::SendBatch { batch, .. },
-                    ..
-                }) if batch.queued_inputs.as_ref() == [grant]
-            ));
-            assert_eq!(self.finish_round().round_result, Some(Ok(())));
-        }
-        SendKey {
-            operation,
-            generation,
-        }
-    }
-
-    fn native_report(&mut self, report: InputId, fact: ExecutorFact) -> AttemptStep {
-        self.step(
-            self.sources.native,
-            AttemptInput::Executor(fact),
-            Some(report),
-        )
-    }
-
-    pub(in crate::task_execution) fn transport_unknown(
-        &mut self,
-        inbox: &crate::task_execution::host::custody::tests::WithdrawalInbox,
-        scope: &ScopeHandle,
-        key: SendKey,
-    ) -> AttemptToLogical<AttemptFailure> {
-        let (mut work, mut payer) = scope
-            .reserve_next(
-                Generation::new(1).unwrap(),
-                ReservationResources::work_only(),
-                WorkKind::Settlement,
-                WorkAdmission::External,
-            )
-            .unwrap()
-            .bind(WorkKind::Settlement)
-            .unwrap();
-        work.start().unwrap();
-        let mut receipt =
-            inbox.reserve_native_receipt(&work, key, OperationKind::AbortParticipation);
-        let original = OperationAcknowledgement::transport_unknown(
-            key.operation,
-            OperationKind::AbortParticipation,
-        );
-        receipt.record(key, original.clone(), None, None).unwrap();
-        let input = receipt.submit().unwrap();
-        let applied = self.native_report(input, inbox.commit(input));
-        let Some(AttemptEffect {
-            body: EffectBody::Port(port),
-            ..
-        }) = applied.abort_settlement
-        else {
-            panic!("actual Core unknown settlement");
-        };
-        assert!(matches!(port.body, AttemptToLogicalBody::AbortSettlement {
-            generation, operation_id, receipt_generation: None,
-            settlement: AbortIssueSettlement::TransportUnknown, ..
-        } if operation_id == key.operation && generation == key.generation.admission_effect()));
-        assert_eq!(self.finish_round().round_result, Some(Ok(())));
-        inbox
-            .runtime()
-            .retire_input(inbox.registration().actor(), input)
-            .unwrap();
-        work.body_exited().unwrap();
-        work.captures_exited().unwrap();
-        let std::task::Poll::Ready(Some(retained)) = receipt.retire_ready_after_exit().unwrap()
-        else {
-            panic!("the original Unknown reporter has retired");
-        };
-        assert_eq!(retained.original, original);
-        assert!(retained.unpublished.is_none());
-        payer.finish().unwrap();
-        port
-    }
-
-    pub(in crate::task_execution) fn expire_queued_abort(
-        &mut self,
-        key: SendKey,
-        action: AttemptActionId,
-    ) -> AttemptToLogical<AttemptFailure> {
-        assert!(self.queue.full);
-        self.now = self.now.saturating_add(self.queue_residence);
-        let expired = self.finish_round();
-        assert_eq!(expired.definitely_unsent_abort, Some(key.operation));
-        assert!(expired.notice_action.is_some());
-        assert!(expired.round_result.is_none());
-        let expected_grant = QueuedInputGrantRef::new(positive(71), key.generation, 1);
-        assert!(matches!(
-            expired.effect,
-            Some(AttemptEffect { body: EffectBody::ReleaseQueuedInput { grant }, .. })
-            if grant == expected_grant
-        ));
-        let Some(AttemptEffect {
-            body: EffectBody::Port(port),
-            ..
-        }) = expired.abort_settlement
-        else {
-            panic!("actual Core definitely-unsent settlement");
-        };
-        assert!(matches!(port.body, AttemptToLogicalBody::AbortSettlement {
-            abort_action, generation, operation_id, receipt_generation: None,
-            settlement: AbortIssueSettlement::DefinitelyUnsent, ..
-        } if abort_action == action && operation_id == key.operation
-            && generation == key.generation.admission_effect()));
-        assert_eq!(
-            self.finish_round().round_result,
-            Some(Err(AttemptFailure::TaskProtocol(Box::new(
-                novarocks_attempt_protocol::error::TaskExecutionError::QueueResidenceExpired {
-                    operation_id: key.operation,
-                    kind: OperationKind::AbortParticipation,
-                    waited: self.queue_residence,
-                },
-            ))))
-        );
-        port
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(in crate::task_execution) enum OriginalAbortRefusal {
-    WorkerOwnerFailed,
-    LocalDispatch,
-}
-
-pub(in crate::task_execution) async fn original_abort_refusal(
-    start: AttemptStart,
-    inbox: &crate::task_execution::host::custody::tests::WithdrawalInbox,
-    scope: &novarocks_control_runtime::transaction::ScopeHandle,
-    input: InputId,
-    original: novarocks_coordination_contract::LogicalToAttempt<AttemptFailure>,
-    refusal: OriginalAbortRefusal,
-) -> novarocks_coordination_contract::AttemptToLogical<AttemptFailure> {
-    use crate::{
-        native::apply_send_owner::canonical_dispatch_rejection_fixture,
-        task_execution::{
-            bridge::terminal::{TerminalOutbox, TerminalPublication},
-            error::TaskExecutionError as FrontendTaskError,
-            host::{publication::OriginalHostFailure, transport::NativeReceiptError},
-            intent::{AckPayload, attempt_receipt::failure_site},
-        },
-    };
-    use novarocks_attempt_protocol::{
-        error::TaskExecutionError,
-        failure::{AttemptFailure, HostFailureKind, HostFailureRef, HostProjectedFailure},
-    };
-    use novarocks_execution_contract::{OperationOutcome, TaskOperationId, status::SafeDetail};
-    use novarocks_query_application::api::NativeAttemptTerminal;
-    use novarocks_workload_control::WorkError;
-    use std::task::Poll;
-
-    let LogicalToAttemptBody::Abort { action, request } = &original.body else {
-        panic!("original QA Abort Control input");
-    };
-    let action = *action;
-    let exact = request.participation();
-    let activation = original.activation;
-    let mut core = OriginalAbortCore::new(start, inbox, activation);
-    let key = core.admit(input, original, 70, false);
-    let operation = key.operation;
-    let admission = key.generation.admission_effect();
-    let actor = inbox.registration().actor();
-    let runtime = inbox.runtime();
-    let control = runtime.input_custody(actor, input).unwrap().unwrap();
-    let (mut work, mut payer) = scope
-        .reserve_next(
-            Generation::new(1).unwrap(),
-            ReservationResources::work_only(),
-            WorkKind::Settlement,
-            WorkAdmission::External,
-        )
-        .unwrap()
-        .bind(WorkKind::Settlement)
-        .unwrap();
-    work.start().unwrap();
-    let mut receipt = inbox.reserve_native_receipt(&work, key, OperationKind::AbortParticipation);
-    let dispatch_cause = WorkError::Capacity("Native dispatch proof work");
-    let original_report = |operation, kind| match refusal {
-        OriginalAbortRefusal::WorkerOwnerFailed => OperationAcknowledgement::worker_receipt(
-            operation,
-            kind,
-            OperationOutcome::OwnerFailed,
-            AckPayload::None,
-        )
-        .with_detail(Some(SafeDetail::truncating(
-            "the original Abort owner failed",
-        ))),
-        OriginalAbortRefusal::LocalDispatch => {
-            canonical_dispatch_rejection_fixture(operation, kind, dispatch_cause.clone())
-        }
-    };
-    let local_refusal =
-        (refusal == OriginalAbortRefusal::LocalDispatch).then_some(HostFailureRef(positive(81)));
-    for refused in [
-        original_report(TaskOperationId::new_v7(), OperationKind::AbortParticipation),
-        original_report(operation, OperationKind::CancelTask),
-    ] {
-        let (reason, returned) = receipt
-            .record(key, refused.clone(), None, local_refusal)
-            .unwrap_err();
-        assert!(matches!(reason, NativeReceiptError::WrongSend));
-        assert_eq!(returned, refused);
-        if local_refusal.is_some() {
-            assert!(returned.shares_original_canonical_with(&refused));
-            assert_eq!(returned.governance_failure(), Some(&dispatch_cause));
-        }
-        assert!(matches!(
-            receipt.submit(),
-            Err(ActorTurnError::InputNotReserved)
-        ));
-        assert_eq!(runtime.input_custody(actor, input).unwrap(), Some(control));
-    }
-    let canonical = original_report(operation, OperationKind::AbortParticipation);
-    receipt
-        .record(key, canonical.clone(), None, local_refusal)
-        .unwrap();
-    let report_input = receipt.submit().unwrap();
-    let fact = inbox.commit(report_input);
-    let failed = core.native_report(report_input, fact);
-    assert!(failed.stop_producing);
-    let Some(AttemptEffect {
-        body: EffectBody::Port(port),
-        ..
-    }) = failed.abort_settlement
-    else {
-        panic!("the original refusal must fail the QA Abort issue closed");
-    };
-    assert_eq!(port.activation, activation);
-    assert!(matches!(port.body, AttemptToLogicalBody::AbortSettlement {
-        abort_action, generation: actual_generation, receipt_generation: None,
-        participation, operation_id, settlement: AbortIssueSettlement::FailedClosed,
-    } if abort_action == action && actual_generation == admission
-        && participation == exact && operation_id == operation));
-    let round = core.finish_round();
-    let original_failure = canonical
-        .governance_failure()
-        .cloned()
-        .map(FrontendTaskError::Workload);
-    let expected = if let Some(reference) = local_refusal {
-        let typed = original_failure.as_ref().unwrap().preparation_input();
-        TaskExecutionError::Workload(HostProjectedFailure {
-            original: reference,
-            kind: HostFailureKind::Workload,
-            class: typed.attempt_class(),
-            site: failure_site(typed.site()),
-        })
-    } else {
-        TaskExecutionError::OperationFailed {
-            task: None,
-            participation: exact,
-            operation_id: operation,
-            kind: OperationKind::AbortParticipation,
-            rejection: canonical.worker_header().unwrap(),
-        }
-    };
-    assert_eq!(
-        round.round_result,
-        Some(Err(AttemptFailure::TaskProtocol(Box::new(expected))))
-    );
-    if let Some((reference, original)) = local_refusal.zip(original_failure) {
-        assert_eq!(canonical.governance_failure(), Some(&dispatch_cause));
-        let expected = original.preparation_input();
-        let terminal = round.effect.or_else(|| core.timer().effect);
-        let Some(AttemptEffect {
-            body: EffectBody::Port(terminal),
-            ..
-        }) = terminal
-        else {
-            panic!("the Core must publish the original local dispatch failure");
-        };
-        let outbox = TerminalOutbox::new(activation);
-        let mut publication = TerminalPublication::new(terminal);
-        assert_eq!(publication.host_reference(), Some(reference));
-        publication.attach_host_failure(reference, OriginalHostFailure::Task(original));
-        assert!(outbox.publish(Box::new(publication)).is_ok());
-        let NativeAttemptTerminal::Failed(failure) = outbox.terminal().await.unwrap() else {
-            panic!("the local refusal cannot complete the attempt");
-        };
-        assert_eq!(failure.input(), &expected);
-    }
-    runtime.retire_input(actor, report_input).unwrap();
-    work.body_exited().unwrap();
-    work.captures_exited().unwrap();
-    let Poll::Ready(Some(retained)) = receipt.retire_ready_after_exit().unwrap() else {
-        panic!("the original Native report and producer have exited");
-    };
-    assert_eq!(retained.original, canonical);
-    if local_refusal.is_some() {
-        assert!(retained.original.shares_original_canonical_with(&canonical));
-        assert_eq!(
-            retained.original.governance_failure(),
-            Some(&dispatch_cause)
-        );
-    }
-    assert!(retained.unpublished.is_none());
-    payer.finish().unwrap();
-    port
-}
-
 #[test]
 fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     let runtime = ActorRuntime::<FrontendActor>::new();
@@ -685,7 +189,38 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     let (mut failure_work, mut failure_capacity) = reserve(WorkKind::Cleanup);
     let (mut original_work, mut original_capacity) = reserve(WorkKind::Settlement);
     original_work.start().unwrap();
-    let start = start();
+    let control_scope = ledger.open_scope_next(None, generation).unwrap();
+    let logical_actor = ActorId::new(31).unwrap();
+    struct OriginalLogicalOwner;
+    impl crate::control_runtime::actor::TestActor for OriginalLogicalOwner {
+        fn handle(
+            &mut self,
+            _: Tick,
+            _: novarocks_control_runtime_core::mailbox::InputEnvelope,
+            _: FrontendInput,
+            _: &mut novarocks_control_runtime::actor::ActorStep<'_, FrontendEffect>,
+        ) {
+            panic!("this exact passive LP registration receives no fixture business input");
+        }
+    }
+    let logical = runtime
+        .register_bound(
+            logical_actor,
+            control_scope.clone(),
+            FrontendActor::Test(Box::new(OriginalLogicalOwner)),
+            ActorConfig {
+                mailbox: [8; 4],
+                max_batches: 1,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 8,
+                max_step_work: 1,
+            },
+        )
+        .unwrap_or_else(|_| panic!("original distinct LP registration"));
+    let mut start = start();
+    start.sources.owner = AttemptSourceId(NonZeroU64::new(logical_actor.get()).unwrap());
+    start.sources.qa = start.sources.owner;
     let members: Arc<[FrozenMember]> = start
         .plan
         .establish_material
@@ -804,7 +339,6 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     let clock = Arc::new(ManualClock::default());
     let inventory = || runtime.standing_input_inventory(actor, None, 16).unwrap();
     let before = inventory();
-    let control_scope = ledger.open_scope_next(None, generation).unwrap();
     let (mut root_control_work, mut root_control_capacity) = control_scope
         .reserve_next(
             generation,
@@ -868,24 +402,49 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     }
 
     let before_owner_controls = inventory();
+    assert!(
+        registered
+            .prepare_port_controls(&runtime, &registration, &original_work)
+            .is_err(),
+        "the AP itself cannot substitute the frozen distinct logical owner"
+    );
+    assert_eq!(inventory(), before_owner_controls);
     let mut owner_controls = registered
-        .prepare_owner_controls(&runtime, &original_work)
+        .prepare_port_controls(&runtime, &logical, &original_work)
         .unwrap();
     let owner_controls_inventory: Vec<_> = inventory()
         .into_iter()
         .filter(|row| !before_owner_controls.contains(row))
         .collect();
-    assert_eq!(owner_controls_inventory.len(), 2);
+    assert_eq!(owner_controls_inventory.len(), 3);
     assert!(
         owner_controls_inventory
             .iter()
-            .all(|row| { row.source == actor && row.class == InputClass::Control })
+            .all(|row| row.source == logical.actor())
+    );
+    assert_eq!(
+        owner_controls_inventory
+            .iter()
+            .filter(|row| row.class == InputClass::Control)
+            .count(),
+        2
+    );
+    assert_eq!(
+        owner_controls_inventory
+            .iter()
+            .filter(|row| row.class == InputClass::Ordinary)
+            .count(),
+        1
+    );
+    assert!(
+        registered
+            .prepare_port_controls(&runtime, &logical, &original_work)
+            .is_err()
     );
 
     let before_abort_route = inventory();
-    let abort_router = crate::query_execution::native_execution_adapter::LogicalAbortRouter::new();
-    let (abort_route, abort_ingress, abort_settlement) = abort_router
-        .prepare_registered_attempt(&mut registered, &runtime, &original_work)
+    let abort_ingress = registered
+        .prepare_port_abort(&runtime, &logical, &original_work)
         .unwrap();
     let abort_positions: Vec<_> = inventory()
         .into_iter()
@@ -895,11 +454,11 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     assert!(
         abort_positions
             .iter()
-            .all(|row| row.source == actor && row.class == InputClass::Control)
+            .all(|row| row.source == logical.actor() && row.class == InputClass::Control)
     );
     assert!(
-        abort_router
-            .prepare_registered_attempt(&mut registered, &runtime, &original_work)
+        registered
+            .prepare_port_abort(&runtime, &logical, &original_work)
             .is_err()
     );
 
@@ -1036,7 +595,10 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     assert!(capacity_source.input.in_flight().unwrap().is_none());
 
     let wrong = runtime
-        .reserve_admitted_input(actor, actor, InputClass::Control, &original_work)
+        // A first StartProtocol from AP.actor is now the legitimate Run.
+        // This exact registered LP source is wrong for StartProtocol and
+        // therefore still exercises actual isolated Core failure.
+        .reserve_admitted_input(actor, logical.actor(), InputClass::Control, &original_work)
         .unwrap()
         .fill(post(AttemptInput::StartProtocol))
         .unwrap();
@@ -1116,12 +678,38 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
         if matches!(&*input, AttemptInput::Executor(ExecutorFact::Operation(observation))
             if observation.generation == key.generation))
     );
-    assert!(abort_ingress.close_after_exit().unwrap());
-    drop(abort_route);
-    drop(abort_settlement);
+    use crate::task_execution::host::port::abort::AbortIngressRetirementProgress;
+    let mut abort_retirement = abort_ingress.retirement();
+    for _ in &*members {
+        assert_eq!(
+            abort_retirement.progress().unwrap(),
+            AbortIngressRetirementProgress::Advanced
+        );
+    }
+    assert_eq!(
+        abort_retirement.progress().unwrap(),
+        AbortIngressRetirementProgress::Complete
+    );
+    assert_eq!(
+        abort_retirement.progress().unwrap(),
+        AbortIngressRetirementProgress::Complete
+    );
+    drop(abort_retirement);
+    drop(abort_ingress);
     startup.close_after_exit().unwrap();
-    owner_controls.close_after_exit().unwrap();
-    owner_controls.close_after_exit().unwrap();
+    owner_controls.stop.close_after_exit().unwrap();
+    owner_controls.convergence.close_after_exit().unwrap();
+    owner_controls.changed.close_after_exit().unwrap();
+    let after_control_exit = inventory();
+    assert!(
+        owner_controls_inventory
+            .iter()
+            .chain(abort_positions.iter())
+            .all(|closed| !after_control_exit
+                .iter()
+                .any(|live| live.standing_input_id == closed.standing_input_id)),
+        "the exact original paid positions actually closed; no route facade supplies an exit"
+    );
     membership.close_after_exit().unwrap();
     observation_work.body_exited().unwrap();
     observation_work.captures_exited().unwrap();
@@ -1131,6 +719,7 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     root_control_capacity.finish().unwrap();
     control_scope.close_external().unwrap();
     control_scope.reap_ready(8).unwrap();
+    runtime.remove_actor(logical.actor()).unwrap();
     ledger.remove_scope(control_scope.id()).unwrap();
     pool.retire_positions();
     capacity_source.close_after_exit().unwrap();
@@ -1210,10 +799,7 @@ fn bound_observation_backing_waits_for_actual_strong_weak_and_progress_aliases()
     )
     .unwrap();
     let actor = attempt.original.actor();
-    let requests = RootControlRequests::new(
-        attempt.root_control_binding().clone(),
-        attempt.failure_publications().clone(),
-    );
+    let requests = RootControlRequests::new(attempt.root_control_binding().clone());
     let resources = AttemptActorRegistration::observation_resources(participants.len()).unwrap();
     let bytes = resources.quota.get(OBSERVATION_BACKING_BYTES);
     let (mut work, mut positions) = reserve(&scope, resources, WorkKind::Settlement);

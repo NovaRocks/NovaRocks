@@ -18,9 +18,11 @@
 //! Real logical Core, original Source, paid roles, HostRegistry and Tokio Join.
 //! Fake application facts do not prove Native/Worker or P11 failure projection.
 
+mod fact_credit;
 pub(super) mod fixture;
 use super::*;
 use fixture::*;
+use novarocks_control_runtime::actor_turn::Clock;
 use novarocks_control_runtime::actor_turn::{FailureSourceState, InputPhase};
 use novarocks_coordination_contract::{
     QueryExecutionErrorKind,
@@ -378,6 +380,90 @@ async fn real_native_result_position_is_committed_before_source_supplies_separat
 }
 
 #[tokio::test]
+async fn original_source_freezes_host_cut_before_delayed_cleanup_job_and_never_renews_it() {
+    let mut f = Fixture::new(false);
+    f.until(|f| {
+        f.has(|e| {
+            matches!(
+                e,
+                LogicalEffectBody::Native(NativeEffect::RunAttempt { .. })
+            )
+        })
+    })
+    .await;
+    f.failure.inject_core_turn_panic();
+    f.actors_only();
+    assert!(f.runtime.snapshot(f.registration.actor()).unwrap().failed);
+    assert_eq!(
+        f.failure.cuts_for_fixture(),
+        (None, None),
+        "the Core fence does not author the host cleanup clock"
+    );
+
+    // Delay the original Host after the Core fence, then run it without
+    // yielding this current-thread Tokio runtime to the queued cleanup job.
+    f.clock.advance_to(Tick(50_000_000));
+    for _ in 0..64 {
+        let Some(turn) = f.runtime.claim_host_actor() else {
+            break;
+        };
+        f.host.drive(f.clock.now(), turn);
+    }
+    let (observed, started) = f.failure.cuts_for_fixture();
+    let original = observed.expect("the same original Source entered failure cleanup");
+    assert_eq!(
+        started, None,
+        "the queued failure future has not been polled"
+    );
+    assert_eq!(
+        original.cut.since_origin(),
+        std::time::Duration::from_millis(50)
+    );
+    assert_eq!(
+        original.remote_deadline.since_origin(),
+        std::time::Duration::from_millis(150)
+    );
+
+    // Starting that future later must use its retained cut, not 120ms + 100ms.
+    f.clock.advance_to(Tick(120_000_000));
+    f.until(|f| f.failure.cuts_for_fixture().1.is_some()).await;
+    assert_eq!(
+        f.failure.cuts_for_fixture(),
+        (Some(original), Some(original))
+    );
+    f.clock.advance_to(Tick(240_000_000));
+    for _ in 0..4 {
+        f.round().await;
+    }
+    assert_eq!(
+        f.failure.cuts_for_fixture(),
+        (Some(original), Some(original))
+    );
+    assert!(matches!(
+        f.state.poll_exit(&mut Context::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+    assert_eq!(
+        f.executor_drops.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an expired observation budget does not dispose the still-running original"
+    );
+
+    f.close_ap();
+    f.run.open();
+    f.until(|f| f.runtime.is_empty() && f.host.is_empty() && f.ledger.is_empty())
+        .await;
+    assert!(matches!(
+        f.state.poll_exit(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(LogicalExit::OwnerFailed(_))
+    ));
+    assert_eq!(
+        f.executor_drops.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
 async fn original_executor_panic_keeps_failure_cause_and_retires_only_after_actual_source_custody()
 {
     let mut f = Fixture::new(true);
@@ -388,12 +474,12 @@ async fn original_executor_panic_keeps_failure_cause_and_retires_only_after_actu
             .is_ok_and(|s| s.failed)
     })
     .await;
-    let original_failure = f.runtime.failure_proof_for(&f.registration).unwrap();
+    f.until(|f| f.failure.cuts_for_fixture().0.is_some()).await;
     let budget = start().budgets.remote_cleanup_timeout;
-    let original_cut = LogicalFailureCut::from_original(&original_failure, budget);
+    let original_cut = f.failure.cuts_for_fixture().0.unwrap();
     assert_eq!(
         original_cut.cut.since_origin(),
-        std::time::Duration::from_nanos(original_failure.failed_at().0)
+        std::time::Duration::from_nanos(f.clock.now().0)
     );
     assert_eq!(
         original_cut
@@ -404,8 +490,7 @@ async fn original_executor_panic_keeps_failure_cause_and_retires_only_after_actu
     for _ in 0..4 {
         f.round().await;
     }
-    let later_failure = f.runtime.failure_proof_for(&f.registration).unwrap();
-    let later_cut = LogicalFailureCut::from_original(&later_failure, budget);
+    let later_cut = f.failure.cuts_for_fixture().0.unwrap();
     assert_eq!(later_cut.cut, original_cut.cut);
     assert_eq!(later_cut.remote_deadline, original_cut.remote_deadline);
     assert!(
@@ -545,5 +630,60 @@ async fn executor_exit_without_required_result_marks_invariant_failure_and_drain
     assert_eq!(
         f.executor_drops.load(std::sync::atomic::Ordering::SeqCst),
         1
+    );
+}
+
+#[tokio::test]
+async fn startup_gate_ignores_original_host_wakes_before_registry_commit() {
+    let mut f = Fixture::new_with_start(false, false);
+    for _ in 0..32 {
+        f.runtime.notify_host_actor(&f.registration).unwrap();
+        f.round().await;
+    }
+    assert_eq!(
+        f.count(|_| true),
+        0,
+        "uncommitted host has issued no Core action"
+    );
+    assert_eq!(
+        f.runtime.snapshot(f.registration.actor()).unwrap().inputs,
+        0
+    );
+    assert!(f.runtime.next_deadline().is_none());
+    assert!(
+        f.runtime.claim_host_actor().is_none(),
+        "uncommitted Source must not self-wake at idle"
+    );
+    f.state.start_direct_source_fixture();
+    f.runtime.notify_host_actor(&f.registration).unwrap();
+    f.run.open();
+    f.until(|f| {
+        f.has(|effect| {
+            matches!(
+                effect,
+                LogicalEffectBody::Native(NativeEffect::RunAttempt { .. })
+            )
+        })
+    })
+    .await;
+    f.port(AttemptToLogicalBody::AttemptTerminal(
+        AttemptTerminal::Completed,
+    ))
+    .await;
+    f.local_converged().await;
+    f.close_ap();
+    f.until(|f| f.join_ready.load(std::sync::atomic::Ordering::Acquire))
+        .await;
+    let installed = f.state.clone();
+    installed.request_close(RegistryClose::Retire);
+    assert_eq!(
+        f.wait(installed.join_readiness(true)).await.unwrap(),
+        LogicalJoinReadiness::Ready
+    );
+    f.until(|f| f.runtime.is_empty() && f.host.is_empty() && f.ledger.is_empty())
+        .await;
+    assert_eq!(
+        installed.poll_exit(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(LogicalExit::Completed)
     );
 }

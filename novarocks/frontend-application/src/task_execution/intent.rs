@@ -30,8 +30,6 @@ use std::sync::Arc;
 use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};
 use novarocks_attempt_protocol::config::{DispatchBudget, DispatchLane};
 #[cfg(test)]
-use novarocks_coordination_contract::MonotonicInstant;
-#[cfg(test)]
 use novarocks_execution::task_execution::FetchTaskDynamicFilters;
 use novarocks_execution::task_execution::{
     AbortParticipation, AcquireParticipationAdmissionTicket, CancelTask, CreateTaskReceipt,
@@ -425,25 +423,6 @@ impl TaskOperationQueueRequest {
             queued_bytes,
             encoded_bytes,
             native_input: None,
-        }
-    }
-
-    #[cfg(test)]
-    /// The reservation for one task-domain update before it enters a
-    /// `RemoteTask`'s pending queue.
-    pub(crate) fn task_update(
-        identity: novarocks_execution::task_execution::TaskIdentity,
-        update: &TaskDomainUpdate,
-    ) -> Self {
-        Self {
-            backend: identity.backend_process_id(),
-            lane: DispatchLane::Update,
-            control_progress: task_domain_requires_control(update),
-            queued_bytes: task_domain_bytes(update).saturating_add(OPERATION_FIXED_BYTES),
-            encoded_bytes: novarocks_task_codec::operation::wire_size::pending_update(
-                identity, update,
-            ),
-            native_input: crate::native::task_transport::queued_update_quote(update).ok(),
         }
     }
 
@@ -918,18 +897,35 @@ pub struct DispatchBatch {
     operations: Vec<OperationIntent>,
     queue_permits: Vec<Box<dyn TaskOperationQueuePermit>>,
     queued_bytes: usize,
-    /// The oldest residence timestamp of any operation in this batch.
-    ///
-    /// A transport refusal restores every operation with this timestamp. That
-    /// is deliberately conservative: backpressure must not reset queue age
-    /// and let an operation evade the residence deadline indefinitely.
-    queued_at: MonotonicInstant,
 }
 
 #[cfg(test)]
 impl DispatchBatch {
+    /// Actual resident element backing for the two fixture batch vectors.
+    /// Their Vec headers and scalar batch fields stay in the enclosing value;
+    /// there is no per-operation dispatcher node in this final carrier.
+    pub(crate) fn queued_entry_layouts() -> [std::alloc::Layout; 2] {
+        [
+            std::alloc::Layout::new::<OperationIntent>(),
+            std::alloc::Layout::new::<Box<dyn TaskOperationQueuePermit>>(),
+        ]
+    }
+
+    fn assert_exact_queued_capacity(&self) {
+        assert_eq!(
+            self.operations.len(),
+            self.operations.capacity(),
+            "the actual queued operation array must match its per-entry invoice"
+        );
+        assert_eq!(
+            self.queue_permits.len(),
+            self.queue_permits.capacity(),
+            "the actual original permit array must match its per-entry invoice"
+        );
+    }
+
     #[cfg(test)]
-    pub(super) fn test_fixture(
+    pub(crate) fn test_fixture(
         backend: BackendProcessId,
         lane: DispatchLane,
         operations: Vec<OperationIntent>,
@@ -939,38 +935,36 @@ impl DispatchBatch {
             .iter()
             .map(|_| Box::new(TestQueuePermit) as Box<dyn TaskOperationQueuePermit>)
             .collect();
-        Self::with_queued_at(
-            backend,
-            lane,
-            operations,
-            queue_permits,
-            queued_bytes,
-            MonotonicInstant::ORIGIN,
-        )
+        Self::with_queue_permits(backend, lane, operations, queue_permits, queued_bytes)
     }
 
-    pub(crate) fn with_queued_at(
+    pub(crate) fn with_queue_permits(
         backend: BackendProcessId,
         lane: DispatchLane,
         operations: Vec<OperationIntent>,
         queue_permits: Vec<Box<dyn TaskOperationQueuePermit>>,
         queued_bytes: usize,
-        queued_at: MonotonicInstant,
     ) -> Self {
         assert_eq!(
             operations.len(),
             queue_permits.len(),
             "every queued operation must retain one process reservation"
         );
-        Self {
+        // Strip spare capacity before these exact entries become the queued
+        // carrier. Box<[T]> -> Vec<T> retains the same elements with cap=len;
+        // no intent, permit or original payload is cloned or replaced.
+        let operations = operations.into_boxed_slice().into_vec();
+        let queue_permits = queue_permits.into_boxed_slice().into_vec();
+        let batch = Self {
             backend,
             lane,
             native_pending: None,
             operations,
             queue_permits,
             queued_bytes,
-            queued_at,
-        }
+        };
+        batch.assert_exact_queued_capacity();
+        batch
     }
 
     #[cfg(test)]
@@ -979,7 +973,10 @@ impl DispatchBatch {
         permits: Vec<Box<dyn TaskOperationQueuePermit>>,
     ) {
         assert_eq!(self.operations.len(), permits.len());
-        self.queue_permits = permits;
+        // Preserve the SAME actual governed permit objects while removing
+        // spare pointer slots which have no corresponding per-entry grant.
+        self.queue_permits = permits.into_boxed_slice().into_vec();
+        self.assert_exact_queued_capacity();
     }
 
     pub const fn backend(&self) -> BackendProcessId {
@@ -998,56 +995,14 @@ impl DispatchBatch {
         self.queued_bytes
     }
 
-    pub(super) const fn queued_at(&self) -> MonotonicInstant {
-        self.queued_at
-    }
-
-    #[cfg(test)]
-    pub fn into_operations(self) -> Vec<OperationIntent> {
-        self.operations
-    }
-
-    pub(super) fn into_queue_parts(
-        self,
-    ) -> (Vec<OperationIntent>, Vec<Box<dyn TaskOperationQueuePermit>>) {
-        (self.operations, self.queue_permits)
-    }
-
     /// Transfers every queue reservation into accepted Native I/O ownership.
     pub(crate) fn commit_queue_permits(mut self) -> Vec<Box<dyn TaskOperationQueuePermit>> {
+        self.assert_exact_queued_capacity();
         for permit in &mut self.queue_permits {
             permit.mark_in_flight();
         }
         std::mem::take(&mut self.queue_permits)
     }
-
-    pub(crate) fn acceptance(&self) -> DispatchAcceptance {
-        // This allocation is bounded by `TransportBudget::max_batch_items`.
-        // Every element already owns a process queue permit; the later
-        // encoding permit covers the potentially large protobuf request.
-        DispatchAcceptance {
-            backend: self.backend,
-            lane: self.lane,
-            operation_ids: self
-                .operations
-                .iter()
-                .map(OperationIntent::operation_id)
-                .collect(),
-        }
-    }
-}
-
-#[cfg(test)]
-/// The immutable identity of a batch the transport accepted.
-///
-/// Payload ownership remains with the transport. The dispatcher needs only
-/// these ids to move its local permits from queued to in-flight after, and
-/// only after, acceptance.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DispatchAcceptance {
-    pub(super) backend: BackendProcessId,
-    pub(super) lane: DispatchLane,
-    pub(super) operation_ids: Vec<TaskOperationId>,
 }
 
 #[cfg(test)]
@@ -1088,14 +1043,6 @@ pub trait TaskOperationQueuePermit: std::fmt::Debug + Send {
     ) -> Option<&novarocks_workload_control::joint_admission::NativeQueuedInputGrant> {
         None
     }
-    fn native_input_retention(
-        &self,
-    ) -> Result<
-        Option<novarocks_resource_contract::ExistingOwnerRetentionPin>,
-        novarocks_workload_control::WorkError,
-    > {
-        Ok(None)
-    }
 }
 
 #[cfg(test)]
@@ -1125,11 +1072,6 @@ struct TestQueuePermit;
 #[cfg(test)]
 impl TaskOperationQueuePermit for TestQueuePermit {
     fn mark_in_flight(&mut self) {}
-}
-
-#[cfg(test)]
-pub(super) fn test_queue_permit() -> Box<dyn TaskOperationQueuePermit> {
-    Box::new(TestQueuePermit)
 }
 
 #[cfg(test)]

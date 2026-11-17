@@ -180,20 +180,38 @@ async fn source_scope_fence_refuses_reply_and_keeps_the_same_unfilled_original_j
 #[tokio::test]
 async fn full_or_closed_request_table_returns_original_jobs_without_disposing_captures() {
     let f = Fixture::new();
-    let requests = table(&f);
+    let wake = Arc::new(Probe::default());
+    let requests = AttemptRequests::new(
+        activation(),
+        f.attempt.registration.clone(),
+        f.logical.registration.clone(),
+        NonZeroUsize::MIN,
+        Waker::from(wake.clone()),
+    );
     let drops = Arc::new(AtomicUsize::new(0));
     let (job, a, ar, ah) = f.job(17, Box::new(Capture(Arc::clone(&drops))));
     requests.insert(&request(17), job).unwrap();
     let (job, b, br, bh) = f.job(18, Box::new(Capture(Arc::clone(&drops))));
     let refused = requests.insert(&request(18), job).unwrap_err();
     assert_eq!(refused.error, RequestError::Full);
-    assert!(b.owns_exit(&refused.job.exit));
+    assert!(b.owns_exit(&refused._job.exit));
+    assert!(!requests.has_capacity());
+    let before = wake.0.load(Ordering::SeqCst);
+    let original = requests.take_unpublished(token(17)).unwrap();
+    assert_eq!(
+        wake.0.load(Ordering::SeqCst),
+        before + 1,
+        "actual capacity return wakes the original Full producer"
+    );
+    assert!(requests.has_capacity());
     requests.close_admission();
     assert!(!requests.has_capacity());
+    let refused = requests.insert(&request(18), refused._job).unwrap_err();
+    assert_eq!(refused.error, RequestError::Closed);
+    assert!(b.owns_exit(&refused._job.exit));
     assert_eq!(drops.load(Ordering::SeqCst), 0);
-    let original = requests.take_unpublished(token(17)).unwrap();
     retire_job(&f, original, a, ar, ah).await;
-    retire_job(&f, refused.job, b, br, bh).await;
+    retire_job(&f, refused._job, b, br, bh).await;
     assert_eq!(drops.load(Ordering::SeqCst), 2);
     f.finish();
 }
@@ -298,7 +316,7 @@ async fn failed_original_owner_replies_to_same_job_without_ordinary_source_ticke
         matches!(seen.as_slice(), [FrontendInput::Attempt(message)] if matches!(message.as_ref(),
         novarocks_attempt_protocol::input::AttemptInput::Port(message)
         if matches!(&message.body, novarocks_coordination_contract::LogicalToAttemptBody::PreReadyReplacementOwnerFailed {
-            token: actual, failure: novarocks_attempt_protocol::failure::AttemptFailure::Logical(actual_failure)
+            token: actual, failure: actual_failure
         } if *actual == token(17) && actual_failure == &cause)))
     );
     drop(seen);

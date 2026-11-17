@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex, Weak};
 use novarocks_coordination_contract::AttemptActivationIdentity;
 use novarocks_execution_contract::{SafeDetail, TaskIdentity, failure::FailureProjection};
 use novarocks_query_application::api::{ComputationReadySource, PlanSeal, QueryExecutionError};
-use novarocks_query_application::coordination::NativeAttemptDrive;
 use novarocks_query_application::execution_error::{
     ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
 };
@@ -206,6 +205,10 @@ pub(crate) fn attempt_handoff_mailbox() -> (AttemptHandoffOfferPort, AttemptHand
 }
 
 impl AttemptHandoffOfferPort {
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) fn shares_directory_for_fixture(&self, claims: &AttemptHandoffClaimPort) -> bool {
+        Arc::ptr_eq(&self.mailbox, &claims.mailbox)
+    }
     /// A replayable factory can reserve through the original directory without
     /// becoming an owner of its staged attempt resources.
     pub(crate) fn reserve_view(&self) -> AttemptHandoffReserveView {
@@ -291,8 +294,8 @@ impl Mailbox {
     }
 }
 
-/// Move-only and private to the original dormant/active Native behavior. The
-/// actual Drive is the only production API that can bind its activation.
+/// Move-only and private to the original Native behavior. Binding records the
+/// exact activation already issued to that original factory; it grants no work.
 pub(crate) struct AttemptHandoffProducer {
     cell: Arc<Cell>,
 }
@@ -331,17 +334,13 @@ impl AttemptHandoffProducer {
         Ok(())
     }
 
-    pub(crate) fn bind(&mut self, drive: &NativeAttemptDrive) -> Result<(), QueryExecutionError> {
-        self.bind_identity(drive.identity())
-    }
-
-    fn bind_identity(
+    pub(crate) fn bind(
         &mut self,
         activation: AttemptActivationIdentity,
     ) -> Result<(), QueryExecutionError> {
         if activation.execution() != self.cell.execution {
             return Err(handoff_error(
-                "internal handoff Drive belongs to another execution",
+                "internal handoff activation belongs to another execution",
             ));
         }
         {
@@ -360,7 +359,7 @@ impl AttemptHandoffProducer {
                 State::Closed(reason) => return Err(reason.error()),
                 _ => {
                     return Err(handoff_error(
-                        "internal handoff Drive cannot replace its original binding",
+                        "internal handoff activation cannot replace its original binding",
                     ));
                 }
             }

@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::port_output::{AbortIssueSettlement, AttemptTerminal, AttemptToLogicalBody};
 use crate::{
     AttemptCore,
     capacity::ReservationToken,
@@ -30,8 +31,7 @@ use crate::{
     },
 };
 use novarocks_coordination_contract::{
-    AbortIssueSettlement, AttemptAuthorizationDecision, AttemptAuthorizationRef, AttemptStopReason,
-    AttemptTerminal, AttemptToLogicalBody,
+    AttemptAuthorizationDecision, AttemptAuthorizationRef, AttemptStopReason,
 };
 use novarocks_execution_contract::{
     AbortParticipation, AcquireParticipationAdmissionTicket, LeaseReceipt, OperationOutcome,
@@ -42,9 +42,8 @@ use std::sync::Arc;
 
 #[test]
 fn next_qa_settlement_is_authored_by_a_separate_timer_input() {
-    use novarocks_coordination_contract::{
-        AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationRef,
-    };
+    use crate::port_output::AttemptAuthorization;
+    use novarocks_coordination_contract::{AttemptAuthorizationDecision, AttemptAuthorizationRef};
 
     let frozen = start();
     let sources = frozen.sources;
@@ -455,7 +454,7 @@ impl Fixture {
                 activation: self.activation,
                 body: LogicalToAttemptBody::Stop {
                     reason,
-                    failure: AttemptFailure::TaskProtocol(Box::new(schedule("original stop"))),
+                    failure: crate::test_support::logical_failure("original stop"),
                 },
             }),
         );
@@ -578,8 +577,8 @@ fn logical_failure_stands_down_every_potential_participation_without_claiming_ex
                         assert!(matches!(
                             port.body,
                             AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
-                                AttemptFailure::TaskProtocol(ref error)
-                            )) if **error == schedule("original stop")
+                                AttemptFailure::Logical(ref error)
+                            )) if *error == crate::test_support::logical_failure("original stop")
                         ));
                         assert!(!std::mem::replace(&mut terminal, true));
                     }
@@ -615,6 +614,84 @@ fn logical_failure_stands_down_every_potential_participation_without_claiming_ex
             }
         }
     }
+}
+
+#[test]
+fn delayed_original_start_after_stop_never_reopens_business_or_replaces_its_failure() {
+    for reason in [
+        AttemptStopReason::Client,
+        AttemptStopReason::LogicalExecutionFailed,
+    ] {
+        for units in [4, 128] {
+            let mut fixture = Fixture::new(BeforeStop::Pristine, units);
+            fixture.stop(reason);
+            let late = fixture.step(fixture.sources.actor, AttemptInput::StartProtocol);
+            assert!(late.effect.is_none());
+            assert!(late.abort_settlement.is_none());
+            assert!(!late.stop_producing);
+            assert!(late.round_result.is_none());
+            assert!(!fixture.core.candidates.enabled);
+            assert!(!fixture.core.candidates.wake);
+            let mut terminal = false;
+            fixture.drain(|effect| match effect.body {
+                EffectBody::ReleaseCreationPayload { .. } => {}
+                EffectBody::Port(port) => {
+                    assert!(matches!(port.body,
+                        AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
+                            AttemptFailure::Logical(ref error)
+                        )) if *error == crate::test_support::logical_failure("original stop")
+                    ));
+                    assert!(!std::mem::replace(&mut terminal, true));
+                }
+                other => panic!("stopped original startup produced business: {other:?}"),
+            });
+            assert!(terminal);
+            assert!(
+                fixture
+                    .core
+                    .execution
+                    .participation_convergence_receipt(fixture.participation)
+                    .is_none()
+            );
+            assert_eq!(
+                fixture.core.execution.dispatcher().in_flight_operations(),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn delayed_start_keeps_original_source_bootstrap_and_duplicate_checks() {
+    let mut fixture = Fixture::new(BeforeStop::Pristine, 128);
+    let reject = |core: &mut Core, source, now| {
+        assert!(
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input: AttemptInputId(id(880)),
+                    native_cut: None,
+                    selected_cut: None,
+                },
+                AttemptInput::StartProtocol,
+                &mut Units(128)
+            )
+            .is_err()
+        );
+    };
+    fixture.stop(AttemptStopReason::Client);
+    reject(&mut fixture.core, fixture.sources.qa, fixture.now);
+
+    let mut duplicate = Fixture::new(BeforeStop::Pristine, 128);
+    duplicate.step(duplicate.sources.actor, AttemptInput::StartProtocol);
+    reject(&mut duplicate.core, duplicate.sources.actor, duplicate.now);
+
+    let frozen = start();
+    let source = frozen.sources.actor;
+    let now = frozen.initial_now;
+    let mut uninitialized = Core::new(frozen).unwrap();
+    reject(&mut uninitialized, source, now);
 }
 
 #[test]
@@ -768,7 +845,7 @@ fn reply_fixture_authorization(
 }
 
 fn emit_fixture_admission(fixture: &mut Fixture) -> SentAdmission {
-    use novarocks_coordination_contract::AttemptAuthorization;
+    use crate::port_output::AttemptAuthorization;
 
     fixture.queue_control = false;
     let sources = fixture.sources;
@@ -871,7 +948,7 @@ fn send_fixture_admission(fixture: &mut Fixture) -> SentAdmission {
 
 #[test]
 fn ticket_after_logical_failure_stand_down_scan_settles_without_reissuing_abort() {
-    use novarocks_coordination_contract::AttemptAuthorization;
+    use crate::port_output::AttemptAuthorization;
     use novarocks_execution_contract::{AdmissionTicketId, ParticipationAdmissionTicketReceipt};
 
     for units in [4, 128] {
@@ -971,8 +1048,8 @@ fn ticket_after_logical_failure_stand_down_scan_settles_without_reissuing_abort(
                 EffectBody::Port(port) if matches!(
                     port.body,
                     AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
-                        AttemptFailure::TaskProtocol(ref error)
-                    )) if **error == schedule("original stop")
+                        AttemptFailure::Logical(ref error)
+                    )) if *error == crate::test_support::logical_failure("original stop")
                 )
             ));
             assert!(!std::mem::replace(&mut terminal, true));
@@ -1085,7 +1162,7 @@ fn ticket_after_logical_failure_stand_down_scan_settles_without_reissuing_abort(
 }
 
 fn admission_ticket_waits_for_worker_expiry(receipt_delay: Duration, settlement_delay: Duration) {
-    use novarocks_coordination_contract::AttemptAuthorization;
+    use crate::port_output::AttemptAuthorization;
     use novarocks_execution_contract::{AdmissionTicketId, ParticipationAdmissionTicketReceipt};
 
     let mut fixture = Fixture::new(BeforeStop::Pristine, 128);
@@ -1334,8 +1411,8 @@ fn remote_convergence_distinguishes_unused_admission_from_uncertain_or_held_part
                     lifecycle_runtime_filters: None,
                 } => assert!(closure.replace(original).is_none()),
                 AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
-                    AttemptFailure::TaskProtocol(ref error),
-                )) if **error == schedule("original stop") => {}
+                    AttemptFailure::Logical(ref error),
+                )) if *error == crate::test_support::logical_failure("original stop") => {}
                 other => panic!("expected remote-only convergence, got {other:?}"),
             },
             EffectBody::PrepareLocalConvergence | EffectBody::ReleaseCreationPayload { .. } => {}
@@ -1387,8 +1464,8 @@ fn remote_convergence_distinguishes_unused_admission_from_uncertain_or_held_part
             EffectBody::Port(port) => assert!(matches!(
                 port.body,
                 AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
-                    AttemptFailure::TaskProtocol(ref error)
-                )) if **error == schedule("original stop")
+                    AttemptFailure::Logical(ref error)
+                )) if *error == crate::test_support::logical_failure("original stop")
             )),
             _ => panic!("unexpected stop effect: {effect:?}"),
         };

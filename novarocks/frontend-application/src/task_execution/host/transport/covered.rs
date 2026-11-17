@@ -38,7 +38,6 @@ use crate::{
         RetirementScan,
         custody::ReturnedActorTransportResult,
         observations::{ObservationError, OrderedObservationInput, RootControlBinding, StreamKey},
-        publication::OriginalHostFailure,
         subscriptions::{
             SubscriptionFailureRecord, SubscriptionGeneration, SubscriptionPhasePublisher,
             SubscriptionRunError, SubscriptionSource, SubscriptionSourceError,
@@ -776,12 +775,6 @@ impl AttemptSubscriptions {
         reference: HostFailureRef,
     ) -> Option<ExecutionFailureInput> {
         self.failure(reference)?.project(reference)
-    }
-
-    pub(super) fn take_failure(&self, reference: HostFailureRef) -> Option<OriginalHostFailure> {
-        self.failure(reference)?
-            .take(reference)
-            .map(OriginalHostFailure::Subscription)
     }
 
     pub(super) fn request_retirement_scan(&mut self) {

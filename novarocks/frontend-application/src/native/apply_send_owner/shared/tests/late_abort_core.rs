@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::task_execution::intent::{AckPayload, OperationAcknowledgement};
+use novarocks_attempt_protocol::port_output::{AbortIssueSettlement, AttemptToLogicalBody};
 use novarocks_attempt_protocol::{
     AttemptCore, AttemptStep, Core, InputSelection,
     capacity::{QueueStage, ReservationToken, StepContext},
@@ -31,8 +32,8 @@ use novarocks_attempt_protocol::{
 };
 use novarocks_control_runtime::obligation::StepRegistration;
 use novarocks_coordination_contract::{
-    AbortIssueSettlement, AttemptActionId, AttemptActivationIdentity, AttemptToLogicalBody,
-    LogicalToAttempt, LogicalToAttemptBody, MonotonicInstant,
+    AttemptActionId, AttemptActivationIdentity, LogicalToAttempt, LogicalToAttemptBody,
+    MonotonicInstant,
 };
 use novarocks_execution_contract::{
     AbortParticipation, OperationKind, OperationOutcome, ParticipationReceipt, ParticipationState,

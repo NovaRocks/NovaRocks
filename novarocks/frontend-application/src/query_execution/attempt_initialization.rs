@@ -882,6 +882,7 @@ impl SerialAttemptInitialization for ProductionInitializationState {
             feedback: Arc::clone(&self.feedback),
             split_assignment_plan,
             credential_leases: Some(credential_leases),
+            closed_split_remainder: None,
             close_job: None,
             close_outcome: None,
         });
@@ -1047,6 +1048,9 @@ pub(crate) struct AttemptReady {
     schedule: Option<ValidatedFragmentSchedule>,
     feedback: Arc<RuntimeFilterFeedbackState>,
     split_assignment_plan: Option<RoundSplitAssignmentPlan>,
+    // Closed empty plan metadata stays with the same original until its
+    // controlled final destruction; closing it never drops it on a poller.
+    closed_split_remainder: Option<RoundSplitAssignmentPlan>,
     credential_leases: Option<QueryCredentialLeases>,
     close_job: Option<ConnectorBlockingIoJob<()>>,
     close_outcome: Option<Result<(), ConnectorBlockingIoError>>,
@@ -1073,6 +1077,43 @@ impl AttemptReady {
 
     pub(crate) fn split_plan_mut(&mut self) -> &mut Option<RoundSplitAssignmentPlan> {
         &mut self.split_assignment_plan
+    }
+
+    /// The original nonempty plan must already belong to the split Source;
+    /// an empty plan must have finished its original close job. This only
+    /// checks ownership geometry and never certifies actual Source exit.
+    pub(crate) fn can_transfer_remainder(&self) -> bool {
+        self.artifacts.is_none()
+            && self.schedule.is_none()
+            && self.credential_leases.is_none()
+            && self.split_assignment_plan.is_none()
+            && self.close_job.is_none()
+            && self.close_outcome.is_none()
+    }
+
+    /// Close the SAME empty/no-source plan while this object still lives in
+    /// the original pending projection. A pending or failed job remains here.
+    /// Successful close moves only its closed metadata to the original final
+    /// capture; no replacement plan or Source close service is constructed.
+    pub(crate) async fn close_empty_split_remainder(
+        &mut self,
+    ) -> Result<(), StatementNativeHealthFailure> {
+        if self.close_job.is_some()
+            || self
+                .split_assignment_plan
+                .as_ref()
+                .is_some_and(|original| !original.has_sources())
+        {
+            self.close().await?;
+            if let Some(original) = self.split_assignment_plan.take() {
+                assert!(
+                    self.closed_split_remainder.is_none(),
+                    "one original closed split remainder"
+                );
+                self.closed_split_remainder = Some(original);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn close(&mut self) -> Result<(), StatementNativeHealthFailure> {

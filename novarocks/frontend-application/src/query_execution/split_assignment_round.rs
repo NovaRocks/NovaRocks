@@ -43,11 +43,7 @@ use crate::task_execution::blocking_io::{
 };
 use crate::task_execution::error::TaskExecutionError;
 #[cfg(test)]
-use crate::task_execution::execution::QueryTaskExecution;
-#[cfg(test)]
 use crate::task_execution::pump_health::PumpCloseUnresolved;
-#[cfg(test)]
-use crate::task_execution::round::{TaskRound, TurnPump};
 use crate::wake::StatusIntakeWake;
 use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 
@@ -843,14 +839,7 @@ impl SplitAssignmentPump {
 }
 
 #[cfg(test)]
-impl TurnPump for SplitAssignmentPump {
-    fn name(&self) -> &'static str {
-        Self::PUMP_NAME
-    }
-
-    fn drive(&mut self, _execution: &mut QueryTaskExecution) -> Result<usize, TaskExecutionError> {
-        self.advance()
-    }
+impl SplitAssignmentPump {
     fn begin_close(&mut self) {
         self.stop.stop();
         self.wake.wake();
@@ -915,7 +904,7 @@ impl TurnPump for SplitAssignmentPump {
 
 impl Drop for SplitAssignmentPump {
     fn drop(&mut self) {
-        // Original TaskRound/role bank retains this owner until real close.
+        // The original split executor retains this owner until real close.
         // Whole-owner destruction is never a detached publisher or exit proof.
         self.stop.stop();
     }
@@ -923,7 +912,7 @@ impl Drop for SplitAssignmentPump {
 
 /// A nonblocking observation handle for the round-owned split pump.
 #[cfg(test)]
-pub(crate) struct SplitAssignmentRoundGuard {
+struct SplitAssignmentSourceGuard {
     stop: RoundSplitAssignmentStop,
     failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
     outcome: Arc<Mutex<Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>>>,
@@ -971,7 +960,7 @@ impl SplitAssignmentFailureSource {
 }
 
 #[cfg(test)]
-impl SplitAssignmentRoundGuard {
+impl SplitAssignmentSourceGuard {
     pub(crate) fn profile_source(&self) -> SplitAssignmentProfileSource {
         SplitAssignmentProfileSource {
             outcome: Arc::downgrade(&self.outcome),
@@ -982,17 +971,19 @@ impl SplitAssignmentRoundGuard {
             failure: Arc::clone(&self.failure),
         }
     }
-    /// Installs the pump. Returns `None` when this round has no typed scan.
-    pub(crate) fn install(
-        round: &mut TaskRound,
+    /// Takes the same opened sources into this one pump component. No Task
+    /// protocol owner, Native Scope, Core or completion fact is constructed.
+    fn install(
+        destination: &mut Option<SplitAssignmentPump>,
         execution_id: QueryExecutionId,
         mut plan: RoundSplitAssignmentPlan,
         transport: Arc<dyn TaskUpdateTransport>,
         data_runtime: FrontendDataRuntime,
         wake: Arc<dyn StatusIntakeWake>,
     ) -> Option<Self> {
-        // Taken, not borrowed: the sources move into the round, so the plan's
-        // own drop must not close what the round now owns.
+        assert!(destination.is_none(), "one original split component");
+        // Taken, not borrowed: the same source allocations move into this
+        // component, so the plan Drop cannot close transferred originals.
         let sources = std::mem::take(&mut plan.sources);
         let tasks = std::mem::take(&mut plan.targets);
         if sources.is_empty() {
@@ -1010,7 +1001,7 @@ impl SplitAssignmentRoundGuard {
         let stop = assignment.stop_handle();
         let failure = Arc::new(Mutex::new(None));
         let outcome = Arc::new(Mutex::new(None));
-        round.add_pump(Box::new(SplitAssignmentPump {
+        *destination = Some(SplitAssignmentPump {
             assignment: Some(assignment),
             stop: stop.clone(),
             data_runtime,
@@ -1032,7 +1023,7 @@ impl SplitAssignmentRoundGuard {
             cleanup_failure_reported: false,
             unresolved: Arc::new(Mutex::new(SplitUnresolved::default())),
             unresolved_reported: false,
-        }));
+        });
         Some(Self {
             stop,
             failure,
@@ -1041,7 +1032,7 @@ impl SplitAssignmentRoundGuard {
         })
     }
 
-    /// Request the original round-owned close; never run provider code here.
+    /// Request the original source-owned close; never run provider code here.
     pub(crate) fn request_stop(&self) {
         self.stop.stop();
         self.wake.wake();
@@ -1092,7 +1083,7 @@ impl SplitAssignmentRoundGuard {
 }
 
 #[cfg(test)]
-impl Drop for SplitAssignmentRoundGuard {
+impl Drop for SplitAssignmentSourceGuard {
     fn drop(&mut self) {
         self.request_stop();
     }
@@ -2167,7 +2158,7 @@ mod tests {
     #[test]
     fn ordinary_finish_refuses_an_unfinished_pump() {
         let stop = RoundSplitAssignmentStop::default();
-        let guard = SplitAssignmentRoundGuard {
+        let guard = SplitAssignmentSourceGuard {
             stop: stop.clone(),
             failure: Arc::new(Mutex::new(None)),
             outcome: Arc::new(Mutex::new(None)),
@@ -2193,7 +2184,7 @@ mod tests {
         // A normal stop must stay silent, because a round whose sources all
         // went terminal legitimately stops delivering long before its scans
         // finish.
-        let failed = SplitAssignmentRoundGuard {
+        let failed = SplitAssignmentSourceGuard {
             stop: RoundSplitAssignmentStop::default(),
             failure: Arc::new(Mutex::new(Some(
                 SplitAssignmentDriverError::NoAdmittedTask {
@@ -2225,7 +2216,7 @@ mod tests {
         assert!(matches!(profile, SplitAssignmentProfileRead::Failed));
         assert_eq!(published, original);
 
-        let healthy = SplitAssignmentRoundGuard {
+        let healthy = SplitAssignmentSourceGuard {
             stop: RoundSplitAssignmentStop::default(),
             failure: Arc::new(Mutex::new(None)),
             outcome: Arc::new(Mutex::new(Some(Ok(SplitSourceProfile::default())))),
@@ -2303,6 +2294,25 @@ mod tests {
         }
     }
 
+    /// Some is ONLY a real Ok from the original close method. Retain an Err
+    /// exactly once and return None; polling may continue, but it is not a
+    /// successful turn or a Task verdict.
+    fn progress_original_close(
+        pump: &mut SplitAssignmentPump,
+        original: &mut Option<TaskExecutionError>,
+    ) -> Option<usize> {
+        match pump.close_turn() {
+            Ok(moved) => Some(moved),
+            Err(error) => {
+                assert!(
+                    original.replace(error).is_none(),
+                    "one original close error handoff"
+                );
+                None
+            }
+        }
+    }
+
     fn closing_round_joins_its_original_sources(
         natural_exhaustion: bool,
         terminal_cleanup: bool,
@@ -2311,10 +2321,7 @@ mod tests {
         provider_error: bool,
     ) {
         use crate::task_execution::blocking_io::tests::{admitted, until};
-        use crate::task_execution::status_intake::{CountingWake, StatusEvent};
-        use novarocks_execution::task_execution::status::{
-            TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
-        };
+        use crate::wake::CountingWake;
         use novarocks_execution_contract::failure::FailureProjection;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -2361,21 +2368,16 @@ mod tests {
                 supervisor.clone(),
             ));
         }
-        let (mut round, statuses, _clock) =
-            crate::task_execution::tests::synchronous_root_control_round();
-        let identity = round.root_task();
+        let graph = crate::task_execution::graph_manifest_tests::split_component_chain_graph();
+        let identity = graph.root_identity();
+        let mut component = None;
         let transport = Arc::new(AcknowledgedSplitUpdates::default());
         let targets = if natural_exhaustion {
             BTreeMap::from([(
                 sources[0].scan,
                 vec![AssignmentTarget {
                     backend_idx: 0,
-                    task_key: round
-                        .execution()
-                        .graph()
-                        .task(identity.task_id())
-                        .unwrap()
-                        .task_key(),
+                    task_key: graph.task(identity.task_id()).unwrap().task_key(),
                 }],
             )])
         } else {
@@ -2389,8 +2391,8 @@ mod tests {
             supervisor.clone(),
         );
         let wake = Arc::new(CountingWake::default());
-        let guard = SplitAssignmentRoundGuard::install(
-            &mut round,
+        let guard = SplitAssignmentSourceGuard::install(
+            &mut component,
             identity.query_execution_id(),
             plan,
             if natural_exhaustion {
@@ -2402,26 +2404,27 @@ mod tests {
             wake.clone(),
         )
         .unwrap();
+        let pump = component.as_mut().unwrap();
+        let mut close_errors = None;
         if !natural_exhaustion {
             let wake_count_before_stop = wake.count();
-            guard.request_stop();
+            if terminal_cleanup {
+                guard.request_stop();
+            } else {
+                pump.begin_close();
+            }
             assert!(
                 wake.count() > wake_count_before_stop,
-                "requesting source close must wake the round owner"
+                "requesting source close must wake the original component owner"
             );
-            if terminal_cleanup {
-                round.begin_terminal_cleanup();
-            } else {
-                round.begin_normal_drain();
-            }
         }
-        let initial_turn = round.turn();
+        let initial_turn = pump.advance();
         if natural_exhaustion {
             // Ordinary turns must enumerate, deliver and acknowledge the real
             // no-more-splits before the pump starts its own close. No stop or
             // drain is injected to manufacture this natural exhaustion.
             until(|| {
-                round.turn().unwrap();
+                pump.advance().unwrap();
                 closes.load(Ordering::SeqCst) != 0
             });
         }
@@ -2433,42 +2436,33 @@ mod tests {
         drop(window);
         let before = control.snapshot();
         let before_finished = guard.is_finished();
-        let before_closed = round.pumps_closed();
+        let before_closed = pump.is_closed();
         let before_drops = drops.load(Ordering::SeqCst);
         // Always release the real foreign close before any negative assertion.
         let released = release.send(());
         until(|| {
-            round.turn().unwrap();
+            // None retains the actual error, never pretends this poll succeeded.
+            let _ = progress_original_close(pump, &mut close_errors);
             guard.is_finished()
         });
-        if !terminal_cleanup {
-            statuses.publish(StatusEvent::Published(Box::new(
-                TaskStatus::try_new(
-                    identity,
-                    TaskStatusVersion::new(3).unwrap(),
-                    TaskState::Running,
-                    None,
-                    TaskOutputFacts::new(false),
-                )
-                .unwrap(),
-            )));
-        }
-        if natural_exhaustion {
-            round.begin_input_close();
-        }
-        let joined_turn = round.turn();
-        let local_closed = round.pumps_closed();
-        let close_error = round.take_pump_close_error();
-        let second_turn = round.turn();
-        let repeated_error = round.take_pump_close_error();
-        let selected_cause = round.failure_cause().cloned();
+        // Actual AP/CommonHost status fairness is asserted by the original
+        // runtime tests named in the migration ledger. This source component
+        // neither fabricates a status counter nor selects a Task conclusion.
+        let joined_turn = progress_original_close(pump, &mut close_errors);
+        let local_closed = pump.is_closed();
+        let close_error = close_errors.take();
+        let second_turn = progress_original_close(pump, &mut close_errors);
+        let repeated_error = close_errors.take();
         let computational_failure = guard.failure_source().failure();
         let result = guard.profile_source().current();
         let published_failure = guard.published_close_failure_for_test();
         drop(guard);
         let final_closes = closes.load(Ordering::SeqCst);
         let final_drops = drops.load(Ordering::SeqCst);
-        drop(round);
+        // The owned slot remains until all original I/O holders are observed.
+        // End the borrow, then drop the original component below.
+        let _ = pump;
+        drop(component);
         drop(data_runtime);
         until(|| control.snapshot().scopes.is_empty());
         control.close_admission();
@@ -2488,11 +2482,11 @@ mod tests {
             if natural_exhaustion { (1, 1) } else { (2, 2) },
             "every actual source must close and drop once"
         );
-        let report = joined_turn.expect("typed close errors cannot starve the serial turn");
-        if !terminal_cleanup {
-            assert_eq!(report.status_events, 1);
-        }
-        assert!(second_turn.is_ok());
+        joined_turn.expect("the post-error original close method must actually return Ok");
+        assert!(
+            second_turn.is_some(),
+            "the next original close call is actually idempotent Ok"
+        );
         assert!(
             computational_failure.is_none(),
             "cleanup must not mint a computation failure"
@@ -2503,10 +2497,6 @@ mod tests {
             assert_eq!((requests[0].1, requests[0].2), (0, true));
         }
         assert!(repeated_error.is_none());
-        assert!(
-            selected_cause.is_none(),
-            "a local cleanup must not mint a Task conclusion"
-        );
         if panic_profile || panic_close || provider_error {
             assert!(matches!(result, SplitAssignmentProfileRead::Failed));
             let error = published_failure.expect("the original close error must not be hidden");
@@ -2646,7 +2636,9 @@ mod tests {
             responsibility,
             supervisor.clone(),
         );
-        let (mut round, _, _clock) = crate::task_execution::tests::synchronous_root_control_round();
+        let identity = crate::task_execution::graph_manifest_tests::split_component_chain_graph()
+            .root_identity();
+        let mut component = None;
         let plan = RoundSplitAssignmentPlan::new(
             BTreeMap::new(),
             vec![source],
@@ -2654,9 +2646,8 @@ mod tests {
             Duration::ZERO,
             supervisor.clone(),
         );
-        let identity = round.root_task();
-        let guard = SplitAssignmentRoundGuard::install(
-            &mut round,
+        let guard = SplitAssignmentSourceGuard::install(
+            &mut component,
             identity.query_execution_id(),
             plan,
             Arc::new(NoCloseTaskUpdates),
@@ -2664,23 +2655,26 @@ mod tests {
             Arc::new(CountingWake::default()),
         )
         .unwrap();
-        round.begin_normal_drain();
-        let started = round.turn();
+        let pump = component.as_mut().unwrap();
+        let mut close_errors = None;
+        pump.begin_close();
+        // Start the original close; an immediate Err stays in close_errors.
+        let _ = progress_original_close(pump, &mut close_errors);
         until(|| {
-            round.turn().unwrap();
+            // None retains the actual error, never pretends this poll succeeded.
+            let _ = progress_original_close(pump, &mut close_errors);
             guard.is_finished()
         });
-        let advanced = round.turn();
-        let local_closed = round.pumps_closed();
-        let health = round
-            .take_pump_close_unresolved()
+        let advanced = progress_original_close(pump, &mut close_errors);
+        let local_closed = pump.is_closed();
+        let health = pump
+            .take_close_unresolved()
             .expect("the genuine original job panic has a health observation");
-        let repeated = round.take_pump_close_unresolved();
+        let repeated = pump.take_close_unresolved();
         root.owner.complete();
         root.business.release();
         drop(window);
         let retained = control.snapshot();
-        let originating_cause = round.failure_cause().cloned();
         let computational_failure = guard.failure_source().failure();
         let captured = health
             .cause
@@ -2691,7 +2685,8 @@ mod tests {
         let result = guard.profile_source().current();
         drop(guard);
         drop(health);
-        drop(round);
+        let _ = pump;
+        drop(component);
         drop(data_runtime);
         // Fixture teardown is explicit protected retirement of its known
         // static payload, not production permission to finish an unknown T.
@@ -2699,14 +2694,13 @@ mod tests {
         until(|| control.snapshot().scopes.is_empty());
         control.close_admission();
         let shutdown = control.shutdown();
-        assert!(started.is_ok() && advanced.is_ok());
+        assert!(
+            advanced.is_some(),
+            "after the first error handoff the real close call is Ok"
+        );
         assert!(!local_closed);
         assert_eq!(owner_name, "split_assignment");
         assert!(repeated.is_none());
-        assert!(
-            originating_cause.is_none(),
-            "health is not a new Task failure"
-        );
         assert!(matches!(result, SplitAssignmentProfileRead::Failed));
         assert!(
             computational_failure.is_none(),
@@ -2797,7 +2791,9 @@ mod tests {
         );
         source.initial_wait_initialized = true;
         let scan = source.scan;
-        let (mut round, _, _clock) = crate::task_execution::tests::synchronous_root_control_round();
+        let identity = crate::task_execution::graph_manifest_tests::split_component_chain_graph()
+            .root_identity();
+        let mut component = None;
         let tasks = BTreeMap::from([(
             scan,
             vec![AssignmentTarget {
@@ -2812,9 +2808,8 @@ mod tests {
             Duration::ZERO,
             supervisor.clone(),
         );
-        let identity = round.root_task();
-        let guard = SplitAssignmentRoundGuard::install(
-            &mut round,
+        let guard = SplitAssignmentSourceGuard::install(
+            &mut component,
             identity.query_execution_id(),
             plan,
             Arc::new(NoCloseTaskUpdates),
@@ -2822,26 +2817,27 @@ mod tests {
             Arc::new(CountingWake::default()),
         )
         .unwrap();
-        let first_turn = round.turn();
-        let publish_turn = round.turn();
+        let pump = component.as_mut().unwrap();
+        let mut close_errors = None;
+        let first_turn = pump.advance();
+        let publish_turn = pump.advance();
         enum_entered
             .recv_timeout(Duration::from_secs(2))
             .expect("the original enumeration entered");
         guard.request_stop();
-        round.begin_normal_drain();
-        let close_turn = round.turn();
+        let close_turn = progress_original_close(pump, &mut close_errors);
         root.owner.complete();
         root.business.release();
         drop(window);
         let waiting_enum = control.snapshot();
-        let falsely_closed = round.pumps_closed() || guard.is_finished();
+        let falsely_closed = pump.is_closed() || guard.is_finished();
         let prematurely_closed_source = closes.load(Ordering::SeqCst);
         let released_enum = enum_release.send(());
         // This loop advances only the closing turn; it cannot enumerate again.
         let stop = Instant::now() + Duration::from_secs(2);
         let mut saw_close = false;
         while Instant::now() < stop {
-            let _ = round.turn();
+            let _ = progress_original_close(pump, &mut close_errors);
             if close_entered.try_recv().is_ok() {
                 saw_close = true;
                 break;
@@ -2849,22 +2845,36 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let waiting_close = control.snapshot();
-        let closed_before_release = round.pumps_closed() || guard.is_finished();
+        let closed_before_release = pump.is_closed() || guard.is_finished();
         let released_close = close_release.send(());
         until(|| {
-            round.turn().unwrap();
+            // None retains the actual error, never pretends this poll succeeded.
+            let _ = progress_original_close(pump, &mut close_errors);
             guard.is_finished()
         });
-        let joined = round.turn();
-        let closed = round.pumps_closed();
+        let joined = progress_original_close(pump, &mut close_errors);
+        let closed = pump.is_closed();
         let outcome = guard.profile_source().current();
         drop(guard);
-        drop(round);
+        let _ = pump;
+        drop(component);
         drop(data_runtime);
         until(|| control.snapshot().scopes.is_empty());
         control.close_admission();
         let shutdown = control.shutdown();
-        assert!(first_turn.is_ok() && publish_turn.is_ok() && close_turn.is_ok() && joined.is_ok());
+        assert!(first_turn.is_ok() && publish_turn.is_ok());
+        assert!(
+            close_turn.is_some(),
+            "held enumeration has no close error yet"
+        );
+        assert!(
+            joined.is_some(),
+            "the original returned close call is actually Ok"
+        );
+        assert!(
+            close_errors.is_none(),
+            "gated successful close produces no hidden error"
+        );
         assert!(released_enum.is_ok() && released_close.is_ok());
         assert!(!falsely_closed && !closed_before_release);
         assert_eq!(prematurely_closed_source, 0);

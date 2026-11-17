@@ -103,13 +103,31 @@ pub trait ConnectorIoRequestSource: Send + Sync {
 
 #[must_use = "Keep the original request while its paid admission is pending"]
 pub struct ConnectorIoRequest {
+    // Field order is intentional: the original alias exits before its fixed
+    // notification guard. The guard never retains the original request cell.
     original: Arc<dyn ConnectorIoRequestSource>,
+    exit: RequestExitNotification,
+}
+struct RequestExitNotification {
+    waker: std::task::Waker,
+    armed: bool,
+}
+impl Drop for RequestExitNotification {
+    fn drop(&mut self) {
+        if self.armed {
+            self.waker.wake_by_ref();
+        }
+    }
 }
 impl ConnectorIoRequest {
     /// Neutral projection of a pre-existing cell. This grants no WC capacity:
     /// poll_admitted still requires the original owner's actual grant.
     pub fn from_original(original: Arc<dyn ConnectorIoRequestSource>) -> Self {
-        Self { original }
+        let waker = original.exit_waker();
+        Self {
+            original,
+            exit: RequestExitNotification { waker, armed: true },
+        }
     }
     /// Silent original receiving seam. The source retains its request while
     /// pending and installs the positive permit before any request/F Drop.
@@ -137,9 +155,12 @@ impl ConnectorIoRequest {
             }
         }
     }
-    pub async fn admitted(self) -> Result<ConnectorIoPermit, ConnectorError> {
+    pub async fn admitted(mut self) -> Result<ConnectorIoPermit, ConnectorError> {
         std::future::poll_fn(|cx| self.original.poll_admitted(cx)).await?;
         let exit_waker = self.original.exit_waker();
+        // This positive handoff moves the SAME strong alias into the permit.
+        // Unlike poll_admitted_in(&self), no request alias remains to notify.
+        self.exit.armed = false;
         Ok(ConnectorIoPermit {
             original: Some(Arc::downgrade(&self.original)),
             keepalive: Some(self.original),
@@ -370,17 +391,20 @@ mod tests {
         wake: Mutex<Waker>,
         closed: AtomicUsize,
         cleanup: Mutex<Option<ConnectorIoCleanupFuture>>,
+        admission: AtomicUsize,
     }
     struct ExitObservation {
         original: Weak<Cell>,
         strong: AtomicUsize,
         weak: AtomicUsize,
+        calls: AtomicUsize,
     }
     impl Wake for ExitObservation {
         fn wake(self: Arc<Self>) {
             self.wake_by_ref();
         }
         fn wake_by_ref(self: &Arc<Self>) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             // Observation only. Production uniqueness still uses Arc::get_mut.
             self.strong
                 .store(self.original.strong_count(), Ordering::SeqCst);
@@ -425,7 +449,12 @@ mod tests {
             Ok(())
         }
         fn poll_admitted(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
-            Poll::Ready(Ok(()))
+            match self.admission.load(Ordering::SeqCst) {
+                0 => Poll::Ready(Ok(())),
+                1 => Poll::Pending,
+                2 => Poll::Ready(Err(source_gone())),
+                _ => panic!("invalid carrier admission fixture state"),
+            }
         }
         fn poll_include_dependency(
             &self,
@@ -454,11 +483,13 @@ mod tests {
             wake: Mutex::new(Waker::noop().clone()),
             closed: AtomicUsize::new(0),
             cleanup: Mutex::new(None),
+            admission: AtomicUsize::new(0),
         });
         let seen = Arc::new(ExitObservation {
             original: Arc::downgrade(&cell),
             strong: AtomicUsize::new(0),
             weak: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
         });
         *cell.wake.lock().unwrap() = Waker::from(Arc::clone(&seen));
         let permit = admitted(&cell);
@@ -476,6 +507,7 @@ mod tests {
             wake: Mutex::new(Waker::noop().clone()),
             closed: AtomicUsize::new(0),
             cleanup: Mutex::new(None),
+            admission: AtomicUsize::new(0),
         });
         let permit = admitted(&cell);
         let stream = permit.begin_stream().unwrap();
@@ -495,5 +527,108 @@ mod tests {
         drop(cell.cleanup.lock().unwrap().take());
         same.closed();
         assert_eq!(cell.closed.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn request_exit_notifies_after_its_actual_alias_and_success_keeps_the_original_permit_wake() {
+        // 0: cancel before first poll; 1: cancel Pending; 2: receive Err;
+        // 3: async handoff; 4/5: silent receiving with both alias-exit orders.
+        let mut checks = Vec::new();
+        for branch in 0..6 {
+            let cell = Arc::new(Cell {
+                wake: Mutex::new(Waker::noop().clone()),
+                closed: AtomicUsize::new(0),
+                cleanup: Mutex::new(None),
+                admission: AtomicUsize::new(match branch {
+                    1 => 1,
+                    2 => 2,
+                    _ => 0,
+                }),
+            });
+            let seen = Arc::new(ExitObservation {
+                original: Arc::downgrade(&cell),
+                strong: AtomicUsize::new(0),
+                weak: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+            });
+            *cell.wake.lock().unwrap() = Waker::from(Arc::clone(&seen));
+            let request = ConnectorIoRequest::from_original(
+                Arc::clone(&cell) as Arc<dyn ConnectorIoRequestSource>
+            );
+            let mut cx = Context::from_waker(Waker::noop());
+            let branch_ok = match branch {
+                0 => {
+                    drop(Box::pin(request.admitted()));
+                    seen.calls.load(Ordering::SeqCst) == 1
+                        && seen.strong.load(Ordering::SeqCst) == 1
+                }
+                1 | 2 => {
+                    let mut future = Box::pin(request.admitted());
+                    let result = future.as_mut().poll(&mut cx);
+                    let expected = if branch == 1 {
+                        result.is_pending()
+                    } else {
+                        matches!(result, Poll::Ready(Err(_)))
+                    };
+                    drop(future);
+                    expected
+                        && seen.calls.load(Ordering::SeqCst) == 1
+                        && seen.strong.load(Ordering::SeqCst) == 1
+                }
+                3 => {
+                    let mut future = Box::pin(request.admitted());
+                    let permit = match future.as_mut().poll(&mut cx) {
+                        Poll::Ready(Ok(permit)) => Some(permit),
+                        _ => None,
+                    };
+                    drop(future);
+                    let silent = seen.calls.load(Ordering::SeqCst) == 0;
+                    let original_still_live = Arc::strong_count(&cell) == 2;
+                    drop(permit);
+                    silent
+                        && original_still_live
+                        && seen.calls.load(Ordering::SeqCst) == 1
+                        && seen.strong.load(Ordering::SeqCst) == 1
+                }
+                4 => {
+                    let mut permit = None;
+                    let installed = matches!(
+                        request.poll_admitted_in(&mut permit, &mut cx),
+                        Poll::Ready(Ok(()))
+                    );
+                    drop(permit);
+                    let request_still_live = seen.calls.load(Ordering::SeqCst) == 1
+                        && seen.strong.load(Ordering::SeqCst) == 2;
+                    drop(request);
+                    installed
+                        && request_still_live
+                        && seen.calls.load(Ordering::SeqCst) == 2
+                        && seen.strong.load(Ordering::SeqCst) == 1
+                }
+                5 => {
+                    let mut permit = None;
+                    let installed = matches!(
+                        request.poll_admitted_in(&mut permit, &mut cx),
+                        Poll::Ready(Ok(()))
+                    );
+                    drop(request);
+                    let permit_still_live = seen.calls.load(Ordering::SeqCst) == 1
+                        && seen.strong.load(Ordering::SeqCst) == 2;
+                    drop(permit);
+                    installed
+                        && permit_still_live
+                        && seen.calls.load(Ordering::SeqCst) == 2
+                        && seen.strong.load(Ordering::SeqCst) == 1
+                }
+                _ => unreachable!(),
+            };
+            // This is an Arc/wake carrier probe, not a fabricated Scope exit.
+            let same_owner_remains = Arc::strong_count(&cell) == 1;
+            drop(cell);
+            checks.push((branch, branch_ok && same_owner_remains));
+        }
+        assert!(
+            checks.iter().all(|(_, ok)| *ok),
+            "original alias/wake branches: {checks:?}"
+        );
     }
 }

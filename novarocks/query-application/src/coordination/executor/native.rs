@@ -19,21 +19,20 @@
 //! The FE carrier supplies work credentials and observes actual work joins.
 
 use crate::api::{
-    LogicalFuture, NativeAttemptPreparationError, NativeAttemptTerminal,
+    BoundedRootReadPort, LogicalFuture, NativeAttemptPreparationError, NativeAttemptStartupOutcome,
     NativeAttemptTopologyRequirement, NativeRowsAttemptRuntime, QueryExecutionError,
     QueryExecutionErrorKind,
 };
 use crate::coordination::{
     AttemptSchedule, LogicalExecutionRegistration, LogicalExecutionRuntimeRegistryHandle,
-    native_active_custody::{
-        OriginalConsumerStart, PendingNativeActivation, SupervisedActiveNativeOwner,
-    },
+    native_active_custody::NativeActivationReturnObligation,
     original_exit::{OriginalLogicalExit, OriginalNativePreparation},
     replacement::{
         ActiveReplacementResources, QualifiedReplacementReservation,
-        ReplacementQualificationEffectAdmission, ReplacementQualificationEffectSubmission,
-        ReplacementQualificationFailure, ReplacementQualificationIdentity,
-        ReplacementQualificationRequest, ReplacementQualificationSettlement, receipt_channel,
+        ReplacementQualificationEffectAdmission, ReplacementQualificationEffectPort,
+        ReplacementQualificationEffectSubmission, ReplacementQualificationFailure,
+        ReplacementQualificationIdentity, ReplacementQualificationRequest,
+        ReplacementQualificationSettlement, receipt_channel,
     },
     schedule::build_attempt_schedule,
 };
@@ -60,7 +59,7 @@ use std::{
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex, Weak},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Instant,
 };
 use tokio::sync::{Mutex as AsyncMutex, watch};
@@ -82,6 +81,13 @@ fn activation_key(identity: AttemptActivationIdentity) -> ActivationKey {
 
 type PanicPayload = Box<dyn Any + Send>;
 type OriginalJoinFailure = Arc<dyn Error + Send + Sync>;
+/// Original per-attempt consumer input, not an execution grant or identity.
+struct OriginalConsumerStart {
+    consumer: Arc<dyn crate::api::InternalComputationConsumer>,
+    activation: crate::api::InternalConsumerActivation,
+    exit: crate::api::InternalConsumerExitReporter,
+    activity: Option<crate::admitted_query_context::ResultCapacityActivityLease>,
+}
 pub(crate) type RootAckFuture = LogicalFuture<
     'static,
     Result<crate::api::RetainedRootReply, crate::coordination::RootResultFetchFailure>,
@@ -222,9 +228,55 @@ struct PreparedAttempt {
         MonotonicInstant,
     )>,
 }
+struct OriginalRootRead {
+    port: Arc<dyn BoundedRootReadPort>,
+    root: TaskIdentity,
+    attempted: bool,
+    closing: bool,
+    sealed: bool,
+    failure: Option<QueryExecutionError>,
+    // The sole failed-owner continuation may await the original action.
+    // This inline observer grants no second callback or execution capacity.
+    close_waiter: Option<Waker>,
+}
+impl OriginalRootRead {
+    fn from_rows(rows: &NativeRowsAttemptRuntime) -> Self {
+        Self {
+            port: rows.binding.port.clone(),
+            root: rows.binding.frontier.root(),
+            attempted: false,
+            closing: false,
+            sealed: false,
+            failure: None,
+            close_waiter: None,
+        }
+    }
+}
+struct OriginalReadCloseProgress<'a> {
+    native: &'a NativeExecutor,
+    activation: AttemptActivationIdentity,
+}
+impl Drop for OriginalReadCloseProgress<'_> {
+    fn drop(&mut self) {
+        let waiter = {
+            let mut storage = self.native.lock();
+            let original = storage
+                .active
+                .get_mut(&activation_key(self.activation))
+                .and_then(|active| active.read.as_mut())
+                .expect("same original in-flight read close");
+            original.closing = false;
+            original.close_waiter.take()
+        };
+        if let Some(waiter) = waiter {
+            waiter.wake();
+        }
+    }
+}
 struct ActiveOriginal {
-    owner: Arc<AsyncMutex<SupervisedActiveNativeOwner>>,
+    owner: Arc<AsyncMutex<NativeActivationReturnObligation>>,
     rows: Option<NativeRowsAttemptRuntime>,
+    read: Option<OriginalRootRead>,
     terminal_cut: Option<(MonotonicInstant, MonotonicInstant)>,
     streamed_success: bool,
     computation_ready: Option<crate::api::ComputationReadyToken>,
@@ -440,6 +492,8 @@ impl NativeStorage {
 /// Owns application originals only. It never creates an identity or recovery decision.
 /// Construction consumes references to the originals already established before install.
 pub struct NativeExecutor {
+    replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
+    installed: Arc<dyn crate::api::NativeInstalledAttemptPort>,
     body: Arc<AsyncMutex<OriginalNativePreparation>>,
     original_exit: Weak<OriginalLogicalExit>,
     registry: LogicalExecutionRuntimeRegistryHandle,
@@ -507,6 +561,7 @@ impl NativeExecutor {
                 activation_key(activation),
                 ActiveOriginal {
                     owner: Arc::new(AsyncMutex::new(owner)),
+                    read: rows.as_ref().map(OriginalRootRead::from_rows),
                     rows,
                     terminal_cut,
                     streamed_success: false,
@@ -581,14 +636,9 @@ impl NativeExecutor {
         clippy::too_many_arguments,
         reason = "the constructor receives distinct original owners"
     )]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "TST-G9b3 P12 wires original Native executor construction"
-        )
-    )]
     pub(in crate::coordination) fn new(
+        replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
+        installed: Arc<dyn crate::api::NativeInstalledAttemptPort>,
         body: Arc<AsyncMutex<OriginalNativePreparation>>,
         original_exit: Weak<OriginalLogicalExit>,
         registry: LogicalExecutionRuntimeRegistryHandle,
@@ -617,6 +667,8 @@ impl NativeExecutor {
             },
         );
         Self {
+            replacements,
+            installed,
             body,
             original_exit,
             registry,
@@ -631,6 +683,23 @@ impl NativeExecutor {
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, NativeStorage> {
         self.storage.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Original recorded metadata only; absence grants no exit or promise.
+    pub fn original_computation_ready(
+        &self,
+        activation: AttemptActivationIdentity,
+    ) -> Result<Option<crate::api::ComputationReadyToken>, QueryExecutionError> {
+        let original = self
+            .lock()
+            .active
+            .get(&activation_key(activation))
+            .and_then(|row| row.computation_ready);
+        if original.is_some_and(|cut| cut.activation() != activation) {
+            return Err(protocol(
+                "original recorded computation cut has a foreign activation",
+            ));
+        }
+        Ok(original)
     }
     fn causes(&self, execution: QueryExecutionId, kind: u8) -> Arc<FutureCauses> {
         Arc::clone(self.lock().causes.entry((execution, kind)).or_default())
@@ -715,6 +784,7 @@ impl NativeExecutor {
             NativeEffect::ActivateReservation { identity, .. } => (identity.replacement, 14, false),
             NativeEffect::CancelQualification { identity, .. } => (identity.replacement, 15, false),
             NativeEffect::AbandonReservation { identity } => (identity.replacement, 16, false),
+            NativeEffect::SealRootRead { activation, .. } => (activation.execution(), 24, false),
             NativeEffect::FinishResources { activation } => (activation.execution(), 17, false),
             NativeEffect::AbandonResources { activation } => (activation.execution(), 18, false),
             NativeEffect::ConvergeDormant { execution, .. } => (*execution, 19, false),
@@ -773,6 +843,9 @@ impl NativeExecutor {
                     inherited_admissions,
                 } => self.activate(activation, inherited_admissions).await,
                 NativeEffect::RunAttempt { activation } => self.run(activation).await,
+                NativeEffect::SealRootRead { activation, sealed } => {
+                    self.seal_root_read(activation, sealed).await
+                }
                 NativeEffect::PrepareSuccessor {
                     failed: _,
                     replacement,
@@ -865,7 +938,7 @@ impl NativeExecutor {
                 }
                 NativeEffect::RecordComputationReady { cut } => {
                     let token = crate::api::ComputationReadyToken::from_runtime_cut(cut);
-                    let owner = {
+                    {
                         let mut storage = self.lock();
                         if !storage
                             .prepared
@@ -900,18 +973,34 @@ impl NativeExecutor {
                             .terminal_cut
                             .get_or_insert((cut.cut, cut.convergence_deadline));
                         terminal.1 = terminal.1.min(cut.convergence_deadline);
-                        Arc::clone(&active.owner)
-                    };
-                    // This is metadata handoff, not waiting on the long original run.
-                    // A running borrowed owner receives the SAME token when it returns.
-                    if let Ok(mut original) = owner.try_lock() {
-                        if let Err(error) = original.retain_computation_ready(token) {
-                            return failed(cut.activation.execution(), error);
-                        }
-                        original
-                            .shorten_remote_deadline(self.absolute(token.convergence_deadline()));
                     }
-                    NativeFact::Applied
+                    let causes = self.causes(cut.activation.execution(), 25);
+                    let installed = &self.installed;
+                    let future =
+                        match catch_unwind(AssertUnwindSafe(move || installed.record_ready(token)))
+                        {
+                            Ok(future) => future,
+                            Err(payload) => {
+                                causes.retain(payload, false);
+                                return failed(
+                                    cut.activation.execution(),
+                                    panic_error("Native computation-ready registration panicked"),
+                                );
+                            }
+                        };
+                    let mut returned = None;
+                    let outcome = poll_original(future, &causes, None, None, |result| {
+                        returned = Some(result)
+                    })
+                    .await;
+                    match returned {
+                        Some(Err(error)) => failed(cut.activation.execution(), error),
+                        Some(Ok(())) if outcome.is_ok() && !causes.failed() => NativeFact::Applied,
+                        _ => failed(
+                            cut.activation.execution(),
+                            panic_error("Native computation-ready registration remains unproven"),
+                        ),
+                    }
                 }
                 NativeEffect::RetirePreparation => {
                     let mut body = self.body.lock().await;
@@ -1059,7 +1148,7 @@ impl NativeExecutor {
                 protocol("an original activation output is already staged"),
             );
         }
-        let Some((owner, original_panic)) = dormant.activation_parts() else {
+        let Some((owner, original_panic, original_health)) = dormant.activation_parts() else {
             return failed(
                 execution,
                 protocol("original dormant activation owner is unavailable"),
@@ -1067,6 +1156,7 @@ impl NativeExecutor {
         };
         let future = match start_activation(
             owner,
+            activation,
             &schedule,
             admissions,
             self.cancellation.clone(),
@@ -1077,10 +1167,29 @@ impl NativeExecutor {
         };
         let mut refusal = None;
         let outcome = poll_original(future, &causes, None, None, |result| match result {
-            Ok(activated) => *pending_activated = Some(PendingNativeActivation::new(activated)),
-            Err(error) => refusal = Some(error.into_failure()),
+            Ok(activated) => reservation.receive_activated_in(pending_activated, activated),
+            Err(error) => match error.into_result() {
+                Ok(original) => refusal = Some(original),
+                Err(original) => {
+                    assert!(
+                        original_health.is_none(),
+                        "one original activation health result"
+                    );
+                    *original_health =
+                        Some(crate::api::DormantConvergenceFailure::Reported(original));
+                }
+            },
         })
         .await;
+        if let Some(original) = dormant.convergence_failure().cloned() {
+            let detail = original.detail();
+            drop(body);
+            self.registry.record_process_failure(original);
+            return failed(
+                execution,
+                QueryExecutionError::new(QueryExecutionErrorKind::Failed, detail),
+            );
+        }
         if let Some(failure) = refusal {
             return NativeFact::Failed {
                 execution,
@@ -1090,11 +1199,14 @@ impl NativeExecutor {
         if outcome.is_err() || causes.failed() {
             // If Ready succeeded, the same output is still in its original stable slot.
             if pending_activated.is_some() {
-                let _ = reservation.stage_activated_in(pending_activated);
+                let _ =
+                    reservation.stage_activated_in(activation, schedule.root(), pending_activated);
             }
             return failed(execution, panic_error("Native attempt activation panicked"));
         }
-        if let Err(error) = reservation.stage_activated_in(pending_activated) {
+        if let Err(error) =
+            reservation.stage_activated_in(activation, schedule.root(), pending_activated)
+        {
             return failed(execution, error);
         }
         match catch_unwind(AssertUnwindSafe(|| dormant.retire())) {
@@ -1126,6 +1238,7 @@ impl NativeExecutor {
                 activation_key(activation),
                 ActiveOriginal {
                     owner: Arc::new(AsyncMutex::new(owner)),
+                    read: rows.as_ref().map(OriginalRootRead::from_rows),
                     rows,
                     terminal_cut,
                     streamed_success: false,
@@ -1151,7 +1264,7 @@ impl NativeExecutor {
     }
 
     async fn run(&self, activation: AttemptActivationIdentity) -> NativeFact {
-        let owner = {
+        let exited = {
             let mut storage = self.lock();
             let Some(active) = storage.active.get_mut(&activation_key(activation)) else {
                 return failed(
@@ -1166,26 +1279,14 @@ impl NativeExecutor {
                 );
             }
             active.run_started = true;
-            Arc::clone(&active.owner)
+            active.resources_exited
         };
-        let causes = self.causes(activation.execution(), 1);
-        let mut original = owner.lock().await;
-        if self
-            .lock()
-            .active
-            .get(&activation_key(activation))
-            .is_some_and(|active| active.resources_exited)
-        {
+        if exited {
             return NativeFact::RunCompleted { activation };
         }
-        let original_owner = original.as_mut();
-        let cancellation = self.cancellation.clone();
-        let future = match catch_unwind(AssertUnwindSafe(move || {
-            // Move only this exclusive borrow into a true FnOnce factory. The
-            // original Box and its mutex guard remain in their stable owner.
-            let owner = original_owner;
-            owner.run_installed(cancellation)
-        })) {
+        let causes = self.causes(activation.execution(), 1);
+        let installed = &self.installed;
+        let future = match catch_unwind(AssertUnwindSafe(move || installed.start(activation))) {
             Ok(future) => future,
             Err(payload) => {
                 causes.retain(payload, false);
@@ -1195,37 +1296,9 @@ impl NativeExecutor {
                 };
             }
         };
-        let mut terminal = None;
+        let mut result = None;
         let outcome =
-            poll_original(future, &causes, None, None, |value| terminal = Some(value)).await;
-        let metadata = {
-            let storage = self.lock();
-            storage
-                .active
-                .get(&activation_key(activation))
-                .map(|active| {
-                    (
-                        active.computation_ready,
-                        active.terminal_cut,
-                        active.streamed_success,
-                    )
-                })
-        };
-        if let Some((ready, terminal, streamed_success)) = metadata {
-            if let Some(ready) = ready {
-                if let Err(error) = original.retain_computation_ready(ready) {
-                    return failed(activation.execution(), error);
-                }
-                original.shorten_remote_deadline(self.absolute(ready.convergence_deadline()));
-            }
-            if let Some((cut, deadline)) = terminal {
-                original.begin_terminal_cut(self.absolute(cut));
-                original.shorten_remote_deadline(self.absolute(deadline));
-            }
-            if streamed_success && let Err(error) = original.retain_streamed_success(activation) {
-                return failed(activation.execution(), error);
-            }
-        }
+            poll_original(future, &causes, None, None, |value| result = Some(value)).await;
         let supervision_failed = outcome.is_err() || causes.failed();
         if supervision_failed && let Some(source) = self.original_exit.upgrade() {
             for cleanup in [false, true] {
@@ -1243,7 +1316,7 @@ impl NativeExecutor {
                 }
             }
         }
-        project_run_terminal(activation, terminal, supervision_failed)
+        project_start_result(activation, result, supervision_failed)
     }
 
     async fn prepare(
@@ -1410,6 +1483,11 @@ impl NativeExecutor {
         )
         .await
         {
+            let original_health = dormant.convergence_failure().cloned();
+            drop(body);
+            if let Some(original) = original_health {
+                self.registry.record_process_failure(original);
+            }
             return failed(execution, error);
         }
         let participations = Arc::from(schedule.participations());
@@ -1466,16 +1544,14 @@ impl NativeExecutor {
             Ok(receiver) => receiver,
             Err(error) => return rejected(error),
         };
-        let (port, native_actions) = {
+        let native_actions = {
             let body = self.body.lock().await;
-            let Some(session) = body.session.as_ref() else {
+            if body.session.is_none() {
                 return rejected(protocol("original Native session is absent"));
-            };
-            (
-                session.replacement_effect_port(),
-                body.native_actions.clone(),
-            )
+            }
+            body.native_actions.clone()
         };
+        let port = self.replacements.clone();
         let Some(port) = port else {
             return rejected(qualification_error(
                 ReplacementQualificationFailure::EffectOwnerClosed,
@@ -1742,11 +1818,105 @@ impl NativeExecutor {
             .resources_retiring = false;
         NativeFact::Applied
     }
+    pub(crate) fn retained_read_root(
+        &self,
+        activation: AttemptActivationIdentity,
+    ) -> Option<TaskIdentity> {
+        self.lock()
+            .active
+            .get(&activation_key(activation))
+            .and_then(|active| active.read.as_ref())
+            .map(|read| read.root)
+    }
+    async fn seal_root_read(
+        &self,
+        activation: AttemptActivationIdentity,
+        sealed: novarocks_execution_contract::root_lifetime::RootReadSealed,
+    ) -> NativeFact {
+        let port = std::future::poll_fn(|cx| {
+            let waiter = cx.waker().clone();
+            let mut previous = None;
+            let result = {
+                let mut storage = self.lock();
+                let Some(original) = storage
+                    .active
+                    .get_mut(&activation_key(activation))
+                    .and_then(|active| active.read.as_mut())
+                else {
+                    return Poll::Ready(Err(protocol(
+                        "original read close has no exact retained port",
+                    )));
+                };
+                if original.root != sealed.task()
+                    || sealed.task().query_execution_id() != activation.execution()
+                {
+                    return Poll::Ready(Err(protocol("original read close has a foreign root")));
+                }
+                if original.closing {
+                    previous = original.close_waiter.replace(waiter);
+                    Poll::Pending
+                } else if original.sealed {
+                    Poll::Ready(Ok(None))
+                } else if original.attempted {
+                    Poll::Ready(Err(original.failure.clone().unwrap_or_else(|| {
+                        protocol("original read close remains unproven")
+                    })))
+                } else {
+                    // Never repeat a possibly partial opaque callback after refusal or
+                    // panic. The original action's custody retains its raw outcome.
+                    original.attempted = true;
+                    original.closing = true;
+                    Poll::Ready(Ok(Some(original.port.clone())))
+                }
+            };
+            drop(previous);
+            result
+        })
+        .await;
+        let port = match port {
+            Ok(Some(port)) => port,
+            Ok(None) => return NativeFact::Applied,
+            Err(error) => return failed(activation.execution(), error),
+        };
+        let _original_progress = OriginalReadCloseProgress {
+            native: self,
+            activation,
+        };
+        if let Err(error) = port.seal(sealed) {
+            self.lock()
+                .active
+                .get_mut(&activation_key(activation))
+                .and_then(|active| active.read.as_mut())
+                .expect("same original refused read close")
+                .failure = Some(error.clone());
+            return failed(activation.execution(), error);
+        }
+        self.lock()
+            .active
+            .get_mut(&activation_key(activation))
+            .expect("same original read-close record")
+            .read
+            .as_mut()
+            .expect("same original read port")
+            .sealed = true;
+        NativeFact::Applied
+    }
     async fn finish_resources(
         &self,
         activation: AttemptActivationIdentity,
         finish: bool,
     ) -> NativeFact {
+        if self
+            .lock()
+            .active
+            .get(&activation_key(activation))
+            .is_some_and(|active| active.read.as_ref().is_some_and(|read| !read.sealed))
+        {
+            return failed(
+                activation.execution(),
+                protocol("original root read admission has not closed"),
+            );
+        }
         let active = {
             let mut storage = self.lock();
             storage
@@ -1756,24 +1926,13 @@ impl NativeExecutor {
                     (
                         Arc::clone(&active.owner),
                         active.rows.take(),
-                        active.computation_ready,
                         active.terminal_cut,
-                        active.streamed_success,
                         Arc::clone(&active.cleanup_failure),
                         active.resources_exited,
                     )
                 })
         };
-        let cleanup = if let Some((
-            owner,
-            rows,
-            ready,
-            terminal,
-            streamed_success,
-            reported,
-            exited,
-        )) = active
-        {
+        let cleanup = if let Some((owner, rows, terminal, reported, exited)) = active {
             if exited {
                 return self.retire_isolation(activation, finish, NativeFact::Applied);
             }
@@ -1788,7 +1947,7 @@ impl NativeExecutor {
                     QueryExecutionError::new(QueryExecutionErrorKind::Failed, failure.detail()),
                 );
             }
-            let Some((_, deadline)) = terminal else {
+            let Some(_) = terminal else {
                 return failed(
                     activation.execution(),
                     protocol("active cleanup has no original absolute terminal cut"),
@@ -1796,12 +1955,6 @@ impl NativeExecutor {
             };
             drop(rows);
             let mut original = owner.lock().await;
-            let request = crate::api::NativeActiveConvergenceRequest::new(
-                self.cancellation.clone(),
-                self.absolute(deadline),
-            )
-            .with_computation_ready(ready)
-            .with_streamed_success(streamed_success.then_some(activation));
             let causes = self.causes(activation.execution(), 7);
             if causes.failed() {
                 return failed(
@@ -1809,18 +1962,18 @@ impl NativeExecutor {
                     panic_error("Native installed resource cleanup remains unproven"),
                 );
             }
-            let owner = original.as_mut();
-            let future =
-                match catch_unwind(AssertUnwindSafe(move || owner.finish_installed(request))) {
-                    Ok(future) => future,
-                    Err(payload) => {
-                        causes.retain(payload, false);
-                        return failed(
-                            activation.execution(),
-                            panic_error("Native installed resource cleanup panicked"),
-                        );
-                    }
-                };
+            let future = match catch_unwind(AssertUnwindSafe(|| {
+                self.installed.resources_exited(activation)
+            })) {
+                Ok(future) => future,
+                Err(payload) => {
+                    causes.retain(payload, false);
+                    return failed(
+                        activation.execution(),
+                        panic_error("Native installed resource cleanup panicked"),
+                    );
+                }
+            };
             let mut completed = false;
             let outcome = poll_original(future, &causes, None, None, |value| match value {
                 Ok(()) => completed = true,
@@ -1829,15 +1982,18 @@ impl NativeExecutor {
                 }
             })
             .await;
-            if let Some(failure) = reported
+            let received_failure = reported
                 .reported
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-            {
+                .clone();
+            if let Some(failure) = received_failure {
+                let detail = failure.detail();
+                drop(original);
+                self.registry.record_process_failure(failure);
                 return failed(
                     activation.execution(),
-                    QueryExecutionError::new(QueryExecutionErrorKind::Failed, failure.detail()),
+                    QueryExecutionError::new(QueryExecutionErrorKind::Failed, detail),
                 );
             }
             if outcome.is_err() || causes.failed() || !completed {
@@ -1846,10 +2002,12 @@ impl NativeExecutor {
                     panic_error("Native installed resource cleanup is unproven"),
                 );
             }
-            original.retire_local();
+            let progress = original.retire_local();
             if let Some(active) = self.lock().active.get_mut(&activation_key(activation)) {
                 active.resources_exited = true;
             }
+            drop(original);
+            progress.notify_waiters();
             NativeFact::Applied
         } else {
             let dormant = self.lock().dormant_execution;
@@ -2014,7 +2172,20 @@ impl NativeExecutor {
                 NativeFact::DormantConverged { execution }
             };
         }
-        if custody.convergence_panic().is_some() || custody.convergence_failure().is_some() {
+        if let Some(original) = custody.convergence_failure() {
+            return failed(
+                execution,
+                QueryExecutionError::new(QueryExecutionErrorKind::Failed, original.detail()),
+            );
+        }
+        if causes.failed() {
+            custody.record_convergence_unproven();
+            return failed(
+                execution,
+                panic_error("original dormant cleanup remains unproven"),
+            );
+        }
+        if custody.convergence_panic().is_some() {
             return failed(
                 execution,
                 protocol("original dormant cleanup remains unproven"),
@@ -2045,8 +2216,10 @@ impl NativeExecutor {
             }
         })
         .await;
-        if succeeded && outcome.is_ok() {
+        if succeeded && outcome.is_ok() && !causes.failed() {
             custody.record_convergence_completed();
+        } else {
+            custody.record_convergence_unproven();
         }
         if outcome.is_err()
             || causes.failed()
@@ -2078,7 +2251,7 @@ async fn bind_original_schedule(
     deadline: tokio::time::Instant,
     causes: &FutureCauses,
 ) -> Result<(), QueryExecutionError> {
-    let Some((owner, original)) = custody.activation_parts() else {
+    let Some((owner, original, original_health)) = custody.activation_parts() else {
         return Err(protocol(
             "original qualification binding owner is unavailable",
         ));
@@ -2087,31 +2260,34 @@ async fn bind_original_schedule(
         match catch_unwind(AssertUnwindSafe(|| {
             owner.poll_bind_qualification(schedule, cx)
         })) {
-            Ok(result) => result,
+            Ok(Poll::Ready(result)) => {
+                Poll::Ready(result.map_err(|failure| failure.into_query_error(original_health)))
+            }
+            Ok(Poll::Pending) => Poll::Pending,
             Err(payload) => {
                 *original = Some(payload);
-                Poll::Ready(Err(crate::api::NativeAttemptActivationFailure::new(
-                    novarocks_coordination_contract::ExecutionFailure::from_input(
-                        ExecutionFailureInput::new(
-                            QueryFailureReason::NativeFuturePanicked.failure_fact(),
-                            SafeDetail::truncating("Native qualification binding panicked"),
-                            ExecutionFailureSite::Coordinator,
-                        ),
-                    ),
-                )))
+                Poll::Ready(Err(panic_error("Native qualification binding panicked")))
             }
         }
     });
     let mut result = None;
-    poll_original(
+    let outcome = poll_original(
         Box::pin(binding),
         causes,
         Some(cancellation),
         Some(deadline),
         |value| result = Some(value),
     )
-    .await
-    .map_err(|error| {
+    .await;
+    // The original reported close failure precedes any secondary F Drop
+    // failure; both remain retained in their independent original slots.
+    if let Some(original) = custody.convergence_failure() {
+        return Err(QueryExecutionError::new(
+            QueryExecutionErrorKind::Failed,
+            original.detail(),
+        ));
+    }
+    outcome.map_err(|error| {
         wait_error(
             error,
             "Native replacement dependency binding was cancelled",
@@ -2119,9 +2295,7 @@ async fn bind_original_schedule(
             "Native qualification binding panicked",
         )
     })?;
-    result
-        .ok_or_else(|| protocol("Native binding returned no original result"))?
-        .map_err(|failure| failure.into_failure().error().clone())?;
+    result.ok_or_else(|| protocol("Native binding returned no original result"))??;
     if causes.failed() {
         return Err(panic_error(
             "Native qualification binding destruction panicked",
@@ -2130,50 +2304,42 @@ async fn bind_original_schedule(
     Ok(())
 }
 
-/// Compatibility only until P12 removes NativeAttemptTerminal from installed
-/// work waiting. Ordinary AP failure is never an independent Native run veto.
-fn project_run_terminal(
+/// Startup is mechanical work; AP terminal facts arrive through its original port.
+/// Protocol closure settles this callback without authoring Ready, successful
+/// execution, resource exit or an independent Native failure.
+fn project_start_result(
     activation: AttemptActivationIdentity,
-    terminal: Option<NativeAttemptTerminal>,
+    result: Option<Result<NativeAttemptStartupOutcome, QueryExecutionError>>,
     supervision_failed: bool,
 ) -> NativeFact {
-    match terminal {
-        Some(NativeAttemptTerminal::Failed(failure)) => {
-            let failure = FailureReport::from_attempt(&failure);
-            if supervision_failed {
-                NativeFact::NativeRunFailed {
-                    activation,
-                    failure,
-                }
-            } else {
-                NativeFact::Failed {
-                    execution: activation.execution(),
-                    failure,
-                }
-            }
-        }
-        Some(NativeAttemptTerminal::Completed) if !supervision_failed => {
-            NativeFact::RunCompleted { activation }
-        }
-        _ if supervision_failed => NativeFact::NativeRunFailed {
+    match result {
+        Some(Err(error)) => NativeFact::NativeRunFailed {
             activation,
-            failure: report(panic_error("Native attempt run panicked")),
+            failure: report(error),
         },
-        _ => failed(
-            activation.execution(),
-            protocol("Native original run returned without its result"),
-        ),
+        Some(Ok(
+            NativeAttemptStartupOutcome::Ready | NativeAttemptStartupOutcome::ClosedByProtocol,
+        )) if !supervision_failed => NativeFact::RunCompleted { activation },
+        _ => NativeFact::NativeRunFailed {
+            activation,
+            failure: report(if supervision_failed {
+                panic_error("Native attempt startup panicked")
+            } else {
+                protocol("Native original startup returned without its result")
+            }),
+        },
     }
 }
 fn start_activation<'a>(
     owner: &'a mut dyn crate::api::DormantNativeAttemptOwner,
+    activation_identity: AttemptActivationIdentity,
     schedule: &'a AttemptSchedule,
     admissions: Option<Box<[crate::coordination::ReplacementWorkerAdmissionEvidence]>>,
     cancellation: CancellationView,
     original_panic: &mut Option<PanicPayload>,
 ) -> Result<crate::api::NativeAttemptActivationFuture<'a>, QueryExecutionError> {
     match catch_unwind(AssertUnwindSafe(move || {
-        owner.activate(schedule, admissions, cancellation)
+        owner.activate(activation_identity, schedule, admissions, cancellation)
     })) {
         Ok(future) => Ok(future),
         Err(payload) => {
@@ -2572,7 +2738,7 @@ impl NativeExecutor {
         }
     }
     /// Refusals preserve the exact consumer/stream/reporter/activity in `incoming`.
-    pub(in crate::coordination) fn stage_consumer_in(
+    fn stage_consumer_in(
         &self,
         activation: AttemptActivationIdentity,
         incoming: &mut Option<OriginalConsumerStart>,
@@ -2742,3 +2908,36 @@ mod qualification_cleanup_tests;
 
 #[cfg(test)]
 mod cleanup_tests;
+
+/// Fixtures which do not install an AP must refuse every installed operation.
+/// They cannot produce a startup, Ready registration, or actual-exit receipt.
+#[cfg(test)]
+struct UnboundInstalledAttemptPort;
+#[cfg(test)]
+impl crate::api::NativeInstalledAttemptPort for UnboundInstalledAttemptPort {
+    fn start(
+        &self,
+        _: AttemptActivationIdentity,
+    ) -> LogicalFuture<'_, Result<NativeAttemptStartupOutcome, QueryExecutionError>> {
+        Box::pin(async { Err(protocol("original test attempt sources are not installed")) })
+    }
+    fn record_ready(
+        &self,
+        _: crate::api::ComputationReadyToken,
+    ) -> LogicalFuture<'_, Result<(), QueryExecutionError>> {
+        Box::pin(async { Err(protocol("original test attempt publisher is not installed")) })
+    }
+    fn resources_exited(
+        &self,
+        _: AttemptActivationIdentity,
+    ) -> LogicalFuture<'_, Result<(), crate::api::StatementNativeHealthFailure>> {
+        Box::pin(async {
+            Err(
+                crate::api::StatementNativeHealthFailure::actual_exit_unproven(
+                    "original test attempt sources are not installed",
+                    Arc::new(protocol("original test attempt sources are not installed")),
+                ),
+            )
+        })
+    }
+}

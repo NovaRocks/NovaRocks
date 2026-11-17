@@ -676,7 +676,7 @@ mod tests {
         query_execution::lifecycle_plan::QueryCredentialLeases,
         task_execution::sources::AttemptEstablishFacts,
     };
-    use novarocks_coordination_contract::AttemptAuthorization;
+    use novarocks_attempt_protocol::port_output::AttemptAuthorization;
     use novarocks_execution_contract::{
         AdmissionTicketId, LeaseSequence, LeaseValidFor, OperationEnvelope, OperationKind,
         ParticipationRef, RenewParticipationLease, UpdateParticipation,
@@ -686,6 +686,56 @@ mod tests {
         QueryId,
     };
     use std::time::Duration;
+
+    #[derive(Debug)]
+    struct PreparationOnlyContent {
+        original: Arc<dyn novarocks_execution_contract::CodecOwnedContent>,
+        forbidden: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl novarocks_execution_contract::CodecOwnedContent for PreparationOnlyContent {
+        fn fingerprint(&self) -> novarocks_execution_contract::ContentFingerprint {
+            assert!(
+                !self.forbidden.load(std::sync::atomic::Ordering::SeqCst),
+                "no opaque fingerprint getter on the Source poller"
+            );
+            self.original.fingerprint()
+        }
+        fn encoded_len(&self) -> usize {
+            assert!(
+                !self.forbidden.load(std::sync::atomic::Ordering::SeqCst),
+                "no opaque size getter on the Source poller"
+            );
+            self.original.encoded_len()
+        }
+        fn stored_representation(&self) -> Option<&(dyn std::any::Any + 'static)> {
+            self.original.stored_representation()
+        }
+    }
+    struct PreparationOnlyFacts<'a> {
+        original: &'a AttemptEstablishFacts,
+        forbidden: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl crate::task_execution::sources::ParticipationEstablishSource for PreparationOnlyFacts<'_> {
+        fn facts_for(
+            &self,
+            participation: ParticipationRef,
+        ) -> Result<
+            crate::task_execution::sources::ParticipationEstablishFacts,
+            crate::task_execution::error::TaskExecutionError,
+        > {
+            let mut original = self.original.facts_for(participation)?;
+            let wrap = |original| {
+                Arc::new(PreparationOnlyContent {
+                    original,
+                    forbidden: self.forbidden.clone(),
+                }) as Arc<dyn novarocks_execution_contract::CodecOwnedContent>
+            };
+            original.catalog_binding = wrap(original.catalog_binding);
+            original.initial_runtime_filter = wrap(original.initial_runtime_filter);
+            original.query_options = wrap(original.query_options);
+            Ok(original)
+        }
+    }
 
     #[test]
     fn establish_authorization_and_send_share_one_frozen_request() {
@@ -714,9 +764,15 @@ mod tests {
         )
         .unwrap();
         let mut next_payload = std::num::NonZeroU64::new(12).unwrap();
+        let forbidden = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guarded = PreparationOnlyFacts {
+            original: &original_facts,
+            forbidden: forbidden.clone(),
+        };
         let (quotes, material) =
-            AttemptEstablishMaterial::project(&original_facts, [first, second], &mut next_payload)
+            AttemptEstablishMaterial::project(&guarded, [first, second], &mut next_payload)
                 .unwrap();
+        forbidden.store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(next_payload.get(), 14);
         let material = Arc::new(material);
         let requests = FrozenSendRequests::with_establish(material.clone());
@@ -757,6 +813,17 @@ mod tests {
         let authorized = material.for_authorization(&passive, initial).unwrap();
         let replayed = material.for_authorization(&passive, replay).unwrap();
         assert!(Arc::ptr_eq(&authorized, &replayed));
+        let projected_facts = material
+            .authorization_facts(first, operation_id, NativeCompatibilityId::new([1; 32]))
+            .unwrap();
+        assert_eq!(projected_facts.ticket_id, authorized.admission_ticket_id());
+        assert!(
+            material
+                .authorization_facts(second, operation_id, NativeCompatibilityId::new([1; 32]))
+                .is_none()
+        );
+        forbidden.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(projected_facts.semantics, authorized.semantic_identity());
         assert!(matches!(
             requests.resolve(&intent(quotes[&first].material, 42)),
             Err(SendBindingError::WrongRequest)

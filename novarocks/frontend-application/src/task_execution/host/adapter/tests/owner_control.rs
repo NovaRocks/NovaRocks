@@ -22,7 +22,7 @@ use crate::control_runtime::{
     actor::TestActor,
     logical::adapter::{LogicalEffectEnvelope, LogicalHostEffect},
 };
-use novarocks_attempt_protocol::{effect::EffectBody, port_projection::project_logical_message};
+use novarocks_attempt_protocol::effect::EffectBody;
 use novarocks_control_runtime::actor_turn::{EffectTicket, InputPhase};
 use novarocks_control_runtime_core::effect::EffectState;
 use novarocks_coordination_contract::{
@@ -373,7 +373,7 @@ impl Fixture {
         }
         let mut inputs = Vec::new();
         for (ticket, message) in tickets.into_iter().zip(copies) {
-            let projected = project_logical_message(&message);
+            let projected = message.clone();
             let class = input_class(&AttemptInput::Port(projected.clone()));
             let role = self.role(runtime_source(self.sources.owner), class);
             let filled = self.runtime.fill_from_effect(
@@ -563,7 +563,7 @@ impl Fixture {
                     panic!("only the original terminal-demand reply precedes the seal")
                 };
                 assert!(
-                    matches!(original.body,novarocks_coordination_contract::AttemptToLogicalBody::TerminalControlResult{token,result:Ok(())} if token==AttemptRequestToken::new(positive(40)))
+                    matches!(original.body,novarocks_attempt_protocol::port_output::AttemptToLogicalBody::TerminalControlResult{token,result:Ok(())} if token==AttemptRequestToken::new(positive(40)))
                 );
                 let projected =
                     novarocks_attempt_protocol::port_projection::project_attempt_message(

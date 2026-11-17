@@ -99,8 +99,13 @@ pub(super) struct AttemptContext {
 #[derive(Default)]
 struct ScriptState {
     next: u64,
-    queue: VecDeque<(AttemptActionId, AttemptToLogicalBody)>,
+    queue: VecDeque<(
+        AttemptActionId,
+        Option<AttemptActivationIdentity>,
+        AttemptToLogicalBody,
+    )>,
     received: Vec<LogicalToAttempt>,
+    received_inputs: Vec<(InputId, LogicalToAttempt)>,
     published: Vec<AttemptActionId>,
     steps: usize,
     signal: Option<Weak<ScriptSignal>>,
@@ -118,10 +123,32 @@ impl AttemptScript {
         assert!(!s.closing, "closed original script producer");
         s.next = s.next.checked_add(1).expect("script action identity");
         let action = AttemptActionId::new(NonZeroU64::new(s.next).unwrap());
-        s.queue.push_back((action, body));
+        s.queue.push_back((action, None, body));
         drop(s);
         self.ping();
         action
+    }
+    /// Carry a message already decided by an independent pure AP Core.
+    /// Preserve its actual action and check its activation at the real actor.
+    pub(crate) fn enqueue_original(&self, original: AttemptToLogical) {
+        let mut s = self.0.lock().unwrap();
+        assert!(!s.closing, "closed original script producer");
+        assert!(
+            !s.original.contains_key(&original.action)
+                && !s
+                    .queue
+                    .iter()
+                    .any(|(action, _, _)| *action == original.action),
+            "the original AP action cannot be issued twice"
+        );
+        s.next = s.next.max(original.action.get());
+        s.queue
+            .push_back((original.action, Some(original.activation), original.body));
+        drop(s);
+        self.ping();
+    }
+    pub(crate) fn received_inputs(&self) -> Vec<(InputId, LogicalToAttempt)> {
+        self.0.lock().unwrap().received_inputs.clone()
     }
     pub(crate) fn received(&self) -> Vec<LogicalToAttempt> {
         self.0.lock().unwrap().received.clone()
@@ -216,13 +243,17 @@ impl TestActor for ScriptActor {
                 let AttemptInput::Port(original) = *value else {
                     panic!("script AP accepts original port input");
                 };
-                let projected = project_received(original);
+                let projected = original;
                 let root = matches!(
                     projected.body,
                     LogicalToAttemptBody::SealRequest { .. }
                         | LogicalToAttemptBody::TerminalControlDemand { .. }
                 );
-                self.script.0.lock().unwrap().received.push(projected);
+                {
+                    let mut s = self.script.0.lock().unwrap();
+                    s.received_inputs.push((envelope.input, projected.clone()));
+                    s.received.push(projected);
+                }
                 if root {
                     let author = step
                         .input_author()
@@ -245,9 +276,17 @@ impl TestActor for ScriptActor {
             FrontendInput::Test(_) => {}
             _ => panic!("unexpected original script AP input"),
         }
-        let Some((action, body)) = self.script.0.lock().unwrap().queue.pop_front() else {
+        let Some((action, original_activation, body)) =
+            self.script.0.lock().unwrap().queue.pop_front()
+        else {
             return;
         };
+        if let Some(original) = original_activation {
+            assert_eq!(
+                original, self.activation,
+                "the exact AP message belongs to this real actor"
+            );
+        }
         let guard = self
             .scope
             .reserve_child_next(
@@ -299,51 +338,15 @@ impl TestActor for ScriptActor {
     }
 }
 
-fn project_failure(original: AttemptFailure) -> novarocks_coordination_contract::ExecutionFailure {
-    match original {
-        AttemptFailure::Logical(original) => original,
-        other => {
-            novarocks_attempt_protocol::port_projection::project_failure(&other, &mut |_| None)
-                .unwrap()
-        }
-    }
-}
-fn project_received(
-    original: novarocks_coordination_contract::LogicalToAttempt<AttemptFailure>,
-) -> LogicalToAttempt {
-    use novarocks_coordination_contract::LogicalToAttemptBody as O;
-    let body = match original.body {
-        O::EstablishDetachReply { .. } => panic!("retired Detach adapter reply has no logical-port projection"),
-        O::AuthorizationReply {token,decision} => LogicalToAttemptBody::AuthorizationReply {token,decision:decision.map_err(|e|match e {
-            novarocks_coordination_contract::AttemptAuthorizationFailure::Rejected(f)=>novarocks_coordination_contract::logical_port::AttemptAuthorizationFailure::Rejected(project_failure(f)),
-            novarocks_coordination_contract::AttemptAuthorizationFailure::EstablishBudgetExhausted(f)=>novarocks_coordination_contract::logical_port::AttemptAuthorizationFailure::EstablishBudgetExhausted(project_failure(f)),
-        })},
-        O::EstablishSettlementReply {token,authorization,result}=>LogicalToAttemptBody::EstablishSettlementReply {token,authorization,result:result.map_err(project_failure)},
-        O::PreReadyReplacementReply {token,may_observe}=>LogicalToAttemptBody::PreReadyReplacementReply {token,may_observe},
-        O::PreReadyReplacementOwnerFailed {token,failure}=>LogicalToAttemptBody::PreReadyReplacementOwnerFailed {token,failure:project_failure(failure)},
-        O::PreReadyReplacementChanged {token}=>LogicalToAttemptBody::PreReadyReplacementChanged {token},
-        O::Abort {action,request}=>LogicalToAttemptBody::Abort {action,request},
-        O::Stop {reason,failure}=>LogicalToAttemptBody::Stop {reason,failure:project_failure(failure)},
-        O::SealRequest {token}=>LogicalToAttemptBody::SealRequest {token},
-        O::TerminalControlDemand {token,root}=>LogicalToAttemptBody::TerminalControlDemand {token,root},
-        O::BeginConvergence {mode,remote_deadline,computation_ready,retain_diagnostics}=>LogicalToAttemptBody::BeginConvergence {mode,remote_deadline,computation_ready,retain_diagnostics},
-    };
-    LogicalToAttempt {
-        activation: original.activation,
-        body,
-    }
-}
 fn script_protocol(
     message: &AttemptToLogical,
-) -> novarocks_coordination_contract::AttemptToLogical<AttemptFailure> {
-    use novarocks_coordination_contract::{
-        AttemptToLogicalBody as O, logical_port::AttemptTerminal as T,
-    };
+) -> novarocks_attempt_protocol::port_output::AttemptToLogical<AttemptFailure> {
+    use novarocks_attempt_protocol::port_output::AttemptToLogicalBody as O;
+    use novarocks_coordination_contract::logical_port::AttemptTerminal as T;
     let body = match &message.body {
         AttemptToLogicalBody::AuthorizationRequest { token, request } => {
-            use novarocks_coordination_contract::{
-                AttemptAuthorization as A, logical_port::AttemptAuthorization as N,
-            };
+            use novarocks_attempt_protocol::port_output::AttemptAuthorization as A;
+            use novarocks_coordination_contract::logical_port::AttemptAuthorization as N;
             let request = match request {
                 N::BeginAdmission(r) => A::BeginAdmission(*r),
                 N::SettleAdmission {
@@ -411,12 +414,12 @@ fn script_protocol(
             lifecycle_runtime_filters: lifecycle_runtime_filters.clone(),
         },
         AttemptToLogicalBody::AttemptTerminal(terminal) => O::AttemptTerminal(match terminal {
-            T::Completed => novarocks_coordination_contract::AttemptTerminal::Completed,
-            T::Failed(f) => novarocks_coordination_contract::AttemptTerminal::Failed(
+            T::Completed => novarocks_attempt_protocol::port_output::AttemptTerminal::Completed,
+            T::Failed(f) => novarocks_attempt_protocol::port_output::AttemptTerminal::Failed(
                 AttemptFailure::Logical(f.clone()),
             ),
             T::Stopped { reason, failure } => {
-                novarocks_coordination_contract::AttemptTerminal::Stopped {
+                novarocks_attempt_protocol::port_output::AttemptTerminal::Stopped {
                     reason: *reason,
                     failure: AttemptFailure::Logical(failure.clone()),
                 }
@@ -444,7 +447,7 @@ fn script_protocol(
             panic!("script Abort settlement requires an original physical receipt backend")
         }
     };
-    novarocks_coordination_contract::AttemptToLogical {
+    novarocks_attempt_protocol::port_output::AttemptToLogical {
         activation: message.activation,
         action: message.action,
         body,
@@ -643,7 +646,6 @@ impl AttemptBackend {
                 .copied()
                 .map(|p| (p, reserve(InputClass::Control))),
         ));
-        let abort_retirement = abort.retirement();
         let (startup_source, startup) =
             AttemptStartupSource::new(registration.clone(), startup_role);
         let mut startup_source = ConstructionOriginal::new(startup_source);
@@ -825,7 +827,7 @@ impl AttemptBackend {
             facts,
             reader: reader.take(),
             abort,
-            abort_retirement,
+            abort_retirement: None,
             endpoints: endpoints.clone(),
             closing: false,
             producer_exited: false,
@@ -856,7 +858,8 @@ impl AttemptBackend {
                 startup: None,
                 capacity: None,
                 membership: None,
-                owner_controls: None,
+
+                local_exit: None,
             })
             .unwrap_or_else(|original| {
                 let reason = original.reason;
@@ -867,7 +870,10 @@ impl AttemptBackend {
         loan.bind_registered(&registration, &exit);
         loan.bind_endpoints(endpoints.clone());
         drop(loan);
-        runtime.notify_host_actor(&registration).unwrap();
+        endpoints
+            .startup()
+            .release_initialization(&runtime)
+            .unwrap();
         AttemptCase {
             activation,
             script,
@@ -1022,7 +1028,7 @@ struct ScriptSource {
     facts: Arc<AttemptFactBank>,
     reader: ControlReaderObligation,
     abort: Arc<AttemptAbortIngress>,
-    abort_retirement: AbortIngressRetirement,
+    abort_retirement: Option<AbortIngressRetirement>,
     endpoints: Arc<AttemptPortEndpoints>,
     closing: bool,
     producer_exited: bool,
@@ -1352,7 +1358,7 @@ impl EffectSource for ScriptSource {
             state.fact_inputs.push(input);
         }
         drop(state);
-        Ok(PreparedEffectBinding::Retained)
+        Ok(PreparedEffectBinding::Retained { transport: None })
     }
     fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>) {
         let index = self.pending.take().unwrap();
@@ -1361,7 +1367,7 @@ impl EffectSource for ScriptSource {
     }
     fn core_consumed(&mut self, inputs: &[InputId]) {
         self.startup.indexed(inputs);
-        self.reader.index_committed(inputs).unwrap();
+        self.reader.index_committed(&self.runtime, inputs).unwrap();
         if self.trigger_input.is_some_and(|id| inputs.contains(&id)) {
             self.trigger_indexed = true;
         }
@@ -1550,7 +1556,10 @@ impl ScriptSource {
                     if (self.closing || failed) && quiescent && !self.producer_exited {
                         self.producer_exited = true;
                         self.endpoints.original_producer_exited();
-                        self.abort.close_external();
+                        // Creating this cursor closes the SAME original Abort intake.
+                        // Keep it open until this actual producer-exit transition.
+                        assert!(self.abort_retirement.is_none());
+                        self.abort_retirement = Some(self.abort.retirement());
                         self.requests.close_admission();
                         progressed = true;
                     }
@@ -1569,7 +1578,13 @@ impl ScriptSource {
                                 progressed = true;
                             }
                         }
-                        match self.abort_retirement.progress().unwrap() {
+                        match self
+                            .abort_retirement
+                            .as_mut()
+                            .expect("the original producer-exit transition closed Abort intake")
+                            .progress()
+                            .unwrap()
+                        {
                             AbortIngressRetirementProgress::Advanced => {
                                 progressed = true;
                                 more = true;

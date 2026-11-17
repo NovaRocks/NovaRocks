@@ -26,7 +26,7 @@ use super::{
     NativeLogicalExecutionSeed,
 };
 use crate::admitted_query_context::QueryResultCapacityBinding;
-use crate::coordination::{AbortParticipationEffectPort, ReplacementQualificationEffectPort};
+use crate::coordination::ReplacementQualificationEffectPort;
 use crate::preparation::{ExecutionFinishBoundary, FrozenExecutionDescription};
 
 /// A product-independent query operation.
@@ -42,6 +42,13 @@ pub struct QueryExecutionRequest {
 }
 
 impl QueryExecutionRequest {
+    /// Bind the SAME per-request FE installer and original observation owner.
+    /// This does not install an actor or admit any Native work.
+    pub fn with_logical_runtime(mut self, runtime: crate::api::LogicalRuntimeComposition) -> Self {
+        self.native_seed.bind_runtime(runtime);
+        self
+    }
+
     pub const fn kind(&self) -> QueryExecutionKind {
         self.description.kind()
     }
@@ -56,16 +63,11 @@ impl QueryExecutionRequest {
     /// the open ticket minted for that logical execution.
     pub fn bind_native(
         description: FrozenExecutionDescription,
-        aborts: Arc<dyn AbortParticipationEffectPort>,
         replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
         attempts: impl NativeAttemptPreparationPort,
     ) -> Self {
-        let native_seed = NativeLogicalExecutionSeed::issue(
-            description.plan_identity(),
-            aborts,
-            replacements,
-            attempts,
-        );
+        let native_seed =
+            NativeLogicalExecutionSeed::issue(description.plan_identity(), replacements, attempts);
         Self {
             description,
             native_seed,
@@ -209,7 +211,8 @@ pub use novarocks_coordination_contract::{QueryExecutionError, QueryExecutionErr
 pub use crate::coordination::{
     LocalExecutionDisposition, LogicalActorExitPhase, LogicalExecutionExitObserver,
     LogicalExecutionExitReceipt, LogicalExecutionExitView, LogicalExecutionStartAttempt,
-    OriginalBackgroundActionInput, OriginalLogicalStartInput, RemoteExecutionDisposition,
+    LogicalOwnerFailureObservation, OriginalBackgroundActionInput, OriginalLogicalStartInput,
+    RemoteExecutionDisposition,
 };
 
 pub type QueryExecutionFuture = Pin<

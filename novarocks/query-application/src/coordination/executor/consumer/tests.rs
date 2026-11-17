@@ -52,6 +52,106 @@ fn carrier() -> RootCarrier {
         client_rows: None,
     }
 }
+
+#[tokio::test]
+async fn exit_registration_refusals_preserve_original_fact_and_first_consumer_receiver() {
+    use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason, domain};
+    let owner = Arc::new(
+        ConsumerExecutor::new_internal(carrier(), plan(), NonZeroUsize::MIN, None).unwrap(),
+    );
+    let a = activation(1);
+    let r = root(a);
+    let original = owner.bind_internal(a, r).unwrap();
+    let seal = owner.lock().internal.get(&key(a)).unwrap().seal.clone();
+    let port = RuntimeReadyPort {
+        owner: Arc::downgrade(&owner),
+        seal: seal.clone(),
+    };
+    let (first, receiver) = oneshot::channel();
+    port.supervise_exit(receiver).await.unwrap();
+    let (_, duplicate) = oneshot::channel();
+    let duplicate_error = port.supervise_exit(duplicate).await.unwrap_err();
+    let foreign_seal = RuntimeReadyPort {
+        owner: Arc::downgrade(&owner),
+        seal: Arc::new(InternalConsumerSeal {
+            activation: a,
+            root: r,
+            plan: plan(),
+        }),
+    };
+    let (_, foreign) = oneshot::channel();
+    let foreign_error = foreign_seal.supervise_exit(foreign).await.unwrap_err();
+    let absent = RuntimeReadyPort {
+        owner: Arc::downgrade(&owner),
+        seal: Arc::new(InternalConsumerSeal {
+            activation: activation(2),
+            root: root(activation(2)),
+            plan: plan(),
+        }),
+    };
+    let (_, missing) = oneshot::channel();
+    let missing_error = absent.supervise_exit(missing).await.unwrap_err();
+    let closed = RuntimeReadyPort {
+        owner: Weak::new(),
+        seal,
+    };
+    let (_, receiver) = oneshot::channel();
+    let closed_error = closed.supervise_exit(receiver).await.unwrap_err();
+    let first_exit = owner
+        .lock()
+        .internal
+        .get(&key(a))
+        .unwrap()
+        .exit
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(first_exit.peek().is_none());
+    let actual_error = protocol("actual original consumer exit failure");
+    first.send(Err(actual_error.clone())).unwrap();
+    assert_eq!(first_exit.await, Some(Err(actual_error)));
+    drop(original);
+    for (error, code, stop, detail) in [
+        (
+            closed_error,
+            50,
+            true,
+            "logical execution actor mailbox is closed",
+        ),
+        (
+            missing_error,
+            52,
+            false,
+            "attempt authority names a different logical execution",
+        ),
+        (
+            duplicate_error,
+            57,
+            false,
+            "logical execution actor invariant was violated",
+        ),
+        (
+            foreign_error,
+            57,
+            false,
+            "logical execution actor invariant was violated",
+        ),
+    ] {
+        let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
+        let expected = if stop {
+            FailureFact::stop_observation(reason)
+        } else {
+            FailureFact::new(FailureClass::Invariant, reason)
+        };
+        let input = error.execution_failure().unwrap();
+        assert_eq!(input.fact(), expected);
+        assert_eq!(input.detail(), &SafeDetail::truncating(detail));
+        assert_eq!(
+            input.site(),
+            novarocks_coordination_contract::ExecutionFailureSite::Coordinator
+        );
+    }
+}
 fn client() -> ConsumerExecutor {
     ConsumerExecutor::new_client(
         QueryId::new(19, 23),
@@ -209,9 +309,14 @@ async fn supervised_failure_preserves_the_exact_original_ready_and_payload() {
     exercise_original_ready_handoff(true).await;
 }
 async fn exercise_original_ready_handoff(supervise: bool) {
+    let (_control, _work, original_start, mut start_result) = completion();
+    let start = original_start.lock().start_reply.take().unwrap();
     let owner = Arc::new(
-        ConsumerExecutor::new_internal(carrier(), plan(), NonZeroUsize::MIN, None).unwrap(),
+        ConsumerExecutor::new_internal(carrier(), plan(), NonZeroUsize::MIN, None)
+            .unwrap()
+            .with_start_reply(start.requester, start.reply.unwrap()),
     );
+    assert!(poll_once(Pin::new(&mut start_result)).await.is_pending());
     let a = activation(1);
     let r = root(a);
     let (facts, mut observed) = mpsc::unbounded_channel();
@@ -290,6 +395,7 @@ async fn exercise_original_ready_handoff(supervise: bool) {
         convergence_deadline: now,
         end: end(),
     };
+    assert_eq!(owner.original_ready_promise(a).unwrap(), None);
     assert!(matches!(
         owner
             .execute(ConsumerEffect::PublishReady {
@@ -301,6 +407,21 @@ async fn exercise_original_ready_handoff(supervise: bool) {
         ConsumerFact::ReadyHandedOff
     ));
     let accepted = accept.await.unwrap();
+    assert_eq!(owner.original_ready_promise(a).unwrap(), Some(accepted));
+    assert_eq!(
+        owner.original_ready_promise(self::activation(2)).unwrap(),
+        None
+    );
+    let mut actual_start = start_result.await.unwrap().unwrap();
+    assert_eq!(actual_start.ready_token(), Some(&accepted));
+    assert!(
+        actual_start.take_output().is_none(),
+        "Internal Ready is not a client row stream"
+    );
+    assert!(
+        actual_start.take_exit_observer().is_none(),
+        "Ready handoff does not create actual exit"
+    );
     assert_eq!(accepted.end(), end());
     if supervise {
         assert!(matches!(
@@ -327,6 +448,7 @@ async fn exercise_original_ready_handoff(supervise: bool) {
         assert!(original.failure.borrow().is_none());
         assert!(matches!(*original.ready.borrow(), Some(Ok(token)) if token == accepted));
     }
+    assert_eq!(owner.original_ready_promise(a).unwrap(), Some(accepted));
     assert_eq!(owner.wait_internal_ready(a).await.unwrap(), accepted);
     assert_eq!(accepted.root(), r);
     exit.complete(Ok(()));
@@ -780,7 +902,7 @@ async fn published_completion_cannot_be_replaced_by_late_cleanup_failure() {
         Some(ExecutionOutput::Completion)
     ));
     assert!(matches!(
-        owner.lock().completion.as_ref().unwrap().published,
+        owner.lock().start_reply.as_ref().unwrap().published,
         Some(Ok(()))
     ));
 }
@@ -793,7 +915,7 @@ async fn completion_receiver_cancellation_does_not_fabricate_a_new_result_failur
         ConsumerFact::Applied
     ));
     assert!(matches!(
-        owner.lock().completion.as_ref().unwrap().published,
+        owner.lock().start_reply.as_ref().unwrap().published,
         Some(Ok(()))
     ));
 }
@@ -954,7 +1076,7 @@ async fn supervised_failure_preserves_original_completion_promise() {
         Some(ExecutionOutput::Completion)
     ));
     assert!(matches!(
-        owner.lock().completion.as_ref().unwrap().published,
+        owner.lock().start_reply.as_ref().unwrap().published,
         Some(Ok(()))
     ));
     assert!(!owner.fail_one_supervised_request());
@@ -1157,7 +1279,7 @@ impl std::task::Wake for ReenterOriginalFailureWake {
                 assert!(original.ready_issued.is_none());
             }
             FailureWakeDestination::Completion => {
-                assert!(matches!(&state.completion.as_ref().unwrap().published,
+                assert!(matches!(&state.start_reply.as_ref().unwrap().published,
                     Some(Err(error)) if error == &self.original));
             }
         }
@@ -1303,7 +1425,7 @@ async fn ordinary_completion_failure_sends_original_reply_outside_lock_before_re
     assert!(matches!(receiver.await.unwrap(), Err(error) if error == original));
     assert_eq!(owner.lock().supervision, Some(supervision));
     assert!(
-        matches!(&owner.lock().completion.as_ref().unwrap().published,
+        matches!(&owner.lock().start_reply.as_ref().unwrap().published,
         Some(Err(error)) if error == &original)
     );
     assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1447,4 +1569,225 @@ async fn promised_client_business_failure_survives_supervision_before_actual_not
     notify_original_failure(&sender, promised);
     assert_eq!(output.next().await.err(), Some(original));
     assert_eq!(owner.lock().supervision, Some(supervision));
+}
+
+#[tokio::test]
+async fn original_client_start_reply_waits_for_expose_and_moves_the_same_stream_once() {
+    let (_control, original, original_start, mut response) = completion();
+    let start = original_start.lock().start_reply.take().unwrap();
+    let owner = client().with_start_reply(start.requester, start.reply.unwrap());
+    assert!(poll_once(Pin::new(&mut response)).await.is_pending());
+    assert!(matches!(
+        owner.execute(ConsumerEffect::PublishCompletion).await,
+        ConsumerFact::Failed(_)
+    ));
+    assert!(
+        poll_once(Pin::new(&mut response)).await.is_pending(),
+        "a refused completion cannot consume the original row reply"
+    );
+    assert!(matches!(
+        owner
+            .execute(ConsumerEffect::ExposeOutput {
+                activation: activation(1)
+            })
+            .await,
+        ConsumerFact::OutputExposed
+    ));
+    let mut output = response.await.unwrap().unwrap();
+    assert!(matches!(
+        output.take_output(),
+        Some(ExecutionOutput::Rows(_))
+    ));
+    assert!(
+        owner.take_exposed_output().is_none(),
+        "the original stream has one recipient"
+    );
+    assert!(output.ready_token().is_none());
+    assert!(output.take_exit_observer().is_none());
+    output.request_cancel().unwrap();
+    assert_eq!(
+        original.owner.scope().cancellation().unwrap().reason(),
+        Some(novarocks_workload_control::CancellationReason::Requested)
+    );
+    owner.begin_supervised_failure(protocol("late original owner failure"));
+    assert!(matches!(
+        owner.lock().start_reply.as_ref().unwrap().published,
+        Some(Ok(()))
+    ));
+}
+
+#[tokio::test]
+async fn original_client_start_failure_keeps_its_cause_and_cannot_become_exposed_output() {
+    let (_control, _original, original_start, response) = completion();
+    let start = original_start.lock().start_reply.take().unwrap();
+    let owner = client().with_start_reply(start.requester, start.reply.unwrap());
+    let error = protocol("original client failure before exposure");
+    assert!(matches!(
+        owner
+            .execute(ConsumerEffect::PublishFailure(error.clone()))
+            .await,
+        ConsumerFact::Applied
+    ));
+    assert!(matches!(response.await.unwrap(), Err(original) if original == error));
+    assert!(
+        matches!(owner.execute(ConsumerEffect::ExposeOutput { activation: activation(1) }).await, ConsumerFact::Failed(original) if original == error)
+    );
+    assert!(!owner.lock().exposed);
+    assert!(owner.take_exposed_output().is_none());
+}
+
+// Physical component tier only. The same-bank isolation half is tested in the
+// supervisor bank regression; no Logical/Native exit is inferred here.
+#[tokio::test]
+async fn ordinary_completion_reply_waker_panic_preserves_actual_raw_payload_and_first_business_promise()
+ {
+    use std::sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct RawReplyCause(Arc<AtomicUsize>);
+    impl Drop for RawReplyCause {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct ActualReplyWake {
+        owner: std::sync::Weak<ConsumerExecutor>,
+        expected: QueryExecutionError,
+        original: Mutex<Option<Box<RawReplyCause>>>,
+        calls: AtomicUsize,
+        observed_same_promise: std::sync::atomic::AtomicBool,
+    }
+    impl std::task::Wake for ActualReplyWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let observed = {
+                let owner = self.owner.upgrade().unwrap();
+                let state = owner.lock();
+                matches!(&state.start_reply.as_ref().unwrap().published,
+                    Some(Err(error)) if error == &self.expected)
+            };
+            self.observed_same_promise.store(observed, Ordering::SeqCst);
+            let original = { self.original.lock().unwrap().take() };
+            if let Some(original) = original {
+                std::panic::panic_any(original);
+            }
+        }
+    }
+    struct Originals {
+        control: novarocks_workload_control::WorkloadControl,
+        root: Option<novarocks_workload_control::RootWork>,
+        owner: Option<Arc<ConsumerExecutor>>,
+        receiver: Option<oneshot::Receiver<Result<ExecutionOutputObligation, QueryExecutionError>>>,
+        publication: Option<Pin<Box<dyn Future<Output = ConsumerFact> + Send>>>,
+        original_panic: Option<Box<dyn std::any::Any + Send>>,
+        wake: Arc<ActualReplyWake>,
+    }
+    struct PreserveWhole(Option<Box<Originals>>);
+    impl Drop for PreserveWhole {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                static ORIGINALS: OnceLock<Mutex<Vec<Box<dyn std::any::Any + Send>>>> =
+                    OnceLock::new();
+                if let Some(original) = self.0.take() {
+                    ORIGINALS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(original);
+                }
+            }
+        }
+    }
+    let (control, root, owner, receiver) = completion();
+    let owner = Arc::new(owner);
+    let original = protocol("ordinary original business failure before reply wake");
+    let drops = Arc::new(AtomicUsize::new(0));
+    let raw = Box::new(RawReplyCause(drops.clone()));
+    let pointer = (&*raw as *const RawReplyCause) as usize;
+    let wake = Arc::new(ActualReplyWake {
+        owner: Arc::downgrade(&owner),
+        expected: original.clone(),
+        original: Mutex::new(Some(raw)),
+        calls: AtomicUsize::new(0),
+        observed_same_promise: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut keep = PreserveWhole(Some(Box::new(Originals {
+        control,
+        root: Some(root),
+        owner: Some(owner),
+        receiver: Some(receiver),
+        publication: None,
+        original_panic: None,
+        wake,
+    })));
+    let actual = keep.0.as_deref_mut().unwrap();
+    let waker = std::task::Waker::from(actual.wake.clone());
+    assert!(
+        Pin::new(actual.receiver.as_mut().unwrap())
+            .poll(&mut std::task::Context::from_waker(&waker),)
+            .is_pending()
+    );
+    let producer = actual.owner.as_ref().unwrap().clone();
+    let cause = original.clone();
+    actual.publication = Some(Box::pin(async move {
+        producer
+            .execute(ConsumerEffect::PublishFailure(cause))
+            .await
+    }));
+    // Standalone API catch only: production supplies the credentialed job
+    // boundary. This does not claim CommonHost can recover a synchronous panic.
+    actual.original_panic = Some(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            actual
+                .publication
+                .as_mut()
+                .unwrap()
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        }))
+        .expect_err("the actual original reply Waker throws"),
+    );
+    let raw = actual
+        .original_panic
+        .as_ref()
+        .unwrap()
+        .downcast_ref::<Box<RawReplyCause>>()
+        .unwrap();
+    assert_eq!((&**raw as *const RawReplyCause) as usize, pointer);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(actual.wake.calls.load(Ordering::SeqCst), 1);
+    assert!(actual.wake.observed_same_promise.load(Ordering::SeqCst));
+    drop(actual.publication.take());
+    assert!(
+        matches!(actual.receiver.take().unwrap().await.unwrap(), Err(error) if error == original)
+    );
+    let later = protocol("later original owner supervision");
+    actual
+        .owner
+        .as_ref()
+        .unwrap()
+        .begin_supervised_failure(later.clone());
+    assert_eq!(
+        actual.owner.as_ref().unwrap().lock().supervision,
+        Some(later)
+    );
+    assert!(
+        matches!(&actual.owner.as_ref().unwrap().lock().start_reply.as_ref().unwrap().published,
+        Some(Err(error)) if error == &original)
+    );
+    assert_eq!(actual.wake.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(actual.original_panic.take()); // Explicit disposition of this same raw object.
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop(actual.owner.take());
+    let scope = actual.root.as_ref().unwrap().owner.scope();
+    let root = actual.root.take().unwrap();
+    root.business.release();
+    root.owner.complete();
+    scope.wait_released().await;
+    assert_eq!(actual.control.snapshot().root_responsibilities, 0);
 }

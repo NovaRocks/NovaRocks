@@ -75,16 +75,7 @@ impl TestActor for Emitter {
         .unwrap();
     }
 }
-type Recorded = Arc<
-    Mutex<
-        Vec<(
-            InputId,
-            novarocks_coordination_contract::LogicalToAttempt<
-                novarocks_attempt_protocol::failure::AttemptFailure,
-            >,
-        )>,
-    >,
->;
+type Recorded = Arc<Mutex<Vec<(InputId, novarocks_coordination_contract::LogicalToAttempt)>>>;
 struct Receiver(Recorded);
 impl TestActor for Receiver {
     fn handle(
@@ -98,6 +89,13 @@ impl TestActor for Receiver {
         let FrontendInput::Attempt(value) = value else {
             panic!("only recipient control commands");
         };
+        // Use the actual production recipient classification, independently
+        // of the paid role selected by the original publisher/reader.
+        assert_eq!(
+            envelope.class,
+            crate::task_execution::host::adapter::input_class(&value),
+            "the real AP accepts this original paid mailbox class"
+        );
         let AttemptInput::Port(value) = *value else {
             panic!("original port command");
         };
@@ -355,13 +353,7 @@ impl Fixture {
         }
         panic!("finite control pass must not restart itself");
     }
-    pub(crate) fn consume(
-        &mut self,
-    ) -> Vec<
-        novarocks_coordination_contract::LogicalToAttempt<
-            novarocks_attempt_protocol::failure::AttemptFailure,
-        >,
-    > {
+    pub(crate) fn consume(&mut self) -> Vec<novarocks_coordination_contract::LogicalToAttempt> {
         for _ in 0..16 {
             if !self.runtime.poll_one(Tick(2)).unwrap() {
                 break;
@@ -369,7 +361,7 @@ impl Fixture {
         }
         let seen = std::mem::take(&mut *self.seen.lock().unwrap());
         let inputs: Vec<_> = seen.iter().map(|(id, _)| *id).collect();
-        self.reader.index_committed(&inputs).unwrap();
+        self.reader.index_committed(&self.runtime, &inputs).unwrap();
         seen.into_iter().map(|(_, value)| value).collect()
     }
     pub(crate) fn reply(
@@ -519,11 +511,7 @@ fn direct_stop_uses_the_original_lp_ticket_and_cannot_fake_reader_exit() {
         *reason,
         novarocks_coordination_contract::AttemptStopReason::Deadline
     );
-    assert_eq!(
-        novarocks_attempt_protocol::port_projection::project_failure(projected, &mut |_| None)
-            .unwrap(),
-        failure
-    );
+    assert_eq!(projected, &failure);
     f.pass(1);
     f.finish();
 }
@@ -725,6 +713,17 @@ fn original_failed_owner_session_stops_once_and_preserves_an_existing_stop() {
     use novarocks_control_runtime::actor_turn::FailureSourceState;
     for existing in [false, true] {
         let mut f = std::mem::ManuallyDrop::new(Fixture::new());
+        let cut = AttemptComputationCut {
+            activation: f.activation,
+            root: f.root,
+            cut: at(10),
+            diagnostic_deadline: at(50),
+            convergence_deadline: at(70),
+            end: novarocks_execution_contract::root_result::RootResultEnd {
+                sequence: NonZeroU64::MIN,
+                output_rows: 9,
+            },
+        };
         let failure = novarocks_coordination_contract::ExecutionFailure::from_input(
             novarocks_coordination_contract::ExecutionFailureInput::new(
                 novarocks_coordination_contract::QueryFailureReason::ActorProtocol.failure_fact(),
@@ -733,6 +732,12 @@ fn original_failed_owner_session_stops_once_and_preserves_an_existing_stop() {
             ),
         );
         if existing {
+            f.publish(LogicalToAttemptBody::BeginConvergence {
+                mode: AttemptConvergenceMode::Normal,
+                remote_deadline: at(60),
+                computation_ready: Some(cut),
+                retain_diagnostics: false,
+            });
             let message = f.message(LogicalToAttemptBody::Stop {
                 reason: novarocks_coordination_contract::AttemptStopReason::Deadline,
                 failure: failure.clone(),
@@ -785,11 +790,63 @@ fn original_failed_owner_session_stops_once_and_preserves_an_existing_stop() {
                 .unwrap(),
             receipt
         );
+        let cleanup_command = ConvergenceCommand {
+            mode: AttemptConvergenceMode::Cleanup,
+            remote_deadline: at(80),
+            // An earlier normal packet supplies its exact cut even if the
+            // failed Native RecordReady job has not first-polled yet.
+            computation_ready: (!existing).then_some(cut),
+            retain_diagnostics: true,
+        };
+        let cleanup_receipt = f
+            .slot
+            .publish_owner_failed_convergence(&f.runtime, &mut session, cleanup_command)
+            .unwrap();
+        assert_eq!(
+            f.slot
+                .publish_owner_failed_convergence(
+                    &f.runtime,
+                    &mut session,
+                    ConvergenceCommand {
+                        remote_deadline: at(200),
+                        ..cleanup_command
+                    }
+                )
+                .unwrap(),
+            cleanup_receipt
+        );
+        let mut foreign = cut;
+        foreign.end.output_rows += 1;
+        assert!(matches!(
+            f.slot.publish_owner_failed_convergence(
+                &f.runtime,
+                &mut session,
+                ConvergenceCommand {
+                    computation_ready: Some(foreign),
+                    ..cleanup_command
+                }
+            ),
+            Err(PortControlError::ConflictingCut)
+        ));
         assert!(!f.runtime.snapshot(f.ap.actor()).unwrap().failed);
+        f.pass(3);
         let seen = f.consume();
-        assert_eq!(seen.len(), 1);
-        let novarocks_coordination_contract::LogicalToAttemptBody::Stop { reason, .. } =
-            &seen[0].body
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().any(|input| matches!(input.body,
+            novarocks_coordination_contract::LogicalToAttemptBody::BeginConvergence {
+                mode: AttemptConvergenceMode::Cleanup, remote_deadline, computation_ready: Some(original), retain_diagnostics: true,
+            } if original == cut && remote_deadline == if existing { at(60) } else { at(70) }
+        )));
+        let novarocks_coordination_contract::LogicalToAttemptBody::Stop { reason, .. } = &seen
+            .iter()
+            .find(|input| {
+                matches!(
+                    input.body,
+                    novarocks_coordination_contract::LogicalToAttemptBody::Stop { .. }
+                )
+            })
+            .unwrap()
+            .body
         else {
             panic!("same original Stop command");
         };

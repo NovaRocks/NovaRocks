@@ -146,6 +146,12 @@ enum Receiving {
     Taken(ComputationReadyToken),
 }
 struct Holder {
+    #[cfg(all(test, novarocks_dev_controls))]
+    pre_union_gate: Mutex<Option<Arc<component_tests::OriginalPreUnionGate>>>,
+    #[cfg(all(test, novarocks_dev_controls))]
+    body_applied: std::sync::OnceLock<()>,
+    #[cfg(all(test, novarocks_dev_controls))]
+    decoded_end: std::sync::OnceLock<RootResultEnd>,
     receiving: Mutex<Receiving>,
     cpu: Arc<DomainCpuCustody>,
     session: Arc<ConnectorWriteSession>,
@@ -294,6 +300,12 @@ pub(crate) fn write_computation_consumer(
         )?,
     };
     let holder = Arc::new(Holder {
+        #[cfg(all(test, novarocks_dev_controls))]
+        pre_union_gate: Mutex::new(None),
+        #[cfg(all(test, novarocks_dev_controls))]
+        body_applied: std::sync::OnceLock::new(),
+        #[cfg(all(test, novarocks_dev_controls))]
+        decoded_end: std::sync::OnceLock::new(),
         receiving: Mutex::new(Receiving::Vacant),
         cpu,
         session: seed.session,
@@ -444,7 +456,13 @@ impl InternalComputationConsumer for WriteComputationConsumer {
                         Some(InternalResultDelivery::Segment(delivery)) => {
                             let (reply, consumed) = delivery.into_parts();
                             match holder.cpu.apply_body(reply).await {
-                                Ok(()) => consumed.complete(),
+                                Ok(()) => {
+                                    consumed.complete();
+                                    #[cfg(all(test, novarocks_dev_controls))]
+                                    {
+                                        let _ = holder.body_applied.set(());
+                                    }
+                                }
                                 Err(error) => {
                                     consumed.fail(error.clone());
                                     return Err(error);
@@ -474,6 +492,10 @@ impl InternalComputationConsumer for WriteComputationConsumer {
                 };
                 let original_end = end.end();
                 let decoded = end.complete().await?;
+                #[cfg(all(test, novarocks_dev_controls))]
+                {
+                    let _ = holder.decoded_end.set(original_end);
+                }
                 wait_write(
                     &mut tracker,
                     &mut protocol,
@@ -482,6 +504,15 @@ impl InternalComputationConsumer for WriteComputationConsumer {
                     &mut stream,
                 )
                 .await?;
+                // Pause only this original test consumer before its second
+                // CPU action. No lock or original input is lent across wait.
+                #[cfg(all(test, novarocks_dev_controls))]
+                {
+                    let gate = { holder.pre_union_gate.lock().unwrap().clone() };
+                    if let Some(gate) = gate {
+                        gate.wait().await;
+                    }
+                }
                 // Pure receiving/union work executes in the existing finite
                 // CPU lane and moves the SAME payload into the stable session.
                 holder

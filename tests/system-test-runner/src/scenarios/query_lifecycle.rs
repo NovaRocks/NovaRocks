@@ -379,7 +379,11 @@ impl DistributedBaseline {
                     let sql = format!(
                         "CALL test_control_probe.system.novarocks_imv_stateless_rebuild(table => 'ns.mv', level => '{level}')"
                     );
-                    match session.execute(&sql) {
+                    let case = format!("binary CALL {level}");
+                    context.action(format!("ordinary baseline CASE={case} starting"));
+                    match session.execute_observed(&sql, |phase, trace| {
+                        eprintln!("ordinary baseline CASE={case} phase={phase} trace={trace:?}");
+                    }) {
                         Err(StatementFailure::Trino(error)) => {
                             ensure!(
                                 error.error_code == 65536
@@ -393,15 +397,23 @@ impl DistributedBaseline {
                             );
                         }
                         Err(error) => {
-                            return Err(anyhow::Error::new(error).context(
-                                "binary test-only CALL did not return a public SQL error",
-                            ));
+                            return Err(anyhow::Error::new(error).context(format!(
+                                "CASE={case}: binary test-only CALL did not return a public SQL error"
+                            )));
                         }
                         Ok(_) => bail!("binary artifact accepted test-only {level} CALL"),
                     }
                 }
                 for ordinal in ["binary first", "binary second", "binary third"] {
-                    assert_baseline_rows(&session.execute(BASELINE_QUERY)?, ordinal)?;
+                    context.action(format!("ordinary baseline CASE={ordinal} SELECT starting"));
+                    let result = session
+                        .execute_observed(BASELINE_QUERY, |phase, trace| {
+                            eprintln!(
+                                "ordinary baseline CASE={ordinal} SELECT phase={phase} trace={trace:?}"
+                            );
+                        })
+                        .with_context(|| format!("CASE={ordinal} SELECT"))?;
+                    assert_baseline_rows(&result, ordinal)?;
                 }
                 Ok(())
             })();
@@ -428,7 +440,49 @@ impl DistributedBaseline {
         if primary.is_err() {
             peer.retain_runtime_artifacts();
         }
+        let failure_logs = if primary.is_err() {
+            match peer.failure_log_sources(REQUIRED_BACKENDS, 64 * 1024) {
+                Ok(sources) => sources,
+                Err(error) => {
+                    eprintln!("ordinary baseline role-log source capture failed: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let failure_log_path = peer
+            .runtime_dir()
+            .join("ordinary-baseline-failure-role-logs.json");
         let cleanup = TestClusterOwner::shutdown(&mut peer);
+        if let Some(sources) = failure_logs {
+            let captured = (|| -> Result<()> {
+                let captured = sources.capture(64 * 1024)?;
+                let logs = captured
+                    .logs
+                    .into_iter()
+                    .map(|log| {
+                        serde_json::json!({
+                            "name": log.name,
+                            "original_bytes": log.original_bytes,
+                            "contents": log.contents,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                std::fs::write(
+                    &failure_log_path,
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "backend_count": captured.backend_count,
+                        "max_tail_bytes_per_role": 64 * 1024,
+                        "logs": logs,
+                    }))?,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = captured {
+                eprintln!("ordinary baseline role-log artifact capture failed: {error:#}");
+            }
+        }
         match (primary, cleanup) {
             (Ok(()), Ok(())) => {
                 context.action("binary baseline peer roles actually stopped and reaped");

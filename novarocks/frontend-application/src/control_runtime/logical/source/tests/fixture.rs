@@ -63,7 +63,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Wake, Waker},
     time::Duration,
@@ -289,10 +289,16 @@ impl LogicalJobExecutor for ScriptExecutor {
         })
     }
 }
-struct FixedClock;
-impl Clock for FixedClock {
+pub(super) struct FixtureClock(AtomicU64);
+impl FixtureClock {
+    pub(super) fn advance_to(&self, now: Tick) {
+        let previous = self.0.swap(now.0, Ordering::AcqRel);
+        assert!(previous <= now.0, "fixture clock must remain monotonic");
+    }
+}
+impl Clock for FixtureClock {
     fn now(&self) -> Tick {
-        Tick(1)
+        Tick(self.0.load(Ordering::Acquire))
     }
 }
 struct HostWake {
@@ -314,6 +320,7 @@ pub(in crate::control_runtime::logical) fn assemble_logical(
     ledger: &RuntimeLedger,
     host: &HostRegistry,
     start: &LogicalStart,
+    start_direct_fixture: bool,
     wrap: impl FnOnce(LogicalActor) -> FrontendActor,
     build: impl FnOnce(&LogicalParts) -> Arc<dyn LogicalJobExecutor>,
 ) -> LogicalParts {
@@ -398,6 +405,7 @@ pub(in crate::control_runtime::logical) fn assemble_logical(
         runtime: Handle::current(),
         original: Arc::downgrade(&application),
     });
+    let executor = super::fact_credit::wrap_executor(executor);
     let source = LogicalEffectSource::reserve(LogicalSourceAssembly {
         runtime,
         registration: registration.clone(),
@@ -424,25 +432,30 @@ pub(in crate::control_runtime::logical) fn assemble_logical(
                 kind: FrontendActorKind::Logical,
                 config: geometry.config,
                 policy: FrontendLanePolicy::logical(OUTPUT_UNITS),
-                source: Box::new(source),
+                source: super::fact_credit::wrap_source(source),
                 executor,
                 transport: None,
                 ordered_observations: None,
                 startup: None,
                 capacity: None,
                 membership: None,
-                owner_controls: None,
+
+                local_exit: None,
             },
             start.actor_instance,
             links,
         )
         .unwrap_or_else(|e| panic!("original logical Host registration: {}", e.reason));
     state.bind_exit(exit);
+    if start_direct_fixture {
+        state.start_direct_source_fixture();
+    }
     runtime.notify_host_actor(&registration).unwrap();
     parts
 }
 
 pub(super) struct Fixture {
+    pub(super) clock: Arc<FixtureClock>,
     pub(super) ledger: RuntimeLedger,
     pub(super) runtime: ActorRuntime<FrontendActor>,
     pub(super) host: HostRegistry,
@@ -465,13 +478,17 @@ pub(super) struct Fixture {
 }
 impl Fixture {
     pub(super) fn new(panic_run: bool) -> Self {
+        Self::new_with_start(panic_run, true)
+    }
+    pub(super) fn new_with_start(panic_run: bool, start_direct_fixture: bool) -> Self {
         let ledger = RuntimeLedger::new(ResourceVector::default());
         let start = start();
         let runtime = ActorRuntime::new();
+        let clock = Arc::new(FixtureClock(AtomicU64::new(1)));
         let host = HostRegistry::new(
             runtime.clone(),
             ledger.clone(),
-            Arc::new(FrontendHostObservations::new(Arc::new(FixedClock))),
+            Arc::new(FrontendHostObservations::new(clock.clone())),
         );
         let seen = Arc::new(Mutex::new(Vec::new()));
         let run = Arc::new(Gate::default());
@@ -486,6 +503,7 @@ impl Fixture {
             &ledger,
             &host,
             &start,
+            start_direct_fixture,
             |actor| FrontendActor::Logical(Box::new(actor)),
             |parts| {
                 let mut bank = parts.inputs.try_loan().unwrap();
@@ -530,6 +548,7 @@ impl Fixture {
             ..
         } = parts;
         Self {
+            clock,
             ledger,
             runtime,
             host,
@@ -565,9 +584,9 @@ impl Fixture {
     pub(super) fn actors_only(&self) {
         for _ in 0..64 {
             if self.convert_timers {
-                self.runtime.advance_time(Tick(1), 64).unwrap();
+                self.runtime.advance_time(self.clock.now(), 64).unwrap();
             }
-            if !self.runtime.poll_one(Tick(1)).unwrap() {
+            if !self.runtime.poll_one(self.clock.now()).unwrap() {
                 break;
             }
         }
@@ -578,7 +597,7 @@ impl Fixture {
             let Some(turn) = self.runtime.claim_host_actor() else {
                 break;
             };
-            self.host.drive(Tick(1), turn);
+            self.host.drive(self.clock.now(), turn);
         }
         tokio::task::yield_now().await;
     }

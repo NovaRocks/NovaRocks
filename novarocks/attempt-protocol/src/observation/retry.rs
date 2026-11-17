@@ -214,6 +214,39 @@ mod tests {
             let base = (100_u128 << (value - 1).min(4)).min(1000);
             assert!((base * 80 / 100..=base * 120 / 100).contains(&delay));
         }
+        // Frozen inputs select the exact original 80/100/120 percent endpoints.
+        // Selection happened offline; every test transition uses the public seed
+        // and the original retry owner, without setting its private failure count.
+        let endpoints = [
+            (1_u64, 100_u64, [51_u128, 98, 10]),
+            (2_u64, 200_u64, [26_u128, 11, 2]),
+            (3_u64, 400_u64, [1_u128, 14, 9]),
+            (4_u64, 800_u64, [8_u128, 80, 17]),
+            (5_u64, 1000_u64, [6_u128, 2, 9]),
+            (6_u64, 1000_u64, [24_u128, 136, 1]),
+        ];
+        for (failures, base, seeds) in endpoints {
+            for (seed, percent) in seeds.into_iter().zip([80_u64, 100, 120]) {
+                let seed = IdSeed::new(seed, 1);
+                assert_eq!(seed.jitter(77, failures) % 41, percent - 80);
+                let mut original = CoveredRetryBudget::new(20, seed, 77).unwrap();
+                for value in 1..=failures {
+                    let current = generation(value);
+                    original.begin_generation(current).unwrap();
+                    let result = original.failed(current, at(50), false);
+                    assert!(matches!(result, RetryDisposition::Backoff { .. }));
+                    if value == failures {
+                        assert_eq!(
+                            result,
+                            RetryDisposition::Backoff {
+                                until: at(50 + base * percent / 100),
+                            },
+                        );
+                    }
+                }
+                assert_eq!(original.failures(), u32::try_from(failures).unwrap());
+            }
+        }
         assert!(CoveredRetryBudget::new(0, IdSeed::new(1, 1), 0).is_err());
     }
 }

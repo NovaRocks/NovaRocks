@@ -26,7 +26,7 @@ use crate::{
     },
     task_execution::host::observations::ObservationError,
 };
-use novarocks_attempt_protocol::{input::AttemptInput, port_projection::project_logical_message};
+use novarocks_attempt_protocol::input::AttemptInput;
 use novarocks_control_runtime::{
     actor_turn::{
         ActorFailureProof, ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket,
@@ -50,12 +50,9 @@ use novarocks_coordination_contract::{
     MonotonicInstant,
     logical_port::{LogicalToAttempt, LogicalToAttemptBody},
 };
-use std::{
-    alloc::Layout,
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc, Mutex, OnceLock, Weak,
+    atomic::{AtomicU64, Ordering},
 };
 
 #[derive(Debug)]
@@ -73,7 +70,7 @@ pub(crate) enum PortControlError {
     ConflictingRootToken,
     ConflictingChangedToken,
     ConflictingCut,
-    Unmaterialized,
+    ComputationCut(novarocks_coordination_contract::QueryExecutionError),
     UnsettledRoot,
     Runtime(ActorTurnError),
     Storage(ReportedWorkBindingError),
@@ -82,6 +79,27 @@ pub(crate) enum PortControlError {
     Header(HeaderReadyError),
     Observation(ObservationError),
 }
+impl std::fmt::Display for PortControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PublicationWake { revision, error } => write!(
+                f,
+                "control publication wake failed at revision {revision}: {error:?}"
+            ),
+            Self::ComputationCut(error) => write!(f, "original computation cut refused: {error}"),
+            Self::Runtime(error) => write!(f, "original control runtime refused: {error:?}"),
+            Self::Storage(error) => write!(f, "original control storage refused: {error:?}"),
+            Self::Custody(error) => write!(f, "original control custody refused: {error:?}"),
+            Self::Ledger(error) => write!(f, "original control ledger refused: {error:?}"),
+            Self::Header(error) => write!(f, "original control header refused: {error:?}"),
+            Self::Observation(error) => {
+                write!(f, "original control observation refused: {error:?}")
+            }
+            original => write!(f, "original control refused: {original:?}"),
+        }
+    }
+}
+impl std::error::Error for PortControlError {}
 impl From<ActorTurnError> for PortControlError {
     fn from(v: ActorTurnError) -> Self {
         Self::Runtime(v)
@@ -193,6 +211,34 @@ fn ticket_message(
     Ok(original)
 }
 
+fn commit_with_original_cut(
+    shared: &Shared,
+    command: Option<ConvergenceCommand>,
+    mut commit: impl FnMut() -> Result<(), PortControlError>,
+) -> Result<(), PortControlError> {
+    let Some(cut) = command.and_then(|command| command.computation_ready) else {
+        return commit();
+    };
+    if cut.activation != shared.activation || cut.root != shared.roots.binding().root() {
+        return Err(PortControlError::ForeignRoot);
+    }
+    if let Some(row) = shared.observation.get() {
+        row.upgrade()
+            .ok_or(PortControlError::Closed)?
+            .register_cut_with(
+                novarocks_query_application::api::ComputationReadyToken::from_runtime_cut(cut),
+                &mut commit,
+            )
+    } else {
+        commit()
+    }
+}
+fn notify_original_cut(shared: &Shared) {
+    if let Some(row) = shared.observation.get().and_then(Weak::upgrade) {
+        row.notify_cut_registered();
+    }
+}
+
 pub(crate) struct ControlPositions {
     pub(crate) stop: StandingInputObligation<FrontendActor>,
     pub(crate) convergence: StandingInputObligation<FrontendActor>,
@@ -216,6 +262,7 @@ struct Publication {
     cell: Option<PublishedSnapshot<Packet>>,
     closed: bool,
     owner_failed_stop: Option<OwnerFailedStopReceipt>,
+    owner_failed_convergence: Option<CommittedControlReceipt>,
 }
 struct Shared {
     lp: ActorRegistration,
@@ -226,6 +273,8 @@ struct Shared {
     roots: Arc<RootControlRequests>,
     changed_retired: AtomicU64,
     retained: Mutex<Option<Arc<Shared>>>,
+    observation:
+        OnceLock<Weak<crate::query_execution::logical_binding::OriginalAttemptObservation>>,
 }
 /// Weak publisher projection. It neither owns a second mailbox nor prolongs
 /// the actual reader/storage Work. Losing the reader preserves UNKNOWN custody.
@@ -240,15 +289,15 @@ pub(crate) struct CommittedControlReceipt {
 #[must_use]
 pub(crate) struct ControlBindingRefusal {
     pub(crate) error: PortControlError,
-    pub(crate) original: Box<ControlBindingOriginal>,
+    pub(crate) _original: Box<ControlBindingOriginal>,
 }
 pub(crate) enum ControlBindingOriginal {
     Unbound {
-        storage: Box<ReportedWork>,
-        positions: Box<ControlPositions>,
+        _storage: Box<ReportedWork>,
+        _positions: Box<ControlPositions>,
     },
     Bound {
-        reader: Box<ControlReaderObligation>,
+        _reader: Box<ControlReaderObligation>,
     },
 }
 impl std::fmt::Debug for ControlBindingRefusal {
@@ -259,6 +308,18 @@ impl std::fmt::Debug for ControlBindingRefusal {
     }
 }
 impl SourcePublishedSlot {
+    // Tests fence the same publisher independently of the original reader's
+    // actual exit. No storage/Work retirement is implied by this local fence.
+    #[cfg(test)]
+    pub(crate) fn close_publication(&self) {
+        if let Some(shared) = self.0.upgrade() {
+            shared
+                .publication
+                .lock()
+                .expect("original control publication")
+                .closed = true;
+        }
+    }
     pub(crate) fn matches_pair(
         &self,
         lp: &ActorRegistration,
@@ -316,9 +377,9 @@ impl SourcePublishedSlot {
         if let Err(error) = validation {
             return Err(ControlBindingRefusal {
                 error,
-                original: Box::new(ControlBindingOriginal::Unbound {
-                    storage: Box::new(storage),
-                    positions: Box::new(positions),
+                _original: Box::new(ControlBindingOriginal::Unbound {
+                    _storage: Box::new(storage),
+                    _positions: Box::new(positions),
                 }),
             });
         }
@@ -327,9 +388,9 @@ impl SourcePublishedSlot {
             Err(error) => {
                 return Err(ControlBindingRefusal {
                     error: PortControlError::Ledger(error),
-                    original: Box::new(ControlBindingOriginal::Unbound {
-                        storage: Box::new(storage),
-                        positions: Box::new(positions),
+                    _original: Box::new(ControlBindingOriginal::Unbound {
+                        _storage: Box::new(storage),
+                        _positions: Box::new(positions),
                     }),
                 });
             }
@@ -354,11 +415,13 @@ impl SourcePublishedSlot {
                 cell: Some(PublishedSnapshot::new_for_actor(&lp, Arc::new(packet))),
                 closed: false,
                 owner_failed_stop: None,
+                owner_failed_convergence: None,
             }),
             stop: Mutex::new(Some(positions.stop)),
             roots,
             changed_retired: AtomicU64::new(0),
             retained: Mutex::new(None),
+            observation: OnceLock::new(),
         });
         *shared
             .retained
@@ -398,26 +461,45 @@ impl SourcePublishedSlot {
         {
             return Err(ControlBindingRefusal {
                 error: PortControlError::Custody(error),
-                original: Box::new(ControlBindingOriginal::Bound {
-                    reader: Box::new(reader),
+                _original: Box::new(ControlBindingOriginal::Bound {
+                    _reader: Box::new(reader),
                 }),
             });
         }
+        #[cfg(test)]
+        {
+            let stop = shared
+                .stop
+                .lock()
+                .expect("original Stop role")
+                .as_ref()
+                .expect("bound original Stop role")
+                .id();
+            eprintln!(
+                "original control reader binding: lp={:?}, ap={:?}, activation={:?}, stop={stop:?}, convergence={:?}, changed={:?}",
+                shared.lp.actor(),
+                shared.ap.actor(),
+                shared.activation,
+                reader.convergence.as_ref().unwrap().id(),
+                reader.changed.as_ref().unwrap().id(),
+            );
+        }
         Ok((Self(Arc::downgrade(&shared)), reader))
     }
-    /// Actual fixed metadata payloads. The payer also quotes Arc/control-block
-    /// overhead using its existing layout author, never by copying this Work.
-    pub(crate) fn backing_payload_layouts() -> [Layout; 7] {
-        [
-            Layout::new::<Shared>(),
-            Layout::new::<Mutex<Arc<Packet>>>(),
-            Layout::new::<Packet>(),
-            Layout::new::<Packet>(),
-            Layout::new::<ControlReaderObligation>(),
-            CoalescingInput::<FrontendActor, ConvergenceNotice>::backing_payload_layout(),
-            CoalescingInput::<FrontendActor, ChangedNotice>::backing_payload_layout(),
-        ]
+    pub(crate) fn bind_observation(
+        &self,
+        original: &Arc<crate::query_execution::logical_binding::OriginalAttemptObservation>,
+    ) -> Result<(), PortControlError> {
+        let shared = self.0.upgrade().ok_or(PortControlError::Closed)?;
+        if shared.activation != original.activation() {
+            return Err(PortControlError::ForeignActivation);
+        }
+        shared
+            .observation
+            .set(Arc::downgrade(original))
+            .map_err(|_| PortControlError::ForeignPair)
     }
+
     /// The SAME failed LP session may publish one original Stop. A prior
     /// in-flight Stop retains its identity and reason; no Scope is stopped here.
     /// Retain the actual handoff receipt even after AP input retirement.
@@ -462,9 +544,7 @@ impl SourcePublishedSlot {
                 session.fill_standing(
                     target,
                     None,
-                    FrontendInput::Attempt(Box::new(AttemptInput::Port(project_logical_message(
-                        &message,
-                    )))),
+                    FrontendInput::Attempt(Box::new(AttemptInput::Port(message.clone()))),
                 )
             }));
             let input = match delivered {
@@ -478,6 +558,86 @@ impl SourcePublishedSlot {
             OwnerFailedStopReceipt::Submitted(input)
         };
         publication.owner_failed_stop = Some(receipt);
+        Ok(receipt)
+    }
+
+    /// The original failed LP still owns this prepaid control cell. Cleanup
+    /// uses that SAME failure session, preserves an already committed Ready
+    /// cut and only shortens the absolute horizon. It never stops an AP Scope.
+    pub(crate) fn publish_owner_failed_convergence(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        session: &mut novarocks_control_runtime::publication::FailurePublicationSession<
+            FrontendActor,
+        >,
+        mut command: ConvergenceCommand,
+    ) -> Result<CommittedControlReceipt, PortControlError> {
+        let shared = self.0.upgrade().ok_or(PortControlError::Closed)?;
+        if !session.registration().same_registration(&shared.lp) {
+            return Err(PortControlError::ForeignPair);
+        }
+        if command.mode != AttemptConvergenceMode::Cleanup
+            || command
+                .computation_ready
+                .is_some_and(|cut| cut.activation != shared.activation)
+        {
+            return Err(PortControlError::WrongMessage);
+        }
+        let receipt = {
+            let mut publication = shared
+                .publication
+                .lock()
+                .expect("original control publication");
+            if publication.closed {
+                return Err(PortControlError::Closed);
+            }
+            let cell = publication.cell.as_ref().ok_or(PortControlError::Closed)?;
+            let mut next = *cell.read();
+            if let Some(prior) = next.convergence {
+                // The failed owner may not have polled Native RecordReady yet.
+                // The cell's SAME already committed cut remains authoritative.
+                if command.computation_ready.is_none() {
+                    command.computation_ready = prior.value.computation_ready;
+                }
+                let mut merged = prior.value;
+                merged.merge(command)?;
+                command = merged;
+            }
+            if let Some(cut) = command.computation_ready {
+                command.remote_deadline = command.remote_deadline.min(cut.convergence_deadline);
+            }
+            if let Some(receipt) = publication.owner_failed_convergence
+                && next.convergence.is_some_and(|prior| prior.value == command)
+            {
+                return Ok(receipt);
+            }
+            let revision = next
+                .revision
+                .checked_add(1)
+                .ok_or(PortControlError::IdentityExhausted)?;
+            next.revision = revision;
+            next.convergence = Some(Versioned {
+                revision,
+                value: command,
+            });
+            commit_with_original_cut(&shared, Some(command), || {
+                let old = session
+                    .commit_snapshot(cell, Arc::new(next))
+                    .map_err(|(error, _)| PortControlError::Runtime(error))?;
+                drop(old);
+                Ok(())
+            })?;
+            let receipt = CommittedControlReceipt { revision };
+            publication.owner_failed_convergence = Some(receipt);
+            receipt
+        };
+        notify_original_cut(&shared);
+        runtime.notify_host_actor(&shared.ap).map_err(|error| {
+            PortControlError::PublicationWake {
+                revision: receipt.revision,
+                error,
+            }
+        })?;
         Ok(receipt)
     }
     pub(crate) fn deliver_stop(
@@ -521,9 +681,7 @@ impl SourcePublishedSlot {
             .fill_from_effect(
                 ticket,
                 target,
-                FrontendInput::Attempt(Box::new(AttemptInput::Port(project_logical_message(
-                    &original,
-                )))),
+                FrontendInput::Attempt(Box::new(AttemptInput::Port(original.clone()))),
             )
             .map_err(|(error, _)| PortControlError::Runtime(error))?;
         Ok(())
@@ -608,13 +766,18 @@ impl SourcePublishedSlot {
             }
             next.revision = revision;
             // Packet contains only Copy passive facts. Its replaced/rejected
-            // Arc has no foreign destructor; no callback runs under this gate.
-            let old = runtime
-                .commit_snapshot(ticket, cell, Arc::new(next))
-                .map_err(|(error, _)| PortControlError::Runtime(error))?;
-            drop(old);
+            // Arc has no foreign destructor. Only exact small registration and
+            // kernel handoff run under this gate, never rich application work.
+            commit_with_original_cut(&shared, next.convergence.map(|value| value.value), || {
+                let old = runtime
+                    .commit_snapshot(ticket, cell, Arc::new(next))
+                    .map_err(|(error, _)| PortControlError::Runtime(error))?;
+                drop(old);
+                Ok(())
+            })?;
             CommittedControlReceipt { revision }
         };
+        notify_original_cut(&shared);
         runtime.notify_host_actor(&shared.ap).map_err(|error| {
             PortControlError::PublicationWake {
                 revision: receipt.revision,
@@ -622,17 +785,6 @@ impl SourcePublishedSlot {
             }
         })?;
         Ok(receipt)
-    }
-    /// Admission closure is serialized with a live commit, never inferred from
-    /// cancellation or an observation. It does not retire the reader or Work.
-    pub(crate) fn close_publication(&self) {
-        if let Some(shared) = self.0.upgrade() {
-            shared
-                .publication
-                .lock()
-                .expect("original control publication")
-                .closed = true;
-        }
     }
 }
 
@@ -653,17 +805,15 @@ impl Merge for ConvergenceNotice {
     }
 }
 fn convergence_input(n: &ConvergenceNotice) -> FrontendInput {
-    FrontendInput::Attempt(Box::new(AttemptInput::Port(project_logical_message(
-        &LogicalToAttempt {
-            activation: n.activation,
-            body: LogicalToAttemptBody::BeginConvergence {
-                mode: n.command.mode,
-                remote_deadline: n.command.remote_deadline,
-                computation_ready: n.command.computation_ready,
-                retain_diagnostics: n.command.retain_diagnostics,
-            },
+    FrontendInput::Attempt(Box::new(AttemptInput::Port(LogicalToAttempt {
+        activation: n.activation,
+        body: LogicalToAttemptBody::BeginConvergence {
+            mode: n.command.mode,
+            remote_deadline: n.command.remote_deadline,
+            computation_ready: n.command.computation_ready,
+            retain_diagnostics: n.command.retain_diagnostics,
         },
-    ))))
+    })))
 }
 #[derive(Clone, Copy)]
 struct ChangedNotice {
@@ -680,12 +830,10 @@ impl Merge for ChangedNotice {
     }
 }
 fn changed_input(n: &ChangedNotice) -> FrontendInput {
-    FrontendInput::Attempt(Box::new(AttemptInput::Port(project_logical_message(
-        &LogicalToAttempt {
-            activation: n.activation,
-            body: LogicalToAttemptBody::PreReadyReplacementChanged { token: n.token },
-        },
-    ))))
+    FrontendInput::Attempt(Box::new(AttemptInput::Port(LogicalToAttempt {
+        activation: n.activation,
+        body: LogicalToAttemptBody::PreReadyReplacementChanged { token: n.token },
+    })))
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ControlProgress {
@@ -722,6 +870,16 @@ pub(crate) struct ControlReaderObligation {
     retired: bool,
 }
 impl ControlReaderObligation {
+    pub(crate) fn matches_pair(
+        &self,
+        logical: &ActorRegistration,
+        attempt: &ActorRegistration,
+        activation: AttemptActivationIdentity,
+    ) -> bool {
+        self.shared.lp.same_registration(logical)
+            && self.shared.ap.same_registration(attempt)
+            && self.shared.activation == activation
+    }
     /// Called for real Source/input/header progress, not after a completed
     /// sibling scan. This keeps composite host families from restarting each other.
     pub(crate) fn begin_pass(&mut self) {
@@ -734,7 +892,11 @@ impl ControlReaderObligation {
             self.rescan_requested = true;
         }
     }
-    pub(crate) fn index_committed(&mut self, inputs: &[InputId]) -> Result<(), PortControlError> {
+    pub(crate) fn index_committed(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        inputs: &[InputId],
+    ) -> Result<(), PortControlError> {
         for (row, current) in [
             self.convergence
                 .as_ref()
@@ -767,8 +929,12 @@ impl ControlReaderObligation {
                 self.indexed[row] = Some(input);
             }
         }
-        if !inputs.is_empty() {
+        if !inputs.is_empty() && !self.reader_exited {
             self.begin_pass();
+            // CommonHost indexes after Source progress. A real committed
+            // occurrence owes its separate retirement visit even when the Core
+            // emitted no effect. Empty/idle scans never create another wake.
+            runtime.notify_host_actor(&self.shared.ap)?;
         }
         Ok(())
     }

@@ -22,11 +22,11 @@ use crate::task_execution::host::observations::{
     ObservationError, OrderedObservationInput, WeakOrderedObservationInput,
 };
 pub(crate) use crate::task_execution::host::observations::{RootControlBinding, RootControlRef};
+#[cfg(test)]
+use novarocks_coordination_contract::logical_port::{AttemptToLogical, AttemptToLogicalBody};
 use novarocks_coordination_contract::{
     AttemptRequestToken,
-    logical_port::{
-        AttemptToLogical, AttemptToLogicalBody, LogicalToAttempt, LogicalToAttemptBody,
-    },
+    logical_port::{LogicalToAttempt, LogicalToAttemptBody},
 };
 use novarocks_execution_contract::TaskIdentity;
 use std::sync::{Arc, Mutex};
@@ -84,6 +84,26 @@ pub(crate) enum RootMaterialization {
     AlreadyQueued,
     Blocked,
 }
+/// Both the actual LP fact handoff and SAME bound root-command receipt have
+/// committed. This value does not certify LP consumption or business success.
+pub(crate) struct RootReplyFactReceipt {
+    activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    original: Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
+    kind: RootControlKind,
+}
+impl RootReplyFactReceipt {
+    pub(crate) fn confirm(
+        self,
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
+        original: &Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
+    ) -> Result<bool, PortControlError> {
+        if self.activation != activation || !Arc::ptr_eq(&self.original, original) {
+            return Err(PortControlError::WrongMessage);
+        }
+        Ok(self.kind == RootControlKind::Seal)
+    }
+}
+
 impl RootControlRequests {
     pub(crate) fn new(binding: RootControlBinding) -> Arc<Self> {
         Arc::new(Self {
@@ -91,9 +111,6 @@ impl RootControlRequests {
             rows: Mutex::new(Rows::default()),
             ingress: Mutex::new(None),
         })
-    }
-    pub(crate) fn backing_payload_layout() -> std::alloc::Layout {
-        std::alloc::Layout::new::<Self>()
     }
     pub(crate) fn bind_ingress(
         &self,
@@ -147,6 +164,18 @@ impl RootControlRequests {
             .writer_error
             .take()
     }
+    /// Read only the SAME original row. Replied is set exclusively by the
+    /// actual original reply/fact handoff; this never issues or acknowledges it.
+    #[cfg(test)]
+    pub(crate) fn fixture_seal_state(&self) -> Option<(AttemptRequestToken, bool, bool)> {
+        self.rows
+            .lock()
+            .expect("original root control rows")
+            .seal
+            .as_ref()
+            .map(|row| (row.command.token, row.queued, row.replied))
+    }
+
     pub(crate) fn binding(&self) -> &RootControlBinding {
         &self.binding
     }
@@ -258,6 +287,7 @@ impl RootControlRequests {
     }
     /// Called by the original fact outlet only after the exact AP reply has
     /// actually entered the LP inlet. This is not input/producer exit evidence.
+    #[cfg(test)]
     pub(crate) fn reply_delivered(
         &self,
         original: &AttemptToLogical,
@@ -272,6 +302,17 @@ impl RootControlRequests {
             }
             _ => return Err(PortControlError::WrongMessage),
         };
+        self.reply_binding_delivered(original.activation, token, kind)
+    }
+    fn reply_binding_delivered(
+        &self,
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
+        token: AttemptRequestToken,
+        kind: RootControlKind,
+    ) -> Result<bool, PortControlError> {
+        if activation != self.binding.activation() {
+            return Err(PortControlError::ForeignActivation);
+        }
         let mut rows = self.rows.lock().expect("original root control rows");
         let row = rows
             .row_mut(kind)
@@ -279,6 +320,27 @@ impl RootControlRequests {
             .filter(|r| r.command.token == token && (r.queued || r.submitting))
             .ok_or(PortControlError::ConflictingRootToken)?;
         Ok(!std::mem::replace(&mut row.replied, true))
+    }
+    pub(crate) fn acknowledge_fact_handoff(
+        &self,
+        original: super::facts::RootReplyFactHandoff,
+    ) -> Result<RootReplyFactReceipt, (PortControlError, super::facts::RootReplyFactHandoff)> {
+        // The original bank already checked the complete same-ticket reply.
+        // Project only fixed correlation; never clone its result/roster.
+        let (activation, token, seal) = original.binding();
+        let kind = if seal {
+            RootControlKind::Seal
+        } else {
+            RootControlKind::Terminal
+        };
+        if let Err(error) = self.reply_binding_delivered(activation, token, kind) {
+            return Err((error, original));
+        }
+        Ok(RootReplyFactReceipt {
+            activation,
+            original: original.into_original(),
+            kind,
+        })
     }
     pub(crate) fn close_after_exit(&self) -> Result<(), PortControlError> {
         let mut rows = self.rows.lock().expect("original root control rows");
@@ -327,6 +389,15 @@ impl crate::task_execution::host::observations::source::RootControlProjection
     fn matches(&self, binding: &RootControlBinding) -> bool {
         self.binding.same_original(binding)
     }
+    fn bind_ingress(
+        &self,
+        original: &OrderedObservationInput<FrontendActor>,
+    ) -> Result<(), ObservationError> {
+        RootControlRequests::bind_ingress(self, original).map_err(|error| match error {
+            PortControlError::Observation(original) => original,
+            _ => ObservationError::InvalidRootControl,
+        })
+    }
     fn close_after_exit(&self) -> Result<(), ObservationError> {
         RootControlRequests::close_after_exit(self).map_err(|_| ObservationError::Busy)
     }
@@ -336,15 +407,8 @@ impl crate::task_execution::host::observations::source::RootControlProjection
     fn project(
         &self,
         reference: &RootControlRef,
-    ) -> Result<
-        novarocks_coordination_contract::LogicalToAttempt<
-            novarocks_attempt_protocol::failure::AttemptFailure,
-        >,
-        ObservationError,
-    > {
-        RootControlRequests::project(self, reference).map(|value| {
-            novarocks_attempt_protocol::port_projection::project_logical_message(&value)
-        })
+    ) -> Result<novarocks_coordination_contract::LogicalToAttempt, ObservationError> {
+        RootControlRequests::project(self, reference)
     }
     fn validate_reference(&self, reference: &RootControlRef) -> Result<(), ObservationError> {
         RootControlRequests::validate_reference(self, reference)

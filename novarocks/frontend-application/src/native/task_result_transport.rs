@@ -66,10 +66,6 @@ use wire::{
 /// rather than an error: success and failure are decided by `TaskStatus`
 /// alone.
 #[derive(Clone, Debug)]
-#[allow(
-    dead_code,
-    reason = "The production cutover routes the coordinator's result loop onto this face."
-)]
 pub enum FinalTaskInfoRead {
     Available(Box<FinalTaskInfo>),
     Unavailable(OperationOutcome),
@@ -127,16 +123,6 @@ pub struct DynamicFilterRead {
 }
 
 impl DynamicFilterRead {
-    /// The transport builds this from a decoded response; only a test that
-    /// scripts a read builds one directly.
-    #[cfg(test)]
-    pub(crate) const fn new(
-        version: Option<DomainVersion>,
-        feedback: Vec<TaskRuntimeFilterFeedback>,
-    ) -> Self {
-        Self { version, feedback }
-    }
-
     pub const fn version(&self) -> Option<DomainVersion> {
         self.version
     }
@@ -168,14 +154,10 @@ impl fmt::Display for DynamicFilterReadError {
     }
 }
 
-/// The task protocol's terminal-info and dynamic-filter observations.
+/// Task-addressed terminal diagnostics.
 ///
-/// Both are addressed by exact [`TaskIdentity`]; none creates a task,
-/// advances a status, or renews a lease.
-#[allow(
-    dead_code,
-    reason = "The production cutover routes the coordinator's result loop onto this face."
-)]
+/// Each read names the exact [`TaskIdentity`]; it creates no task, advances
+/// no status and renews no lease.
 pub trait TaskResultTransport: Send + Sync + 'static {
     /// Reads one terminal task's bounded final info without blocking a turn.
     /// The caller keeps this future in its original local owner while pending;
@@ -184,14 +166,6 @@ pub trait TaskResultTransport: Send + Sync + 'static {
         &self,
         identity: TaskIdentity,
     ) -> BoxFuture<'_, Result<FinalTaskInfoRead, String>>;
-
-    /// Reads whatever one task advertised above the reader's own cursor.
-    #[cfg(test)]
-    fn dynamic_filters(
-        &self,
-        identity: TaskIdentity,
-        acknowledged: Option<DomainVersion>,
-    ) -> Result<DynamicFilterRead, DynamicFilterReadError>;
 }
 
 /// The native implementation over one frozen backend process set.
@@ -200,15 +174,9 @@ pub trait TaskResultTransport: Send + Sync + 'static {
 /// as the operation transport freezes its own: a task identity naming a
 /// process that is not in it is not looked up elsewhere, because a replaced
 /// process is a different process.
-#[allow(
-    dead_code,
-    reason = "The production cutover routes the coordinator's result loop onto this face."
-)]
 pub(crate) struct NativeTaskResultTransport {
     clients: BTreeMap<BackendProcessId, Client>,
     endpoints: BTreeMap<BackendProcessId, RuntimeEndpoint>,
-    #[cfg(test)]
-    data_runtime: FrontendDataRuntime,
     grace: TaskReadGrace,
 }
 
@@ -220,11 +188,6 @@ impl fmt::Debug for NativeTaskResultTransport {
             .finish_non_exhaustive()
     }
 }
-
-#[allow(
-    dead_code,
-    reason = "The production cutover routes the coordinator's result loop onto this face."
-)]
 impl NativeTaskResultTransport {
     pub(crate) fn new(
         backends: Arc<[BackendProcessDescriptor]>,
@@ -247,8 +210,6 @@ impl NativeTaskResultTransport {
         Ok(Self {
             clients,
             endpoints,
-            #[cfg(test)]
-            data_runtime,
             grace,
         })
     }
@@ -455,56 +416,36 @@ impl TaskResultTransport for NativeTaskResultTransport {
         }
         })
     }
-
-    #[cfg(test)]
-    fn dynamic_filters(
-        &self,
-        identity: TaskIdentity,
-        acknowledged: Option<DomainVersion>,
-    ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
-        let (client, address) = self
-            .client_of(identity)
-            .map_err(DynamicFilterReadError::Refused)?;
-        // The operation identity is minted per call and never replayed: this
-        // read creates nothing, so there is nothing for a replay to be
-        // idempotent against.
-        let request =
-            encode_dynamic_filter_request(TaskOperationId::new_v7(), identity, acknowledged);
-        let response = self
-            .data_runtime
-            .block_on(async {
-                let expires_at = tokio::time::Instant::now() + DYNAMIC_FILTER_READ_TIMEOUT;
-                let mut grpc = tokio::time::timeout_at(
-                    expires_at,
-                    client.grpc_with_channel_error(NativeRpcMethod::FetchTaskDynamicFilters),
-                )
-                .await
-                .map_err(|_| {
-                    DynamicFilterReadError::Unavailable(format!(
-                        "{address}: dynamic filter read could not acquire a channel in time"
-                    ))
-                })?
-                .map_err(|error| DynamicFilterReadError::Unavailable(error.to_string()))?;
-                tokio::time::timeout_at(expires_at, grpc.fetch_task_dynamic_filters(request))
-                    .await
-                    .map_err(|_| {
-                        DynamicFilterReadError::Unavailable(format!(
-                            "{address}: dynamic filter read did not answer in time"
-                        ))
-                    })?
-                    .map(tonic::Response::into_inner)
-                    .map_err(|error| classify_dynamic_filter_status(&address, &error))
-            })
-            .map_err(DynamicFilterReadError::Unavailable)??;
-        decode_dynamic_filter_response(&address, identity, response)
-    }
 }
 
 /// The Frontend side of `FetchRootResult` for one frozen attempt: bounded
 /// root reads relayed without decode. Each reply retains the caller's window
 /// alias until its delivery exits. The result window granted at admission is
 /// this read's carrier commitment, so no separate fetch permit is taken.
+/// Passive copy of an actual original read failure. It grants no input,
+/// failure marker, recovery permission, resource or exit authority.
+#[cfg(all(test, novarocks_dev_controls))]
+#[derive(Default)]
+pub(crate) struct OriginalRootReadObservation {
+    first_failure: std::sync::Mutex<Option<ExecutionFailureInput>>,
+}
+#[cfg(all(test, novarocks_dev_controls))]
+impl OriginalRootReadObservation {
+    pub(crate) fn failure(&self) -> Option<ExecutionFailureInput> {
+        self.first_failure.lock().unwrap().clone()
+    }
+    fn observe(&self, original: &RootResultFetchFailure) {
+        let mut first = self.first_failure.lock().unwrap();
+        if first.is_none() {
+            *first = Some(original.input().clone());
+        }
+    }
+}
+
 pub(crate) struct NativeBoundedRootReadPort {
+    #[cfg(all(test, novarocks_dev_controls))]
+    original_read_observation:
+        std::sync::Mutex<Option<std::sync::Weak<OriginalRootReadObservation>>>,
     transport: Arc<NativeTaskResultTransport>,
     sealed: std::sync::atomic::AtomicBool,
     #[cfg(novarocks_dev_controls)]
@@ -516,6 +457,8 @@ pub(crate) struct NativeBoundedRootReadPort {
 impl NativeBoundedRootReadPort {
     pub(crate) fn new(transport: Arc<NativeTaskResultTransport>) -> Self {
         Self {
+            #[cfg(all(test, novarocks_dev_controls))]
+            original_read_observation: std::sync::Mutex::new(None),
             transport,
             sealed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(novarocks_dev_controls)]
@@ -523,6 +466,25 @@ impl NativeBoundedRootReadPort {
             #[cfg(novarocks_dev_controls)]
             read_observed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) fn observe_original_read_for_fixture(
+        &self,
+        original: std::sync::Weak<OriginalRootReadObservation>,
+    ) {
+        assert!(
+            self.original_read_observation
+                .lock()
+                .unwrap()
+                .replace(original)
+                .is_none()
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_sealed_for_fixture(&self) -> bool {
+        self.sealed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[cfg(novarocks_dev_controls)]
@@ -567,7 +529,9 @@ impl novarocks_query_application::api::BoundedRootReadPort for NativeBoundedRoot
             .client_of(root)
             .map(|(client, address)| (client.clone(), address));
         let grace = self.transport.grace;
-        Box::pin(async move {
+        #[cfg(all(test, novarocks_dev_controls))]
+        let observation = self.original_read_observation.lock().unwrap().clone();
+        let original = async move {
             let site = ExecutionFailureSite::RootRead { root };
             if sealed {
                 return Err(root_failure(
@@ -690,7 +654,18 @@ impl novarocks_query_application::api::BoundedRootReadPort for NativeBoundedRoot
                     tracing::warn!(task = %root, error = %error, "Root response conflicts with its retained window");
                     root_failure(QueryFailureReason::ResultProtocol, site, "root response conflicts with its retained window")
                 })
-        })
+        };
+        #[cfg(all(test, novarocks_dev_controls))]
+        let original = async move {
+            let result = original.await;
+            if let (Err(failure), Some(observation)) =
+                (&result, observation.and_then(|weak| weak.upgrade()))
+            {
+                observation.observe(failure);
+            }
+            result
+        };
+        Box::pin(original)
     }
 
     fn seal(
@@ -823,7 +798,6 @@ mod tests {
         let transport = NativeTaskResultTransport {
             clients: BTreeMap::new(),
             endpoints: BTreeMap::new(),
-            data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             grace: TaskReadGrace::new(std::time::Duration::from_secs(1)),
         };
         let original = match transport.client_of(task) {

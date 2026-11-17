@@ -58,7 +58,7 @@ use novarocks_query_application::{
 use std::{
     num::NonZeroU16,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
     task::{Wake, Waker},
@@ -68,6 +68,14 @@ use tokio::runtime::Handle;
 /// P10 receives the original registration and the SAME source inventory. An
 /// identity alone never constructs an author or a second routing registry.
 pub(crate) struct LogicalPortInstallContext<'a> {
+    #[cfg(test)]
+    failure: Arc<LogicalInfrastructureFailure>,
+    #[cfg(test)]
+    failure_work: novarocks_control_runtime_core::identity::ScopedWorkRef,
+    #[cfg(test)]
+    native: Weak<novarocks_query_application::coordination::executor::NativeExecutor>,
+    #[cfg(test)]
+    consumer: Weak<novarocks_query_application::coordination::executor::ConsumerExecutor>,
     start: &'a LogicalStart,
     runtime: &'a ActorRuntime<FrontendActor>,
     registration: ActorRegistration,
@@ -75,6 +83,51 @@ pub(crate) struct LogicalPortInstallContext<'a> {
     links: Arc<LogicalAttemptLinks>,
 }
 impl LogicalPortInstallContext<'_> {
+    #[cfg(test)]
+    pub(crate) fn original_consumer_for_fixture(
+        &self,
+    ) -> Weak<novarocks_query_application::coordination::executor::ConsumerExecutor> {
+        self.consumer.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn original_failure_trigger_for_fixture(
+        &self,
+    ) -> (
+        Arc<dyn Fn() + Send + Sync>,
+        novarocks_control_runtime_core::identity::ScopedWorkRef,
+    ) {
+        let original = Arc::downgrade(&self.failure);
+        (
+            Arc::new(move || {
+                original
+                    .upgrade()
+                    .expect("same live failure owner")
+                    .inject_core_turn_panic()
+            }),
+            self.failure_work,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn original_failure_probe_for_fixture(
+        &self,
+    ) -> Arc<dyn Fn() -> String + Send + Sync> {
+        let original = Arc::downgrade(&self.failure);
+        let native = self.native.clone();
+        Arc::new(move || {
+            let failure = original.upgrade().map_or_else(
+                || "original failure owner exited".to_owned(),
+                |original| original.original_diagnostic_for_fixture(),
+            );
+            let native = native.upgrade().map(|native| {
+                (
+                    native.has_unhandled_failure(),
+                    native.cleanup_inventory().map(|inventory| inventory.active),
+                )
+            });
+            format!("{failure}, original_native={native:?}")
+        })
+    }
     pub(crate) fn links(&self) -> Arc<LogicalAttemptLinks> {
         self.links.clone()
     }
@@ -95,9 +148,10 @@ pub(crate) trait LogicalPortInstaller: Send + Sync {
     fn bind(&self, original: LogicalPortInstallContext<'_>) -> Arc<dyn LogicalHostPorts>;
 }
 pub(crate) struct LogicalRuntimeInstaller {
-    process: Arc<FrontendAttemptRuntime>,
+    process: Weak<FrontendAttemptRuntime>,
     data_runtime: Handle,
     ports: Arc<dyn LogicalPortInstaller>,
+    installation_started: AtomicBool,
 }
 impl LogicalRuntimeInstaller {
     pub(crate) fn new(
@@ -106,9 +160,10 @@ impl LogicalRuntimeInstaller {
         ports: Arc<dyn LogicalPortInstaller>,
     ) -> Self {
         Self {
-            process,
+            process: Arc::downgrade(&process),
             data_runtime,
             ports,
+            installation_started: AtomicBool::new(false),
         }
     }
 }
@@ -135,19 +190,31 @@ impl LogicalRuntimeInstall for LogicalRuntimeInstaller {
         start
             .validate()
             .map_err(LogicalInstallRefusal::InvalidStart)?;
-        let _registration = self
-            .process
-            .begin_attempt_registration()
-            .map_err(|_| LogicalInstallRefusal::RuntimeClosed)?;
-        if self.process.host.contains_logical(start.actor_instance) {
+        // One original request installs at most once, including concurrent
+        // calls through an alias of this same capability. Refuse before any
+        // funding/registration or the one-shot cell bind can occur.
+        if self.installation_started.swap(true, Ordering::AcqRel) {
             return Err(LogicalInstallRefusal::DuplicateExecution);
         }
-        let funding = LogicalFundingObligation::reserve(&self.process.ledger)
+        // The capability may travel through the original Session. Retaining
+        // the process here would form process -> Host -> Source -> Session ->
+        // installer -> process after installation.
+        let process = self
+            .process
+            .upgrade()
+            .ok_or(LogicalInstallRefusal::RuntimeClosed)?;
+        let _registration = process
+            .begin_attempt_registration()
+            .map_err(|_| LogicalInstallRefusal::RuntimeClosed)?;
+        if process.host.contains_logical(start.actor_instance) {
+            return Err(LogicalInstallRefusal::DuplicateExecution);
+        }
+        let funding = LogicalFundingObligation::reserve(&process.ledger)
             .map_err(|error| LogicalInstallRefusal::Resource(resource_failure(error)))?;
         let geometry = match LogicalGeometry::derive(funding.scope().id(), &start) {
             Ok(geometry) => geometry,
             Err(_) => {
-                funding.retire_unpublished(&self.process.ledger);
+                funding.retire_unpublished(&process.ledger);
                 return Err(LogicalInstallRefusal::Resource(resource_failure(
                     RuntimeError::IdentityExhausted,
                 )));
@@ -161,7 +228,7 @@ impl LogicalRuntimeInstall for LogicalRuntimeInstaller {
             .expect("original prepaid executor disposal work");
         let core = LogicalExecutionCore::new(start.clone());
         let adapter = LogicalActor::new(core, funding.step_reservations());
-        let runtime = &self.process.runtime;
+        let runtime = &process.runtime;
         let registration = runtime
             .register_supervised_bound_with_source_cut(
                 geometry.actor,
@@ -223,6 +290,14 @@ impl LogicalRuntimeInstall for LogicalRuntimeInstaller {
         let inputs = LogicalInputBank::new(inputs, wake.clone());
         let links = LogicalAttemptLinks::new(geometry.attempts, wake.clone(), failure.reporter());
         let ports = self.ports.bind(LogicalPortInstallContext {
+            #[cfg(test)]
+            failure: failure.clone(),
+            #[cfg(test)]
+            failure_work: failure_work.work().reference(),
+            #[cfg(test)]
+            native: Arc::downgrade(&executors.native),
+            #[cfg(test)]
+            consumer: Arc::downgrade(&executors.consumer),
             start: &start,
             runtime,
             registration: registration.clone(),
@@ -273,10 +348,10 @@ impl LogicalRuntimeInstall for LogicalRuntimeInstaller {
             startup: None,
             capacity: None,
             membership: None,
-            owner_controls: None,
+
+            local_exit: None,
         };
-        let exit = self
-            .process
+        let exit = process
             .host
             .register_logical(binding, start.actor_instance, links)
             .unwrap_or_else(|original| {
@@ -286,9 +361,8 @@ impl LogicalRuntimeInstall for LogicalRuntimeInstaller {
                 )
             });
         state.bind_exit(exit);
-        runtime
-            .notify_host_actor(&registration)
-            .expect("original installed logical startup");
+        // Registration/header wakes may already exist. The original Source
+        // stays unstarted until the Registry commits and releases its gate.
         Ok(state)
     }
 }

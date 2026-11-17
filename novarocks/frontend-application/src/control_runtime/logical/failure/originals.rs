@@ -34,6 +34,10 @@ pub(in crate::control_runtime::logical) trait LogicalFailureOriginals:
     fn governance(&self) -> Arc<GovernanceExecutor>;
     fn begin_failure(&self, error: QueryExecutionError);
     fn fail_one_pending_request(&self) -> bool;
+    fn computation_cut(
+        &self,
+        activation: AttemptActivationIdentity,
+    ) -> Result<Option<novarocks_coordination_contract::AttemptComputationCut>, QueryExecutionError>;
     fn cleanup_inventory(&self) -> Result<NativeCleanupInventory, QueryExecutionError>;
     fn original_cleanup_deadline(&self, deadline: MonotonicInstant) -> Instant;
     fn execute_native(&self, effect: NativeEffect) -> LogicalFuture<'_, NativeFact>;
@@ -66,6 +70,30 @@ impl LogicalFailureOriginals for LogicalExecutors {
     }
     fn fail_one_pending_request(&self) -> bool {
         self.consumer.fail_one_supervised_request() || self.relay.fail_one_supervised_request()
+    }
+    fn computation_cut(
+        &self,
+        activation: AttemptActivationIdentity,
+    ) -> Result<Option<novarocks_coordination_contract::AttemptComputationCut>, QueryExecutionError>
+    {
+        let promised = self.consumer.original_ready_promise(activation)?;
+        let recorded = self.native.original_computation_ready(activation)?;
+        if promised.zip(recorded).is_some_and(|(a, b)| a != b) {
+            return Err(QueryExecutionError::new(
+                novarocks_coordination_contract::QueryExecutionErrorKind::Failed,
+                "original Ready promise and recorded computation cut disagree",
+            ));
+        }
+        Ok(promised.or(recorded).map(|cut| {
+            novarocks_coordination_contract::AttemptComputationCut {
+                activation: cut.activation(),
+                root: cut.root(),
+                cut: cut.cut(),
+                diagnostic_deadline: cut.diagnostic_deadline(),
+                convergence_deadline: cut.convergence_deadline(),
+                end: cut.end(),
+            }
+        }))
     }
     fn cleanup_inventory(&self) -> Result<NativeCleanupInventory, QueryExecutionError> {
         self.native.cleanup_inventory()

@@ -471,6 +471,9 @@ impl StatisticsState {
                 self.pending = Some(Box::pin(publish_session(
                     self.session.clone(),
                     self.context.clone(),
+                    self.native_tail
+                        .as_ref()
+                        .and_then(|tail| tail.supervision_observation()),
                 )));
             }
             ActionPhase::Finished => {
@@ -879,8 +882,10 @@ async fn prepare_plan(
 async fn publish_session(
     slot: Arc<tokio::sync::Mutex<SessionSlot>>,
     context: ConnectorRequestContext,
+    supervision: Option<novarocks_query_application::api::LogicalOwnerFailureObservation>,
 ) -> Result<(), CoreStatisticsAttemptError> {
     let mut original = slot.lock().await;
+    check_original_supervision(&supervision)?;
     let SessionSlot {
         session,
         artifacts,
@@ -901,6 +906,7 @@ async fn publish_session(
         *provider_failure = Some(error);
         return Err(projected);
     }
+    check_original_supervision(&supervision)?;
     if let Err(error) = context.check_active() {
         let projected = failure(&error);
         *provider_failure = Some(error);
@@ -915,6 +921,23 @@ async fn publish_session(
         }
     }
     Ok(())
+}
+fn check_original_supervision(
+    original: &Option<novarocks_query_application::api::LogicalOwnerFailureObservation>,
+) -> Result<(), CoreStatisticsAttemptError> {
+    let Some(original) = original else {
+        return Ok(());
+    };
+    match original.failure() {
+        Ok(None) => Ok(()),
+        Ok(Some(error)) | Err(error) => {
+            Err(CoreStatisticsAttemptError::Failed(StatisticsFailure {
+                error: novarocks_query_application::session_outcome::governed_query_execution_error(
+                    error,
+                ),
+            }))
+        }
+    }
 }
 async fn close_session(
     slot: Arc<tokio::sync::Mutex<SessionSlot>>,
@@ -950,6 +973,9 @@ async fn close_session(
     provider.close().await?;
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) use tests::StatisticsLateSupervisionProbes;
 
 #[cfg(test)]
 pub(super) mod tests {
@@ -1035,6 +1061,11 @@ pub(super) mod tests {
         assert!(!failure.to_string().contains("private catalog"));
     }
 
+    struct PublicationPhaseGates {
+        prepare_calls: Arc<AtomicUsize>,
+        prepare: Option<tokio::sync::oneshot::Receiver<()>>,
+        finish: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
     struct EmptyCollectionSession {
         descriptor: ConnectorInstanceDescriptor,
         finish_calls: Arc<AtomicUsize>,
@@ -1044,6 +1075,7 @@ pub(super) mod tests {
         published: bool,
         stop_on_prepare: Option<novarocks_spi::connector::ConnectorStopOwner>,
         close_gate: Option<Arc<tokio::sync::Notify>>,
+        phase_gates: Option<PublicationPhaseGates>,
     }
     impl EmptyCollectionSession {
         fn receipt(&self) -> StatisticsReceipt {
@@ -1076,6 +1108,12 @@ pub(super) mod tests {
             artifacts: &'a mut Option<Vec<StatisticsArtifactDraft>>,
         ) -> StatisticsSessionFuture<'a, ()> {
             Box::pin(async move {
+                if let Some(gates) = self.phase_gates.as_mut() {
+                    gates.prepare_calls.fetch_add(1, Ordering::SeqCst);
+                    if let Some(gate) = gates.prepare.take() {
+                        gate.await.unwrap();
+                    }
+                }
                 assert!(artifacts.as_ref().unwrap().is_empty());
                 assert!(!self.prepared);
                 drop(artifacts.take());
@@ -1091,8 +1129,13 @@ pub(super) mod tests {
         ) -> StatisticsSessionFuture<'_, StatisticsPublicationReady> {
             Box::pin(async move {
                 assert!(self.prepared && !self.published);
-                self.published = true;
                 self.finish_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(gates) = self.phase_gates.as_mut()
+                    && let Some(gate) = gates.finish.take()
+                {
+                    gate.await.unwrap();
+                }
+                self.published = true;
                 Ok(if self.settled {
                     StatisticsPublicationReady::Settled(ExternalMutationOutcome::KnownCommitted {
                         effect: ExternalMutationEffect::NoOp,
@@ -1149,6 +1192,17 @@ pub(super) mod tests {
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
     ) {
+        empty_session_with_phases(settled, close_gate, None)
+    }
+    fn empty_session_with_phases(
+        settled: bool,
+        close_gate: Option<Arc<tokio::sync::Notify>>,
+        phase_gates: Option<PublicationPhaseGates>,
+    ) -> (
+        Arc<tokio::sync::Mutex<SessionSlot>>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
         let finishes = Arc::new(AtomicUsize::new(0));
         let closes = Arc::new(AtomicUsize::new(0));
         let original = SessionSlot {
@@ -1164,6 +1218,7 @@ pub(super) mod tests {
                 published: false,
                 stop_on_prepare: None,
                 close_gate,
+                phase_gates,
             })),
             artifacts: Some(Vec::new()),
             ..SessionSlot::default()
@@ -1174,12 +1229,149 @@ pub(super) mod tests {
             closes,
         )
     }
+    /// Provider component futures only. The caller supplies the read-only
+    /// observation of its actual original Source, never a fabricated failure.
+    pub(crate) struct StatisticsLateSupervisionProbes(Vec<LateSupervisionProbe>);
+    struct LateSupervisionProbe {
+        slot: Arc<tokio::sync::Mutex<SessionSlot>>,
+        lock: Option<tokio::sync::OwnedMutexGuard<SessionSlot>>,
+        release: Option<tokio::sync::oneshot::Sender<()>>,
+        future: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), CoreStatisticsAttemptError>> + Send>,
+        >,
+        prepares: Arc<AtomicUsize>,
+        finishes: Arc<AtomicUsize>,
+        closes: Arc<AtomicUsize>,
+    }
+    impl StatisticsLateSupervisionProbes {
+        pub(crate) async fn arm(
+            original: novarocks_query_application::api::LogicalOwnerFailureObservation,
+        ) -> Self {
+            use futures::FutureExt;
+            assert_eq!(original.failure().unwrap(), None);
+            let mut probes = Vec::new();
+            for phase in 0..3 {
+                let prepares = Arc::new(AtomicUsize::new(0));
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                let (prepare, finish, release) = match phase {
+                    1 => (Some(receiver), None, Some(sender)),
+                    2 => (None, Some(receiver), Some(sender)),
+                    _ => {
+                        drop((sender, receiver));
+                        (None, None, None)
+                    }
+                };
+                let (slot, finishes, closes) = empty_session_with_phases(
+                    false,
+                    None,
+                    Some(PublicationPhaseGates {
+                        prepare_calls: prepares.clone(),
+                        prepare,
+                        finish,
+                    }),
+                );
+                let lock = if phase == 0 {
+                    Some(slot.clone().lock_owned().await)
+                } else {
+                    None
+                };
+                let mut future: std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = Result<(), CoreStatisticsAttemptError>>
+                            + Send,
+                    >,
+                > = Box::pin(publish_session(
+                    slot.clone(),
+                    crate::connector::test_request_context(),
+                    Some(original.clone()),
+                ));
+                assert!(
+                    future.as_mut().now_or_never().is_none(),
+                    "original publication phase must be held"
+                );
+                assert_eq!(prepares.load(Ordering::SeqCst), usize::from(phase != 0));
+                assert_eq!(finishes.load(Ordering::SeqCst), usize::from(phase == 2));
+                probes.push(LateSupervisionProbe {
+                    slot,
+                    lock,
+                    release,
+                    future,
+                    prepares,
+                    finishes,
+                    closes,
+                });
+            }
+            Self(probes)
+        }
+        pub(crate) async fn release_and_check(
+            self,
+            original: &novarocks_query_application::api::QueryExecutionError,
+        ) {
+            assert!(original.execution_failure().is_some());
+            for (phase, mut probe) in self.0.into_iter().enumerate() {
+                drop(probe.lock.take());
+                if let Some(release) = probe.release.take() {
+                    release.send(()).unwrap();
+                }
+                let result = probe.future.as_mut().await;
+                if phase == 2 {
+                    result.unwrap();
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().failure().error.execution_failure(),
+                        original.execution_failure()
+                    );
+                }
+                assert_eq!(
+                    probe.prepares.load(Ordering::SeqCst),
+                    usize::from(phase != 0)
+                );
+                assert_eq!(
+                    probe.finishes.load(Ordering::SeqCst),
+                    usize::from(phase == 2)
+                );
+                {
+                    let slot = probe.slot.lock().await;
+                    assert_eq!(slot.publication.is_some(), phase == 2);
+                    assert!(
+                        slot.provider_failure.is_none(),
+                        "original supervision failure is not a Provider refusal"
+                    );
+                }
+                let cpu_closes = Arc::new(AtomicUsize::new(0));
+                close_session(
+                    probe.slot.clone(),
+                    Arc::new(tokio::sync::Mutex::new(PlanSlot::default())),
+                    FrontendCompletionCustody::new(),
+                    crate::connector::test_request_context(),
+                    Arc::new(CloseOnlyCpu(cpu_closes.clone())),
+                )
+                .await
+                .unwrap();
+                assert_eq!(probe.closes.load(Ordering::SeqCst), 1);
+                assert_eq!(cpu_closes.load(Ordering::SeqCst), 1);
+                let slot = probe.slot.lock().await;
+                let Some(StatisticsPublicationClose::Observed {
+                    outcome,
+                    owned_objects_disposed: true,
+                }) = &slot.close
+                else {
+                    panic!("same original Provider close must actually settle");
+                };
+                assert_eq!(
+                    matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }),
+                    phase == 2
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn empty_collection_is_retained_until_needed_publication_without_a_query_request() {
         let (slot, finishes, closes) = empty_session(false, None);
         assert!(slot.lock().await.program.is_none());
         assert_eq!(finishes.load(Ordering::SeqCst), 0);
-        publish_session(slot.clone(), crate::connector::test_request_context())
+        publish_session(slot.clone(), crate::connector::test_request_context(), None)
             .await
             .unwrap();
         let original = slot.lock().await;
@@ -1202,7 +1394,7 @@ pub(super) mod tests {
     async fn both_no_op_publication_shapes_keep_original_session_until_close() {
         for settled in [false, true] {
             let (slot, finishes, closes) = empty_session(settled, None);
-            publish_session(slot.clone(), crate::connector::test_request_context())
+            publish_session(slot.clone(), crate::connector::test_request_context(), None)
                 .await
                 .unwrap();
             let original = slot.lock().await;
@@ -1243,7 +1435,7 @@ pub(super) mod tests {
         let gate = Arc::new(tokio::sync::Notify::new());
         let (slot, finishes, closes) = empty_session(false, Some(gate.clone()));
         let context = crate::connector::test_request_context();
-        publish_session(slot.clone(), context.clone())
+        publish_session(slot.clone(), context.clone(), None)
             .await
             .unwrap();
         assert_eq!(finishes.load(Ordering::SeqCst), 1);
@@ -1379,6 +1571,7 @@ pub(super) mod tests {
                     published: false,
                     stop_on_prepare: during_prepare.then(|| stop.clone()),
                     close_gate: None,
+                    phase_gates: None,
                 })),
                 artifacts: Some(Vec::new()),
                 ..Default::default()
@@ -1386,7 +1579,7 @@ pub(super) mod tests {
             if !during_prepare {
                 stop.request_stop();
             }
-            assert!(publish_session(slot.clone(), context).await.is_err());
+            assert!(publish_session(slot.clone(), context, None).await.is_err());
             assert_eq!(finishes.load(Ordering::SeqCst), 0);
             let original = slot.lock().await;
             assert!(original.publication.is_none());

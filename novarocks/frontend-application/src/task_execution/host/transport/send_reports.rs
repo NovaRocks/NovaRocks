@@ -22,7 +22,7 @@ use super::{
     receipt_input::{NativeReceiptError, RetiredNativeReceipt, retire_passive_report_position},
     source_ports::BodyOutcome,
 };
-use crate::task_execution::bridge::abort::AbortReceiptSlot;
+use crate::task_execution::host::port::abort::{AbortReceiptSlot, ClosedParticipations};
 use crate::{
     control_runtime::actor::{FrontendActor, FrontendInput},
     task_execution::{
@@ -118,7 +118,11 @@ impl SendMemberReport {
             .bind_release_diagnostic(report);
     }
 
-    pub(super) fn retain_abort_receipt(&mut self, participation: ParticipationRef) {
+    pub(super) fn retain_abort_receipt(
+        &mut self,
+        participation: ParticipationRef,
+        closed: ClosedParticipations,
+    ) {
         let key = self
             .receipt
             .as_ref()
@@ -126,7 +130,7 @@ impl SendMemberReport {
             .key();
         assert!(
             self.abort_receipt
-                .replace(Arc::new(AbortReceiptSlot::new(key, participation)))
+                .replace(Arc::new(AbortReceiptSlot::new(key, participation, closed)))
                 .is_none()
         );
     }
@@ -169,11 +173,13 @@ impl SendMemberReport {
         ) {
             Ok(()) => {
                 if let Some(original) = &self.abort_receipt {
-                    original.record(
-                        receipt
-                            .prepared_ack()
-                            .expect("original prepared Abort receipt"),
-                    );
+                    original
+                        .record(
+                            receipt
+                                .prepared_ack()
+                                .expect("original prepared Abort receipt"),
+                        )
+                        .expect("same original physical Abort acknowledgement");
                 }
                 // Core can select this exact failure immediately after fill.
                 // The canonical ACK itself stays in the original report.
@@ -275,6 +281,18 @@ impl SendReports {
         failure: PreparationFailure,
     ) -> BodyOutcome {
         assert_eq!(operations.len(), keys.len());
+        // A SAME WC cancellation is an ordinary local preparation refusal.
+        // Keep its exact producer fact/detail on every original operation;
+        // it is neither a Worker receipt nor an unused/unsent certificate.
+        let cancelled = match (self, &failure) {
+            (
+                Self::Actor(_),
+                PreparationFailure::Governance(
+                    original @ novarocks_workload_control::WorkError::Cancelled(_),
+                ),
+            ) => Some(original),
+            _ => None,
+        };
         let channel_dispatch = match (self, &failure) {
             (Self::Actor(_), PreparationFailure::Channel(error)) => {
                 let dispatch = super::execute::classify_channel_error(error);
@@ -284,22 +302,28 @@ impl SendReports {
             _ => None,
         };
         for (intent, &key) in operations.iter().zip(keys) {
-            self.record_ack(
-                key,
-                OperationAcknowledgement::from_dispatch_result(
+            let acknowledgement = match cancelled {
+                Some(original) => OperationAcknowledgement::local_refusal(
+                    intent.operation_id(),
+                    intent.kind(),
+                    TaskExecutionError::Workload(original.clone()).preparation_input(),
+                ),
+                None => OperationAcknowledgement::from_dispatch_result(
                     intent.operation_id(),
                     intent.kind(),
                     channel_dispatch.unwrap_or(OperationDispatchResult::NonWorkerRejected),
                     AckPayload::None,
                 ),
-            );
+            };
+            self.record_ack(key, acknowledgement);
         }
-        // Channel acquisition has the same typed outcome on both sides of
-        // preparation. The Source still waits for the original Join and
-        // report retirement before it releases this generation.
-        match channel_dispatch {
-            Some(_) => BodyOutcome::ReceiptsRecorded,
-            None => BodyOutcome::RawFailure(Box::new(failure)),
+        // Both typed actor paths recorded every exact original receipt.
+        // All other failures retain their original raw custody. Source still
+        // waits for actual Join/result/header retirement for every generation.
+        if channel_dispatch.is_some() || cancelled.is_some() {
+            BodyOutcome::ReceiptsRecorded
+        } else {
+            BodyOutcome::RawFailure(Box::new(failure))
         }
     }
 
@@ -902,7 +926,7 @@ mod tests {
         };
         let (earlier, earlier_ref, mut earlier_report) = report(17);
         let (later, later_ref, mut later_report) = report(19);
-        let mut telemetry = crate::task_execution::tests::fixture_runtime_filter_contribution();
+        let mut telemetry = crate::fixtures::facts::fixture_runtime_filter_contribution();
         let original = Arc::new(OriginalTelemetry(telemetry.as_proto().clone()));
         let backing: Arc<dyn CanonicalTerminalTelemetry> = original.clone();
         telemetry.bind_canonical_owner(Arc::downgrade(&backing), 0);
@@ -1049,7 +1073,8 @@ mod tests {
             FailureRecords::default(),
             None,
         );
-        report.retain_abort_receipt(part);
+        let closed = ClosedParticipations::new();
+        report.retain_abort_receipt(part, closed.clone());
         let original = OperationAcknowledgement::worker_receipt(
             key.operation,
             OperationKind::AbortParticipation,
@@ -1063,6 +1088,7 @@ mod tests {
         let input = report.receipt_delivery.take().unwrap().unwrap();
         let slot = report.abort_receipt.take().unwrap();
         assert_eq!(slot.original_for_test(), Some(&original));
+        assert!(closed.contains(part));
         assert!(matches!(
             report
                 .receipt

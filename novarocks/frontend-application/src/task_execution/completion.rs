@@ -26,7 +26,7 @@ use novarocks_result_contract::{PerKind, SummaryKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
-use crate::task_execution::status_validation::verify_final_info;
+use novarocks_attempt_protocol::status_validation::verify_final_info;
 #[cfg(test)]
 use novarocks_execution::task_execution::FinalTaskInfo;
 use novarocks_execution::task_execution::{TaskIdentity, TaskState, TaskStatus};

@@ -30,14 +30,62 @@ use std::{
     any::Any,
     collections::VecDeque,
     mem::ManuallyDrop,
-    sync::Arc,
+    sync::{Arc, Weak},
     task::{Context, Poll, Waker},
 };
 use tokio::{runtime::Handle, task::JoinError};
 
 type Original = Box<dyn Any + Send>;
 
+/// Constructed only by the original AP Source after its real producer and
+/// three original LP fact positions closed. The index is retained from the
+/// same activation link, never used to issue Work or reconstruct an author.
+/// Checked by the original metadata disposal body and its real Join/header.
+/// This value has no Drop completion; issuance alone cannot return the author.
+#[must_use = "Return the same original author through its actual metadata work"]
+pub(super) struct OriginalInputAuthorReturnObligation {
+    bank: Weak<crate::control_runtime::logical::LogicalInputBank>,
+    index: usize,
+    endpoints: Arc<crate::task_execution::host::port::AttemptPortEndpoints>,
+}
+impl OriginalInputAuthorReturnObligation {
+    pub(super) fn after_close(
+        bank: Weak<crate::control_runtime::logical::LogicalInputBank>,
+        index: usize,
+        endpoints: Arc<crate::task_execution::host::port::AttemptPortEndpoints>,
+    ) -> Option<Self> {
+        (endpoints.producer_exited()
+            && endpoints.facts.is_closed()
+            && endpoints.requests.is_empty())
+        .then_some(Self {
+            bank,
+            index,
+            endpoints,
+        })
+    }
+}
+async fn return_original_input_author(original: OriginalInputAuthorReturnObligation) {
+    assert!(original.endpoints.producer_exited() && original.endpoints.facts.is_closed());
+    let bank = original
+        .bank
+        .upgrade()
+        .expect("same LP inventory outlives its original AP child");
+    let mut loan = bank
+        .loan()
+        .await
+        .expect("issued original AP input author is not retired");
+    loan.ap_inputs_closed_after_producer_exit(original.index)
+        .unwrap_or_else(|original| std::panic::panic_any(original));
+}
+
 pub(super) enum ReleaseCapture {
+    NativeOriginals(
+        Box<crate::query_execution::native_execution_adapter::AttemptSourceOriginalsObligation>,
+    ),
+    FailureResidual(
+        Arc<crate::task_execution::host::failure_residual::OriginalFailureResidualRecord>,
+    ),
+    InputAuthor(OriginalInputAuthorReturnObligation),
     Original(Original),
     Transport(TransportRelease),
     Subscription(WorkOwner),
@@ -48,6 +96,9 @@ pub(super) enum ReleaseCapture {
 impl ReleaseCapture {
     pub(super) fn dispose(self) {
         match self {
+            Self::NativeOriginals(original) => original.dispose_on_executor(),
+            Self::FailureResidual(original) => original.dispose_on_executor(),
+            Self::InputAuthor(original) => std::panic::resume_unwind(Box::new(original)),
             Self::Original(original) => drop(original),
             Self::Transport(original) => original.dispose(),
             Self::Subscription(owner) => owner.complete_after_terminal_cancel_settled(),
@@ -78,10 +129,31 @@ pub(super) struct ReleaseFailure {
     pub(super) panic: Option<Original>,
 }
 
+enum Disposal {
+    Blocking(HostDisposal<ReleaseCapture>),
+    InputAuthor(HostDisposal<OriginalInputAuthorReturnObligation>),
+}
+impl Disposal {
+    fn poll_complete(&self, cx: &mut Context<'_>) -> Poll<Result<(), CustodyError>> {
+        match self {
+            Self::Blocking(original) => original.poll_complete(cx),
+            Self::InputAuthor(original) => original.poll_complete(cx),
+        }
+    }
+    fn take_failure(&self) -> (Option<Original>, Option<JoinError>, Option<Original>) {
+        match self {
+            Self::Blocking(original) => original.take_failure(),
+            Self::InputAuthor(original) => original.take_failure(),
+        }
+    }
+}
+
 struct Active {
     header: WorkRetirementObserver,
-    original: HostDisposal<ReleaseCapture>,
+    original: Disposal,
     _observation_backing: Option<backing::ObservationBackingPin>,
+    residual:
+        Option<Arc<crate::task_execution::host::failure_residual::OriginalFailureResidualRecord>>,
 }
 
 /// One blocking job, one host batch (at most two objects), and the sole
@@ -142,17 +214,22 @@ impl TransportReleases {
     }
 
     pub(in crate::task_execution::host) fn backing_bytes() -> Result<usize, ObservationError> {
-        let [record, exit, panic, capture, carrier] =
-            HostDisposal::<ReleaseCapture>::backing_layouts()
-                .map_err(|_| ObservationError::Budget)?;
+        let blocking = HostDisposal::<ReleaseCapture>::backing_layouts()
+            .map_err(|_| ObservationError::Budget)?;
+        let asynchronous =
+            HostDisposal::<OriginalInputAuthorReturnObligation>::future_backing_layouts(
+                return_original_input_author,
+            )
+            .map_err(|_| ObservationError::Budget)?;
+        // There is still ONE sequential Active. Both the actual boxed inner
+        // metadata future and its obligated carrier are priced; the original
+        // inventory/endpoints already have their original Source allocation.
+        let blocking = backing::sum(blocking.map(|layout| layout.size()))?;
+        let asynchronous = backing::sum(asynchronous.map(|layout| layout.size()))?;
         backing::sum([
             std::mem::size_of::<Self>(),
             backing::array::<ManuallyDrop<ReleaseCapture>>(2)?,
-            record.size(),
-            exit.size(),
-            panic.size(),
-            capture.size(),
-            carrier.size(),
+            blocking.max(asynchronous),
         ])
     }
 
@@ -168,6 +245,9 @@ impl TransportReleases {
                 Poll::Pending => return Ok(false),
                 Poll::Ready(Ok(())) => match author.reap_disposal(&active.header) {
                     Ok(true) => {
+                        if let Some(original) = &active.residual {
+                            original.disposal_retired();
+                        }
                         self.active = None;
                         return Ok(true);
                     }
@@ -215,19 +295,38 @@ impl TransportReleases {
             ReleaseCapture::Observations(original) => original.backing_pin(),
             _ => None,
         };
+        let residual = match &original {
+            ReleaseCapture::FailureResidual(original) => Some(original.clone()),
+            _ => None,
+        };
         let header = work.work().retirement_observer();
-        let original = HostDisposal::start(
-            &self.executor,
-            work,
-            author.observer(),
-            original,
-            ReleaseCapture::dispose,
-        )
-        .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)));
+        let original = match original {
+            ReleaseCapture::InputAuthor(original) => Disposal::InputAuthor(
+                HostDisposal::start_future(
+                    &self.executor,
+                    work,
+                    author.observer(),
+                    original,
+                    return_original_input_author,
+                )
+                .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused))),
+            ),
+            original => Disposal::Blocking(
+                HostDisposal::start(
+                    &self.executor,
+                    work,
+                    author.observer(),
+                    original,
+                    ReleaseCapture::dispose,
+                )
+                .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused))),
+            ),
+        };
         self.active = Some(Active {
             header,
             original,
             _observation_backing: observation_backing,
+            residual,
         });
         Ok(true)
     }
@@ -272,6 +371,202 @@ mod tests {
                 .send(thread::current().id())
                 .unwrap();
             self.finish.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn residual_rich_capture_waits_for_original_disposal_join_and_header() {
+        use crate::{
+            control_runtime::host::EffectSource,
+            task_execution::host::{
+                auxiliary::AttemptAuxiliarySource,
+                failure_publication::FailurePublicationError,
+                failure_residual::{FailureResidualReceiveObligation, ResidualVerdict},
+                failure_supervisor::FailureCleanupRequest,
+                port::requests::test_support::{EPOCH, Fixture, OBSERVER, activation},
+            },
+        };
+        use novarocks_control_runtime::{
+            actor_turn::ActorTurnError, causal_input::CausalInputObligation,
+        };
+        use novarocks_control_runtime_core::{identity::Tick, mailbox::InputClass};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct OriginalResidualCapture {
+            _capture: OriginalCapture,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for OriginalResidualCapture {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for typed_refusal in [false, true] {
+            let f = Fixture::new();
+            let input = f
+                .runtime
+                .reserve_admitted_input_for(
+                    &f.attempt.registration,
+                    f.attempt.registration.actor(),
+                    InputClass::Lifecycle,
+                    &f.attempt.work,
+                )
+                .unwrap()
+                .into_standing_input()
+                .unwrap_or_else(|_| panic!("same original infrastructure role"));
+            let (mut auxiliary, health) =
+                AttemptAuxiliarySource::new(f.attempt.registration.clone(), input);
+            let (mut receiver, sink) = FailureResidualReceiveObligation::new(
+                f.attempt.registration.clone(),
+                activation(),
+                Arc::from([]),
+                Waker::noop().clone(),
+                auxiliary.raw_failure_publisher(),
+            );
+            let (entered, started) = oneshot::channel();
+            let (release, finish) = mpsc::channel();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let refusal = Arc::new(FailurePublicationError::Runtime(ActorTurnError::Closed));
+            sink.finish(
+                FailureCleanupRequest {
+                    core_panic: Box::new(OriginalResidualCapture {
+                        _capture: OriginalCapture {
+                            entered: Some(entered),
+                            finish,
+                        },
+                        dropped: dropped.clone(),
+                    }),
+                    publication: if typed_refusal {
+                        Err(refusal.clone())
+                    } else {
+                        Ok(())
+                    },
+                    root_reply: None,
+                    observation_drain: Ok(()),
+                    unknown_participations: Box::new([]),
+                },
+                Vec::new(),
+            )
+            .await;
+            // Only receiver metadata is scripted here. The disposal below uses
+            // actual Work, blocking execution, Join, reports and header reaping;
+            // this test does not claim a real failure-supervisor/AP HostExit.
+            assert!(receiver.progress(2, Some(true)).error.is_none());
+            let record = health.raw_record().unwrap();
+            assert_eq!(
+                record.verdict(),
+                Some(if typed_refusal {
+                    ResidualVerdict::TypedRefusal
+                } else {
+                    ResidualVerdict::LocallyProven
+                })
+            );
+            assert!(
+                receiver.ready_for_disposal()
+                    && receiver.needs_disposal()
+                    && !receiver.is_retired()
+            );
+            let payload = receiver.take_disposal().unwrap();
+            assert!(
+                !receiver.needs_disposal(),
+                "issued work waits for its original disposal wake"
+            );
+            assert!(Arc::ptr_eq(&payload, &record) && receiver.take_disposal().is_none());
+            let result = CausalInputObligation::reserve_admitted(
+                &f.runtime,
+                &f.attempt.registration,
+                f.logical.registration.actor(),
+                InputClass::Lifecycle,
+                &f.attempt.work,
+            )
+            .unwrap();
+            let mut author = AttemptCallSource::new(
+                &f.attempt.work,
+                &f.attempt.payer,
+                EPOCH,
+                OBSERVER,
+                AttemptCallOwner::Release,
+                result,
+            );
+            let mut releases = TransportReleases::new(Handle::current(), Waker::noop().clone());
+            releases.retain(ReleaseCapture::FailureResidual(payload));
+            assert!(!receiver.is_retired() && !releases.is_empty());
+            assert!(
+                releases
+                    .progress(&author)
+                    .unwrap_or_else(|f| panic!("{:?}", f.error))
+            );
+            let executor = tokio::time::timeout(Duration::from_secs(3), started)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(executor, thread::current().id());
+            assert!(!receiver.is_retired() && !releases.is_empty());
+            assert_eq!(f.attempt.scope.snapshot().unwrap().work, 2);
+            assert!(
+                !releases
+                    .progress(&author)
+                    .unwrap_or_else(|f| panic!("{:?}", f.error))
+            );
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !record.disposal_body_returned() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                !receiver.is_retired() && !releases.is_empty(),
+                "body return is not actual Join/header retirement"
+            );
+            assert_eq!(f.attempt.scope.snapshot().unwrap().work, 2);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !releases
+                    .progress(&author)
+                    .unwrap_or_else(|f| panic!("{:?}", f.error))
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert!(receiver.is_retired() && !receiver.needs_disposal() && releases.is_empty());
+            assert_eq!(f.attempt.scope.snapshot().unwrap().work, 1);
+            assert_eq!(
+                record.original_publication_refusal().is_some(),
+                typed_refusal
+            );
+            if typed_refusal {
+                assert!(Arc::ptr_eq(
+                    record.original_publication_refusal().unwrap(),
+                    &refusal
+                ));
+            }
+            assert!(record.original_root_reply_refusal().is_none());
+            assert_eq!(health.exit_failure().is_some(), typed_refusal);
+            assert!(author.close_idle().unwrap());
+            assert!(author.take_drained_owner().is_none() && author.is_drained());
+            auxiliary.close_external();
+            auxiliary.transport_roles_drained();
+            f.runtime
+                .notify_host_actor(&f.attempt.registration)
+                .unwrap();
+            loop {
+                let turn = f.runtime.claim_host_actor().unwrap();
+                if turn.matches_registration(&f.attempt.registration) {
+                    assert!(
+                        auxiliary
+                            .progress_retirement(&f.runtime, &turn, Tick(1), 1)
+                            .retired
+                    );
+                    turn.release(false).unwrap();
+                    break;
+                }
+                turn.release(false).unwrap();
+            }
+            drop((receiver, releases, author, auxiliary, health, record));
+            f.finish();
         }
     }
 

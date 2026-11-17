@@ -33,8 +33,21 @@ fn successor(
     r: &mut RecoveryFixture,
     attempt: u64,
 ) -> (AttemptActivationIdentity, Vec<QualifiedAdmission>) {
+    let failed_process = match r
+        .f
+        .core
+        .facts()
+        .attempts()
+        .find(|original| original.activation == activation(attempt - 1))
+        .and_then(|original| original.accepted_failure)
+        .expect("successor helper retains its originating backend failure")
+        .site()
+    {
+        ExecutionFailureSite::Backend { process } => process,
+        _ => panic!("this helper requires the original Backend failure site"),
+    };
     let (dispatch, topology) = r.prepare(roster(attempt));
-    assert!(matches!(topology, SuccessorTopology::LiveSnapshot));
+    assert_eq!(topology, SuccessorTopology::ExcludeProcess(failed_process));
     assert_eq!(dispatch.failed.as_ref(), roster(attempt - 1));
     assert_eq!(dispatch.replacement.as_ref(), roster(attempt));
     let grants = dispatch
@@ -79,6 +92,18 @@ fn first_unknown() -> (RecoveryFixture, Vec<Issued>, ExecutionFailure) {
     r.fail(activation(1), failure.clone());
     (r, old, failure)
 }
+#[test]
+fn pending_original_read_close_does_not_spin_or_block_successor_qualification() {
+    let (mut r, _, _) = first_unknown();
+    // Preparing the successor may proceed while the predecessor's original
+    // close is pending. Neither its callback result nor Abort is fabricated.
+    let (_dispatch, _) = r.prepare(roster(2));
+    let close = r.f.take(|body| matches!(body, LogicalEffectBody::Native(NativeEffect::SealRootRead { activation: held, .. }) if *held == activation(1)));
+    assert!(!r.f.effects.iter().any(|effect| matches!(&effect.body, LogicalEffectBody::AttemptPort(port) if matches!(port.body, LogicalToAttemptBody::Abort { .. }))));
+    assert_ne!(r.f.core.next_deadline(), Some(r.f.now));
+    r.f.result(close.action, ActionResult::Native(NativeFact::Applied));
+    assert!(r.f.effects.iter().any(|effect| matches!(&effect.body, LogicalEffectBody::AttemptPort(port) if matches!(port.body, LogicalToAttemptBody::Abort { .. }))));
+}
 fn assert_old_failure(r: &RecoveryFixture, original: &ExecutionFailure) {
     assert_eq!(
         r.f.core
@@ -110,7 +135,10 @@ fn two_real_recoveries_reuse_first_preparation_deadline_and_never_activate_expir
     };
     assert_eq!(failed, a2.execution());
     assert_eq!(replacement, activation(3).execution());
-    assert!(matches!(topology, SuccessorTopology::LiveSnapshot));
+    assert_eq!(
+        topology,
+        SuccessorTopology::ExcludeProcess(root(2).backend_process_id())
+    );
     assert_eq!(
         deadline,
         at(50),
@@ -396,7 +424,7 @@ fn accepted_scope_cancellation_wins_over_late_initial_activation_failure() {
     )));
 }
 #[test]
-fn native_backend_failure_without_any_root_status_can_prepare_live_snapshot() {
+fn native_backend_failure_without_any_root_status_excludes_its_original_process() {
     let mut r = RecoveryFixture::new(LogicalOutputMode::ResultStream);
     assert!(
         r.f.core
@@ -423,7 +451,7 @@ fn native_backend_failure_without_any_root_status_can_prepare_live_snapshot() {
         )
     });
     assert!(
-        matches!(prepare.body,LogicalEffectBody::Native(NativeEffect::PrepareSuccessor{failed,topology:SuccessorTopology::LiveSnapshot,..})if failed==activation(1).execution())
+        matches!(prepare.body,LogicalEffectBody::Native(NativeEffect::PrepareSuccessor{failed,topology:SuccessorTopology::ExcludeProcess(process),..})if failed==activation(1).execution() && process==root(1).backend_process_id())
     );
     assert_old_failure(&r, &original);
     assert_eq!(r.f.core.facts().conclusion(), None);
@@ -433,11 +461,13 @@ fn native_backend_failure_without_any_root_status_can_prepare_live_snapshot() {
             .any(|e| matches!(e.body, LogicalEffectBody::Relay(RelayEffect::Start { .. })))
     );
 }
-fn witnessed(r: &mut RecoveryFixture, observed: bool) -> (Issued, ExecutionFailure) {
+fn witnessed(r: &mut RecoveryFixture, observed: bool) -> (Option<Issued>, ExecutionFailure) {
     let p = participant(1, 1);
     let grant = r.grant(activation(1), p, 10);
-    let issued = r.issue(activation(1), p, grant, 10);
-    if observed {
+    // The authorization reply itself crosses the original possible-send
+    // boundary. A negative parent oracle must genuinely omit that request.
+    let issued = observed.then(|| r.issue(activation(1), p, grant, 10));
+    if let Some(issued) = issued {
         r.settle(issued, AttemptIssueSettlement::TransportOwned)
             .unwrap();
         r.settle(issued, AttemptIssueSettlement::TransportUnknown)
@@ -578,7 +608,7 @@ fn late_parent_refusal_during_preparation_revokes_witness_before_dispatch() {
         )
     });
     r.settle(
-        issued,
+        issued.expect("this late parent refusal retains its original issued Establish"),
         AttemptIssueSettlement::Worker(OperationOutcome::CompatibilityMismatch),
     )
     .unwrap();
@@ -1371,6 +1401,15 @@ fn authorized_establish_already_requires_exact_abort_before_any_transport_observ
     );
     r.fail(activation(1), first.clone());
     let (d, _) = r.prepare(roster(2));
+    assert!(issued.iter().all(|i| {
+        r.f.core
+            .facts()
+            .participation(activation(1), i.participation)
+            .unwrap()
+            .abort_authorizations
+            == 0
+    }));
+    r.f.acknowledge_original_read_close(activation(1));
     let before=issued.iter().map(|i| {
         let fact=r.f.core.facts().participation(activation(1),i.participation).unwrap();
         assert_eq!(fact.closure,ParticipationClosureState::AbortPending);

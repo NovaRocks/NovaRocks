@@ -194,6 +194,49 @@ fn actual_unpublished_child_rollback_and_activation_exit_are_both_required() {
     f.close();
 }
 #[test]
+fn already_issued_link_derives_same_settlement_storage_in_actual_failed_scope_epoch() {
+    for opened_before_failure in [false, true] {
+        let f = Fixture::new();
+        f.issue();
+        let loan = f.links.borrow(f.activation).unwrap();
+        let before = f.scope.snapshot().unwrap().generation;
+        let child = opened_before_failure.then(|| {
+            loan.reserve_attempt(&f.ledger, GENERATION, ReservationResources::work_only())
+                .unwrap()
+        });
+        let failed = f.scope.fail().unwrap();
+        assert_ne!(failed, before);
+        let storage = loan.reserve_port_storage().unwrap();
+        assert_eq!(storage.work().scope().id(), f.scope.id());
+        assert_eq!(storage.work().kind().unwrap(), WorkKind::Settlement);
+        let header = storage.work().retirement_observer();
+        let (custody, exit) = ExitCustody::from_admitted(storage);
+        exit.revoke_unused_and_exit().unwrap();
+        assert!(custody.try_retire().unwrap());
+        assert!(f.scope.reap_observed_header(&header).unwrap());
+        // An existing child is independent; a newly opened child inherits
+        // failure. Neither case fabricates an AP registration or Core panic.
+        let child = child.unwrap_or_else(|| {
+            loan.reserve_attempt(&f.ledger, GENERATION, ReservationResources::work_only())
+                .unwrap()
+        });
+        assert_eq!(
+            child.scope().gates().unwrap().failed,
+            !opened_before_failure
+        );
+        assert_eq!(
+            child.scope().snapshot().unwrap().generation == GENERATION,
+            opened_before_failure
+        );
+        loan.retire_unpublished_child(child, &f.ledger);
+        f.links.activation_exited(0);
+        drop(loan);
+        assert!(f.progress());
+        f.close();
+    }
+}
+
+#[test]
 fn original_stop_refuses_new_business_links_without_minting_an_activation() {
     let f = Fixture::new();
     f.scope.request_stop().unwrap();
@@ -356,10 +399,13 @@ fn installed_child(
             startup: None,
             capacity: None,
             membership: None,
-            owner_controls: None,
+
+            local_exit: None,
         })
         .unwrap_or_else(|_| panic!("the original installed child HostExit"));
+    assert!(!loan.has_bound_host_exit(f.activation, &registration, &exit));
     observe_inventory_change(f, || loan.bind_registered(&registration, &exit), true);
+    assert!(loan.has_bound_host_exit(f.activation, &registration, &exit));
     (host, registration, exit)
 }
 fn drive_child(f: &Fixture, host: &HostRegistry, child: &ActorRegistration) {
@@ -374,6 +420,33 @@ fn drive_child(f: &Fixture, host: &HostRegistry, child: &ActorRegistration) {
         }
     }
     panic!("the finite child host closure did not settle");
+}
+#[test]
+fn same_exit_receiving_receipt_survives_the_original_wait_future_loan() {
+    let f = Fixture::new();
+    f.issue();
+    let loan = f.links.borrow(f.activation).unwrap();
+    let (host, child, exit) = installed_child(&f, &loan);
+    let wait = loan.slot.state.lock().unwrap().child_exit.take().unwrap();
+    assert!(loan.has_bound_host_exit(f.activation, &child, &exit));
+    assert!(!loan.has_bound_host_exit(f.activation, &f.registration, &exit));
+    assert!(
+        !f.links.actual_child_exited(f.activation),
+        "an installed receipt is not physical removal"
+    );
+    {
+        let mut state = loan.slot.state.lock().unwrap();
+        assert!(state.child_exit.is_none());
+        state.child_exit = Some(wait);
+    }
+    exit.request_close().unwrap();
+    drive_child(&f, &host, &child);
+    assert!(host.is_empty() && *exit.observe_actual_exit().borrow());
+    assert!(loan.has_bound_host_exit(f.activation, &child, &exit));
+    f.links.activation_exited(0);
+    drop(loan);
+    assert!(f.progress());
+    f.close();
 }
 #[test]
 fn registered_child_scope_removal_wakes_original_link_and_cannot_be_replaced_by_activation_exit() {

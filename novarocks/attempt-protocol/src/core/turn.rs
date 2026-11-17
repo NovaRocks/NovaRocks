@@ -21,6 +21,7 @@ use super::{
     Core, RootControlApplication, SealedRootCut, round_tail::RoundTailStep, schedule,
     stop::StopProgress,
 };
+use crate::port_output::{AttemptToLogical, AttemptToLogicalBody};
 use crate::{
     AttemptCore,
     authorization::gate::{CloseProgress, QaReply},
@@ -41,8 +42,7 @@ use crate::{
 };
 use novarocks_coordination_contract::{
     AttemptActionId, AttemptConvergenceMode, AttemptRequestToken, AttemptRootProjection,
-    AttemptStopReason, AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody,
-    MonotonicInstant,
+    AttemptStopReason, LogicalToAttemptBody, MonotonicInstant,
 };
 use novarocks_execution_contract::{TaskOperationId, TaskStatus};
 use std::{num::NonZeroU64, sync::Arc};
@@ -349,6 +349,12 @@ impl AttemptCore for Core {
 }
 
 impl Core {
+    /// Read-only rendering of the original activation and control continuation.
+    /// This observation grants no input, scheduling or lifecycle authority.
+    pub fn control_phase(&self) -> impl std::fmt::Debug + '_ {
+        (self.activation, &self.turn.phase)
+    }
+
     fn input_selection(&self) -> InputSelection {
         use InputSelection::{Only, Prefer};
         if self.diagnostics_wait_for_publication() {
@@ -672,6 +678,12 @@ impl Core {
         match input {
             AttemptInput::StartProtocol => {
                 self.verify_source(claim.source, self.sources.actor)?;
+                // The original RunAttempt can first poll after Stop has
+                // already closed business. Consume that delayed startup
+                // without admitting candidates or replacing the stop cause.
+                if !self.candidates.enabled && self.stop.business_closed() {
+                    return Ok(true);
+                }
                 if self.candidates.enabled
                     || self.turn.phase != Phase::Idle
                     || self.stop.business_closed()
@@ -686,8 +698,7 @@ impl Core {
 
             AttemptInput::Port(port) => match &port.body {
                 LogicalToAttemptBody::AuthorizationReply { .. }
-                | LogicalToAttemptBody::EstablishSettlementReply { .. }
-                | LogicalToAttemptBody::EstablishDetachReply { .. } => {
+                | LogicalToAttemptBody::EstablishSettlementReply { .. } => {
                     self.verify_source(claim.source, self.sources.qa)?;
                     // Owner ingress stays reachable beside a frozen primary
                     // prefix. Only the original gate decides exact/wrong/late
@@ -722,7 +733,7 @@ impl Core {
                     self.terminal.permission_reply(*token, false);
                     self.observe_owner_stop(
                         AttemptStopReason::LogicalExecutionFailed,
-                        failure.clone(),
+                        AttemptFailure::Logical(failure.clone()),
                         result,
                     );
                 }
@@ -741,16 +752,16 @@ impl Core {
                     self.verify_owner_port(claim.source, port.activation)?;
                     let (admission, _) = self.turn.issue()?;
                     if self.aborts.taking_over() || self.aborts.retired_request(*request) {
-                        result.abort_settlement = Some(self.abort_effect(
-                            AttemptToLogicalBody::AbortSettlement {
+                        result.abort_settlement =
+                            Some(self.abort_effect(AttemptToLogicalBody::AbortSettlement {
                                 abort_action: *action,
                                 generation: admission,
                                 receipt_generation: None,
                                 participation: request.participation(),
                                 operation_id: request.envelope().operation_id(),
-                                settlement: novarocks_coordination_contract::AbortIssueSettlement::DefinitelyUnsent,
-                            },
-                        )?);
+                                settlement:
+                                    crate::port_output::AbortIssueSettlement::DefinitelyUnsent,
+                            })?);
                     } else {
                         self.aborts.begin(
                             &self.execution,
@@ -762,7 +773,11 @@ impl Core {
                 }
                 LogicalToAttemptBody::Stop { reason, failure } => {
                     self.verify_owner_port(claim.source, port.activation)?;
-                    self.observe_owner_stop(*reason, failure.clone(), result);
+                    self.observe_owner_stop(
+                        *reason,
+                        AttemptFailure::Logical(failure.clone()),
+                        result,
+                    );
                 }
                 LogicalToAttemptBody::BeginConvergence {
                     mode,
@@ -1557,7 +1572,11 @@ impl Core {
             result.effect = Some(AttemptEffect {
                 id,
                 class: EffectClass::Publication,
-                body: EffectBody::Publish(Publication::RootStatus(Box::new(projection))),
+                body: EffectBody::Port(AttemptToLogical {
+                    activation: self.activation,
+                    action: id,
+                    body: AttemptToLogicalBody::RootStatus(Box::new(projection)),
+                }),
             });
             self.turn.phase = Phase::AwaitRoot(id, PublicationApplied::RootStatus);
             return Ok(());
@@ -2025,10 +2044,7 @@ impl Core {
                 self.turn.phase = Phase::Terminal(TerminalWake::Continuation);
             }
             TerminalDirective::Selected(terminal) => {
-                if matches!(
-                    terminal,
-                    novarocks_coordination_contract::AttemptTerminal::Failed(_)
-                ) {
+                if matches!(terminal, crate::port_output::AttemptTerminal::Failed(_)) {
                     self.request_stop(result);
                 }
                 if defer_publication {
@@ -2049,13 +2065,10 @@ impl Core {
 
     fn publish_terminal(
         &mut self,
-        terminal: novarocks_coordination_contract::AttemptTerminal<AttemptFailure>,
+        terminal: crate::port_output::AttemptTerminal<AttemptFailure>,
         result: &mut AttemptStep,
     ) -> Result<(), TaskExecutionError> {
-        let normal = matches!(
-            terminal,
-            novarocks_coordination_contract::AttemptTerminal::Completed
-        );
+        let normal = matches!(terminal, crate::port_output::AttemptTerminal::Completed);
         result.effect = Some(self.port_effect(AttemptToLogicalBody::AttemptTerminal(terminal))?);
         if normal {
             self.begin_candidates_or_resume();
@@ -2067,14 +2080,13 @@ impl Core {
 
     fn accept_qa(
         &mut self,
-        port: novarocks_coordination_contract::LogicalToAttempt<AttemptFailure>,
+        port: novarocks_coordination_contract::LogicalToAttempt,
         result: &mut AttemptStep,
     ) -> Result<(), TaskExecutionError> {
         if !matches!(
             &port.body,
             LogicalToAttemptBody::AuthorizationReply { .. }
                 | LogicalToAttemptBody::EstablishSettlementReply { .. }
-                | LogicalToAttemptBody::EstablishDetachReply { .. }
         ) {
             return Err(schedule("QA continuation received an unrelated port reply"));
         }
@@ -2092,15 +2104,6 @@ impl Core {
                     ));
                 }
                 self.candidates.authorization = Some(Authorization::Ready(intent));
-            }
-            QaReply::ClosingFailed(failure) => {
-                self.record_terminal_failure(failure)?;
-                self.turn.phase = Phase::Terminal(
-                    self.turn
-                        .terminal_after_close
-                        .take()
-                        .unwrap_or(TerminalWake::Round),
-                );
             }
             QaReply::AuthorizationFailed(failure) => {
                 self.record_terminal_failure(failure)?;

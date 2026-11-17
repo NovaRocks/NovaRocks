@@ -203,6 +203,13 @@ pub enum ConsumerFact {
 #[derive(Clone, Debug)]
 pub enum RelayFact {
     Applied,
+    /// Exact consumed End after the optional ACK future has been admitted and
+    /// handed to its original Native tail. Does not prove ACK success or Join.
+    EndRelayed {
+        activation: AttemptActivationIdentity,
+        root: TaskIdentity,
+        end: novarocks_execution_contract::root_result::RootResultEnd,
+    },
     Stopped {
         activation: AttemptActivationIdentity,
         all_deliveries_settled: bool,

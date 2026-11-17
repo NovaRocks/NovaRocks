@@ -45,3 +45,5 @@ mod ids;
 pub use ids::*;
 
 pub mod logical_port;
+
+pub use logical_port::*;

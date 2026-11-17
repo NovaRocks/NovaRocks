@@ -184,7 +184,15 @@ impl RelayExecutor {
                     }
                 }
                 RelayEffect::Start { activation } => match self.start(activation).await {
-                    Ok(()) => RelayFact::Stopped {
+                    Ok(Some(end)) => RelayFact::EndRelayed {
+                        activation,
+                        root: self
+                            .native
+                            .retained_read_root(activation)
+                            .expect("same original completed relay root"),
+                        end,
+                    },
+                    Ok(None) => RelayFact::Stopped {
                         activation,
                         all_deliveries_settled: true,
                     },
@@ -217,7 +225,8 @@ impl RelayExecutor {
     async fn start(
         &self,
         activation: AttemptActivationIdentity,
-    ) -> Result<(), novarocks_logical_execution_protocol::input::FailureReport> {
+    ) -> Result<Option<RootResultEnd>, novarocks_logical_execution_protocol::input::FailureReport>
+    {
         let (mut source, mut stop) = {
             let mut state = self.lock();
             let a = state
@@ -236,7 +245,7 @@ impl RelayExecutor {
             )
         };
         if *stop.borrow() {
-            return Ok(());
+            return Ok(None);
         }
         let rows = self
             .native
@@ -252,15 +261,7 @@ impl RelayExecutor {
                 .consumer
                 .bind_internal(activation, root)
                 .map_err(report)?;
-            let exit = original.supervise_exit().await.map_err(|error| {
-                report(QueryExecutionError::from_execution(
-                    novarocks_coordination_contract::ExecutionFailureInput::new(
-                        error.failure_fact(),
-                        error.safe_detail(),
-                        novarocks_coordination_contract::ExecutionFailureSite::Coordinator,
-                    ),
-                ))
-            })?;
+            let exit = original.supervise_exit().await.map_err(report)?;
             if let Err(error) = self.consumer.register_internal(activation, root).await {
                 exit.complete(Err(error.clone()));
                 return Err(report(error));
@@ -281,7 +282,7 @@ impl RelayExecutor {
         }
         let opened = tokio::select! {
             biased;
-            _ = stopped(&mut stop) => return Ok(()),
+            _ = stopped(&mut stop) => return Ok(None),
             result = self.request(source.as_mut(), activation, RelayRequest::OpenDelivery { root, carrier }) => result.map_err(report)?,
         };
         if !matches!(
@@ -301,7 +302,7 @@ impl RelayExecutor {
         .await?
         {
             Some(value) => value,
-            None => return Ok(()),
+            None => return Ok(None),
         };
         self.consumer.record_end(activation, end).map_err(report)?;
         let consumed = RelayRequest::EndConsumed {
@@ -312,7 +313,7 @@ impl RelayExecutor {
         };
         let result = tokio::select! {
             biased;
-            _ = stopped(&mut stop) => return Ok(()),
+            _ = stopped(&mut stop) => return Ok(None),
             result = self.request(source.as_mut(), activation, consumed) => result.map_err(report)?,
         };
         if !matches!(result, RelayResponse::Applied) {
@@ -321,13 +322,13 @@ impl RelayExecutor {
         if self.consumer.is_internal() {
             let slot = tokio::select! {
                 biased;
-                _ = stopped(&mut stop) => return Ok(()),
+                _ = stopped(&mut stop) => return Ok(None),
                 result = self.consumer.reserve_segment(activation) => result.map_err(report)?,
             };
             let transfer = {
                 let state = self.lock();
                 if state.stopped.contains(&key(activation)) {
-                    return Ok(());
+                    return Ok(None);
                 }
                 self.consumer.deliver_internal_end_in(activation, end, slot)
             };
@@ -335,12 +336,12 @@ impl RelayExecutor {
             tokio::select! {
                 biased;
                 result = &mut transfer => result.map_err(report)?,
-                _ = stopped(&mut stop) => { let _ = transfer.await; return Ok(()); },
+                _ = stopped(&mut stop) => { let _ = transfer.await; return Ok(None); },
             }
             tokio::select! {
                 biased;
                 result = self.consumer.wait_internal_ready(activation) => { let ready = result.map_err(report)?; if ready.activation() != activation || ready.root() != root || ready.end() != end { return Err(report(protocol("accepted Ready differs from original relay End"))); } }
-                _ = stopped(&mut stop) => return Ok(()),
+                _ = stopped(&mut stop) => return Ok(None),
             }
         }
         if let Some(ack) = final_ack.take() {
@@ -365,7 +366,7 @@ impl RelayExecutor {
                 .expect("original relay record retained")
                 .cut = Some(cut);
         }
-        Ok(())
+        Ok(Some(end))
     }
     async fn pump_data(
         state: &Mutex<State>,

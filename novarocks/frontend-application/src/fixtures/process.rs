@@ -47,7 +47,7 @@ impl BackendProcessObservationPort for ScriptTopology {
     }
 }
 pub(super) struct Process {
-    pub(super) original: FrontendAttemptRuntime,
+    pub(super) original: Arc<FrontendAttemptRuntime>,
     pub(super) clock: Arc<crate::task_execution::clock::ManualClock>,
     pub(super) history: HistoryCapture,
     pub(super) workload: Option<novarocks_workload_control::WorkloadControl>,
@@ -96,7 +96,7 @@ impl Process {
         .unwrap();
         workload.mark_ready().unwrap();
         Self {
-            original: FrontendAttemptRuntime {
+            original: Arc::new(FrontendAttemptRuntime {
                 registration_open: Mutex::new(true),
                 runtime,
                 ledger,
@@ -108,7 +108,7 @@ impl Process {
                 observation,
                 host_observation,
                 unresolved_replacements: Mutex::new(BTreeMap::new()),
-            },
+            }),
             clock,
             history,
             workload: Some(workload),
@@ -171,5 +171,19 @@ impl crate::control_runtime::actor::TestActor for PausedLogicalActor {
     }
     fn next_deadline(&self) -> Option<Tick> {
         self.original.next_deadline()
+    }
+}
+
+// Test-only observation/cleanup of this SAME original process. No raw host or
+// membership authority is exposed to component callers.
+impl FrontendAttemptRuntime {
+    pub(crate) fn close_original_host_registration_for_fixture(&self) {
+        self.host.close_registration();
+    }
+    pub(crate) fn original_registries_empty_for_fixture(&self) -> bool {
+        self.host.is_empty()
+            && self.runtime.is_empty()
+            && self.ledger.is_empty()
+            && self.members.is_empty()
     }
 }

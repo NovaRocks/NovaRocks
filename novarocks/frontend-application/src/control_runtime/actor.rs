@@ -47,26 +47,12 @@ impl Clock for FrontendClock {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FrontendActorKind {
     Attempt,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "P12 wires the second actor kind into production composition"
-        )
-    )]
     Logical,
     #[cfg(test)]
     Test,
 }
 pub(crate) enum FrontendActor {
     Attempt(Box<AttemptActor>),
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "P12 wires the second actor kind into production composition"
-        )
-    )]
     Logical(Box<super::logical::adapter::LogicalActor>),
     #[cfg(test)]
     Test(Box<dyn TestActor>),
@@ -79,29 +65,8 @@ pub(crate) enum FrontendInput {
     CapacityReleased,
     Membership(super::membership::MembershipUpdate),
     Attempt(Box<AttemptInput>),
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "P12 wires the second actor kind into production composition"
-        )
-    )]
     Logical(Box<novarocks_logical_execution_protocol::input::LogicalInput>),
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "P12 wires the logical carrier into production composition"
-        )
-    )]
     LogicalInfrastructureFailed,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "P12 wires the logical carrier into production composition"
-        )
-    )]
     LogicalHostSettled,
     #[cfg(test)]
     Test(u64),
@@ -113,13 +78,6 @@ pub(crate) enum FrontendEffect {
     Attempt(Arc<AttemptEffectEnvelope>),
     AttemptNotice(Arc<AttemptNotice>),
     AttemptRootControlProcessed(InputId),
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "P12 wires the second actor kind into production composition"
-        )
-    )]
     Logical(Arc<super::logical::adapter::LogicalEffectEnvelope>),
     #[allow(
         dead_code,
@@ -148,13 +106,6 @@ pub(crate) enum FrontendLaneKey {
     },
     Pump(PayloadRef),
     Publication,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "P12 wires the second actor kind into production composition"
-        )
-    )]
     Logical(FrontendLogicalLaneKey),
     #[cfg(test)]
     Test(u64),

@@ -95,6 +95,8 @@ pub(super) struct LogicalEffectSource {
     cursor: usize,
     remaining: usize,
     pass_active: bool,
+    retirement_scan_requested: bool,
+    pass_retirement_scan: bool,
     input_pass_done: bool,
     tail_pass_done: bool,
     tails_retired: bool,
@@ -133,6 +135,7 @@ pub(super) struct LogicalEffectSource {
     originals_disposed: bool,
     startup_cursor: u8,
     observe_client: bool,
+    retain_diagnostics: bool,
     bootstrap_purpose: usize,
     client_purpose: usize,
     wake: Waker,
@@ -230,6 +233,7 @@ impl LogicalEffectSource {
             links,
             bootstrap_purpose: geometry.attempts * ATTEMPT_PURPOSES + 14,
             client_purpose: geometry.attempts * ATTEMPT_PURPOSES + 16,
+            retain_diagnostics: start.policy.retain_diagnostics,
             observe_client: start.policy.output
                 == novarocks_logical_execution_protocol::start::LogicalOutputMode::ResultStream,
             startup_cursor: 0,
@@ -253,6 +257,8 @@ impl LogicalEffectSource {
             cursor: 0,
             remaining: 0,
             pass_active: false,
+            retirement_scan_requested: false,
+            pass_retirement_scan: false,
             input_pass_done: false,
             tail_pass_done: false,
             tails_retired: false,
@@ -352,6 +358,11 @@ impl EffectSource for LogicalEffectSource {
             return None;
         };
         assert!(self.pending.is_none(), "one original logical prepayment");
+        if effect.body.work_kind() == LogicalWorkKind::Business
+            && !self.state.registry_is_committed()
+        {
+            return None;
+        }
         // A result role can be reused after its real job/report retires while
         // an earlier input batch still pins that job's metadata header. Keep
         // that exact header separately; its bounded credit precedes handoff.
@@ -502,14 +513,19 @@ impl EffectSource for LogicalEffectSource {
     fn core_consumed(&mut self, inputs: &[InputId]) {
         if !inputs.is_empty() {
             self.rescan_requested = true;
+            self.retirement_scan_requested = true;
+            // Indexing follows this Source's progress in the same host turn.
+            // Keep the real event even when that finite pass just finished.
+            self.wake.wake_by_ref();
         }
     }
     fn owner_failed_binding(
         &mut self,
         ticket: EffectTicket<FrontendEffect>,
         refused: EffectBindRefusal,
-    ) {
+    ) -> Option<crate::control_runtime::host::OriginalUntrackedTransport> {
         self.retain(Box::new((ticket, refused)));
+        None
     }
     fn owner_failed_pending(&mut self, original: PendingHandoff) {
         self.retain(Box::new(original));
@@ -561,7 +577,7 @@ impl EffectSource for LogicalEffectSource {
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
         turn: &ActorHostTurn<FrontendActor>,
-        _: Tick,
+        now: Tick,
         budget: usize,
     ) -> SourceProgress {
         let mut units = 0;
@@ -571,13 +587,17 @@ impl EffectSource for LogicalEffectSource {
             .expect("same original logical actor")
             .failed;
         if failed && self.failure_cut.is_none() {
-            let proof = runtime
+            runtime
                 .failure_proof_for(&self.registration)
                 .expect("same original logical failure proof");
-            self.failure_cut = Some(LogicalFailureCut::from_original(
-                &proof,
-                self.failure_budget,
-            ));
+            // Freeze when this original Source first enters failure cleanup,
+            // before its failure ticket or cleanup job can be delayed. Later
+            // scans and late Native rows reuse this cut, only shortening it
+            // against terminal/Ready deadlines that already exist.
+            let cut = LogicalFailureCut::from_host(now, self.failure_budget);
+            self.failure_cut = Some(cut);
+            #[cfg(test)]
+            self.failure.observe_cut_for_fixture(cut, false);
         }
         if failed
             && self.failure_job.is_none()
@@ -606,6 +626,7 @@ impl EffectSource for LogicalEffectSource {
                 self.wake.clone(),
             );
             let supervisor = LogicalFailureSupervisor {
+                retain_diagnostics: self.retain_diagnostics,
                 runtime: runtime.clone(),
                 registration: self.registration.clone(),
                 ticket: ticket.clone(),
@@ -644,7 +665,11 @@ impl EffectSource for LogicalEffectSource {
             units += 1;
             progressed = true;
         }
-        let notified = self.progress_requested.swap(false, Ordering::AcqRel);
+        // Read both original notification owners. Runtime ticket completion
+        // can make a standing fact retireable without another Core index;
+        // explicit release(more) continuation does not set was_notified.
+        let notified = self.progress_requested.swap(false, Ordering::AcqRel) || turn.was_notified();
+        self.retirement_scan_requested |= notified;
         if self.pass_active && notified {
             self.rescan_requested = true;
         }
@@ -652,13 +677,21 @@ impl EffectSource for LogicalEffectSource {
             units += 1;
             self.rescan_requested = true;
         }
-        if !failed && self.startup_cursor == 0 && units < budget {
+        if !failed
+            && self.state.registry_is_committed()
+            && self.startup_cursor == 0
+            && units < budget
+        {
             self.launch_original(self.bootstrap_purpose, LogicalHostEffect::Bootstrap);
             self.startup_cursor = 1;
             units += 1;
             progressed = true;
         }
-        if !failed && self.startup_cursor == 1 && units < budget {
+        if !failed
+            && self.state.registry_is_committed()
+            && self.startup_cursor == 1
+            && units < budget
+        {
             if self.observe_client {
                 self.launch_original(
                     self.client_purpose,
@@ -701,6 +734,10 @@ impl EffectSource for LogicalEffectSource {
         // owns the next wake; a cursor inspection alone never self-schedules.
         if !self.pass_active {
             self.pass_active = true;
+            // A real retirement event during an older pass belongs to the
+            // following full pass. Each original Link receives this hint
+            // under its own paid visit, including completion without indexing.
+            self.pass_retirement_scan = std::mem::take(&mut self.retirement_scan_requested);
             self.remaining = if self.live_authors == 0 {
                 0
             } else {
@@ -743,7 +780,10 @@ impl EffectSource for LogicalEffectSource {
                     .snapshot(self.registration.actor())
                     .expect("original logical port actor")
                     .failed;
-                match self.links.endpoint_progress(index, failed) {
+                match self
+                    .links
+                    .endpoint_progress(index, failed, self.pass_retirement_scan)
+                {
                     Ok(Some(port)) => {
                         progressed |= port.progressed;
                         self.rescan_requested |= port.more;
@@ -1006,7 +1046,7 @@ impl EffectSource for LogicalEffectSource {
             || inputs_more
             || !self.tail_pass_done
             || self.header_remaining != 0
-            || self.startup_cursor < 2;
+            || self.state.registry_is_committed() && self.startup_cursor < 2;
         if self.remaining == 0
             && self.input_pass_done
             && self.tail_pass_done

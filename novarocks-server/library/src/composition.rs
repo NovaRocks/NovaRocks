@@ -580,7 +580,7 @@ pub fn compose_frontend_role_config(
         .ok_or_else(|| anyhow::anyhow!("compose frontend server without catalog source preflight"))?
         .input()?;
     let task_execution_budgets = compose_task_execution_budgets(config)?;
-    let (logical_supervisor, workload, abort_capacity, result_profile, capacity_inputs) =
+    let (logical_supervisor, workload, result_profile, capacity_inputs) =
         compose_frontend_workload_runtime(runtime_config)?;
     // Runtime settings come from the same original ingress and Native owners.
     let capacity_profile = FrontendWorkloadCapacityProfile::try_for_native(
@@ -595,7 +595,6 @@ pub fn compose_frontend_role_config(
     let logical_runtime = FrontendLogicalExecutionRuntimeConfig::new(
         logical_supervisor,
         workload,
-        abort_capacity,
         result_profile,
         capacity_profile,
     );
@@ -864,7 +863,6 @@ fn compose_frontend_workload_runtime(
 ) -> anyhow::Result<(
     LogicalExecutionSupervisorConfig,
     WorkloadConfig,
-    NonZeroUsize,
     FrontendResultCapacityProfile,
     FrontendNativeCapacityInputs,
 )> {
@@ -886,10 +884,6 @@ fn compose_frontend_workload_runtime(
                 "runtime.frontend_workload.restarts_per_work cannot form a nonzero u32 attempt bound"
             )
         })?;
-    let abort_capacity = nonzero(
-        "logical_abort_effect_capacity",
-        input.logical_abort_effect_capacity,
-    )?;
     if input.logical_replacement_reservation_ms == 0 {
         anyhow::bail!(
             "runtime.frontend_workload.logical_replacement_reservation_ms must be nonzero"
@@ -912,10 +906,6 @@ fn compose_frontend_workload_runtime(
         Duration::from_millis(input.logical_replacement_reservation_ms),
     );
     let supervisor = LogicalExecutionSupervisorConfig::new(
-        nonzero(
-            "logical_actor_mailbox_capacity",
-            input.logical_actor_mailbox_capacity,
-        )?,
         nonzero(
             "logical_participation_admission_issue_capacity",
             input.logical_participation_admission_issue_capacity,
@@ -940,13 +930,7 @@ fn compose_frontend_workload_runtime(
         query_blocking,
     )
     .context("construct unvalidated frontend Native capacity inputs")?;
-    Ok((
-        supervisor,
-        workload,
-        abort_capacity,
-        result_profile,
-        capacity_inputs,
-    ))
+    Ok((supervisor, workload, result_profile, capacity_inputs))
 }
 
 fn compose_task_execution_budgets(
@@ -1365,7 +1349,7 @@ mod tests {
         let mut config = crate::app_config::NovaRocksConfig::default();
         config.runtime.query_blocking_worker_threads = 1;
         config.runtime.query_blocking_queue_capacity = 1;
-        let (_, workload, _, result, inputs) =
+        let (_, workload, result, inputs) =
             compose_frontend_workload_runtime(&config.runtime).unwrap();
         let transport = compose_task_execution_budgets(&config).unwrap().transport;
         let profile =
@@ -1387,12 +1371,10 @@ mod tests {
     fn frontend_workload_runtime_is_built_from_validated_server_fields() {
         let mut config = crate::app_config::NovaRocksConfig::default();
         config.runtime.mem_limit = "1G".to_string();
-        let (_, workload, abort_capacity, _, inputs) =
-            compose_frontend_workload_runtime(&config.runtime)
-                .expect("explicit frontend workload fields compose");
+        let (_, workload, _, inputs) = compose_frontend_workload_runtime(&config.runtime)
+            .expect("explicit frontend workload fields compose");
         assert_eq!(workload.query_concurrency_limit, 256);
         assert_eq!(workload.execution_limit, workload.scope_records_limit);
-        assert_eq!(abort_capacity.get(), 16);
         assert_eq!(inputs.policy().scope_limit(), 8192);
         assert_eq!(inputs.policy().scope_limit(), workload.scope_records_limit);
         assert_eq!(
@@ -1415,21 +1397,6 @@ mod tests {
             .runtime
             .frontend_workload
             .logical_replacement_reservation_ms = 30_000;
-        config
-            .runtime
-            .frontend_workload
-            .logical_abort_effect_capacity = 0;
-        assert!(
-            compose_frontend_workload_runtime(&config.runtime)
-                .expect_err("zero logical Abort effect capacity must fail preflight")
-                .to_string()
-                .contains("logical_abort_effect_capacity")
-        );
-
-        config
-            .runtime
-            .frontend_workload
-            .logical_abort_effect_capacity = 16;
         // FE admission no longer derives an allocation budget from mem_limit.
         config.runtime.mem_limit = "64M".to_string();
         assert!(compose_frontend_workload_runtime(&config.runtime).is_ok());
@@ -1551,7 +1518,7 @@ mod frontend_runtime_policy_tests {
         let mut runtime: crate::app_config::RuntimeConfig =
             toml::from_str("[frontend_workload]\nclient_result_all_objects_bytes = 201326592\n")
                 .unwrap();
-        let (_, _, _, installed, _) = compose_frontend_workload_runtime(&runtime).unwrap();
+        let (_, _, installed, _) = compose_frontend_workload_runtime(&runtime).unwrap();
         let installed = installed.declared();
         assert_eq!(installed.all_objects_bytes[0], 192 * 1024 * 1024);
         assert_eq!(
@@ -1577,7 +1544,7 @@ mod frontend_runtime_policy_tests {
         runtime.frontend_workload.internal_result_positions = 1;
         runtime.frontend_workload.internal_result_all_objects_bytes = 2 * 1024 * 1024 * 1024;
         validate_frontend_joint_startup(&runtime).unwrap();
-        let (_, _, _, installed, _) = compose_frontend_workload_runtime(&runtime).unwrap();
+        let (_, _, installed, _) = compose_frontend_workload_runtime(&runtime).unwrap();
         assert_eq!(installed.declared().positions[2], 1);
         assert_eq!(
             installed.declared().all_objects_bytes[2],
@@ -1609,7 +1576,7 @@ mod frontend_runtime_policy_tests {
     fn global_scope_inventory_reaches_the_original_workload() {
         let mut runtime = crate::app_config::RuntimeConfig::default();
         runtime.frontend_workload.scope_records_limit = 5000;
-        let (_, workload, _, _, inputs) = compose_frontend_workload_runtime(&runtime).unwrap();
+        let (_, workload, _, inputs) = compose_frontend_workload_runtime(&runtime).unwrap();
         assert_eq!(workload.scope_records_limit, 5000);
         assert_eq!(workload.root_limit, 5000);
         assert_eq!(inputs.policy().scope_limit(), 5000);

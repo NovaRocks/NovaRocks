@@ -18,121 +18,18 @@
 //! The production attempt assembler with its original Sources and no poller pool.
 
 use super::*;
+use crate::control_runtime::actor::FrontendEffect;
 use crate::{
-    native::{
-        fragment_encoder::frozen::tests::frozen_package,
-        task_result_transport::{NativeTaskResultTransport, TaskReadGrace},
-        task_transport::{NativeTaskOperationSink, tests::Loopback},
-    },
-    query_execution::{
-        artifact::{
-            NativePlacementAssignment, TaskManifestBinding, ValidatedNativeSubmission,
-            task_key_for_contract_test,
-        },
-        lifecycle_plan::QueryCredentialLeases,
-        native_execution_adapter::{LogicalAbortRouter, source_cohort},
-        schedule::{SchedulingPlan, TaskPlacement},
-    },
-    task_execution::{
-        clock::ManualClock,
-        host::{
-            install::InstallAttemptHost,
-            transport::{FrozenSubscriptionStageInputs, stage_subscription_endpoints},
-        },
-        lease::RequestedLeaseDurations,
-        manifest_projection::{AttemptPlanPolicy, ManifestAttemptInputs},
-        sources::{AttemptEstablishFacts, SubmissionTaskPlans},
-    },
+    native::task_transport::tests::Loopback,
+    query_execution::native_execution_adapter::source_cohort, task_execution::clock::ManualClock,
 };
-use novarocks_attempt_protocol::{config::CoordinationBudgets, ids::IdSeed};
-use novarocks_coordination_contract::ExecutionEffect;
-use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
-use novarocks_physical_plan::PipelineDopDomain;
-use novarocks_proto_models::{
-    catalog::CatalogSet,
-    novarocks::{QueryOptions, RuntimeFilterContribution},
-};
-use novarocks_query_application::{
-    api::{BackendProcessObservation, BackendTopologyError},
-    coordination::LogicalExecutionActorConfig,
-    test_support::LogicalExecutionTestHarness,
-};
-use novarocks_task_codec::TransportBudget;
-use novarocks_types::{AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId};
+use novarocks_execution_contract::BackendProcessDescriptor;
+use novarocks_types::BackendProcessId;
 use novarocks_workload_control::{
-    ControlStorageConfig, PollRoleSourceBacking, ResultCapacityConfig, ResultWindowClass, Stage,
-    WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
-    joint_admission::{JointProgressDriver, ResponsibilityConfig},
+    ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest, WorkloadControl,
+    joint_admission::JointProgressDriver,
 };
-use std::{
-    alloc::Layout,
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll, Waker},
-    time::Duration,
-};
-
-struct CurrentPeer(BackendProcessDescriptor);
-impl BackendProcessObservationPort for CurrentPeer {
-    fn observe_process_at_endpoint(
-        &self,
-        process: BackendProcessId,
-        endpoint: &RuntimeEndpoint,
-    ) -> Result<BackendProcessObservation, BackendTopologyError> {
-        assert_eq!(process, self.0.process_id());
-        assert_eq!(endpoint, self.0.endpoint());
-        Ok(BackendProcessObservation::Current)
-    }
-}
-
-// This is the normal production process owner without its separately-owned
-// poller and membership service. The test gives the same queues finite turns.
-fn manual_process(
-    data: &FrontendDataRuntime,
-    clock: Arc<dyn MonotonicClock>,
-    peer: BackendProcessDescriptor,
-    history: Option<novarocks_control_runtime::history::HistoryCapture>,
-) -> FrontendAttemptRuntime {
-    let layout = data.transport_capacity().clone();
-    let clock: Arc<dyn Clock> = Arc::new(FrontendClock(clock));
-    let observation = RuntimeObservation::new(Some(clock.clone()));
-    let limit = NonZeroUsize::new(8).unwrap();
-    let budget = ObservationBudget::for_task_attempt();
-    let limits = layout
-        .process_limits()
-        .checked_add(&budget.byte_windows(limit).unwrap())
-        .unwrap()
-        .checked_add(&ObservationBackingQuote::process_limit(budget, limit).unwrap())
-        .unwrap();
-    let ledger = RuntimeLedger::with_keyed_families_and_observation(
-        limits,
-        layout.keyed_families(),
-        [],
-        history.clone(),
-        observation.clone(),
-    )
-    .unwrap();
-    let runtime = ActorRuntime::with_observation(history, observation.clone());
-    let host_observation = Arc::new(FrontendHostObservations::new(clock.clone()));
-    let host = Arc::new(HostRegistry::new(
-        runtime.clone(),
-        ledger.clone(),
-        host_observation.clone(),
-    ));
-    FrontendAttemptRuntime {
-        registration_open: Mutex::new(true),
-        runtime,
-        ledger,
-        layout,
-        host,
-        members: Arc::new(MembershipRegistry::new()),
-        backend_processes: Arc::new(CurrentPeer(peer)),
-        clock,
-        observation,
-        host_observation,
-        unresolved_replacements: Mutex::new(BTreeMap::new()),
-    }
-}
+use std::{future::Future, task::Poll, time::Duration};
 
 // The original finite queue turns are driven even while the external native
 // future is pending. No Core input, source callback or exit fact is synthesized.
@@ -142,11 +39,22 @@ async fn drive_until<F: Future>(
     future: F,
     until: Instant,
 ) -> Option<F::Output> {
+    drive_until_with_original_clock(process, joint, future, until, None).await
+}
+
+async fn drive_until_with_original_clock<F: Future>(
+    process: &FrontendAttemptRuntime,
+    joint: &mut JointProgressDriver,
+    future: F,
+    until: Instant,
+    clock: Option<&ManualClock>,
+) -> Option<F::Output> {
     let mut future = Box::pin(future);
     loop {
         source_cohort::tests::drive(joint);
         let now = process.clock.now();
         process.runtime.advance_time(now, 64).unwrap();
+        let mut runnable = false;
         for _ in 0..64 {
             let core = process
                 .runtime
@@ -161,6 +69,7 @@ async fn drive_until<F: Future>(
             if !core && !host_claimed {
                 break;
             }
+            runnable = true;
         }
         if let Poll::Ready(value) = futures::poll!(future.as_mut()) {
             return Some(value);
@@ -168,639 +77,289 @@ async fn drive_until<F: Future>(
         if Instant::now() >= until {
             return None;
         }
+        if !runnable
+            && let Some(clock) = clock
+            && let Some(next) = process.runtime.next_deadline()
+            && next > process.clock.now()
+        {
+            // Select only an existing indexed future deadline after all
+            // currently runnable original Core/Host work has been polled.
+            clock.advance(Duration::from_nanos(next.0 - process.clock.now().0));
+        }
         tokio::task::yield_now().await;
+    }
+}
+
+use crate::control_runtime::logical::test_fixtures::{
+    FrontendFixture,
+    native_recipe::{
+        ActualLogicalCase, OriginalRecipeContext, OriginalRecipeOperands,
+        PreparedOriginalRecipeProcess, ReadCloseGate, RecipeRoot, count_description,
+        install_original_recipe, prepare_original_recipe_process,
+    },
+};
+use crate::query_execution::internal_consumer::profile::{
+    ProfileComputationOutput, profile_computation_consumer,
+};
+use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
+use novarocks_query_application::coordination::LogicalExecutionSupervisor;
+
+struct OriginalFixture {
+    fixture: FrontendFixture,
+    logical: ActualLogicalCase,
+    process: Arc<FrontendAttemptRuntime>,
+    clock: Arc<ManualClock>,
+    joint: JointProgressDriver,
+    workload: WorkloadControl,
+    supervisor: LogicalExecutionSupervisor,
+    scope: novarocks_workload_control::WorkScope,
+    business: novarocks_workload_control::BusinessPermit,
+    capacity: novarocks_workload_control::ResultCapacityHandle,
+    window: novarocks_workload_control::ResultWindowGrant,
+    cohort: crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
+    requester: novarocks_workload_control::WorkCancellationRequester,
+    output: ProfileComputationOutput,
+}
+fn install_original_fixture(
+    data: &FrontendDataRuntime,
+    descriptor: BackendProcessDescriptor,
+    history: novarocks_control_runtime::history::HistoryCapture,
+) -> OriginalFixture {
+    install_original_fixture_shape(data, descriptor, history, false)
+}
+fn install_original_fixture_shape(
+    data: &FrontendDataRuntime,
+    descriptor: BackendProcessDescriptor,
+    history: novarocks_control_runtime::history::HistoryCapture,
+    three_tasks: bool,
+) -> OriginalFixture {
+    let PreparedOriginalRecipeProcess {
+        mut fixture,
+        process,
+        clock,
+        mut joint,
+        workload,
+        supervisor,
+        client,
+        capacity,
+        handle,
+        descriptor,
+    } = prepare_original_recipe_process(data, descriptor, history, ResultCapacityConfig::V1, None);
+    let original = workload
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = original.owner.scope();
+    let requester = original.owner.cancellation_requester();
+    let window = capacity
+        .try_acquire(&scope, ResultWindowClass::Internal)
+        .unwrap();
+    let (description, plan) = count_description();
+    let (consumer, offers, output) = profile_computation_consumer(&description, plan).unwrap();
+    let (logical, cohort, output) = install_original_recipe(
+        OriginalRecipeContext {
+            fixture: &mut fixture,
+            joint: &mut joint,
+            process: &process,
+            data,
+            clock: &clock,
+            handle,
+            descriptor,
+            client,
+        },
+        OriginalRecipeOperands {
+            owner: original.owner,
+            binding: QueryResultCapacityBinding::try_new(&scope, window.retain_alias()).unwrap(),
+            description,
+            plan,
+            root: if three_tasks {
+                RecipeRoot::EmptyCountOnly.with_three_task_protocol_chain(plan, [2, 3])
+            } else {
+                RecipeRoot::EmptyCountOnly
+            },
+            consumer,
+            offers,
+            output,
+        },
+    );
+    OriginalFixture {
+        fixture,
+        logical,
+        process,
+        clock,
+        joint,
+        workload,
+        supervisor,
+        scope,
+        business: original.business,
+        capacity,
+        window,
+        cohort,
+        requester,
+        output,
     }
 }
 
 #[tokio::test]
 async fn installed_unstarted_single_participation_closes_all_original_sources() {
-    let wait = Duration::from_secs(5);
-    let handle = tokio::runtime::Handle::current();
-    let mut data = FrontendDataRuntime::new(handle.clone());
-    let mut peer = Loopback::start().await;
-    let backend = BackendProcessId::new_v7();
-    let descriptor = peer.bounded_root_descriptor(backend);
-    let backends: Arc<[BackendProcessDescriptor]> = Arc::from([descriptor.clone()]);
-    let execution =
-        QueryExecutionId::new(QueryId::new(711, 19), AttemptId::new(1).unwrap()).unwrap();
-    let frontend = FrontendProcessId::new_v7();
-    let fragment_id = 1;
-    let task_key = task_key_for_contract_test(execution.query_id(), fragment_id, 0);
-    let fragment = frozen_package(
-        fragment_id,
-        100,
-        [9; 16],
-        PipelineDopDomain {
-            min: 1,
-            max: 1,
-            requires_power_of_two: false,
-        },
-        None,
-        0,
-    );
-    let schedule = SchedulingPlan {
-        root_fragment_id: fragment_id,
-        by_fragment: [(
-            fragment_id,
-            vec![TaskPlacement {
-                fragment_id,
-                instance_index: 0,
-                task_key,
-                backend_idx: 0,
-                endpoint: descriptor.endpoint().clone(),
-                scan_ranges: BTreeMap::new(),
-            }],
-        )]
-        .into(),
-        root_task_key: task_key,
-        root_backend_idx: 0,
-    };
-    let manifest = TaskManifestBinding::protocol_fixture_with_topology_for_test(
-        execution,
-        frontend,
-        &schedule,
-        &[],
-        &[(0, backend)].into(),
-        [(fragment_id, fragment.clone())].into(),
-        &[(0, descriptor.clone())].into(),
-    )
-    .unwrap();
-    let participations = manifest
-        .participations()
-        .iter()
-        .map(|member| member.participation())
-        .collect::<Vec<_>>();
-    let submission = ValidatedNativeSubmission::new(
-        0,
-        task_key,
-        execution,
-        fragment,
-        NativePlacementAssignment::new(0, NonZeroUsize::MIN, BTreeMap::new()),
-    );
-    let mut plans = SubmissionTaskPlans::index_manifest(vec![submission], &manifest).unwrap();
-    let mut prepared = ManifestAttemptInputs::freeze(
-        &manifest,
-        &mut plans,
-        descriptor.native_compatibility_id(),
-        TransportBudget::DEFAULT,
-    )
-    .unwrap()
-    .prepare_publications()
-    .unwrap();
-    let statuses = prepared.publications.root_status.take().unwrap();
-    let protocol_facts = prepared.publications.protocol_facts.take().unwrap();
-
-    // One original root pays QA, the result window, all Native actions and
-    // the actual subscription child. No second root or quota wallet is used.
-    let count = 8;
-    let send_geometry =
-        NativeTaskOperationSink::proposal_wait_source_geometry(TransportBudget::DEFAULT).unwrap();
-    let send_backing = Layout::array::<u8>(send_geometry.resident_bytes().unwrap()).unwrap();
-    let subscription_backing = Layout::from_size_align(
-        crate::native::NativeSubscriptionOwner::resident_storage_bytes(count).unwrap(),
-        8,
-    )
-    .unwrap();
-    let storage = ControlStorageConfig::new(count, &[]).with_process_source_backing(
-        PollRoleSourceBacking::from_layouts(&[subscription_backing], &[send_backing]).unwrap(),
-    );
-    let workload = WorkloadControl::try_new_counted(WorkloadConfig {
-        root_limit: count,
-        business_limit: count,
-        query_concurrency_limit: count,
-        scope_records_limit: count,
-        ..WorkloadConfig::default()
-    })
-    .unwrap()
-    .owner;
-    let (_, mut joint) = workload
-        .configure_responsibility(ResponsibilityConfig {
-            work_per_turn: NonZeroUsize::new(7).unwrap(),
-        })
-        .unwrap();
-    workload.configure_control_storage(storage).unwrap();
-    let capacity = workload
-        .configure_result_capacity(ResultCapacityConfig::V1)
-        .unwrap();
-    workload.mark_ready().unwrap();
-    let original = workload
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    let scope = original.owner.scope();
-    let transport = novarocks_native_adapter::FrontendNativeTransport::plaintext();
-    let mut binding = scope.begin_control_binding().unwrap();
-    for endpoint in [descriptor.endpoint(), descriptor.control_endpoint()] {
-        binding
-            .push_selected_network(
-                transport
-                    .selected_network_origin(endpoint.native_endpoint())
-                    .unwrap(),
-            )
-            .unwrap();
-    }
-    binding.end_change().unwrap();
-    let mut admission = binding.submit().unwrap();
-    source_cohort::tests::drive(&mut joint);
-    let Poll::Ready(Ok(mut granted)) =
-        Pin::new(&mut admission).poll(&mut Context::from_waker(Waker::noop()))
-    else {
-        panic!("the original selected native binding must grant");
-    };
-    granted
-        .adjustment
-        .as_mut()
-        .unwrap()
-        .install_control_scope_in(&scope)
-        .unwrap()
-        .notify();
-    drop((granted, admission));
-    source_cohort::tests::drive(&mut joint);
-    let window = capacity
-        .try_acquire(&scope, ResultWindowClass::Client)
-        .unwrap();
-    let authority = window.retain_alias().native_action_authority().unwrap();
-    let cohort = source_cohort::tests::cohort(&scope, 1, &mut joint);
-    let stage = scope.try_acquire(Stage::Execution).unwrap();
-    let business = original.business;
-    let router = LogicalAbortRouter::new();
-    let config = LogicalExecutionActorConfig::single_attempt_completion(
-        execution,
-        ExecutionEffect::None,
-        NonZeroUsize::new(8).unwrap(),
-        participations,
-        NonZeroUsize::MIN,
-        NonZeroUsize::MIN,
-        original.owner,
-        stage,
-    )
-    .unwrap()
-    .with_abort_participation_effect_port(router.clone(), NonZeroUsize::MIN);
-    let mut logical = LogicalExecutionTestHarness::install(
-        handle,
-        config,
-        execution,
-        manifest
-            .participations()
-            .iter()
-            .map(|member| member.participation())
-            .collect(),
-    )
-    .unwrap();
-    logical.activate_initial().await.unwrap();
-    let drive = logical.native_attempt_drive();
-    let route = Arc::new(router.reserve_route(execution).unwrap());
-    let clock = Arc::new(ManualClock::new());
-    let process = manual_process(&data, clock.clone(), descriptor.clone(), None);
-    let staged = stage_subscription_endpoints(
-        &[crate::control_runtime::membership::FrozenMember {
-            participation: manifest.participations()[0].participation(),
-            endpoint: descriptor.endpoint().clone(),
-        }],
-        FrozenSubscriptionStageInputs {
-            backends: &backends,
-            compatibility: descriptor.native_compatibility_id(),
-            data: &data,
-            scope: &scope,
-            cohort: &cohort,
-            execution,
-        },
-    )
-    .unwrap();
-    let establish = AttemptEstablishFacts::freeze(
-        CatalogSet::default(),
-        [(backend, RuntimeFilterContribution::default())],
-        QueryOptions::default(),
-        &QueryCredentialLeases::empty(),
-    )
-    .unwrap();
-    let lease = RequestedLeaseDurations::DEFAULT;
-    let mut split = None;
-    let installed = InstallAttemptHost {
-        process: &process,
-        data: &data,
-        clock,
-        drive: &drive,
-        prepared,
-        establish: &establish,
-        replacements: None,
-        subscriptions: staged,
-        authority,
-        route: route.clone(),
-        results: Arc::new(
-            NativeTaskResultTransport::new(
-                backends,
-                data.clone(),
-                TaskReadGrace::new(Duration::from_secs(1)),
-            )
-            .unwrap(),
-        ),
-        profile: None,
-        dynamic: None,
-        split: &mut split,
-        policy: AttemptPlanPolicy {
-            coordination: CoordinationBudgets::DEFAULT,
-            retry: Default::default(),
-            initial_lease: lease.initial(),
-            steady_lease: lease.steady(),
-        },
-        ids: IdSeed::new(1, 100),
-        retain_diagnostics: false,
-        observe_dev_root: false,
-        observe_lifecycle: false,
-        #[cfg(novarocks_dev_controls)]
-        root_observer: None,
-    }
-    .install()
-    .unwrap();
-
-    // Close the exact registered owner BEFORE its first Host/Core turn.
-    // This first slice proves only unused/staged production-source cleanup.
-    // No Open, Task execution, P convergence or live RPC exit is claimed.
-    process.host.close_registration();
-    // Retain the original execution observer through the real Host close.
-    // No asynchronous bridge run or convergence was started in this slice.
-    drop((statuses, protocol_facts, cohort, window));
-    let host_exit = drive_until(
-        &process,
-        &mut joint,
-        async {
-            while !process.host.is_empty() {
-                tokio::task::yield_now().await;
-            }
-        },
-        Instant::now() + wait,
-    )
-    .await;
-    let no_native_dispatch =
-        peer.subscription_requests().is_empty() && peer.applied_requests().is_empty();
-    drop((installed, drive, route, router, manifest, capacity));
-    let qa_exit = logical.finish_until(Instant::now() + wait).await;
-    business.release();
-    source_cohort::tests::drive(&mut joint);
-    let scope_released = tokio::time::timeout(wait, scope.wait_released()).await;
-    drop(scope);
-    workload.close_admission();
-    source_cohort::tests::drive(&mut joint);
-    let workload_exit = workload.shutdown();
-    let subscriptions_exit = data
-        .drain_original_subscriptions_until(Instant::now() + wait)
-        .await;
-    let apply_exit = data.drain_original_apply_until(Instant::now() + wait).await;
-    let outgoing_exit = data
-        .drain_native_outgoing_until(Instant::now() + wait)
-        .await;
-    let peer_exit = peer.settle().await;
-    let clean = process.host.is_empty()
-        && process.runtime.is_empty()
-        && process.ledger.is_empty()
-        && process.members.is_empty();
-
-    // Assertions follow actual host/Source/QA/Workload/channel/peer cleanup.
-    assert!(clean);
-    assert!(qa_exit.is_ok() && scope_released.is_ok() && workload_exit.is_ok());
-    assert!(subscriptions_exit.is_ok() && apply_exit.is_ok() && outgoing_exit.is_ok() && peer_exit);
-    assert!(host_exit.is_some() && no_native_dispatch);
+    run_original_recipe(true, false, false, false).await;
 }
-
 #[tokio::test]
 async fn installed_live_single_root_subscription_normally_converges_and_really_closes() {
-    run_installed_live(false).await;
+    run_original_recipe(false, false, false, false).await;
 }
-
 #[tokio::test]
 async fn installed_reopen_retires_original_final_phase_before_reusing_paid_source() {
-    run_installed_live(true).await;
+    run_original_recipe(false, true, false, false).await;
 }
-
-async fn run_installed_live(controlled_reopen: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn installed_core_failure_waits_for_original_read_close_and_really_retires() {
+    run_original_recipe(false, false, true, false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn installed_shutdown_keeps_same_join_and_native_work_after_cancelled_wait() {
+    run_original_recipe(false, false, false, true).await;
+}
+#[tokio::test]
+async fn installed_three_task_protocol_recipe_keeps_actual_graph_and_closes_all_original_sources() {
+    run_original_recipe_shape(false, false, false, false, true).await;
+}
+async fn run_original_recipe(
+    unstarted: bool,
+    controlled_reopen: bool,
+    failure_during_read_close: bool,
+    shutdown_during_read_close: bool,
+) {
+    run_original_recipe_shape(
+        unstarted,
+        controlled_reopen,
+        failure_during_read_close,
+        shutdown_during_read_close,
+        false,
+    )
+    .await;
+}
+async fn run_original_recipe_shape(
+    unstarted: bool,
+    controlled_reopen: bool,
+    failure_during_read_close: bool,
+    shutdown_during_read_close: bool,
+    three_tasks: bool,
+) {
     let wait = Duration::from_secs(5);
-    let handle = tokio::runtime::Handle::current();
-    let mut data = FrontendDataRuntime::new(handle.clone());
+    let mut data = FrontendDataRuntime::new(tokio::runtime::Handle::current());
     let mut peer = Loopback::start().await;
-    let backend = BackendProcessId::new_v7();
-    let descriptor = peer.bounded_root_descriptor(backend);
-    let backends: Arc<[BackendProcessDescriptor]> = Arc::from([descriptor.clone()]);
-    let execution =
-        QueryExecutionId::new(QueryId::new(712, 19), AttemptId::new(1).unwrap()).unwrap();
-    let frontend = FrontendProcessId::new_v7();
-    let fragment_id = 1;
-    let task_key = task_key_for_contract_test(execution.query_id(), fragment_id, 0);
-    let fragment = frozen_package(
-        fragment_id,
-        100,
-        [9; 16],
-        PipelineDopDomain {
-            min: 1,
-            max: 1,
-            requires_power_of_two: false,
-        },
-        None,
-        0,
-    );
-    let schedule = SchedulingPlan {
-        root_fragment_id: fragment_id,
-        by_fragment: [(
-            fragment_id,
-            vec![TaskPlacement {
-                fragment_id,
-                instance_index: 0,
-                task_key,
-                backend_idx: 0,
-                endpoint: descriptor.endpoint().clone(),
-                scan_ranges: BTreeMap::new(),
-            }],
-        )]
-        .into(),
-        root_task_key: task_key,
-        root_backend_idx: 0,
-    };
-    let manifest = TaskManifestBinding::protocol_fixture_with_topology_for_test(
-        execution,
-        frontend,
-        &schedule,
-        &[],
-        &[(0, backend)].into(),
-        [(fragment_id, fragment.clone())].into(),
-        &[(0, descriptor.clone())].into(),
-    )
-    .unwrap();
-    // The fixture purpose is completion without row payloads. This explicit
-    // declaration is not inferred from the package's Binary carrier.
-    let kind = novarocks_result_contract::RootOutputKind::CountOnly;
-    let root_task = manifest.root();
-    if controlled_reopen {
-        peer.enable_single_root_first_subscription_eof_before_create(root_task, kind);
-    } else {
-        peer.enable_single_root_lifecycle(root_task, kind);
+    let descriptor = peer.bounded_root_descriptor(BackendProcessId::new_v7());
+    let history = novarocks_control_runtime::history::HistoryCapture::new(32_768);
+    let OriginalFixture {
+        mut fixture,
+        mut logical,
+        process,
+        clock,
+        mut joint,
+        workload,
+        mut supervisor,
+        scope,
+        business,
+        capacity,
+        window,
+        cohort,
+        requester,
+        mut output,
+    } = install_original_fixture_shape(&data, descriptor, history.clone(), three_tasks);
+    let original_cancellation = scope.cancellation().unwrap();
+    if three_tasks {
+        assert!(
+            !unstarted
+                && !controlled_reopen
+                && !failure_during_read_close
+                && !shutdown_during_read_close
+        );
+        logical
+            .probe
+            .graph_capture_requested
+            .store(true, std::sync::atomic::Ordering::Release);
     }
-    let participations = manifest
-        .participations()
-        .iter()
-        .map(|member| member.participation())
-        .collect::<Vec<_>>();
-    let submission = ValidatedNativeSubmission::new(
-        0,
-        task_key,
-        execution,
-        fragment,
-        NativePlacementAssignment::new(0, NonZeroUsize::MIN, BTreeMap::new()),
-    );
-    let mut plans = SubmissionTaskPlans::index_manifest(vec![submission], &manifest).unwrap();
-    let mut prepared = ManifestAttemptInputs::freeze(
-        &manifest,
-        &mut plans,
-        descriptor.native_compatibility_id(),
-        TransportBudget::DEFAULT,
-    )
-    .unwrap()
-    .prepare_publications()
-    .unwrap();
-    let statuses = prepared.publications.root_status.take().unwrap();
-    let protocol_facts = prepared.publications.protocol_facts.take().unwrap();
-
-    // One original root pays QA, the result window, all Native actions and
-    // the actual subscription child. No second root or quota wallet is used.
-    let count = 8;
-    let send_geometry =
-        NativeTaskOperationSink::proposal_wait_source_geometry(TransportBudget::DEFAULT).unwrap();
-    let send_backing = Layout::array::<u8>(send_geometry.resident_bytes().unwrap()).unwrap();
-    let subscription_backing = Layout::from_size_align(
-        crate::native::NativeSubscriptionOwner::resident_storage_bytes(count).unwrap(),
-        8,
-    )
-    .unwrap();
-    let storage = ControlStorageConfig::new(count, &[]).with_process_source_backing(
-        PollRoleSourceBacking::from_layouts(&[subscription_backing], &[send_backing]).unwrap(),
-    );
-    let workload = WorkloadControl::try_new_counted(WorkloadConfig {
-        root_limit: count,
-        business_limit: count,
-        query_concurrency_limit: count,
-        scope_records_limit: count,
-        ..WorkloadConfig::default()
-    })
-    .unwrap()
-    .owner;
-    let (_, mut joint) = workload
-        .configure_responsibility(ResponsibilityConfig {
-            work_per_turn: NonZeroUsize::new(7).unwrap(),
-        })
-        .unwrap();
-    workload.configure_control_storage(storage).unwrap();
-    let capacity = workload
-        .configure_result_capacity(ResultCapacityConfig::V1)
-        .unwrap();
-    workload.mark_ready().unwrap();
-    let original = workload
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    let scope = original.owner.scope();
-    let cancellation = scope.cancellation().unwrap();
-    let requester = original.owner.cancellation_requester();
-    let transport = novarocks_native_adapter::FrontendNativeTransport::plaintext();
-    let mut binding = scope.begin_control_binding().unwrap();
-    for endpoint in [descriptor.endpoint(), descriptor.control_endpoint()] {
-        binding
-            .push_selected_network(
-                transport
-                    .selected_network_origin(endpoint.native_endpoint())
-                    .unwrap(),
-            )
+    let held_read_close = failure_during_read_close || shutdown_during_read_close;
+    let read_close_gate = held_read_close.then(|| Arc::new(ReadCloseGate::default()));
+    let _release_on_unwind = read_close_gate.as_ref().map(|gate| gate.release_guard());
+    *logical.probe.read_close_gate.lock().unwrap() = read_close_gate.clone();
+    let installed = fixture
+        .activate_attempt(&logical, &mut joint, unstarted)
+        .await;
+    let (actor_id, subscription_source) = installed.fixture_sources;
+    let root_task = logical.probe.root.lock().unwrap().unwrap();
+    let original_participations = logical.probe.participations.lock().unwrap().clone();
+    let three_task_roster = three_tasks.then(|| {
+        let snapshot = logical
+            .probe
+            .graph_capture
+            .lock()
+            .unwrap()
+            .take()
+            .expect("same original protocol graph was captured before transfer");
+        assert_eq!(snapshot.root, root_task);
+        assert_eq!(snapshot.tasks.len(), 3);
+        assert_eq!(snapshot.stages.len(), 3);
+        assert_eq!(snapshot.edges.len(), 2);
+        assert_eq!(snapshot.fragments, vec![1, 2, 3]);
+        assert_eq!(snapshot.participations, original_participations);
+        assert_eq!(snapshot.plan, count_description().1);
+        let actual = snapshot
+            .tasks
+            .iter()
+            .map(|task| task.identity())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            logical
+                .probe
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        <[novarocks_execution_contract::TaskIdentity; 3]>::try_from(actual).unwrap()
+    });
+    let original_endpoint = held_read_close.then(|| {
+        let activation = logical.probe.activation.lock().unwrap().unwrap();
+        logical
+            .binding
+            .bound()
+            .unwrap()
+            .links
+            .endpoint(activation)
+            .unwrap()
+    });
+    let original_supervision = failure_during_read_close.then(|| {
+        logical
+            .exit
+            .as_ref()
+            .unwrap()
+            .owner_failure_observation()
+            .unwrap()
+    });
+    let kind = novarocks_result_contract::RootOutputKind::CountOnly;
+    if !unstarted {
+        if controlled_reopen {
+            peer.enable_single_root_first_subscription_eof_before_create(root_task, kind);
+        } else {
+            peer.enable_single_root_lifecycle(root_task, kind);
+        }
+        if let Some(roster) = three_task_roster {
+            peer.enable_three_task_roster(roster).unwrap();
+        }
+        logical.probe.release_activation();
+    } else {
+        requester
+            .request(novarocks_workload_control::CancellationReason::Requested)
             .unwrap();
     }
-    binding.end_change().unwrap();
-    let mut admission = binding.submit().unwrap();
-    source_cohort::tests::drive(&mut joint);
-    let Poll::Ready(Ok(mut granted)) =
-        Pin::new(&mut admission).poll(&mut Context::from_waker(Waker::noop()))
-    else {
-        panic!("the original selected native binding must grant");
-    };
-    granted
-        .adjustment
-        .as_mut()
-        .unwrap()
-        .install_control_scope_in(&scope)
-        .unwrap()
-        .notify();
-    drop((granted, admission));
-    source_cohort::tests::drive(&mut joint);
-    let window = capacity
-        .try_acquire(&scope, ResultWindowClass::Client)
-        .unwrap();
-    let authority = window.retain_alias().native_action_authority().unwrap();
-    let cohort = source_cohort::tests::cohort(&scope, 1, &mut joint);
-    let stage = scope.try_acquire(Stage::Execution).unwrap();
-    let business = original.business;
-    let router = LogicalAbortRouter::new();
-    let expected_participations = participations.clone();
-    let config = LogicalExecutionActorConfig::single_attempt_completion(
-        execution,
-        ExecutionEffect::None,
-        NonZeroUsize::new(8).unwrap(),
-        participations,
-        NonZeroUsize::MIN,
-        NonZeroUsize::MIN,
-        original.owner,
-        stage,
-    )
-    .unwrap()
-    .with_abort_participation_effect_port(router.clone(), NonZeroUsize::MIN);
-    let mut logical = LogicalExecutionTestHarness::install(
-        handle,
-        config,
-        execution,
-        manifest
-            .participations()
-            .iter()
-            .map(|member| member.participation())
-            .collect(),
-    )
-    .unwrap();
-    logical.activate_initial().await.unwrap();
-    let drive = logical.native_attempt_drive();
-    let route = Arc::new(router.reserve_route(execution).unwrap());
-    let clock = Arc::new(ManualClock::new());
-    let history = novarocks_control_runtime::history::HistoryCapture::new(32_768);
-    let process = manual_process(
-        &data,
-        clock.clone(),
-        descriptor.clone(),
-        controlled_reopen.then(|| history.clone()),
-    );
-    let staged = stage_subscription_endpoints(
-        &[crate::control_runtime::membership::FrozenMember {
-            participation: manifest.participations()[0].participation(),
-            endpoint: descriptor.endpoint().clone(),
-        }],
-        FrozenSubscriptionStageInputs {
-            backends: &backends,
-            compatibility: descriptor.native_compatibility_id(),
-            data: &data,
-            scope: &scope,
-            cohort: &cohort,
-            execution,
-        },
-    )
-    .unwrap();
-    let establish = AttemptEstablishFacts::freeze(
-        CatalogSet::default(),
-        [(backend, RuntimeFilterContribution::default())],
-        QueryOptions::default(),
-        &QueryCredentialLeases::empty(),
-    )
-    .unwrap();
-    let lease = RequestedLeaseDurations::DEFAULT;
-    let mut split = None;
-    let results = Arc::new(
-        NativeTaskResultTransport::new(
-            backends.clone(),
-            data.clone(),
-            TaskReadGrace::new(Duration::from_secs(1)),
-        )
-        .unwrap(),
-    );
-    let root_port =
-        crate::native::task_result_transport::NativeBoundedRootReadPort::new(results.clone());
-    let mut installed = InstallAttemptHost {
-        process: &process,
-        data: &data,
-        clock: clock.clone(),
-        drive: &drive,
-        prepared,
-        establish: &establish,
-        replacements: None,
-        subscriptions: staged,
-        authority,
-        route: route.clone(),
-        results: results.clone(),
-        profile: None,
-        dynamic: None,
-        split: &mut split,
-        policy: AttemptPlanPolicy {
-            coordination: CoordinationBudgets::DEFAULT,
-            retry: Default::default(),
-            initial_lease: lease.initial(),
-            steady_lease: lease.steady(),
-        },
-        ids: IdSeed::new(1, 100),
-        retain_diagnostics: false,
-        observe_dev_root: false,
-        observe_lifecycle: false,
-        #[cfg(novarocks_dev_controls)]
-        root_observer: None,
-    }
-    .install()
-    .unwrap();
-
-    // Drive the original Core until it creates the task and opens its real
-    // loopback subscription. The consumer below obtains exact empty EOS and
-    // ACK through the native codec and original retained result window before
-    // requesting the serialized owner's success decision.
-    let (actor_id, subscription_source) = installed.fixture_sources;
-    let (allow_consumer, consumer_allowed) = tokio::sync::oneshot::channel::<()>();
-    let mut allow_consumer = Some(allow_consumer);
-    if !controlled_reopen {
-        let _ = allow_consumer.take().unwrap().send(());
-    }
-    let mut normal_future = Box::pin(async {
-        let consume_and_seal = async {
-            consumer_allowed
-                .await
-                .map_err(|_| "fixture consumer gate withdrawn".to_owned())?;
-            use novarocks_execution_contract::root_result::RootResultRead;
-            use novarocks_query_application::api::BoundedRootReadPort;
-            use novarocks_query_application::coordination::{RootRelayFrontier, RootRelayStep};
-            use novarocks_result_contract::RootProfileId;
-
-            let mut frontier = RootRelayFrontier::new(root_task, RootProfileId::V1, kind, None)
-                .map_err(|error| error.to_string())?;
-            while let Some(read) = frontier.next_read() {
-                let request = RootResultRead::try_new(
-                    root_task,
-                    RootProfileId::V1,
-                    kind,
-                    read.wanted,
-                    read.consumed,
-                    Duration::from_millis(10),
-                )
-                .map_err(|error| error.to_string())?;
-                frontier.sent(read);
-                let reply = root_port
-                    .read(request, window.retain_alias())
-                    .await
-                    .map_err(|error| format!("fixed empty-root read failed: {error:?}"))?;
-                let step = frontier
-                    .accept(reply.response(), None)
-                    .map_err(|error| error.to_string())?;
-                drop(reply);
-                match step {
-                    RootRelayStep::EndKnown(_) | RootRelayStep::Acknowledged => {}
-                    RootRelayStep::Deferred(_) | RootRelayStep::NotReady => {
-                        tokio::task::yield_now().await;
-                    }
-                    _ => {
-                        return Err(
-                            "fixed CountOnly root returned an unexpected outcome".to_owned()
-                        );
-                    }
-                }
-            }
-            let end = frontier
-                .end_consumed()
-                .ok_or_else(|| "fixed CountOnly root did not consume exact EOS".to_owned())?;
-            // next_read=None with an empty root is reached only after the
-            // original frontier checked its ACK-only accepted-consumed reply.
-            let seal = statuses
-                .begin_success_seal_request()
-                .map_err(|error| error.to_string())?;
-            seal.await
-                .map_err(|error| error.to_string())?
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>(end)
-        };
-        tokio::join!(installed.bridge.run(cancellation.clone()), consume_and_seal)
-    });
+    let mut normal_future = logical.ready.take().unwrap();
     use novarocks_control_runtime::actor_turn::{ActorTurnError, InputPhase};
     use novarocks_control_runtime_core::{history::HistoryFact, mailbox::InputClass};
     let mut early_normal = None;
@@ -963,7 +522,6 @@ async fn run_installed_live(controlled_reopen: bool) {
         }
         peer.release_single_root_first_subscription();
         peer.release_single_root_create();
-        let _ = allow_consumer.take().unwrap().send(());
     }
     let normal_first = if early_normal.is_some() {
         early_normal
@@ -992,149 +550,354 @@ async fn run_installed_live(controlled_reopen: bool) {
         .await
     };
     drop(normal_future);
-    let original_terminal = installed.bridge.original_terminal_debug_for_test();
-    // Match the production completion supervisor: consume the original
-    // running permit only for the terminal this Native owner actually returned.
-    // None/timeout is not Completed; an original failure preserves its error.
-    let qa_completion = match &normal {
-        Some((novarocks_query_application::api::NativeAttemptTerminal::Completed, _)) => {
-            Some(tokio::time::timeout(wait, logical.complete_original_running_attempt()).await)
+    let mut ready_receiving = None;
+    let mut actual_ready_cut = None;
+    let mut original_business_error = None;
+    let ready_ok = match normal {
+        Some(Ok(mut original)) => {
+            let token = *original
+                .ready_token()
+                .expect("real internal computation Ready");
+            let received = output.take_ready(token).unwrap();
+            actual_ready_cut = Some(token);
+            assert_eq!(received.ready_token(), token);
+            assert_eq!(received.output_rows(), token.end().output_rows);
+            assert_eq!(
+                received.expected_tasks(),
+                logical.probe.tasks.lock().unwrap().as_slice()
+            );
+            if let Some(exit) = original.take_exit_observer() {
+                assert!(logical.exit.is_none());
+                logical.exit = Some(exit);
+            }
+            ready_receiving = Some((original, received));
+            true
         }
-        Some((novarocks_query_application::api::NativeAttemptTerminal::Failed(failure), _)) => {
-            Some(
-                tokio::time::timeout(
-                    wait,
-                    logical.fail_original_running_attempt(failure.error().clone()),
-                )
-                .await,
+        Some(Err(error)) => {
+            original_business_error = Some(error);
+            false
+        }
+        None => false,
+    };
+    let mut original_shutdown_wait = None;
+    let mut original_shutdown_result = None;
+    if let Some(gate) = &read_close_gate {
+        assert!(ready_ok, "original Ready precedes the held cleanup");
+        let entered = drive_until(
+            &process,
+            &mut joint,
+            async {
+                while !gate.entered() {
+                    tokio::task::yield_now().await;
+                }
+            },
+            Instant::now() + wait,
+        )
+        .await;
+        assert!(
+            entered.is_some(),
+            "same original seal callback never entered"
+        );
+        assert_eq!(gate.calls(), 1);
+        assert!(
+            !logical
+                .probe
+                .root_port
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_sealed_for_fixture()
+        );
+        assert!(!*installed.fixture_exit.observe_actual_exit().borrow());
+        if shutdown_during_read_close {
+            // Cancelling this borrow must retain the same supervisor Join,
+            // Registry registration and actual installed Native work.
+            let shutdown_wait = original_shutdown_wait
+                .insert(Box::pin(supervisor.shutdown_until(Instant::now() + wait)));
+            assert!(futures::poll!(shutdown_wait.as_mut()).is_pending());
+            let shutdown_observed = drive_until(
+                &process,
+                &mut joint,
+                async {
+                    loop {
+                        assert!(futures::poll!(shutdown_wait.as_mut()).is_pending());
+                        if scope.cancellation().unwrap().reason()
+                            == Some(novarocks_workload_control::CancellationReason::ServerShutdown)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                },
+                Instant::now() + wait,
             )
-        }
-        _ => None,
-    };
-    let read_closed = {
-        use novarocks_execution_contract::root_lifetime::RootReadConvergence;
-        use novarocks_query_application::api::{BoundedRootReadPort, NativeAttemptTerminal};
-        let mut read = RootReadConvergence::new(root_task);
-        match &normal {
-            Some((NativeAttemptTerminal::Completed, Ok(end))) => {
-                let end_checked = read.consume_end(*end).is_ok();
-                // Completed is the original serialized terminal, not a test
-                // TaskStatus assignment or a root ACK masquerading as success.
-                read.observe_root_finished();
-                end_checked
-                    && read
-                        .seal_normal()
-                        .is_ok_and(|sealed| root_port.seal(sealed).is_ok())
+            .await;
+            assert!(
+                shutdown_observed.is_some(),
+                "original Registry close did not reach the same Root"
+            );
+            assert!(!*installed.fixture_exit.observe_actual_exit().borrow());
+            assert_eq!(gate.calls(), 1);
+            {
+                let exit = logical.exit.as_mut().unwrap();
+                assert!(futures::poll!(std::future::poll_fn(|cx| exit.poll_exit(cx))).is_pending());
             }
-            Some((NativeAttemptTerminal::Failed(_), _)) => {
-                root_port.seal(read.seal_terminated()).is_ok()
+            let mut borrowed_wait = Box::pin(async { shutdown_wait.as_mut().await });
+            assert!(futures::poll!(borrowed_wait.as_mut()).is_pending());
+            drop(borrowed_wait);
+            // Only this await borrow ended. The SAME pinned shutdown future,
+            // original Join, registration and pending exit remain retained.
+            assert!(!*installed.fixture_exit.observe_actual_exit().borrow());
+            {
+                let exit = logical.exit.as_mut().unwrap();
+                assert!(futures::poll!(std::future::poll_fn(|cx| exit.poll_exit(cx))).is_pending());
             }
-            _ if cancellation.reason().is_some() => root_port.seal(read.seal_terminated()).is_ok(),
-            _ => false,
+            gate.release();
+        } else {
+            let original = logical.binding.bound().unwrap();
+            let publications =
+                crate::statistics::attempt_executor::StatisticsLateSupervisionProbes::arm(
+                    original_supervision.as_ref().unwrap().clone(),
+                )
+                .await;
+            let work = logical.binding.inject_original_core_fault_for_fixture();
+            let failed_owner_started = drive_until(&process, &mut joint, async {
+            loop {
+                captured_history.extend(history.drain(4096).entries);
+                let started = captured_history.iter().any(|entry| matches!(entry.fact, HistoryFact::Started { scope, work: id } if scope == work.scope && id == work.work));
+                if started && process.runtime.failure_proof_for(&original.registration).is_ok() { break; }
+                tokio::task::yield_now().await;
+            }
+        }, Instant::now()+wait).await;
+            assert!(
+                failed_owner_started.is_some(),
+                "same paid failure work did not start after actual receiver failure"
+            );
+            assert!(
+                original_supervision
+                    .as_ref()
+                    .unwrap()
+                    .failure()
+                    .unwrap()
+                    .is_some(),
+                "same outer statement observes failure before actual read close or runtime exit"
+            );
+            assert!(!captured_history.iter().any(|entry| matches!(entry.fact, HistoryFact::BodyExited { scope, work: id } | HistoryFact::CapturesExited { scope, work: id } | HistoryFact::WorkRetired { scope, work: id } if scope == work.scope && id == work.work)));
+            assert_eq!(gate.calls(), 1);
+            assert!(
+                !logical
+                    .probe
+                    .root_port
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .is_sealed_for_fixture()
+            );
+            assert!(!*installed.fixture_exit.observe_actual_exit().borrow());
+            // The original callback must wake failed-owner control without any
+            // clock advance. Require the actual AP Scope stop and first Abort RPC
+            // before selecting its original retry/convergence deadlines.
+            publications
+                .release_and_check(
+                    &original_supervision
+                        .as_ref()
+                        .unwrap()
+                        .failure()
+                        .unwrap()
+                        .unwrap(),
+                )
+                .await;
+            gate.release();
+            let ap_scope = original_endpoint.as_ref().unwrap().attempt().scope_id();
+            let stopped_without_clock = drive_until(&process, &mut joint, async {
+            loop {
+                captured_history.extend(history.drain(4096).entries);
+                if peer.single_root_abort_observed() && captured_history.iter().any(|entry| matches!(entry.fact, HistoryFact::ScopeStopped {scope} if scope == ap_scope)) { break; }
+                tokio::task::yield_now().await;
+            }
+        }, Instant::now()+wait).await;
+            assert!(
+                stopped_without_clock.is_some(),
+                "same callback result did not drive the original AP stop and Abort RPC without a clock advance: {}",
+                logical.binding.original_failure_for_fixture()
+            );
         }
-    };
-
-    // The same borrowed convergence future owns its original frozen remote
-    // deadline and caller-position return closure across bounded observations.
-    let convergence_deadline = Instant::now() + wait;
-    let mut convergence_future = Box::pin(installed.bridge.converge(
-        novarocks_query_application::api::NativeActiveConvergenceRequest::new(
-            cancellation.clone(),
-            convergence_deadline,
-        ),
-        false,
-        move || {
-            drop((statuses, protocol_facts));
-            Ok(())
-        },
-    ));
-    let closure_first = drive_until(
+    }
+    // Receiving Ready does not prove closure. Release the original receiving
+    // value, then poll the same QA actual-exit observer and AP HostExit.
+    drop(ready_receiving.take());
+    let mut exit = logical.exit.take().expect("same original observed exit");
+    let closure = drive_until_with_original_clock(
         &process,
         &mut joint,
-        convergence_future.as_mut(),
-        convergence_deadline,
+        std::future::poll_fn(|cx| {
+            // The same original shutdown sweep must keep progressing while
+            // the independent original physical-exit observer is polled.
+            let progress = original_shutdown_wait
+                .as_mut()
+                .map(|waiting| std::future::Future::poll(waiting.as_mut(), cx));
+            if let Some(Poll::Ready(result)) = progress {
+                original_shutdown_result = Some(result);
+                original_shutdown_wait.take();
+            }
+            exit.poll_exit(cx)
+        }),
+        Instant::now() + wait,
+        held_read_close.then_some(clock.as_ref()),
     )
     .await;
-    let convergence_within_watchdog = closure_first.is_some();
-    let closure = if closure_first.is_some() {
-        closure_first
+    if closure.is_none() {
+        let lp = logical.binding.bound().unwrap().registration.actor();
+        eprintln!(
+            "original installed closure pending: clock={:?}, next={:?}, lp={:?}, ap={:?}, lp_inputs={:?}, lp_effects={:?}, ap_effects={:?}, unresolved={:?}, shutdown={original_shutdown_result:?}",
+            process.clock.now(),
+            process.runtime.next_deadline(),
+            process.runtime.snapshot(lp),
+            process.runtime.snapshot(actor_id),
+            process.runtime.input_inventory(lp, None, 64),
+            original_pending_protocol(&process, lp),
+            original_pending_protocol(&process, actor_id),
+            process.ledger.unresolved_work(),
+        );
+    }
+    let convergence_within_watchdog = closure.is_some();
+    let original_owner_error = closure
+        .as_ref()
+        .and_then(|result| result.as_ref().err())
+        .cloned();
+    let original_runtime_failure = closure.as_ref().and_then(|result| {
+        let view = result.as_ref().ok()?.view();
+        match view.runtime_actor_result()? {
+            novarocks_query_application::api::logical_runtime::LogicalExit::OwnerFailed(error) => {
+                Some(error.clone())
+            }
+            novarocks_query_application::api::logical_runtime::LogicalExit::Completed => None,
+        }
+    });
+    // Preserve the original carrier's raw disposition. Paid Native tails
+    // return their actual role footer; they do not mint a Tokio Source Join.
+    let qa_local_return = closure
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(|receipt| receipt.local_disposition());
+    let original_remote_closure = actual_ready_cut.is_some_and(|cut| {
+        matches!(
+            logical
+                .binding
+                .original_convergence_for_fixture(cut)
+                .unwrap(),
+            Some((true, _, true))
+        )
+    });
+    if failure_during_read_close {
+        // A health verdict can precede physical teardown. Independently wait
+        // for the same AP witness and both actual runtime Scope removals.
+        let physical_exit = drive_until_with_original_clock(
+            &process,
+            &mut joint,
+            async {
+                while !*installed.fixture_exit.observe_actual_exit().borrow()
+                    || !process.runtime.is_empty()
+                    || !process.host.is_empty()
+                    || !process.ledger.is_empty()
+                {
+                    tokio::task::yield_now().await;
+                }
+            },
+            Instant::now() + wait,
+            Some(clock.as_ref()),
+        )
+        .await;
+        assert!(
+            physical_exit.is_some(),
+            "original failed-owner physical cleanup remains unproven: ap_exit={}, runtime_empty={}, host_empty={}, ledger_empty={}, lp={:?}, ap={:?}, native={}, owner_error={original_owner_error:?}, release={}, unresolved={:?}, lp_pending={:?}, ap_pending={:?}, ap_inputs={:?}",
+            *installed.fixture_exit.observe_actual_exit().borrow(),
+            process.runtime.is_empty(),
+            process.host.is_empty(),
+            process.ledger.is_empty(),
+            process
+                .runtime
+                .snapshot(logical.binding.bound().unwrap().registration.actor()),
+            process.runtime.snapshot(actor_id),
+            logical.binding.original_failure_for_fixture(),
+            peer.single_root_release_observed(),
+            process.ledger.unresolved_work(),
+            original_pending_protocol(
+                &process,
+                logical.binding.bound().unwrap().registration.actor()
+            ),
+            original_pending_protocol(&process, actor_id),
+            process.runtime.input_inventory(actor_id, None, 64)
+        );
+    }
+    let actual_ap_exit = *installed.fixture_exit.observe_actual_exit().borrow();
+    if let Some(original) = &original_supervision {
+        assert_eq!(original.failure().unwrap(), original_runtime_failure);
+    }
+    let subscribed = !peer.subscription_requests().is_empty();
+    let released = peer.single_root_release_observed();
+    let no_native_dispatch =
+        peer.subscription_requests().is_empty() && peer.applied_requests().is_empty();
+    let read_closed = logical
+        .probe
+        .root_port
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|port| port.is_sealed_for_fixture());
+    let original_ap_closure = original_endpoint
+        .as_ref()
+        .and_then(|endpoint| endpoint.facts.completion_receipt());
+    let (end_offered, actual_acked) = peer.single_root_result_progress();
+    eprintln!(
+        "original actual fixture result: unstarted={unstarted}, ready_ok={ready_ok}, actual_ap_exit={actual_ap_exit}, qa_local_return={qa_local_return:?}, original_remote_closure={original_remote_closure}, read_closed={read_closed}, original_business_error={original_business_error:?}, native_failure={}",
+        logical.binding.original_failure_for_fixture()
+    );
+    drop(original_endpoint);
+    drop((
+        closure, exit, installed, logical, output, cohort, window, requester, capacity,
+    ));
+    let waited = {
+        let waiting = original_shutdown_wait.take();
+        match waiting {
+            Some(waiting) => {
+                drive_until(&process, &mut joint, waiting, Instant::now() + wait).await
+            }
+            None => None,
+        }
+    };
+    drop(original_shutdown_wait);
+    let qa_exit = if shutdown_during_read_close {
+        match original_shutdown_result {
+            Some(result) => Some(result),
+            None => waited,
+        }
     } else {
-        let _ = requester.request(novarocks_workload_control::CancellationReason::Requested);
         drive_until(
             &process,
             &mut joint,
-            convergence_future.as_mut(),
+            supervisor.shutdown_until(Instant::now() + wait),
             Instant::now() + wait,
         )
         .await
     };
-    drop(convergence_future);
-    // Return the actual Native closure to the original QA registry. Host
-    // emptiness, a local timeout or Release acknowledgement is not this fact.
-    let qa_convergence = tokio::time::timeout(wait, async {
-        use novarocks_query_application::api::{
-            NativeActiveConvergenceClosure, NativeAttemptConvergence,
-            NativeParticipationConvergence, NativeParticipationConvergenceKind,
-        };
-        let expected = expected_participations
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        if expected.len() != expected_participations.len() {
-            return Err("original scheduled participation list contains duplicates".to_owned());
-        }
-        let facts = match &closure {
-            Some(Ok(NativeActiveConvergenceClosure::Evidence(
-                NativeAttemptConvergence::Participations(facts),
-            ))) => facts.to_vec(),
-            Some(Ok(NativeActiveConvergenceClosure::Evidence(
-                NativeAttemptConvergence::AllWorkersStoppedAndParticipationsFenced,
-            ))) => {
-                // This is the original owner's typed whole-attempt evidence,
-                // projected exactly as the production Supervisor does.
-                expected
-                    .iter()
-                    .copied()
-                    .map(NativeParticipationConvergence::worker_stopped_and_participation_fenced)
-                    .collect()
-            }
-            _ => return Err("no positive Native participation convergence was returned".to_owned()),
-        };
-        let observed = facts
-            .iter()
-            .map(|fact| fact.participation())
-            .collect::<std::collections::BTreeSet<_>>();
-        if observed.len() != facts.len() || observed != expected {
-            return Err(
-                "Native closure omitted, duplicated or changed a scheduled participation"
-                    .to_owned(),
-            );
-        }
-        for fact in facts {
-            let result = match fact.kind() {
-                NativeParticipationConvergenceKind::NeverEstablished => {
-                    logical
-                        .observe_participation_never_established(fact.participation())
-                        .await
-                }
-                NativeParticipationConvergenceKind::WorkerStoppedAndParticipationFenced => {
-                    logical
-                        .observe_worker_stopped_and_participation_fenced(fact.participation())
-                        .await
-                }
-                NativeParticipationConvergenceKind::WorkerProcessReplaced => {
-                    logical
-                        .observe_worker_process_replaced(fact.participation())
-                        .await
-                }
-            };
-            result.map_err(|error| error.to_string())?;
-        }
-        Ok::<_, String>(())
-    })
-    .await;
-    // A failed observation is never local exit. Ask the existing Host owner
-    // to close its entries and separately retain its actual bounded outcome.
+    let qa_terminal = matches!(qa_exit, Some(Ok(())));
+    if qa_terminal {
+        drop(supervisor);
+    } else {
+        // Keep the same unresolved owner. A failed shutdown is not a process
+        // exit and cannot authorize the production abandon operation.
+        eprintln!("original QA shutdown remains unproven: {qa_exit:?}");
+        static UNRESOLVED: std::sync::OnceLock<Mutex<Vec<LogicalExecutionSupervisor>>> =
+            std::sync::OnceLock::new();
+        UNRESOLVED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .push(supervisor);
+    }
     process.host.close_registration();
     let host_exit = drive_until(
         &process,
@@ -1147,33 +910,25 @@ async fn run_installed_live(controlled_reopen: bool) {
         Instant::now() + wait,
     )
     .await;
-    let subscribed = !peer.subscription_requests().is_empty();
-    let released = peer.single_root_release_observed();
-    drop((
-        installed,
-        drive,
-        route,
-        router,
-        manifest,
-        cohort,
-        window,
-        root_port,
-        results,
-        requester,
-        cancellation,
-        capacity,
-    ));
-    let qa_exit = logical.finish_until(Instant::now() + wait).await;
+    fixture.finish().await;
+    drop(fixture);
     business.release();
     source_cohort::tests::drive(&mut joint);
     let scope_released = tokio::time::timeout(wait, scope.wait_released()).await;
     drop(scope);
+    if !unstarted && !failure_during_read_close && !shutdown_during_read_close {
+        assert_eq!(
+            original_cancellation.reason(),
+            None,
+            "Registry retirement preserves the same concluded Root's uncancelled work"
+        );
+    }
+    // The observation retains the original cancellation cell, although it
+    // grants no Work authority. Its final alias must exit before WC drain.
+    drop(original_cancellation);
     workload.close_admission();
     source_cohort::tests::drive(&mut joint);
     let workload_exit = workload.shutdown();
-    let subscriptions_exit = data
-        .drain_original_subscriptions_until(Instant::now() + wait)
-        .await;
     let apply_exit = data.drain_original_apply_until(Instant::now() + wait).await;
     let outgoing_exit = data
         .drain_native_outgoing_until(Instant::now() + wait)
@@ -1183,13 +938,113 @@ async fn run_installed_live(controlled_reopen: bool) {
         && process.runtime.is_empty()
         && process.ledger.is_empty()
         && process.members.is_empty();
-
-    // Assertions follow actual host/Source/QA/Workload/channel/peer cleanup.
     assert!(
         clean,
-        "original host cleanup failed: setup={setup:?}, body_exit={body_exit}, blocked={blocked:?}, second_subscribe={second_subscribe}, normal={normal:?}, original_terminal={original_terminal:?}, closure={closure:?}, host_exit={host_exit:?}, qa={qa_exit:?}, scope={scope_released:?}, workload_ok={}, subscriptions={subscriptions_exit:?}, apply={apply_exit:?}, outgoing={outgoing_exit:?}, peer={peer_exit}",
+        "original runtime/host/ledger/membership cleanup failed"
+    );
+    assert!(
+        qa_terminal && scope_released.is_ok() && workload_exit.is_ok(),
+        "original QA/WC exit failed: qa={qa_exit:?}, scope={scope_released:?}, workload_ok={}",
         workload_exit.is_ok()
     );
+    assert!(apply_exit.is_ok() && outgoing_exit.is_ok() && peer_exit);
+    assert!(host_exit.is_some() && actual_ap_exit);
+    if failure_during_read_close {
+        assert!(
+            original_owner_error.is_none() && original_runtime_failure.is_some(),
+            "actual physical receipt retains its distinct original isolated failure"
+        );
+        assert!(
+            qa_local_return.is_some(),
+            "the same local return remains independent of its isolated failure"
+        );
+        let input = original_runtime_failure
+            .as_ref()
+            .unwrap()
+            .execution_failure()
+            .unwrap();
+        use novarocks_execution_contract::failure::{FailureClass, FailureReason, domain};
+        assert_eq!(input.fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            input.fact().reason(),
+            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(84).unwrap())
+        );
+        assert_eq!(
+            input.site(),
+            novarocks_coordination_contract::ExecutionFailureSite::Coordinator
+        );
+        assert!(normal_within_watchdog && convergence_within_watchdog && ready_ok);
+        assert!(subscribed && read_closed && end_offered && actual_acked == 1);
+        assert_eq!(read_close_gate.as_ref().unwrap().calls(), 1);
+        let receipt = original_ap_closure
+            .as_ref()
+            .expect("same original AP convergence receipt");
+        assert_eq!(receipt.activation(), actual_ready_cut.unwrap().activation());
+        match receipt.closure().as_ref() {
+            novarocks_coordination_contract::AttemptConvergenceClosure::Evidence(_) => assert!(
+                released,
+                "positive remote closure requires the actual peer's release"
+            ),
+            novarocks_coordination_contract::AttemptConvergenceClosure::RemoteTrackingEnded {
+                exact_participations,
+            } => {
+                assert_eq!(
+                    exact_participations.as_ref(),
+                    original_participations.as_slice()
+                );
+                assert!(
+                    !original_remote_closure,
+                    "remote tracking end must not become a positive Ready convergence publication"
+                );
+            }
+        }
+        assert!(history.is_complete());
+    } else {
+        assert!(matches!(qa_local_return,Some(
+            novarocks_query_application::coordination::LocalExecutionDisposition::ActualSourcesExited
+            | novarocks_query_application::coordination::LocalExecutionDisposition::OriginalPaidOwnerReturn
+        )));
+    }
+    if unstarted {
+        assert!(no_native_dispatch);
+    } else if shutdown_during_read_close {
+        assert!(normal_within_watchdog && convergence_within_watchdog && ready_ok);
+        assert!(original_owner_error.is_none() && original_runtime_failure.is_none());
+        assert!(subscribed && read_closed && end_offered && actual_acked == 1);
+        assert_eq!(read_close_gate.as_ref().unwrap().calls(), 1);
+        let receipt =
+            original_ap_closure.expect("same installed AP closure after original shutdown");
+        assert_eq!(receipt.activation(), actual_ready_cut.unwrap().activation());
+        match receipt.closure().as_ref() {
+            novarocks_coordination_contract::AttemptConvergenceClosure::Evidence(_) => {
+                assert!(
+                    released,
+                    "positive shutdown closure requires the actual peer release"
+                );
+            }
+            novarocks_coordination_contract::AttemptConvergenceClosure::RemoteTrackingEnded {
+                exact_participations,
+            } => {
+                assert_eq!(
+                    exact_participations.as_ref(),
+                    original_participations.as_slice()
+                );
+                assert!(
+                    !original_remote_closure,
+                    "tracking end is not positive Ready convergence"
+                );
+            }
+        }
+        assert!(history.is_complete());
+    } else if !failure_during_read_close {
+        assert!(
+            normal_within_watchdog
+                && convergence_within_watchdog
+                && ready_ok
+                && original_remote_closure
+        );
+        assert!(subscribed && released && read_closed && end_offered && actual_acked == 1);
+    }
     if controlled_reopen {
         assert!(history.is_complete());
         assert!(setup.is_some() && body_exit);
@@ -1198,34 +1053,40 @@ async fn run_installed_live(controlled_reopen: bool) {
             "next original Open was stranded: {blocked:?}"
         );
     }
-    assert!(
-        qa_exit.is_ok() && scope_released.is_ok() && workload_exit.is_ok(),
-        "saved live fixture outcomes: qa={qa_exit:?}, scope={scope_released:?}, workload_ok={},, normal={normal:?}, original_terminal={original_terminal:?}, convergence={closure:?}, normal_first={normal_within_watchdog}, convergence_first={convergence_within_watchdog}, host_exit={host_exit:?}, subscribed={subscribed}, released={released}, read_closed={read_closed}, subscriptions={subscriptions_exit:?}, apply={apply_exit:?}, outgoing={outgoing_exit:?}, peer={peer_exit}, qa_completion={qa_completion:?}, qa_convergence={qa_convergence:?}, setup={setup:?}, body_exit={body_exit}, blocked={blocked:?}, second_subscribe={second_subscribe}",
-        workload_exit.is_ok()
-    );
-    assert!(subscriptions_exit.is_ok() && apply_exit.is_ok() && outgoing_exit.is_ok() && peer_exit);
-    assert!(host_exit.is_some() && subscribed && released && read_closed);
-    assert!(normal_within_watchdog && convergence_within_watchdog);
-    assert!(matches!(
-        qa_completion,
-        Some(Ok(Ok(
-            novarocks_query_application::coordination::LogicalConclusion::Succeeded,
-        )))
-    ));
-    assert!(matches!(qa_convergence, Ok(Ok(()))));
-    assert!(matches!(
-        normal,
-        Some((
-            novarocks_query_application::api::NativeAttemptTerminal::Completed,
-            Ok(_)
-        ))
-    ));
-    assert!(matches!(
-        closure,
-        Some(Ok(
-            novarocks_query_application::api::NativeActiveConvergenceClosure::Evidence(_)
-        ))
-    ));
+}
+
+fn original_pending_protocol(
+    process: &FrontendAttemptRuntime,
+    actor: novarocks_control_runtime_core::identity::ActorId,
+) -> Vec<String> {
+    let mut result = Vec::new();
+    for input in process
+        .runtime
+        .pending_batches(actor, None, 64)
+        .unwrap_or_default()
+    {
+        for (descriptor, state) in process
+            .runtime
+            .effect_inventory(actor, input, None, 64)
+            .unwrap()
+        {
+            // Attempt effects contain only the pure protocol vocabulary;
+            // opaque material remains represented by its PayloadRef.
+            let metadata = process
+                .runtime
+                .pending_effect_metadata(actor, input, descriptor.id)
+                .unwrap()
+                .map(|effect| match effect {
+                    FrontendEffect::Attempt(original) => format!("{:?}", original.protocol.body),
+                    FrontendEffect::Logical(_) => "original logical effect".to_owned(),
+                    other => format!("{:?}", std::mem::discriminant(&other)),
+                });
+            result.push(format!(
+                "input={input:?}, descriptor={descriptor:?}, state={state:?}, metadata={metadata:?}"
+            ));
+        }
+    }
+    result
 }
 
 fn fixture_pending_open(
@@ -1271,3 +1132,229 @@ fn fixture_pending_open(
     }
     None
 }
+
+// These two carriers intentionally retain an original raw destruction failure.
+// Their only final release boundary is the actual child process exit, not a
+// fabricated WC/Scope completion or an ordinary serving-process abandon.
+#[test]
+fn installed_activation_future_drop_keeps_native_unknown_after_actual_ap_exit() {
+    run_activation_drop_subprocess(
+        crate::fixtures::native_recipe::ActivationDropFault::Future,
+        "installed_activation_future_drop_keeps_native_unknown_after_actual_ap_exit",
+    );
+}
+
+#[test]
+fn installed_dormant_drop_keeps_native_unknown_after_actual_ap_exit() {
+    run_activation_drop_subprocess(
+        crate::fixtures::native_recipe::ActivationDropFault::Dormant,
+        "installed_dormant_drop_keeps_native_unknown_after_actual_ap_exit",
+    );
+}
+
+fn run_activation_drop_subprocess(
+    fault: crate::fixtures::native_recipe::ActivationDropFault,
+    leaf: &str,
+) {
+    let output = run_installed_unknown_subprocess(
+        leaf,
+        "TST_G9B3_NATIVE_ACTIVATION_DROP_CHILD",
+        |runtime| runtime.block_on(run_activation_drop_child(fault)),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(
+            novarocks_failpoint::observation_marker::TST_G9B3_NATIVE_UNKNOWN_AFTER_AP_EXIT
+        )
+    );
+}
+
+/// Test-only process disposition for an original opaque UNKNOWN. All positive
+/// Source/Join assertions belong in the child before its actual final exit.
+fn run_installed_unknown_subprocess(
+    leaf: &str,
+    selector: &str,
+    child: impl FnOnce(&tokio::runtime::Runtime),
+) -> std::process::Output {
+    if let Some(selected) = std::env::var_os(selector) {
+        assert_eq!(selected, std::ffi::OsStr::new(leaf));
+        let runtime = std::mem::ManuallyDrop::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(3)
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let result: Result<(), Box<dyn std::any::Any + Send>> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                child(&runtime);
+                panic!("the original UNKNOWN child returned without its process disposition");
+            }));
+        if let Err(original) = result {
+            // Keep the first actual panic hook output and every unresolved
+            // original alive; never unwind through their checked destructors.
+            drop(original);
+            std::process::exit(101);
+        }
+        unreachable!();
+    }
+    let module = module_path!().split_once("::").unwrap().1;
+    let exact = format!("{module}::{leaf}");
+    // Validate the SAME test binary's exact registered selection. This is
+    // libtest metadata, not a new application log marker or an exit receipt.
+    let listed = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(&exact)
+        .arg("--list")
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let expected = format!("{exact}: test");
+    assert!(
+        String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .any(|line| line == expected),
+        "the exact original UNKNOWN child must be registered: {exact}"
+    );
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(exact)
+        .arg("--nocapture")
+        .env(selector, leaf)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "original installed child failed: status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+async fn run_activation_drop_child(fault: crate::fixtures::native_recipe::ActivationDropFault) {
+    let wait = Duration::from_secs(5);
+    let data =
+        std::mem::ManuallyDrop::new(FrontendDataRuntime::new(tokio::runtime::Handle::current()));
+    let peer = std::mem::ManuallyDrop::new(Loopback::start().await);
+    let descriptor = peer.bounded_root_descriptor(BackendProcessId::new_v7());
+    let history = novarocks_control_runtime::history::HistoryCapture::new(32_768);
+    // Keep this WHOLE same original fixture, including the original Work and
+    // joins. Neither a test assertion nor Source exit retires its Native UNKNOWN.
+    let mut storage =
+        std::mem::ManuallyDrop::new(install_original_fixture(&data, descriptor, history.clone()));
+    let original: &mut OriginalFixture = &mut storage;
+    original.logical.probe.arm_activation_drop(fault);
+    let gate = Arc::new(ReadCloseGate::default());
+    let _release_on_unwind = gate.release_guard();
+    *original.logical.probe.read_close_gate.lock().unwrap() = Some(gate.clone());
+    let installed = original
+        .fixture
+        .activate_attempt(&original.logical, &mut original.joint, false)
+        .await;
+    let root = original.logical.probe.root.lock().unwrap().unwrap();
+    let activation = original.logical.probe.activation.lock().unwrap().unwrap();
+    peer.enable_single_root_lifecycle(root, novarocks_result_contract::RootOutputKind::CountOnly);
+    original.logical.probe.release_activation();
+    let reached = drive_until_with_original_clock(
+        &original.process,
+        &mut original.joint,
+        async {
+            while !gate.entered() {
+                tokio::task::yield_now().await;
+            }
+        },
+        Instant::now() + wait,
+        Some(original.clock.as_ref()),
+    )
+    .await;
+    assert!(
+        reached.is_some(),
+        "original failed-owner read close was not reached"
+    );
+    assert!(!*installed.fixture_exit.observe_actual_exit().borrow());
+    let causes = original.logical.probe.activation_drop_observation();
+    assert_eq!(causes.activation_calls, 1);
+    assert_eq!(causes.returned, 1);
+    assert_eq!(causes.future_drops, 1);
+    assert_eq!(causes.original_panic_drops, 0);
+    assert!(causes.original_panic_alive);
+    assert_eq!(causes.original_panic_fault, Some(fault));
+    {
+        let view = original.logical.exit.as_ref().unwrap().view().unwrap();
+        assert_eq!(view.pending_native_returns(), 1);
+        assert!(!view.native_preparation_exited());
+    }
+    // This releases the SAME real Root read call. It does not supply a Native
+    // exit receipt, change Core phase or terminate a Work future.
+    gate.release();
+    let logical_exit = original.logical.exit.as_ref().unwrap();
+    let exited = drive_until_with_original_clock(
+        &original.process,
+        &mut original.joint,
+        async {
+            loop {
+                let native_returned = logical_exit.view().unwrap().pending_native_returns() == 0;
+                if native_returned && *installed.fixture_exit.observe_actual_exit().borrow() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        },
+        Instant::now() + wait,
+        Some(original.clock.as_ref()),
+    )
+    .await;
+    assert!(
+        exited.is_some(),
+        "same actual AP exit and Native return remain unproven"
+    );
+    let port_exit = novarocks_query_application::api::NativeInstalledAttemptPort::resources_exited(
+        original.logical.binding.as_ref(),
+        activation,
+    )
+    .await;
+    assert!(
+        port_exit.is_ok(),
+        "the actual AP Source is independently healthy"
+    );
+    {
+        let view = original.logical.exit.as_ref().unwrap().view().unwrap();
+        assert!(!view.native_preparation_exited());
+        assert_eq!(view.pending_native_returns(), 0);
+        assert_eq!(view.native_return_disposition(), Some(
+            novarocks_query_application::coordination::LocalExecutionDisposition::OriginalPaidOwnerReturn
+        ));
+    }
+    let causes = original.logical.probe.activation_drop_observation();
+    assert_eq!(causes.activation_calls, 1, "no ordinary activation retry");
+    assert_eq!(causes.returned, 1);
+    assert_eq!(causes.future_drops, 1);
+    assert_eq!(
+        causes.dormant_drops, 1,
+        "the original dormant destructor runs once"
+    );
+    assert!(causes.original_panic_alive);
+    assert_eq!(causes.original_panic_fault, Some(fault));
+    assert_eq!(causes.original_panic_drops, 0);
+    // No assertion of body disposal, Gov complete, WC/ledger emptiness, panic
+    // payload normal Drop, healthy QA shutdown or AP remote-positive evidence.
+    println!(
+        "{} activation={activation:?} fault={fault:?}",
+        novarocks_failpoint::observation_marker::TST_G9B3_NATIVE_UNKNOWN_AFTER_AP_EXIT,
+    );
+    std::process::exit(0);
+}
+
+// The actual statistics case shares this process/control bootstrap, not the
+// retired TaskRound component driver. Existing component module cfgs stay put.
+#[cfg(all(test, novarocks_dev_controls))]
+#[path = "installed_subscription_tests/statistics_recipe.rs"]
+pub(crate) mod statistics_recipe;
+
+// The same owned computation cell across real consumer/pump exit and P=1 reuse.
+#[path = "installed_subscription_tests/p1.rs"]
+mod p1;
+
+#[path = "installed_subscription_tests/reply_wake.rs"]
+mod reply_wake;

@@ -106,31 +106,6 @@ impl ReplacementQualificationRequest {
         }
     }
 
-    pub(crate) fn new(
-        identity: ReplacementQualificationIdentity,
-        failed_participations: Arc<[ParticipationRef]>,
-        replacement_participations: Arc<[ParticipationRef]>,
-        issued_at: MonotonicInstant,
-        conservative_expiry: MonotonicInstant,
-        native_actions: Option<
-            novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
-        >,
-    ) -> Self {
-        let absolute_expiry = std::time::Instant::now()
-            .checked_add(conservative_expiry.saturating_duration_since(issued_at))
-            .unwrap_or_else(std::time::Instant::now);
-        Self {
-            operation_id: TaskOperationId::new_v7(),
-            identity,
-            failed_participations,
-            replacement_participations,
-            issued_at,
-            conservative_expiry,
-            absolute_expiry,
-            native_actions,
-        }
-    }
-
     pub fn native_action_authority(
         &self,
     ) -> Result<
@@ -362,63 +337,10 @@ impl QualifiedReplacementReservation {
         self.identity
     }
 
-    pub(crate) fn conservative_expiry(
-        &self,
-        dispatched_at: MonotonicInstant,
-        maximum_lifetime: std::time::Duration,
-    ) -> MonotonicInstant {
-        let effective = self
-            .reservation
-            .as_deref()
-            .and_then(|reservation| {
-                reservation
-                    .admissions()
-                    .iter()
-                    .map(|admission| admission.receipt().valid_for().get())
-                    .min()
-            })
-            .map_or(maximum_lifetime, |valid_for| {
-                valid_for.min(maximum_lifetime)
-            });
-        dispatched_at.saturating_add(effective)
-    }
-
     fn reject_unpublished(mut self) {
         if let Some(reservation) = self.reservation.take() {
             reservation.abandon();
         }
-    }
-
-    pub(crate) fn activate(
-        mut self,
-    ) -> Result<ActivatedReplacementReservation, ReplacementQualificationFailure> {
-        let reservation = self
-            .reservation
-            .take()
-            .expect("qualified replacement retains its opaque reservation");
-        let admissions = reservation
-            .admissions()
-            .iter()
-            .map(QualifiedWorkerAdmission::copy_for_actor)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let isolation = match reservation.activate() {
-            Ok(isolation) => isolation,
-            Err(failure) => {
-                let (failure, reservation) = failure.into_parts();
-                reservation.abandon();
-                return Err(failure);
-            }
-        };
-        if isolation.execution() != self.identity.replacement() {
-            isolation.abandon();
-            return Err(ReplacementQualificationFailure::InvalidReservation);
-        }
-        Ok(ActivatedReplacementReservation {
-            execution: self.identity.replacement(),
-            admissions: Some(admissions),
-            isolation: Some(isolation),
-        })
     }
 
     /// Failure retains the same returned reservation, or an invalid activated
@@ -480,12 +402,6 @@ pub(crate) struct ActiveReplacementResources {
     execution: QueryExecutionId,
     admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
     isolation: Option<Box<dyn ActiveAttemptIsolationOwner>>,
-}
-
-impl ActivatedReplacementReservation {
-    pub(crate) fn admissions(&self) -> &[QualifiedWorkerAdmission] {
-        self.admissions.as_deref().unwrap_or_default()
-    }
 }
 
 impl Drop for ActivatedReplacementReservation {
@@ -676,22 +592,6 @@ impl ReplacementQualificationEffectSubmission {
         self.settled = true;
     }
 
-    #[cfg(test)]
-    pub(crate) fn reject_with_header_for_test(
-        mut self,
-        operation_id: TaskOperationId,
-        identity: ReplacementQualificationIdentity,
-    ) {
-        let _ = self.receipts.send(ReplacementQualificationEffectReceipt {
-            operation_id,
-            identity,
-            settlement: ReplacementQualificationSettlement::Failed(
-                ReplacementQualificationFailure::Rejected,
-            ),
-        });
-        self.settled = true;
-    }
-
     fn publish(
         &self,
         settlement: ReplacementQualificationSettlement,
@@ -730,19 +630,13 @@ mod failure_projection_tests {
     fn qualification_outcome_cannot_claim_backend_loss_or_accepted_cancellation() {
         use super::ReplacementQualificationFailure;
         use crate::api::NativeAttemptTopologyRequirement;
-        use crate::coordination::LogicalExecutionActorError;
-        use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
         use novarocks_coordination_contract::AttemptFailureClass;
         use novarocks_execution_contract::failure::{
             FailureClass, FailureEvidence, FailureProjection,
         };
         let source = ReplacementQualificationFailure::OutcomeUnknown;
-        let actor = LogicalExecutionActorError::ReplacementQualificationFailed(source);
-        let input = ExecutionFailureInput::new(
-            actor.failure_fact(),
-            actor.safe_detail(),
-            ExecutionFailureSite::Coordinator,
-        );
+        let original = source.error();
+        let input = original.execution_failure().unwrap();
         assert_eq!(input.fact(), source.failure_fact());
         assert_eq!(input.detail(), &source.safe_detail());
         assert_eq!(input.fact().class(), FailureClass::Dependency);
@@ -752,12 +646,8 @@ mod failure_projection_tests {
             NativeAttemptTopologyRequirement::LiveSnapshot
         );
         let source = ReplacementQualificationFailure::EffectOwnerClosed;
-        let actor = LogicalExecutionActorError::ReplacementQualificationFailed(source);
-        let input = ExecutionFailureInput::new(
-            actor.failure_fact(),
-            actor.safe_detail(),
-            ExecutionFailureSite::Coordinator,
-        );
+        let original = source.error();
+        let input = original.execution_failure().unwrap();
         assert_eq!(input.fact().evidence(), FailureEvidence::StopObservation);
         assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
     }

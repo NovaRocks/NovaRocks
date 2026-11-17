@@ -253,3 +253,69 @@ mod part3;
 
 #[path = "authorization/part3_support.rs"]
 pub(crate) mod part3_support;
+
+#[test]
+fn manifest_member_admission_resource_exhausted_is_retryable() {
+    let p = participation(1);
+    let mut original = start(LogicalOutputMode::CompletionOnly);
+    original.first_attempt.participations = vec![p].into_boxed_slice();
+    original.budgets.establish_per_participation = std::num::NonZeroUsize::new(3).unwrap();
+    original.budgets.abort_per_participation = std::num::NonZeroUsize::new(5).unwrap();
+    let mut f = Fixture::with_start(original);
+    f.begin();
+    let request = AcquireParticipationAdmissionTicket::new(
+        OperationIds::new(IdSeed::new(3301, 100)).issue(),
+        p,
+        LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        AdmissionEpochCapability::try_from_bytes([4; 16]).unwrap(),
+    );
+    let token = AttemptRequestToken::new(NonZeroU64::new(1).unwrap());
+    f.port(AttemptToLogicalBody::AuthorizationRequest {
+        token,
+        request: AttemptAuthorization::BeginAdmission(request),
+    });
+    let issued = f.take(|b| {
+        matches!(b, LogicalEffectBody::AttemptPort(p)
+        if matches!(&p.body, LogicalToAttemptBody::AuthorizationReply { token: found, .. }
+            if *found == token))
+    });
+    let LogicalEffectBody::AttemptPort(issued) = issued.body else {
+        unreachable!()
+    };
+    assert_eq!(issued.activation, activation(1));
+    let LogicalToAttemptBody::AuthorizationReply {
+        decision: Ok(AttemptAuthorizationDecision::AdmissionStarted(issue)),
+        ..
+    } = issued.body
+    else {
+        panic!("the same logical activation must authorize its manifest member");
+    };
+    let settled = AttemptRequestToken::new(NonZeroU64::new(2).unwrap());
+    f.port(AttemptToLogicalBody::AuthorizationRequest {
+        token: settled,
+        request: AttemptAuthorization::SettleAdmission {
+            issue,
+            participation: p,
+            operation_id: request.envelope().operation_id(),
+            outcome: Some(OperationOutcome::ResourceExhausted),
+            receipt: None,
+            prior_transport_unknown: false,
+        },
+    });
+    let reply = f.take(|b| {
+        matches!(b, LogicalEffectBody::AttemptPort(p)
+        if matches!(&p.body, LogicalToAttemptBody::AuthorizationReply { token: found, .. }
+            if *found == settled))
+    });
+    let LogicalEffectBody::AttemptPort(reply) = reply.body else {
+        unreachable!()
+    };
+    assert_eq!(reply.activation, activation(1));
+    assert!(
+        matches!(reply.body, LogicalToAttemptBody::AuthorizationReply {
+        token, decision: Ok(AttemptAuthorizationDecision::AdmissionRetryable),
+    } if token == settled)
+    );
+    assert_eq!(f.core.facts().conclusion(), None);
+}

@@ -34,14 +34,16 @@ use novarocks_control_runtime::{
 };
 use novarocks_control_runtime_core::identity::{InputId, Tick};
 use novarocks_coordination_contract::AttemptActionId;
+#[cfg(test)]
+use std::future::pending;
+
 use std::{
     any::Any,
     fmt,
-    future::pending,
     mem::ManuallyDrop,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 type Original = Box<dyn Any + Send>;
 
@@ -69,17 +71,149 @@ impl fmt::Display for AttemptInfrastructureFailure {
 
 impl std::error::Error for AttemptInfrastructureFailure {}
 
-pub(crate) struct AttemptInfrastructureHealth(
-    watch::Receiver<Option<Arc<AttemptInfrastructureFailure>>>,
-);
+/// Raw causes remain observable independently of unresolved resource custody.
+/// This fixed record does not block the original host's actual retirement.
+struct AttemptRawFailureRecord {
+    registration: ActorRegistration,
+    original: Mutex<Option<Arc<super::failure_residual::OriginalFailureResidualRecord>>>,
+    changed: Notify,
+}
+
+#[derive(Clone)]
+pub(crate) struct AttemptRawFailurePublisher(Weak<AttemptRawFailureRecord>);
+
+impl AttemptRawFailurePublisher {
+    pub(crate) fn matches(&self, original: &ActorRegistration) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|record| record.registration.same_registration(original))
+    }
+
+    pub(in crate::task_execution::host) fn backing_bytes()
+    -> Result<usize, super::observations::ObservationError> {
+        Ok(super::observations::backing::arc::<AttemptRawFailureRecord>()?.size())
+    }
+
+    pub(crate) fn verdict_committed(
+        &self,
+        original: &Arc<super::failure_residual::OriginalFailureResidualRecord>,
+    ) -> bool {
+        let Some(target) = self.0.upgrade() else {
+            return false;
+        };
+        let same = target
+            .original
+            .lock()
+            .expect("original raw verdict notification")
+            .as_ref()
+            .is_some_and(|row| Arc::ptr_eq(row, original));
+        if same {
+            target.changed.notify_waiters();
+        }
+        same
+    }
+
+    pub(crate) fn publish(
+        &self,
+        original: Arc<super::failure_residual::OriginalFailureResidualRecord>,
+    ) -> Result<(), Arc<super::failure_residual::OriginalFailureResidualRecord>> {
+        let Some(target) = self.0.upgrade() else {
+            return Err(original);
+        };
+        let mut row = target.original.lock().expect("original raw failure record");
+        if row.is_some() {
+            return Err(original);
+        }
+        *row = Some(original);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AttemptInfrastructureHealth {
+    registration: ActorRegistration,
+    unresolved: watch::Receiver<Option<Arc<AttemptInfrastructureFailure>>>,
+    raw: Arc<AttemptRawFailureRecord>,
+}
 
 impl AttemptInfrastructureHealth {
-    pub(crate) async fn failed(&mut self) -> Arc<AttemptInfrastructureFailure> {
+    pub(crate) fn matches(&self, original: &ActorRegistration) -> bool {
+        self.registration.same_registration(original)
+    }
+
+    pub(crate) fn current_unresolved(&self) -> Option<Arc<AttemptInfrastructureFailure>> {
+        self.unresolved.borrow().clone()
+    }
+
+    pub(crate) fn raw_record(
+        &self,
+    ) -> Option<Arc<super::failure_residual::OriginalFailureResidualRecord>> {
+        self.raw
+            .original
+            .lock()
+            .expect("original raw failure record")
+            .clone()
+    }
+
+    /// Preserve the original health error separately from the HostExit fact.
+    /// A raw Core panic alone does not claim that local exit is unproven.
+    pub(crate) fn exit_failure(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
+        use super::failure_residual::ResidualVerdict;
+        use novarocks_query_application::api::StatementNativeHealthFailure;
+        if let Some(cause) = self.current_unresolved() {
+            return Some(StatementNativeHealthFailure::actual_exit_unproven(
+                "Native attempt host retained unresolved infrastructure custody",
+                cause,
+            ));
+        }
+        let original = self.raw_record()?;
+        let detail = match original.verdict()? {
+            ResidualVerdict::LocallyProven => return None,
+            ResidualVerdict::TypedRefusal => {
+                "original attempt failure residual retained a typed refusal"
+            }
+            ResidualVerdict::UnresolvedLocalCustody => {
+                "original attempt failure residual has unproven local custody"
+            }
+        };
+        Some(StatementNativeHealthFailure::actual_exit_unproven(
+            detail, original,
+        ))
+    }
+
+    /// Raw local-custody verdicts and infrastructure errors are independent
+    /// original observations. Register before reading either to avoid losing
+    /// a verdict while actual HostExit remains blocked by unresolved captures.
+    pub(crate) async fn exit_failed(
+        &mut self,
+    ) -> novarocks_query_application::api::StatementNativeHealthFailure {
+        let raw = self.raw.clone();
+        let mut unresolved_closed = false;
         loop {
-            if let Some(original) = self.0.borrow_and_update().clone() {
+            let changed = raw.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(original) = self.exit_failure() {
                 return original;
             }
-            if self.0.changed().await.is_err() {
+            tokio::select! {
+                _ = changed => {},
+                result = self.unresolved.changed(), if !unresolved_closed => {
+                    unresolved_closed = result.is_err();
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn failed(&mut self) -> Arc<AttemptInfrastructureFailure> {
+        loop {
+            if let Some(original) = self.unresolved.borrow_and_update().clone() {
+                return original;
+            }
+            if self.unresolved.changed().await.is_err() {
                 pending().await
             }
         }
@@ -103,6 +237,7 @@ pub(crate) struct AttemptAuxiliarySource {
     registration: ActorRegistration,
     input: Option<StandingInputObligation<FrontendActor>>,
     health: watch::Sender<Option<Arc<AttemptInfrastructureFailure>>>,
+    raw: Arc<AttemptRawFailureRecord>,
     closing: bool,
     transport_drained: bool,
     input_retirement_failed: bool,
@@ -115,20 +250,86 @@ impl AttemptAuxiliarySource {
     ) -> (Self, AttemptInfrastructureHealth) {
         assert!(input.matches_registration(&registration));
         let (health, observer) = watch::channel(None);
+        let raw = Arc::new(AttemptRawFailureRecord {
+            registration: registration.clone(),
+            original: Mutex::new(None),
+            changed: Notify::new(),
+        });
+        let observed_registration = registration.clone();
         (
             Self {
                 registration,
+                raw: raw.clone(),
                 input: Some(input),
                 health,
                 closing: false,
                 transport_drained: false,
                 input_retirement_failed: false,
             },
-            AttemptInfrastructureHealth(observer),
+            AttemptInfrastructureHealth {
+                registration: observed_registration,
+                unresolved: observer,
+                raw,
+            },
         )
     }
 
+    pub(crate) fn raw_failure_publisher(&self) -> AttemptRawFailurePublisher {
+        AttemptRawFailurePublisher(Arc::downgrade(&self.raw))
+    }
+
     fn retain(&mut self, original: Original) {
+        // Read only known metadata from the SAME original before retaining it.
+        // Unknown/provider payloads remain opaque; no ownership downcast/Drop.
+        #[cfg(test)]
+        {
+            let value = original.as_ref();
+            let first = self.health.borrow().is_none();
+            eprintln!(
+                "original AP infrastructure custody: actor={:?}, first={first}, original_type={:?}",
+                self.registration.actor(),
+                value.type_id()
+            );
+            if first {
+                eprintln!(
+                    "original AP infrastructure first-cause stack: {}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+            if let Some(error) = value.downcast_ref::<novarocks_control_runtime::causal_input::CausalFillFailure<FrontendInput>>() {
+                eprintln!("original AP infrastructure causal refusal: error={:?}, predecessor_input={:?}",
+                    error.error, error.predecessor_input);
+            } else if let Some(error) = value.downcast_ref::<ActorTurnError>() {
+                eprintln!("original AP infrastructure actor refusal: {error:?}");
+            } else if let Some(error) = value.downcast_ref::<novarocks_control_runtime::transaction::RuntimeError>() {
+                eprintln!("original AP infrastructure runtime refusal: {error:?}");
+            } else if let Some(error) = value.downcast_ref::<super::custody::CustodyError>() {
+                eprintln!("original AP infrastructure exit-custody refusal: {error:?}");
+            } else if let Some(error) = value.downcast_ref::<super::observations::ObservationError>() {
+                eprintln!("original AP infrastructure observation refusal: {error:?}");
+            } else if let Some(error) = value.downcast_ref::<super::publication::PublicationError>() {
+                use super::publication::PublicationError as P;
+                let kind = match error {
+                    P::MissingProfileObserver => "MissingProfileObserver",
+                    P::MissingDiagnosticRecords => "MissingDiagnosticRecords",
+                    P::MissingOriginalComputationCut => "MissingOriginalComputationCut",
+                    P::MissingDiagnosticSources => "MissingDiagnosticSources",
+                    P::ForeignOriginalComputationCut => "ForeignOriginalComputationCut",
+                    P::ForeignRootFactHandoff => "ForeignRootFactHandoff",
+                    P::Protocol(_) => "Protocol",
+                    P::Diagnostic(_) => "Diagnostic",
+                    P::Observation(_) => "Observation",
+                };
+                eprintln!("original AP infrastructure publication refusal: {kind}");
+            } else if let Some(error) = value.downcast_ref::<EffectBindRefusal>() {
+                eprintln!("original AP infrastructure binding refusal: error={:?}, refused_type={:?}",
+                    error.error, error.original.as_ref().type_id());
+            } else if let Some(error) = value.downcast_ref::<super::custody::ReturnedActorTransportResult>() {
+                eprintln!("original AP infrastructure returned transport: effect={:?}, outcome_present={}, withdrawal={:?}",
+                    error.effect.protocol.id, error.outcome.is_some(),
+                    error.withdrawal.as_ref().and_then(|result| result.as_ref().err()).map(|original| &original.error));
+            }
+        }
         if let Some(failure) = self.health.borrow().as_ref() {
             failure
                 .originals
@@ -221,8 +422,9 @@ impl EffectSource for AttemptAuxiliarySource {
         &mut self,
         ticket: EffectTicket<FrontendEffect>,
         refused: EffectBindRefusal,
-    ) {
+    ) -> Option<crate::control_runtime::host::OriginalUntrackedTransport> {
         self.retain(Box::new((ticket, refused)));
+        None
     }
 
     fn owner_failed_pending(&mut self, original: PendingHandoff) {

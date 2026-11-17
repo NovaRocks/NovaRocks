@@ -191,14 +191,25 @@ impl LogicalScript {
         })
     }
 }
-pub(super) fn governor(start: &LogicalStart, control: &WorkloadControl) -> Arc<GovernanceExecutor> {
+pub(super) fn governor(
+    start: &LogicalStart,
+    control: &WorkloadControl,
+) -> (
+    Arc<GovernanceExecutor>,
+    novarocks_workload_control::WorkCancellationRequester,
+) {
     let root = control
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
     let stage = root.owner.scope().try_acquire(Stage::Execution).unwrap();
+    let cancellation = root.owner.cancellation_requester();
     root.business.release();
-    Arc::new(
-        GovernanceExecutor::new(start.identity, start.actor_instance, root.owner, stage).unwrap(),
+    (
+        Arc::new(
+            GovernanceExecutor::new(start.identity, start.actor_instance, root.owner, stage)
+                .unwrap(),
+        ),
+        cancellation,
     )
 }
 struct NativeState {
@@ -207,8 +218,10 @@ struct NativeState {
     body_closed: bool,
 }
 struct ScriptOriginals {
+    runtime: ActorRuntime<FrontendActor>,
     script: LogicalScript,
     governor: Arc<GovernanceExecutor>,
+    cancel: Arc<novarocks_query_application::coordination::executor::CancelObserver>,
     links: Arc<LogicalAttemptLinks>,
     initial: AttemptActivationIdentity,
     native: Mutex<NativeState>,
@@ -237,7 +250,7 @@ impl ScriptOriginals {
                     if let Some(endpoint) = self.links.endpoint(activation) {
                         let mut startup = endpoint.startup();
                         startup
-                            .wait_ready()
+                            .wait_initialized()
                             .await
                             .expect("same original AP bootstrap exited");
                         self.native
@@ -246,6 +259,9 @@ impl ScriptOriginals {
                             .active
                             .push(NativeCleanupActive {
                                 activation,
+                                read_root: None,
+                                read_closing: false,
+                                read_sealed: false,
                                 resources_exited: false,
                                 adopted: false,
                                 dormant_retired: false,
@@ -264,6 +280,12 @@ impl ScriptOriginals {
                     !self.script.panic_run.load(Ordering::Acquire),
                     "scripted original Native run factory panic"
                 );
+                self.links
+                    .endpoint(activation)
+                    .expect("same original installed AP endpoints")
+                    .startup()
+                    .release_protocol(&self.runtime)
+                    .expect("original LP RunAttempt releases initialized AP");
                 self.script.run.wait().await;
                 NativeFact::RunCompleted { activation }
             }
@@ -345,6 +367,9 @@ impl ScriptOriginals {
                 identity,
                 operation_id,
             },
+            NativeEffect::SealRootRead { .. } => {
+                panic!("Script Native backend declares no original root read port")
+            }
             NativeEffect::FinishResources { activation }
             | NativeEffect::AbandonResources { activation } => {
                 let mut state = self.native.lock().unwrap();
@@ -389,10 +414,20 @@ impl ScriptOriginals {
     }
 }
 impl LogicalFailureOriginals for ScriptOriginals {
+    fn computation_cut(
+        &self,
+        _: AttemptActivationIdentity,
+    ) -> Result<Option<novarocks_coordination_contract::AttemptComputationCut>, QueryExecutionError>
+    {
+        // This backend has no Internal Ready publisher. P12 real-source
+        // composition supplies the actual consumer/Native original cuts.
+        Ok(None)
+    }
     fn governance(&self) -> Arc<GovernanceExecutor> {
         self.governor.clone()
     }
     fn begin_failure(&self, error: QueryExecutionError) {
+        self.cancel.stop();
         *self.failure.lock().unwrap() = Some(error);
         self.script.run.open();
         self.script.snapshot.open();
@@ -459,17 +494,25 @@ pub(super) struct ScriptExecutor {
 impl ScriptExecutor {
     pub(super) fn new(
         parts: &LogicalParts,
+        runtime: ActorRuntime<FrontendActor>,
         script: LogicalScript,
         governor: Arc<GovernanceExecutor>,
         start: LogicalStart,
         clock: Arc<crate::task_execution::clock::ManualClock>,
     ) -> Self {
+        let cancel = Arc::new(
+            novarocks_query_application::coordination::executor::CancelObserver::new(
+                governor.scope().cancellation().unwrap(),
+            ),
+        );
         Self {
             bootstrap: parts.bootstrap.clone(),
             state: parts.state.clone(),
             originals: Arc::new(ScriptOriginals {
+                runtime,
                 script,
                 governor,
+                cancel,
                 links: parts.links.clone(),
                 initial: start.first_attempt.activation,
                 native: Mutex::new(NativeState {
@@ -521,8 +564,18 @@ impl LogicalJobExecutor for ScriptExecutor {
         Box::pin(async move {
             let effect = match body {
                 LogicalHostEffect::Bootstrap => {
+                    use novarocks_query_application::api::logical_runtime::{
+                        InstalledLogicalExecution, LogicalSourceKind,
+                    };
                     self.bootstrap.publish_started().await.unwrap();
-                    self.state.stopped().await;
+                    let mut source = self.state.source(LogicalSourceKind::Cancellation).unwrap();
+                    // Exactly the same public observer used by the concrete
+                    // application, under this same paid Bootstrap job.
+                    self.originals
+                        .cancel
+                        .observe(&mut *source)
+                        .await
+                        .expect("the original cancellation source remains admitted until stopped");
                     return None;
                 }
                 LogicalHostEffect::ClientCloseObservation => {
@@ -584,6 +637,7 @@ impl LogicalJobExecutor for ScriptExecutor {
                     None
                 }
                 LogicalEffectBody::Retirable => {
+                    self.originals.cancel.stop();
                     self.state.retirable();
                     None
                 }

@@ -521,6 +521,7 @@ fn late_abort_facts_for_residual_a_cannot_revoke_or_settle_running_successor_b()
         .collect();
     r.qualify(&dispatch, grants.clone(), at(5));
     let (b, _) = r.activate(&dispatch);
+    r.f.acknowledge_original_read_close(activation(1));
     let original_aborts = aborts(&mut r.f);
     assert_eq!(original_aborts.len(), 2);
     let (first, request) = original_aborts[0];

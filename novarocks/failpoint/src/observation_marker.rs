@@ -98,6 +98,7 @@ use ObservationAction::{
 };
 
 marker_registry! {
+    TST_G9B3_NATIVE_UNKNOWN_AFTER_AP_EXIT => ("NOVAROCKS_TST_G9B3_NATIVE_UNKNOWN_AFTER_AP_EXIT", Fixture, FaultInjection, ["activation", "fault"]),
     MEM_1_M07_HELD_LIVE_FENCE => ("NOVAROCKS_MEM_1_M07_HELD_LIVE_FENCE", Fixture, Unconditional, ["phase", "sequence", "sizes"]),
     MEM_1_M07_HELD_LIVE_LOG_OWNER => ("NOVAROCKS_MEM_1_M07_HELD_LIVE_LOG_OWNER", Fixture, Unconditional, ["role", "dev", "ino"]),
     CATALOG_INSTALL_FAILED => ("NOVAROCKS_CATALOG_INSTALL_FAILED", Catalog, Observation(CatalogLifecycle), ["execution_id"]),

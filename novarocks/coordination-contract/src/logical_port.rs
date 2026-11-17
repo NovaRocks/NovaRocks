@@ -113,8 +113,8 @@ pub enum AttemptAuthorization {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttemptAuthorizationFailure {
     Rejected(ExecutionFailure),
-    /// Only QA's actual EstablishIssueError::AuthorizationBudgetExhausted.
-    /// The pure gate still decides whether this same operation was unknown.
+    /// The logical ledger exhausted this original operation's issue budget.
+    /// The attempt gate independently retains its transport-unknown history.
     EstablishBudgetExhausted(ExecutionFailure),
 }
 

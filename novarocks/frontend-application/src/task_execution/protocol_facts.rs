@@ -19,14 +19,10 @@
 
 use super::completion::{WriteCompletionTracker, WriteVerdict};
 use super::error::TaskExecutionError;
-#[cfg(test)]
-use super::execution::QueryTaskExecution;
 use super::graph::TaskGraph;
 use novarocks_coordination_contract::{AttemptActivationIdentity, SelectedTaskTermination};
 use novarocks_execution_contract::{TaskIdentity, TaskStatus};
 use novarocks_query_application::api::PlanSeal;
-#[cfg(test)]
-use novarocks_query_application::coordination::NativeAttemptDrive;
 use novarocks_result_contract::PerKind;
 #[cfg(test)]
 use novarocks_result_contract::SummaryKind;
@@ -257,12 +253,70 @@ pub(crate) struct AttemptProtocolFactsReceiver {
     revisions: watch::Receiver<u64>,
     last_read: Option<u64>,
 }
+/// Passive test view of the SAME accepted AP publication store. It never
+/// consumes/reset the only receiver's dirty frontier and never keeps it alive.
+#[cfg(all(test, novarocks_dev_controls))]
+#[derive(Clone)]
+pub(crate) struct AttemptProtocolObservation {
+    shared: std::sync::Weak<Shared>,
+}
+#[cfg(all(test, novarocks_dev_controls))]
+pub(crate) struct AttemptProtocolObservationSnapshot {
+    pub(crate) tasks: Vec<(TaskIdentity, Option<Arc<TaskStatus>>)>,
+}
+#[cfg(all(test, novarocks_dev_controls))]
+impl AttemptProtocolObservation {
+    pub(crate) fn snapshot(
+        &self,
+        activation: AttemptActivationIdentity,
+        root: TaskIdentity,
+        plan: PlanSeal,
+    ) -> Result<Option<AttemptProtocolObservationSnapshot>, TaskExecutionError> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Ok(None);
+        };
+        let store = shared
+            .store
+            .lock()
+            .map_err(|_| protocol_error("Task protocol observation lock was poisoned"))?;
+        let Some(binding) = store.binding else {
+            return Ok(None);
+        };
+        binding.verify(activation, root, plan)?;
+        Ok(Some(AttemptProtocolObservationSnapshot {
+            tasks: shared
+                .frozen
+                .tasks
+                .iter()
+                .copied()
+                .zip(store.slots.iter().map(|slot| slot.status.clone()))
+                .collect(),
+        }))
+    }
+}
 struct Update {
     index: usize,
     status: Option<Arc<TaskStatus>>,
     writer_witness: Option<Arc<TaskStatus>>,
 }
 impl AttemptProtocolFactsPublisher {
+    /// Freeze only the original captured diagnostic Task roster. This
+    /// component author owns no creation seed, Worker fact or Ready capability.
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(super) fn for_diagnostic_metadata(
+        plan: PlanSeal,
+        root: TaskIdentity,
+        tasks: &[TaskIdentity],
+    ) -> Result<(Self, AttemptProtocolFactsReceiver), TaskExecutionError> {
+        Ok(Self::pair(FrozenAttemptProtocol::from_tasks(
+            plan,
+            root,
+            tasks.into(),
+            BTreeSet::new(),
+            PerKind::default(),
+        )?))
+    }
+
     pub(super) fn for_graph(
         plan: PlanSeal,
         graph: &TaskGraph,
@@ -306,11 +360,6 @@ impl AttemptProtocolFactsPublisher {
             },
         )
     }
-    #[cfg(test)]
-    pub(super) fn bind(&mut self, drive: &NativeAttemptDrive) -> Result<(), TaskExecutionError> {
-        self.bind_identity(drive.identity())
-    }
-
     fn bind_identity(
         &mut self,
         activation: AttemptActivationIdentity,
@@ -319,7 +368,7 @@ impl AttemptProtocolFactsPublisher {
             || self.activation.is_some_and(|held| held != activation)
         {
             return Err(protocol_error(
-                "Native drive differs from this frozen protocol activation",
+                "protocol facts differ from this frozen activation",
             ));
         }
         self.activation = Some(activation);
@@ -327,59 +376,6 @@ impl AttemptProtocolFactsPublisher {
     }
     fn unchanged(&self, owner_revision: u64, sealed: bool) -> bool {
         self.last_owner_revision == Some(owner_revision) && self.last_sealed == sealed
-    }
-    #[cfg(test)]
-    pub(super) fn publish(
-        &mut self,
-        execution: &mut QueryTaskExecution,
-        sealed: bool,
-    ) -> Result<bool, TaskExecutionError> {
-        // A never-run dormant owner must still converge without publishing a
-        // guessed binding or an empty-success view.
-        if self.activation.is_none() {
-            return Ok(false);
-        }
-        let owner_revision = execution.accepted_protocol_revision();
-        if self.unchanged(owner_revision, sealed) {
-            return Ok(false);
-        }
-        if execution.graph().execution_id() != self.shared.frozen.execution
-            || execution.graph().root_identity() != self.shared.frozen.root
-        {
-            return Err(protocol_error(
-                "protocol publisher was installed on a different Task graph",
-            ));
-        }
-        let changed = execution.accepted_protocol_task_changes();
-        let mut updates = Vec::with_capacity(changed.len());
-        for &task_id in changed {
-            let task = execution.task(task_id).ok_or_else(|| {
-                protocol_error("changed accepted Task is absent from its frozen graph")
-            })?;
-            let writer_witness = execution.accepted_protocol_writer_witness(task_id).cloned();
-            let status = task.status().map(|status| {
-                if let Some(witness) = writer_witness.as_ref()
-                    && witness.version() == status.version()
-                {
-                    Arc::clone(witness)
-                } else {
-                    Arc::new(status.clone())
-                }
-            });
-            updates.push(Update {
-                index: self.shared.frozen.index(task.identity())?,
-                status,
-                writer_witness,
-            });
-        }
-        let published = self.publish_updates(
-            owner_revision,
-            updates,
-            execution.selected_task_failure(),
-            sealed,
-        )?;
-        execution.clear_accepted_protocol_task_changes();
-        Ok(published)
     }
     /// Apply one core-authored accepted batch through the original publisher.
     /// The original frozen allocation, PlanSeal, slot map, lock and notification
@@ -505,6 +501,12 @@ impl AttemptProtocolFactsPublisher {
     }
 }
 impl AttemptProtocolFactsReceiver {
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) fn observation_for_fixture(&self) -> AttemptProtocolObservation {
+        AttemptProtocolObservation {
+            shared: Arc::downgrade(&self.shared),
+        }
+    }
     pub(crate) fn take_changes(
         &mut self,
         activation: AttemptActivationIdentity,

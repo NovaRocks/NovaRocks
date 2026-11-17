@@ -35,6 +35,7 @@ impl LogicalExecutionCore {
                 }
                 let attempt = self.attempt_mut(activation)?;
                 attempt.activated = true;
+                attempt.read_owner = root.is_some();
                 if let Some(root) = root {
                     if root.query_execution_id() != activation.execution() {
                         return Err(CoreFault::ForeignExecution);
@@ -44,7 +45,13 @@ impl LogicalExecutionCore {
                     }
                     attempt.root.get_or_insert_with(|| RootControl::new(root));
                 } else if self.start.policy.output != LogicalOutputMode::CompletionOnly {
-                    return Err(CoreFault::UnexpectedInput);
+                    // The same original activation/return is already retained.
+                    // Its absent Rows runtime is the original typed contract
+                    // failure, not a missing activation or a physical exit.
+                    // Keep activated=true so AP closing and the existing
+                    // resource cleanup still address that same actual Source.
+                    self.conclude_failure(crate::failure::missing_rows_runtime());
+                    return Ok(());
                 }
                 if self.state.conclusion().is_none() {
                     self.state
@@ -182,6 +189,13 @@ impl LogicalExecutionCore {
                     .observe_resource_result(action, Ok(()))
                     .map_err(|_| CoreFault::UnexpectedInput)?;
             }
+            (NativeAction::SealRead(activation), NativeFact::Applied) => {
+                let attempt = self.attempt_mut(activation)?;
+                if !attempt.read_seal_issued {
+                    return Err(CoreFault::UnexpectedInput);
+                }
+                attempt.read_sealed = true;
+            }
             (NativeAction::RecordReady(activation), NativeFact::Applied) => {
                 self.attempt_mut(activation)?.ready_cut_recorded = true
             }
@@ -244,6 +258,12 @@ impl LogicalExecutionCore {
                         return Err(CoreFault::ForeignExecution);
                     }
                     self.accept_attempt_failure(activation, failure)?;
+                }
+                NativeAction::SealRead(activation) => {
+                    if activation.execution() != execution {
+                        return Err(CoreFault::ForeignExecution);
+                    }
+                    self.report_supervision_failure(failure.error);
                 }
                 NativeAction::RecordReady(_)
                 | NativeAction::RecordCut

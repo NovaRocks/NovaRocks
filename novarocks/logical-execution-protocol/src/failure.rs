@@ -30,6 +30,15 @@ pub fn query_failure(reason: QueryFailureReason, detail: &str) -> QueryExecution
     ))
 }
 
+/// Original activated Rows return contract failure; no Task/operation author
+/// or native physical-exit fact is inferred from the absent read runtime.
+pub fn missing_rows_runtime() -> QueryExecutionError {
+    query_failure(
+        QueryFailureReason::ResultProtocol,
+        "Native activated a row execution without its root result runtime",
+    )
+}
+
 pub fn invariant_failure(detail: &str) -> QueryExecutionError {
     query_failure(QueryFailureReason::ActorProtocol, detail)
 }

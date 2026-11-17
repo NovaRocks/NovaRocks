@@ -453,35 +453,6 @@ pub fn local_protocol_refusal(
     )
 }
 
-/// Reverse the passive logical response without manufacturing a host reference.
-pub fn project_logical_message(
-    message: &novarocks_coordination_contract::logical_port::LogicalToAttempt,
-) -> novarocks_coordination_contract::LogicalToAttempt<AttemptFailure> {
-    use novarocks_coordination_contract::{LogicalToAttemptBody as Out, logical_port as lp};
-    let body = match &message.body {
-        lp::LogicalToAttemptBody::AuthorizationReply { token, decision } => Out::AuthorizationReply {
-            token: *token,
-            decision: decision.clone().map_err(|failure| match failure {
-                lp::AttemptAuthorizationFailure::Rejected(original) => novarocks_coordination_contract::AttemptAuthorizationFailure::Rejected(AttemptFailure::Logical(original)),
-                lp::AttemptAuthorizationFailure::EstablishBudgetExhausted(original) => novarocks_coordination_contract::AttemptAuthorizationFailure::EstablishBudgetExhausted(AttemptFailure::Logical(original)),
-            }),
-        },
-        lp::LogicalToAttemptBody::EstablishSettlementReply { token, authorization, result } => Out::EstablishSettlementReply { token:*token, authorization:*authorization, result:result.clone().map_err(AttemptFailure::Logical) },
-        lp::LogicalToAttemptBody::PreReadyReplacementReply { token, may_observe } => Out::PreReadyReplacementReply { token:*token, may_observe:*may_observe },
-        lp::LogicalToAttemptBody::PreReadyReplacementOwnerFailed { token, failure } => Out::PreReadyReplacementOwnerFailed { token:*token, failure:AttemptFailure::Logical(failure.clone()) },
-        lp::LogicalToAttemptBody::PreReadyReplacementChanged { token } => Out::PreReadyReplacementChanged { token:*token },
-        lp::LogicalToAttemptBody::Abort { action, request } => Out::Abort { action:*action, request:*request },
-        lp::LogicalToAttemptBody::Stop { reason, failure } => Out::Stop { reason:*reason, failure:AttemptFailure::Logical(failure.clone()) },
-        lp::LogicalToAttemptBody::SealRequest { token } => Out::SealRequest { token:*token },
-        lp::LogicalToAttemptBody::TerminalControlDemand { token, root } => Out::TerminalControlDemand { token:*token, root:*root },
-        lp::LogicalToAttemptBody::BeginConvergence { mode, remote_deadline, computation_ready, retain_diagnostics } => Out::BeginConvergence { mode:*mode, remote_deadline:*remote_deadline, computation_ready:*computation_ready, retain_diagnostics:*retain_diagnostics },
-    };
-    novarocks_coordination_contract::LogicalToAttempt {
-        activation: message.activation,
-        body,
-    }
-}
-
 /// Original immutable Establish metadata, resolved from the same retained host request.
 #[derive(Clone, Copy, Debug)]
 pub struct EstablishAuthorizationFacts {
@@ -541,7 +512,7 @@ pub fn abort_worker_closure(
         .map_err(|_| AbortProjectionError::NonClosingReceipt)
 }
 pub fn project_abort_settlement(
-    message: &novarocks_coordination_contract::AttemptToLogical<AttemptFailure>,
+    message: &crate::port_output::AttemptToLogical<AttemptFailure>,
     resolve: &mut impl FnMut(
         ParticipationRef,
         TaskOperationId,
@@ -549,9 +520,9 @@ pub fn project_abort_settlement(
     ) -> Option<AbortReceiptFact>,
 ) -> Result<novarocks_coordination_contract::logical_port::AttemptToLogicalBody, AbortProjectionError>
 {
-    use novarocks_coordination_contract::{
-        AbortIssueSettlement as In, AttemptToLogicalBody as Body,
-        logical_port::{AbortIssueSettlement as Out, AttemptToLogicalBody as Projected},
+    use crate::port_output::{AbortIssueSettlement as In, AttemptToLogicalBody as Body};
+    use novarocks_coordination_contract::logical_port::{
+        AbortIssueSettlement as Out, AttemptToLogicalBody as Projected,
     };
     let Body::AbortSettlement {
         abort_action,
@@ -619,7 +590,6 @@ pub enum PortProjectionError {
         operation_id: TaskOperationId,
     },
     MismatchedOriginalEstablish,
-    UnsupportedDetachEstablish,
 }
 impl std::fmt::Display for PortProjectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -630,7 +600,7 @@ impl std::error::Error for PortProjectionError {}
 /// Total passive outbound projection. Rich original lookups remain in the
 /// Source; no missing immutable Establish or physical receipt fact is guessed.
 pub fn project_attempt_message(
-    message: &novarocks_coordination_contract::AttemptToLogical<AttemptFailure>,
+    message: &crate::port_output::AttemptToLogical<AttemptFailure>,
     resolve_host: &mut impl FnMut(HostFailureRef) -> Option<ExecutionFailureInput>,
     resolve_establish: &mut impl FnMut(
         ParticipationRef,
@@ -642,10 +612,10 @@ pub fn project_attempt_message(
         novarocks_coordination_contract::AttemptActionId,
     ) -> Option<AbortReceiptFact>,
 ) -> Result<novarocks_coordination_contract::logical_port::AttemptToLogical, PortProjectionError> {
-    use novarocks_coordination_contract::{
+    use crate::port_output::{
         AttemptAuthorization as Auth, AttemptTerminal as Terminal, AttemptToLogicalBody as In,
-        logical_port as lp,
     };
+    use novarocks_coordination_contract::logical_port as lp;
     let mut failure = |original: &AttemptFailure| {
         project_failure(original, resolve_host).map_err(PortProjectionError::Failure)
     };
@@ -725,7 +695,6 @@ pub fn project_attempt_message(
             operation_id: *operation_id,
             settlement: *settlement,
         },
-        In::DetachEstablish { .. } => return Err(PortProjectionError::UnsupportedDetachEstablish),
         In::AbortSettlement { .. } => {
             project_abort_settlement(message, resolve_abort).map_err(PortProjectionError::Abort)?
         }

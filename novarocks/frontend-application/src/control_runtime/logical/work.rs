@@ -298,6 +298,7 @@ impl LogicalWorkObligation {
     pub(super) fn result_action(&self) -> Option<LogicalActionId> {
         self.state.lock().unwrap().result_action
     }
+    #[cfg(test)]
     pub(super) fn result_filled(&self) -> bool {
         self.state.lock().unwrap().result_filled
     }

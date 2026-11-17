@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Attempt-local internal consumption and actor-issued readiness receipts.
+//! Attempt-local internal consumption and runtime-issued readiness receipts.
 //!
 //! Design: ADR-0198 (docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md).
 
@@ -33,7 +33,7 @@ use super::{
     ResultDeliveryReceipt, ResultRowCarrier, RetainedRootReply, RootRelayResidentWindow,
     RootSegmentDelivery,
 };
-use crate::coordination::InternalReadyActorPort;
+use crate::coordination::executor::consumer::RuntimeReadyPort;
 
 /// This allocation is minted for one exact registered consumer. Correlation
 /// values alone cannot recreate its source capability or a decoded receipt.
@@ -86,7 +86,9 @@ pub struct ComputationReadyToken {
 }
 
 impl ComputationReadyToken {
-    pub(crate) const fn from_runtime_cut(
+    /// Projects the complete accepted protocol fact without issuing a Ready
+    /// promise, Work, publication right or lifetime guarantee.
+    pub const fn from_runtime_cut(
         cut: novarocks_coordination_contract::AttemptComputationCut,
     ) -> Self {
         Self {
@@ -99,21 +101,6 @@ impl ComputationReadyToken {
         }
     }
 
-    pub(crate) fn accepted(
-        source: &InternalConsumerSeal,
-        cut: MonotonicInstant,
-        end: RootResultEnd,
-        budgets: ComputationObservationBudgets,
-    ) -> Self {
-        Self {
-            activation: source.activation,
-            root: source.root,
-            cut,
-            diagnostic_deadline: cut.saturating_add(budgets.diagnostics),
-            convergence_deadline: cut.saturating_add(budgets.convergence),
-            end,
-        }
-    }
     pub const fn activation(&self) -> AttemptActivationIdentity {
         self.activation
     }
@@ -164,67 +151,16 @@ impl DecodedInternalEndReceipt {
 /// That owner retains this inside its typed proof and calls accept only after
 /// its protocol rules and actual receiving-custody transfer have succeeded.
 pub struct ComputationReadySource {
-    port: ComputationReadyPort,
+    port: RuntimeReadyPort,
     liveness: Option<oneshot::Sender<()>>,
 }
 
-/// Transitional composition only; the Actor arm is removed at the single cutover.
-enum ComputationReadyPort {
-    Actor(InternalReadyActorPort),
-    Runtime(crate::coordination::executor::consumer::RuntimeReadyPort),
-}
-
-impl ComputationReadyPort {
-    fn origin(&self) -> &InternalConsumerSeal {
-        match self {
-            Self::Actor(port) => port.origin(),
-            Self::Runtime(port) => port.origin(),
-        }
-    }
-    async fn accept(
-        &self,
-        decoded: DecodedInternalEndReceipt,
-    ) -> Result<ComputationReadyToken, QueryExecutionError> {
-        match self {
-            Self::Actor(port) => port.accept(decoded).await,
-            Self::Runtime(port) => port.accept(decoded).await,
-        }
-    }
-    async fn fail(&self, error: QueryExecutionError) -> Result<(), QueryExecutionError> {
-        match self {
-            Self::Actor(port) => port.fail(error).await,
-            Self::Runtime(port) => port.fail(error).await,
-        }
-    }
-    async fn supervise_exit(
-        &self,
-        receiver: oneshot::Receiver<Result<(), QueryExecutionError>>,
-    ) -> Result<(), crate::coordination::LogicalExecutionActorError> {
-        match self {
-            Self::Actor(port) => port.supervise_exit(receiver).await,
-            Self::Runtime(port) => port.supervise_exit(receiver).await,
-        }
-    }
-}
-
 impl ComputationReadySource {
-    pub(crate) fn issued(port: InternalReadyActorPort) -> (Self, oneshot::Receiver<()>) {
+    pub(crate) fn issued_runtime(port: RuntimeReadyPort) -> (Self, oneshot::Receiver<()>) {
         let (liveness, receiver) = oneshot::channel();
         (
             Self {
-                port: ComputationReadyPort::Actor(port),
-                liveness: Some(liveness),
-            },
-            receiver,
-        )
-    }
-    pub(crate) fn issued_runtime(
-        port: crate::coordination::executor::consumer::RuntimeReadyPort,
-    ) -> (Self, oneshot::Receiver<()>) {
-        let (liveness, receiver) = oneshot::channel();
-        (
-            Self {
-                port: ComputationReadyPort::Runtime(port),
+                port,
                 liveness: Some(liveness),
             },
             receiver,
@@ -443,13 +379,12 @@ impl InternalResultStream {
 pub struct InternalConsumerActivation {
     pub(crate) stream: InternalResultStream,
     pub(crate) source: ComputationReadySource,
-    pub(crate) ready: watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
 }
 
 impl InternalConsumerActivation {
     pub(crate) async fn supervise_exit(
         &self,
-    ) -> Result<InternalConsumerExitReporter, crate::coordination::LogicalExecutionActorError> {
+    ) -> Result<InternalConsumerExitReporter, QueryExecutionError> {
         let (sender, receiver) = oneshot::channel();
         self.source.port.supervise_exit(receiver).await?;
         Ok(InternalConsumerExitReporter(sender))

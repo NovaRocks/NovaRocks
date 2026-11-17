@@ -29,10 +29,11 @@ mod tests;
 
 #[cfg(test)]
 use crate::input::OperationReply;
+use crate::port_output::AttemptAuthorization;
 use crate::{error::TaskExecutionError, failure::AttemptFailure};
 use novarocks_coordination_contract::{
-    AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationFailure,
-    AttemptAuthorizationRef, AttemptRequestToken,
+    AttemptAuthorizationDecision, AttemptAuthorizationFailure, AttemptAuthorizationRef,
+    AttemptRequestToken,
 };
 use novarocks_execution_contract::AcquireParticipationAdmissionTicket;
 
@@ -181,7 +182,7 @@ impl AdmissionAuthorization {
     pub(crate) fn replied(
         &mut self,
         token: AttemptRequestToken,
-        result: Result<AttemptAuthorizationDecision, AttemptAuthorizationFailure<AttemptFailure>>,
+        result: Result<AttemptAuthorizationDecision, AttemptAuthorizationFailure>,
     ) -> Result<AdmissionGateReply, TaskExecutionError> {
         let Some(flight) = self.flight.filter(|flight| flight.token == token) else {
             return Ok(AdmissionGateReply::Stale);
@@ -213,7 +214,7 @@ impl AdmissionAuthorization {
                 // On Settle error the old Copy receipt and unknown marker stay
                 // owned for a later observed verdict or convergence cleanup.
                 Ok(AdmissionGateReply::Failed {
-                    failure,
+                    failure: AttemptFailure::Logical(failure),
                     retire_queued_authorization: matches!(flight.call, AdmissionCall::Settle),
                 })
             }

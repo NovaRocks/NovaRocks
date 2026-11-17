@@ -23,11 +23,12 @@
 mod tests;
 #[cfg(test)]
 use crate::operation::OperationDispatchResult;
+use crate::port_output::AttemptAuthorization;
 use crate::{error::TaskExecutionError, failure::AttemptFailure, input::SendGeneration};
 use novarocks_coordination_contract::{
-    AttemptActivationIdentity, AttemptAuthorization, AttemptAuthorizationDecision,
-    AttemptAuthorizationFailure, AttemptAuthorizationLimits, AttemptAuthorizationRef,
-    AttemptIssueSettlement, AttemptRequestToken,
+    AttemptActivationIdentity, AttemptAuthorizationDecision, AttemptAuthorizationFailure,
+    AttemptAuthorizationLimits, AttemptAuthorizationRef, AttemptIssueSettlement,
+    AttemptRequestToken,
 };
 use novarocks_execution_contract::{OperationOutcome, ParticipationRef, TaskOperationId};
 use std::collections::VecDeque;
@@ -56,12 +57,6 @@ pub(crate) enum Step {
         token: AttemptRequestToken,
         authorization: AttemptAuthorizationRef,
         settlement: AttemptIssueSettlement,
-    },
-    /// Drop one original local late guard off the poller. QA retains the
-    /// residual remote obligation. Wait for actual local disposal completion.
-    DetachLate {
-        token: AttemptRequestToken,
-        authorization: AttemptAuthorizationRef,
     },
     Waiting,
     WaitingTransport,
@@ -99,15 +94,10 @@ struct Pass {
     first_error: Option<AttemptFailure>,
 }
 #[derive(Clone, Copy, Debug)]
-enum FlightKind {
-    Settle(AttemptIssueSettlement),
-    DetachLate,
-}
-#[derive(Clone, Copy, Debug)]
 struct Flight {
     token: AttemptRequestToken,
     authorization: AttemptAuthorizationRef,
-    kind: FlightKind,
+    settlement: AttemptIssueSettlement,
 }
 #[derive(Debug)]
 pub(crate) struct EstablishAuthorization {
@@ -207,7 +197,7 @@ impl EstablishAuthorization {
     pub(crate) fn authorized(
         &mut self,
         token: AttemptRequestToken,
-        result: Result<AttemptAuthorizationDecision, AttemptAuthorizationFailure<AttemptFailure>>,
+        result: Result<AttemptAuthorizationDecision, AttemptAuthorizationFailure>,
     ) -> Result<AuthorizationReply, TaskExecutionError> {
         if self.authorization_flight != Some(token) {
             return Ok(AuthorizationReply::Stale);
@@ -227,17 +217,14 @@ impl EstablishAuthorization {
                 AuthorizationReply::IssueRecorded(authorization)
             }
             Err(AttemptAuthorizationFailure::Rejected(failure)) => {
-                AuthorizationReply::Failed(failure)
+                AuthorizationReply::Failed(AttemptFailure::Logical(failure))
             }
             Err(AttemptAuthorizationFailure::EstablishBudgetExhausted(failure)) => {
                 let failure = if self.late.is_empty() {
-                    failure
+                    AttemptFailure::Logical(failure)
                 } else {
-                    let AttemptFailure::Host(original) = failure else {
-                        return Err(invalid("QA budget failure lacks its original host error"));
-                    };
                     AttemptFailure::EstablishReplayExhausted {
-                        original,
+                        original: failure,
                         participation: self.participation,
                         operation_id: self.operation_id,
                     }
@@ -375,7 +362,7 @@ impl EstablishAuthorization {
                 self.flight = Some(Flight {
                     token,
                     authorization,
-                    kind: FlightKind::Settle(settlement),
+                    settlement,
                 });
                 return Step::Settle {
                     token,
@@ -399,17 +386,6 @@ impl EstablishAuthorization {
             });
             return self.advance(token);
         }
-        if let Some(authorization) = self.late.pop_front() {
-            self.flight = Some(Flight {
-                token,
-                authorization,
-                kind: FlightKind::DetachLate,
-            });
-            return Step::DetachLate {
-                token,
-                authorization,
-            };
-        }
         Step::Ready
     }
     pub(crate) fn settled(
@@ -424,9 +400,7 @@ impl EstablishAuthorization {
         else {
             return Ok(SettlementReply::Stale);
         };
-        let FlightKind::Settle(settlement) = flight.kind else {
-            return Err(invalid("Establish settlement answered a local detach"));
-        };
+        let settlement = flight.settlement;
         let pass = self
             .pass
             .as_mut()
@@ -494,7 +468,7 @@ impl EstablishAuthorization {
     /// Invoke only after the ORIGINAL whole gate has drained its ACKs and
     /// pending calls and accepted convergence preparation. Clearing this local
     /// correlation is not QA residual cleanup or physical exit. Do not clear
-    /// merely when the last guard of this row has been detached.
+    /// merely when the last reference of this row has been removed.
     pub(crate) fn forget_closed_local_entry(&mut self) -> bool {
         if !self.closing
             || !self.permits_protocol_turn()
@@ -506,24 +480,22 @@ impl EstablishAuthorization {
         self.late_entry = false;
         true
     }
-    /// Original local guard was actually dropped by its credentialed owner.
-    /// This proves neither remote release nor that job/capture's actual exit.
-    pub(crate) fn detached(
+    /// Consume one pure correlation only after the whole gate has observed
+    /// every current physical transport result. LP retains its original rich
+    /// late guard and unknown remote responsibility independently.
+    pub(crate) fn forget_one_closed_late_ref(
         &mut self,
-        token: AttemptRequestToken,
-        authorization: AttemptAuthorizationRef,
-    ) -> Result<bool, TaskExecutionError> {
-        let Some(flight) = self
-            .flight
-            .filter(|f| f.token == token && f.authorization == authorization)
-        else {
-            return Ok(false);
-        };
-        if !matches!(flight.kind, FlightKind::DetachLate) {
-            return Err(invalid("Establish detach answered a settlement"));
+    ) -> Result<Option<AttemptAuthorizationRef>, TaskExecutionError> {
+        if !self.closing || !self.permits_protocol_turn() || self.current.is_some() {
+            return Err(invalid(
+                "Establish local references remain in an active phase",
+            ));
         }
-        self.flight = None;
-        Ok(true)
+        Ok(self.late.pop_front())
+    }
+    #[cfg(test)]
+    pub(super) fn local_late_ref_count(&self) -> usize {
+        self.late.len()
     }
 }
 fn invalid(detail: &str) -> TaskExecutionError {

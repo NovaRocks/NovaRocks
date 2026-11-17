@@ -98,7 +98,12 @@ impl LogicalPurposes {
                         a = Some(*activation);
                         1
                     }
-                    N::FinishResources { activation } | N::AbandonResources { activation } => {
+                    // Read close precedes resource cleanup. The SAME paid
+                    // position is reused only after its actual prior job and
+                    // input retire; no additional configurable quota exists.
+                    N::SealRootRead { activation, .. }
+                    | N::FinishResources { activation }
+                    | N::AbandonResources { activation } => {
                         a = Some(*activation);
                         2
                     }

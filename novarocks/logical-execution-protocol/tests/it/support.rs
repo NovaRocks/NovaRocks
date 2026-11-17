@@ -130,6 +130,7 @@ impl EffectSink for Sink {
     }
 }
 pub struct Fixture {
+    output: LogicalOutputMode,
     pub core: LogicalExecutionCore,
     pub effects: Vec<LogicalEffect>,
     pub now: MonotonicInstant,
@@ -144,7 +145,9 @@ impl Fixture {
         Self::with_start(start(output))
     }
     pub fn with_start(start: LogicalStart) -> Self {
+        let output = start.policy.output;
         Self {
+            output,
             core: LogicalExecutionCore::new(start),
             effects: Vec::new(),
             now: MonotonicInstant::ORIGIN,
@@ -154,6 +157,12 @@ impl Fixture {
             budget: 32,
             steps: 0,
         }
+    }
+    pub fn declared_read_root(
+        &self,
+        original: novarocks_execution_contract::TaskIdentity,
+    ) -> Option<novarocks_execution_contract::TaskIdentity> {
+        (self.output != LogicalOutputMode::CompletionOnly).then_some(original)
     }
     pub fn send(&mut self, input: LogicalInput) {
         let mut out = Sink::default();
@@ -201,6 +210,16 @@ impl Fixture {
         self.result(action, result);
         self.exit(action)
     }
+    pub fn acknowledge_original_read_close(&mut self, activation: AttemptActivationIdentity) {
+        let close = self.take(|body| matches!(body, LogicalEffectBody::Native(NativeEffect::SealRootRead { activation: held, .. }) if *held == activation));
+        let LogicalEffectBody::Native(NativeEffect::SealRootRead { sealed, .. }) = close.body
+        else {
+            unreachable!()
+        };
+        assert_eq!(sealed.task().query_execution_id(), activation.execution());
+        // A public Core action result, never a real port callback or host exit.
+        self.ack(close.action, ActionResult::Native(NativeFact::Applied));
+    }
     pub fn begin(&mut self) {
         self.send(LogicalInput::Started);
         let register = self.take(|b| {
@@ -238,7 +257,7 @@ impl Fixture {
             activate.action,
             ActionResult::Native(NativeFact::AttemptActivated {
                 activation: activation(1),
-                root: Some(root(1)),
+                root: self.declared_read_root(root(1)),
             }),
         );
         self.run = Some(

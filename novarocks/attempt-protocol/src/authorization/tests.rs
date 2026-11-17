@@ -225,11 +225,13 @@ fn actual_settlement_error_retains_original_receipt_and_unknown_for_later_verdic
     assert_eq!(
         gate.replied(
             token(3),
-            Err(AttemptAuthorizationFailure::Rejected(failure()))
+            Err(AttemptAuthorizationFailure::Rejected(
+                crate::test_support::passive_failure(&failure())
+            ))
         )
         .unwrap(),
         AdmissionGateReply::Failed {
-            failure: failure(),
+            failure: AttemptFailure::Logical(crate::test_support::passive_failure(&failure())),
             retire_queued_authorization: true
         }
     );
@@ -372,11 +374,13 @@ fn recording_semantic_debt_keeps_qa_idle_until_post_round_and_retains_error_foll
     assert_eq!(
         gate.replied(
             token(3),
-            Err(AttemptAuthorizationFailure::Rejected(failure()))
+            Err(AttemptAuthorizationFailure::Rejected(
+                crate::test_support::passive_failure(&failure())
+            ))
         )
         .unwrap(),
         AdmissionGateReply::Failed {
-            failure: failure(),
+            failure: AttemptFailure::Logical(crate::test_support::passive_failure(&failure())),
             retire_queued_authorization: true
         }
     );

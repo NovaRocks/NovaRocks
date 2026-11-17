@@ -25,6 +25,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 mod control_binding;
+#[cfg(all(test, novarocks_dev_controls))]
+pub(crate) mod original_install_fixture;
 pub(crate) mod source_cohort;
 use control_binding::NativeControlBinding;
 use source_cohort::NativeSourceCohortAdmission;
@@ -46,20 +48,16 @@ use novarocks_query_application::admitted_query_context::QueryResultCapacityBind
 #[cfg(test)]
 use novarocks_query_application::api::QueryExecutionErrorKind;
 use novarocks_query_application::api::{
-    ActivatedNativeAttempt, ActiveNativeAttemptOwner, CancellationView, DormantNativeAttemptOwner,
-    LogicalExecutionNativePort, LogicalNativeOpenRequest, NativeActiveAttemptConvergenceFuture,
-    NativeActiveConvergenceClosure, NativeActiveConvergenceRequest, NativeAttemptActivationFailure,
-    NativeAttemptActivationFuture, NativeAttemptConvergence, NativeAttemptConvergenceFuture,
-    NativeAttemptPreparationError, NativeAttemptPreparationFailure, NativeAttemptPreparationFuture,
-    NativeAttemptPreparationPort, NativeAttemptPreparationRequest, NativeAttemptPreparationWork,
-    NativeAttemptRunFuture, NativeAttemptTerminal, NativeParticipationConvergence,
-    QueryExecutionClient, QueryExecutionError, QueryExecutionRequest,
+    ActivatedNativeAttempt, CancellationView, DormantNativeAttemptOwner,
+    LogicalExecutionNativePort, LogicalNativeOpenRequest, NativeAttemptActivationFailure,
+    NativeAttemptActivationFuture, NativeAttemptConvergenceFuture, NativeAttemptPreparationError,
+    NativeAttemptPreparationFailure, NativeAttemptPreparationFuture, NativeAttemptPreparationPort,
+    NativeAttemptPreparationRequest, NativeAttemptPreparationWork, QueryExecutionClient,
+    QueryExecutionError, QueryExecutionRequest,
 };
 use novarocks_query_application::coordination::{
-    AbortParticipationEffectAdmission, AbortParticipationEffectPort,
-    AbortParticipationIssueIdentity, AcceptedRootStatusSource, ActiveAttemptIsolationOwner,
-    AttemptIsolationActivationFailure, AttemptIsolationReservation, AttemptSchedule,
-    NativeAttemptDrive, QualifiedReplacementReservation, QualifiedWorkerAdmission,
+    ActiveAttemptIsolationOwner, AttemptIsolationActivationFailure, AttemptIsolationReservation,
+    AttemptSchedule, QualifiedReplacementReservation, QualifiedWorkerAdmission,
     ReplacementQualificationEffectAdmission, ReplacementQualificationEffectPort,
     ReplacementQualificationEffectReservation, ReplacementQualificationEffectSubmission,
     ReplacementQualificationFailure, ReplacementQualificationIdentity,
@@ -100,6 +98,7 @@ use crate::query_execution::logical_execution::{
     ComputationDiagnostics, InitialComputationCredentials, LogicalExecutionLauncher,
     PreparedLogicalComputation, validate_initial_computation_start,
 };
+use crate::query_execution::split_assignment_round::RoundSplitAssignmentPlan;
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
@@ -123,211 +122,6 @@ use crate::task_execution::sources::{AttemptEstablishFacts, SubmissionTaskPlans}
 use crate::wake::NotifyWake;
 use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 use novarocks_query_application::api::{BackendProcessObservationService, BackendTopologyService};
-
-/// One logical execution's Abort port. Every physical attempt installs one
-/// exact route and retains its registration through residual convergence.
-#[derive(Debug)]
-pub(crate) struct LogicalAbortRouter {
-    routes: Mutex<
-        BTreeMap<novarocks_types::QueryExecutionId, Option<Arc<dyn AbortParticipationEffectPort>>>,
-    >,
-    capacity_epoch: watch::Sender<u64>,
-    worker_closed_participations: Arc<Mutex<BTreeSet<ParticipationRef>>>,
-    closure_epoch: watch::Sender<u64>,
-}
-
-impl LogicalAbortRouter {
-    pub(crate) fn new() -> Arc<Self> {
-        let (capacity_epoch, _) = watch::channel(0);
-        let (closure_epoch, _) = watch::channel(0);
-        Arc::new(Self {
-            routes: Mutex::new(BTreeMap::new()),
-            capacity_epoch,
-            worker_closed_participations: Arc::new(Mutex::new(BTreeSet::new())),
-            closure_epoch,
-        })
-    }
-
-    pub(crate) fn reserve_route(
-        self: &Arc<Self>,
-        execution: novarocks_types::QueryExecutionId,
-    ) -> Result<LogicalAbortRoute, NativeAttemptActivationFailure> {
-        let mut routes = self.routes.lock().expect("logical Abort route table");
-        let std::collections::btree_map::Entry::Vacant(route) = routes.entry(execution) else {
-            return Err(NativeAttemptActivationFailure::new(
-                attempt_runtime_failure(
-                    QueryFailureReason::PreparationProtocol,
-                    "logical execution installed the same Native Abort route twice",
-                ),
-            ));
-        };
-        route.insert(None);
-        Ok(LogicalAbortRoute {
-            execution,
-            router: self.clone(),
-        })
-    }
-
-    pub(crate) fn capacity_author(&self) -> watch::Sender<u64> {
-        self.capacity_epoch.clone()
-    }
-
-    fn closure_observer(&self) -> Arc<dyn Fn(ParticipationRef) + Send + Sync> {
-        let closed = self.worker_closed_participations.clone();
-        let closure_epoch = self.closure_epoch.clone();
-        Arc::new(move |participation| {
-            closed
-                .lock()
-                .expect("logical Abort closed-participation facts")
-                .insert(participation);
-            closure_epoch.send_modify(|epoch| *epoch = epoch.saturating_add(1));
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prepare_registered_attempt(
-        self: &Arc<Self>,
-        attempt: &mut crate::task_execution::host::adapter::AttemptActorRegistration,
-        runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<
-            crate::control_runtime::actor::FrontendActor,
-        >,
-        work: &novarocks_control_runtime::obligation::WorkObligation,
-    ) -> Result<
-        (
-            LogicalAbortRoute,
-            Arc<crate::task_execution::bridge::abort::AttemptAbortIngress>,
-            Arc<crate::task_execution::bridge::abort::AbortSettlementOwner>,
-        ),
-        NativeAttemptActivationFailure,
-    > {
-        let route = self.reserve_route(attempt.root_control_binding().activation().execution())?;
-        let (ingress, settlement) = route.bind_attempt_ingress(attempt, runtime, work)?;
-        Ok((route, ingress, settlement))
-    }
-
-    fn worker_closed_participations(&self) -> Arc<Mutex<BTreeSet<ParticipationRef>>> {
-        Arc::clone(&self.worker_closed_participations)
-    }
-
-    fn closure_epoch(&self) -> watch::Sender<u64> {
-        self.closure_epoch.clone()
-    }
-}
-
-impl LogicalAbortRoute {
-    pub(crate) fn bind_attempt_ingress(
-        &self,
-        attempt: &mut crate::task_execution::host::adapter::AttemptActorRegistration,
-        runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<
-            crate::control_runtime::actor::FrontendActor,
-        >,
-        work: &novarocks_control_runtime::obligation::WorkObligation,
-    ) -> Result<
-        (
-            Arc<crate::task_execution::bridge::abort::AttemptAbortIngress>,
-            Arc<crate::task_execution::bridge::abort::AbortSettlementOwner>,
-        ),
-        NativeAttemptActivationFailure,
-    > {
-        assert_eq!(
-            self.execution,
-            attempt.root_control_binding().activation().execution()
-        );
-        let ingress = attempt
-            .prepare_abort_ingress(
-                runtime,
-                work,
-                self.router.capacity_author(),
-                Some(self.router.closure_observer()),
-            )
-            .map(Arc::new)
-            .map_err(|error| {
-                NativeAttemptActivationFailure::new(attempt_runtime_failure(
-                    QueryFailureReason::PreparationProtocol,
-                    error.to_string(),
-                ))
-            })?;
-        let settlement = Arc::new(
-            crate::task_execution::bridge::abort::AbortSettlementOwner::new(ingress.clone()),
-        );
-        Ok((ingress, settlement))
-    }
-}
-
-impl AbortParticipationEffectPort for LogicalAbortRouter {
-    fn subscribe_capacity(&self) -> watch::Receiver<u64> {
-        self.capacity_epoch.subscribe()
-    }
-
-    fn try_reserve(
-        &self,
-        identity: AbortParticipationIssueIdentity,
-    ) -> AbortParticipationEffectAdmission {
-        let execution = identity.participation().query_execution_id();
-        self.routes
-            .lock()
-            .expect("logical Abort route table")
-            .get(&execution)
-            .and_then(Option::as_ref)
-            .map_or(AbortParticipationEffectAdmission::Backpressured, |route| {
-                route.try_reserve(identity)
-            })
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct LogicalAbortRoute {
-    execution: novarocks_types::QueryExecutionId,
-    router: Arc<LogicalAbortRouter>,
-}
-
-impl LogicalAbortRoute {
-    pub(crate) fn publish_registered(
-        &self,
-        startup: &crate::task_execution::host::startup::AttemptStartup,
-        endpoint: Arc<crate::task_execution::bridge::abort::AttemptAbortIngress>,
-    ) -> Result<(), novarocks_control_runtime::actor_turn::ActorTurnError> {
-        use novarocks_control_runtime::actor_turn::ActorTurnError;
-        if !endpoint.ready_for_route(startup, self.execution) {
-            return Err(ActorTurnError::InputAuthorMismatch);
-        }
-        self.publish(endpoint);
-        Ok(())
-    }
-
-    pub(crate) fn publish(&self, endpoint: Arc<dyn AbortParticipationEffectPort>) {
-        {
-            let mut routes = self
-                .router
-                .routes
-                .lock()
-                .expect("logical Abort route table");
-            let original = routes
-                .get_mut(&self.execution)
-                .expect("reserved original Abort route");
-            assert!(original.is_none());
-            *original = Some(endpoint);
-        }
-        self.router
-            .capacity_epoch
-            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
-    }
-}
-
-impl Drop for LogicalAbortRoute {
-    fn drop(&mut self) {
-        let original = self
-            .router
-            .routes
-            .lock()
-            .expect("logical Abort route table")
-            .remove(&self.execution);
-        drop(original);
-        self.router
-            .capacity_epoch
-            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
-    }
-}
 
 #[derive(Clone, Debug)]
 struct ReplacementCandidate {
@@ -451,6 +245,10 @@ impl LogicalReplacementQualificationPort {
         request: &ReplacementQualificationRequest,
         mut cancellation: watch::Receiver<bool>,
     ) -> Result<FrontendAttemptIsolationReservation, ReplacementQualificationFailure> {
+        #[cfg(all(test, novarocks_dev_controls))]
+        if let Some(probe) = &self.inner.runtime.original_install_probe {
+            probe.observe_qualification(request);
+        }
         if *cancellation.borrow() {
             return Err(ReplacementQualificationFailure::Rejected);
         }
@@ -505,6 +303,13 @@ impl LogicalReplacementQualificationPort {
         )
         .await?;
         Ok(FrontendAttemptIsolationReservation {
+            #[cfg(all(test, novarocks_dev_controls))]
+            original_probe: self
+                .inner
+                .runtime
+                .original_install_probe
+                .as_ref()
+                .map(Arc::downgrade),
             identity: request.identity(),
             topology_revision: replacement.topology_revision,
             failed_participations: request.failed_participations().iter().copied().collect(),
@@ -626,6 +431,8 @@ impl ReplacementQualificationEffectPort for LogicalReplacementQualificationPort 
 }
 
 struct FrontendAttemptIsolationReservation {
+    #[cfg(all(test, novarocks_dev_controls))]
+    original_probe: Option<Weak<original_install_fixture::OriginalInstallProbe>>,
     identity: ReplacementQualificationIdentity,
     topology_revision: u64,
     failed_participations: BTreeSet<ParticipationRef>,
@@ -674,6 +481,8 @@ impl AttemptIsolationReservation for FrontendAttemptIsolationReservation {
         self: Box<Self>,
     ) -> Result<Box<dyn ActiveAttemptIsolationOwner>, AttemptIsolationActivationFailure> {
         Ok(Box::new(FrontendActiveIsolationOwner {
+            #[cfg(all(test, novarocks_dev_controls))]
+            original_probe: self.original_probe,
             execution: self.identity.replacement(),
             runtime: self.runtime.clone(),
             admissions: Some(self.admissions),
@@ -686,6 +495,8 @@ impl AttemptIsolationReservation for FrontendAttemptIsolationReservation {
 }
 
 struct FrontendActiveIsolationOwner {
+    #[cfg(all(test, novarocks_dev_controls))]
+    original_probe: Option<Weak<original_install_fixture::OriginalInstallProbe>>,
     execution: novarocks_types::QueryExecutionId,
     runtime: FrontendDataRuntime,
     admissions: Option<Box<[QualifiedWorkerAdmission]>>,
@@ -711,6 +522,10 @@ impl ActiveAttemptIsolationOwner for FrontendActiveIsolationOwner {
 
     fn finish(mut self: Box<Self>) {
         self.admissions.take();
+        #[cfg(all(test, novarocks_dev_controls))]
+        if let Some(probe) = self.original_probe.as_ref().and_then(Weak::upgrade) {
+            probe.observe_isolation_finish(self.execution);
+        }
     }
 
     fn abandon(mut self: Box<Self>) {
@@ -758,7 +573,10 @@ async fn acquire_replacement_admissions(
         .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
     let valid_for = LeaseValidFor::new(crate::task_execution::sources::ADMISSION_TICKET_VALID_FOR)
         .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
-    let attempt_runtime = &runtime.attempt_runtime;
+    let attempt_runtime = runtime
+        .attempt_runtime
+        .upgrade()
+        .ok_or(ReplacementQualificationFailure::EffectOwnerClosed)?;
     let scope = attempt_runtime
         .open_replacement_qualification()
         .map_err(|error| match error {
@@ -1002,6 +820,8 @@ impl LogicalExecutionNativePort for FrontendLogicalExecutionNativePort {
 /// manifest through these handles and cannot reacquire policy from globals.
 #[derive(Clone)]
 pub(crate) struct FrontendNativeLogicalExecutionRuntime {
+    #[cfg(all(test, novarocks_dev_controls))]
+    original_install_probe: Option<Arc<original_install_fixture::OriginalInstallProbe>>,
     #[cfg(novarocks_dev_controls)]
     statement_observation:
         Option<std::sync::Weak<crate::preparation_diagnostics::StatementObservationOwner>>,
@@ -1014,13 +834,13 @@ pub(crate) struct FrontendNativeLogicalExecutionRuntime {
     topology: BackendTopologyService,
     process_observation: BackendProcessObservationService,
     data_runtime: FrontendDataRuntime,
-    attempt_runtime: Arc<crate::control_runtime::FrontendAttemptRuntime>,
+    attempt_runtime: Weak<crate::control_runtime::FrontendAttemptRuntime>,
+    transport_budget: TransportBudget,
     native_compatibility_id: NativeCompatibilityId,
     runtime_filter_worker_count: NonZeroUsize,
     task_update_retry_policy: TaskUpdateRetryPolicy,
     split_initial_wait_cap: Duration,
     coordination_budgets: CoordinationBudgets,
-    abort_capacity: NonZeroUsize,
     lifecycle_diagnostics:
         Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
 }
@@ -1036,14 +856,57 @@ impl std::fmt::Debug for FrontendNativeLogicalExecutionRuntime {
             )
             .field("coordination_budgets", &self.coordination_budgets)
             .field("transport_budget", &self.transport_budget())
-            .field("abort_capacity", &self.abort_capacity)
             .finish_non_exhaustive()
     }
 }
 
 impl FrontendNativeLogicalExecutionRuntime {
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) fn with_original_install_probe(
+        mut self,
+        probe: Arc<original_install_fixture::OriginalInstallProbe>,
+    ) -> Self {
+        self.original_install_probe = Some(probe);
+        self
+    }
+    fn logical_composition(
+        &self,
+        retain_profile: bool,
+    ) -> Result<
+        (
+            Arc<super::logical_binding::LogicalAttemptBindingCell>,
+            novarocks_query_application::api::LogicalRuntimeComposition,
+        ),
+        QueryExecutionError,
+    > {
+        let process = self.attempt_runtime.upgrade().ok_or_else(|| {
+            attempt_runtime_failure(
+                QueryFailureReason::PreparationProtocol,
+                "the original frontend attempt runtime is closed",
+            )
+            .error()
+            .clone()
+        })?;
+        let binding = super::logical_binding::LogicalAttemptBindingCell::new(
+            retain_profile,
+            self.lifecycle_diagnostics.clone(),
+        );
+        let installer = crate::control_runtime::logical::LogicalRuntimeInstaller::new(
+            process,
+            self.data_runtime.handle().clone(),
+            binding.clone(),
+        );
+        let composition = novarocks_query_application::api::LogicalRuntimeComposition::new(
+            Arc::new(installer),
+            binding.clone(),
+            Some(binding.clone()),
+            retain_profile,
+        );
+        Ok((binding, composition))
+    }
+
     fn transport_budget(&self) -> TransportBudget {
-        self.attempt_runtime.transport_capacity().transport_budget()
+        self.transport_budget
     }
 
     #[cfg(novarocks_dev_controls)]
@@ -1077,13 +940,15 @@ impl FrontendNativeLogicalExecutionRuntime {
         task_update_retry_policy: TaskUpdateRetryPolicy,
         split_initial_wait_cap: Duration,
         coordination_budgets: CoordinationBudgets,
-        abort_capacity: NonZeroUsize,
         lifecycle_diagnostics: Arc<
             crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
         >,
         clock: Arc<dyn novarocks_coordination_contract::MonotonicClock>,
     ) -> Self {
+        let transport_budget = attempt_runtime.transport_capacity().transport_budget();
         Self {
+            #[cfg(all(test, novarocks_dev_controls))]
+            original_install_probe: None,
             clock,
             #[cfg(novarocks_dev_controls)]
             statement_observation: None,
@@ -1094,13 +959,13 @@ impl FrontendNativeLogicalExecutionRuntime {
             topology,
             process_observation,
             data_runtime,
-            attempt_runtime,
+            attempt_runtime: Arc::downgrade(&attempt_runtime),
+            transport_budget,
             native_compatibility_id,
             runtime_filter_worker_count,
             task_update_retry_policy,
             split_initial_wait_cap,
             coordination_budgets,
-            abort_capacity,
             lifecycle_diagnostics,
         }
     }
@@ -1177,18 +1042,19 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 carrier,
                 Some(capacity.window_alias()),
             )?);
+            let (logical_binding, composition) = self.runtime.logical_composition(false)?;
             let (description, template, options) = read.take().unwrap().into_parts();
-            let aborts = LogicalAbortRouter::new();
+            let closed = logical_binding.closed_participations();
             let replacements = LogicalReplacementQualificationPort::new(
                 self.runtime.clone(),
-                aborts.worker_closed_participations(),
-                aborts.closure_epoch(),
+                closed.rows(),
+                closed.epoch(),
             );
             let factory = ProductionDormantAttemptFactory {
+                logical_binding,
                 metadata_io: OriginalAttemptMetadataSource::Read(Arc::downgrade(io)),
                 runtime: self.runtime.clone(),
                 options,
-                aborts: Arc::clone(&aborts),
                 diagnostics: ComputationDiagnostics::None,
                 initial_credentials: None,
                 replacements: replacements.clone(),
@@ -1210,10 +1076,10 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             original.request = Some(
                 QueryExecutionRequest::bind_native(
                     description,
-                    aborts as Arc<dyn AbortParticipationEffectPort>,
                     Some(Arc::new(replacements) as Arc<dyn ReplacementQualificationEffectPort>),
                     attempts,
                 )
+                .with_logical_runtime(composition)
                 .with_result_capacity(capacity.clone())?,
             );
         }
@@ -1313,6 +1179,10 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             })?;
             let delivery = ProductionRootDelivery::bind(carrier, Some(capacity.window_alias()))?;
             drop(delivery);
+            let (logical_binding, composition) = self.runtime.logical_composition(matches!(
+                prepared.diagnostics,
+                ComputationDiagnostics::Profile
+            ))?;
             let PreparedLogicalComputation {
                 description,
                 template,
@@ -1322,17 +1192,17 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 diagnostics,
                 initial_credentials,
             } = computation.take().unwrap();
-            let aborts = LogicalAbortRouter::new();
+            let closed = logical_binding.closed_participations();
             let replacements = LogicalReplacementQualificationPort::new(
                 self.runtime.clone(),
-                aborts.worker_closed_participations(),
-                aborts.closure_epoch(),
+                closed.rows(),
+                closed.epoch(),
             );
             let factory = ProductionDormantAttemptFactory {
+                logical_binding,
                 metadata_io: OriginalAttemptMetadataSource::Computation(Arc::downgrade(io)),
                 runtime: self.runtime.clone(),
                 options,
-                aborts: Arc::clone(&aborts),
                 diagnostics,
                 initial_credentials: initial_credentials.map(|c| Arc::downgrade(&c)),
                 replacements: replacements.clone(),
@@ -1359,14 +1229,11 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             };
             // All fallible carrier checks ran while the original computation
             // and unique owner still occupied the caller's stable fields.
-            let request = QueryExecutionRequest::bind_native(
-                description,
-                aborts as Arc<dyn AbortParticipationEffectPort>,
-                replacement_port,
-                attempts,
-            )
-            .with_result_capacity(capacity.clone())?
-            .with_internal_consumer(consumer)?;
+            let request =
+                QueryExecutionRequest::bind_native(description, replacement_port, attempts)
+                    .with_logical_runtime(composition)
+                    .with_result_capacity(capacity.clone())?
+                    .with_internal_consumer(consumer)?;
             original.request = Some(request);
         }
         if original.input.is_none() {
@@ -1415,6 +1282,7 @@ enum OriginalAttemptMetadataSource {
 }
 
 struct ProductionManifestAttemptProjection {
+    logical_binding: Arc<super::logical_binding::LogicalAttemptBindingCell>,
     metadata_io: OriginalAttemptMetadataSource,
     control_binding: NativeControlBinding,
     source_cohort: NativeSourceCohortAdmission,
@@ -1422,7 +1290,6 @@ struct ProductionManifestAttemptProjection {
     work_scope: novarocks_workload_control::WorkScope,
     runtime: FrontendNativeLogicalExecutionRuntime,
     options: Arc<ResolvedQueryOptions>,
-    aborts: Arc<LogicalAbortRouter>,
     delivery: ProductionRootDelivery,
     diagnostics: ComputationDiagnostics,
     initial_credentials: Option<Weak<InitialComputationCredentials>>,
@@ -1501,46 +1368,11 @@ impl ProductionRootDelivery {
 
 pub(crate) type FrontendRootRowsRuntime = RootRelayBinding;
 
-/// Frontend-local Task protocol and transport behavior used by the fixed
-/// snapshot-owning dormant adapter.
-///
-/// The behavior only borrows the manifest already bound by the adapter. It
-/// cannot provide eligible backend identities, substitute a topology snapshot,
-/// or move attempt leases into an activation future. The adapter transfers the
-/// manifest only after activation returns an active behavior successfully.
-pub(crate) trait FrontendActiveAttemptBehavior<M = ManifestBoundNativeAttemptInputs>:
-    std::fmt::Debug + Send + 'static
-{
-    fn take_rows_runtime(&mut self) -> Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)> {
-        None
-    }
-
-    fn run<'a>(
-        &'a mut self,
-        inputs: &'a mut M,
-        drive: &'a NativeAttemptDrive,
-        cancellation: CancellationView,
-    ) -> NativeAttemptRunFuture<'a>;
-
-    fn converge<'a>(
-        &'a mut self,
-        inputs: &'a mut M,
-        request: NativeActiveConvergenceRequest,
-    ) -> NativeActiveAttemptConvergenceFuture<'a>;
-
-    /// Closes a completed activation result which never entered run(). The
-    /// same active/manifest fields stay installed throughout this borrowed F.
-    fn converge_unstarted<'a>(
-        &'a mut self,
-        inputs: &'a mut M,
-    ) -> NativeAttemptConvergenceFuture<'a>;
-}
-
+/// Original manifest-borrowing preparation and attempt installation. Successful
+/// activation returns passive facts; the installed Source owns live resources.
 pub(crate) trait FrontendDormantAttemptBehavior<M = ManifestBoundNativeAttemptInputs>:
     std::fmt::Debug + Send + 'static
 {
-    type ActiveBehavior: FrontendActiveAttemptBehavior<M>;
-
     fn poll_bind_qualification(
         &mut self,
         inputs: &mut M,
@@ -1549,19 +1381,13 @@ pub(crate) trait FrontendDormantAttemptBehavior<M = ManifestBoundNativeAttemptIn
 
     fn activate<'a>(
         &'a mut self,
+        _activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         inputs: &'a mut M,
         replacement_admissions: Option<
             Box<[novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence]>,
         >,
         cancellation: CancellationView,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<Self::ActiveBehavior, NativeAttemptActivationFailure>,
-                > + Send
-                + 'a,
-        >,
-    >;
+    ) -> NativeAttemptActivationFuture<'a>;
 
     fn converge<'a>(&'a mut self, inputs: &'a mut M) -> NativeAttemptConvergenceFuture<'a>;
 }
@@ -1605,6 +1431,7 @@ pub(crate) trait FrontendManifestAttemptProjection:
 
     fn project<'a>(
         &'a mut self,
+        activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         prepared: PreparedDistributedQuery,
         manifest: &'a TaskManifestBinding,
         replacement_admissions: Option<
@@ -1625,8 +1452,10 @@ pub(crate) trait FrontendManifestAttemptProjection:
 
 /// One exact Task round and its move-only root result owners.
 pub(crate) struct ProjectedManifestAttempt {
+    #[cfg(all(test, novarocks_dev_controls))]
+    original_root_port: Weak<NativeBoundedRootReadPort>,
     host: DormantManifestHost,
-    rows: Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
+    rows: Option<FrontendRootRowsRuntime>,
     _prepared: Option<TaskExecutionPreparedQuery>,
     _credential_storage:
         Option<Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>>,
@@ -1634,20 +1463,203 @@ pub(crate) struct ProjectedManifestAttempt {
     profile_observer: Option<crate::task_execution::profile_diagnostics::ProfileDiagnosticObserver>,
 }
 
+/// The original Native captures transferred once to the AP Source. This
+/// obligation is not checked by Drop: the Source retains it in ManuallyDrop
+/// until its original credentialed disposal body destroys these captures.
+/// Neither transfer nor the body returning proves the disposal Join exited.
+#[must_use = "Retain the same Native originals until their controlled disposal"]
+pub(crate) struct AttemptSourceOriginalsObligation {
+    activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    captures: AttemptSourceCaptures,
+}
+struct NativeAttemptSourceCaptures {
+    inputs: crate::query_execution::artifact::ManifestBoundNativeAttemptOriginals,
+    prepared: Option<TaskExecutionPreparedQuery>,
+    credential_storage: Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>,
+    ready: AttemptReady,
+    handoff: Option<AttemptHandoffProducer>,
+    profile_observer: Option<crate::task_execution::profile_diagnostics::ProfileDiagnosticObserver>,
+    #[cfg(all(test, novarocks_dev_controls))]
+    original_disposal_gate: Option<Weak<crate::fixtures::native_recipe::ReadCloseGate>>,
+}
+enum AttemptSourceCaptures {
+    Native(Box<NativeAttemptSourceCaptures>),
+    #[cfg(test)]
+    ProtocolHandoff(AttemptHandoffProducer),
+}
+impl AttemptSourceOriginalsObligation {
+    pub(crate) fn activation(&self) -> novarocks_coordination_contract::AttemptActivationIdentity {
+        self.activation
+    }
+    /// The existing observation author pays both actual Native allocations.
+    /// Protocol fixtures retain less backing and receive no additional quota.
+    pub(crate) const fn backing_bytes() -> usize {
+        std::mem::size_of::<Self>() + std::mem::size_of::<NativeAttemptSourceCaptures>()
+    }
+    /// Only the original blocking disposal body calls this. Returning from
+    /// this body still requires the same actual Join/report/header retirement.
+    pub(crate) fn dispose_on_executor(self) {
+        match self.captures {
+            AttemptSourceCaptures::Native(mut original) => {
+                if let Some(handoff) = &mut original.handoff {
+                    handoff.retire_unclaimed();
+                }
+                // Pause the SAME credentialed disposal body with its actual
+                // Native captures intact, after Root read admission is sealed.
+                #[cfg(all(test, novarocks_dev_controls))]
+                if let Some(gate) = original.original_disposal_gate.take() {
+                    gate.upgrade()
+                        .expect("the caller retains its original disposal gate")
+                        .wait();
+                }
+                let NativeAttemptSourceCaptures {
+                    inputs,
+                    prepared,
+                    credential_storage,
+                    ready,
+                    handoff,
+                    profile_observer,
+                    #[cfg(all(test, novarocks_dev_controls))]
+                        original_disposal_gate: _,
+                } = *original;
+                drop((
+                    inputs,
+                    prepared,
+                    credential_storage,
+                    ready,
+                    handoff,
+                    profile_observer,
+                ));
+            }
+            #[cfg(test)]
+            AttemptSourceCaptures::ProtocolHandoff(mut original) => {
+                original.retire_unclaimed();
+                drop(original);
+            }
+        }
+    }
+}
+
+/// A synchronous borrow of the original pending slots. It owns no new
+/// captures, makes no copy and never crosses an async boundary. The sole
+/// installer consumes it only after every typed Source preflight succeeds.
+pub(crate) struct NativeOriginalSourceSlots<'a> {
+    pub(crate) activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    pub(crate) inputs: &'a mut ManifestBoundNativeAttemptInputs,
+    pub(crate) prepared: &'a mut Option<TaskExecutionPreparedQuery>,
+    pub(crate) credential_storage:
+        &'a mut Option<Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>>,
+    pub(crate) ready: &'a mut Option<AttemptReady>,
+    pub(crate) handoff: &'a mut Option<AttemptHandoffProducer>,
+    pub(crate) profile_observer:
+        &'a mut Option<crate::task_execution::profile_diagnostics::ProfileDiagnosticObserver>,
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) original_disposal_gate: Option<Weak<crate::fixtures::native_recipe::ReadCloseGate>>,
+}
+impl NativeOriginalSourceSlots<'_> {
+    pub(crate) fn split_plan_mut(
+        &mut self,
+    ) -> &mut Option<crate::query_execution::split_assignment_round::RoundSplitAssignmentPlan> {
+        self.ready
+            .as_mut()
+            .expect("same original Native ready remainder")
+            .split_plan_mut()
+    }
+    pub(crate) fn take(self) -> AttemptSourceOriginalsObligation {
+        assert_eq!(self.activation.execution(), self.inputs.execution_id());
+        assert!(
+            self.ready
+                .as_ref()
+                .is_some_and(AttemptReady::can_transfer_remainder)
+        );
+        assert!(
+            self.credential_storage.is_some(),
+            "retain the original storage table, including its empty identity"
+        );
+        AttemptSourceOriginalsObligation {
+            activation: self.activation,
+            captures: AttemptSourceCaptures::Native(Box::new(NativeAttemptSourceCaptures {
+                inputs: self.inputs.take_for_source(),
+                prepared: self.prepared.take(),
+                credential_storage: self.credential_storage.take().unwrap(),
+                ready: self.ready.take().unwrap(),
+                handoff: self.handoff.take(),
+                profile_observer: self.profile_observer.take(),
+                #[cfg(all(test, novarocks_dev_controls))]
+                original_disposal_gate: self.original_disposal_gate,
+            })),
+        }
+    }
+}
+
+/// Production always supplies its original Native pending slots. Protocol
+/// fixtures exercise this same AP assembler without ever having a Native M,
+/// Ready or access owner; they cannot manufacture those missing originals.
+pub(crate) enum AttemptSourceInputs<'a> {
+    Native(NativeOriginalSourceSlots<'a>),
+    #[cfg(test)]
+    ProtocolFixture {
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
+        split: &'a mut Option<RoundSplitAssignmentPlan>,
+        handoff: &'a mut Option<AttemptHandoffProducer>,
+    },
+}
+impl AttemptSourceInputs<'_> {
+    pub(crate) fn activation(&self) -> novarocks_coordination_contract::AttemptActivationIdentity {
+        match self {
+            Self::Native(original) => original.activation,
+            #[cfg(test)]
+            Self::ProtocolFixture { activation, .. } => *activation,
+        }
+    }
+    pub(crate) fn split_plan_mut(&mut self) -> &mut Option<RoundSplitAssignmentPlan> {
+        match self {
+            Self::Native(original) => original.split_plan_mut(),
+            #[cfg(test)]
+            Self::ProtocolFixture { split, .. } => split,
+        }
+    }
+    pub(crate) fn take(self) -> Option<AttemptSourceOriginalsObligation> {
+        match self {
+            Self::Native(original) => Some(original.take()),
+            #[cfg(test)]
+            Self::ProtocolFixture {
+                activation,
+                split,
+                handoff,
+            } => {
+                assert!(
+                    split.is_none(),
+                    "the original fixture split must already belong to its Source"
+                );
+                handoff
+                    .take()
+                    .map(|original| AttemptSourceOriginalsObligation {
+                        activation,
+                        captures: AttemptSourceCaptures::ProtocolHandoff(original),
+                    })
+            }
+        }
+    }
+}
+
 struct DormantManifestHost {
+    activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
+    logical_binding: Arc<super::logical_binding::LogicalAttemptBindingCell>,
     runtime: FrontendNativeLogicalExecutionRuntime,
     prepared: Option<PreparedManifestAttempt>,
-    ready: AttemptReady,
+    ready: Option<AttemptReady>,
     establish: AttemptEstablishFacts,
+    establish_preparation: crate::task_execution::host::transport::EstablishMaterialPreparation,
     replacements: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
     participations: Box<[ParticipationRef]>,
     subscriptions: Option<StagedSubscriptionEndpoints>,
     authority: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
-    abort_route: Arc<LogicalAbortRoute>,
     result_transport: Arc<NativeTaskResultTransport>,
     profile: Option<TaskFinalInfoCollector>,
     dynamic: Option<Arc<DynamicFilterRecords>>,
     retain_diagnostics: bool,
+    original_exit: Option<crate::control_runtime::host::HostExit>,
 }
 
 impl DormantManifestHost {
@@ -1665,82 +1677,216 @@ impl DormantManifestHost {
         self.prepared.as_mut()?.publications.protocol_facts.take()
     }
 
-    fn install(
+    async fn converge_unstarted(
         &mut self,
-        drive: &NativeAttemptDrive,
-    ) -> Result<InstalledAttemptHost, NativeAttemptPreparationFailure> {
-        let prepared = self
+    ) -> Result<(), novarocks_query_application::api::StatementNativeHealthFailure> {
+        drop(self.subscriptions.take());
+        match self.ready.as_mut() {
+            Some(original) => original.close().await,
+            // An empty shell is not exit evidence. Await only the SAME
+            // installed Source's original health and actual HostExit.
+            None => {
+                novarocks_query_application::api::NativeInstalledAttemptPort::resources_exited(
+                    self.logical_binding.as_ref(),
+                    self.activation_identity,
+                )
+                .await
+            }
+        }
+    }
+}
+
+impl ProjectedManifestAttempt {
+    async fn install_original_source(
+        &mut self,
+        inputs: &mut ManifestBoundNativeAttemptInputs,
+        cancellation: &CancellationView,
+    ) -> Result<InstalledAttemptHost, NativeAttemptActivationFailure> {
+        let host = &mut self.host;
+        let activation = host.activation_identity;
+        if inputs.execution_id() != activation.execution() {
+            return Err(projection_message(
+                "original Native installation has a foreign manifest",
+            ));
+        }
+        // Test-only metadata/pause of this SAME stable original projection.
+        // No Source has installed, and every rich field remains in self/host.
+        #[cfg(all(test, novarocks_dev_controls))]
+        let fixture_row = if let Some(probe) = &host.runtime.original_install_probe {
+            let row = probe.capture(
+                activation,
+                host.prepared
+                    .as_ref()
+                    .expect("same original pending manifest")
+                    .graph(),
+                Arc::downgrade(
+                    self._credential_storage
+                        .as_ref()
+                        .expect("same original credentials"),
+                ),
+                self.original_root_port.clone(),
+                host.replacements.as_deref().unwrap_or(&[]),
+                &host
+                    .logical_binding
+                    .closed_participations()
+                    .rows()
+                    .lock()
+                    .unwrap(),
+            );
+            row.wait_for_release().await;
+            Some(row)
+        } else {
+            None
+        };
+        let logical = host.logical_binding.bound().map_err(|error|
+            NativeAttemptActivationFailure::local_exit_unproven(
+                novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                    "original logical installation is unavailable", Arc::new(error))))?;
+        let link = logical.links.borrow(activation).ok_or_else(|| {
+            projection_message("original Native installation has no issued activation link")
+        })?;
+        let mut logical_inputs = logical.inputs.loan().await.map_err(|error|
+            NativeAttemptActivationFailure::local_exit_unproven(
+                novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                    "original logical input inventory closed before activation binding", Arc::new(error))))?;
+        let process =
+            host.runtime.attempt_runtime.upgrade().ok_or_else(|| {
+                projection_message("the original frontend attempt runtime is closed")
+            })?;
+        // The original clock and opaque Establish getters run while their
+        // entire pending projection still owns the M/Ready/resource slots.
+        let initial_now = host.runtime.clock.now();
+        host.establish_preparation
+            .freeze(&host.establish, host.participations.iter().copied())
+            .map_err(|error| {
+                NativeAttemptActivationFailure::new(NativeAttemptPreparationFailure::from_input(
+                    error.preparation_input(),
+                ))
+            })?;
+        if let Some(handoff) = self.handoff.as_mut() {
+            handoff
+                .bind(activation)
+                .map_err(|error| NativeAttemptActivationFailure::new(handoff_failure(error)))?;
+        }
+        let prepared = host
             .prepared
             .take()
             .expect("one original Native host installation");
         let leases = crate::task_execution::lease::RequestedLeaseDurations::DEFAULT;
         #[cfg(novarocks_dev_controls)]
-        let root_observer = self
+        let root_observer = host
             .runtime
             .lifecycle_diagnostics
-            .root_observer_for_execution(drive.identity().execution());
+            .root_observer_for_execution(activation.execution());
         #[cfg(novarocks_dev_controls)]
         let observe_dev_root = root_observer.is_some();
         #[cfg(not(novarocks_dev_controls))]
         let observe_dev_root = false;
-        InstallAttemptHost {
-            process: &self.runtime.attempt_runtime,
-            data: &self.runtime.data_runtime,
-            clock: self.runtime.clock.clone(),
-            drive,
+        let limits = novarocks_coordination_contract::AttemptAuthorizationLimits {
+            activation,
+            establish_per_participation: logical.start.budgets.establish_per_participation,
+            abort_per_participation: logical.start.budgets.abort_per_participation,
+        };
+        let original = InstallAttemptHost {
+            #[cfg(test)]
+            fixture_observation_budget: None,
+            initial_now,
+            process: &process,
+            data: &host.runtime.data_runtime,
+            clock: host.runtime.clock.clone(),
+            activation,
+            authorization_limits: limits,
+            logical: &logical,
+            link: &link,
+            logical_inputs: &mut logical_inputs,
+            original_exit: &mut host.original_exit,
             prepared,
-            establish: &self.establish,
-            replacements: self.replacements.as_deref(),
-            subscriptions: self
+            establish: &mut host.establish_preparation,
+            replacements: host.replacements.as_deref(),
+            subscriptions: host
                 .subscriptions
                 .take()
-                .expect("original staged WC Sources"),
-            authority: self.authority.clone(),
-            route: self.abort_route.clone(),
-            results: self.result_transport.clone(),
-            profile: self.profile.take(),
-            dynamic: self.dynamic.take(),
-            split: self.ready.split_plan_mut(),
+                .expect("same original staged WC Sources"),
+            authority: host.authority.clone(),
+            results: host.result_transport.clone(),
+            profile: host.profile.take(),
+            dynamic: host.dynamic.take(),
+            originals: AttemptSourceInputs::Native(NativeOriginalSourceSlots {
+                activation,
+                inputs,
+                prepared: &mut self._prepared,
+                credential_storage: &mut self._credential_storage,
+                ready: &mut host.ready,
+                handoff: &mut self.handoff,
+                profile_observer: &mut self.profile_observer,
+                #[cfg(all(test, novarocks_dev_controls))]
+                original_disposal_gate: fixture_row
+                    .as_ref()
+                    .and_then(|row| row.original_disposal_gate()),
+            }),
             policy: AttemptPlanPolicy {
-                coordination: self.runtime.coordination_budgets,
-                retry: self.runtime.task_update_retry_policy,
+                coordination: host.runtime.coordination_budgets,
+                retry: host.runtime.task_update_retry_policy,
                 initial_lease: leases.initial(),
                 steady_lease: leases.steady(),
             },
             ids: attempt_id_seed(),
-            retain_diagnostics: self.retain_diagnostics,
+            retain_diagnostics: host.retain_diagnostics,
             observe_dev_root,
-            observe_lifecycle: self.runtime.lifecycle_diagnostics.is_enabled(),
+            observe_lifecycle: host.runtime.lifecycle_diagnostics.is_enabled(),
             #[cfg(novarocks_dev_controls)]
             root_observer,
         }
-        .install()
+        .install()?;
+        #[cfg(all(test, novarocks_dev_controls))]
+        if let Some(row) = &fixture_row {
+            row.bind_actual_exit(
+                original.fixture_exit.observe_actual_exit(),
+                original.fixture_sources.0,
+            );
+        }
+        // Return the same two exclusive loans before initialization may await
+        // LP/AP progress. The installed Source already owns every rich capture.
+        drop(logical_inputs);
+        drop(link);
+        let mut startup = original.startup.clone();
+        wait_original_attempt_initialization(
+            &mut startup,
+            host.logical_binding.as_ref(),
+            activation,
+            cancellation,
+        )
+        .await?;
+        Ok(original)
     }
+}
 
-    async fn converge_unstarted(
-        &mut self,
-    ) -> Result<(), novarocks_query_application::api::StatementNativeHealthFailure> {
-        drop(self.subscriptions.take());
-        self.ready.close().await
-    }
-
-    async fn never_established(
-        &mut self,
-    ) -> Result<
-        NativeActiveConvergenceClosure,
-        novarocks_query_application::api::StatementNativeHealthFailure,
-    > {
-        self.converge_unstarted().await?;
-        Ok(NativeActiveConvergenceClosure::Evidence(
-            NativeAttemptConvergence::participations(
-                self.participations
-                    .iter()
-                    .copied()
-                    .map(NativeParticipationConvergence::never_established)
-                    .collect::<Box<[_]>>(),
-            ),
-        ))
-    }
+/// A closed startup is not itself a raw infrastructure failure or local-exit
+/// receipt. Observe the SAME installed Source's actual health and exit before
+/// returning an ordinary initialization refusal. Unproven exit stays sticky in
+/// the original Native custody; no retry, timeout or replacement receipt exists.
+pub(crate) async fn wait_original_attempt_initialization(
+    startup: &mut crate::task_execution::host::startup::AttemptStartup,
+    binding: &super::logical_binding::LogicalAttemptBindingCell,
+    activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    cancellation: &CancellationView,
+) -> Result<(), NativeAttemptActivationFailure> {
+    let Err(original_refusal) = startup.wait_initialized().await else {
+        return Ok(());
+    };
+    novarocks_query_application::api::NativeInstalledAttemptPort::resources_exited(
+        binding, activation,
+    )
+    .await
+    .map_err(NativeAttemptActivationFailure::local_exit_unproven)?;
+    let reason = cancellation
+        .reason()
+        .as_ref()
+        .map(query_cancellation_reason)
+        .unwrap_or(QueryFailureReason::PreparationProtocol);
+    Err(NativeAttemptActivationFailure::new(
+        attempt_runtime_failure(reason, original_refusal),
+    ))
 }
 
 fn attempt_id_seed() -> novarocks_attempt_protocol::ids::IdSeed {
@@ -1759,10 +1905,10 @@ fn attempt_id_seed() -> novarocks_attempt_protocol::ids::IdSeed {
 }
 
 struct ProductionDormantAttemptFactory {
+    logical_binding: Arc<super::logical_binding::LogicalAttemptBindingCell>,
     metadata_io: OriginalAttemptMetadataSource,
     runtime: FrontendNativeLogicalExecutionRuntime,
     options: Arc<ResolvedQueryOptions>,
-    aborts: Arc<LogicalAbortRouter>,
     diagnostics: ComputationDiagnostics,
     initial_credentials: Option<Weak<InitialComputationCredentials>>,
     replacements: LogicalReplacementQualificationPort,
@@ -1808,6 +1954,7 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
             .native_action_authority()
             .map_err(|error| attempt_failure(QueryFailureReason::PreparationProtocol, error))?;
         self.pending_projection = Some(ProductionManifestAttemptProjection {
+            logical_binding: self.logical_binding.clone(),
             metadata_io: self.metadata_io.clone(),
             control_binding: NativeControlBinding::default(),
             source_cohort: NativeSourceCohortAdmission::default(),
@@ -1815,7 +1962,6 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
             runtime: self.runtime.clone(),
             work_scope: capacity.scope().clone(),
             options: Arc::clone(&self.options),
-            aborts: Arc::clone(&self.aborts),
             delivery,
             diagnostics: self.diagnostics,
             initial_credentials: self.initial_credentials.clone(),
@@ -1838,7 +1984,6 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
                 handoff: self.pending_handoff.take(),
                 pending_projected: None,
             },
-            Arc::clone(&self.runtime.lifecycle_diagnostics),
         ))
     }
 
@@ -1877,6 +2022,7 @@ impl FrontendManifestAttemptProjection for RegisteredManifestAttemptProjection {
 
     fn project<'a>(
         &'a mut self,
+        activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         prepared: PreparedDistributedQuery,
         manifest: &'a TaskManifestBinding,
         replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
@@ -1899,7 +2045,13 @@ impl FrontendManifestAttemptProjection for RegisteredManifestAttemptProjection {
         Box::pin(async move {
             self.pending_projected = Some(
                 self.base
-                    .project(prepared, manifest, replacement_admissions, cancellation)
+                    .project(
+                        activation_identity,
+                        prepared,
+                        manifest,
+                        replacement_admissions,
+                        cancellation,
+                    )
                     .await?,
             );
             let projected = self.pending_projected.as_mut().unwrap();
@@ -1951,6 +2103,13 @@ impl FrontendManifestAttemptProjection for ProductionManifestAttemptProjection {
         manifest: &TaskManifestBinding,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>> {
+        #[cfg(all(test, novarocks_dev_controls))]
+        if let Some(probe) = &self.runtime.original_install_probe {
+            let candidate = probe.capture_candidate(manifest);
+            if candidate.poll_released(cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+        }
         let ProductionRootDelivery::Relayed { window, .. } = &self.delivery;
         // This is the SAME original projection field used by activation.
         // Internal binding derives from original positive payload/computation
@@ -1979,6 +2138,7 @@ impl FrontendManifestAttemptProjection for ProductionManifestAttemptProjection {
 
     fn project<'a>(
         &'a mut self,
+        activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         prepared: PreparedDistributedQuery,
         manifest: &'a TaskManifestBinding,
         replacement_admissions: Option<
@@ -1994,8 +2154,14 @@ impl FrontendManifestAttemptProjection for ProductionManifestAttemptProjection {
         >,
     > {
         Box::pin(async move {
-            self.project_attempt(prepared, manifest, replacement_admissions, cancellation)
-                .await
+            self.project_attempt(
+                activation_identity,
+                prepared,
+                manifest,
+                replacement_admissions,
+                cancellation,
+            )
+            .await
         })
     }
 
@@ -2029,6 +2195,7 @@ impl FrontendManifestAttemptProjection for ProductionManifestAttemptProjection {
 impl ProductionManifestAttemptProjection {
     async fn project_attempt(
         &mut self,
+        activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         prepared: PreparedDistributedQuery,
         manifest: &TaskManifestBinding,
         replacement_admissions: Option<
@@ -2036,6 +2203,11 @@ impl ProductionManifestAttemptProjection {
         >,
         cancellation: CancellationView,
     ) -> Result<ProjectedManifestAttempt, NativeAttemptActivationFailure> {
+        if activation_identity.execution() != manifest.execution() {
+            return Err(projection_message(
+                "original activation differs from the exact projected manifest",
+            ));
+        }
         if self.pending_credential_source.is_some()
             || self.pending_initializer.is_some()
             || self.pending_ready.is_some()
@@ -2331,7 +2503,8 @@ impl ProductionManifestAttemptProjection {
         );
         let dynamic = (feedback_declaration.channels().len() != 0)
             .then(|| DynamicFilterRecords::new(result_transport.clone(), feedback));
-        let abort_route = Arc::new(self.aborts.reserve_route(execution)?);
+        #[cfg(all(test, novarocks_dev_controls))]
+        let original_root_port;
         let root_binding = match &self.delivery {
             ProductionRootDelivery::Relayed {
                 kind,
@@ -2352,8 +2525,13 @@ impl ProductionManifestAttemptProjection {
                         .lifecycle_diagnostics
                         .root_observer_for_execution(execution),
                 );
+                let port = Arc::new(port);
+                #[cfg(all(test, novarocks_dev_controls))]
+                {
+                    original_root_port = Arc::downgrade(&port);
+                }
                 RootRelayBinding {
-                    port: Arc::new(port),
+                    port,
                     frontier,
                     window: window.clone(),
                     max_wait: Duration::from_millis(250),
@@ -2389,36 +2567,47 @@ impl ProductionManifestAttemptProjection {
         .map_err(|error| {
             projection_message(format!("stage original Native subscriptions: {error:?}"))
         })?;
-        let mut prepared = inputs
+        let prepared = inputs
             .prepare_publications()
             .map_err(|error| projection_message(error.to_string()))?;
-        let root_status = prepared
-            .publications
-            .root_status
-            .take()
-            .expect("original root status Source");
         self.pending_projected = Some(ProjectedManifestAttempt {
+            #[cfg(all(test, novarocks_dev_controls))]
+            original_root_port,
             host: DormantManifestHost {
+                activation_identity,
+                logical_binding: self.logical_binding.clone(),
                 runtime: self.runtime.clone(),
                 prepared: Some(prepared),
-                ready: self.pending_ready.take().expect("original opened Sources"),
+                ready: Some(self.pending_ready.take().expect("original opened Sources")),
                 establish,
+                establish_preparation:
+                    crate::task_execution::host::transport::EstablishMaterialPreparation::new(),
                 replacements: replacement_admissions,
                 participations,
                 subscriptions: Some(subscriptions),
                 authority: self.native_actions.clone(),
-                abort_route,
                 result_transport,
                 profile,
                 dynamic,
                 retain_diagnostics,
+                original_exit: None,
             },
-            rows: Some((root_binding, root_status)),
+            rows: Some(root_binding),
             _prepared: Some(task_prepared),
             _credential_storage: credential_storage,
             handoff: None,
             profile_observer,
         });
+        self.pending_projected
+            .as_mut()
+            .expect("same original projected attempt")
+            .host
+            .ready
+            .as_mut()
+            .expect("same original ready remainder")
+            .close_empty_split_remainder()
+            .await
+            .map_err(NativeAttemptActivationFailure::local_exit_unproven)?;
         Ok(self.pending_projected.take().unwrap())
     }
 }
@@ -2461,8 +2650,7 @@ fn projection_message(message: impl Into<String>) -> NativeAttemptActivationFail
 /// Dormant half of the concrete manifest-only Task protocol behavior.
 pub(crate) struct FrontendTaskProtocolDormantBehavior<P> {
     projection: P,
-    lifecycle_diagnostics:
-        Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
+    pending_projected: Option<ProjectedManifestAttempt>,
 }
 
 impl<P> std::fmt::Debug for FrontendTaskProtocolDormantBehavior<P>
@@ -2478,15 +2666,10 @@ where
 }
 
 impl<P> FrontendTaskProtocolDormantBehavior<P> {
-    pub(crate) fn new(
-        projection: P,
-        lifecycle_diagnostics: Arc<
-            crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
-        >,
-    ) -> Self {
+    pub(crate) fn new(projection: P) -> Self {
         Self {
             projection,
-            lifecycle_diagnostics,
+            pending_projected: None,
         }
     }
 }
@@ -2495,8 +2678,6 @@ impl<P> FrontendDormantAttemptBehavior for FrontendTaskProtocolDormantBehavior<P
 where
     P: FrontendManifestAttemptProjection,
 {
-    type ActiveBehavior = FrontendTaskProtocolActiveBehavior;
-
     fn poll_bind_qualification(
         &mut self,
         inputs: &mut ManifestBoundNativeAttemptInputs,
@@ -2510,183 +2691,66 @@ where
 
     fn activate<'a>(
         &'a mut self,
+        activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         inputs: &'a mut ManifestBoundNativeAttemptInputs,
         replacement_admissions: Option<
             Box<[novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence]>,
         >,
         cancellation: CancellationView,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<Self::ActiveBehavior, NativeAttemptActivationFailure>,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> NativeAttemptActivationFuture<'a> {
         Box::pin(async move {
-            let activation = inputs.begin_activation().map_err(|error| {
+            if activation_identity.execution() != inputs.execution_id() {
+                return Err(projection_message(
+                    "original activation differs from its retained manifest execution",
+                ));
+            }
+            let transaction = inputs.begin_activation().map_err(|error| {
                 NativeAttemptActivationFailure::new(attempt_runtime_failure(
                     QueryFailureReason::PreparationProtocol,
                     error.to_string(),
                 ))
             })?;
-            let attempt = {
-                let (prepared, manifest) = activation.into_prepared_and_manifest();
+            assert!(
+                self.pending_projected.is_none(),
+                "one original pending Native projection"
+            );
+            self.pending_projected = Some({
+                let (prepared, manifest) = transaction.into_prepared_and_manifest();
                 self.projection
-                    .project(prepared, manifest, replacement_admissions, cancellation)
+                    .project(
+                        activation_identity,
+                        prepared,
+                        manifest,
+                        replacement_admissions,
+                        cancellation.clone(),
+                    )
                     .await?
-            };
-            Ok(FrontendTaskProtocolActiveBehavior::new(
-                attempt,
-                Arc::clone(&self.lifecycle_diagnostics),
-            ))
-        })
-    }
-
-    fn converge<'a>(
-        &'a mut self,
-        _inputs: &'a mut ManifestBoundNativeAttemptInputs,
-    ) -> NativeAttemptConvergenceFuture<'a> {
-        self.projection.converge()
-    }
-}
-
-/// Concrete active behavior for the manifest-only Frontend Task protocol.
-///
-/// C3 constructs this only after it has projected and validated the exact
-/// manifest's fragment plans, establish facts and attempt-local source owners.
-/// This type receives no compiler, topology reader, scheduling plan or backend
-/// ordinal map; its only execution authority is the already assembled round.
-pub(crate) struct FrontendTaskProtocolActiveBehavior {
-    attempt: DormantManifestHost,
-    registered: Option<InstalledAttemptHost>,
-    rows: Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
-    _prepared: Option<TaskExecutionPreparedQuery>,
-    _credential_storage:
-        Option<Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>>,
-    handoff: Option<AttemptHandoffProducer>,
-    _profile_observer:
-        Option<crate::task_execution::profile_diagnostics::ProfileDiagnosticObserver>,
-    lifecycle_diagnostics:
-        Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
-}
-
-impl std::fmt::Debug for FrontendTaskProtocolActiveBehavior {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FrontendTaskProtocolActiveBehavior")
-            .field("registered", &self.registered.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-impl FrontendTaskProtocolActiveBehavior {
-    pub(crate) fn new(
-        attempt: ProjectedManifestAttempt,
-        lifecycle_diagnostics: Arc<
-            crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
-        >,
-    ) -> Self {
-        let ProjectedManifestAttempt {
-            host,
-            rows,
-            _prepared: prepared,
-            _credential_storage: credential_storage,
-            handoff,
-            profile_observer,
-        } = attempt;
-        Self {
-            attempt: host,
-            registered: None,
-            rows,
-            _prepared: prepared,
-            _credential_storage: credential_storage,
-            handoff,
-            _profile_observer: profile_observer,
-            lifecycle_diagnostics,
-        }
-    }
-}
-
-impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
-    fn converge_unstarted<'a>(
-        &'a mut self,
-        _inputs: &'a mut ManifestBoundNativeAttemptInputs,
-    ) -> NativeAttemptConvergenceFuture<'a> {
-        Box::pin(async move {
-            if let Some(handoff) = self.handoff.as_mut() {
-                handoff.retire_unclaimed();
-            }
-            self.attempt.converge_unstarted().await
-        })
-    }
-
-    fn take_rows_runtime(&mut self) -> Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)> {
-        self.rows.take()
-    }
-
-    fn run<'a>(
-        &'a mut self,
-        _inputs: &'a mut ManifestBoundNativeAttemptInputs,
-        drive: &'a NativeAttemptDrive,
-        cancellation: CancellationView,
-    ) -> NativeAttemptRunFuture<'a> {
-        Box::pin(async move {
-            if let Some(handoff) = self.handoff.as_mut()
-                && let Err(error) = handoff.bind(drive)
-            {
-                return NativeAttemptTerminal::Failed(handoff_failure(error));
-            }
-            if self.registered.is_none() {
-                match self.attempt.install(drive) {
-                    Ok(original) => self.registered = Some(original),
-                    Err(error) => return NativeAttemptTerminal::Failed(error),
-                }
-            }
-            self.registered
+            });
+            let _installed = self
+                .pending_projected
                 .as_mut()
                 .unwrap()
-                .bridge
-                .run(cancellation)
-                .await
+                .install_original_source(inputs, &cancellation)
+                .await?;
+            let attempt = self.pending_projected.take().unwrap();
+            Ok(match attempt.rows {
+                Some(binding) => ActivatedNativeAttempt::relayed_rows(activation_identity, binding),
+                None => ActivatedNativeAttempt::completion(activation_identity),
+            })
         })
     }
 
     fn converge<'a>(
         &'a mut self,
-        inputs: &'a mut ManifestBoundNativeAttemptInputs,
-        request: NativeActiveConvergenceRequest,
-    ) -> NativeActiveAttemptConvergenceFuture<'a> {
-        let execution_id = inputs.execution_id();
-        // The original logical actor accepted this exact attempt's failure.
-        // Dropping the borrowed run cannot erase it or select another cause.
-        let accepted_failure = request.accepted_failure().cloned();
+        _inputs: &'a mut ManifestBoundNativeAttemptInputs,
+    ) -> NativeAttemptConvergenceFuture<'a> {
         Box::pin(async move {
-            if let Some(handoff) = self.handoff.as_mut() {
-                handoff.retire_unclaimed();
+            if let Some(original) = self.pending_projected.as_mut() {
+                original.host.converge_unstarted().await?;
+                drop(self.pending_projected.take());
+                return Ok(());
             }
-            let Some(original) = self.registered.as_mut() else {
-                return self.attempt.never_established().await;
-            };
-            let retain = self.attempt.retain_diagnostics;
-            if retain && let Some(ready) = request.computation_ready() {
-                original.register_cut(ready).await?;
-            }
-            let convergence = original.bridge.converge(request, retain, || Ok(())).await?;
-            if self.lifecycle_diagnostics.is_enabled()
-                && let Some(runtime_filter) = original.take_lifecycle_rollup()
-            {
-                self.lifecycle_diagnostics.publish(
-                    crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
-                        execution_id,
-                        primary_error: None,
-                        failure: accepted_failure,
-                        worker_participations_converged: matches!(&convergence, NativeActiveConvergenceClosure::Evidence(_)),
-                        runtime_filter,
-                    },
-                );
-            }
-            Ok(convergence)
+            self.projection.converge().await
         })
     }
 }
@@ -2800,8 +2864,6 @@ where
     )>,
     dormant_inputs: Option<I>,
     manifest_inputs: Option<I::Manifest>,
-    pending_active_behavior:
-        Option<<B as FrontendDormantAttemptBehavior<I::Manifest>>::ActiveBehavior>,
     behavior: B,
 }
 
@@ -2820,21 +2882,6 @@ where
     }
 }
 
-type NativeActiveAttemptActivationFuture<'a, Manifest, Behavior> = std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = Result<
-                    (
-                        SnapshotBoundActiveAttemptOwner<Manifest, Behavior>,
-                        Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
-                    ),
-                    NativeAttemptActivationFailure,
-                >,
-            > + Send
-            + 'a,
-    >,
->;
-
 impl<B, I> SnapshotBoundDormantAttemptOwner<B, I>
 where
     I: RetainedAttemptInputs,
@@ -2846,7 +2893,6 @@ where
             test_placement: None,
             dormant_inputs: Some(inputs),
             manifest_inputs: None,
-            pending_active_behavior: None,
             behavior,
         }
     }
@@ -2858,7 +2904,6 @@ where
             test_placement: None,
             dormant_inputs: None,
             manifest_inputs: Some(inputs),
-            pending_active_behavior: None,
             behavior,
         }
     }
@@ -2897,75 +2942,22 @@ where
         Ok(())
     }
 
-    fn activate_fixed_retained<'a>(
-        &'a mut self,
-        replacement_admissions: Option<
-            Box<[novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence]>,
-        >,
-        cancellation: CancellationView,
-    ) -> NativeActiveAttemptActivationFuture<'a, I::Manifest, B::ActiveBehavior>
-    where
-        B: FrontendDormantAttemptBehavior<I::Manifest>,
-    {
-        if self.pending_active_behavior.is_some() {
-            return Box::pin(async {
-                Err(projection_message(
-                    "the original active behavior still awaits source disposition",
-                ))
-            });
-        }
-        let behavior = &mut self.behavior;
-        let manifest_inputs = &mut self.manifest_inputs;
-        let pending_active = &mut self.pending_active_behavior;
-        Box::pin(async move {
-            *pending_active = Some(
-                behavior
-                    .activate(
-                        manifest_inputs
-                            .as_mut()
-                            .expect("activation retains its manifest inputs"),
-                        replacement_admissions,
-                        cancellation,
-                    )
-                    .await?,
-            );
-            // This trait extraction may unwind. Both the original manifest
-            // and the returned active behavior remain in their owner fields.
-            let rows = pending_active.as_mut().unwrap().take_rows_runtime();
-            let inputs = manifest_inputs
-                .take()
-                .expect("successful activation transfers the retained manifest once");
-            let active_behavior = pending_active.take().unwrap();
-            Ok((
-                SnapshotBoundActiveAttemptOwner {
-                    inputs,
-                    behavior: active_behavior,
-                },
-                rows,
-            ))
-        })
-    }
-
     fn activate_retained<'a>(
         &'a mut self,
+        activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         replacement_admissions: Option<
             Box<[novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence]>,
         >,
         cancellation: CancellationView,
-    ) -> NativeAttemptActivationFuture<'a>
-    where
-        B: FrontendDormantAttemptBehavior<I::Manifest>,
-    {
-        let activation = self.activate_fixed_retained(replacement_admissions, cancellation);
-        Box::pin(async move {
-            let (owner, rows) = activation.await?;
-            Ok(match rows {
-                Some((binding, statuses)) => {
-                    ActivatedNativeAttempt::relayed_rows(owner, binding, statuses)
-                }
-                None => ActivatedNativeAttempt::completion(owner),
-            })
-        })
+    ) -> NativeAttemptActivationFuture<'a> {
+        self.behavior.activate(
+            activation_identity,
+            self.manifest_inputs
+                .as_mut()
+                .expect("activation retains its original manifest inputs"),
+            replacement_admissions,
+            cancellation,
+        )
     }
 
     fn converge_retained<'a>(
@@ -2980,59 +2972,11 @@ where
         // retained health clone through several async return frames.
         drop(cancellation);
         Box::pin(async move {
-            if let Some(active) = self.pending_active_behavior.as_mut() {
-                let inputs = self
-                    .manifest_inputs
-                    .as_mut()
-                    .expect("a stable returned active retains its original manifest");
-                active.converge_unstarted(inputs).await?;
-                drop(self.pending_active_behavior.take());
-            }
             match self.manifest_inputs.as_mut() {
                 Some(inputs) => self.behavior.converge(inputs).await,
                 None => Ok(()),
             }
         })
-    }
-}
-
-struct SnapshotBoundActiveAttemptOwner<M, B> {
-    inputs: M,
-    behavior: B,
-}
-
-impl<M, B> std::fmt::Debug for SnapshotBoundActiveAttemptOwner<M, B>
-where
-    M: std::fmt::Debug,
-    B: std::fmt::Debug,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SnapshotBoundActiveAttemptOwner")
-            .field("inputs", &self.inputs)
-            .field("behavior", &self.behavior)
-            .finish()
-    }
-}
-
-impl<M, B> ActiveNativeAttemptOwner for SnapshotBoundActiveAttemptOwner<M, B>
-where
-    M: std::fmt::Debug + Send + 'static,
-    B: FrontendActiveAttemptBehavior<M>,
-{
-    fn run<'a>(
-        &'a mut self,
-        drive: &'a NativeAttemptDrive,
-        cancellation: CancellationView,
-    ) -> NativeAttemptRunFuture<'a> {
-        self.behavior.run(&mut self.inputs, drive, cancellation)
-    }
-
-    fn converge<'a>(
-        &'a mut self,
-        request: NativeActiveConvergenceRequest,
-    ) -> NativeActiveAttemptConvergenceFuture<'a> {
-        self.behavior.converge(&mut self.inputs, request)
     }
 }
 
@@ -3074,16 +3018,24 @@ where
 
     fn activate<'a>(
         &'a mut self,
+        activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
         schedule: &'a AttemptSchedule,
         replacement_admissions: Option<
             Box<[novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence]>,
         >,
         cancellation: CancellationView,
     ) -> NativeAttemptActivationFuture<'a> {
+        if activation_identity.execution() != schedule.execution() {
+            return Box::pin(async {
+                Err(projection_message(
+                    "original activation differs from its exact schedule execution",
+                ))
+            });
+        }
         if let Err(error) = self.bind_manifest(schedule) {
             return Box::pin(async move { Err(error) });
         }
-        self.activate_retained(replacement_admissions, cancellation)
+        self.activate_retained(activation_identity, replacement_admissions, cancellation)
     }
 
     fn converge<'a>(
@@ -3410,6 +3362,17 @@ fn attempt_runtime_failure(
 
 #[cfg(test)]
 mod tests {
+    fn unit_activation_identity() -> novarocks_coordination_contract::AttemptActivationIdentity {
+        novarocks_coordination_contract::AttemptActivationIdentity::from_parts(
+            91,
+            novarocks_types::QueryExecutionId::new(
+                novarocks_types::QueryId::new(0x7788, 0x9900),
+                novarocks_types::AttemptId::new(3).unwrap(),
+            )
+            .unwrap(),
+            73,
+        )
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -3417,12 +3380,10 @@ mod tests {
     use futures::FutureExt;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_query_application::api::{
-        ActiveNativeAttemptOwner, CancellationView, NativeActiveAttemptConvergenceFuture,
-        NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
-        NativeAttemptActivationFailure, NativeAttemptConvergence, NativeAttemptConvergenceFuture,
-        NativeAttemptPreparationError, NativeAttemptRunFuture, NativeAttemptTerminal,
+        CancellationView, NativeAttemptActivationFailure, NativeAttemptActivationFuture,
+        NativeAttemptConvergenceFuture, NativeAttemptPreparationError,
     };
-    use novarocks_query_application::coordination::{AttemptSchedule, NativeAttemptDrive};
+    use novarocks_query_application::coordination::AttemptSchedule;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
@@ -3432,10 +3393,9 @@ mod tests {
     };
 
     use super::{
-        AttemptFailureClass, FrontendActiveAttemptBehavior, FrontendDormantAttemptBehavior,
-        QueryExecutionErrorKind, RetainedAttemptInputs, SnapshotBoundDormantAttemptOwner,
-        attempt_runtime_failure, failed_participation_allows_successor,
-        wait_for_failed_participation_isolation,
+        AttemptFailureClass, FrontendDormantAttemptBehavior, QueryExecutionErrorKind,
+        RetainedAttemptInputs, SnapshotBoundDormantAttemptOwner, attempt_runtime_failure,
+        failed_participation_allows_successor, wait_for_failed_participation_isolation,
     };
     use novarocks_execution::task_execution::AdmissionEpochCapability;
     use novarocks_execution_contract::BackendProcessDescriptor;
@@ -3914,39 +3874,6 @@ mod tests {
         replacement_backends: Vec<BackendProcessId>,
     }
 
-    #[derive(Debug)]
-    struct NeverActiveBehavior;
-
-    impl<M: std::fmt::Debug + Send + 'static> FrontendActiveAttemptBehavior<M> for NeverActiveBehavior {
-        fn converge_unstarted<'a>(
-            &'a mut self,
-            _: &'a mut M,
-        ) -> NativeAttemptConvergenceFuture<'a> {
-            Box::pin(async { panic!("the adversarial eligibility fixture never activates") })
-        }
-
-        fn run<'a>(
-            &'a mut self,
-            _inputs: &'a mut M,
-            _drive: &'a NativeAttemptDrive,
-            _cancellation: CancellationView,
-        ) -> NativeAttemptRunFuture<'a> {
-            Box::pin(async { panic!("adversarial eligibility test must not run") })
-        }
-
-        fn converge<'a>(
-            &'a mut self,
-            _inputs: &'a mut M,
-            _request: NativeActiveConvergenceRequest,
-        ) -> NativeActiveAttemptConvergenceFuture<'a> {
-            Box::pin(async {
-                Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
-                ))
-            })
-        }
-    }
-
     impl<M: std::fmt::Debug + Send + 'static> FrontendDormantAttemptBehavior<M>
         for AdversarialBehavior
     {
@@ -3958,21 +3885,13 @@ mod tests {
             panic!("the adversarial eligibility fixture never qualifies")
         }
 
-        type ActiveBehavior = NeverActiveBehavior;
-
         fn activate<'a>(
             &'a mut self,
+            _activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
             _inputs: &'a mut M,
             _replacement_admissions: Option<Box<[novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: CancellationView,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<Self::ActiveBehavior, NativeAttemptActivationFailure>,
-                    > + Send
-                    + 'a,
-            >,
-        > {
+        ) -> NativeAttemptActivationFuture<'a> {
             Box::pin(async { panic!("adversarial eligibility test must not activate") })
         }
 
@@ -4039,71 +3958,8 @@ mod tests {
     struct LifecycleBehavior {
         mode: ActivationMode,
         convergence_observed: Arc<AtomicBool>,
-    }
-
-    #[derive(Debug)]
-    struct TestActiveBehavior {
-        identity_address: usize,
-        run_observed: Arc<AtomicBool>,
-        convergence_observed: Arc<AtomicBool>,
-    }
-
-    impl TestActiveBehavior {
-        fn observe_run_inputs(&self, inputs: &mut TestManifest) {
-            assert_eq!(inputs.marker, 73);
-            assert_eq!(
-                inputs.identity.as_ref() as *const u8 as usize,
-                self.identity_address
-            );
-            self.run_observed.store(true, Ordering::SeqCst);
-        }
-    }
-
-    impl FrontendActiveAttemptBehavior<TestManifest> for TestActiveBehavior {
-        fn converge_unstarted<'a>(
-            &'a mut self,
-            inputs: &'a mut TestManifest,
-        ) -> NativeAttemptConvergenceFuture<'a> {
-            assert_eq!(inputs.marker, 73);
-            assert_eq!(
-                inputs.identity.as_ref() as *const u8 as usize,
-                self.identity_address
-            );
-            let observed = Arc::clone(&self.convergence_observed);
-            Box::pin(async move {
-                observed.store(true, Ordering::SeqCst);
-                Ok(())
-            })
-        }
-
-        fn run<'a>(
-            &'a mut self,
-            inputs: &'a mut TestManifest,
-            _drive: &'a NativeAttemptDrive,
-            _cancellation: CancellationView,
-        ) -> NativeAttemptRunFuture<'a> {
-            self.observe_run_inputs(inputs);
-            Box::pin(async { NativeAttemptTerminal::Completed })
-        }
-
-        fn converge<'a>(
-            &'a mut self,
-            inputs: &'a mut TestManifest,
-            _request: NativeActiveConvergenceRequest,
-        ) -> NativeActiveAttemptConvergenceFuture<'a> {
-            assert_eq!(inputs.marker, 73);
-            assert_eq!(
-                inputs.identity.as_ref() as *const u8 as usize,
-                self.identity_address
-            );
-            let observed = Arc::clone(&self.convergence_observed);
-            Box::pin(async move {
-                observed.store(true, Ordering::SeqCst);
-                Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
-                ))
-            })
-        }
+        observed_manifest: Option<usize>,
+        observed_activation: Option<novarocks_coordination_contract::AttemptActivationIdentity>,
     }
 
     impl FrontendDormantAttemptBehavior<TestManifest> for LifecycleBehavior {
@@ -4115,22 +3971,15 @@ mod tests {
             // This lifecycle fixture owns no external dependency.
             std::task::Poll::Ready(Ok(()))
         }
-        type ActiveBehavior = TestActiveBehavior;
-
         fn activate<'a>(
             &'a mut self,
+            activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
             inputs: &'a mut TestManifest,
             _replacement_admissions: Option<Box<[novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: CancellationView,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<Self::ActiveBehavior, NativeAttemptActivationFailure>,
-                    > + Send
-                    + 'a,
-            >,
-        > {
+        ) -> NativeAttemptActivationFuture<'a> {
             Box::pin(async move {
+                assert_eq!(activation_identity, unit_activation_identity());
                 assert_eq!(inputs.marker, 73);
                 match self.mode {
                     ActivationMode::Pending => std::future::pending().await,
@@ -4141,11 +3990,14 @@ mod tests {
                         ),
                     )),
                     ActivationMode::Panic => panic!("activation poll panic"),
-                    ActivationMode::Success => Ok(TestActiveBehavior {
-                        identity_address: inputs.identity.as_ref() as *const u8 as usize,
-                        run_observed: Arc::new(AtomicBool::new(false)),
-                        convergence_observed: Arc::clone(&self.convergence_observed),
-                    }),
+                    ActivationMode::Success => {
+                        self.observed_manifest =
+                            Some(inputs.identity.as_ref() as *const u8 as usize);
+                        self.observed_activation = Some(activation_identity);
+                        Ok(super::ActivatedNativeAttempt::completion(
+                            activation_identity,
+                        ))
+                    }
                 }
             })
         }
@@ -4263,6 +4115,8 @@ mod tests {
                 LifecycleBehavior {
                     mode,
                     convergence_observed: Arc::clone(&convergence_observed),
+                    observed_manifest: None,
+                    observed_activation: None,
                 },
             ),
             convergence_observed,
@@ -4286,7 +4140,8 @@ mod tests {
     async fn cancelled_activation_future_retains_manifest_for_convergence() {
         let (_control, root, cancellation) = governed_cancellation();
         let (mut owner, convergence_observed) = lifecycle_owner(ActivationMode::Pending);
-        let mut activation = owner.activate_retained(None, cancellation.clone());
+        let mut activation =
+            owner.activate_retained(unit_activation_identity(), None, cancellation.clone());
         assert!(
             tokio::time::timeout(Duration::from_millis(1), &mut activation)
                 .await
@@ -4304,7 +4159,7 @@ mod tests {
         let (mut owner, convergence_observed) = lifecycle_owner(ActivationMode::Error);
         assert!(
             owner
-                .activate_retained(None, cancellation.clone())
+                .activate_retained(unit_activation_identity(), None, cancellation.clone())
                 .await
                 .is_err()
         );
@@ -4316,232 +4171,216 @@ mod tests {
     async fn activation_poll_panic_retains_manifest_for_convergence() {
         let (_control, _root, cancellation) = governed_cancellation();
         let (mut owner, convergence_observed) = lifecycle_owner(ActivationMode::Panic);
-        let outcome =
-            std::panic::AssertUnwindSafe(owner.activate_retained(None, cancellation.clone()))
-                .catch_unwind()
-                .await;
+        let outcome = std::panic::AssertUnwindSafe(owner.activate_retained(
+            unit_activation_identity(),
+            None,
+            cancellation.clone(),
+        ))
+        .catch_unwind()
+        .await;
         assert!(outcome.is_err());
 
         assert_retained_and_converges(&mut owner, &convergence_observed, cancellation).await;
     }
 
     #[tokio::test]
-    async fn successful_activation_transfers_one_manifest_to_the_fixed_active_owner() {
+    async fn successful_activation_borrows_one_original_manifest_and_returns_exact_passive_identity()
+     {
         let (_control, _root, cancellation) = governed_cancellation();
         let (mut dormant, convergence_observed) = lifecycle_owner(ActivationMode::Success);
         let identity_address =
             dormant.manifest_inputs.as_ref().unwrap().identity.as_ref() as *const u8 as usize;
-        let (mut active, rows) = dormant
-            .activate_fixed_retained(None, cancellation.clone())
+        let _activated = dormant
+            .activate_retained(unit_activation_identity(), None, cancellation.clone())
             .await
             .expect("activation succeeds");
 
-        assert!(dormant.manifest_inputs.is_none());
-        assert!(rows.is_none());
-        assert_eq!(active.inputs.marker, 73);
+        assert!(dormant.dormant_inputs.is_none());
+        assert_eq!(dormant.manifest_inputs.as_ref().unwrap().marker, 73);
         assert_eq!(
-            active.inputs.identity.as_ref() as *const u8 as usize,
-            identity_address
+            dormant.manifest_inputs.as_ref().unwrap().identity.as_ref() as *const u8 as usize,
+            identity_address,
         );
-        active.behavior.observe_run_inputs(&mut active.inputs);
-        assert!(active.behavior.run_observed.load(Ordering::SeqCst));
-        ActiveNativeAttemptOwner::converge(
-            &mut active,
-            NativeActiveConvergenceRequest::new(
-                cancellation,
-                Instant::now() + Duration::from_secs(5),
-            ),
-        )
-        .await
-        .expect("the original active fixture joins successfully");
-        assert!(convergence_observed.load(Ordering::SeqCst));
+        assert_eq!(dormant.behavior.observed_manifest, Some(identity_address));
+        assert_eq!(
+            dormant.behavior.observed_activation,
+            Some(unit_activation_identity())
+        );
+        // This generic borrowing fixture does not install an AP Source. Its
+        // passive return is no evidence that Native resources have exited.
+        assert!(!convergence_observed.load(Ordering::SeqCst));
+        assert_retained_and_converges(&mut dormant, &convergence_observed, cancellation).await;
     }
 
-    struct OriginalRowsExtractionPanic {
+    struct OriginalBindingCreationPanic {
         drops: Arc<AtomicU64>,
     }
-    impl Drop for OriginalRowsExtractionPanic {
+    impl Drop for OriginalBindingCreationPanic {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::SeqCst);
         }
     }
     #[derive(Debug)]
-    struct ExtractionPanicDormant {
+    struct BindingPanicDormant {
         close_gate: Arc<tokio::sync::Notify>,
-        active_closes: Arc<AtomicU64>,
-        active_drops: Arc<AtomicU64>,
+        close_attempts: Arc<AtomicU64>,
+        closes: Arc<AtomicU64>,
+        owner_drops: Arc<AtomicU64>,
         cause_drops: Arc<AtomicU64>,
-        extractions: Arc<AtomicU64>,
-        dormant_closes: Arc<AtomicU64>,
+        bindings: Arc<AtomicU64>,
+        observed_manifest: Option<usize>,
+        observed_activation: Option<novarocks_coordination_contract::AttemptActivationIdentity>,
     }
-    #[derive(Debug)]
-    struct ExtractionPanicActive {
-        close_gate: Arc<tokio::sync::Notify>,
-        active_closes: Arc<AtomicU64>,
-        active_drops: Arc<AtomicU64>,
-        cause_drops: Arc<AtomicU64>,
-        extractions: Arc<AtomicU64>,
-    }
-    impl Drop for ExtractionPanicActive {
+    impl Drop for BindingPanicDormant {
         fn drop(&mut self) {
-            self.active_drops.fetch_add(1, Ordering::SeqCst);
+            self.owner_drops.fetch_add(1, Ordering::SeqCst);
         }
     }
-    impl FrontendActiveAttemptBehavior<TestManifest> for ExtractionPanicActive {
-        fn converge_unstarted<'a>(
-            &'a mut self,
-            inputs: &'a mut TestManifest,
-        ) -> NativeAttemptConvergenceFuture<'a> {
-            assert_eq!(inputs.marker, 73);
-            let gate = Arc::clone(&self.close_gate);
-            let closes = Arc::clone(&self.active_closes);
-            Box::pin(async move {
-                gate.notified().await;
-                closes.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            })
-        }
-
-        fn take_rows_runtime(
-            &mut self,
-        ) -> Option<(
-            super::FrontendRootRowsRuntime,
-            super::AcceptedRootStatusSource,
-        )> {
-            self.extractions.fetch_add(1, Ordering::SeqCst);
-            std::panic::panic_any(OriginalRowsExtractionPanic {
-                drops: Arc::clone(&self.cause_drops),
-            });
-        }
-        fn run<'a>(
-            &'a mut self,
-            _inputs: &'a mut TestManifest,
-            _drive: &'a NativeAttemptDrive,
-            _cancellation: CancellationView,
-        ) -> NativeAttemptRunFuture<'a> {
-            Box::pin(async { panic!("the extraction-failure fixture must not dispatch") })
-        }
-        fn converge<'a>(
-            &'a mut self,
-            _inputs: &'a mut TestManifest,
-            _request: NativeActiveConvergenceRequest,
-        ) -> NativeActiveAttemptConvergenceFuture<'a> {
-            Box::pin(async { panic!("no active close receipt is invented by this fixture") })
-        }
-    }
-    impl FrontendDormantAttemptBehavior<TestManifest> for ExtractionPanicDormant {
+    impl FrontendDormantAttemptBehavior<TestManifest> for BindingPanicDormant {
         fn poll_bind_qualification(
             &mut self,
             _inputs: &mut TestManifest,
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>> {
-            // This lifecycle fixture owns no external dependency.
+            // This generic retention fixture has no external dependency.
             std::task::Poll::Ready(Ok(()))
         }
-        type ActiveBehavior = ExtractionPanicActive;
         fn activate<'a>(
             &'a mut self,
+            activation_identity: novarocks_coordination_contract::AttemptActivationIdentity,
             inputs: &'a mut TestManifest,
             _admissions: Option<Box<[novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: CancellationView,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<Self::ActiveBehavior, NativeAttemptActivationFailure>,
-                    > + Send
-                    + 'a,
-            >,
-        > {
+        ) -> NativeAttemptActivationFuture<'a> {
             Box::pin(async move {
+                assert_eq!(activation_identity, unit_activation_identity());
                 assert_eq!(inputs.marker, 73);
-                Ok(ExtractionPanicActive {
-                    close_gate: Arc::clone(&self.close_gate),
-                    active_closes: Arc::clone(&self.active_closes),
-                    active_drops: Arc::clone(&self.active_drops),
-                    cause_drops: Arc::clone(&self.cause_drops),
-                    extractions: Arc::clone(&self.extractions),
-                })
+                self.observed_manifest = Some(inputs.identity.as_ref() as *const u8 as usize);
+                self.observed_activation = Some(activation_identity);
+                self.bindings.fetch_add(1, Ordering::SeqCst);
+                // The original binding operation fails BEFORE an activation
+                // result exists. No returned rows or active owner is invented.
+                std::panic::panic_any(OriginalBindingCreationPanic {
+                    drops: Arc::clone(&self.cause_drops),
+                });
             })
         }
         fn converge<'a>(
             &'a mut self,
-            _inputs: &'a mut TestManifest,
+            inputs: &'a mut TestManifest,
         ) -> NativeAttemptConvergenceFuture<'a> {
-            self.dormant_closes.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
+            assert_eq!(inputs.marker, 73);
+            assert_eq!(
+                Some(inputs.identity.as_ref() as *const u8 as usize),
+                self.observed_manifest,
+            );
+            let gate = Arc::clone(&self.close_gate);
+            let attempts = Arc::clone(&self.close_attempts);
+            let closes = Arc::clone(&self.closes);
+            Box::pin(async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                gate.notified().await;
+                closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
         }
     }
     #[tokio::test]
-    async fn real_rows_extraction_panic_keeps_returned_active_and_manifest_in_original_owner() {
+    async fn pre_return_binding_panic_retains_original_manifest_and_cause_across_cancelled_cleanup_wait()
+     {
         let (_control, root, cancellation) = governed_cancellation();
-        let active_drops = Arc::new(AtomicU64::new(0));
+        let owner_drops = Arc::new(AtomicU64::new(0));
         let cause_drops = Arc::new(AtomicU64::new(0));
-        let extractions = Arc::new(AtomicU64::new(0));
-        let dormant_closes = Arc::new(AtomicU64::new(0));
+        let bindings = Arc::new(AtomicU64::new(0));
+        let closes = Arc::new(AtomicU64::new(0));
+        let close_attempts = Arc::new(AtomicU64::new(0));
         let close_gate = Arc::new(tokio::sync::Notify::new());
-        let active_closes = Arc::new(AtomicU64::new(0));
         let mut owner = SnapshotBoundDormantAttemptOwner::<_, CapturedInputs>::from_manifest(
             TestManifest {
                 eligible_backends: vec![],
                 marker: 73,
                 identity: Box::new(91),
             },
-            ExtractionPanicDormant {
+            BindingPanicDormant {
                 close_gate: Arc::clone(&close_gate),
-                active_closes: Arc::clone(&active_closes),
-                active_drops: Arc::clone(&active_drops),
+                close_attempts: Arc::clone(&close_attempts),
+                closes: Arc::clone(&closes),
+                owner_drops: Arc::clone(&owner_drops),
                 cause_drops: Arc::clone(&cause_drops),
-                extractions: Arc::clone(&extractions),
-                dormant_closes: Arc::clone(&dormant_closes),
+                bindings: Arc::clone(&bindings),
+                observed_manifest: None,
+                observed_activation: None,
             },
         );
         let original_identity =
             owner.manifest_inputs.as_ref().unwrap().identity.as_ref() as *const u8 as usize;
-        let outcome =
-            std::panic::AssertUnwindSafe(owner.activate_fixed_retained(None, cancellation.clone()))
-                .catch_unwind()
-                .await;
+        let outcome = std::panic::AssertUnwindSafe(owner.activate_retained(
+            unit_activation_identity(),
+            None,
+            cancellation.clone(),
+        ))
+        .catch_unwind()
+        .await;
         let original_cause = match outcome {
-            Err(original) => Some(original),
+            Err(original) => original,
             Ok(result) => {
                 drop(result);
-                None
+                panic!("the original binding must panic before returning an activation");
             }
         };
-        let exact_cause = original_cause
-            .as_ref()
-            .is_some_and(|cause| cause.is::<OriginalRowsExtractionPanic>());
-        let manifest_retained = owner.manifest_inputs.as_ref().is_some_and(|manifest| {
-            manifest.identity.as_ref() as *const u8 as usize == original_identity
-        });
-        let active_retained = owner.pending_active_behavior.is_some();
+        assert!(original_cause.is::<OriginalBindingCreationPanic>());
+        assert_eq!(owner.behavior.observed_manifest, Some(original_identity));
+        assert_eq!(
+            owner.behavior.observed_activation,
+            Some(unit_activation_identity())
+        );
+        assert_eq!(owner.manifest_inputs.as_ref().unwrap().marker, 73);
+        assert_eq!(
+            owner.manifest_inputs.as_ref().unwrap().identity.as_ref() as *const u8 as usize,
+            original_identity,
+        );
+        assert_eq!(bindings.load(Ordering::SeqCst), 1);
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+
+        // Dropping a borrowed wait cancels only that wait. It neither takes
+        // the original manifest nor drops/restarts its actual dormant owner.
         let mut close = owner.converge_retained(cancellation.clone());
-        let close_pending = futures::poll!(&mut close).is_pending();
+        assert!(futures::poll!(&mut close).is_pending());
         drop(close);
-        assert!(owner.pending_active_behavior.is_some());
-        assert_eq!(active_closes.load(Ordering::SeqCst), 0);
-        assert_eq!(active_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(close_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(owner.manifest_inputs.as_ref().unwrap().marker, 73);
+        assert_eq!(
+            owner.manifest_inputs.as_ref().unwrap().identity.as_ref() as *const u8 as usize,
+            original_identity,
+        );
+
+        // Recreate only the SAME owner's cleanup borrow. Notify stores the
+        // original gate permit; there is no second activation or close owner.
         close_gate.notify_one();
         owner.converge_retained(cancellation).await.unwrap();
-        assert!(owner.pending_active_behavior.is_none());
-        assert!(owner.manifest_inputs.is_some());
-        assert_eq!(active_closes.load(Ordering::SeqCst), 1);
-        let before = (
-            active_drops.load(Ordering::SeqCst),
-            cause_drops.load(Ordering::SeqCst),
+        assert_eq!(close_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(bindings.load(Ordering::SeqCst), 1);
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(owner.manifest_inputs.as_ref().unwrap().marker, 73);
+        assert_eq!(
+            owner.manifest_inputs.as_ref().unwrap().identity.as_ref() as *const u8 as usize,
+            original_identity,
         );
-        // This explicit fixture-owner disposition is not a normal Native close
-        // receipt, WorkerStopped evidence or a profile qualification.
+        // Explicit disposition of this finite generic fixture. This is not an
+        // installed AP/Native exit receipt, M5, or a recovered activation result.
         drop(owner);
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
         drop(original_cause);
+        assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
         root.owner.complete();
         root.business.release();
-        assert!(exact_cause && manifest_retained && active_retained && close_pending);
-        assert_eq!(before, (1, 0));
-        assert_eq!(extractions.load(Ordering::SeqCst), 1);
-        assert_eq!(dormant_closes.load(Ordering::SeqCst), 1);
-        assert_eq!(active_drops.load(Ordering::SeqCst), 1);
-        assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -4559,10 +4398,13 @@ mod production_failure_projection_tests {
         );
         let fact = original.failure_fact();
         let projected = write_production_failure(original);
-        let input = projected.failure().input();
+        let original_failure = projected
+            .failure()
+            .expect("original production domain refusal");
+        let input = original_failure.input();
         assert_eq!(input.fact(), fact);
         assert_eq!(
-            projected.failure().class(),
+            original_failure.class(),
             AttemptFailureClass::ResourceGovernance
         );
         assert_ne!(

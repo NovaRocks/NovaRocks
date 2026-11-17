@@ -17,7 +17,6 @@
 
 use super::{
     adapter::tests::start,
-    custody::tests::WithdrawalInbox,
     observations::StreamKey,
     publication::OriginalHostFailure,
     subscriptions::{
@@ -25,13 +24,9 @@ use super::{
         SubscriptionFailureRecord,
     },
 };
-use crate::{
-    native::task_transport::wire::CoveredEventValidationError,
-    query_execution::native_execution_adapter::LogicalAbortRouter,
-    task_execution::bridge::{
-        control::AttemptOwnerControls,
-        terminal::{TerminalOutbox, TerminalPublication},
-    },
+use crate::native::task_transport::wire::CoveredEventValidationError;
+use novarocks_attempt_protocol::port_output::{
+    AttemptTerminal, AttemptToLogical, AttemptToLogicalBody,
 };
 use novarocks_attempt_protocol::{
     AttemptCore, AttemptStep, Core, InputSelection,
@@ -47,127 +42,22 @@ use novarocks_attempt_protocol::{
     },
     start::{AttemptSources, AttemptStart},
 };
-use novarocks_control_runtime::transaction::RuntimeLedger;
-use novarocks_control_runtime_core::{
-    capacity::{ReservationResources, ResourceVector},
-    identity::Generation,
-    mailbox::InputClass,
-    scope::{WorkAdmission, WorkKind},
-};
 use novarocks_coordination_contract::{
     AttemptActionId, AttemptActivationIdentity, AttemptFailureClass, AttemptRequestToken,
-    AttemptTerminal, AttemptToLogical, AttemptToLogicalBody, ExecutionEffect, LogicalToAttemptBody,
-    MonotonicInstant,
+    ExecutionFailure, LogicalToAttempt, LogicalToAttemptBody, MonotonicInstant,
 };
 use novarocks_execution_contract::{
     SafeDetail, TaskFailure, TaskFailurePhase, TaskIdentity, TaskOutputFacts, TaskState,
     TaskStatus, TaskStatusVersion, TerminationDetail, failure::FailureProjection,
 };
-use novarocks_query_application::{
-    api::{NativeAttemptPreparationFailure, NativeAttemptTerminal},
-    coordination::{LogicalConclusion, LogicalExecutionActorConfig},
-    execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
-    test_support::LogicalExecutionTestHarness,
+use novarocks_query_application::execution_error::{
+    ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
 };
 use novarocks_types::{BackendProcessId, TaskId};
-use novarocks_workload_control::{
-    BusinessPermit, CancellationReason, CancellationView, ResourceConfig, Stage,
-    WorkCancellationRequester, WorkClass, WorkRequest, WorkScope, WorkloadConfig, WorkloadControl,
-};
-use std::{
-    num::{NonZeroU64, NonZeroUsize},
-    time::{Duration, Instant},
-};
+use std::num::NonZeroU64;
 
 fn id(value: u64) -> NonZeroU64 {
     NonZeroU64::new(value).unwrap()
-}
-
-struct QaAttempt {
-    logical: LogicalExecutionTestHarness,
-    scope: WorkScope,
-    business: BusinessPermit,
-    workload: WorkloadControl,
-    cancellation: CancellationView,
-    requester: WorkCancellationRequester,
-}
-
-impl QaAttempt {
-    async fn activate(start: &mut AttemptStart) -> Self {
-        let workload = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 12,
-                per_scope_bytes: 1 << 18,
-            },
-        )
-        .unwrap();
-        workload.mark_ready().unwrap();
-        let work = workload
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let scope = work.owner.scope();
-        let cancellation = scope.cancellation().unwrap();
-        let requester = work.owner.cancellation_requester();
-        let stage = scope.try_acquire(Stage::Execution).unwrap();
-        let execution = start.plan.graph.root.query_execution_id();
-        let participations: Vec<_> = start.plan.establish_material.keys().copied().collect();
-        let config = LogicalExecutionActorConfig::single_attempt_completion(
-            execution,
-            ExecutionEffect::None,
-            NonZeroUsize::new(8).unwrap(),
-            participations.clone(),
-            NonZeroUsize::MIN,
-            NonZeroUsize::MIN,
-            work.owner,
-            stage,
-        )
-        .unwrap()
-        .with_abort_participation_effect_port(LogicalAbortRouter::new(), NonZeroUsize::MIN);
-        let mut logical = LogicalExecutionTestHarness::install(
-            tokio::runtime::Handle::current(),
-            config,
-            execution,
-            participations,
-        )
-        .unwrap();
-        start.activation.identity = logical.activate_initial().await.unwrap();
-        let drive = logical.native_attempt_drive();
-        start.plan.authorization_limits = drive.authorization_limits();
-        drop(drive);
-        Self {
-            logical,
-            scope,
-            business: work.business,
-            workload,
-            cancellation,
-            requester,
-        }
-    }
-
-    async fn finish(self) {
-        let Self {
-            mut logical,
-            scope,
-            business,
-            workload,
-            cancellation,
-            requester,
-        } = self;
-        drop(requester);
-        drop(cancellation);
-        business.release();
-        logical
-            .finish_until(Instant::now() + Duration::from_secs(2))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
-            .await
-            .unwrap();
-        workload.close_admission();
-        assert!(workload.shutdown().is_ok());
-    }
 }
 
 struct Units(usize);
@@ -304,35 +194,54 @@ fn status_event(status: TaskStatus) -> ObservationEvent {
     }
 }
 
-async fn original_projection(
-    outbox: &TerminalOutbox,
+// Pure metadata projection only: this function does not fill an LP position,
+// complete an AP action, close a Scope or certify any original physical exit.
+fn original_projection(
     port: TerminalPort,
     retained: Option<&SubscriptionFailureRecord>,
-) -> NativeAttemptPreparationFailure {
-    let mut publication = TerminalPublication::new(port);
-    if let Some(record) = retained {
-        let reference = publication.host_reference().unwrap();
-        assert_eq!(reference, record.reference());
-        let original = record.take(reference).unwrap();
-        publication.attach_host_failure(reference, OriginalHostFailure::Subscription(original));
-        assert!(record.take(reference).is_none());
-    } else {
-        assert!(publication.host_reference().is_none());
-    }
-    assert!(outbox.publish(Box::new(publication)).is_ok());
-    let NativeAttemptTerminal::Failed(original) =
-        tokio::time::timeout(Duration::from_secs(2), outbox.terminal())
-            .await
-            .unwrap()
-            .unwrap()
+) -> (ExecutionFailure, Option<OriginalHostFailure>) {
+    let mut resolutions = 0;
+    let projected = novarocks_attempt_protocol::port_projection::project_attempt_message(
+        &port,
+        &mut |reference| {
+            let record = retained.expect("only the selected original raw host record resolves");
+            assert_eq!(reference, record.reference());
+            resolutions += 1;
+            record.project(reference)
+        },
+        &mut |_, _| None,
+        &mut |_, _, _| None,
+    )
+    .unwrap();
+    assert_eq!(projected.activation, port.activation);
+    assert_eq!(projected.action, port.action);
+    let novarocks_coordination_contract::logical_port::AttemptToLogicalBody::AttemptTerminal(
+        novarocks_coordination_contract::logical_port::AttemptTerminal::Failed(failure),
+    ) = projected.body
     else {
-        panic!("the original Native terminal is a failure");
+        panic!("the original AP terminal projects to a complete passive failure");
     };
-    assert_eq!(
-        outbox.terminal().await.unwrap(),
-        NativeAttemptTerminal::Failed(original.clone())
-    );
-    original
+    let raw = if let Some(record) = retained {
+        assert_eq!(
+            resolutions, 1,
+            "resolve the SAME original raw reference exactly once"
+        );
+        assert!(record.is_terminal_candidate());
+        let original = OriginalHostFailure::Subscription(record.take(record.reference()).unwrap());
+        assert_eq!(original.preparation_input(), *failure.input());
+        assert!(
+            record.take(record.reference()).is_none(),
+            "no second raw owner is minted"
+        );
+        Some(original)
+    } else {
+        assert_eq!(
+            resolutions, 0,
+            "non-host terminal projection cannot consume unrelated raw custody"
+        );
+        None
+    };
+    (failure, raw)
 }
 
 #[derive(Clone, Copy)]
@@ -347,14 +256,12 @@ enum CompetingObservation {
     },
 }
 
-async fn competing_observation(case: CompetingObservation) {
+fn competing_observation(case: CompetingObservation) {
     let mut start = start();
     start.plan.coordination.status_subscription_error_budget = 1;
     let root = start.plan.graph.root;
     let participation = *start.plan.establish_material.keys().next().unwrap();
-    let mut qa = QaAttempt::activate(&mut start).await;
     let activation = start.activation.identity;
-    let outbox = TerminalOutbox::new(activation);
     let cancel_while_receiving = matches!(
         case,
         CompetingObservation::UnknownCoveredTask {
@@ -470,7 +377,7 @@ async fn competing_observation(case: CompetingObservation) {
         assert_eq!(step.selection, InputSelection::Only(cut.sources.actor));
         assert!(step.effect.is_none() && step.round_result.is_none());
         assert!(cut.core.selected_task_failure_for_test().is_some());
-        stop_during_original_receiver_pass(&qa, activation, &mut cut);
+        stop_during_original_receiver_pass(activation, &mut cut);
         cut.budget = 128;
         cut.input(cut.sources.actor, AttemptInput::Timer, None)
     } else {
@@ -505,7 +412,7 @@ async fn competing_observation(case: CompetingObservation) {
         AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(actual)) if actual == &expected_terminal
     ));
     let retained = matches!(case, CompetingObservation::ProcessMismatch).then_some(record.as_ref());
-    let failure = original_projection(&outbox, terminal, retained).await;
+    let (failure, raw_original) = original_projection(terminal, retained);
     if task_wins {
         assert_eq!(failure.input(), &selected_input);
         assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
@@ -527,117 +434,69 @@ async fn competing_observation(case: CompetingObservation) {
         assert!(!record.is_terminal_candidate());
         assert!(record.take(record.reference()).is_some());
     }
-    if cancel_while_receiving {
-        qa.logical.abandon_running_attempt();
+    // Keep the actual raw object until the final exact passive assertions have
+    // completed. Dropping it here is not an executor/Work/Scope exit receipt.
+    if matches!(case, CompetingObservation::ProcessMismatch) {
+        assert!(raw_original.is_some());
     } else {
-        assert_eq!(
-            qa.logical
-                .fail_original_running_attempt(failure.error().clone())
-                .await
-                .unwrap(),
-            LogicalConclusion::Failed
-        );
-        assert_eq!(
-            qa.logical.actor_snapshot().await.unwrap().conclusion,
-            Some(LogicalConclusion::Failed)
-        );
+        assert!(raw_original.is_none());
     }
-    qa.finish().await;
+    drop(raw_original);
 }
 
-#[tokio::test]
-async fn original_task_failure_precedes_same_cut_ordinary_loss_in_both_orders() {
+#[test]
+fn original_task_failure_precedes_same_cut_ordinary_loss_in_both_orders() {
     for connection_loss in [false, true] {
         for observation_first in [false, true] {
             competing_observation(CompetingObservation::OrdinaryLoss {
                 connection_loss,
                 observation_first,
-            })
-            .await;
+            });
         }
     }
 }
 
-#[tokio::test]
-async fn original_subscription_identity_error_precedes_same_cut_task_failure() {
-    competing_observation(CompetingObservation::ProcessMismatch).await;
+#[test]
+fn original_subscription_identity_error_precedes_same_cut_task_failure() {
+    competing_observation(CompetingObservation::ProcessMismatch);
 }
 
-#[tokio::test]
-async fn later_bad_covered_frame_wins_without_erasing_the_accepted_task_failure() {
+#[test]
+fn later_bad_covered_frame_wins_without_erasing_the_accepted_task_failure() {
     competing_observation(CompetingObservation::UnknownCoveredTask {
         cancel_while_receiving: false,
-    })
-    .await;
+    });
 }
 
-#[tokio::test]
-async fn a_definitive_receiver_error_wins_with_cancellation_visible_in_the_same_pass() {
+#[test]
+fn a_definitive_receiver_error_wins_with_cancellation_visible_in_the_same_pass() {
     competing_observation(CompetingObservation::UnknownCoveredTask {
         cancel_while_receiving: true,
-    })
-    .await;
+    });
 }
 
 fn stop_during_original_receiver_pass(
-    qa: &QaAttempt,
     activation: AttemptActivationIdentity,
     cut: &mut ReceiverCut,
 ) {
-    let generation = Generation::new(1).unwrap();
-    let ledger = RuntimeLedger::new(ResourceVector::default());
-    let scope = ledger.open_scope_next(None, generation).unwrap();
-    let inbox = WithdrawalInbox::new(&scope);
-    let (mut work, mut payer) = scope
-        .reserve_next(
-            generation,
-            ReservationResources::work_only(),
-            WorkKind::Settlement,
-            WorkAdmission::External,
-        )
-        .unwrap()
-        .bind(WorkKind::Settlement)
-        .unwrap();
-    work.start().unwrap();
-    let actor = inbox.registration().actor();
-    assert_eq!(cut.sources.actor.0.get(), actor.get());
-    let runtime = inbox.runtime();
-    let control = || {
-        runtime
-            .reserve_admitted_input_for(inbox.registration(), actor, InputClass::Control, &work)
-            .unwrap()
-            .into_standing_input()
-            .unwrap()
+    use novarocks_logical_execution_protocol::cancel::{
+        LogicalCancellationReason, cancellation_decision,
     };
-    let mut controls = AttemptOwnerControls::new(activation, control(), control());
-
-    qa.requester.request(CancellationReason::Requested).unwrap();
-    let reason = qa
-        .cancellation
-        .reason()
-        .expect("original cancellation is visible");
-    assert_eq!(reason, CancellationReason::Requested);
-    let stop_id = controls.stop_for_cancellation(reason).unwrap().unwrap();
-    let (input, stop) = inbox.try_commit_owner_control().unwrap();
-    assert_eq!(input, stop_id);
-    assert!(matches!(&stop, AttemptInput::Port(port)
-        if port.activation == activation && matches!(port.body, LogicalToAttemptBody::Stop { .. })));
-    let stopped = cut.input(
-        cut.sources.actor,
-        stop,
-        Some(AttemptInputId(id(stop_id.get()))),
-    );
+    // The final LP is the sole cancellation consequence author. This narrow
+    // AP-core case supplies its canonical passive Stop directly; current-ticket
+    // carrier handoff and original WC first-winner observation are separate
+    // existing component contracts, not inferred from this projection.
+    let decision = cancellation_decision(LogicalCancellationReason::Requested);
+    let failure =
+        ExecutionFailure::from_input(decision.failure.execution_failure().unwrap().clone());
+    let stop = AttemptInput::Port(LogicalToAttempt {
+        activation,
+        body: LogicalToAttemptBody::Stop {
+            reason: decision.stop,
+            failure,
+        },
+    });
+    let stopped = cut.input(cut.sources.owner, stop, None);
     assert!(stopped.stop_producing && stopped.effect.is_none() && stopped.round_result.is_none());
     assert_eq!(stopped.selection, InputSelection::Only(cut.sources.actor));
-
-    runtime.retire_input(actor, stop_id).unwrap();
-    work.body_exited().unwrap();
-    work.captures_exited().unwrap();
-    controls.close_after_exit().unwrap();
-    payer.finish().unwrap();
-    scope.close_external().unwrap();
-    ledger.reap_scope_ready(scope.id(), 8).unwrap();
-    inbox.finish();
-    ledger.remove_scope(scope.id()).unwrap();
-    assert!(ledger.is_empty());
 }

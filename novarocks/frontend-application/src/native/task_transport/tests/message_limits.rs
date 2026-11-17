@@ -220,35 +220,6 @@ fn original_queue_bound_is_required_even_when_wire_length_alone_would_fit() {
     assert!(NativeRequestWindows::for_transport(understated).is_err());
 }
 
-#[test]
-fn small_operations_keep_grouping_at_the_target_without_losing_the_next_head() {
-    let backend = BackendProcessId::new_v7();
-    let intents: Vec<_> = (1..=3).map(|task| cancel_intent(task, backend)).collect();
-    let ids: Vec<_> = intents.iter().map(OperationIntent::operation_id).collect();
-    let transport = budget(
-        TransportMessageLimits::DEFAULT,
-        2 * intents[0].queued_bytes(),
-    );
-    let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
-    for intent in intents {
-        dispatcher
-            .enqueue(intent, MonotonicInstant::ORIGIN)
-            .unwrap();
-    }
-    let first = dispatcher.take_batch().unwrap();
-    assert_eq!(
-        first
-            .operations()
-            .iter()
-            .map(OperationIntent::operation_id)
-            .collect::<Vec<_>>(),
-        ids[..2]
-    );
-    let last = dispatcher.take_batch().unwrap();
-    assert_eq!(last.operations()[0].operation_id(), ids[2]);
-    assert!(dispatcher.take_batch().is_none());
-}
-
 pub(super) async fn close(fixture: SinkFixture) {
     let SinkFixture {
         mut loopback,
@@ -261,10 +232,6 @@ pub(super) async fn close(fixture: SinkFixture) {
     drop(acks);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     runtime.drain_original_apply_until(deadline).await.unwrap();
-    runtime
-        .drain_original_subscriptions_until(deadline)
-        .await
-        .unwrap();
     runtime.drain_native_outgoing_until(deadline).await.unwrap();
     drop(runtime);
     assert!(loopback.settle().await);
@@ -306,11 +273,7 @@ async fn a_create_above_the_old_grouping_target_reaches_the_production_decoder()
                     .unwrap(),
                 )),
             )]));
-        let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
-        dispatcher
-            .enqueue(intent, MonotonicInstant::ORIGIN)
-            .unwrap();
-        let batch = dispatcher.take_batch().unwrap();
+        let batch = released_batch(backend, vec![intent]);
         assert_eq!(batch.operations().len(), 1);
         submit_batch(&fixture, batch);
         let acknowledgements = settled(&fixture.acks, 1).await;
@@ -366,11 +329,7 @@ async fn exact_message_limit_with_larger_queued_carrier_fits_minimum_windows() {
                 .unwrap(),
             )),
         )]));
-    let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
-    dispatcher
-        .enqueue(intent, MonotonicInstant::ORIGIN)
-        .unwrap();
-    submit_batch(&fixture, dispatcher.take_batch().unwrap());
+    submit_batch(&fixture, released_batch(backend, vec![intent]));
     let acknowledgements = settled(&fixture.acks, 1).await;
     assert_eq!(
         acknowledgements[0].worker_outcome(),

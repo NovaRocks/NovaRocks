@@ -550,15 +550,12 @@ pub fn classify_channel_failure(error: ChannelFailureClass) -> OperationDispatch
         ChannelFailureClass::RetryableNetwork => OperationDispatchResult::TransportUnknown,
     }
 }
+#[cfg(test)]
 pub(super) fn classify_channel_error(error: &ChannelAcquisitionError) -> OperationDispatchResult {
     classify_channel_failure(match error {
         ChannelAcquisitionError::Fatal(_) => ChannelFailureClass::Fatal,
         ChannelAcquisitionError::RetryableNetwork(_) => ChannelFailureClass::RetryableNetwork,
     })
-}
-
-pub(super) const fn worker_result(outcome: OperationOutcome) -> OperationDispatchResult {
-    OperationDispatchResult::WorkerReceipt(WorkerReceiptOutcome::from_contract(outcome))
 }
 
 /// Whether a status stream rejection is fatal to the attempt.
@@ -586,6 +583,7 @@ pub enum EncodedMethodRequest {
 }
 
 impl EncodedMethodRequest {
+    #[cfg(test)]
     pub(super) fn encoded_len(&self) -> usize {
         match self {
             Self::Ordinary(value) => prost::Message::encoded_len(value),
@@ -608,6 +606,7 @@ impl EncodedMethodBatch {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn expires_at(&self, submitted_at: tokio::time::Instant) -> tokio::time::Instant {
         submitted_at + self.deadline
     }
@@ -715,17 +714,6 @@ pub enum CoveredEventValidationError {
     ProcessMismatch,
     QueryMismatch,
     Protocol(&'static str),
-}
-
-#[cfg(test)]
-impl CoveredEventValidationError {
-    pub(super) const fn subscription_state(self) -> SubscriptionState {
-        match self {
-            Self::ProcessMismatch => SubscriptionState::ProcessMismatch,
-            Self::QueryMismatch => SubscriptionState::QueryMismatch,
-            Self::Protocol(_) => SubscriptionState::Rejected,
-        }
-    }
 }
 
 impl fmt::Display for CoveredEventValidationError {

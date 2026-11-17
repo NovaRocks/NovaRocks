@@ -23,8 +23,7 @@ use super::{
     RootControlBinding, RootControlRef, StreamKey, backing, credits::ObservationCredits,
     read_progress::ReadProgressInput,
 };
-use crate::task_execution::bridge::root_control::RootControlRequests;
-use novarocks_attempt_protocol::{failure::AttemptFailure, input::ReadProgressSnapshot};
+use novarocks_attempt_protocol::input::ReadProgressSnapshot;
 use novarocks_coordination_contract::LogicalToAttempt;
 use novarocks_execution_contract::ParticipationRef;
 use std::{
@@ -49,35 +48,15 @@ pub(crate) trait ObservationMetadataAuthor: Send + Sync + 'static {
 /// a new request nor a second observation Source.
 pub(crate) trait RootControlProjection: Send + Sync + 'static {
     fn matches(&self, binding: &RootControlBinding) -> bool;
+    fn bind_ingress(
+        &self,
+        original: &super::OrderedObservationInput<crate::control_runtime::actor::FrontendActor>,
+    ) -> Result<(), ObservationError>;
     fn close_after_exit(&self) -> Result<(), ObservationError>;
     fn fence_for_close(&self) -> bool;
-    fn project(
-        &self,
-        reference: &RootControlRef,
-    ) -> Result<LogicalToAttempt<AttemptFailure>, ObservationError>;
+    fn project(&self, reference: &RootControlRef) -> Result<LogicalToAttempt, ObservationError>;
     fn validate_reference(&self, reference: &RootControlRef) -> Result<(), ObservationError>;
 }
-impl RootControlProjection for RootControlRequests {
-    fn matches(&self, binding: &RootControlBinding) -> bool {
-        self.matches(binding)
-    }
-    fn close_after_exit(&self) -> Result<(), ObservationError> {
-        self.close_after_exit()
-    }
-    fn fence_for_close(&self) -> bool {
-        self.fence_for_close()
-    }
-    fn project(
-        &self,
-        reference: &RootControlRef,
-    ) -> Result<LogicalToAttempt<AttemptFailure>, ObservationError> {
-        self.project(reference)
-    }
-    fn validate_reference(&self, reference: &RootControlRef) -> Result<(), ObservationError> {
-        self.validate_reference(reference)
-    }
-}
-
 pub(crate) struct BoundObservationSource {
     binding: RootControlBinding,
     requests: Arc<dyn RootControlProjection>,
@@ -234,7 +213,7 @@ impl ObservationSourcePool for BoundObservationSource {
     fn project_root_control(
         &self,
         reference: &RootControlRef,
-    ) -> Result<LogicalToAttempt<AttemptFailure>, ObservationError> {
+    ) -> Result<LogicalToAttempt, ObservationError> {
         self.requests.project(reference)
     }
 

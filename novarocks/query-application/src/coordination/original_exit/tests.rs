@@ -20,6 +20,120 @@ use crate::api::logical_runtime::LogicalExit;
 use novarocks_types::{QueryId, identity::AttemptId};
 
 #[test]
+fn abandoning_the_unique_supervision_observer_releases_its_original_waker_captures() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CapturedWake {
+        _original: Arc<OriginalLogicalExit>,
+        dropped: Arc<AtomicUsize>,
+        wakes: Arc<AtomicUsize>,
+    }
+    impl std::task::Wake for CapturedWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Drop for CapturedWake {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let source = OriginalLogicalExit::new();
+    let weak = Arc::downgrade(&source);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let mut observer = LogicalExecutionExitObserver::new(source.clone());
+    let wake = std::task::Waker::from(Arc::new(CapturedWake {
+        _original: source.clone(),
+        dropped: drops.clone(),
+        wakes: wakes.clone(),
+    }));
+    assert!(
+        observer
+            .poll_owner_failure(&mut Context::from_waker(&wake))
+            .is_none()
+    );
+    drop(wake);
+    drop(source);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(observer);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(wakes.load(Ordering::SeqCst), 0);
+    assert!(
+        weak.upgrade().is_none(),
+        "original Source is not held by a waker cycle"
+    );
+}
+
+#[test]
+fn isolated_failure_wake_is_independent_of_physical_exit_wait_and_read_only_weak_custody() {
+    use novarocks_execution_contract::failure::FailureProjection;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct WakeCount(AtomicUsize);
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let source = OriginalLogicalExit::new();
+    let mut original = LogicalExecutionExitObserver::new(source.clone());
+    let observation = original.owner_failure_observation().unwrap();
+    let failure_wake = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let exit_wake = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let fw = std::task::Waker::from(failure_wake.clone());
+    let ew = std::task::Waker::from(exit_wake.clone());
+    assert!(
+        original
+            .poll_owner_failure(&mut Context::from_waker(&fw))
+            .is_none()
+    );
+    assert!(
+        original
+            .poll_exit(&mut Context::from_waker(&ew))
+            .is_pending()
+    );
+    let error =
+        QueryExecutionError::new(QueryExecutionErrorKind::Failed, "same original owner cause");
+    assert!(source.retain_owner_failure_silent(error.clone()));
+    source.notify_owner_failure();
+    source.notify();
+    assert_eq!(failure_wake.0.load(Ordering::SeqCst), 1);
+    assert_eq!(exit_wake.0.load(Ordering::SeqCst), 1);
+    assert_eq!(observation.failure(), Ok(Some(error.clone())));
+    assert!(
+        !source.retain_owner_failure_silent(QueryExecutionError::new(
+            QueryExecutionErrorKind::Failed,
+            "later cause"
+        ))
+    );
+    assert_eq!(
+        original.poll_owner_failure(&mut Context::from_waker(&fw)),
+        Some(error.clone())
+    );
+    assert!(
+        original
+            .poll_exit(&mut Context::from_waker(&ew))
+            .is_pending(),
+        "typed failure is not actual exit"
+    );
+    assert!(!source.has_unhandled_failure());
+    drop(original);
+    assert_eq!(observation.failure(), Ok(Some(error)));
+    drop(source);
+    let missing = observation.failure().unwrap_err();
+    assert_eq!(
+        missing.execution_failure().unwrap().site(),
+        crate::execution_error::ExecutionFailureSite::Coordinator
+    );
+    assert_eq!(
+        missing.execution_failure().unwrap().fact(),
+        crate::execution_error::QueryFailureReason::ResultProtocol.failure_fact()
+    );
+}
+
+#[test]
 fn runtime_failure_retains_original_typed_cause_without_forging_join_error() {
     let source = OriginalLogicalExit::new();
     let association = OriginalAssociation {
@@ -28,12 +142,14 @@ fn runtime_failure_retains_original_typed_cause_without_forging_join_error() {
         generation: 1,
     };
     source.reserve_silent(association);
-    source.installed_silent(association);
+    source.runtime_installed_silent(association);
     assert!(!source.pending_actor());
     // This fixture reports the install-only role's actual exit separately.
     // Pending actor custody is a legacy role condition, not the Installed phase.
     source.role_ended_silent(false);
-    assert!(source.pending_actor());
+    assert!(!source.pending_actor());
+    assert_eq!(source.lock().phase, LogicalActorExitPhase::Installed);
+    assert!(source.lock().runtime.is_none());
     assert!(!source.has_failure());
     let error = QueryExecutionError::new(QueryExecutionErrorKind::Failed, "original runtime cause");
     source.runtime_joined_silent(association, LogicalExit::OwnerFailed(error.clone()));
@@ -42,7 +158,6 @@ fn runtime_failure_retains_original_typed_cause_without_forging_join_error() {
     };
     assert_eq!(view.actor_phase(), LogicalActorExitPhase::Joined);
     assert!(view.role_ended());
-    assert!(view.actor_result().is_none());
     assert_eq!(
         view.runtime_actor_result(),
         Some(&LogicalExit::OwnerFailed(error))
@@ -50,7 +165,7 @@ fn runtime_failure_retains_original_typed_cause_without_forging_join_error() {
     drop(view);
     assert!(!source.pending_actor());
     assert!(source.has_failure());
-    assert!(source.has_unhandled_failure());
+    assert!(!source.has_unhandled_failure());
 }
 
 #[test]
@@ -62,7 +177,7 @@ fn runtime_completion_is_distinct_from_role_and_native_actual_exit() {
         generation: 1,
     };
     source.reserve_silent(association);
-    source.installed_silent(association);
+    source.runtime_installed_silent(association);
     // Model the original pre-actor body still retained by its source.
     source.lock().native_body_exited = false;
     source.runtime_joined_silent(association, LogicalExit::Completed);
@@ -75,7 +190,7 @@ fn runtime_completion_is_distinct_from_role_and_native_actual_exit() {
 }
 
 #[test]
-fn owner_failure_is_original_health_without_an_actor_or_native_exit() {
+fn isolated_owner_failure_keeps_original_verdict_without_process_health_or_invented_exit() {
     let source = OriginalLogicalExit::new();
     let association = OriginalAssociation {
         registry: 3,
@@ -83,7 +198,7 @@ fn owner_failure_is_original_health_without_an_actor_or_native_exit() {
         generation: 1,
     };
     source.reserve_silent(association);
-    source.installed_silent(association);
+    source.runtime_installed_silent(association);
     let error = QueryExecutionError::new(
         QueryExecutionErrorKind::Failed,
         "original logical owner cause",
@@ -94,19 +209,30 @@ fn owner_failure_is_original_health_without_an_actor_or_native_exit() {
         "later cause",
     ));
     assert_eq!(source.owner_failure(), Some(error));
-    assert!(source.has_failure() && source.has_unhandled_failure());
+    assert!(source.has_failure());
+    assert!(!source.has_unhandled_failure());
     assert!(
         !source.run_failed(),
         "a typed owner failure is not a fabricated Native panic"
     );
     let state = source.lock();
     assert_eq!(state.phase, LogicalActorExitPhase::Installed);
-    assert!(state.actor.is_none() && state.role.is_none());
+    assert!(state.runtime.is_none() && state.role.is_none());
     assert!(state.run_panic.is_none() && state.run_cleanup_panic.is_none());
     drop(state);
     assert!(
         source.disposition().is_none(),
-        "health never proves physical closure"
+        "an isolated owner verdict never proves physical closure"
+    );
+    source.runtime_joined_silent(
+        association,
+        crate::api::logical_runtime::LogicalExit::OwnerFailed(source.owner_failure().unwrap()),
+    );
+    assert!(source.has_failure());
+    assert!(!source.has_unhandled_failure());
+    assert!(
+        source.disposition().is_none(),
+        "the original role/body must also exit"
     );
 }
 
@@ -264,7 +390,7 @@ async fn explicit_body_close_records_actual_drop_without_actor_join_or_health_re
         let state = source.lock();
         assert!(state.native_body_exited && !state.native_pre_actor_started);
         assert_eq!(state.phase, LogicalActorExitPhase::Installed);
-        assert!(state.actor.is_none() && state.role.is_none());
+        assert!(state.runtime.is_none() && state.role.is_none());
         assert!(state.role_ended && !state.role_failed);
         assert_eq!(state.owner_failure.as_ref(), Some(&owner_error));
         assert_eq!(
@@ -331,7 +457,7 @@ async fn body_drop_panic_is_sticky_and_preserves_the_earlier_native_cause() {
             Some(&"earlier Native cause")
         );
         assert_eq!(state.phase, LogicalActorExitPhase::Installed);
-        assert!(state.actor.is_none());
+        assert!(state.runtime.is_none());
     }
     assert_eq!(
         source

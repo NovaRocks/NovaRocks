@@ -18,6 +18,7 @@
 //! Finish the original local gate without claiming transport or remote exit.
 
 use super::{AuthorizationGate, QaReply, schedule};
+use crate::port_output::AttemptToLogicalBody;
 use crate::{
     authorization::establish::{SettlementReply, Step},
     capacity::StepContext,
@@ -27,8 +28,7 @@ use crate::{
     terminal::GatePreparation,
 };
 use novarocks_coordination_contract::{
-    AttemptActionId, AttemptAuthorizationRef, AttemptRequestToken, AttemptToLogicalBody,
-    LogicalToAttemptBody,
+    AttemptActionId, AttemptAuthorizationRef, AttemptRequestToken, LogicalToAttemptBody,
 };
 use novarocks_execution_contract::TaskOperationId;
 use std::{
@@ -44,9 +44,8 @@ enum Phase {
     Establish(Option<TaskOperationId>),
     WaitingTransport,
     ForgetAdmission(Option<TaskOperationId>),
-    Detach(Option<TaskOperationId>),
+    ForgetEstablish(Option<TaskOperationId>),
     Ready,
-    Failed,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -54,7 +53,6 @@ struct ClosingFlight {
     operation: TaskOperationId,
     token: AttemptRequestToken,
     authorization: AttemptAuthorizationRef,
-    detach: bool,
 }
 
 #[derive(Debug, Default)]
@@ -67,7 +65,7 @@ pub(super) struct ClosingGate {
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
-    reason = "the charged close drive moves each original QA settlement or detach effect directly into the actor output"
+    reason = "the charged close drive moves each original QA settlement effect directly into the actor output"
 )]
 pub(crate) enum CloseProgress {
     Yield,
@@ -111,14 +109,14 @@ impl AuthorizationGate {
             Phase::Admission(_)
                 | Phase::Establish(_)
                 | Phase::ForgetAdmission(_)
-                | Phase::Detach(_)
+                | Phase::ForgetEstablish(_)
         )
     }
 
     pub(crate) fn preparation(&self) -> GatePreparation {
         match self.close.phase {
             Phase::Open => GatePreparation::Open,
-            Phase::WaitingTransport | Phase::Failed => GatePreparation::Applied { ready: false },
+            Phase::WaitingTransport => GatePreparation::Applied { ready: false },
             Phase::Ready => GatePreparation::Applied { ready: true },
             _ => GatePreparation::Applying,
         }
@@ -144,11 +142,6 @@ impl AuthorizationGate {
                 Phase::Open => return Err(schedule("original authorization gate is still open")),
                 Phase::WaitingTransport => return Ok(CloseProgress::WaitingTransport),
                 Phase::Ready => return Ok(CloseProgress::Ready),
-                Phase::Failed => {
-                    return Err(schedule(
-                        "original authorization guard could not be disposed",
-                    ));
-                }
                 Phase::Admission(after) | Phase::ForgetAdmission(after) => {
                     let forget = matches!(self.close.phase, Phase::ForgetAdmission(_));
                     if !context.charge(1) {
@@ -169,21 +162,18 @@ impl AuthorizationGate {
                         }
                     } else {
                         self.close.phase = if forget {
-                            Phase::Detach(None)
+                            Phase::ForgetEstablish(None)
                         } else {
                             Phase::Establish(None)
                         };
                     }
                 }
-                Phase::Establish(after) | Phase::Detach(after) => {
-                    let detach = matches!(self.close.phase, Phase::Detach(_));
+                Phase::Establish(after) => {
                     if !context.charge(1) {
                         return Ok(CloseProgress::Yield);
                     }
                     let Some((&operation, row)) = next(&mut self.establishments, after) else {
-                        self.close.phase = if detach {
-                            Phase::Ready
-                        } else if self.close.waits_for_transport {
+                        self.close.phase = if self.close.waits_for_transport {
                             Phase::WaitingTransport
                         } else {
                             Phase::ForgetAdmission(None)
@@ -192,72 +182,66 @@ impl AuthorizationGate {
                     };
                     row.close();
                     let participation = row.participation();
-                    let step = if detach {
-                        row.advance(token)
-                    } else {
-                        row.advance_closing_current(token)
-                    };
-                    let (authorization, body, class) = match step {
+                    match row.advance_closing_current(token) {
                         Step::Settle {
                             authorization,
                             settlement,
                             ..
-                        } if !detach => (
-                            authorization,
-                            AttemptToLogicalBody::EstablishSettlement {
+                        } => {
+                            self.close.flight = Some(ClosingFlight {
+                                operation,
                                 token,
                                 authorization,
-                                participation,
-                                operation_id: operation,
-                                settlement,
-                            },
-                            EffectClass::Settlement,
-                        ),
-                        Step::DetachLate { authorization, .. } if detach => (
-                            authorization,
-                            AttemptToLogicalBody::DetachEstablish {
-                                token,
-                                authorization,
-                                participation,
-                                operation_id: operation,
-                            },
-                            EffectClass::Cleanup,
-                        ),
-                        Step::WaitingTransport if !detach => {
+                            });
+                            return Ok(CloseProgress::Request(AttemptEffect {
+                                id: action,
+                                class: EffectClass::Settlement,
+                                body: EffectBody::Port(self.port(
+                                    action,
+                                    AttemptToLogicalBody::EstablishSettlement {
+                                        token,
+                                        authorization,
+                                        participation,
+                                        operation_id: operation,
+                                        settlement,
+                                    },
+                                )),
+                            }));
+                        }
+                        Step::WaitingTransport => {
                             self.close.waits_for_transport = true;
                             self.close.phase = Phase::Establish(Some(operation));
-                            continue;
                         }
                         Step::Ready => {
-                            if detach {
-                                if !row.forget_closed_local_entry() {
-                                    return Err(schedule(
-                                        "closed Establish retains its original guard",
-                                    ));
-                                }
-                                self.close.phase = Phase::Detach(Some(operation));
-                            } else {
-                                self.close.phase = Phase::Establish(Some(operation));
-                            }
-                            continue;
+                            self.close.phase = Phase::Establish(Some(operation));
                         }
                         _ => {
                             return Err(schedule(
                                 "unexpected original authorization close transition",
                             ));
                         }
+                    }
+                }
+                Phase::ForgetEstablish(after) => {
+                    if !context.charge(1) {
+                        return Ok(CloseProgress::Yield);
+                    }
+                    let Some((&operation, row)) = next(&mut self.establishments, after) else {
+                        self.close.phase = Phase::Ready;
+                        continue;
                     };
-                    self.close.flight = Some(ClosingFlight {
-                        operation,
-                        token,
-                        authorization,
-                        detach,
-                    });
-                    return Ok(CloseProgress::Request(AttemptEffect {
-                        id: action,
-                        class,
-                        body: EffectBody::Port(self.port(action, body)),
-                    }));
+                    if row.forget_one_closed_late_ref()?.is_some() {
+                        // One charged pure ref; revisit THIS row on the next
+                        // unit, preserving the whole gate's final-forget cut.
+                        self.close.phase = Phase::ForgetEstablish(after);
+                    } else {
+                        if !row.forget_closed_local_entry() {
+                            return Err(schedule(
+                                "closed Establish retains active local correlation",
+                            ));
+                        }
+                        self.close.phase = Phase::ForgetEstablish(Some(operation));
+                    }
                 }
             }
         }
@@ -265,7 +249,7 @@ impl AuthorizationGate {
 
     pub(super) fn close_replied(
         &mut self,
-        body: LogicalToAttemptBody<AttemptFailure>,
+        body: LogicalToAttemptBody,
     ) -> Result<QaReply, TaskExecutionError> {
         let flight = self.close.flight.expect("original closing flight");
         let row = self
@@ -277,32 +261,16 @@ impl AuthorizationGate {
                 token,
                 authorization,
                 result,
-            } if !flight.detach
-                && token == flight.token
-                && authorization == flight.authorization =>
-            {
+            } if token == flight.token && authorization == flight.authorization => {
                 if !matches!(
-                    row.settled(token, authorization, result)?,
+                    row.settled(
+                        token,
+                        authorization,
+                        result.map_err(AttemptFailure::Logical)
+                    )?,
                     SettlementReply::Complete { .. }
                 ) {
                     return Err(schedule("original unused Establish did not settle"));
-                }
-            }
-            LogicalToAttemptBody::EstablishDetachReply {
-                token,
-                authorization,
-                result,
-            } if flight.detach
-                && token == flight.token
-                && authorization == flight.authorization =>
-            {
-                if let Err(failure) = result {
-                    self.close.phase = Phase::Failed;
-                    self.close.flight = None;
-                    return Ok(QaReply::ClosingFailed(failure));
-                }
-                if !row.detached(token, authorization)? {
-                    return Err(schedule("original late Establish did not detach"));
                 }
             }
             _ => return Ok(QaReply::Stale),

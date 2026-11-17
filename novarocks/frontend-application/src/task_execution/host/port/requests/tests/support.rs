@@ -22,6 +22,9 @@ use crate::control_runtime::{
     logical::adapter::{LogicalEffectEnvelope, LogicalHostEffect},
     transport_withdrawal::AttemptEffectEnvelope,
 };
+use novarocks_attempt_protocol::port_output::{
+    AttemptToLogical as ApMessage, AttemptToLogicalBody as ApBody,
+};
 use novarocks_attempt_protocol::{
     effect::{AttemptEffect, EffectBody, EffectClass},
     failure::AttemptFailure,
@@ -45,8 +48,7 @@ use novarocks_control_runtime_core::{
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_coordination_contract::{
-    AttemptActionId, AttemptActivationIdentity, AttemptRequestToken, AttemptToLogical as ApMessage,
-    AttemptToLogicalBody as ApBody, ExecutionFailure,
+    AttemptActionId, AttemptActivationIdentity, AttemptRequestToken, ExecutionFailure,
     logical_port::{
         AttemptToLogical, AttemptToLogicalBody, LogicalToAttempt, LogicalToAttemptBody,
     },
@@ -225,9 +227,20 @@ pub(crate) struct Fixture {
 }
 impl Fixture {
     pub(crate) fn new() -> Self {
+        Self::build(false).0
+    }
+    pub(crate) fn with_attempt_failure_work() -> (Self, ReportedWork) {
+        let (fixture, work) = Self::build(true);
+        (
+            fixture,
+            work.expect("same original supervised attempt Work"),
+        )
+    }
+    fn build(supervised: bool) -> (Self, Option<ReportedWork>) {
         let ledger = RuntimeLedger::new(ResourceVector::default());
         let runtime = ActorRuntime::new();
-        let make = |id| {
+        let mut failure = None;
+        let mut make = |id| {
             let scope = ledger.open_scope_next(None, EPOCH).unwrap();
             let (mut work, payer) = scope
                 .reserve_next(
@@ -251,24 +264,59 @@ impl Fixture {
             work.start().unwrap();
             let next = Arc::new(Mutex::new(None));
             let seen = Arc::new(Mutex::new(Vec::new()));
-            let registration = runtime
-                .register_bound(
+            let actor = FrontendActor::Test(Box::new(Actor {
+                next: Arc::clone(&next),
+                seen: Arc::clone(&seen),
+            }));
+            let config = ActorConfig {
+                mailbox: [32; 4],
+                max_batches: 32,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 16,
+                max_step_work: 2,
+            };
+            if supervised && id == 11 {
+                let (cleanup, mut positions) = scope
+                    .reserve_child_next(
+                        EPOCH,
+                        payer.id(),
+                        ReservationResources::new(
+                            ResourceVector::default(),
+                            OwnedSlotNeed {
+                                work_headers: 1,
+                                completions: 1,
+                                captures: 1,
+                                ..Default::default()
+                            },
+                        ),
+                        WorkKind::Cleanup,
+                    )
+                    .unwrap()
+                    .bind(WorkKind::Cleanup)
+                    .unwrap();
+                let report = ReportSlot::reserve_next(
+                    &mut positions,
+                    EPOCH,
+                    1,
+                    [(OBSERVER, ConsumerKind::Observer)],
+                )
+                .unwrap();
+                failure = Some(ReportedWork::try_new(cleanup, positions, report).unwrap());
+            }
+            let registration = if supervised && id == 11 {
+                runtime.register_supervised_bound_with_source_cut(
                     ActorId::new(id).unwrap(),
                     scope.clone(),
-                    FrontendActor::Test(Box::new(Actor {
-                        next: Arc::clone(&next),
-                        seen: Arc::clone(&seen),
-                    })),
-                    ActorConfig {
-                        mailbox: [32; 4],
-                        max_batches: 32,
-                        max_effects_per_step: 1,
-                        max_dependencies_per_effect: 0,
-                        turn_budget: 16,
-                        max_step_work: 2,
-                    },
+                    actor,
+                    config,
+                    failure.as_ref().unwrap().work(),
+                    ActorId::new(1).unwrap(),
                 )
-                .unwrap_or_else(|(error, _)| panic!("original paid test actor: {error:?}"));
+            } else {
+                runtime.register_bound(ActorId::new(id).unwrap(), scope.clone(), actor, config)
+            }
+            .unwrap_or_else(|(error, _)| panic!("original paid test actor: {error:?}"));
             Side {
                 scope,
                 work,
@@ -281,12 +329,15 @@ impl Fixture {
         };
         let logical = make(1);
         let attempt = make(11);
-        Self {
-            ledger,
-            runtime,
-            logical,
-            attempt,
-        }
+        (
+            Self {
+                ledger,
+                runtime,
+                logical,
+                attempt,
+            },
+            failure,
+        )
     }
     pub(crate) fn emit(
         &mut self,

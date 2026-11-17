@@ -237,7 +237,7 @@ impl Fixture {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let source = OriginalLogicalExit::new();
-        let registry = LogicalExecutionRuntimeRegistry::new(tokio::runtime::Handle::current());
+        let registry = LogicalExecutionRuntimeRegistry::new();
         let initial_schedule = schedule(execution(1));
         let mut reservation = registry
             .reserve_with_original_exit(
@@ -260,6 +260,8 @@ impl Fixture {
         };
         let operation = OperationIds::new(IdSeed::new(941, 12)).issue();
         let native = Arc::new(NativeExecutor::new(
+            None,
+            Arc::new(super::UnboundInstalledAttemptPort),
             source.native.clone(),
             Arc::downgrade(&source),
             registry.handle(),

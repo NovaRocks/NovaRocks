@@ -620,11 +620,13 @@ impl LogicalInputs {
             &self.admission_closed,
         ))
     }
+    #[cfg(test)]
     pub(crate) fn ap_count(&self) -> usize {
         self.ap.len()
     }
     /// Borrowing records that the same author was exposed to P10. The three
     /// roles and original producer must then explicitly close before retirement.
+    #[cfg(test)]
     pub(crate) fn ap_author(&mut self, index: usize) -> Option<&WorkObligation> {
         if self.closing {
             return None;

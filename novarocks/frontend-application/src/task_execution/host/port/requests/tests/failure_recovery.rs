@@ -296,19 +296,27 @@ async fn failed_ap_recovery_keeps_unobserved_actual_reply_after_post_commit_call
     let effect = logical_effect(74, message.clone(), &f.logical.payer);
     let ticket = f.emit(true, effect);
     let mut actual = None;
-    let interrupted =
-        std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut loan = requests
-                .loan(token(74), RequestKind::PreReadyReplacement)
-                .unwrap();
-            actual = Some(loan.job.as_mut().unwrap().result.fill_event_from_effect(
-            &f.runtime, &ticket, None,
-            FrontendInput::Attempt(Box::new(novarocks_attempt_protocol::input::AttemptInput::Port(
-                novarocks_attempt_protocol::port_projection::project_logical_message(&message),
-            ))),
-        ).unwrap());
-            panic!("original LP caller unwind before local reply receipt");
-        }));
+    let interrupted = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut loan = requests
+            .loan(token(74), RequestKind::PreReadyReplacement)
+            .unwrap();
+        actual = Some(
+            loan.job
+                .as_mut()
+                .unwrap()
+                .result
+                .fill_event_from_effect(
+                    &f.runtime,
+                    &ticket,
+                    None,
+                    FrontendInput::Attempt(Box::new(
+                        novarocks_attempt_protocol::input::AttemptInput::Port(message.clone()),
+                    )),
+                )
+                .unwrap(),
+        );
+        panic!("original LP caller unwind before local reply receipt");
+    }));
     assert!(interrupted.is_err());
     assert!(
         requests

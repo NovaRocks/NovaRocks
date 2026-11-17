@@ -19,6 +19,8 @@
 //! this single construction path; backends supply work, never LP decisions.
 #[path = "attempt.rs"]
 mod attempt;
+#[path = "native_recipe.rs"]
+pub(crate) mod native_recipe;
 #[path = "process.rs"]
 mod process;
 #[path = "scripts.rs"]
@@ -87,6 +89,17 @@ pub(crate) struct LogicalCase {
     parts: Arc<LogicalParts>,
     governor: std::sync::Weak<GovernanceExecutor>,
     gate: Arc<process::TurnGate>,
+    cancellation: novarocks_workload_control::WorkCancellationRequester,
+}
+impl LogicalCase {
+    /// Requests only the same original WC latch. The real observer and LP
+    /// choose the resulting input and Stop; this does not fill either one.
+    pub(crate) fn request_cancel(
+        &self,
+        reason: novarocks_workload_control::CancellationReason,
+    ) -> Result<(), novarocks_workload_control::WorkError> {
+        self.cancellation.request(reason)
+    }
 }
 #[derive(Clone, Copy)]
 pub(crate) enum ProgressSelection {
@@ -156,6 +169,45 @@ impl FrontendFixture {
             finished: false,
         }
     }
+    pub(crate) fn from_original_process(
+        original: Arc<crate::control_runtime::FrontendAttemptRuntime>,
+        clock: Arc<crate::task_execution::clock::ManualClock>,
+        history: HistoryCapture,
+    ) -> Self {
+        Self {
+            original: Some(Box::new(FixtureState {
+                process: process::Process {
+                    original,
+                    clock,
+                    history,
+                    workload: None,
+                },
+                logical: Vec::new(),
+                attempts: Vec::new(),
+                worker: None,
+                worker_failures: Vec::new(),
+            })),
+            finished: false,
+        }
+    }
+    pub(crate) fn install_logical<S: InstallFixture<B>, B>(
+        &mut self,
+        start: S,
+        backend: B,
+    ) -> S::Case {
+        start.install(self, backend)
+    }
+    pub(crate) async fn activate_attempt<L: ActivateFixture<A, S>, A, S>(
+        &mut self,
+        logical: &L,
+        activation: A,
+        script: S,
+    ) -> L::Attempt {
+        logical.activate(self, activation, script).await
+    }
+    pub(crate) fn observe<L: ObserveFixture>(&self, logical: &L) -> L::Observation {
+        logical.observe(self)
+    }
     fn state(&self) -> &FixtureState {
         self.original.as_ref().unwrap()
     }
@@ -174,19 +226,17 @@ impl FrontendFixture {
     pub(crate) fn advance_time(&self, delta: Duration) {
         self.state().process.clock.advance(delta);
     }
-    pub(crate) fn install_logical(
-        &mut self,
-        start: LogicalStart,
-        script: LogicalScript,
-    ) -> LogicalCase {
+    fn install_script(&mut self, start: LogicalStart, script: LogicalScript) -> LogicalCase {
         let gate = Arc::new(process::TurnGate::default());
-        let governor = scripts::governor(&start, self.state().process.workload.as_ref().unwrap());
+        let (governor, cancellation) =
+            scripts::governor(&start, self.state().process.workload.as_ref().unwrap());
         let p = &self.state().process;
         let parts = super::source::assemble_logical(
             &p.original.runtime,
             &p.original.ledger,
             &p.original.host,
             &start,
+            true,
             {
                 let gate = gate.clone();
                 let panic = script.core_panic.clone();
@@ -201,6 +251,7 @@ impl FrontendFixture {
             |parts| {
                 Arc::new(scripts::ScriptExecutor::new(
                     parts,
+                    p.original.runtime.clone(),
                     script.clone(),
                     governor.clone(),
                     start.clone(),
@@ -215,11 +266,12 @@ impl FrontendFixture {
             parts: Arc::new(parts),
             governor: Arc::downgrade(&governor),
             gate,
+            cancellation,
         };
         self.state_mut().logical.push(case.clone());
         case
     }
-    pub(crate) async fn activate_attempt(
+    async fn activate_script(
         &mut self,
         logical: &LogicalCase,
         activation: AttemptActivationIdentity,
@@ -387,7 +439,7 @@ impl FrontendFixture {
         tokio::task::yield_now().await;
         result
     }
-    pub(crate) fn observe(&self, logical: &LogicalCase) -> LogicalObservation {
+    fn observe_script(&self, logical: &LogicalCase) -> LogicalObservation {
         let script = &logical.script;
         let mut received = Vec::new();
         let mut request_occupied = false;
@@ -493,16 +545,12 @@ impl FrontendFixture {
                 && self.state().process.original.host.is_empty()
                 && closes.iter().all(|(_, original)| original.is_none())
             {
-                let workload = self
-                    .state_mut()
-                    .process
-                    .workload
-                    .take()
-                    .expect("same original process Workload owner");
-                workload.close_admission();
-                workload.shutdown().unwrap_or_else(|failure| {
-                    panic!("actual workload owner did not retire: {}", failure.error())
-                });
+                if let Some(workload) = self.state_mut().process.workload.take() {
+                    workload.close_admission();
+                    workload.shutdown().unwrap_or_else(|failure| {
+                        panic!("actual workload owner did not retire: {}", failure.error())
+                    });
+                }
                 self.finished = true;
                 return;
             }
@@ -535,6 +583,46 @@ impl FrontendFixture {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+}
+pub(crate) trait InstallFixture<B> {
+    type Case;
+    fn install(self, fixture: &mut FrontendFixture, backend: B) -> Self::Case;
+}
+pub(crate) trait ObserveFixture {
+    type Observation;
+    fn observe(&self, fixture: &FrontendFixture) -> Self::Observation;
+}
+pub(crate) trait ActivateFixture<A, S> {
+    type Attempt;
+    async fn activate(
+        &self,
+        fixture: &mut FrontendFixture,
+        activation: A,
+        script: S,
+    ) -> Self::Attempt;
+}
+impl InstallFixture<LogicalScript> for LogicalStart {
+    type Case = LogicalCase;
+    fn install(self, fixture: &mut FrontendFixture, script: LogicalScript) -> LogicalCase {
+        fixture.install_script(self, script)
+    }
+}
+impl ObserveFixture for LogicalCase {
+    type Observation = LogicalObservation;
+    fn observe(&self, fixture: &FrontendFixture) -> LogicalObservation {
+        fixture.observe_script(self)
+    }
+}
+impl ActivateFixture<AttemptActivationIdentity, AttemptScript> for LogicalCase {
+    type Attempt = AttemptCase;
+    async fn activate(
+        &self,
+        fixture: &mut FrontendFixture,
+        activation: AttemptActivationIdentity,
+        script: AttemptScript,
+    ) -> AttemptCase {
+        fixture.activate_script(self, activation, script).await
     }
 }
 impl Drop for FrontendFixture {

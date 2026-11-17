@@ -219,6 +219,41 @@ impl LogicalExecutionCore {
         attempt.relay_stopping = true;
         self.queue(LogicalEffectBody::Relay(RelayEffect::Stop { activation }));
     }
+    fn drive_read_seal(&mut self, execution: QueryExecutionId) -> Result<(), CoreFault> {
+        use novarocks_execution_contract::root_lifetime::RootReadConvergence;
+        let attempt = self.attempts.get_mut(&execution).unwrap();
+        if !attempt.activated
+            || !attempt.read_owner
+            || attempt.read_seal_issued
+            || attempt.closing.is_none()
+        {
+            return Ok(());
+        }
+        let root = attempt.root.as_ref().ok_or(CoreFault::UnexpectedInput)?;
+        let mut read = RootReadConvergence::new(root.root());
+        let terminated = attempt.read_termination_authorized || self.logical_failure.is_some();
+        let sealed = if terminated {
+            read.seal_terminated()
+        } else {
+            let Some(summary) = self.visibility.end(attempt.activation) else {
+                return Ok(());
+            };
+            if !root.finished() || attempt.relay_end_handoff != Some(summary.end) {
+                return Ok(());
+            }
+            read.consume_end(summary.end)
+                .map_err(|_| CoreFault::UnexpectedInput)?;
+            read.observe_root_finished();
+            read.seal_normal().map_err(|_| CoreFault::UnexpectedInput)?
+        };
+        attempt.read_seal_issued = true;
+        let activation = attempt.activation;
+        self.queue(LogicalEffectBody::Native(NativeEffect::SealRootRead {
+            activation,
+            sealed,
+        }));
+        Ok(())
+    }
     fn notify_convergence(&mut self, execution: QueryExecutionId) {
         let cancelled = self.cancellation.map(cancellation_decision);
         let cut = self
@@ -240,7 +275,7 @@ impl LogicalExecutionCore {
             } else {
                 None
             };
-        let begin = if !attempt.closing_notified {
+        let begin = if !attempt.closing_notified && (!attempt.read_owner || attempt.read_sealed) {
             attempt.closing_notified = true;
             Some((attempt.closing.unwrap(), attempt.remote_deadline.unwrap()))
         } else {
@@ -528,7 +563,15 @@ impl LogicalExecutionCore {
             }
             attempt.tracking_pass_done = true;
         }
+        self.drive_read_seal(execution)?;
         self.notify_convergence(execution);
+        if self
+            .attempts
+            .get(&execution)
+            .is_some_and(|attempt| attempt.read_owner && !attempt.read_sealed)
+        {
+            return Ok(());
+        }
         let reserved = self.fresh_action();
         let abort_action = AttemptActionId::new(NonZeroU64::new(reserved.get()).unwrap());
         let attempt = self.attempts.get_mut(&execution).unwrap();
@@ -902,7 +945,12 @@ impl LogicalExecutionCore {
             {
                 offer(self.now);
             }
-            if let Some(at) = attempt.stand_down.next_abort_at(self.now) {
+            // Abort dispatch waits for the original read-close result. An
+            // eligible retry time is not runnable work while that action is
+            // still pending; its actual result supplies the next wake.
+            if (!attempt.read_owner || attempt.read_sealed)
+                && let Some(at) = attempt.stand_down.next_abort_at(self.now)
+            {
                 offer(at);
             }
             if !attempt.tracking_pass_done

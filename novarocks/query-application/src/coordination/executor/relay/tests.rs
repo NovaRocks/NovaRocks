@@ -980,3 +980,217 @@ async fn supervised_failure_drains_original_relay_reply_once_and_rejects_late_re
         "no fresh source send after failure latch"
     );
 }
+
+// Data-plane component tier: Core's replacement policy/qualification is covered
+// by its public tests. This uses one original client transport and two passive
+// activation identities; it never claims an actual Native/AP Scope exited.
+#[tokio::test]
+async fn successor_segment_uses_same_original_global_client_stream_while_predecessor_cleanup_is_held()
+ {
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    struct OriginalCleanupFrame {
+        _original_window: novarocks_workload_control::ResultWindowAlias,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for OriginalCleanupFrame {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    type PumpResult = Result<
+        Option<(RootResultEnd, Option<FinalAck>, DeliverySummary)>,
+        novarocks_logical_execution_protocol::input::FailureReport,
+    >;
+    struct Originals {
+        control: Option<WorkloadControl>,
+        work: Option<RootWork>,
+        window: Option<ResultWindowGrant>,
+        consumer: Option<Arc<ConsumerExecutor>>,
+        stream: Option<QueryResultStream>,
+        cleanup: Option<LogicalFuture<'static, ()>>,
+        release: Option<oneshot::Sender<()>>,
+        pump: Option<LogicalFuture<'static, PumpResult>>,
+        stop: Option<watch::Sender<bool>>,
+        state: Arc<Mutex<State>>,
+        held: Option<RootSegmentDelivery>,
+    }
+    struct KeepWhole(Option<Box<Originals>>);
+    impl Drop for KeepWhole {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                static ORIGINALS: OnceLock<Mutex<Vec<Box<dyn std::any::Any + Send>>>> =
+                    OnceLock::new();
+                if let Some(original) = self.0.take() {
+                    ORIGINALS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(original);
+                }
+            }
+        }
+    }
+    let OriginalWindow {
+        _control: control,
+        _work: work,
+        window,
+    } = original_window(RootOutputKind::ClientRows);
+    let scope = work.owner.scope();
+    let capacity = scope.result_capacity().unwrap();
+    let (consumer, stream) = original_consumer(RootOutputKind::ClientRows).await;
+    let consumer = Arc::new(consumer);
+    let (state, source) = state_and_source();
+    let (release, gate) = oneshot::channel();
+    let entered = Arc::new(AtomicBool::new(false));
+    let cleanup_drops = Arc::new(AtomicUsize::new(0));
+    let original_frame = OriginalCleanupFrame {
+        _original_window: window.retain_alias(),
+        drops: cleanup_drops.clone(),
+    };
+    let seen = entered.clone();
+    let cleanup = Box::pin(async move {
+        let _same_original_cleanup_frame = original_frame;
+        seen.store(true, Ordering::SeqCst);
+        gate.await.unwrap();
+    });
+    let mut keep = KeepWhole(Some(Box::new(Originals {
+        control: Some(control),
+        work: Some(work),
+        window: Some(window),
+        consumer: Some(consumer.clone()),
+        stream: Some(stream),
+        cleanup: Some(cleanup),
+        release: Some(release),
+        pump: None,
+        stop: None,
+        state: state.clone(),
+        held: None,
+    })));
+    let actual = keep.0.as_deref_mut().unwrap();
+    assert!(
+        poll_once(actual.cleanup.as_mut().unwrap().as_mut())
+            .await
+            .is_pending()
+    );
+    assert!(entered.load(Ordering::SeqCst));
+    assert_eq!(cleanup_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(capacity.snapshot().held_positions[0], 1);
+    assert!(
+        actual.stream.as_mut().unwrap().begin_schema().is_none(),
+        "the original schema is already written once"
+    );
+    let successor = activation(2);
+    let original_root = original_root();
+    let successor_root = TaskIdentity::new(
+        successor.execution(),
+        original_root.stage_id(),
+        original_root.task_id(),
+        original_root.backend_process_id(),
+    );
+    let port = Port::new(vec![
+        rows(1, &[1, 0, 0, 0, b'b'], None),
+        rows(2, &[1, 0, 0, 0, b'c'], Some((3, 2))),
+    ]);
+    let binding = RootRelayBinding {
+        port: port.clone(),
+        frontier: crate::coordination::RootRelayFrontier::new(
+            successor_root,
+            RootProfileId::V1,
+            RootOutputKind::ClientRows,
+            Some(profile()),
+        )
+        .unwrap(),
+        window: actual.window.as_ref().unwrap().retain_alias(),
+        max_wait: Duration::from_millis(1),
+    };
+    let (stop, mut stopped) = watch::channel(false);
+    actual.stop = Some(stop);
+    actual.pump = Some(Box::pin(async move {
+        let mut source = source;
+        RelayExecutor::pump_data(
+            &state,
+            &consumer,
+            successor,
+            &mut source,
+            &mut stopped,
+            binding,
+        )
+        .await
+    }));
+    assert!(
+        poll_once(actual.pump.as_mut().unwrap().as_mut())
+            .await
+            .is_pending()
+    );
+    let Some(ResultDelivery::Segment(segment)) =
+        actual.stream.as_mut().unwrap().next().await.unwrap()
+    else {
+        panic!("same original global client stream must receive the successor segment");
+    };
+    actual.held = Some(segment);
+    let segment = actual.held.as_ref().unwrap();
+    assert_eq!(segment.execution_id(), successor.execution());
+    assert_eq!(segment.sequence(), ResultPacketSequence::new(0));
+    assert_eq!(segment.rows(), 1);
+    assert_eq!(segment.body(), &[1, 0, 0, 0, b'b']);
+    assert_eq!(port.requests(), vec![(Some(1), 0), (Some(2), 0)]);
+    assert!(
+        actual
+            .consumer
+            .as_ref()
+            .unwrap()
+            .take_exposed_output()
+            .is_none(),
+        "no second client stream was constructed or handed off"
+    );
+    assert!(
+        poll_once(actual.cleanup.as_mut().unwrap().as_mut())
+            .await
+            .is_pending()
+    );
+    assert_eq!(
+        cleanup_drops.load(Ordering::SeqCst),
+        0,
+        "B delivery cannot release A's actual cleanup frame"
+    );
+    actual.state.lock().unwrap().stopped.insert(key(successor));
+    actual.stop.as_ref().unwrap().send_replace(true);
+    assert!(
+        poll_once(actual.pump.as_mut().unwrap().as_mut())
+            .await
+            .is_pending(),
+        "the actual B receipt is still held"
+    );
+    actual.held.take().unwrap().complete();
+    assert!(actual.pump.take().unwrap().await.unwrap().is_none());
+    assert_eq!(
+        port.requests(),
+        vec![(Some(1), 0), (Some(2), 0)],
+        "cancelled prefetch does not send a new read or ACK"
+    );
+    drop(actual.consumer.take());
+    drop(actual.stream.take());
+    drop(actual.window.take());
+    assert_eq!(
+        capacity.snapshot().held_positions[0],
+        1,
+        "only A's actual cleanup alias remains"
+    );
+    actual.release.take().unwrap().send(()).unwrap();
+    actual.cleanup.take().unwrap().await;
+    assert_eq!(cleanup_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(capacity.snapshot().held_positions[0], 0);
+    let work = actual.work.take().unwrap();
+    work.business.release();
+    work.owner.complete();
+    scope.wait_released().await;
+    actual.control.as_ref().unwrap().close_admission();
+    if let Err(failure) = actual.control.take().unwrap().shutdown() {
+        let (error, control) = failure.into_parts();
+        actual.control = Some(control);
+        panic!("same original client-window component refused actual shutdown: {error}");
+    }
+}

@@ -124,6 +124,11 @@ pub(crate) struct LogicalInputsLoan {
     original: Option<LogicalInputs>,
 }
 impl LogicalInputsLoan {
+    /// A wake of the same original LP host, without any additional author or
+    /// input position. The exclusive inventory remains this same loan.
+    pub(crate) fn host_waker(&self) -> Waker {
+        self.bank.host.clone()
+    }
     /// Called by the Source only after all actual jobs and the AP's original
     /// input rows have closed. External close is NOT this gate: an issued
     /// activation may still complete binding under its original AP author.

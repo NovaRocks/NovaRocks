@@ -52,6 +52,22 @@ impl LogicalExecutionCore {
                     } else {
                         attempt.establish.authorize(now, request)
                     };
+                // Returning this authorization already permits AP to hand off
+                // the exact operation. Freeze possible transmission in this
+                // SAME serial turn, as the former bridge's try_submit did;
+                // no later host/guard event may move this boundary.
+                let decision = decision.and_then(|decision| {
+                    if let novarocks_coordination_contract::AttemptAuthorizationDecision::EstablishAuthorized(reference) = decision {
+                        let (participation, operation_id) = match request {
+                            AttemptAuthorization::Establish { participation, operation_id, .. }
+                            | AttemptAuthorization::ReauthorizeEstablish { participation, operation_id } => (participation, operation_id),
+                            _ => unreachable!("Establish authorization belongs to its exact request"),
+                        };
+                        attempt.establish.settle_establish(reference, participation, operation_id,
+                            novarocks_coordination_contract::AttemptIssueSettlement::TransportOwned)?;
+                    }
+                    Ok(decision)
+                });
                 let refresh = match request {
                     AttemptAuthorization::SettleAdmission { participation, .. }
                     | AttemptAuthorization::Establish { participation, .. }

@@ -1112,10 +1112,6 @@ async fn shared_row_releases_funds_before_wc_queue_exit(mode: Mode) {
         .drain_original_apply_until(Instant::now() + Duration::from_secs(2))
         .await
         .unwrap();
-    runtime
-        .drain_original_subscriptions_until(Instant::now() + Duration::from_secs(2))
-        .await
-        .unwrap();
     runtime.close_native_outgoing().unwrap();
     runtime
         .drain_native_outgoing_until(Instant::now() + Duration::from_secs(2))
@@ -1219,10 +1215,6 @@ async fn encoded_local_join_precedes_child_exit_and_foreign_disposal_keeps_same_
         .unwrap();
     runtime
         .drain_original_apply_until(Instant::now() + Duration::from_secs(2))
-        .await
-        .unwrap();
-    runtime
-        .drain_original_subscriptions_until(Instant::now() + Duration::from_secs(2))
         .await
         .unwrap();
     runtime.close_native_outgoing().unwrap();
@@ -1674,10 +1666,6 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
         .drain_original_apply_until(Instant::now() + Duration::from_secs(2))
         .await
         .unwrap();
-    runtime
-        .drain_original_subscriptions_until(Instant::now() + Duration::from_secs(2))
-        .await
-        .unwrap();
     runtime.close_native_outgoing().unwrap();
     runtime
         .drain_native_outgoing_until(Instant::now() + Duration::from_secs(2))
@@ -1764,7 +1752,6 @@ async fn run_actor_send(
     mode: ActorSendMode,
     failure_verdict: Option<novarocks_execution_contract::OperationOutcome>,
 ) {
-    use crate::control_runtime::membership::FrozenMember;
     use crate::control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},
         host::{
@@ -1779,9 +1766,16 @@ async fn run_actor_send(
     use crate::task_execution::host::failure_supervisor::{
         FailureCleanupRequest, FailureSupervisor,
     };
-    use crate::task_execution::{
-        bridge::terminal::{RegisteredAttemptTerminal, TerminalOutbox},
-        host::failure_bridge::PendingFailureBridge,
+    use crate::task_execution::host::{
+        port::{
+            AttemptPortEndpoints,
+            abort::{AbortIngressRetirementProgress, AttemptAbortIngress},
+            control::{ControlBinding, ControlPositions, SourcePublishedSlot},
+            facts::AttemptFactBank,
+            requests::AttemptRequests,
+            root_control::{RootControlBinding, RootControlRequests},
+        },
+        startup::AttemptStartupSource,
     };
     use crate::task_execution::{
         clock::ProcessMonotonicClock,
@@ -1807,16 +1801,11 @@ async fn run_actor_send(
     };
     use novarocks_control_runtime_core::{identity::Tick, mailbox::InputClass, scope::ScopeError};
     use novarocks_coordination_contract::{
-        AttemptActionId, AttemptActivationIdentity, AttemptToLogicalBody, MonotonicInstant,
+        AttemptActionId, AttemptActivationIdentity, MonotonicInstant,
     };
     use novarocks_execution_contract::{
         AbortCause, AbortParticipation, OperationEnvelope, OperationKind, OperationOutcome,
         ParticipationRef, RuntimeEndpoint,
-    };
-    use novarocks_query_application::api::{
-        BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
-        NativeActiveConvergenceClosure, NativeActiveConvergenceRequest, NativeAttemptConvergence,
-        NativeAttemptTerminal, NativeParticipationConvergence,
     };
     use novarocks_types::FrontendProcessId;
 
@@ -2226,57 +2215,160 @@ async fn run_actor_send(
     struct CleanupState {
         transferred: bool,
         dropped: bool,
+        // The SAME original raw panic, publication result and actual Native
+        // attempts remain in this slot until the controlled failure F consumes it.
+        original: Option<(FailureCleanupRequest, Vec<transport::FailureAbortAttempt>)>,
+        release: bool,
+        changed: Arc<tokio::sync::Notify>,
     }
-    struct CleanupPort(
-        Arc<Mutex<CleanupState>>,
-        Option<Box<dyn transport::FailureResidualPort>>,
-    );
+    struct CleanupPort(Arc<Mutex<CleanupState>>);
     impl transport::FailureResidualPort for CleanupPort {
         fn finish(
-            mut self: Box<Self>,
+            self: Box<Self>,
             original: FailureCleanupRequest,
             attempts: Vec<transport::FailureAbortAttempt>,
         ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             Box::pin(async move {
-                for attempt in &attempts {
-                    if let Err(error) = &attempt.result {
-                        eprintln!("Original failure Abort: {error:?}");
+                let changed = {
+                    let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+                    assert!(state.original.replace((original, attempts)).is_none());
+                    state.transferred = true;
+                    state.changed.clone()
+                };
+                loop {
+                    let notified = changed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self
+                        .0
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .release
+                    {
+                        break;
                     }
+                    notified.await;
                 }
-                self.1.take().unwrap().finish(original, attempts).await;
-                self.0.lock().unwrap().transferred = true;
+                let original = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .original
+                    .take()
+                    .unwrap();
+                // Foreign raw/error destructors run in this SAME controlled
+                // failure Work, outside every Source/registry/kernel mutex.
+                drop(original);
             })
         }
     }
     impl Drop for CleanupPort {
         fn drop(&mut self) {
-            self.0.lock().unwrap().dropped = true;
+            self.0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .dropped = true;
         }
     }
-    struct ProcessFacts {
-        backend: BackendProcessId,
-        endpoint: RuntimeEndpoint,
-        replacement: BackendProcessId,
-        changed: tokio::sync::watch::Sender<u64>,
-    }
-    impl BackendProcessObservationPort for ProcessFacts {
-        fn subscribe_process_changes(&self) -> tokio::sync::watch::Receiver<u64> {
-            self.changed.subscribe()
-        }
-        fn observe_process_at_endpoint(
-            &self,
-            expected: BackendProcessId,
-            endpoint: &RuntimeEndpoint,
-        ) -> Result<BackendProcessObservation, BackendTopologyError> {
-            assert_eq!(expected, self.backend);
-            assert_eq!(endpoint, &self.endpoint);
-            Ok(if *self.changed.borrow() == 0 {
-                BackendProcessObservation::Unobservable
-            } else {
-                BackendProcessObservation::Replaced {
-                    current_process: self.replacement,
+
+    struct CleanupRelease(Arc<Mutex<CleanupState>>);
+    impl Drop for CleanupRelease {
+        fn drop(&mut self) {
+            let changed = {
+                let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+                if state.release {
+                    None
+                } else {
+                    state.release = true;
+                    Some(state.changed.clone())
                 }
-            })
+            };
+            if let Some(changed) = changed {
+                changed.notify_waiters();
+            }
+        }
+    }
+
+    struct LogicalReceiver {
+        attempt: novarocks_control_runtime_core::identity::ActorId,
+        seen: Arc<Mutex<Vec<novarocks_coordination_contract::logical_port::AttemptToLogical>>>,
+    }
+    impl crate::control_runtime::actor::TestActor for LogicalReceiver {
+        fn handle(
+            &mut self,
+            _: Tick,
+            envelope: novarocks_control_runtime_core::mailbox::InputEnvelope,
+            input: FrontendInput,
+            step: &mut novarocks_control_runtime::actor::ActorStep<'_, FrontendEffect>,
+        ) {
+            assert!(step.charge(1));
+            assert_eq!(envelope.source, self.attempt);
+            assert_eq!(envelope.class, InputClass::Lifecycle);
+            let FrontendInput::Logical(input) = input else {
+                panic!("same original LP fact receiver")
+            };
+            let novarocks_logical_execution_protocol::input::LogicalInput::AttemptPort(message) =
+                *input
+            else {
+                panic!("only the original passive attempt fact enters LP");
+            };
+            self.seen.lock().unwrap().push(*message);
+        }
+    }
+    struct LogicalReceivingSource {
+        scope: ScopeHandle,
+        closing: bool,
+    }
+    impl EffectSource for LogicalReceivingSource {
+        fn prepay_result(
+            &mut self,
+            _: &FrontendEffect,
+        ) -> Option<CausalInputObligation<FrontendActor>> {
+            unreachable!("passive receiver emits no effects")
+        }
+        fn bind_job(
+            &mut self,
+            _: &ActorRuntime<FrontendActor>,
+            _: &ActorHostTurn<FrontendActor>,
+            _: &EffectTicket<FrontendEffect>,
+            _: CausalInputObligation<FrontendActor>,
+        ) -> PreparedEffectJob {
+            unreachable!("no receiver job")
+        }
+        fn return_unclaimed_result(&mut self, _: CausalInputObligation<FrontendActor>) {
+            unreachable!("no receiver loan")
+        }
+        fn core_consumed(&mut self, _: &[novarocks_control_runtime_core::identity::InputId]) {}
+        fn owner_failed_pending(&mut self, _: PendingHandoff) {
+            unreachable!("receiver remains healthy")
+        }
+        fn close_external(&mut self) {
+            self.closing = true;
+            self.scope.close_external().unwrap();
+        }
+        fn result_admission_closed(&self) -> bool {
+            self.closing
+        }
+        fn progress_retirement(
+            &mut self,
+            runtime: &ActorRuntime<FrontendActor>,
+            turn: &ActorHostTurn<FrontendActor>,
+            _: Tick,
+            budget: usize,
+        ) -> SourceProgress {
+            SourceProgress {
+                units: usize::from(budget != 0),
+                progressed: false,
+                more: budget == 0 && self.closing,
+                retired: budget != 0
+                    && self.closing
+                    && runtime
+                        .snapshot(turn.registration().actor())
+                        .unwrap()
+                        .inputs
+                        == 0
+                    && self.scope.join_ready().unwrap(),
+            }
         }
     }
 
@@ -2284,8 +2376,12 @@ async fn run_actor_send(
     let failure_payer = failure_capacity.id();
     let failure_work =
         ReportedWork::try_new(failure_work, failure_capacity, failure_report).unwrap();
+    let failure_financial_work = failure_work.work().reference();
     let replay_custody = replay_commands.as_ref().map(|(_, custody)| *custody);
     let mut mailbox = [8; 4];
+    // The final port fixture installs one additional original startup standing.
+    // Causal call/result pairs retain both of their existing Lifecycle roles.
+    mailbox[InputClass::Lifecycle.index()] += 1;
     if replay {
         mailbox[InputClass::Lifecycle.index()] += 2 + usize::from(withdraw_replay);
     }
@@ -2404,54 +2500,151 @@ async fn run_actor_send(
         activation,
         &roles.scope,
     ));
-    let (failure_bridge, residual_port) = PendingFailureBridge::new(
-        inbox.registration().clone(),
-        activation,
-        Arc::new([FrozenMember {
-            participation,
-            endpoint: original_endpoint.clone(),
-        }]),
-        publications.clone(),
-    );
-    let processes = Arc::new(ProcessFacts {
-        backend,
-        endpoint: original_endpoint,
-        replacement: BackendProcessId::new_v7(),
-        changed: tokio::sync::watch::channel(0).0,
-    });
-    let cleanup = Arc::new(Mutex::new(CleanupState::default()));
-    let release_parent = Arc::new(AtomicBool::new(!fail_core));
-    use crate::task_execution::bridge::abort::{AbortSettlementOwner, AttemptAbortIngress};
-    let role = actor_runtime
-        .reserve_admitted_input_for(inbox.registration(), actor, InputClass::Control, &parent)
+    let logical_scope = roles.ledger.open_scope_next(None, generation()).unwrap();
+    let (mut logical_work, mut logical_payer) = logical_scope
+        .reserve_next(
+            generation(),
+            ReservationResources::work_only(),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
         .unwrap()
-        .into_standing_input()
+        .bind(WorkKind::Settlement)
         .unwrap();
+    logical_work.start().unwrap();
+    let logical_seen = Arc::new(Mutex::new(Vec::new()));
+    let logical_config = ActorConfig {
+        mailbox: [8; 4],
+        max_batches: 4,
+        max_effects_per_step: 1,
+        max_dependencies_per_effect: 0,
+        turn_budget: 8,
+        max_step_work: 1,
+    };
+    let logical = actor_runtime
+        .register_bound(
+            novarocks_control_runtime_core::identity::ActorId::new(31).unwrap(),
+            logical_scope.clone(),
+            FrontendActor::Test(Box::new(LogicalReceiver {
+                attempt: actor,
+                seen: logical_seen.clone(),
+            })),
+            logical_config,
+        )
+        .unwrap_or_else(|_| panic!("same runtime independent original LP receiver"));
+    let facts = AttemptFactBank::reserve(
+        actor_runtime,
+        &logical,
+        inbox.registration(),
+        activation,
+        &logical_work,
+        Waker::noop().clone(),
+        Waker::noop().clone(),
+    )
+    .unwrap();
+    // No Root command is issued by this physical transport fixture. The exact
+    // registered root binding is passive endpoint metadata, not a Ready proof.
+    let root = creation_task.unwrap_or_else(|| {
+        TaskIdentity::new(
+            execution,
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            backend,
+        )
+    });
+    let roots = RootControlRequests::new(
+        RootControlBinding::for_registered_source(inbox.registration().clone(), activation, root)
+            .unwrap(),
+    );
+    let port_requests = AttemptRequests::new(
+        activation,
+        inbox.registration().clone(),
+        logical.clone(),
+        NonZeroUsize::MIN,
+        Waker::noop().clone(),
+    );
+    let standing = |class| {
+        actor_runtime
+            .reserve_admitted_input_for(inbox.registration(), logical.actor(), class, &parent)
+            .unwrap()
+            .into_standing_input()
+            .unwrap_or_else(|_| panic!("same original unused standing AP role"))
+    };
     let ingress = Arc::new(AttemptAbortIngress::new(
+        logical.clone(),
         inbox.registration().clone(),
         activation,
-        [(participation, role)],
-        tokio::sync::watch::channel(0).0,
-        None,
+        [(participation, standing(InputClass::Control))],
     ));
-    let abort = Arc::new(AbortSettlementOwner::new(ingress.clone()));
-    let (abort_sender, abort_drain) = if fail_core {
-        let (handoff, drain) = tokio::sync::oneshot::channel();
-        (Some((abort.clone(), handoff)), Some(drain))
-    } else {
-        (None, None)
-    };
+    let (storage_work, mut storage_payer) = logical_scope
+        .reserve_child_next(
+            generation(),
+            logical_payer.id(),
+            ReservationResources::new(
+                ResourceVector::default(),
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    completions: 1,
+                    captures: 1,
+                    ..Default::default()
+                },
+            ),
+            WorkKind::Settlement,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    let control_observer = ConsumerId::new(2).unwrap();
+    let storage_report = ReportSlot::reserve_next(
+        &mut storage_payer,
+        generation(),
+        1,
+        [(control_observer, ConsumerKind::Observer)],
+    )
+    .unwrap();
+    let (control_slot, mut control_reader) = SourcePublishedSlot::bind(
+        actor_runtime,
+        ControlBinding {
+            lp: logical.clone(),
+            ap: inbox.registration().clone(),
+            activation,
+            positions: ControlPositions {
+                stop: standing(InputClass::Control),
+                convergence: standing(InputClass::Control),
+                changed: standing(InputClass::Ordinary),
+            },
+            storage: ReportedWork::try_new(storage_work, storage_payer, storage_report).unwrap(),
+            observer: control_observer,
+            roots: roots.clone(),
+        },
+    )
+    .unwrap_or_else(|_| panic!("same original paid control reader"));
+    let (mut startup_source, startup) = AttemptStartupSource::new(
+        inbox.registration().clone(),
+        standing(InputClass::Lifecycle),
+    );
+    let endpoints = AttemptPortEndpoints::bind(
+        logical.clone(),
+        inbox.registration().clone(),
+        activation,
+        startup,
+        port_requests.clone(),
+        facts.clone(),
+        control_slot,
+        ingress,
+        roots.clone(),
+    )
+    .unwrap_or_else(|_| panic!("exact original final port pair"));
+    publications.bind_ports(endpoints.clone());
+    let cleanup = Arc::new(Mutex::new(CleanupState::default()));
+    let _cleanup_release = CleanupRelease(cleanup.clone());
+    let release_parent = Arc::new(AtomicBool::new(!fail_core));
     let failure_port = transport::NativeFailureCleanup::new(
         contexts.clone(),
         failure_payer,
         handle.clone(),
-        Box::new(CleanupPort(cleanup.clone(), Some(residual_port))),
+        Box::new(CleanupPort(cleanup.clone())),
     );
-    let failure_port = if let Some((owner, sender)) = abort_sender {
-        failure_port.with_abort_drain(owner, sender)
-    } else {
-        failure_port
-    };
     let supervisor = FailureSupervisor::new(
         actor_runtime.clone(),
         inbox.registration().clone(),
@@ -2479,45 +2672,42 @@ async fn run_actor_send(
                 max_step_work: 1,
             },
             policy: FrontendLanePolicy::attempt(1),
-            source: Box::new(
-                transport::AttemptTransportSource::new(
-                    actor_runtime.clone(),
-                    inbox.registration().clone(),
-                    inbox.source(),
-                    roles.scope.clone(),
-                    admission,
-                    [None, None, None, release_source, None, None],
-                    None,
-                    transport::AttemptSendSource {
-                        requests,
-                        contexts,
-                        report_author,
-                        idle: send_idle,
+            source: Box::new(transport::AttemptTransportSource::new(
+                actor_runtime.clone(),
+                inbox.registration().clone(),
+                inbox.source(),
+                roles.scope.clone(),
+                admission,
+                [None, None, None, None, None, release_source, None, None],
+                None,
+                transport::AttemptSendSource {
+                    closed: crate::task_execution::host::port::abort::ClosedParticipations::new(),
+                    requests,
+                    contexts,
+                    report_author,
+                    idle: send_idle,
+                },
+                (
+                    FailureContext {
+                        lifecycle,
+                        publications: publications.clone(),
                     },
-                    (
-                        FailureContext {
-                            lifecycle,
-                            publications: publications.clone(),
-                        },
-                        transport::AttemptFailureBinding {
-                            supervisor,
-                            port: Box::new(failure_port),
-                            abort_drain,
-                        },
-                    ),
-                    Box::new(ScopeOwner {
-                        scope: roles.scope.clone(),
-                        parent,
-                        payer,
-                        closing: false,
-                        exited: false,
-                        finished: false,
-                        receipt: receipt.clone(),
-                        release_parent: release_parent.clone(),
-                    }),
-                )
-                .with_abort_retirement(&abort, retirement.host_waker()),
-            ),
+                    transport::AttemptFailureBinding {
+                        supervisor,
+                        port: Box::new(failure_port),
+                    },
+                ),
+                Box::new(ScopeOwner {
+                    scope: roles.scope.clone(),
+                    parent,
+                    payer,
+                    closing: false,
+                    exited: false,
+                    finished: false,
+                    receipt: receipt.clone(),
+                    release_parent: release_parent.clone(),
+                }),
+            )),
             executor: Arc::new(transport::AttemptTransportExecutor {
                 native: transport::ActorTransportExecutor(handle.clone()),
                 other: Arc::new(OtherExecutor),
@@ -2526,15 +2716,32 @@ async fn run_actor_send(
             startup: None,
             capacity: None,
             membership: None,
-            owner_controls: None,
+
+            local_exit: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("same host registration"));
-    let mut terminal_owner = RegisteredAttemptTerminal::new(
-        TerminalOutbox::new(activation),
-        failure_bridge.bind(exit, processes.clone()),
-        None,
-    );
+    let actual_ap_exit = exit.observe_actual_exit();
+    let logical_exit = host
+        .register(HostBinding {
+            scope: logical_scope.clone(),
+            registration: logical.clone(),
+            kind: FrontendActorKind::Test,
+            config: logical_config,
+            policy: FrontendLanePolicy::logical(1),
+            source: Box::new(LogicalReceivingSource {
+                scope: logical_scope.clone(),
+                closing: false,
+            }),
+            executor: Arc::new(OtherExecutor),
+            transport: None,
+            startup: None,
+            capacity: None,
+            membership: None,
+            local_exit: None,
+            ordered_observations: None,
+        })
+        .unwrap_or_else(|_| panic!("same actual LP receiving Source"));
     let input_exits = Arc::new(Mutex::new(Vec::new()));
     let advance_host = || {
         let run = || {
@@ -2902,7 +3109,12 @@ async fn run_actor_send(
                 .entries
                 .iter()
                 .chain(&remaining.entries)
-                .find(|entry| predicate(&entry.fact, work))
+                .find(|entry| {
+                    matches!(entry.fact,
+                    HistoryFact::WorkRetired { scope, .. } | HistoryFact::Started { scope, .. }
+                    if scope == roles.scope.id())
+                        && predicate(&entry.fact, work)
+                })
                 .expect("original Work history")
                 .ordinal
         };
@@ -2937,7 +3149,7 @@ async fn run_actor_send(
             assert!(first_retired < replay_split_at);
             assert!(replay_split_at < partition_retired && partition_retired < replay_retired);
             assert!(!remaining.entries.iter().any(|entry| {
-                matches!(entry.fact, HistoryFact::Started { work, .. } if work == replay_work)
+                matches!(entry.fact, HistoryFact::Started { scope, work } if scope == roles.scope.id() && work == replay_work)
             }));
         } else {
             let replay_started = recorded(
@@ -2982,39 +3194,93 @@ async fn run_actor_send(
         actor_runtime.retire_input(actor, command).unwrap();
     }
     if fail_core {
-        {
-            let mut waiting = Box::pin(terminal_owner.terminal());
-            assert!(futures::poll!(waiting.as_mut()).is_pending());
-        }
+        assert!(logical_seen.lock().unwrap().is_empty());
         let failed = actor_runtime
             .reserve_input(actor, actor, InputClass::Lifecycle)
             .unwrap()
             .fill(FrontendInput::Test(u64::MAX))
             .unwrap();
         assert!(actor_runtime.poll_one(Tick(2)).unwrap());
-        advance_host();
-        let terminal = tokio::time::timeout(Duration::from_secs(1), terminal_owner.terminal())
-            .await
+        let failure_actions = actor_runtime
+            .committed_batches(actor, None, 8)
             .unwrap()
-            .unwrap();
-        assert_eq!(terminal_owner.terminal().await.unwrap(), terminal);
-        assert!(
-            matches!(terminal, NativeAttemptTerminal::Failed(error) if error.class() == novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure)
+            .into_iter()
+            .flat_map(|(_, input)| {
+                actor_runtime
+                    .effect_inventory(actor, input, None, 8)
+                    .unwrap()
+            })
+            .filter(|(descriptor, _)| descriptor.work == failure_financial_work)
+            .map(|(descriptor, _)| descriptor.id)
+            .collect::<Vec<_>>();
+        let [failure_action] = failure_actions.as_slice() else {
+            panic!("same immutable failure Work names exactly one original failure ticket");
+        };
+        advance_host();
+        let lost = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                facts.progress(3, false, false).unwrap();
+                while actor_runtime.poll_one(Tick(2)).unwrap() {}
+                advance_host();
+                if let Some(original) = logical_seen.lock().unwrap().first().cloned() {
+                    break original;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(lost.activation, activation);
+        assert_eq!(
+            lost.action.get(),
+            failure_action.get(),
+            "same original current failure action"
         );
-        let lost = terminal_owner.failure_bridge_mut().original_loss();
-        assert!(
-            matches!(&lost.body, AttemptToLogicalBody::AttemptLost { unknown_participations, unresolved_actions, .. }
-            if **unknown_participations == [participation] && **unresolved_actions == [send_id])
+        assert!(matches!(&lost.body,
+            novarocks_coordination_contract::logical_port::AttemptToLogicalBody::AttemptLost {
+                failure, unknown_participations, unresolved_actions,
+            } if failure.input() == &novarocks_attempt_protocol::port_projection::owner_failure()
+                && **unknown_participations == [participation] && **unresolved_actions == [send_id]));
+        assert_eq!(
+            logical_seen.lock().unwrap().len(),
+            1,
+            "one original kernel-fenced loss fact"
         );
         actor_runtime.retire_input(actor, failed).unwrap();
     }
+    // These original control/startup roles were never issued in this
+    // transport-only fixture. Their actual owner closes the exact positions;
+    // no Root ACK, Ready, normal control or positive remote closure is invented.
+    if fail_core {
+        let proof = actor_runtime
+            .failure_proof_for(inbox.registration())
+            .unwrap();
+        assert!(
+            control_reader
+                .close_after_failure(actor_runtime, &proof)
+                .unwrap()
+        );
+    } else {
+        assert!(control_reader.close_after_exit(actor_runtime).unwrap());
+    }
+    let mut abort_roles = endpoints.abort_retirement();
+    assert_eq!(
+        abort_roles.progress().unwrap(),
+        AbortIngressRetirementProgress::Advanced
+    );
+    assert_eq!(
+        abort_roles.progress().unwrap(),
+        AbortIngressRetirementProgress::Complete
+    );
+    startup_source.progress(fail_core, true).unwrap();
+    assert!(startup_source.is_closed());
     actor_runtime.close_actor_admission(actor).unwrap();
     actor_runtime.close_timer_source(actor).unwrap();
     host.close_registration();
     advance_host();
     if sends && !withdraw_replay && !create_replay {
         assert!(
-            !host.is_empty(),
+            !*actual_ap_exit.borrow(),
             "the original Native row still has a reply alias"
         );
         let original = receipt.lock().unwrap().take().unwrap();
@@ -3024,7 +3290,6 @@ async fn run_actor_send(
         );
         drop(original);
     }
-    let cancellation = fail_core.then(|| wc.root.owner.scope().cancellation().unwrap());
     if fail_core {
         tokio::time::timeout(Duration::from_secs(2), async {
             while !cleanup.lock().unwrap().transferred {
@@ -3035,28 +3300,74 @@ async fn run_actor_send(
         })
         .await
         .unwrap();
-        // The installed Host owns the same Abort position through exit.
-        let deadline = if failure_verdict == Some(OperationOutcome::Accepted) {
-            Instant::now()
-        } else {
-            Instant::now() + Duration::from_secs(5)
-        };
-        let mut waiting = Box::pin(terminal_owner.failure_bridge_mut().converge(
-            NativeActiveConvergenceRequest::new(cancellation.as_ref().unwrap().clone(), deadline),
-        ));
         assert!(
-            futures::poll!(waiting.as_mut()).is_pending(),
-            "remote deadline cannot settle original local work"
+            !*actual_ap_exit.borrow(),
+            "original failure F/raw custody and Source parent still live"
         );
-        drop(waiting);
-        assert!(!host.is_empty());
+        {
+            let state = cleanup.lock().unwrap();
+            let (residual, attempts) = state.original.as_ref().unwrap();
+            let raw = residual
+                .core_panic
+                .downcast_ref::<String>()
+                .expect("same original transport fixture Core assertion allocation");
+            assert!(raw.contains("transport fixture Core failure"));
+            assert_eq!(&*residual.unknown_participations, &[participation]);
+            residual.publication.as_ref().unwrap();
+            assert!(residual.root_reply.is_none());
+            residual.observation_drain.as_ref().unwrap();
+            let [abort] = attempts.as_slice() else {
+                panic!("one original frozen failure Abort")
+            };
+            assert_eq!(abort.request.participation(), participation);
+            let outcome = abort
+                .result
+                .as_ref()
+                .unwrap_or_else(|error| panic!("original failure Abort delivery: {error:?}"));
+            let receipt = outcome.receipt.as_ref().unwrap();
+            assert_eq!(receipt.operation, abort.request.envelope().operation_id());
+            assert_ne!(receipt.operation, key.operation);
+            assert_eq!(
+                receipt.worker.as_ref().unwrap().outcome(),
+                failure_verdict.unwrap()
+            );
+            assert_eq!(
+                receipt.participation_state,
+                (failure_verdict == Some(OperationOutcome::Accepted))
+                    .then_some(novarocks_execution_contract::ParticipationState::Aborting)
+            );
+            assert_eq!(peer.as_ref().unwrap().control_requests(), 2);
+        }
+        let changed = {
+            let mut state = cleanup.lock().unwrap();
+            state.release = true;
+            state.changed.clone()
+        };
+        changed.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cleanup.lock().unwrap().dropped {
+                drive(&mut wc.driver);
+                advance_host();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            cleanup.lock().unwrap().original.is_none(),
+            "same controlled failure F consumed raw originals"
+        );
+        assert!(
+            !*actual_ap_exit.borrow(),
+            "callback completion still cannot release the held original parent"
+        );
         release_parent.store(true, Ordering::Release);
         actor_runtime
             .notify_host_actor(inbox.registration())
             .unwrap();
     }
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !host.is_empty() {
+        while !*actual_ap_exit.borrow() {
             drive(&mut wc.driver);
             advance_host();
             tokio::task::yield_now().await;
@@ -3065,71 +3376,45 @@ async fn run_actor_send(
     .await
     .unwrap();
     assert!(cleanup.lock().unwrap().dropped);
-    if fail_core {
-        let cancellation = cancellation.unwrap();
-        let (residual, attempts) = terminal_owner.failure_bridge_mut().original_residual();
-        let [abort] = attempts else {
-            panic!("one frozen failure abort")
-        };
-        assert_eq!(abort.request.participation(), participation);
-        let outcome = abort
-            .result
-            .as_ref()
-            .unwrap_or_else(|error| panic!("failed to deliver original failure Abort: {error:?}"));
-        let receipt = outcome.receipt.as_ref().unwrap();
-        assert_eq!(receipt.operation, abort.request.envelope().operation_id());
-        assert_ne!(receipt.operation, key.operation);
-        assert_eq!(
-            receipt.worker.as_ref().unwrap().outcome(),
-            failure_verdict.unwrap()
-        );
-        assert_eq!(
-            receipt.participation_state,
-            (failure_verdict == Some(OperationOutcome::Accepted))
-                .then_some(novarocks_execution_contract::ParticipationState::Aborting)
-        );
-        assert_eq!(peer.as_ref().unwrap().control_requests(), 2);
-        assert_eq!(&*residual.unknown_participations, &[participation]);
-        residual.publication.unwrap();
-        if failure_verdict == Some(OperationOutcome::OwnerFailed) {
-            processes.changed.send_replace(1);
-        }
-        let closure = tokio::time::timeout(
-            Duration::from_secs(1),
-            terminal_owner
-                .failure_bridge_mut()
-                .converge(NativeActiveConvergenceRequest::new(
-                    cancellation.clone(),
-                    Instant::now() + Duration::from_secs(5),
-                )),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        if failure_verdict == Some(OperationOutcome::Accepted) {
-            assert!(
-                matches!(closure, NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_participations } if *exact_participations == [participation])
-            );
-            processes.changed.send_replace(1);
-            let original = terminal_owner
-                .failure_bridge_mut()
-                .converge(NativeActiveConvergenceRequest::new(
-                    cancellation,
-                    Instant::now() + Duration::from_secs(5),
-                ))
-                .await
-                .unwrap();
-            assert!(
-                matches!(original, NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_participations } if *exact_participations == [participation])
-            );
-        } else {
-            assert!(
-                matches!(closure, NativeActiveConvergenceClosure::Evidence(NativeAttemptConvergence::Participations(facts)) if *facts == [NativeParticipationConvergence::worker_process_replaced(participation)])
-            );
-        }
-    } else {
+    if !fail_core {
         assert!(!cleanup.lock().unwrap().transferred);
     }
+    assert!(
+        !host.is_empty(),
+        "LP receiver still retains the actual bank/Work until explicit retirement"
+    );
+    endpoints.original_producer_exited();
+    port_requests.close_admission();
+    facts.close_admission();
+    let mut bank_closed = false;
+    for _ in 0..8 {
+        while actor_runtime.poll_one(Tick(3)).unwrap() {}
+        bank_closed = facts.progress(3, true, false).unwrap().complete;
+        if bank_closed {
+            break;
+        }
+    }
+    assert!(bank_closed && facts.is_closed());
+    drop((
+        endpoints,
+        control_reader,
+        startup_source,
+        roots,
+        port_requests,
+        facts,
+        abort_roles,
+    ));
+    logical_work.body_exited().unwrap();
+    logical_work.captures_exited().unwrap();
+    logical_payer.finish().unwrap();
+    logical_scope.close_external().unwrap();
+    roles
+        .ledger
+        .reap_scope_ready(logical_scope.id(), 8)
+        .unwrap();
+    logical_exit.request_close().unwrap();
+    advance_host();
+    assert!(*logical_exit.observe_actual_exit().borrow());
     assert!(host.is_empty() && actor_runtime.is_empty() && roles.ledger.is_empty());
     if withdraw_replay || create_replay {
         let waits = roles
@@ -3141,10 +3426,6 @@ async fn run_actor_send(
     }
     let deadline = Instant::now() + Duration::from_secs(3);
     runtime.drain_original_apply_until(deadline).await.unwrap();
-    runtime
-        .drain_original_subscriptions_until(deadline)
-        .await
-        .unwrap();
     runtime.drain_native_outgoing_until(deadline).await.unwrap();
     if let Some(peer) = peer.as_mut() {
         assert!(peer.settle().await);
