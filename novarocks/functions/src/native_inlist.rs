@@ -489,6 +489,22 @@ impl PreparedNativeInListRecipe {
         .map(|recipe| recipe.expect("recipe publication requested"))
     }
 
+    /// Validate a static complete profile before any invocation exists.
+    /// This borrows the original types and does not publish a candidate owner
+    /// or invent an expression occurrence solely to obtain an effects value.
+    pub fn validate_borrowed_profile<'a>(
+        source: &novarocks_type_contract::FunctionValueType,
+        candidates: impl ExactSizeIterator<Item = &'a novarocks_type_contract::FunctionValueType>,
+        result: &novarocks_type_contract::FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), crate::ComparisonPrepareError> {
+        Self::try_new_core::<false, std::convert::Infallible, _>(
+            false, source, candidates, result, None, control,
+        )
+        .map(|_| ())
+        .map_err(inlist_pure_failure)
+    }
+
     /// Validate the same original complete source/candidate/result profile
     /// without publishing a recipe or its otherwise discarded candidate owner.
     /// Actual prepared instances still consume the original owning constructor.

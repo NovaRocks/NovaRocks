@@ -937,6 +937,21 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     pattern,
                     negated,
                 } => {
+                    work.flush()?;
+                    novarocks_functions::PreparedNativeLikeRecipe::try_new(
+                        *negated,
+                        &source
+                            .definition(*expr)
+                            .expect("checked LIKE text source")
+                            .ty,
+                        &source
+                            .definition(*pattern)
+                            .expect("checked LIKE pattern source")
+                            .ty,
+                        &node.ty,
+                        control,
+                    )?;
+
                     let text = *ids
                         .get(expr)
                         .ok_or(ExprCompileError::Invalid("LIKE source was not lowered"))?;
@@ -954,6 +969,19 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     list,
                     negated,
                 } => {
+                    work.flush()?;
+                    novarocks_functions::PreparedNativeInListRecipe::validate_borrowed_profile(
+                        &source.definition(*expr).expect("checked IN source").ty,
+                        list.iter().map(|id| {
+                            &source
+                                .definition(*id)
+                                .expect("checked IN candidate source")
+                                .ty
+                        }),
+                        &node.ty,
+                        control,
+                    )?;
+
                     let child = *ids
                         .get(expr)
                         .ok_or(ExprCompileError::Invalid("IN source was not lowered"))?;
@@ -977,6 +1005,22 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     high,
                     negated,
                 } => {
+                    work.flush()?;
+                    novarocks_functions::PreparedNativeBetweenRecipe::try_new(
+                        novarocks_type_contract::NativeBetweenPlan::new(*negated),
+                        &source.definition(*expr).expect("checked BETWEEN source").ty,
+                        &source
+                            .definition(*low)
+                            .expect("checked BETWEEN lower source")
+                            .ty,
+                        &source
+                            .definition(*high)
+                            .expect("checked BETWEEN upper source")
+                            .ty,
+                        &node.ty,
+                        control,
+                    )?;
+
                     let operand = *ids
                         .get(expr)
                         .ok_or(ExprCompileError::Invalid("BETWEEN operand was not lowered"))?;

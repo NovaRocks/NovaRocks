@@ -1025,3 +1025,179 @@ fn original_expected_constraint_stays_some_and_is_not_inferred_from_selected_res
     );
     assert_eq!(owner.instances.load(Ordering::Relaxed), 0);
 }
+
+fn check_type_only_hidden_native_profile(kind: &str) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_type_contract::ValueLogicalType;
+    let mut owner = Owner::for_overload(TYPE_ONLY);
+    owner.explicit_type_only = Some([result_type(), result_type()]);
+    let owner = Arc::new(owner);
+    let catalogue = catalog(owner.clone());
+    let arguments = owner.arguments(&owner.implementations[0].overload);
+    let request = FunctionBindingRequest {
+        arguments: &arguments,
+        logical_argument_count: 2,
+        expected_result_type: None,
+    };
+    let selected = owner.resolve(request, &Control::good()).unwrap();
+    let mut b = builder();
+    let input_type = if kind == "in_float" {
+        FunctionValueType::new(DataType::Float64, false)
+    } else {
+        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+            .unwrap()
+    };
+    let mut ports = vec![
+        (ValueId::new(10), input_type.clone()),
+        (ValueId::new(20), result_type()),
+    ];
+    let input = b
+        .add(None, input_type.clone(), ExprKind::Value(ValueId::new(10)))
+        .unwrap();
+    let other = b
+        .add(None, result_type(), ExprKind::Value(ValueId::new(20)))
+        .unwrap();
+    let hidden_kind = match kind {
+        "like_json" => {
+            let pattern_type = FunctionValueType::new(DataType::Utf8, false);
+            ports.push((ValueId::new(30), pattern_type.clone()));
+            let pattern = b
+                .add(None, pattern_type, ExprKind::Value(ValueId::new(30)))
+                .unwrap();
+            ExprKind::Like {
+                expr: input,
+                pattern,
+                negated: false,
+            }
+        }
+        "in_float" => ExprKind::InList {
+            expr: input,
+            list: Box::from([input]),
+            negated: false,
+        },
+        "between_json" => ExprKind::Between {
+            expr: input,
+            low: input,
+            high: input,
+            negated: false,
+        },
+        _ => unreachable!(),
+    };
+    let hidden = b.add(None, result_type(), hidden_kind).unwrap();
+    let call = b
+        .add(
+            None,
+            result_type(),
+            ExprKind::FunctionCall {
+                function: BoundFunction::from_exact_signature(
+                    owner.declaration.function_id().clone(),
+                    selected.overload.clone(),
+                    FunctionKind::Scalar,
+                    selected.argument_types.clone(),
+                    result_type(),
+                ),
+                args: Box::from([hidden, other]),
+            },
+        )
+        .unwrap();
+    b.request(
+        call,
+        PhysicalCallRequest {
+            arguments: Box::from([
+                novarocks_function_contract::FunctionArgument::Value {
+                    value_type: result_type(),
+                    constant: None,
+                },
+                novarocks_function_contract::FunctionArgument::Value {
+                    value_type: result_type(),
+                    constant: None,
+                },
+            ]),
+            logical_argument_count: 2,
+            expected_result_type: None,
+            constant_policy: policy(),
+        },
+    )
+    .unwrap();
+    b.definition_control(
+        call,
+        DefinitionControl {
+            shape: ControlShape::TypeOnly,
+            temporal_sources: None,
+        },
+    )
+    .unwrap();
+    b.root(call, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let c = Control::good();
+    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();
+    let sealed = b
+        .seal(
+            vec![ExprPort {
+                values: ports.clone().into_boxed_slice(),
+            }],
+            &mut work,
+        )
+        .unwrap();
+    assert_eq!(sealed.uses().len(), 1);
+    let claims = sealed
+        .uses()
+        .iter()
+        .map(|(&id, u)| {
+            (
+                id,
+                ExpressionCallClaim {
+                    context: u.context,
+                    effects: owner.frozen(u.context, &selected),
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    temporal_source: None,
+                    regexp_count_pattern_source: None,
+                    to_base64_byte_source: None,
+                },
+            )
+        })
+        .collect();
+    let unit = sealed.finish(claims, &mut work).unwrap();
+    work.finish().unwrap();
+    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
+    let layout = layouts(&ports);
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let error = compile_expr_set_pure(
+        &unit,
+        EvaluationEnvironment {
+            constants: &ConstantPools::empty(),
+            parameters: &parameters,
+        },
+        ScopeLayouts {
+            ports: &[layout],
+            all_ports: None,
+        },
+        policy(),
+        &catalogue,
+        &mut work,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ExprCompileError::Comparison(ComparisonPrepareError::Unsupported)
+        ),
+        "{kind}: {error:?}"
+    );
+    work.finish().unwrap();
+    assert_eq!(error.failure_fact().class(), FailureClass::Unsupported);
+    assert_eq!(owner.instances.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn type_only_hidden_json_like_keeps_the_original_profile_refusal() {
+    check_type_only_hidden_native_profile("like_json");
+}
+#[test]
+fn type_only_hidden_float_in_keeps_the_original_profile_refusal() {
+    check_type_only_hidden_native_profile("in_float");
+}
+#[test]
+fn type_only_hidden_json_between_keeps_the_original_profile_refusal() {
+    check_type_only_hidden_native_profile("between_json");
+}

@@ -576,6 +576,19 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
     assert_eq!(effects, prepared.own_effects(context));
     let trace = original.trace.into_inner().unwrap();
     assert_eq!(*borrowed.trace.lock().unwrap(), trace);
+    let static_profile = Compile {
+        trace: Mutex::new(Vec::new()),
+        refusal: None,
+    };
+    PreparedNativeInListRecipe::validate_borrowed_profile(
+        &source,
+        candidates.iter().copied(),
+        &target,
+        &static_profile,
+    )
+    .unwrap();
+    assert_eq!(*static_profile.trace.lock().unwrap(), trace);
+
     assert!(trace.iter().all(|(_, units)| *units <= 256));
     assert!(
         trace
@@ -604,6 +617,19 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
             .unwrap_err();
             assert_eq!(error.control_error(), Some(cause.clone()));
             assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
+            let static_control = Compile {
+                trace: Mutex::new(Vec::new()),
+                refusal: Some((stop, cause.clone())),
+            };
+            let error = PreparedNativeInListRecipe::validate_borrowed_profile(
+                &source,
+                candidates.iter().copied(),
+                &target,
+                &static_control,
+            )
+            .unwrap_err();
+            assert_eq!(error.control_error(), Some(cause.clone()));
+            assert_eq!(*static_control.trace.lock().unwrap(), trace[..=stop]);
         }
     }
     let required_target = FunctionValueType::new(DataType::Boolean, false);
@@ -634,6 +660,23 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
         )
         .unwrap_err();
         assert_eq!(error, borrowed_error);
+        let static_control = Compile {
+            trace: Mutex::new(Vec::new()),
+            refusal: None,
+        };
+        let static_error = PreparedNativeInListRecipe::validate_borrowed_profile(
+            input,
+            std::iter::once(candidate),
+            output,
+            &static_control,
+        )
+        .unwrap_err();
+        assert_eq!(error, static_error);
+        assert_eq!(
+            *original.trace.lock().unwrap(),
+            *static_control.trace.lock().unwrap()
+        );
+
         assert_eq!(
             *original.trace.lock().unwrap(),
             *borrowed.trace.lock().unwrap()
