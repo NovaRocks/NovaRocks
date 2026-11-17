@@ -910,9 +910,11 @@ pub fn extract_fragment_packages(
             .map_err(FragmentPackageExtractionError::Control)?;
         let mut constant_work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
             .map_err(FragmentPackageExtractionError::Control)?;
-        let projected = plan
-            .constants()
-            .project_fragment_observed(fragment, &mut constant_work);
+        let projected = crate::project_fragment_constants_observed(
+            plan.constants(),
+            fragment,
+            &mut constant_work,
+        );
         let projected = match projected {
             Err(crate::ConstantReferenceError::Control(error)) => {
                 return Err(FragmentPackageExtractionError::Control(error));

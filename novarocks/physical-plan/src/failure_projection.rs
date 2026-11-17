@@ -97,9 +97,6 @@ enum PhysicalReason {
     FrozenCallWrongProofScope = 109,
     FrozenCallWrongControl = 110,
     FrozenCallReplicaEquivalence = 111,
-    ConstantReferenceMissingPool = 120,
-    ConstantReferenceDuplicatePool = 121,
-    ConstantReferenceSourceTypeMismatch = 122,
     ConstantReferenceUnusedPools = 123,
     ConstantReferenceInvalidConsumer = 124,
     CallRequestWrongFragment = 130,
@@ -480,21 +477,10 @@ impl FailureProjection for FrozenCallError {
 impl FailureProjection for ConstantReferenceError {
     fn failure_fact(&self) -> FailureFact {
         match self {
+            Self::Table(source) => source.failure_fact(),
             Self::Control(source) => source.failure_fact(),
             Self::Constant(source) => source.failure_fact(),
             Self::Structure(source) => source.failure_fact(),
-            Self::MissingPool(_) => fact(
-                FailureClass::Invariant,
-                PhysicalReason::ConstantReferenceMissingPool,
-            ),
-            Self::DuplicatePool(_) => fact(
-                FailureClass::Invariant,
-                PhysicalReason::ConstantReferenceDuplicatePool,
-            ),
-            Self::SourceTypeMismatch(_) => fact(
-                FailureClass::Invariant,
-                PhysicalReason::ConstantReferenceSourceTypeMismatch,
-            ),
             Self::UnusedPools => fact(
                 FailureClass::Invariant,
                 PhysicalReason::ConstantReferenceUnusedPools,

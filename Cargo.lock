@@ -3423,6 +3423,8 @@ dependencies = [
  "novarocks-control-runtime-core",
  "novarocks-coordination-contract",
  "novarocks-execution-contract",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-failpoint",
  "novarocks-failure-contract",
  "novarocks-functions",
@@ -3471,6 +3473,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-expression"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "novarocks-constant-contract",
+ "novarocks-expression-contract",
+ "novarocks-failure-contract",
+ "novarocks-function-contract",
+ "novarocks-functions",
+ "novarocks-type-contract",
+]
+
+[[package]]
+name = "novarocks-expression-contract"
+version = "0.1.0"
+dependencies = [
+ "arrow-schema",
+ "novarocks-constant-contract",
+ "novarocks-failure-contract",
+ "novarocks-function-contract",
+ "novarocks-type-contract",
+]
+
+[[package]]
 name = "novarocks-failpoint"
 version = "0.1.0"
 dependencies = [
@@ -3508,6 +3534,8 @@ dependencies = [
  "novarocks-coordination-contract",
  "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-failpoint",
  "novarocks-failure-contract",
  "novarocks-functions",
@@ -3659,6 +3687,9 @@ dependencies = [
  "bytes",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
+ "novarocks-constant-contract",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-local-program",
@@ -3677,6 +3708,8 @@ dependencies = [
  "bytes",
  "novarocks-connector-contract",
  "novarocks-execution-contract",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-result-contract",
@@ -3841,6 +3874,7 @@ dependencies = [
  "arrow-schema",
  "novarocks-connector-contract",
  "novarocks-constant-contract",
+ "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-function-contract",
  "novarocks-result-contract",
@@ -3859,6 +3893,7 @@ dependencies = [
  "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
  "novarocks-constant-contract",
+ "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-local-program",
@@ -4072,6 +4107,7 @@ dependencies = [
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
  "novarocks-constant-contract",
+ "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-local-program",

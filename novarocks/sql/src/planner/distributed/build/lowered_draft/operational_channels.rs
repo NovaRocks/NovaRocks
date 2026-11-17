@@ -663,3 +663,9 @@ fn completed_delegate<T>(
     work.flush()?;
     outcome
 }
+
+impl From<novarocks_constant_contract::ConstantTableError> for SqlOperationalProjectionError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(ConstantReferenceError::from(error))
+    }
+}

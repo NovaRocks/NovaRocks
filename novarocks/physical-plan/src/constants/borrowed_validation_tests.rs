@@ -271,7 +271,7 @@ fn borrowed_fragment_scalar_sparse_source_and_closed_ordinary_errors_keep_every_
     );
     let c = BorrowedControl::new(None);
     let selected = borrowed(&c, |w| {
-        pools.resolve_source_observed(reference(u32::MAX, 1), w)
+        pools.resolve_source_observed(reference(u32::MAX, 1), w).map_err(ConstantReferenceError::from)
     })
     .unwrap();
     assert_eq!(selected.ordinal(), 1);
@@ -286,7 +286,7 @@ fn borrowed_fragment_scalar_sparse_source_and_closed_ordinary_errors_keep_every_
         (
             reference(4, 1),
             backing.value_type().clone(),
-            ConstantReferenceError::MissingPool(ConstantPoolId::new(4)),
+            ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::MissingPool(ConstantPoolId::new(4))),
         ),
         (
             reference(0, 2),
@@ -298,7 +298,7 @@ fn borrowed_fragment_scalar_sparse_source_and_closed_ordinary_errors_keep_every_
         (
             reference(0, 1),
             FunctionValueType::new(DataType::Int64, true),
-            ConstantReferenceError::SourceTypeMismatch(reference(0, 1)),
+            ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(reference(0, 1))),
         ),
     ] {
         let invalid = constant_fragment(202, &[(address, ty)]);
@@ -416,7 +416,7 @@ fn borrowed_utf8_map_keeps_actual_nonzero_row_and_rejects_unsorted_source_with_c
                 w,
             )?;
             assert_eq!((usage.items, usage.payload_bytes), (2, 9));
-            let selected = pools.resolve_source_observed(reference(u32::MAX, 1), w)?;
+            let selected = pools.resolve_source_observed(reference(u32::MAX, 1), w).map_err(ConstantReferenceError::from)?;
             let view = selected.utf8_map_in(w)?.unwrap();
             assert_eq!(view.item_observed(0, w)?, (Some("a"), Some("λ\0")));
             assert_eq!(view.item_observed(1, w)?, (Some("z"), Some("tail")));
@@ -499,7 +499,7 @@ fn borrowed_unpivot_scalar_payload_reads_only_actual_selected_constant_on_caller
     );
     every_prefix(
         |w| {
-            let selected = pools.resolve_source_observed(reference(u32::MAX, 1), w)?;
+            let selected = pools.resolve_source_observed(reference(u32::MAX, 1), w).map_err(ConstantReferenceError::from)?;
             assert_eq!(selected.selected_payload_bytes_in(w)?, 3);
             assert_eq!(selected.ordinal(), 1);
             assert!(Arc::ptr_eq(selected.pool().array(), backing.array()));

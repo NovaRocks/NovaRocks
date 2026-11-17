@@ -892,8 +892,8 @@ fn receiving_constants_preserve_selected_ordinal_and_require_exact_nested_source
     bad.value_type_id = Some(42);
     assert!(matches!(
         run(&changed, &[bad], SOURCE, limits(), &Control::default()),
-        Err(Error::Constant(ConstantReferenceError::SourceTypeMismatch(
-            _
+        Err(Error::Constant(ConstantReferenceError::Table(
+            novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(_)
         )))
     ));
     let value = expression(0, 1, K::ValueId(0));
@@ -917,8 +917,8 @@ fn receiving_constants_preserve_selected_ordinal_and_require_exact_nested_source
             limits(),
             &Control::default()
         ),
-        Err(Error::Constant(ConstantReferenceError::SourceTypeMismatch(
-            _
+        Err(Error::Constant(ConstantReferenceError::Table(
+            novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(_)
         )))
     ));
     bad.value_type_id = Some(4);

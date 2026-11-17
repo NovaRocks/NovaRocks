@@ -333,9 +333,9 @@ fn caller_owned_captured_value_literal_and_signature_pairs_preserve_facts_and_pr
         } else {
             assert!(matches!(
                 baseline,
-                Err(Error::Constant(
-                    p::ConstantReferenceError::SourceTypeMismatch(_)
-                ))
+                Err(Error::Constant(p::ConstantReferenceError::Table(
+                    novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(_)
+                )))
             ));
         }
         let trace = c.trace();

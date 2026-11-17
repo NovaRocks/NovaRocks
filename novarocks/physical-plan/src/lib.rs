@@ -59,7 +59,8 @@ pub use identity::*;
 pub use join_condition::*;
 pub use novarocks_connector_contract::{ConnectorWriteRouteId, WriteTargetOrdinal};
 pub use novarocks_constant_contract::{
-    ConstantError, ConstantPolicy, ConstantPool, ConstantResourceFacts, ConstantValue,
+    ConstantError, ConstantPolicy, ConstantPool, ConstantPools, ConstantReference,
+    ConstantResourceFacts, ConstantTableError, ConstantValue,
 };
 pub use novarocks_function_contract::FunctionArgument as StaticFunctionArgument;
 pub use novarocks_type_contract::FunctionValueType as ValueType;

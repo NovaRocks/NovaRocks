@@ -166,3 +166,24 @@ impl ConstantError {
         })
     }
 }
+
+#[derive(Clone, Copy)]
+#[repr(u16)]
+enum ConstantTableReason {
+    MissingPool = 10,
+    DuplicatePool = 11,
+    SourceTypeMismatch = 12,
+}
+impl FailureProjection for crate::ConstantTableError {
+    fn failure_fact(&self) -> FailureFact {
+        use crate::ConstantTableError as E;
+        let reason = match self {
+            E::Control(source) => return source.failure_fact(),
+            E::Constant(source) => return source.failure_fact(),
+            E::MissingPool(_) => ConstantTableReason::MissingPool,
+            E::DuplicatePool(_) => ConstantTableReason::DuplicatePool,
+            E::SourceTypeMismatch(_) => ConstantTableReason::SourceTypeMismatch,
+        };
+        fact(FailureClass::Invariant, reason as u16)
+    }
+}

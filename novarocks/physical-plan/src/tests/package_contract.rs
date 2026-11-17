@@ -1594,10 +1594,9 @@ fn package_refuses_a_runtime_filter_binding_table_other_than_its_plan_slice() {
     let mut constant_work =
         novarocks_type_contract::CompileCheckpoints::try_new(&Control, CompilePhase::Validate)
             .unwrap();
-    input.constants = plan
-        .constants()
-        .project_fragment_observed(&fragment, &mut constant_work)
-        .unwrap();
+    input.constants =
+        crate::project_fragment_constants_observed(plan.constants(), &fragment, &mut constant_work)
+            .unwrap();
     constant_work.finish().unwrap();
     let package = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     assert_eq!(

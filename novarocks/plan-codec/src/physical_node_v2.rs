@@ -702,3 +702,9 @@ pub(crate) fn decode_header(
 mod error_tests;
 #[cfg(test)]
 mod owner_tests;
+
+impl From<novarocks_constant_contract::ConstantTableError> for NodeCodecError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(p::ConstantReferenceError::from(error))
+    }
+}

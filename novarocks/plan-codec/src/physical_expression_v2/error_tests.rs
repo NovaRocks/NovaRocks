@@ -77,9 +77,11 @@ fn receiving_ordinary_dependency_errors_keep_the_completed_tail_and_typed_detail
     let control = Control(Mutex::new(Vec::new()));
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     work.step().unwrap();
-    let error = ConstantReferenceError::MissingPool(ConstantPoolId::new(u32::MAX));
+    let error = ConstantReferenceError::Table(
+        novarocks_constant_contract::ConstantTableError::MissingPool(ConstantPoolId::new(u32::MAX)),
+    );
     assert!(matches!(namespace::finish::<()>(work, Err(error.into())),
-        Err(ExpressionCodecError::Constant(ConstantReferenceError::MissingPool(id)))
+        Err(ExpressionCodecError::Constant(ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::MissingPool(id))))
         if id.get() == u32::MAX));
     assert_eq!(*control.0.lock().unwrap(), [0, 1]);
 }

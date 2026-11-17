@@ -640,6 +640,12 @@ fn reservation_exit(
     Ok(())
 }
 
+impl From<novarocks_constant_contract::ConstantTableError> for UnpivotLoweringError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(ConstantReferenceError::from(error))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

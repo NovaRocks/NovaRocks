@@ -220,7 +220,7 @@ fn physical_call_request_never_turns_reference_type_or_address_errors_into_nonco
     ty = ty.with_nullable(false).unwrap();
     let ref1 = reference(1);
     assert!(
-        matches!(invoke(&source(ty, ExprKind::Constant(ref1)), &pools, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::SourceTypeMismatch(actual))) if actual == ref1)
+        matches!(invoke(&source(ty, ExprKind::Constant(ref1)), &pools, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(actual)))) if actual == ref1)
     );
     let missing = ConstantReference {
         pool: ConstantPoolId::new(0),
@@ -228,7 +228,7 @@ fn physical_call_request_never_turns_reference_type_or_address_errors_into_nonco
     };
     let ty = FunctionValueType::new(DataType::Float32, true);
     assert!(
-        matches!(invoke(&source(ty.clone(), ExprKind::Constant(missing)), &pools, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::MissingPool(actual))) if actual == missing.pool)
+        matches!(invoke(&source(ty.clone(), ExprKind::Constant(missing)), &pools, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::MissingPool(actual)))) if actual == missing.pool)
     );
     assert!(matches!(
         invoke(
@@ -274,7 +274,7 @@ fn physical_call_request_never_turns_reference_type_or_address_errors_into_nonco
         false,
     );
     assert!(
-        matches!(invoke(&source(changed, ExprKind::Constant(ref1)), &table, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::SourceTypeMismatch(actual))) if actual == ref1)
+        matches!(invoke(&source(changed, ExprKind::Constant(ref1)), &table, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(actual)))) if actual == ref1)
     );
 }
 

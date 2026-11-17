@@ -356,11 +356,12 @@ fn neutral_sql_partial_final_own_literal_requests_survive_fragment_pool_projecti
     let mut final_calls = 0;
     let mut request_only = 0;
     for fragment in owner.plan().fragments().values() {
-        let projected = owner
-            .plan()
-            .constants()
-            .project_fragment_observed(fragment, &mut work)
-            .unwrap();
+        let projected = novarocks_physical_plan::project_fragment_constants_observed(
+            owner.plan().constants(),
+            fragment,
+            &mut work,
+        )
+        .unwrap();
         for node in fragment.nodes().values() {
             let NodeKind::Aggregate { calls, .. } = &node.kind else {
                 continue;

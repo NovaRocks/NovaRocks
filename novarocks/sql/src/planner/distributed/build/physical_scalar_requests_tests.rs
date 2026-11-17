@@ -426,7 +426,7 @@ fn scalar_requests_checked_constants_keep_nonzero_ordinal_typed_null_original_fi
     );
     assert!(matches!(invoke(&bad,&wrong,&pools,&Control::default()),
         Err(PhysicalScalarRequestError::Argument(PhysicalArgumentError::Reference(
-            novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(actual)))) if actual==reference(2)));
+            novarocks_physical_plan::ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(actual))))) if actual==reference(2)));
 }
 
 #[test]

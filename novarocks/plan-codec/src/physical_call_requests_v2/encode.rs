@@ -328,10 +328,12 @@ fn validate_constant<H>(
     };
     capture_constant(&selected, expected, model, limits)?;
     if !model.compare(expected, selected.value_type(), limits, w)? {
-        return Err((Error::Constant(
-            novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(reference),
-        ))
-        .into());
+        return Err(
+            (Error::Constant(novarocks_physical_plan::ConstantReferenceError::Table(
+                novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(reference),
+            )))
+            .into(),
+        );
     }
     w.step()?;
     Ok(())

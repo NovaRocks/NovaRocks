@@ -377,7 +377,7 @@ fn caller_request_receiver_every_success_and_original_ordinary_callback_has_prim
             1 => assert!(matches!(
                 ordinary,
                 Err(E::Constant(
-                    novarocks_physical_plan::ConstantReferenceError::MissingPool(_)
+                    novarocks_physical_plan::ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::MissingPool(_))
                 ))
             )),
             2 => assert!(matches!(
@@ -389,7 +389,7 @@ fn caller_request_receiver_every_success_and_original_ordinary_callback_has_prim
             _ => assert!(matches!(
                 ordinary,
                 Err(E::Constant(
-                    novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(_)
+                    novarocks_physical_plan::ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(_))
                 ))
             )),
         }

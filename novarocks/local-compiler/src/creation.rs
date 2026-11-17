@@ -404,6 +404,12 @@ pub(crate) fn borrow_scope<'borrow, H>(
     }
 }
 
+impl<H> From<novarocks_constant_contract::ConstantTableError> for FragmentCreationError<H> {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(novarocks_physical_plan::ConstantReferenceError::from(error))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

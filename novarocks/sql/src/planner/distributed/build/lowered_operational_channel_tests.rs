@@ -284,7 +284,9 @@ fn operational_channels_equal_content_foreign_pool_and_field_cannot_replace_orig
     assert!(matches!(
         project_with_pools(&receipt, &ConstantPools::empty(), &Control::default()),
         Err(SqlOperationalProjectionError::Reference(
-            novarocks_physical_plan::ConstantReferenceError::MissingPool(_)
+            novarocks_physical_plan::ConstantReferenceError::Table(
+                novarocks_constant_contract::ConstantTableError::MissingPool(_)
+            )
         ))
     ));
 }

@@ -2912,6 +2912,12 @@ pub fn compile_fragment_with_project_metadata_host<P: ProjectMetadataScope>(
     })
 }
 
+impl From<novarocks_constant_contract::ConstantTableError> for FragmentCompileError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(novarocks_physical_plan::ConstantReferenceError::from(error))
+    }
+}
+
 #[cfg(test)]
 mod capability_admission_tests {
     use super::*;

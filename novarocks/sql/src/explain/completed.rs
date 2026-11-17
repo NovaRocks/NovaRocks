@@ -576,8 +576,8 @@ impl<'a> RenderDiagnostic<'a> {
                 .constants()
                 .resolve_observed(reference, expected, &mut work)
                 .map_err(|error| match error {
-                    novarocks_physical_plan::ConstantReferenceError::Control(error) => error.into(),
-                    novarocks_physical_plan::ConstantReferenceError::Constant(error) => {
+                    novarocks_constant_contract::ConstantTableError::Control(error) => error.into(),
+                    novarocks_constant_contract::ConstantTableError::Constant(error) => {
                         error.into()
                     }
                     other => SqlCompileError::InvalidRequest(other.to_string()),

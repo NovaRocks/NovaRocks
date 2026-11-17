@@ -191,3 +191,16 @@ fn finish<T>(
     work.finish()?;
     result
 }
+
+impl From<novarocks_constant_contract::ConstantTableError> for CallRequestCodecError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(ConstantReferenceError::from(error))
+    }
+}
+impl<H> From<novarocks_constant_contract::ConstantTableError>
+    for crate::host_projection_v2::ProjectionFailure<CallRequestCodecError, H>
+{
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(ConstantReferenceError::from(error))
+    }
+}

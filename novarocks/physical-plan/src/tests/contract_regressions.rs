@@ -3932,7 +3932,11 @@ fn writer_grouped_unpivot_source_gate_preserves_each_original_control_and_ordina
         if ordinary {
             assert_eq!(
                 result,
-                Err(ConstantReferenceError::MissingPool(ConstantPoolId::new(42)))
+                Err(ConstantReferenceError::Table(
+                    novarocks_constant_contract::ConstantTableError::MissingPool(
+                        ConstantPoolId::new(42)
+                    )
+                ))
             );
         } else {
             result.unwrap();

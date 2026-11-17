@@ -188,3 +188,9 @@ where
         _ => Ok(false),
     }
 }
+
+impl From<novarocks_constant_contract::ConstantTableError> for PhysicalArgumentError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(ConstantReferenceError::from(error))
+    }
+}

@@ -92,8 +92,10 @@ fn ordinary_dependency_errors_retain_typed_details_and_completed_work() {
         NodeCodecError::from(ExpressionCodecError::InvalidShape(
             "missing scalar expression",
         )),
-        NodeCodecError::from(p::ConstantReferenceError::MissingPool(
-            p::ConstantPoolId::new(u32::MAX),
+        NodeCodecError::from(p::ConstantReferenceError::Table(
+            novarocks_constant_contract::ConstantTableError::MissingPool(p::ConstantPoolId::new(
+                u32::MAX,
+            )),
         )),
         NodeCodecError::from(RelationCodecError::InvalidShape("missing relation")),
         NodeCodecError::from(
@@ -121,7 +123,9 @@ fn ordinary_dependency_errors_retain_typed_details_and_completed_work() {
             NodeCodecError::Expression(ExpressionCodecError::InvalidShape(message)) => {
                 assert_eq!(message, "missing scalar expression")
             }
-            NodeCodecError::Constant(p::ConstantReferenceError::MissingPool(id)) => {
+            NodeCodecError::Constant(p::ConstantReferenceError::Table(
+                novarocks_constant_contract::ConstantTableError::MissingPool(id),
+            )) => {
                 assert_eq!(id.get(), u32::MAX)
             }
             NodeCodecError::Relation(RelationCodecError::InvalidShape(message)) => {

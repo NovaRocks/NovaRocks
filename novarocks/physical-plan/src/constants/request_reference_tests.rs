@@ -229,7 +229,7 @@ fn project(
     control: &dyn PureCompileControl,
 ) -> Result<ConstantPools, ConstantReferenceError> {
     let mut work = CompileCheckpoints::try_new(control, PHASE)?;
-    let result = pools.project_fragment_observed(fragment, &mut work);
+    let result = crate::project_fragment_constants_observed(pools, fragment, &mut work);
     if matches!(result, Err(ConstantReferenceError::Control(_))) {
         return result;
     }
@@ -362,7 +362,11 @@ fn request_reference_missing_pool_out_of_bounds_and_full_type_refuse_without_rea
     for (address, expected) in [
         (
             reference(7, 1),
-            ConstantReferenceError::MissingPool(ConstantPoolId::new(7)),
+            ConstantReferenceError::Table(
+                novarocks_constant_contract::ConstantTableError::MissingPool(ConstantPoolId::new(
+                    7,
+                )),
+            ),
         ),
         (
             reference(0, 3),
@@ -385,11 +389,15 @@ fn request_reference_missing_pool_out_of_bounds_and_full_type_refuse_without_rea
     );
     assert_eq!(
         project(&wrong, &pools, &Control::default()).unwrap_err(),
-        ConstantReferenceError::SourceTypeMismatch(reference(0, 1))
+        ConstantReferenceError::Table(
+            novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(reference(0, 1))
+        )
     );
     assert_eq!(
         closed(&wrong, &pools, &Control::default()).unwrap_err(),
-        ConstantReferenceError::SourceTypeMismatch(reference(0, 1))
+        ConstantReferenceError::Table(
+            novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(reference(0, 1))
+        )
     );
 }
 
@@ -421,7 +429,9 @@ fn request_nested_named_semantics_are_checked_against_the_real_admitted_pool() {
     let wrong = request_fragment(13, wrong_type, &[Some(reference(0, 1))], None);
     assert_eq!(
         project(&wrong, &pools, &Control::default()).unwrap_err(),
-        ConstantReferenceError::SourceTypeMismatch(reference(0, 1))
+        ConstantReferenceError::Table(
+            novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(reference(0, 1))
+        )
     );
 }
 
@@ -451,7 +461,9 @@ fn request_reference_projection_and_validation_preserve_every_actual_small_contr
         &[Some(reference(9, 1))],
         None,
     );
-    let expected = Err(ConstantReferenceError::MissingPool(ConstantPoolId::new(9)));
+    let expected = Err(ConstantReferenceError::Table(
+        novarocks_constant_contract::ConstantTableError::MissingPool(ConstantPoolId::new(9)),
+    ));
     let trace = every_prefix(
         |control| project(&bad, &pools, control).map(|_| ()),
         expected.clone(),

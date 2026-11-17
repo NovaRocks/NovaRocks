@@ -1064,7 +1064,7 @@ fn unpivot_special_reference_missing_pool_and_ordinal_are_exact_package_errors()
         };
         match shape {
             Shape::MissingCollectionPool => assert!(matches!(error,
-                ConstantReferenceError::MissingPool(id) if id.get()==u32::MAX-2)),
+                ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::MissingPool(id)) if id.get()==u32::MAX-2)),
             Shape::BadCollectionOrdinal => assert!(matches!(
                 error,
                 ConstantReferenceError::Constant(ConstantError::Invalid(

@@ -20855,3 +20855,9 @@ mod constant_limit_category_tests {
         }
     }
 }
+
+impl From<novarocks_constant_contract::ConstantTableError> for ContractLoweringError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(novarocks_physical_plan::ConstantReferenceError::from(error))
+    }
+}

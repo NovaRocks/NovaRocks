@@ -209,7 +209,7 @@ fn collection_sparse_closure_keeps_each_used_alias_and_selected_nonzero_ordinal(
         Err(ConstantReferenceError::UnusedPools)
     );
     let projected = completed(&Control::good(), |work| {
-        pools.project_fragment_observed(&fragment, work)
+        crate::project_fragment_constants_observed(&pools, &fragment, work)
     })
     .unwrap();
     assert_eq!(
@@ -223,7 +223,9 @@ fn collection_sparse_closure_keeps_each_used_alias_and_selected_nonzero_ordinal(
     gate(&fragment, &projected, PlanLimits::FROZEN, &Control::good()).unwrap();
     completed(&Control::good(), |work| {
         for (id, ordinal, expected) in [(0, 1, vec![-2, -1]), (u32::MAX, 2, vec![11])] {
-            let value = projected.resolve_source_observed(reference(id, ordinal), work)?;
+            let value = projected
+                .resolve_source_observed(reference(id, ordinal), work)
+                .map_err(ConstantReferenceError::from)?;
             assert_eq!(value.ordinal(), ordinal);
             assert!(Arc::ptr_eq(value.pool().array(), backing.array()));
             let view = value
@@ -239,7 +241,7 @@ fn collection_sparse_closure_keeps_each_used_alias_and_selected_nonzero_ordinal(
     .unwrap();
     let (single, _) = collection_fragment(&constants[..1], backing.value_type());
     let one = completed(&Control::good(), |work| {
-        pools.project_fragment_observed(&single, work)
+        crate::project_fragment_constants_observed(&pools, &single, work)
     })
     .unwrap();
     assert_eq!(one.entries().len(), 1);
@@ -427,7 +429,9 @@ fn selected_map_rows_preserve_payload_and_original_item_byte_limits() {
     let (fragment, _) = collection_fragment(std::slice::from_ref(&selected), backing.value_type());
     gate(&fragment, &pools, PlanLimits::FROZEN, &Control::good()).unwrap();
     completed(&Control::good(), |work| {
-        let value = pools.resolve_source_observed(reference(u32::MAX, 1), work)?;
+        let value = pools
+            .resolve_source_observed(reference(u32::MAX, 1), work)
+            .map_err(ConstantReferenceError::from)?;
         let view = value
             .utf8_map_observed(CompilePhase::Validate, work.control())?
             .unwrap();
@@ -591,9 +595,11 @@ fn collection_gate_original_three_causes_stop_each_actual_prefix_including_ordin
         } else if address.pool.get() == u32::MAX {
             assert_eq!(
                 result,
-                Err(ConstantReferenceError::MissingPool(ConstantPoolId::new(
-                    u32::MAX
-                )))
+                Err(ConstantReferenceError::Table(
+                    novarocks_constant_contract::ConstantTableError::MissingPool(
+                        ConstantPoolId::new(u32::MAX)
+                    )
+                ))
             );
         } else {
             assert_eq!(
@@ -703,6 +709,7 @@ fn actual_plan_extraction_publishes_direct_collection_closure_without_scalar_pla
             package
                 .constants()
                 .resolve_source_observed(reference(id, ordinal), work)
+                .map_err(ConstantReferenceError::from)
         })
         .unwrap();
         assert!(Arc::ptr_eq(source.pool().array(), backing.array()));

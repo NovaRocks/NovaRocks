@@ -36,9 +36,8 @@ macro_rules! numeric_id {
 
 numeric_id!(FragmentId);
 numeric_id!(NodeId);
-numeric_id!(ValueId);
-numeric_id!(ExprId);
-numeric_id!(ConstantPoolId);
+pub use novarocks_constant_contract::ConstantPoolId;
+pub use novarocks_expression_contract::{ExprId, ValueId};
 numeric_id!(AggregateCallId);
 numeric_id!(AggregateSequenceId);
 numeric_id!(EdgeId);

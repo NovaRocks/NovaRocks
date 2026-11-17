@@ -497,7 +497,7 @@ fn wrong_complete_type_missing_pool_and_selected_ordinal_fail_before_emission() 
         .insert(p::ConstantPoolId::new(u32::MAX), pool)
         .unwrap();
     assert!(matches!(run(&foreign, &c, limits(), SOURCE, false),
-        Err(Error::Constant(p::ConstantReferenceError::SourceTypeMismatch(reference)))
+        Err(Error::Constant(p::ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(reference))))
             if reference.pool == p::ConstantPoolId::new(u32::MAX) && reference.ordinal == 1));
 
     assert!(matches!(

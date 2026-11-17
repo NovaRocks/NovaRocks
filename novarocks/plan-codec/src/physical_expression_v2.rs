@@ -165,3 +165,9 @@ struct PreparedExpressionIds<'a> {
 
 #[cfg(test)]
 mod error_tests;
+
+impl From<novarocks_constant_contract::ConstantTableError> for ExpressionCodecError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(novarocks_physical_plan::ConstantReferenceError::from(error))
+    }
+}

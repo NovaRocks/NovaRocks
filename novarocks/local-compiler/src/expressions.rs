@@ -407,6 +407,7 @@ expression_creation_cause!(ValueTypeError);
 expression_creation_cause!(novarocks_type_contract::owned_resources::btree::BTreeResourceError);
 expression_creation_cause!(ConstantError);
 expression_creation_cause!(ConstantReferenceError);
+expression_creation_cause!(novarocks_constant_contract::ConstantTableError);
 expression_creation_cause!(ExpressionsCompileError);
 expression_creation_cause!(novarocks_functions::ArithmeticPrepareError);
 expression_creation_cause!(novarocks_functions::CastPrepareError);
@@ -2819,6 +2820,12 @@ fn arithmetic_operator(
 #[cfg(test)]
 #[path = "checked_reference_tests.rs"]
 pub(crate) mod checked_reference_tests;
+
+impl From<novarocks_constant_contract::ConstantTableError> for ExpressionLoweringError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(ConstantReferenceError::from(error))
+    }
+}
 
 #[cfg(test)]
 mod primary_cause_footer_tests {

@@ -73,6 +73,7 @@ trait ReadFailure:
     + From<TypeCodecError>
     + From<CompileControlError>
     + From<novarocks_physical_plan::ConstantReferenceError>
+    + From<novarocks_constant_contract::ConstantTableError>
 {
     fn is_primary_refusal(&self) -> bool;
 }
@@ -623,7 +624,12 @@ fn preflight<F: ReadFailure>(
                         };
                         w.step()?;
                         if !matches {
-                            return Err(novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(address).into());
+                            return Err(novarocks_physical_plan::ConstantReferenceError::Table(
+                                novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(
+                                    address,
+                                ),
+                            )
+                            .into());
                         }
                     }
                 }

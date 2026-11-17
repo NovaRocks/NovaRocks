@@ -742,12 +742,12 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     compare_types(header, pool.value_type(), &mut self.facts, admission, work)?
                 };
                 if !verified.matches() {
-                    return Err(
-                        novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(
+                    return Err(novarocks_physical_plan::ConstantReferenceError::Table(
+                        novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(
                             reference,
-                        )
-                        .into(),
-                    );
+                        ),
+                    )
+                    .into());
                 }
                 work.flush()?;
                 let selected = self

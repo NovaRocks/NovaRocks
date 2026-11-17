@@ -15,221 +15,49 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Sparse references into the plan's sole checked immutable backing table.
-//! Address identity is not selected-value equality. No scalar is reconstructed
-//! and borrowing an admitted source does not consume a new backing policy.
-
-use crate::ConstantPoolId;
-use novarocks_constant_contract::{ConstantError, ConstantPool, ConstantValue};
+//! Fragment-level constant consumers and checked backing projection.
+#[cfg(test)]
+use novarocks_constant_contract::ConstantPool;
+use novarocks_constant_contract::{
+    ConstantError, ConstantPoolId, ConstantPools, ConstantReference, ConstantTableError,
+};
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError, FunctionValueType};
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConstantReference {
-    pub pool: ConstantPoolId,
-    pub ordinal: u32,
-}
-
-/// This map deliberately has no Eq or Hash implementation: two addresses do
-/// not prove value equality and checked backings are not raw-byte values.
-#[derive(Clone, Debug)]
-pub struct ConstantPools {
-    entries: BTreeMap<ConstantPoolId, ConstantPool>,
-    storage: novarocks_type_contract::ValueTypeStorageLifetime,
-}
-
-impl ConstantPools {
-    pub fn empty() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-            storage: novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-        }
-    }
-    /// The map's finite construction responsibility is independent of each pool.
-    /// Moving this marker neither allocates nor authorizes another map request.
-    pub fn with_storage_lifetime(
-        mut self,
-        storage: novarocks_type_contract::ValueTypeStorageLifetime,
-    ) -> Self {
-        self.storage = storage;
-        self
-    }
-    pub fn entries(&self) -> &BTreeMap<ConstantPoolId, ConstantPool> {
-        &self.entries
-    }
-    pub fn insert(
-        &mut self,
-        id: ConstantPoolId,
-        pool: ConstantPool,
-    ) -> Result<(), ConstantReferenceError> {
-        use std::collections::btree_map::Entry;
-        match self.entries.entry(id) {
-            Entry::Vacant(entry) => {
-                entry.insert(pool);
-                Ok(())
-            }
-            Entry::Occupied(_) => Err(ConstantReferenceError::DuplicatePool(id)),
-        }
-    }
-    pub fn resolve_observed(
-        &self,
-        reference: ConstantReference,
-        expected: &FunctionValueType,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<ConstantValue, ConstantReferenceError> {
-        // The caller owns the encompassing finish; an originating control or
-        // resource refusal must never be replaced by a later observation.
-        let pool = self.pool_observed(reference.pool, work)?;
-        if !expected.exactly_equals_observed(pool.value_type(), || {
-            work.step().map_err(ConstantReferenceError::from)
-        })? {
-            return Err(ConstantReferenceError::SourceTypeMismatch(reference));
+/// Preserve every actual pool address used by expressions, original call
+/// requests or either relational/writer-statistics Unpivot. Identity is sparse
+/// namespace identity, even when two keys loan the same checked backing.
+pub fn project_fragment_constants_observed(
+    pools: &ConstantPools,
+    fragment: &crate::Fragment,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ConstantPools, ConstantReferenceError> {
+    let mut projected = ConstantPools::empty();
+    visit_typed_constant_references_observed(fragment, work, |reference, expected, work| {
+        let value = pools.resolve_observed(reference, expected, work)?;
+        work.flush()?;
+        if !projected.entries().contains_key(&reference.pool) {
+            projected.insert(reference.pool, value.pool().clone())?;
         }
         work.step()?;
-        pool.value(reference.ordinal)
-            .map_err(ConstantReferenceError::from)
-    }
-    fn pool_observed(
-        &self,
-        id: ConstantPoolId,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<&ConstantPool, ConstantReferenceError> {
-        work.step()?;
-        self.entries
-            .get(&id)
-            .ok_or(ConstantReferenceError::MissingPool(id))
-    }
-    /// Borrow the selected row and its actual admitted source type. This
-    /// resolves an address only: each consumer must independently prove its
-    /// complete type/profile and output relation. No expected type is guessed
-    /// from a joined output, and no source Field or backing is reconstructed.
-    pub fn resolve_source_observed(
-        &self,
-        reference: ConstantReference,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<ConstantValue, ConstantReferenceError> {
-        self.resolve_source_core::<ConstantReferenceError>(
-            reference,
-            false,
-            &mut |_, _| Ok(()),
-            work,
-        )
-    }
-    /// Capture the actual selected source before its completed lookup steps.
-    /// The caller has admitted lookup work and owns entry and finish. The
-    /// original pool author creates only its Arc-backed ordinal handle; no
-    /// type, Field, array or scalar is reconstructed and no grant is minted.
-    pub fn resolve_source_captured_observed<E: From<ConstantReferenceError>>(
-        &self,
-        reference: ConstantReference,
-        capture: &mut impl FnMut(&ConstantValue, &mut CompileCheckpoints<'_>) -> Result<(), E>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<ConstantValue, E> {
-        self.resolve_source_core(reference, true, capture, work)
-    }
-    fn resolve_source_core<E: From<ConstantReferenceError>>(
-        &self,
-        reference: ConstantReference,
-        captured: bool,
-        capture: &mut impl FnMut(&ConstantValue, &mut CompileCheckpoints<'_>) -> Result<(), E>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<ConstantValue, E> {
-        if !captured {
-            work.step().map_err(ConstantReferenceError::from)?;
-        }
-        let pool = self.entries.get(&reference.pool);
-        let Some(pool) = pool else {
-            if captured {
-                work.step().map_err(ConstantReferenceError::from)?;
-            }
-            return Err(ConstantReferenceError::MissingPool(reference.pool).into());
-        };
-        // Only the caller-owned path selects before completed observations.
-        // An invalid ordinal has no source capture and keeps both old steps.
-        let selected = if captured {
-            let selected = pool.value(reference.ordinal);
-            if let Ok(value) = &selected {
-                capture(value, work)?;
-            }
-            work.step().map_err(ConstantReferenceError::from)?;
-            Some(selected)
-        } else {
-            None
-        };
-        work.step().map_err(ConstantReferenceError::from)?;
-        selected
-            .unwrap_or_else(|| pool.value(reference.ordinal))
-            .map_err(ConstantReferenceError::from)
-            .map_err(E::from)
-    }
-    /// Project only the already admitted backings referenced by this closure.
-    /// All references are checked, including repeat ordinals and full types;
-    /// one pool handle is retained once per sparse key.
-    pub fn project_observed<'a>(
-        &self,
-        references: impl IntoIterator<Item = (ConstantReference, &'a FunctionValueType)>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Self, ConstantReferenceError> {
-        self.project_optional_references_observed(references.into_iter().map(Some), work)
-    }
-    /// Observe every visited definition, including definitions without a
-    /// constant reference. Filtering before this boundary would hide work.
-    pub fn project_optional_references_observed<'a>(
-        &self,
-        references: impl IntoIterator<Item = Option<(ConstantReference, &'a FunctionValueType)>>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Self, ConstantReferenceError> {
-        let mut projected = Self::empty();
-        for definition in references {
-            work.step()?;
-            let Some((reference, expected)) = definition else {
-                continue;
-            };
-            let value = self.resolve_observed(reference, expected, work)?;
-            work.step()?;
-            projected
-                .entries
-                .entry(reference.pool)
-                .or_insert_with(|| value.pool().clone());
-        }
-        Ok(projected)
-    }
-    /// Preserve every actual pool address used by expressions, original call
-    /// requests or either relational/writer-statistics Unpivot. Identity is sparse
-    /// namespace identity, even when two keys loan the same checked backing.
-    pub fn project_fragment_observed(
-        &self,
-        fragment: &crate::Fragment,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Self, ConstantReferenceError> {
-        let mut projected = Self::empty();
-        visit_typed_constant_references_observed(fragment, work, |reference, expected, work| {
-            let value = self.resolve_observed(reference, expected, work)?;
+        work.flush()?;
+        Ok(())
+    })?;
+    visit_unpivot_constants_observed(fragment, work, |_, constant, _, work| {
+        if let Some(reference) = collection_reference(constant) {
+            let value = pools.resolve_source_observed(reference, work)?;
             work.flush()?;
-            projected
-                .entries
-                .entry(reference.pool)
-                .or_insert_with(|| value.pool().clone());
+            if !projected.entries().contains_key(&reference.pool) {
+                projected.insert(reference.pool, value.pool().clone())?;
+            }
             work.step()?;
             work.flush()?;
-            Ok(())
-        })?;
-        visit_unpivot_constants_observed(fragment, work, |_, constant, _, work| {
-            if let Some(reference) = collection_reference(constant) {
-                let value = self.resolve_source_observed(reference, work)?;
-                work.flush()?;
-                projected
-                    .entries
-                    .entry(reference.pool)
-                    .or_insert_with(|| value.pool().clone());
-                work.step()?;
-                work.flush()?;
-            }
-            Ok(())
-        })?;
-        Ok(projected)
-    }
+        }
+        Ok(())
+    })?;
+    Ok(projected)
 }
 
 /// Visit the actual typed expression and original request references. Every
@@ -273,9 +101,7 @@ pub enum ConstantReferenceError {
     Control(CompileControlError),
     Constant(ConstantError),
     Structure(crate::ValidationErrors),
-    MissingPool(ConstantPoolId),
-    DuplicatePool(ConstantPoolId),
-    SourceTypeMismatch(ConstantReference),
+    Table(ConstantTableError),
     UnusedPools,
     InvalidConsumer(&'static str),
 }
@@ -297,24 +123,26 @@ impl From<ConstantError> for ConstantReferenceError {
         }
     }
 }
+impl From<ConstantTableError> for ConstantReferenceError {
+    fn from(error: ConstantTableError) -> Self {
+        match error {
+            ConstantTableError::Control(cause) => Self::Control(cause),
+            ConstantTableError::Constant(cause) => Self::from(cause),
+            other => Self::Table(other),
+        }
+    }
+}
 impl fmt::Display for ConstantReferenceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(formatter),
             Self::Constant(error) => error.fmt(formatter),
             Self::Structure(error) => error.fmt(formatter),
-            Self::MissingPool(id) => write!(formatter, "missing constant pool {}", id.get()),
-            Self::DuplicatePool(id) => write!(formatter, "duplicate constant pool {}", id.get()),
+            Self::Table(error) => error.fmt(formatter),
             Self::UnusedPools => {
                 formatter.write_str("constant pool table contains unused definitions")
             }
             Self::InvalidConsumer(message) => formatter.write_str(message),
-            Self::SourceTypeMismatch(reference) => write!(
-                formatter,
-                "constant {}:{} differs from its expected source type",
-                reference.pool.get(),
-                reference.ordinal
-            ),
         }
     }
 }
@@ -324,11 +152,8 @@ impl std::error::Error for ConstantReferenceError {
             Self::Control(source) => Some(source),
             Self::Constant(source) => Some(source),
             Self::Structure(source) => Some(source),
-            Self::MissingPool(_)
-            | Self::DuplicatePool(_)
-            | Self::SourceTypeMismatch(_)
-            | Self::UnusedPools
-            | Self::InvalidConsumer(_) => None,
+            Self::Table(source) => Some(source),
+            Self::UnusedPools | Self::InvalidConsumer(_) => None,
         }
     }
 }
@@ -720,7 +545,7 @@ fn validate_fragment_constants_core(
         }
     }
     validate_unpivot_constants(fragment, pools, limits, &mut used, mode, work)?;
-    if require_closed && used.len() != pools.entries.len() {
+    if require_closed && used.len() != pools.entries().len() {
         return Err(ConstantReferenceError::UnusedPools);
     }
     Ok(())

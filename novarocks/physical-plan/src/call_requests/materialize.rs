@@ -356,3 +356,16 @@ fn boxed<T, H>(
     work.flush()?;
     Ok(values)
 }
+
+impl From<novarocks_constant_contract::ConstantTableError> for CallRequestMaterializationError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(ConstantReferenceError::from(error))
+    }
+}
+impl<H> From<novarocks_constant_contract::ConstantTableError>
+    for CallRequestMaterializationFailure<H>
+{
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(ConstantReferenceError::from(error))
+    }
+}

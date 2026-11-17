@@ -364,7 +364,7 @@ fn caller_sender_captured_constant_address_and_complete_type_keep_original_failu
         let result = invoke(&f, &types, &requests, &c, SOURCE, limits(), &mut |_| Ok(()));
         if reference.pool.get() == 1 {
             assert!(
-                matches!(result,Err(Error::Constant(p::ConstantReferenceError::MissingPool(id))) if id==reference.pool)
+                matches!(result,Err(Error::Constant(p::ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::MissingPool(id)))) if id==reference.pool)
             );
         } else {
             assert!(matches!(
@@ -395,7 +395,7 @@ fn caller_sender_captured_constant_address_and_complete_type_keep_original_failu
     let requests = project(&params, &args);
     setup.arm(None);
     assert!(
-        matches!(invoke(&f,&types,&requests,&setup,SOURCE,limits(),&mut |_|Ok(())),Err(Error::Constant(p::ConstantReferenceError::SourceTypeMismatch(r))) if r.ordinal==1 && r.pool.get()==u32::MAX)
+        matches!(invoke(&f,&types,&requests,&setup,SOURCE,limits(),&mut |_|Ok(())),Err(Error::Constant(p::ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(r)))) if r.ordinal==1 && r.pool.get()==u32::MAX)
     );
 }
 

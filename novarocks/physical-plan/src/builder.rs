@@ -1135,7 +1135,9 @@ impl PlanBuilder {
         id: crate::ConstantPoolId,
         pool: crate::ConstantPool,
     ) -> Result<(), crate::ConstantReferenceError> {
-        self.constants.insert(id, pool)
+        self.constants
+            .insert(id, pool)
+            .map_err(crate::ConstantReferenceError::from)
     }
 
     /// Install the authored parameter values consumed by exact expression refs.
@@ -1672,4 +1674,10 @@ pub fn validate_plan_observed(
     work.finish_result(result, |cause| {
         crate::ConstantReferenceError::from(cause).into()
     })
+}
+
+impl From<novarocks_constant_contract::ConstantTableError> for PlanConstructionError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(crate::ConstantReferenceError::from(error))
+    }
 }

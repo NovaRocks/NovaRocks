@@ -681,7 +681,7 @@ fn lower_constant(
             let value = package
                 .constants()
                 .resolve_source_observed(*reference, work)
-                .map_err(constant_error)?;
+                .map_err(|error| constant_error(error.into()))?;
             collection_domain(value.value_type(), output, work)?;
             work.flush()?;
             let selected = value
@@ -709,7 +709,7 @@ fn lower_constant(
             let value = package
                 .constants()
                 .resolve_source_observed(*reference, work)
-                .map_err(constant_error)?;
+                .map_err(|error| constant_error(error.into()))?;
             collection_domain(value.value_type(), output, work)?;
             work.flush()?;
             let selected = value
