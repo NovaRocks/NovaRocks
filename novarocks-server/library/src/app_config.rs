@@ -795,8 +795,6 @@ fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
 fn validate_application_configuration(config: &NovaRocksConfig) -> Result<()> {
     if config.cluster.role == ClusterRole::Fe {
         crate::composition::validate_frontend_joint_startup(&config.runtime)?;
-    } else {
-        crate::sdk_listing_profile::validate_current()?;
     }
     config.application.state_store_policy.resolve()?;
     Ok(())
@@ -5062,7 +5060,7 @@ mod joint_startup_load_tests {
         config.cluster.role = ClusterRole::Be;
         config.runtime.frontend_workload.concurrency_limit = 257;
         validate_application_configuration(&config)
-            .expect("BE keeps its original listing validation");
+            .expect("BE load does not apply the frontend workload policy");
     }
 }
 

@@ -368,7 +368,6 @@ pub fn compose_backend_server_config(
         novarocks_failpoint::liveness::PreparedRoleSession,
     >,
 ) -> anyhow::Result<BackendServerConfig> {
-    crate::sdk_listing_profile::validate_current()?;
     config
         .server
         .validate_for_role(novarocks_types::ClusterRole::Be)
@@ -566,7 +565,6 @@ pub fn compose_frontend_role_config(
         novarocks_failpoint::liveness::PreparedRoleSession,
     >,
 ) -> anyhow::Result<FrontendRoleConfig> {
-    crate::sdk_listing_profile::validate_current()?;
     let runtime_config = &config.runtime;
     let constant_policy = crate::compiled_composition::frontend_constant_policy(
         runtime_config
