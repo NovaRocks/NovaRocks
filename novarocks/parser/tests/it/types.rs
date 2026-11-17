@@ -443,3 +443,19 @@ fn overlapping_type_rules_choose_grammar_alternatives_without_swallowing_constru
         assert_eq!(span, expected_span, "{source}");
     }
 }
+
+#[test]
+fn interval_constructor_rejection_keeps_qualifier_location_instead_of_generic_fallback() {
+    for source in [
+        "INTERVAL HOUR TO HOUR",
+        "INTERVAL MINUTE TO HOUR",
+        "INTERVAL MINUTE TO MINUTE",
+    ] {
+        let ParserError::Parse(ParseError::UnexpectedToken { span, .. }) =
+            parse_type(source).unwrap_err()
+        else {
+            panic!("constructor error")
+        };
+        assert_eq!(span, Span::new(9, source.len()), "{source}");
+    }
+}

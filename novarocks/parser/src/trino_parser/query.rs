@@ -412,7 +412,7 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_group_by(&mut self) -> Result<GroupBy, ParserError> {
+    pub(super) fn parse_group_by(&mut self) -> Result<GroupBy, ParserError> {
         let start = self.current().span;
         let distinct = self.parse_optional_distinct();
         let mut elements = vec![self.parse_grouping_element()?];

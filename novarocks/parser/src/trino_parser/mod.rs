@@ -42,6 +42,11 @@ struct Parser<'source> {
     // Only committed parameter productions enter this construction ledger.
     // Pattern quantifiers and trivia question marks are not parameter events.
     parameter_events: Vec<Span>,
+    // An enclosing grammar production may own a specific delimiter token.
+    // Keep that token's real kind and range; never insert another End token.
+    grammar_boundary: Option<usize>,
+    // SELECT items and ROW fields admit an implicit alias after the expression.
+    alias_follow: bool,
 }
 
 impl<'source> Parser<'source> {
@@ -52,6 +57,8 @@ impl<'source> Parser<'source> {
             position: 0,
             next_parameter: 0,
             parameter_events: Vec::new(),
+            grammar_boundary: None,
+            alias_follow: false,
         })
     }
 
@@ -61,6 +68,34 @@ impl<'source> Parser<'source> {
         } else {
             Err(self.error("end of input"))
         }
+    }
+
+    pub(super) fn with_grammar_boundary<T>(
+        &mut self,
+        boundary: usize,
+        parse: impl FnOnce(&mut Self) -> Result<T, GrammarError>,
+    ) -> Result<T, GrammarError> {
+        assert!(boundary < self.tokens.len());
+        let previous = self.grammar_boundary.replace(boundary);
+        let result = parse(self);
+        self.grammar_boundary = previous;
+        result
+    }
+
+    pub(super) fn grammar_boundary_at_current(&self) -> bool {
+        self.grammar_boundary
+            .is_some_and(|index| self.peek(0).span == self.tokens[index].span)
+    }
+
+    fn with_alias_follow<T>(
+        &mut self,
+        allowed: bool,
+        parse: impl FnOnce(&mut Self) -> Result<T, GrammarError>,
+    ) -> Result<T, GrammarError> {
+        let previous = std::mem::replace(&mut self.alias_follow, allowed);
+        let result = parse(self);
+        self.alias_follow = previous;
+        result
     }
 }
 

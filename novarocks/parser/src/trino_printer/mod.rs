@@ -6,6 +6,7 @@ use crate::ast::*;
 use std::fmt::Write;
 
 mod expression;
+mod json;
 mod literal_type;
 mod query;
 

@@ -322,6 +322,17 @@ impl Parser<'_> {
             }));
         }
         let end = self.current();
+        let grammar_end = match first.kind {
+            TokenKind::Keyword(Keyword::Year) => end.kind == TokenKind::Keyword(Keyword::Month),
+            TokenKind::Keyword(Keyword::Day | Keyword::Hour | Keyword::Minute) => matches!(
+                end.kind,
+                TokenKind::Keyword(Keyword::Hour | Keyword::Minute | Keyword::Second)
+            ),
+            _ => false,
+        };
+        if !grammar_end {
+            return Err(self.error("a grammar ending field for this interval qualifier"));
+        }
         let valid = match first.kind {
             TokenKind::Keyword(Keyword::Year) => end.kind == TokenKind::Keyword(Keyword::Month),
             TokenKind::Keyword(Keyword::Day) => matches!(
@@ -336,9 +347,12 @@ impl Parser<'_> {
             _ => false,
         };
         if !valid {
-            return Err(self
-                .error("a valid ending field for this interval qualifier")
-                .into());
+            let span = Span::new(first.span.start(), end.span.end());
+            return Err(literal_error(
+                "a valid ending field for this interval qualifier",
+                &self.source[span.start()..span.end()],
+                span,
+            ));
         }
         self.bump();
         let fractional_precision = if end.kind == TokenKind::Keyword(Keyword::Second)

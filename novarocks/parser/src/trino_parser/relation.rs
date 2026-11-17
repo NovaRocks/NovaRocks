@@ -122,6 +122,7 @@ impl Parser<'_> {
         let explicit = self.eat_keyword(Keyword::As).is_some();
         if explicit
             || (self.is_identifier(0)
+                && !self.grammar_boundary_at_current()
                 && !self.query_clause_follows_alias()
                 && !self.relation_clause_follows_alias())
         {
@@ -142,7 +143,7 @@ impl Parser<'_> {
         }
     }
 
-    fn relation_clause_follows_alias(&self) -> bool {
+    pub(super) fn relation_clause_follows_alias(&self) -> bool {
         match self.peek(0).kind {
             TokenKind::Keyword(Keyword::Tablesample) => {
                 matches!(

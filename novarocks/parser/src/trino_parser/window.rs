@@ -33,7 +33,7 @@ impl Parser<'_> {
         })
     }
 
-    fn parse_sort_item(&mut self) -> Result<SortItem, ParserError> {
+    pub(super) fn parse_sort_item(&mut self) -> Result<SortItem, ParserError> {
         let start = self.current().span;
         let sort_key = self.parse_expression()?;
         let ordering = if self.eat_keyword(Keyword::Desc).is_some() {
@@ -195,7 +195,7 @@ impl Parser<'_> {
         })
     }
 
-    fn parse_window_bound(&mut self) -> Result<WindowFrameBound, ParserError> {
+    pub(super) fn parse_window_bound(&mut self) -> Result<WindowFrameBound, ParserError> {
         let start = self.current().span;
         if self.at_keyword(Keyword::Current)
             && self.peek(1).kind == TokenKind::Keyword(Keyword::Row)

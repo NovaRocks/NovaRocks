@@ -387,10 +387,10 @@ impl Writer {
                 self.character(')');
             }
             Relation::LegacyTableFunction(_) => legacy("table function"),
+            Relation::JsonTable(value) => self.json_table(value),
             Relation::Pivot(_)
             | Relation::Nearest(_)
             | Relation::TableFunction(_)
-            | Relation::JsonTable(_)
             | Relation::PatternRecognition(_) => unsupported("advanced relation vocabulary"),
         }
     }

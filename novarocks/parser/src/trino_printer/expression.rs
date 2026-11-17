@@ -209,7 +209,7 @@ impl Writer {
             | Expr::JsonQuery(_)
             | Expr::JsonSerialize(_)
             | Expr::JsonObject(_)
-            | Expr::JsonArray(_) => unsupported("JSON expression vocabulary"),
+            | Expr::JsonArray(_) => self.json_expression(value),
             Expr::Extract(_)
             | Expr::AtLocal(_)
             | Expr::AtTimeZone(_)

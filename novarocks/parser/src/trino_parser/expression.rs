@@ -54,20 +54,23 @@ impl Parsed {
 
 impl Parser<'_> {
     pub(super) fn parse_expression(&mut self) -> Result<Expr, ParserError> {
-        Ok(self.expression_bp(0)?.expression)
+        self.with_alias_follow(false, |parser| Ok(parser.expression_bp(0)?.expression))
     }
 
     pub(super) fn parse_value_expression(&mut self) -> Result<Expr, ParserError> {
-        Ok(self.expression_bp(50)?.expression)
+        self.with_alias_follow(false, |parser| Ok(parser.expression_bp(50)?.expression))
     }
 
     pub(super) fn parse_projection_expression(&mut self) -> Result<(Expr, bool), ParserError> {
-        let parsed = self.expression_bp(0)?;
+        let parsed = self.with_alias_follow(true, |parser| parser.expression_bp(0))?;
         Ok((parsed.expression, parsed.primary))
     }
 
     #[recursive::recursive]
     fn expression_bp(&mut self, minimum: u8) -> Result<Parsed, ParserError> {
+        if self.grammar_boundary_at_current() {
+            return Err(self.error("an expression before the enclosing delimiter"));
+        }
         let start = self.peek(0).span;
         let mut left = if minimum <= 30 && self.eat_keyword(K::Not).is_some() {
             let child = self.expression_bp(30)?;
@@ -103,6 +106,9 @@ impl Parser<'_> {
             self.primary_expression()?
         };
         loop {
+            if self.grammar_boundary_at_current() {
+                break;
+            }
             let logical = if self.at_keyword(K::Or) {
                 Some((10, LogicalOperator::Or))
             } else if self.at_keyword(K::And) {
@@ -557,7 +563,7 @@ impl Parser<'_> {
                 let mut fields = Vec::new();
                 loop {
                     let field_start = self.peek(0).span;
-                    let expression = self.parse_expression()?;
+                    let (expression, _) = self.parse_projection_expression()?;
                     let name = if self.eat_keyword(K::As).is_some() || self.is_identifier(0) {
                         Some(self.ident()?)
                     } else {
@@ -603,7 +609,7 @@ impl Parser<'_> {
                     }
                     self.expect_symbol(S::RParen)?;
                     self.expect_symbol(S::Arrow)?;
-                    let body = self.parse_expression()?;
+                    let body = self.expression_bp(0)?.expression;
                     Expr::Lambda(AstBox::new(LambdaExpr {
                         arguments: arguments.into(),
                         body,
@@ -674,7 +680,7 @@ impl Parser<'_> {
                         name,
                     };
                     self.expect_symbol(S::Arrow)?;
-                    let body = self.parse_expression()?;
+                    let body = self.expression_bp(0)?.expression;
                     Expr::Lambda(AstBox::new(LambdaExpr {
                         arguments: vec![argument].into(),
                         body,
@@ -870,6 +876,23 @@ impl Parser<'_> {
         })
     }
 
+    pub(super) fn parse_call_argument(&mut self) -> Result<CallArgument, ParserError> {
+        let start = self.peek(0).span;
+        let name = if self.is_identifier(0) && self.peek(1).kind == T::Symbol(S::FatArrow) {
+            let name = self.ident()?;
+            self.bump();
+            Some(name)
+        } else {
+            None
+        };
+        let value = self.parse_expression()?;
+        Ok(CallArgument {
+            name,
+            value,
+            span: self.span_since(start),
+        })
+    }
+
     fn function_expression(
         &mut self,
         name: ObjectName,
@@ -910,20 +933,7 @@ impl Parser<'_> {
             });
         } else if !self.at_symbol(S::RParen) && !self.at_keyword(K::Order) {
             loop {
-                let argument_start = self.peek(0).span;
-                let name = if self.is_identifier(0) && self.peek(1).kind == T::Symbol(S::FatArrow) {
-                    let name = self.ident()?;
-                    self.bump();
-                    Some(name)
-                } else {
-                    None
-                };
-                let value = self.parse_expression()?;
-                arguments.push(CallArgument {
-                    name,
-                    value,
-                    span: self.span_since(argument_start),
-                });
+                arguments.push(self.parse_call_argument()?);
                 if self.eat_symbol(S::Comma).is_none() {
                     break;
                 }
@@ -1066,7 +1076,7 @@ impl Parser<'_> {
     }
 }
 
-fn name_expression(name: ObjectName) -> Expr {
+pub(super) fn name_expression(name: ObjectName) -> Expr {
     let mut parts = name.parts.into_iter();
     let mut expression = Expr::Identifier(parts.next().expect("qualified name is nonempty"));
     for field in parts {

@@ -45,3 +45,5 @@ mod trino_special;
 mod types;
 
 mod trino_json;
+
+mod printer_json;
