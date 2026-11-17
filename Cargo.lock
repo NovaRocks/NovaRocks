@@ -3713,6 +3713,7 @@ dependencies = [
  "novarocks-expression",
  "novarocks-expression-contract",
  "novarocks-failure-contract",
+ "novarocks-function-contract",
  "novarocks-functions",
  "novarocks-result-contract",
  "novarocks-type-contract",
