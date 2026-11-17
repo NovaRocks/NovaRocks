@@ -1183,11 +1183,13 @@ mod tests {
         };
         assert_eq!(logical.operator, ast::LogicalOperator::Or);
         assert_eq!(logical.terms.len(), 4);
-        assert!(
-            logical.terms[1..]
-                .iter()
-                .all(|term| matches!(term, Expr::LegacyParenthesized(_)))
-        );
+        for term in &logical.terms[1..] {
+            let Expr::Logical(group) = term else {
+                panic!("original grouped AND");
+            };
+            assert_eq!(group.operator, ast::LogicalOperator::And);
+            assert_eq!(group.terms.len(), 2);
+        }
     }
 
     // --------------- Timestamp predicate tests ---------------

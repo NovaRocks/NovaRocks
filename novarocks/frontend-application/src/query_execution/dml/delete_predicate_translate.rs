@@ -539,12 +539,13 @@ mod tests {
         let Expr::Logical(root) = &predicate else {
             panic!("root AND");
         };
-        let Expr::LegacyParenthesized(nested) = &root.terms[1] else {
-            panic!("explicit group");
-        };
-        let Expr::Logical(group) = nested.expression.as_ref() else {
+        assert_eq!(root.operator, LogicalOperator::And);
+        assert_eq!(root.terms.len(), 3);
+        let Expr::Logical(group) = &root.terms[1] else {
             panic!("group AND");
         };
+        assert_eq!(group.operator, LogicalOperator::And);
+        assert_eq!(group.terms.len(), 2);
         let expected = [
             &root.terms[0],
             &group.terms[0],
