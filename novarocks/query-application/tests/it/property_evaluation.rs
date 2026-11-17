@@ -1215,3 +1215,336 @@ fn ddl_property_name_policy_bypasses_known_duplicate_and_dynamic_catalog_names()
     assert_eq!(port.seen.len(), 2);
     port.exhausted();
 }
+
+#[test]
+fn authored_property_inputs_share_expression_results_defaults_and_order_without_sql_casts() {
+    let cases = vec![
+        (
+            Type::Integer,
+            Target::Integer,
+            Value::Integer(i32::MAX),
+            constant(
+                Arc::new(Int32Array::from(vec![Some(0), Some(i32::MAX)])),
+                ValueLogicalType::Physical,
+            ),
+        ),
+        (
+            Type::Varchar,
+            Target::Varchar,
+            Value::Varchar("actual中".into()),
+            text(Some("actual中")),
+        ),
+        (
+            Type::ArrayVarchar,
+            Target::ArrayVarchar,
+            Value::ArrayVarchar(vec![Some("bucket(id, 8)".into()), None, Some("中".into())]),
+            strings(),
+        ),
+    ];
+    for (value_type, target, authored, checked) in cases {
+        let source = "actual_value";
+        let expression = parse_expression(source).unwrap();
+        let declarations = [
+            declaration("before", Type::Boolean, Value::Boolean(true)),
+            declaration("chosen", value_type, Value::Null),
+        ];
+        let mut port = Port::new(vec![Call {
+            expression: &expression,
+            target,
+            result: Ok(checked),
+        }]);
+        let evaluated_expression = evaluate_ddl_properties(
+            DdlPropertyScope::Table,
+            DdlPropertyEvaluationMode::Create,
+            source,
+            &declarations,
+            &[assignment("CHOSEN", &expression)],
+            &mut port,
+            &Control::default(),
+        )
+        .unwrap();
+        port.exhausted();
+        let mut port = Port::new(vec![]);
+        let evaluated_authored = evaluate_ddl_properties(
+            DdlPropertyScope::Table,
+            DdlPropertyEvaluationMode::Create,
+            source,
+            &declarations,
+            &[DdlPropertyAssignment {
+                name: "CHOSEN",
+                name_span: SYNTHETIC,
+                span: expression.span(),
+                value: DdlPropertyAssignmentValue::Authored {
+                    value: &authored,
+                    span: expression.span(),
+                },
+            }],
+            &mut port,
+            &Control::default(),
+        )
+        .unwrap();
+        port.exhausted();
+        assert_eq!(evaluated_expression, evaluated_authored);
+        assert_eq!(
+            evaluated_authored.properties(),
+            &[
+                EvaluatedDdlProperty {
+                    name: "before".into(),
+                    change: DdlPropertyChange::Set(Value::Boolean(true))
+                },
+                EvaluatedDdlProperty {
+                    name: "chosen".into(),
+                    change: DdlPropertyChange::Set(authored.clone())
+                },
+            ]
+        );
+    }
+    let source = "actual_map_value";
+    let expression = parse_expression(source).unwrap();
+    let map = Value::MapVarcharVarchar(vec![
+        ("first".into(), None),
+        ("second".into(), Some("kept".into())),
+    ]);
+    let mut port = Port::new(vec![]);
+    let result = evaluate_ddl_properties(
+        DdlPropertyScope::Table,
+        DdlPropertyEvaluationMode::Alter,
+        source,
+        &[declaration(
+            "extra_properties",
+            Type::MapVarcharVarchar,
+            Value::Null,
+        )],
+        &[DdlPropertyAssignment {
+            name: "extra_properties",
+            name_span: SYNTHETIC,
+            span: expression.span(),
+            value: DdlPropertyAssignmentValue::Authored {
+                value: &map,
+                span: expression.span(),
+            },
+        }],
+        &mut port,
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(result.properties()[0].change, DdlPropertyChange::Set(map));
+    port.exhausted();
+}
+
+#[test]
+fn authored_property_input_errors_keep_scope_span_and_original_name_duplicate_precedence() {
+    let source = "actual_property_value";
+    let expression = parse_expression(source).unwrap();
+    let value_span = expression.span();
+    let null = Value::Null;
+    let wrong = Value::Varchar("2".into());
+    let duplicate_map = Value::MapVarcharVarchar(vec![
+        ("key".into(), None),
+        ("key".into(), Some("not overwritten".into())),
+    ]);
+    for (value_type, value, expected) in [
+        (Type::Integer, &null, "cannot be NULL"),
+        (Type::Integer, &wrong, "requires Integer, got Varchar"),
+        (
+            Type::MapVarcharVarchar,
+            &duplicate_map,
+            "Duplicate map property key",
+        ),
+    ] {
+        let mut port = Port::new(vec![]);
+        let error = evaluate_ddl_properties(
+            DdlPropertyScope::Table,
+            DdlPropertyEvaluationMode::Alter,
+            source,
+            &[declaration("known", value_type, Value::Null)],
+            &[DdlPropertyAssignment {
+                name: "known",
+                name_span: SYNTHETIC,
+                span: value_span,
+                value: DdlPropertyAssignmentValue::Authored {
+                    value,
+                    span: value_span,
+                },
+            }],
+            &mut port,
+            &Control::default(),
+        )
+        .unwrap_err();
+        let user = error.user_error().expect("typed property data error");
+        assert_eq!(user.code().as_str(), "sql.admit.invalid_table_property");
+        assert_eq!(
+            user.location(),
+            Some(&value_span.to_user_error_location(source))
+        );
+        assert!(user.message().contains(expected));
+        port.exhausted();
+    }
+    let mut port = Port::new(vec![]);
+    let error = evaluate_ddl_properties(
+        DdlPropertyScope::Table,
+        DdlPropertyEvaluationMode::Alter,
+        source,
+        &[declaration("known", Type::Integer, Value::Null)],
+        &[DdlPropertyAssignment {
+            name: "unknown",
+            name_span: SYNTHETIC,
+            span: value_span,
+            value: DdlPropertyAssignmentValue::Authored {
+                value: &wrong,
+                span: value_span,
+            },
+        }],
+        &mut port,
+        &Control::default(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .user_error()
+            .unwrap()
+            .message()
+            .contains("Unknown property 'unknown'")
+    );
+    let first = Value::Integer(7);
+    let error = evaluate_ddl_properties(
+        DdlPropertyScope::Table,
+        DdlPropertyEvaluationMode::Alter,
+        source,
+        &[declaration("known", Type::Integer, Value::Null)],
+        &[
+            DdlPropertyAssignment {
+                name: "known",
+                name_span: SYNTHETIC,
+                span: value_span,
+                value: DdlPropertyAssignmentValue::Authored {
+                    value: &first,
+                    span: value_span,
+                },
+            },
+            DdlPropertyAssignment {
+                name: "KNOWN",
+                name_span: SYNTHETIC,
+                span: value_span,
+                value: DdlPropertyAssignmentValue::Authored {
+                    value: &null,
+                    span: value_span,
+                },
+            },
+        ],
+        &mut port,
+        &Control::default(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .user_error()
+            .unwrap()
+            .message()
+            .contains("Duplicate property 'known'")
+    );
+    port.exhausted();
+}
+
+#[test]
+fn authored_property_copy_preserves_control_source_and_does_not_reorder_expression_failure() {
+    struct StopCopy {
+        cause: SharedFailureCause,
+        stopped: AtomicBool,
+    }
+    impl PureCompileControl for StopCopy {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert_eq!(phase, CompilePhase::Validate);
+            assert!(
+                !self.stopped.load(Ordering::SeqCst),
+                "no callback after original refusal"
+            );
+            if units == 256 {
+                self.stopped.store(true, Ordering::SeqCst);
+                return Err(CompileControlError::Source(self.cause.clone()));
+            }
+            Ok(())
+        }
+    }
+    let cause = SharedFailureCause::new(novarocks_spi::connector::ConnectorError::new(
+        novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+        "original property preparation control source",
+    ));
+    let control = StopCopy {
+        cause: cause.clone(),
+        stopped: AtomicBool::new(false),
+    };
+    let source = "actual_value";
+    let expression = parse_expression(source).unwrap();
+    let large = Value::Varchar("x".repeat(600));
+    let declarations = [
+        declaration("first", Type::Varchar, Value::Null),
+        declaration("later", Type::Integer, Value::Null),
+    ];
+    let mut port = Port::new(vec![]);
+    let error = evaluate_ddl_properties(
+        DdlPropertyScope::Table,
+        DdlPropertyEvaluationMode::Alter,
+        source,
+        &declarations,
+        &[
+            DdlPropertyAssignment {
+                name: "first",
+                name_span: SYNTHETIC,
+                span: expression.span(),
+                value: DdlPropertyAssignmentValue::Authored {
+                    value: &large,
+                    span: expression.span(),
+                },
+            },
+            assignment("later", &expression),
+        ],
+        &mut port,
+        &control,
+    )
+    .unwrap_err();
+    assert!(control.stopped.load(Ordering::SeqCst));
+    assert_eq!(
+        error.compile_control_error(),
+        Some(CompileControlError::Source(cause))
+    );
+    assert!(
+        error
+            .user_error()
+            .is_none_or(|user| user.code().as_str() != "sql.admit.invalid_table_property")
+    );
+    port.exhausted();
+    let original = QueryServiceError::new(
+        QueryServiceErrorKind::Unsupported,
+        "original required expression unavailable",
+    );
+    let mut port = Port::new(vec![Call {
+        expression: &expression,
+        target: Target::Varchar,
+        result: Err(DdlPropertyConstantError::Failure(original.clone())),
+    }]);
+    let wrong = Value::Varchar("not an integer".into());
+    let error = evaluate_ddl_properties(
+        DdlPropertyScope::Table,
+        DdlPropertyEvaluationMode::Alter,
+        source,
+        &declarations,
+        &[
+            assignment("first", &expression),
+            DdlPropertyAssignment {
+                name: "later",
+                name_span: SYNTHETIC,
+                span: expression.span(),
+                value: DdlPropertyAssignmentValue::Authored {
+                    value: &wrong,
+                    span: expression.span(),
+                },
+            },
+        ],
+        &mut port,
+        &Control::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error, original);
+    port.exhausted();
+}

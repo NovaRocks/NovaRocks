@@ -43,7 +43,15 @@ pub struct DdlPropertyAssignment<'a> {
 #[derive(Clone, Copy, Debug)]
 pub enum DdlPropertyAssignmentValue<'a> {
     Expression(&'a Expr),
-    Default { span: Span },
+    /// A neutral value already issued by the original preparation owner.
+    /// It is not SQL syntax, a carrier/domain inference, or setter authority.
+    Authored {
+        value: &'a DdlPropertyValue,
+        span: Span,
+    },
+    Default {
+        span: Span,
+    },
 }
 
 /// The original computation owner alone classifies a failed expression as
@@ -331,6 +339,42 @@ pub fn evaluate_ddl_properties_with_name_policy(
                     continue;
                 }
                 DdlPropertyChange::Reset(value)
+            }
+            DdlPropertyAssignmentValue::Authored { value, span } => {
+                checkpoint(control, 0)?;
+                if let Some(actual) = value.value_type()
+                    && actual != value_type
+                {
+                    return Err(invalid(
+                        scope,
+                        source,
+                        span,
+                        format!("Property '{name}' requires {value_type:?}, got {actual:?}"),
+                    ));
+                }
+                if value == &DdlPropertyValue::Null {
+                    return Err(invalid(
+                        scope,
+                        source,
+                        span,
+                        format!("Property '{name}' cannot be NULL"),
+                    ));
+                }
+                if let DdlPropertyValue::MapVarcharVarchar(entries) = value {
+                    let mut keys = HashSet::new();
+                    for (key, _) in entries {
+                        checkpoint(control, 1)?;
+                        observe_bytes(key, control)?;
+                        if !keys.insert(key.as_str()) {
+                            return Err(invalid(scope, source, span, "Duplicate map property key"));
+                        }
+                    }
+                }
+                // The user map has already passed its scope duplicate check;
+                // the existing default-copy invariant is never its classifier.
+                let value = copy_value(value, control)?;
+                checkpoint(control, 0)?;
+                DdlPropertyChange::Set(value)
             }
             DdlPropertyAssignmentValue::Expression(expression) => {
                 let value = if value_type == DdlPropertyType::MapVarcharVarchar {
