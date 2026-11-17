@@ -3573,7 +3573,7 @@ fn natural_field_name(expr: &ast::Expr) -> Option<String> {
             ast::Expr::Identifier(ident) => {
                 return Some(terminal.unwrap_or(ident).value.clone());
             }
-            ast::Expr::Nested(nested) => current = &nested.expression,
+            ast::Expr::LegacyParenthesized(nested) => current = &nested.expression,
             ast::Expr::Dereference(node) => {
                 let field = node.field.as_ref()?;
                 terminal.get_or_insert(field);
@@ -3644,7 +3644,7 @@ mod tests {
                 span: SYNTHETIC,
             })]
             .into(),
-            vec![build::nested(
+            vec![build::legacy_nested(
                 build::tuple_value(vec![build::integer(1), build::integer(2)]).unwrap(),
             )]
             .into(),
@@ -3749,6 +3749,166 @@ mod tests {
         assert_eq!(actual.repeat_column_ref_ids, expected.repeat_column_ref_ids);
         assert_eq!(actual.all_rollup_columns, expected.all_rollup_columns);
         assert_eq!(actual.all_rollup_column_ids, expected.all_rollup_column_ids);
+    }
+
+    #[test]
+    fn parenthesized_struct_base_keeps_its_column_when_an_alias_has_the_same_name() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_type_contract::FunctionValueType;
+        use std::sync::Arc;
+
+        struct Catalog {
+            struct_type: DataType,
+        }
+        impl crate::catalog::PlannerTableProvider for Catalog {
+            fn resolve_table_for_analysis(
+                &self,
+                catalog: Option<&str>,
+                database: &str,
+                table: &str,
+            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+                let column = match table {
+                    "row_source" => ColumnDef {
+                        name: "x".into(),
+                        data_type: self.struct_type.clone(),
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    },
+                    "qualified_source" => ColumnDef {
+                        name: "y".into(),
+                        data_type: DataType::Utf8,
+                        nullable: true,
+                        write_default: None,
+                        logical_type: None,
+                    },
+                    _ => return Err(format!("table not found: {table}")),
+                };
+                let planner = TableDef {
+                    name: table.into(),
+                    columns: vec![column],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: sql_test_scan_source(
+                        catalog.unwrap_or("default_catalog"),
+                        database,
+                        table,
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    ),
+                };
+                Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
+                    catalog, database, planner,
+                ))
+            }
+        }
+
+        let raw_field = Arc::new(Field::new("y", DataType::Int32, false).with_metadata(
+            std::collections::HashMap::from([("provider.fact".into(), "row-y".into())]),
+        ));
+        let catalog = Catalog {
+            struct_type: DataType::Struct(vec![raw_field.clone()].into()),
+        };
+        // The original physical declaration author removes nested annotations;
+        // provider raw facts and canonical function FVT remain separate checks.
+        let expected_source = FunctionValueType::new(catalog.struct_type.clone(), false);
+        // The original Functions subfield owner declares its result nullable.
+        let expected_field = FunctionValueType::new(DataType::Int32, true);
+        let expected_qualified = FunctionValueType::new(DataType::Utf8, true);
+
+        for (sql, struct_access) in [
+            (
+                "SELECT (x).y FROM row_source t CROSS JOIN qualified_source x",
+                true,
+            ),
+            (
+                "SELECT x.y FROM row_source t CROSS JOIN qualified_source x",
+                false,
+            ),
+        ] {
+            let source = parse_native_query(sql).expect("original dereference SQL");
+            let (resolved, _, _) = super::analyze(&source, &catalog, "default")
+                .expect("original binding must succeed");
+            let QueryBody::Select(select) = &resolved.body else {
+                panic!("original SELECT")
+            };
+            let Some(Relation::Join(join)) = &select.from else {
+                panic!("actual CROSS JOIN")
+            };
+            assert!(matches!(join.join_type, crate::analysis::JoinKind::Cross));
+            let (Relation::Scan(left), Relation::Scan(right)) = (&join.left, &join.right) else {
+                panic!("two original table declarations")
+            };
+            assert_eq!(left.table.name, "row_source");
+            assert_eq!(left.alias.as_deref(), Some("t"));
+            assert_eq!(right.table.name, "qualified_source");
+            assert_eq!(right.alias.as_deref(), Some("x"));
+            assert_eq!(left.column_ids.len(), 1);
+            assert_eq!(right.column_ids.len(), 1);
+            assert_ne!(left.column_ids[0], right.column_ids[0]);
+            assert_eq!(left.table.columns[0].name, "x");
+            assert_eq!(left.table.columns[0].data_type, catalog.struct_type);
+            assert!(!left.table.columns[0].nullable);
+            let DataType::Struct(fields) = &left.table.columns[0].data_type else {
+                panic!("original provider STRUCT")
+            };
+            assert!(Arc::ptr_eq(&fields[0], &raw_field));
+            assert_eq!(
+                fields[0]
+                    .metadata()
+                    .get("provider.fact")
+                    .map(String::as_str),
+                Some("row-y")
+            );
+            assert_eq!(right.table.columns[0].name, "y");
+            assert_eq!(right.table.columns[0].data_type, DataType::Utf8);
+            assert!(right.table.columns[0].nullable);
+
+            let [projected] = select.projection.as_slice() else {
+                panic!("one original projection")
+            };
+            let [published] = resolved.output_columns.as_slice() else {
+                panic!("one original result field")
+            };
+            assert_eq!(published.column_id, projected.output_column_id);
+            assert_eq!(published.value_type, projected.expr.value_type);
+            if struct_access {
+                assert_eq!(projected.expr.value_type, expected_field);
+                let ExprKind::FunctionCall {
+                    name,
+                    args,
+                    binding,
+                    ..
+                } = &projected.expr.kind
+                else {
+                    panic!("parenthesized base must select original STRUCT-field owner")
+                };
+                assert_eq!(name, "__struct_subfield");
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0].value_type, expected_source);
+                assert_eq!(binding.logical_argument_count, 2);
+                assert!(
+                    matches!(&args[1].kind, ExprKind::Literal(LiteralValue::String(name)) if name == "y")
+                );
+                // Read the actual original base through its existing IR wrapper;
+                // success is decided by binding identity, not wrapper presence.
+                let mut base = &args[0];
+                while let ExprKind::Nested(inner) = &base.kind {
+                    assert_eq!(inner.value_type, expected_source);
+                    base = inner;
+                }
+                assert!(
+                    matches!(&base.kind, ExprKind::ColumnRef { column_id, qualifier: None, column }
+                    if *column_id == left.column_ids[0] && column == "x")
+                );
+            } else {
+                assert_eq!(projected.expr.value_type, expected_qualified);
+                assert!(
+                    matches!(&projected.expr.kind, ExprKind::ColumnRef { column_id, qualifier: Some(qualifier), column }
+                    if *column_id == right.column_ids[0] && qualifier == "x" && column == "y")
+                );
+            }
+        }
     }
 
     struct TestCatalog;

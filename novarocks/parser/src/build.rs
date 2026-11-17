@@ -258,9 +258,10 @@ pub fn cast(expr: Expr, data_type: TypeName) -> Expr {
     }))
 }
 
-pub fn nested(expr: Expr) -> Expr {
+/// Preserve the old parser's parenthesis barrier until cutover.
+pub fn legacy_nested(expr: Expr) -> Expr {
     let span = expr.span();
-    Expr::Nested(NestedExpr {
+    Expr::LegacyParenthesized(LegacyParenthesizedExpr {
         expression: crate::ast::AstBox::new(expr),
         span: span,
     })
@@ -575,7 +576,7 @@ pub fn select(
         selection: selection,
         group_by: group_by,
         having: None,
-        qualify: None,
+        legacy: Default::default(),
         windows: AstVec::new(),
         modifiers: Default::default(),
         span: SYNTHETIC,
@@ -686,11 +687,11 @@ pub fn array(values: Vec<Expr>) -> Expr {
     })
 }
 
-/// Parentheses around a single expression form a Nested node, not a tuple.
+/// Temporarily preserve the old singleton parenthesis barrier; multiple values form a ROW.
 pub fn tuple(mut expressions: Vec<Expr>) -> Result<Expr, BuildError> {
     match expressions.len() {
         0 => Err(BuildError::EmptyTuple),
-        1 => Ok(nested(expressions.pop().expect("one expression"))),
+        1 => Ok(legacy_nested(expressions.pop().expect("one expression"))),
         _ => tuple_value(expressions),
     }
 }

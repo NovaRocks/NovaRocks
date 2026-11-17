@@ -147,7 +147,7 @@ fn dynamic_null_and_parenthesized_paths_remain_real_expressions_in_the_old_bridg
         assert_eq!(call.name.parts[0].value, "json_query");
         assert!(matches!(
             &call.arguments[0].value,
-            Expr::Row(_) | Expr::Nested(_)
+            Expr::Row(_) | Expr::LegacyParenthesized(_)
         ));
         assert!(matches!(&call.arguments[1].value,Expr::Identifier(id) if id.value=="path"));
     }

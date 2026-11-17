@@ -185,7 +185,7 @@ fn select_statement(windows: Vec<WindowDefinition>) -> Statement {
                 selection: None,
                 group_by: None,
                 having: None,
-                qualify: None,
+                legacy: Default::default(),
                 windows: windows.into(),
                 modifiers: Default::default(),
                 span: SPAN,

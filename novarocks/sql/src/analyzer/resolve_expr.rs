@@ -66,15 +66,15 @@ fn scalar_function_is_unknown(
 fn interval_field_name(field: ast::IntervalField) -> &'static str {
     match field {
         ast::IntervalField::Year => "year",
-        ast::IntervalField::Quarter => "quarter",
+        ast::IntervalField::Legacy(ast::LegacyIntervalField::Quarter) => "quarter",
         ast::IntervalField::Month => "month",
-        ast::IntervalField::Week => "week",
+        ast::IntervalField::Legacy(ast::LegacyIntervalField::Week) => "week",
         ast::IntervalField::Day => "day",
         ast::IntervalField::Hour => "hour",
         ast::IntervalField::Minute => "minute",
         ast::IntervalField::Second => "second",
-        ast::IntervalField::Millisecond => "millisecond",
-        ast::IntervalField::Microsecond => "microsecond",
+        ast::IntervalField::Legacy(ast::LegacyIntervalField::Millisecond) => "millisecond",
+        ast::IntervalField::Legacy(ast::LegacyIntervalField::Microsecond) => "microsecond",
     }
 }
 
@@ -575,7 +575,12 @@ impl<'a> super::AnalyzerContext<'a> {
             }
 
             // Bitwise NOT (~)
-            ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::BitwiseNot) => {
+            ast::Expr::Unary(unary)
+                if matches!(
+                    unary.operator,
+                    ast::UnaryOperator::Legacy(ast::LegacyUnaryOperator::BitwiseNot)
+                ) =>
+            {
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
                 if !is_integer_value_type(&inner_typed.value_type)
                     && !is_strict_null_value_type(&inner_typed.value_type)
@@ -736,7 +741,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 self.analyze_subscript(base, &node.index, scope, node.span)
             }
             // Nested (parenthesized)
-            ast::Expr::Nested(nested) => {
+            ast::Expr::LegacyParenthesized(nested) => {
                 let inner_typed = self.analyze_expr(&nested.expression, scope)?;
                 let value_type = inner_typed.value_type.clone();
                 Ok(TypedExpr {
@@ -778,7 +783,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // INTERVAL `value unit` remains a syntax-level string literal for
             // the existing function rewrites; source rendering is native.
-            ast::Expr::Interval(_) => {
+            ast::Expr::LegacyInterval(_) => {
                 let s = print_expr(expr);
                 Ok(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::String(s)),
@@ -1599,7 +1604,9 @@ impl<'a> super::AnalyzerContext<'a> {
         // skip the BITMAP / JSON / HLL precheck here: those checks
         // are per-column and only meaningful for a single-column LHS.
         let lhs_is_tuple = match value {
-            ast::Expr::Nested(inner) => self.anonymous_row(&inner.expression)?.is_some(),
+            ast::Expr::LegacyParenthesized(inner) => {
+                self.anonymous_row(&inner.expression)?.is_some()
+            }
             other => self.anonymous_row(other)?.is_some(),
         };
         let mut json_probe = false;
@@ -1964,7 +1971,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // || is logical OR in MySQL/StarRocks default sql_mode.
             // Non-boolean operands are implicitly cast to boolean.
-            ast::BinaryOperator::StringConcat => {
+            ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::StringConcat) => {
                 let left_cast = implicit_cast_to_boolean(left_typed);
                 let right_cast = implicit_cast_to_boolean(right_typed);
                 let nullable = left_cast.value_type.nullable() || right_cast.value_type.nullable();
@@ -1983,7 +1990,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 });
             }
 
-            other => {
+            ast::BinaryOperator::Legacy(other) => {
                 return Err(AnalyzeError::unsupported_expression(
                     format!("unsupported binary operator: {other:?}"),
                     left.span(),
@@ -2470,7 +2477,7 @@ impl<'a> super::AnalyzerContext<'a> {
         let date_add_interval_rewrites: Vec<ast::Expr> =
             if matches!(name.as_str(), "date_add" | "date_sub")
                 && arg_exprs.len() == 2
-                && let ast::Expr::Interval(interval) = arg_exprs[1]
+                && let ast::Expr::LegacyInterval(interval) = arg_exprs[1]
             {
                 let unit = interval_field_name(interval.leading_field).to_string();
                 let suffix = if name == "date_sub" { "_sub" } else { "_add" };
@@ -2498,7 +2505,7 @@ impl<'a> super::AnalyzerContext<'a> {
             && name == "array_generate"
             && arg_exprs.len() == 3
         {
-            if let ast::Expr::Interval(interval) = arg_exprs[2] {
+            if let ast::Expr::LegacyInterval(interval) = arg_exprs[2] {
                 if !is_integer_const_literal(interval.value.as_ref()) {
                     return Err(AnalyzeError::invalid_argument(
                         "array_generate requires step parameter must be a constant integer",
@@ -2534,7 +2541,7 @@ impl<'a> super::AnalyzerContext<'a> {
             for (idx, e) in arg_exprs.iter().enumerate() {
                 // Position 1 is the interval; expand it into value + unit.
                 if idx == 1
-                    && let ast::Expr::Interval(interval) = e
+                    && let ast::Expr::LegacyInterval(interval) = e
                 {
                     // StarRocks rejects non-integer constant
                     // intervals at planning time; mirror that error
@@ -2550,7 +2557,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     rewritten.push(string_literal_expr(unit, interval.span));
                     continue;
                 }
-                if idx == 1 && !matches!(e, ast::Expr::Interval(_)) {
+                if idx == 1 && !matches!(e, ast::Expr::LegacyInterval(_)) {
                     rewritten.push((*e).clone());
                     let default_day = arg_exprs.len() == 2
                         || (arg_exprs.len() == 3 && slice_boundary_keyword(arg_exprs[2]).is_some());
@@ -3933,7 +3940,7 @@ impl<'a> super::AnalyzerContext<'a> {
         let (new_key, new_value) = match name {
             "map_apply" => {
                 let tuple_body = match body_expr {
-                    ast::Expr::Nested(inner) => inner.expression.as_ref(),
+                    ast::Expr::LegacyParenthesized(inner) => inner.expression.as_ref(),
                     other => other,
                 };
                 let tuple_items: Vec<&ast::Expr> = match self.anonymous_row(tuple_body)? {
@@ -4560,7 +4567,9 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
             }
             ast::Expr::InList(list) => list.values.iter().any(|e| self.expr_contains_aggregate(e)),
-            ast::Expr::Nested(nested) => self.expr_contains_aggregate(&nested.expression),
+            ast::Expr::LegacyParenthesized(nested) => {
+                self.expr_contains_aggregate(&nested.expression)
+            }
             ast::Expr::Cast(cast) => self.expr_contains_aggregate(&cast.expression),
             ast::Expr::Array(array) => array
                 .values
@@ -4591,7 +4600,9 @@ impl<'a> super::AnalyzerContext<'a> {
 fn slice_boundary_keyword(expr: &ast::Expr) -> Option<String> {
     let token = match expr {
         ast::Expr::Identifier(ident) => ident.value.to_ascii_lowercase(),
-        ast::Expr::Nested(nested) => return slice_boundary_keyword(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => {
+            return slice_boundary_keyword(&nested.expression);
+        }
         _ => return None,
     };
     matches!(token.as_str(), "floor" | "ceil").then_some(token)
@@ -4625,7 +4636,7 @@ fn normalize_slice_arguments(
             {
                 integer_source(&unary.expression)
             }
-            ast::Expr::Nested(nested) => integer_source(&nested.expression),
+            ast::Expr::LegacyParenthesized(nested) => integer_source(&nested.expression),
             _ => false,
         }
     }
@@ -6820,7 +6831,7 @@ fn extract_lambda_field_chain(expr: &ast::Expr, param_name: &str) -> Result<Vec<
     let mut fields = Vec::new();
     loop {
         match current {
-            ast::Expr::Nested(inner) => current = &inner.expression,
+            ast::Expr::LegacyParenthesized(inner) => current = &inner.expression,
             ast::Expr::Dereference(node) => {
                 let Some(field) = &node.field else {
                     return Err("array_sortby lambda rewrite only supports dotted struct field access".to_string());
@@ -6845,7 +6856,7 @@ fn parse_array_sortby_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)> {
             .arguments
             .first()
             .map(|argument| (argument.name.value.to_lowercase(), &lambda.body)),
-        ast::Expr::Nested(inner) => parse_array_sortby_lambda(&inner.expression),
+        ast::Expr::LegacyParenthesized(inner) => parse_array_sortby_lambda(&inner.expression),
         _ => None,
     }
 }
@@ -6876,14 +6887,16 @@ fn parse_lambda_expr(expr: &ast::Expr) -> Option<(Vec<String>, &ast::Expr)> {
                 .collect(),
             &lambda.body,
         )),
-        ast::Expr::Nested(inner) => parse_lambda_expr(&inner.expression),
+        ast::Expr::LegacyParenthesized(inner) => parse_lambda_expr(&inner.expression),
         _ => None,
     }
 }
 
 fn lambda_body_casts_param_to_utf8(expr: &ast::Expr, param_name: &str) -> bool {
     match expr {
-        ast::Expr::Nested(inner) => lambda_body_casts_param_to_utf8(&inner.expression, param_name),
+        ast::Expr::LegacyParenthesized(inner) => {
+            lambda_body_casts_param_to_utf8(&inner.expression, param_name)
+        }
         ast::Expr::Cast(cast) if lambda_expr_is_param(&cast.expression, param_name) => {
             matches!(
                 sql_type_to_arrow(&cast.data_type),
@@ -6897,7 +6910,9 @@ fn lambda_body_casts_param_to_utf8(expr: &ast::Expr, param_name: &str) -> bool {
 fn lambda_expr_is_param(expr: &ast::Expr, param_name: &str) -> bool {
     match expr {
         ast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(param_name),
-        ast::Expr::Nested(inner) => lambda_expr_is_param(&inner.expression, param_name),
+        ast::Expr::LegacyParenthesized(inner) => {
+            lambda_expr_is_param(&inner.expression, param_name)
+        }
         _ => false,
     }
 }
@@ -6912,7 +6927,7 @@ fn parse_multi_param_lambda(expr: &ast::Expr) -> Option<(Vec<String>, &ast::Expr
                 .collect(),
             &lambda.body,
         )),
-        ast::Expr::Nested(inner) => parse_multi_param_lambda(&inner.expression),
+        ast::Expr::LegacyParenthesized(inner) => parse_multi_param_lambda(&inner.expression),
         _ => None,
     }
 }
@@ -6950,7 +6965,7 @@ fn is_integer_const_literal(expr: &ast::Expr) -> bool {
         {
             is_integer_const_literal(&unary.expression)
         }
-        ast::Expr::Nested(inner) => is_integer_const_literal(&inner.expression),
+        ast::Expr::LegacyParenthesized(inner) => is_integer_const_literal(&inner.expression),
         _ => false,
     }
 }
@@ -6997,7 +7012,7 @@ fn signed_integer_literal_expr(expr: &ast::Expr) -> Option<ast::Expr> {
         ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Plus => {
             signed_integer_literal_expr(&unary.expression)
         }
-        ast::Expr::Nested(inner) => signed_integer_literal_expr(&inner.expression),
+        ast::Expr::LegacyParenthesized(inner) => signed_integer_literal_expr(&inner.expression),
         _ => None,
     }
 }
@@ -7005,7 +7020,7 @@ fn signed_integer_literal_expr(expr: &ast::Expr) -> Option<ast::Expr> {
 fn syntactic_array_literal_len(expr: &ast::Expr) -> Option<usize> {
     match expr {
         ast::Expr::Array(array) => Some(array.values.len()),
-        ast::Expr::Nested(inner) => syntactic_array_literal_len(&inner.expression),
+        ast::Expr::LegacyParenthesized(inner) => syntactic_array_literal_len(&inner.expression),
         ast::Expr::Cast(cast) => syntactic_array_literal_len(&cast.expression),
         _ => None,
     }
@@ -8036,6 +8051,11 @@ mod tests {
                 DataType::Boolean,
                 "{sql}"
             );
+            assert_eq!(
+                expression.value_type,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+                "complete nullable Boolean declaration: {sql}",
+            );
             assert!(
                 expression.value_type.nullable(),
                 "string boolean conversion can produce SQL NULL: {sql}"
@@ -8047,6 +8067,11 @@ mod tests {
                 *expression.value_type.data_type(),
                 DataType::Boolean,
                 "{sql}"
+            );
+            assert_eq!(
+                expression.value_type,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+                "complete non-null Boolean declaration: {sql}",
             );
             assert!(
                 !expression.value_type.nullable(),

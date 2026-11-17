@@ -27,12 +27,13 @@ use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
         ArrayExpr, AstVec, BinaryExpr, BinaryOperator, CastExpr, DataTypeParameter,
-        DereferenceExpr, ExistsExpr, Expr, FunctionCall, Ident, InListExpr, IntervalExpr,
-        IntervalField, LambdaArgumentDeclaration, LambdaExpr, Literal, LiteralKind, NestedExpr,
-        NullOrdering, NullTreatment, ObjectName, OrderBy, RowDataTypeField, RowExpr, RowField,
-        SearchedCaseExpr, SimpleCaseExpr, SortItem, SortOrdering, SubqueryExpr, TypeName,
-        UnaryExpr, UnaryOperator, WhenClause, WhenMatch, Window, WindowFrame, WindowFrameBound,
-        WindowFrameExclusion, WindowFrameUnits, WindowReference, WindowSpecification,
+        DereferenceExpr, ExistsExpr, Expr, FunctionCall, Ident, InListExpr, IntervalField,
+        LambdaArgumentDeclaration, LambdaExpr, LegacyIntervalExpr, LegacyParenthesizedExpr,
+        Literal, LiteralKind, NullOrdering, NullTreatment, ObjectName, OrderBy, RowDataTypeField,
+        RowExpr, RowField, SearchedCaseExpr, SimpleCaseExpr, SortItem, SortOrdering, SubqueryExpr,
+        TypeName, UnaryExpr, UnaryOperator, WhenClause, WhenMatch, Window, WindowFrame,
+        WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowReference,
+        WindowSpecification,
     },
     error::ParseError,
     keyword_class,
@@ -161,32 +162,44 @@ const INFIX_BINDINGS: &[InfixBinding] = &[
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::DoublePipe),
-        operator: InfixOperator::Binary(BinaryOperator::StringConcat),
+        operator: InfixOperator::Binary(BinaryOperator::Legacy(
+            crate::ast::legacy::BinaryOperator::StringConcat,
+        )),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::ShiftLeft),
-        operator: InfixOperator::Binary(BinaryOperator::ShiftLeft),
+        operator: InfixOperator::Binary(BinaryOperator::Legacy(
+            crate::ast::legacy::BinaryOperator::ShiftLeft,
+        )),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::ShiftRight),
-        operator: InfixOperator::Binary(BinaryOperator::ShiftRight),
+        operator: InfixOperator::Binary(BinaryOperator::Legacy(
+            crate::ast::legacy::BinaryOperator::ShiftRight,
+        )),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Ampersand),
-        operator: InfixOperator::Binary(BinaryOperator::BitwiseAnd),
+        operator: InfixOperator::Binary(BinaryOperator::Legacy(
+            crate::ast::legacy::BinaryOperator::BitwiseAnd,
+        )),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Caret),
-        operator: InfixOperator::Binary(BinaryOperator::BitwiseXor),
+        operator: InfixOperator::Binary(BinaryOperator::Legacy(
+            crate::ast::legacy::BinaryOperator::BitwiseXor,
+        )),
         precedence: ADDITIVE_PRECEDENCE,
     },
     InfixBinding {
         token: TokenPattern::Symbol(Symbol::Pipe),
-        operator: InfixOperator::Binary(BinaryOperator::BitwiseOr),
+        operator: InfixOperator::Binary(BinaryOperator::Legacy(
+            crate::ast::legacy::BinaryOperator::BitwiseOr,
+        )),
         precedence: ADDITIVE_PRECEDENCE,
     },
 ];
@@ -209,7 +222,7 @@ const PREFIX_BINDINGS: &[PrefixBinding] = &[
     },
     PrefixBinding {
         token: TokenPattern::Symbol(Symbol::Tilde),
-        operator: UnaryOperator::BitwiseNot,
+        operator: UnaryOperator::Legacy(crate::ast::legacy::UnaryOperator::BitwiseNot),
         precedence: UNARY_ARITHMETIC_PRECEDENCE,
     },
 ];
@@ -484,7 +497,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     fn lambda_parameters(expression: &Expr) -> Option<Vec<Ident>> {
         match expression {
             Expr::Identifier(ident) => Some(vec![ident.clone()]),
-            Expr::Nested(nested) => Self::lambda_parameters(&nested.expression),
+            Expr::LegacyParenthesized(nested) => Self::lambda_parameters(&nested.expression),
             Expr::Row(row) if row.fields.iter().all(|field| field.name.is_none()) => row
                 .fields
                 .iter()
@@ -992,7 +1005,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let value = self.parse_binding_power(0)?;
         self.skip_trivia();
         let (leading_field, field_span) = self.parse_interval_field()?;
-        Ok(Expr::Interval(IntervalExpr {
+        Ok(Expr::LegacyInterval(LegacyIntervalExpr {
             value: crate::ast::AstBox::new(value),
             leading_field: leading_field,
             leading_precision: None,
@@ -1006,11 +1019,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let field = if self.current_is_word("YEAR") {
             IntervalField::Year
         } else if self.current_is_word("QUARTER") {
-            IntervalField::Quarter
+            IntervalField::Legacy(crate::ast::legacy::IntervalField::Quarter)
         } else if self.current_is_word("MONTH") {
             IntervalField::Month
         } else if self.current_is_word("WEEK") {
-            IntervalField::Week
+            IntervalField::Legacy(crate::ast::legacy::IntervalField::Week)
         } else if self.current_is_word("DAY") {
             IntervalField::Day
         } else if self.current_is_word("HOUR") {
@@ -1020,9 +1033,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         } else if self.current_is_word("SECOND") {
             IntervalField::Second
         } else if self.current_is_word("MILLISECOND") {
-            IntervalField::Millisecond
+            IntervalField::Legacy(crate::ast::legacy::IntervalField::Millisecond)
         } else if self.current_is_word("MICROSECOND") {
-            IntervalField::Microsecond
+            IntervalField::Legacy(crate::ast::legacy::IntervalField::Microsecond)
         } else {
             return Err(self.unexpected("interval field"));
         };
@@ -1849,7 +1862,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 // The current grammar has no RUNNING/FINAL producer. P05
                 // checks that mode at this same stage before constructing a node.
                 else if filter.is_some() { Some(("a control expression without FILTER","FILTER")) }
-                else if arguments.iter().any(|value| matches!(value,Expr::Binary(binary) if binary.operator==BinaryOperator::NamedArgument)) { Some(("positional control-expression arguments","named argument")) }
+                else if arguments.iter().any(|value| matches!(value,Expr::Binary(binary) if binary.operator==BinaryOperator::Legacy(crate::ast::legacy::BinaryOperator::NamedArgument))) { Some(("positional control-expression arguments","named argument")) }
                 else if separator.is_some() { Some(("a control expression without SEPARATOR","SEPARATOR")) }
                 else { None };
             if let Some((expected, found)) = metadata_error {
@@ -1967,7 +1980,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let span = Span::new(start, value.span().end());
         Ok(Expr::Binary(BinaryExpr {
             left: crate::ast::AstBox::new(Expr::Identifier(name)),
-            operator: BinaryOperator::NamedArgument,
+            operator: BinaryOperator::Legacy(crate::ast::legacy::BinaryOperator::NamedArgument),
             right: crate::ast::AstBox::new(value),
             span: span,
         }))
@@ -2235,7 +2248,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
         let end = self.current_span().end();
         self.advance();
-        Ok(Expr::Nested(NestedExpr {
+        Ok(Expr::LegacyParenthesized(LegacyParenthesizedExpr {
             expression: crate::ast::AstBox::new(first),
             span: Span::new(opening_span.start(), end),
         }))
@@ -2699,7 +2712,10 @@ mod tests {
         let Expr::Binary(named) = &call.arguments[0].value else {
             panic!("original named argument producer")
         };
-        assert_eq!(named.operator, BinaryOperator::NamedArgument);
+        assert_eq!(
+            named.operator,
+            BinaryOperator::Legacy(crate::ast::legacy::BinaryOperator::NamedArgument)
+        );
         assert!(matches!(named.left.as_ref(),Expr::Identifier(name)if name.value=="end"));
         assert!(
             matches!(named.right.as_ref(),Expr::Literal(value)if matches!(value.kind,LiteralKind::Long{parsed_value:9,..}))
@@ -2781,7 +2797,7 @@ mod tests {
             assert_eq!(call.arguments.len(), 2);
             assert!(matches!(
                 &call.arguments[0].value,
-                Expr::Row(_) | Expr::Nested(_)
+                Expr::Row(_) | Expr::LegacyParenthesized(_)
             ));
             assert!(
                 matches!(&call.arguments[1].value,Expr::Identifier(name) if name.value=="path")

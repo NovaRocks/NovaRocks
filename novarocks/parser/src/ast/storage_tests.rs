@@ -491,7 +491,7 @@ fn actual_row_fields_preserve_names_order_spans_and_deep_semantic_children() {
         matches!(&one, Expr::Row(value) if value.fields.len() == 1 && value.fields[0].name.is_none())
     );
     let parentheses = build::tuple(vec![build::integer(1)]).unwrap();
-    assert!(matches!(parentheses, Expr::Nested(_)));
+    assert!(matches!(parentheses, Expr::LegacyParenthesized(_)));
     assert!(!one.syntax_eq(&parentheses));
 
     const DEPTH: i64 = 20_000;
@@ -3121,7 +3121,7 @@ fn remaining_core_expression_edges_preserve_deep_order_precision_and_owning_trai
                 expression: AstBox::new(tree),
                 span,
             }),
-            1 => Expr::Nested(NestedExpr {
+            1 => Expr::LegacyParenthesized(LegacyParenthesizedExpr {
                 expression: AstBox::new(tree),
                 span,
             }),
@@ -3143,7 +3143,7 @@ fn remaining_core_expression_edges_preserve_deep_order_precision_and_owning_trai
                     5 => (build::integer(marker), tree, build::integer(-marker)),
                     _ => (build::integer(marker), build::integer(-marker), tree),
                 };
-                Expr::Interval(IntervalExpr {
+                Expr::LegacyInterval(LegacyIntervalExpr {
                     value: AstBox::new(value),
                     leading_field: IntervalField::Day,
                     leading_precision: Some(AstBox::new(leading)),
@@ -3219,7 +3219,7 @@ fn remaining_core_expression_edges_preserve_deep_order_precision_and_owning_trai
     assert!(printed.contains("-7"));
     assert!(printed.contains(" TO SECOND("));
     match tree {
-        Expr::Interval(node) => drop(node.fractional_seconds_precision),
+        Expr::LegacyInterval(node) => drop(node.fractional_seconds_precision),
         other => drop(other),
     }
 }

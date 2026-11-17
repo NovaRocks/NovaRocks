@@ -77,7 +77,7 @@ impl<'a> Iterator for ReverseIdents<'a> {
 impl ExactSizeIterator for ReverseIdents<'_> {}
 
 /// Inspect each original expression from the outer node toward its base.
-/// Only Identifier and Dereference(Some) form a name; Nested is a real boundary.
+/// Only Identifier and Dereference(Some) form a name; LegacyParenthesized is a real old-parser boundary.
 /// No source loan, type, resource or name-resolution policy is inferred here.
 pub fn identifier_chain_observed<'a, E>(
     expression: &'a Expr,
@@ -168,7 +168,7 @@ mod tests {
             field: None,
             span: crate::SYNTHETIC,
         }));
-        for source in [build::nested(plain), missing, build::integer(7)] {
+        for source in [build::legacy_nested(plain), missing, build::integer(7)] {
             assert!(
                 identifier_chain_observed(&source, |_| Ok::<_, ()>(()))
                     .unwrap()

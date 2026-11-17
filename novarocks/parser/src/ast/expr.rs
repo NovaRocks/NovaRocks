@@ -64,7 +64,7 @@ pub enum Expr {
     Unary(UnaryExpr),
     Binary(BinaryExpr),
     Logical(LogicalExpr),
-    Nested(NestedExpr),
+    LegacyParenthesized(super::LegacyParenthesizedExpr),
     Predicated(AstBox<super::PredicatedExpr>),
     InList(AstBox<super::InListExpr>),
     Exists(AstBox<super::ExistsExpr>),
@@ -72,7 +72,7 @@ pub enum Expr {
     SimpleCase(AstBox<super::SimpleCaseExpr>),
     Unique(AstBox<super::UniqueExpr>),
     Cast(AstBox<super::CastExpr>),
-    Interval(IntervalExpr),
+    LegacyInterval(super::LegacyIntervalExpr),
     Subquery(SubqueryExpr),
     Row(RowExpr),
     Array(ArrayExpr),
@@ -126,7 +126,7 @@ impl Expr {
             Self::Unary(expression) => expression.span,
             Self::Binary(expression) => expression.span,
             Self::Logical(expression) => expression.span,
-            Self::Nested(expression) => expression.span,
+            Self::LegacyParenthesized(expression) => expression.span,
             Self::InList(expression) => expression.span,
             Self::Predicated(expression) => expression.span,
             Self::Exists(expression) => expression.span,
@@ -134,7 +134,7 @@ impl Expr {
             Self::SimpleCase(node) => node.span,
             Self::Unique(node) => node.span,
             Self::Cast(expression) => expression.span,
-            Self::Interval(expression) => expression.span,
+            Self::LegacyInterval(expression) => expression.span,
             Self::Subquery(expression) => expression.span,
             Self::Row(expression) => expression.span,
             Self::Array(expression) => expression.span,
@@ -183,35 +183,15 @@ pub struct BinaryExpr {
     pub span: Span,
 }
 
-/// A parenthesized expression.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NestedExpr {
-    pub expression: AstBox<Expr>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IntervalExpr {
-    pub value: AstBox<Expr>,
-    pub leading_field: IntervalField,
-    pub leading_precision: Option<AstBox<Expr>>,
-    pub last_field: Option<IntervalField>,
-    pub fractional_seconds_precision: Option<AstBox<Expr>>,
-    pub span: Span,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntervalField {
     Year,
-    Quarter,
     Month,
-    Week,
     Day,
     Hour,
     Minute,
     Second,
-    Millisecond,
-    Microsecond,
+    Legacy(super::legacy::IntervalField),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -279,24 +259,18 @@ pub enum UnaryOperator {
     Not,
     Plus,
     Minus,
-    BitwiseNot,
+    Legacy(super::legacy::UnaryOperator),
 }
 
 /// Infix operators initially recognized by the Pratt parser.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BinaryOperator {
-    NamedArgument,
     Add,
     Subtract,
     Multiply,
     Divide,
     Modulo,
-    BitwiseAnd,
-    BitwiseOr,
-    BitwiseXor,
-    ShiftLeft,
-    ShiftRight,
-    StringConcat,
+    Legacy(super::legacy::BinaryOperator),
 }
 
 /// One positional or named function argument with its original expression.

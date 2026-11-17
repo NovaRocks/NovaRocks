@@ -158,7 +158,7 @@ pub struct Select {
     pub selection: Option<Expr>,
     pub group_by: Option<GroupBy>,
     pub having: Option<Expr>,
-    pub qualify: Option<Expr>,
+    pub legacy: super::LegacySelectExtensions,
     pub windows: AstVec<WindowDefinition>,
     pub modifiers: QueryModifiers,
     pub span: Span,

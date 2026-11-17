@@ -676,8 +676,12 @@ pub trait Visit {
         walk_binary_expr(self, expression);
     }
 
-    fn visit_nested_expr(&mut self, expression: &NestedExpr) {
-        walk_nested_expr(self, expression);
+    fn visit_legacy_interval_expr(&mut self, expression: &LegacyIntervalExpr) {
+        walk_legacy_interval_expr(self, expression);
+    }
+
+    fn visit_legacy_parenthesized_expr(&mut self, expression: &LegacyParenthesizedExpr) {
+        walk_legacy_parenthesized_expr(self, expression);
     }
 }
 
@@ -814,7 +818,7 @@ pub fn walk_select<V: Visit + ?Sized>(visitor: &mut V, select: &Select) {
     if let Some(having) = &select.having {
         visitor.visit_expr(having);
     }
-    if let Some(qualify) = &select.qualify {
+    if let Some(qualify) = &select.legacy.qualify {
         visitor.visit_expr(qualify);
     }
     for window in &select.windows {
@@ -945,17 +949,11 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::SimpleCase(node) => visitor.visit_simple_case_expr(node),
         Expr::Predicated(node) => visitor.visit_predicated_expr(node),
         Expr::InList(node) => visitor.visit_in_list_expr(node),
-        Expr::Nested(expression) => visitor.visit_nested_expr(expression),
-
-        Expr::Interval(expression) => {
-            visitor.visit_expr(&expression.value);
-            if let Some(precision) = &expression.leading_precision {
-                visitor.visit_expr(precision);
-            }
-            if let Some(precision) = &expression.fractional_seconds_precision {
-                visitor.visit_expr(precision);
-            }
+        Expr::LegacyParenthesized(expression) => {
+            visitor.visit_legacy_parenthesized_expr(expression)
         }
+
+        Expr::LegacyInterval(expression) => visitor.visit_legacy_interval_expr(expression),
         Expr::Subquery(expression) => visitor.visit_query(&expression.query),
         Expr::Row(expression) => visitor.visit_row_expr(expression),
         Expr::Array(expression) => walk_array_expr(visitor, expression),
@@ -995,7 +993,24 @@ pub fn walk_binary_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &BinaryE
     visitor.visit_expr(&expression.right);
 }
 
-pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedExpr) {
+#[recursive::recursive]
+pub fn walk_legacy_interval_expr<V: Visit + ?Sized>(
+    visitor: &mut V,
+    expression: &LegacyIntervalExpr,
+) {
+    visitor.visit_expr(&expression.value);
+    if let Some(precision) = &expression.leading_precision {
+        visitor.visit_expr(precision);
+    }
+    if let Some(precision) = &expression.fractional_seconds_precision {
+        visitor.visit_expr(precision);
+    }
+}
+
+pub fn walk_legacy_parenthesized_expr<V: Visit + ?Sized>(
+    visitor: &mut V,
+    expression: &LegacyParenthesizedExpr,
+) {
     visitor.visit_expr(&expression.expression);
 }
 
@@ -1742,8 +1757,15 @@ pub trait Fold {
         fold_binary_expr(self, expression)
     }
 
-    fn fold_nested_expr(&mut self, expression: NestedExpr) -> NestedExpr {
-        fold_nested_expr(self, expression)
+    fn fold_legacy_interval_expr(&mut self, expression: LegacyIntervalExpr) -> LegacyIntervalExpr {
+        fold_legacy_interval_expr(self, expression)
+    }
+
+    fn fold_legacy_parenthesized_expr(
+        &mut self,
+        expression: LegacyParenthesizedExpr,
+    ) -> LegacyParenthesizedExpr {
+        fold_legacy_parenthesized_expr(self, expression)
     }
 }
 
@@ -1969,7 +1991,7 @@ pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Sele
     select.selection = select.selection.map(|expr| folder.fold_expr(expr));
     select.group_by = select.group_by.map(|node| folder.fold_group_by(node));
     select.having = select.having.map(|expr| folder.fold_expr(expr));
-    select.qualify = select.qualify.map(|expr| folder.fold_expr(expr));
+    select.legacy.qualify = select.legacy.qualify.map(|expr| folder.fold_expr(expr));
     select.windows = select
         .windows
         .into_iter()
@@ -2178,17 +2200,12 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::InList(node) => {
             Expr::InList(AstBox::new(folder.fold_in_list_expr(node.into_inner())))
         }
-        Expr::Nested(expression) => Expr::Nested(folder.fold_nested_expr(expression)),
+        Expr::LegacyParenthesized(expression) => {
+            Expr::LegacyParenthesized(folder.fold_legacy_parenthesized_expr(expression))
+        }
 
-        Expr::Interval(mut expression) => {
-            expression.value = AstBox::new(folder.fold_expr(expression.value.into_inner()));
-            expression.leading_precision = expression
-                .leading_precision
-                .map(|precision| AstBox::new(folder.fold_expr(precision.into_inner())));
-            expression.fractional_seconds_precision = expression
-                .fractional_seconds_precision
-                .map(|precision| AstBox::new(folder.fold_expr(precision.into_inner())));
-            Expr::Interval(expression)
+        Expr::LegacyInterval(expression) => {
+            Expr::LegacyInterval(folder.fold_legacy_interval_expr(expression))
         }
         Expr::Subquery(mut expression) => {
             expression.query = AstBox::new(folder.fold_query(expression.query.into_inner()));
@@ -2243,10 +2260,25 @@ pub fn fold_binary_expr<F: Fold + ?Sized>(
     expression
 }
 
-pub fn fold_nested_expr<F: Fold + ?Sized>(
+#[recursive::recursive]
+pub fn fold_legacy_interval_expr<F: Fold + ?Sized>(
     folder: &mut F,
-    mut expression: NestedExpr,
-) -> NestedExpr {
+    mut expression: LegacyIntervalExpr,
+) -> LegacyIntervalExpr {
+    expression.value = AstBox::new(folder.fold_expr(expression.value.into_inner()));
+    expression.leading_precision = expression
+        .leading_precision
+        .map(|precision| AstBox::new(folder.fold_expr(precision.into_inner())));
+    expression.fractional_seconds_precision = expression
+        .fractional_seconds_precision
+        .map(|precision| AstBox::new(folder.fold_expr(precision.into_inner())));
+    expression
+}
+
+pub fn fold_legacy_parenthesized_expr<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut expression: LegacyParenthesizedExpr,
+) -> LegacyParenthesizedExpr {
     expression.expression = AstBox::new(folder.fold_expr(expression.expression.into_inner()));
     expression
 }

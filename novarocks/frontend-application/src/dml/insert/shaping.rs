@@ -511,7 +511,7 @@ fn explicit_variant_source_path(
     mut expr: &ast::Expr,
 ) -> Option<Vec<novarocks_sql::compiler::SqlConstantExpressionStep>> {
     let mut path = Vec::new();
-    while let ast::Expr::Nested(nested) = expr {
+    while let ast::Expr::LegacyParenthesized(nested) = expr {
         path.push(novarocks_sql::compiler::SqlConstantExpressionStep::Nested);
         expr = &nested.expression;
     }
@@ -536,7 +536,7 @@ fn constrain_literal_in(
                 cast.expression = syntax;
             }
         }
-        ast::Expr::Nested(nested) => {
+        ast::Expr::LegacyParenthesized(nested) => {
             *nested.expression =
                 constrain_literal_in((*nested.expression).clone(), target, encoded.as_deref_mut())?;
         }
@@ -659,7 +659,7 @@ fn variant_bytes_expr(bytes: &[u8], span: Span) -> ast::Expr {
     })
 }
 fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
-    if let ast::Expr::Nested(nested) = expr {
+    if let ast::Expr::LegacyParenthesized(nested) = expr {
         return constant_variant_bytes(&nested.expression);
     }
     let ast::Expr::FunctionCall(function) = expr else {
@@ -677,7 +677,7 @@ fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
                 kind: ast::LiteralKind::String(text),
                 ..
             }) => Some(text),
-            ast::Expr::Nested(nested) => string_literal(&nested.expression),
+            ast::Expr::LegacyParenthesized(nested) => string_literal(&nested.expression),
             ast::Expr::Cast(cast)
                 if matches!(
                     match &cast.data_type.kind {
@@ -917,7 +917,7 @@ fn typed_write_literal_source(
     encoded: Option<&mut Option<Vec<u8>>>,
 ) -> Result<ast::Expr, String> {
     match &mut expression {
-        ast::Expr::Nested(nested) => {
+        ast::Expr::LegacyParenthesized(nested) => {
             *nested.expression =
                 typed_write_literal_source((*nested.expression).clone(), target, encoded)?;
         }
@@ -1118,7 +1118,7 @@ fn source_assignment_before_common_type(query: &ast::Query) -> bool {
                     && select.selection.is_none()
                     && select.group_by.is_none()
                     && select.having.is_none()
-                    && select.qualify.is_none()
+                    && select.legacy.qualify.is_none()
                     && select.windows.is_empty()
                     && select.projection.iter().all(|item| match item {
                         ast::SelectItem::SingleColumn(column) => {

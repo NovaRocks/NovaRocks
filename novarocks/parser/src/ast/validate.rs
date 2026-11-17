@@ -214,7 +214,7 @@ fn validate_select(select: &Select) -> Result<(), ValidateError> {
     if let Some(having) = &select.having {
         validate_expr(having)?;
     }
-    if let Some(qualify) = &select.qualify {
+    if let Some(qualify) = &select.legacy.qualify {
         validate_expr(qualify)?;
     }
     if let Some(group_by) = &select.group_by {
@@ -717,7 +717,7 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             validate_expr(&binary.left)?;
             validate_expr(&binary.right)?;
         }
-        Expr::Nested(nested) => validate_expr(&nested.expression)?,
+        Expr::LegacyParenthesized(nested) => validate_expr(&nested.expression)?,
 
         Expr::SearchedCase(case) => validate_case(
             None,
@@ -732,7 +732,7 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             case.span,
         )?,
         Expr::Cast(cast) => validate_expr(&cast.expression)?,
-        Expr::Interval(interval) => {
+        Expr::LegacyInterval(interval) => {
             validate_expr(&interval.value)?;
             if let Some(precision) = &interval.leading_precision {
                 validate_expr(precision)?;

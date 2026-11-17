@@ -875,7 +875,7 @@ fn type_name_argument_span(argument: &ast::DataTypeParameter) -> novarocks_parse
 
 pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
     match expr {
-        ast::Expr::Nested(nested) => expr_display_name(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => expr_display_name(&nested.expression),
         ast::Expr::Literal(literal) => format_literal_display_name(literal),
         ast::Expr::Identifier(ident) => ident.value.clone(),
         ast::Expr::Dereference(node) => format_dereference_display_name(node, expr),
@@ -1039,7 +1039,9 @@ fn expr_display_name_preserve_path(expr: &ast::Expr) -> String {
         return parts.join(".");
     }
     match expr {
-        ast::Expr::Nested(nested) => expr_display_name_preserve_path(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => {
+            expr_display_name_preserve_path(&nested.expression)
+        }
         ast::Expr::Dereference(node) => match &node.field {
             Some(field) => format!(
                 "{}.{}",
@@ -1086,7 +1088,7 @@ fn expr_display_name_with_parens(expr: &ast::Expr) -> String {
         {
             expr_display_name(expr)
         }
-        ast::Expr::Nested(nested) => expr_display_name_with_parens(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => expr_display_name_with_parens(&nested.expression),
         _ => format!("({})", expr_display_name(expr)),
     }
 }
@@ -1162,18 +1164,18 @@ fn format_predicated_display_name(expression: &ast::Expr, node: &ast::Predicated
 
 fn binary_operator_display(operator: ast::BinaryOperator) -> &'static str {
     match operator {
-        ast::BinaryOperator::NamedArgument => "=>",
+        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::NamedArgument) => "=>",
         ast::BinaryOperator::Add => "+",
         ast::BinaryOperator::Subtract => "-",
         ast::BinaryOperator::Multiply => "*",
         ast::BinaryOperator::Divide => "/",
         ast::BinaryOperator::Modulo => "%",
-        ast::BinaryOperator::BitwiseAnd => "&",
-        ast::BinaryOperator::BitwiseOr => "|",
-        ast::BinaryOperator::BitwiseXor => "^",
-        ast::BinaryOperator::ShiftLeft => "<<",
-        ast::BinaryOperator::ShiftRight => ">>",
-        ast::BinaryOperator::StringConcat => "||",
+        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::BitwiseAnd) => "&",
+        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::BitwiseOr) => "|",
+        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::BitwiseXor) => "^",
+        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::ShiftLeft) => "<<",
+        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::ShiftRight) => ">>",
+        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::StringConcat) => "||",
     }
 }
 
@@ -1550,7 +1552,7 @@ fn ordinal_function_argument<'a>(
 fn is_constant_expr(expr: &ast::Expr) -> bool {
     match expr {
         ast::Expr::Literal(_) => true,
-        ast::Expr::Nested(nested) => is_constant_expr(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => is_constant_expr(&nested.expression),
         _ => false,
     }
 }
@@ -1799,7 +1801,7 @@ pub(super) fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
                 )),
             }
         }
-        ast::Expr::Nested(nested) => eval_const_i64(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => eval_const_i64(&nested.expression),
         _ => Err(AnalyzeError::invalid_literal(
             format!(
                 "expected constant integer expression, got: {}",

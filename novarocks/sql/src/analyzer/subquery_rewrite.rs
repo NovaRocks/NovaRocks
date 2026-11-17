@@ -462,7 +462,7 @@ impl<'a> AnalyzerContext<'a> {
                     .as_ref()
                     .ok_or_else(|| AnalyzeError::internal("IN subquery missing LHS expression"))?;
                 let positional_lhs = match in_expr.as_ref() {
-                    ast::Expr::Nested(nested) => nested.expression.as_ref(),
+                    ast::Expr::LegacyParenthesized(nested) => nested.expression.as_ref(),
                     other => other,
                 };
                 if self.anonymous_row(positional_lhs)?.is_some() {
@@ -1837,7 +1837,7 @@ impl<'a> AnalyzerContext<'a> {
         // `Expr::Nested`). Analyze each component separately and pair
         // them with the subquery's output columns one-to-one.
         let positional_lhs = match in_expr_ast.as_ref() {
-            ast::Expr::Nested(nested) => nested.expression.as_ref(),
+            ast::Expr::LegacyParenthesized(nested) => nested.expression.as_ref(),
             other => other,
         };
         let lhs_items_ast: Vec<&ast::Expr> = match self.anonymous_row(positional_lhs)? {

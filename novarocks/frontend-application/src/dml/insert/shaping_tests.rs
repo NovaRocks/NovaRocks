@@ -901,7 +901,8 @@ fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
             FunctionValueType::try_with_logical_type(DataType::Binary, true, domain).unwrap();
         let target = ColumnDef::from_value_type("v".into(), declared, None).unwrap();
         let query = shape(&format!("VALUES (({source}))"), &[target]);
-        let ast::Expr::Nested(nested) = cast_input(rows(&query)[0][0], target_name) else {
+        let ast::Expr::LegacyParenthesized(nested) = cast_input(rows(&query)[0][0], target_name)
+        else {
             panic!("source parentheses must stay on the original path");
         };
         let original_call = cast_input(&nested.expression, target_name);

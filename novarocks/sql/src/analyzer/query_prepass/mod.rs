@@ -539,7 +539,7 @@ fn inline_iteration(
         selection: None,
         group_by: None,
         having: None,
-        qualify: None,
+        legacy: ast::LegacySelectExtensions::default(),
         windows: ast::AstVec::new(),
         modifiers: Default::default(),
         span,
@@ -630,7 +630,10 @@ fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, ex
             if let Some(group_by) = &select.group_by {
                 visitor.visit_group_by(group_by);
             }
-            for expression in [&select.having, &select.qualify].into_iter().flatten() {
+            for expression in [&select.having, &select.legacy.qualify]
+                .into_iter()
+                .flatten()
+            {
                 visitor.visit_expr(expression);
             }
             for window in &select.windows {
@@ -789,7 +792,7 @@ fn remove_bare_top_level_dual(query: &mut Query) {
     if select.selection.is_some()
         || select.group_by.is_some()
         || select.having.is_some()
-        || select.qualify.is_some()
+        || select.legacy.qualify.is_some()
         || !select.windows.is_empty()
         || !select.modifiers.is_empty()
         || query.modifiers.order_by.is_some()

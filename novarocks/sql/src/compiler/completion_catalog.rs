@@ -601,7 +601,7 @@ impl<'a> CatalogNeedCollector<'a> {
         if let Some(having) = &select.having {
             self.collect_expr(having, scope)?;
         }
-        if let Some(qualify) = &select.qualify {
+        if let Some(qualify) = &select.legacy.qualify {
             self.collect_expr(qualify, scope)?;
         }
         for window in &select.windows {

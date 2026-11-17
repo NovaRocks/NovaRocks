@@ -232,7 +232,7 @@ fn identifiers_literals_and_unary_nodes_match_parser_shapes() {
     assert_expression(build::boolean(true), "TRUE");
     assert_expression(build::boolean(false), "FALSE");
     assert_expression(build::null(), "NULL");
-    assert_expression(build::nested(id("x")), "(x)");
+    assert_expression(build::legacy_nested(id("x")), "(x)");
     assert_expression(build::not(id("x")), "NOT x");
     assert_expression(
         build::unary(ast::UnaryOperator::Minus, build::integer(1)).expect("signed integer"),
@@ -243,7 +243,11 @@ fn identifiers_literals_and_unary_nodes_match_parser_shapes() {
         "- -1",
     );
     assert_expression(
-        build::unary(ast::UnaryOperator::BitwiseNot, id("x")).expect("bitwise not"),
+        build::unary(
+            ast::UnaryOperator::Legacy(ast::legacy::UnaryOperator::BitwiseNot),
+            id("x"),
+        )
+        .expect("bitwise not"),
         "~x",
     );
     assert!(matches!(
@@ -283,7 +287,7 @@ fn one_field_value_tuples_remain_distinct_from_source_parentheses() {
     assert_eq!(row.fields[0].span, field.span());
     assert_eq!(row.span, SYNTHETIC);
     let source_parentheses = build::tuple(vec![field.clone()]).expect("source parentheses");
-    let Expr::Nested(nested) = source_parentheses else {
+    let Expr::LegacyParenthesized(nested) = source_parentheses else {
         panic!("source parentheses retain their Nested shape");
     };
     assert_eq!(*nested.expression, field);
@@ -545,7 +549,7 @@ fn derived_expressions_retain_source_locations_and_envelopes_are_synthetic() {
     let source = build::identifier(build::ident_at("user_value", false, source_span));
     let cast = build::cast(source.clone(), build::simple_type("INT"));
     assert_eq!(cast.span(), source_span);
-    assert_eq!(build::nested(cast.clone()).span(), source_span);
+    assert_eq!(build::legacy_nested(cast.clone()).span(), source_span);
     assert_eq!(build::not(source.clone()).span(), source_span);
     assert_eq!(build::is_null(source.clone(), true).span(), source_span);
     assert_eq!(
@@ -671,7 +675,7 @@ fn logical_nodes_keep_source_order_grouping_and_every_visitor_child() {
     };
     assert_eq!(logical.operator, ast::LogicalOperator::And);
     assert_eq!(logical.terms.len(), 3);
-    let Expr::Nested(group) = &logical.terms[1] else {
+    let Expr::LegacyParenthesized(group) = &logical.terms[1] else {
         panic!("explicit parentheses")
     };
     let Expr::Logical(or) = group.expression.as_ref() else {

@@ -51,6 +51,11 @@ pub use legacy::{
     TableProperty, TableStatement, TransactionControlKind, TransactionControlStatement,
     TruncateTable, Update, UseStatement, ViewStatement,
 };
+pub use legacy::{
+    BinaryOperator as LegacyBinaryOperator, IntervalExpr as LegacyIntervalExpr,
+    IntervalField as LegacyIntervalField, ParenthesizedExpr as LegacyParenthesizedExpr,
+    SelectExtensions as LegacySelectExtensions, UnaryOperator as LegacyUnaryOperator,
+};
 mod relation;
 mod routine;
 
@@ -70,12 +75,14 @@ mod visit;
 mod window;
 pub use storage::{AstBox, AstVec};
 
+pub use visit::{fold_legacy_interval_expr, walk_legacy_interval_expr};
+
 pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
     AllRows, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr, BinaryOperator, CallArgument,
-    DereferenceExpr, Expr, FunctionCall, IntervalExpr, IntervalField, LogicalExpr, LogicalOperator,
-    NestedExpr, NullTreatment, Parameter, ProcessingMode, ProcessingModeKind, RowExpr, RowField,
-    SubqueryExpr, SubscriptExpr, UnaryExpr, UnaryOperator,
+    DereferenceExpr, Expr, FunctionCall, IntervalField, LogicalExpr, LogicalOperator,
+    NullTreatment, Parameter, ProcessingMode, ProcessingModeKind, RowExpr, RowField, SubqueryExpr,
+    SubscriptExpr, UnaryExpr, UnaryOperator,
 };
 
 pub use query::{
@@ -95,14 +102,14 @@ pub use validate::{validate_statement, validate_statements};
 pub use visit::{
     Fold, Visit, fold_all_columns, fold_auto_group_by, fold_binary_expr, fold_cte, fold_expr,
     fold_function_call, fold_group_by, fold_grouping_element, fold_grouping_sets, fold_ident,
-    fold_logical_expr, fold_nested_expr, fold_object_name, fold_query, fold_select,
+    fold_legacy_parenthesized_expr, fold_logical_expr, fold_object_name, fold_query, fold_select,
     fold_select_item, fold_set_expr, fold_simple_group_by, fold_single_column, fold_statement,
     fold_unary_expr, fold_values, fold_view_statement, fold_with, walk_all_columns,
     walk_auto_group_by, walk_binary_expr, walk_cte, walk_expr, walk_function_call, walk_group_by,
-    walk_grouping_element, walk_grouping_sets, walk_ident, walk_logical_expr, walk_nested_expr,
-    walk_object_name, walk_query, walk_select, walk_select_item, walk_simple_group_by,
-    walk_single_column, walk_statement, walk_unary_expr, walk_values, walk_view_statement,
-    walk_with,
+    walk_grouping_element, walk_grouping_sets, walk_ident, walk_legacy_parenthesized_expr,
+    walk_logical_expr, walk_object_name, walk_query, walk_select, walk_select_item,
+    walk_simple_group_by, walk_single_column, walk_statement, walk_unary_expr, walk_values,
+    walk_view_statement, walk_with,
 };
 pub use window::{
     Window, WindowDefinition, WindowFrame, WindowFrameBound, WindowFrameExclusion,
@@ -241,7 +248,7 @@ mod tests {
             }
         }
 
-        let expression = Expr::Nested(NestedExpr {
+        let expression = Expr::LegacyParenthesized(LegacyParenthesizedExpr {
             expression: crate::ast::AstBox::new(Expr::Identifier(Ident {
                 value: "old".to_owned(),
                 quoted: false,
@@ -253,7 +260,7 @@ mod tests {
         let expression = Rename.fold_expr(expression);
         assert_eq!(
             expression,
-            Expr::Nested(NestedExpr {
+            Expr::LegacyParenthesized(LegacyParenthesizedExpr {
                 expression: crate::ast::AstBox::new(Expr::Identifier(Ident {
                     value: "new".to_owned(),
                     quoted: false,

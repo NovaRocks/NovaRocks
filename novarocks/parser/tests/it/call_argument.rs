@@ -818,7 +818,7 @@ fn row_and_map_builders_retain_original_owning_nodes_without_changing_tuple_cont
     );
     assert!(matches!(
         build::tuple(vec![build::integer(1)]).unwrap(),
-        Expr::Nested(_)
+        Expr::LegacyParenthesized(_)
     ));
     let singleton = build::tuple_value(vec![build::integer(1)]).unwrap();
     assert!(matches!(&singleton, Expr::Row(node) if node.fields.len() == 1));

@@ -902,7 +902,7 @@ fn update_assignment_projection(
                 })?;
             Ok((
                 build::ident_at(&column.name, false, assignment.column_span),
-                build::nested(assignment.value.clone()),
+                build::legacy_nested(assignment.value.clone()),
             ))
         })
         .collect()
@@ -1036,7 +1036,7 @@ fn build_merge_match_query(
         action_cases.push((
             build::and_all(vec![
                 build::is_null(qualify("_file"), true),
-                build::nested(matched_predicate.unwrap_or_else(|| build::boolean(true))),
+                build::legacy_nested(matched_predicate.unwrap_or_else(|| build::boolean(true))),
             ])
             .expect("MERGE matched action has two predicates"),
             build::integer(i64::from(action)),
@@ -1046,7 +1046,7 @@ fn build_merge_match_query(
         action_cases.push((
             build::and_all(vec![
                 build::is_null(qualify("_file"), false),
-                build::nested(not_matched_predicate.unwrap_or_else(|| build::boolean(true))),
+                build::legacy_nested(not_matched_predicate.unwrap_or_else(|| build::boolean(true))),
             ])
             .expect("MERGE not-matched action has two predicates"),
             build::integer(i64::from(MERGE_ACTION_NOT_MATCHED_INSERT)),
@@ -1076,7 +1076,7 @@ fn build_merge_match_query(
         ));
     }
     projection.push(build::item(
-        build::nested(action),
+        build::legacy_nested(action),
         Some(build::ident("__nr_merge_action", false)),
     ));
     for column in target_columns {
@@ -1091,7 +1091,7 @@ fn build_merge_match_query(
     ] {
         projection.extend(values.into_iter().map(|(column, expr)| {
             build::item(
-                build::nested(expr),
+                build::legacy_nested(expr),
                 Some(build::ident_at(
                     format!("{prefix}{}", column.value),
                     false,
@@ -1159,7 +1159,7 @@ fn build_merge_mor_producer(
                     })?;
                 Ok((
                     build::ident_at(&column.name, false, assignment.column_span),
-                    build::nested(assignment.value.clone()),
+                    build::legacy_nested(assignment.value.clone()),
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -1170,7 +1170,10 @@ fn build_merge_mor_producer(
         for column in columns {
             if let Some(index) = column.value_index {
                 let expr = clause.action.values[index].clone();
-                insert_values.push((build::ident(&column.name, false), build::nested(expr)));
+                insert_values.push((
+                    build::ident(&column.name, false),
+                    build::legacy_nested(expr),
+                ));
             }
         }
     }
@@ -1947,7 +1950,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let ast::Expr::Nested(action) = action else {
+        let ast::Expr::LegacyParenthesized(action) = action else {
             panic!("action expression boundary");
         };
         let ast::Expr::SearchedCase(case) = action.expression.as_ref() else {
@@ -1994,7 +1997,7 @@ mod tests {
                 .unwrap_or_else(|never| match never {})
                 .is_some_and(|chain| chain.last().value == "_file")
             );
-            let ast::Expr::Nested(clause) = &condition.terms[1] else {
+            let ast::Expr::LegacyParenthesized(clause) = &condition.terms[1] else {
                 panic!("original clause boundary");
             };
             assert_eq!(clause.expression.as_ref(), original);

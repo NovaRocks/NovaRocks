@@ -131,7 +131,7 @@ fn register_literal_assignments<'a>(
     control
         .checkpoint(CompilePhase::Validate, 1)
         .map_err(AnalyzeError::control)?;
-    if let ast::Expr::Nested(nested) = expression {
+    if let ast::Expr::LegacyParenthesized(nested) = expression {
         return register_literal_assignments(&nested.expression, assignment, source, control);
     }
     // A carrier cannot authorize child semantics for a nominal domain.
@@ -421,7 +421,7 @@ fn context_hole(
         return Ok(false);
     }
     match expression {
-        ast::Expr::Nested(nested) => context_hole(&nested.expression, source, control),
+        ast::Expr::LegacyParenthesized(nested) => context_hole(&nested.expression, source, control),
         ast::Expr::Literal(literal) => Ok(matches!(literal.kind, ast::LiteralKind::Null)),
         ast::Expr::Array(array) => Ok(array.values.is_empty()),
         ast::Expr::FunctionCall(call) if plain_map_arguments(call).is_some() => {
@@ -455,7 +455,7 @@ fn context_literal<'a>(
         return Ok(());
     }
     let constant = match expression {
-        ast::Expr::Nested(nested) => {
+        ast::Expr::LegacyParenthesized(nested) => {
             return context_literal(&nested.expression, expected, source, policy, control);
         }
         ast::Expr::Literal(literal) if matches!(literal.kind, ast::LiteralKind::Null) => {

@@ -483,7 +483,7 @@ fn validate_where_predicate(
                 Err(format!("phase 1 DELETE WHERE does not support predicate `{other:?}`").into())
             }
         },
-        Expr::Nested(nested) => validate_where_predicate(&nested.expression, columns),
+        Expr::LegacyParenthesized(nested) => validate_where_predicate(&nested.expression, columns),
         other => Err(format!(
             "phase 1 DELETE WHERE supports comparison / IN / IS NULL / AND / OR \
              over primitive columns; rewrite this clause and retry. Unsupported: {other:?}"
@@ -650,7 +650,7 @@ fn is_literal_expr(expr: &Expr) -> bool {
         Expr::Unary(unary) if unary.operator == UnaryOperator::Minus => {
             matches!(unary.expression.as_ref(), Expr::Literal(_))
         }
-        Expr::Nested(nested) => is_literal_expr(&nested.expression),
+        Expr::LegacyParenthesized(nested) => is_literal_expr(&nested.expression),
         _ => false,
     }
 }
@@ -784,7 +784,7 @@ fn extract_string_literal(expr: &Expr) -> Option<&str> {
             LiteralKind::String(value) => Some(value.as_str()),
             _ => None,
         },
-        Expr::Nested(nested) => extract_string_literal(&nested.expression),
+        Expr::LegacyParenthesized(nested) => extract_string_literal(&nested.expression),
         _ => None,
     }
 }
@@ -1186,7 +1186,7 @@ mod tests {
         assert!(
             logical.terms[1..]
                 .iter()
-                .all(|term| matches!(term, Expr::Nested(_)))
+                .all(|term| matches!(term, Expr::LegacyParenthesized(_)))
         );
     }
 

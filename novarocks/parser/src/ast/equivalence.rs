@@ -153,7 +153,7 @@ impl SyntaxEq for Select {
             && syntax_eq_option(&self.selection, &other.selection)
             && syntax_eq_option(&self.group_by, &other.group_by)
             && syntax_eq_option(&self.having, &other.having)
-            && syntax_eq_option(&self.qualify, &other.qualify)
+            && self.legacy.syntax_eq(&other.legacy)
             && syntax_eq_slice(&self.windows, &other.windows)
             && self.modifiers.syntax_eq(&other.modifiers)
     }
@@ -374,8 +374,10 @@ impl SyntaxEq for Expr {
             (Self::SimpleCase(left), Self::SimpleCase(right)) => left.syntax_eq(right),
             (Self::Predicated(left), Self::Predicated(right)) => left.syntax_eq(right),
             (Self::InList(left), Self::InList(right)) => left.syntax_eq(right),
-            (Self::Nested(left), Self::Nested(right)) => left.syntax_eq(right),
-            (Self::Interval(left), Self::Interval(right)) => left.syntax_eq(right),
+            (Self::LegacyParenthesized(left), Self::LegacyParenthesized(right)) => {
+                left.syntax_eq(right)
+            }
+            (Self::LegacyInterval(left), Self::LegacyInterval(right)) => left.syntax_eq(right),
             (Self::Subquery(left), Self::Subquery(right)) => left.syntax_eq(right),
             (Self::Row(left), Self::Row(right)) => left.syntax_eq(right),
             (Self::Array(left), Self::Array(right)) => left.syntax_eq(right),
@@ -424,13 +426,19 @@ impl SyntaxEq for BinaryExpr {
     }
 }
 
-impl SyntaxEq for NestedExpr {
+impl SyntaxEq for LegacySelectExtensions {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        syntax_eq_option(&self.qualify, &other.qualify)
+    }
+}
+
+impl SyntaxEq for LegacyParenthesizedExpr {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.expression.syntax_eq(&other.expression)
     }
 }
 
-impl SyntaxEq for IntervalExpr {
+impl SyntaxEq for LegacyIntervalExpr {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.value.syntax_eq(&other.value)
             && self.leading_field == other.leading_field
@@ -701,7 +709,7 @@ mod tests {
                     span: span(start + 13),
                 }),
                 having: None,
-                qualify: None,
+                legacy: Default::default(),
                 windows: AstVec::new(),
                 modifiers: QueryModifiers {
                     order_by: Some(OrderBy {

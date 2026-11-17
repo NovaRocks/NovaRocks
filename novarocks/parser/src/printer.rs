@@ -375,7 +375,7 @@ impl Printer {
             self.output.push_str(" HAVING ");
             self.write_expr(having);
         }
-        if let Some(qualify) = &select.qualify {
+        if let Some(qualify) = &select.legacy.qualify {
             self.output.push_str(" QUALIFY ");
             self.write_expr(qualify);
         }
@@ -426,7 +426,7 @@ impl Printer {
                 target,
                 Expr::Identifier(_)
                     | Expr::Dereference(_)
-                    | Expr::Nested(_)
+                    | Expr::LegacyParenthesized(_)
                     | Expr::FunctionCall(_)
                     | Expr::Subscript(_)
             );
@@ -1211,7 +1211,9 @@ impl Printer {
             Expr::Unary(expression) => self.write_unary_expr(expression),
             Expr::Binary(expression) => self.write_binary_expr(expression),
             Expr::Logical(expression) => self.write_logical_expr(expression),
-            Expr::Nested(expression) => self.write_nested_expr(expression),
+            Expr::LegacyParenthesized(expression) => {
+                self.write_legacy_parenthesized_expr(expression)
+            }
             Expr::InList(expression) => self.write_in_list_expr(expression),
             Expr::Predicated(expression) => self.write_predicated_expr(expression),
             Expr::Exists(expression) => self.write_exists_expr(expression),
@@ -1228,7 +1230,7 @@ impl Printer {
                 self.write_expr(&node.subquery);
             }
             Expr::Cast(expression) => self.write_cast_expr(expression),
-            Expr::Interval(expression) => self.write_interval_expr(expression),
+            Expr::LegacyInterval(expression) => self.write_legacy_interval_expr(expression),
             Expr::Subquery(expression) => self.write_subquery_expr(expression),
             Expr::Row(expression) => self.write_row_expr(expression),
             Expr::Array(expression) => self.write_array_expr(expression),
@@ -1568,7 +1570,9 @@ impl Printer {
             UnaryOperator::Not => self.output.push_str("NOT "),
             UnaryOperator::Plus => self.output.push('+'),
             UnaryOperator::Minus => self.output.push('-'),
-            UnaryOperator::BitwiseNot => self.output.push('~'),
+            UnaryOperator::Legacy(crate::ast::legacy::UnaryOperator::BitwiseNot) => {
+                self.output.push('~')
+            }
         }
         let requires_separator = (matches!(expression.expression.as_ref(), Expr::Unary(_))
             && !matches!(expression.operator, UnaryOperator::Not))
@@ -1770,7 +1774,7 @@ impl Printer {
         self.output.push(')');
     }
 
-    fn write_nested_expr(&mut self, expression: &NestedExpr) {
+    fn write_legacy_parenthesized_expr(&mut self, expression: &LegacyParenthesizedExpr) {
         self.output.push('(');
         self.write_expr(&expression.expression);
         self.output.push(')');
@@ -1823,7 +1827,7 @@ impl Printer {
         self.output.push(')');
     }
 
-    fn write_interval_expr(&mut self, expression: &IntervalExpr) {
+    fn write_legacy_interval_expr(&mut self, expression: &LegacyIntervalExpr) {
         self.output.push_str("INTERVAL ");
         self.write_expr(&expression.value);
         self.output.push(' ');
@@ -1847,15 +1851,15 @@ impl Printer {
     fn write_interval_field(&mut self, field: IntervalField) {
         self.output.push_str(match field {
             IntervalField::Year => "YEAR",
-            IntervalField::Quarter => "QUARTER",
+            IntervalField::Legacy(crate::ast::legacy::IntervalField::Quarter) => "QUARTER",
             IntervalField::Month => "MONTH",
-            IntervalField::Week => "WEEK",
+            IntervalField::Legacy(crate::ast::legacy::IntervalField::Week) => "WEEK",
             IntervalField::Day => "DAY",
             IntervalField::Hour => "HOUR",
             IntervalField::Minute => "MINUTE",
             IntervalField::Second => "SECOND",
-            IntervalField::Millisecond => "MILLISECOND",
-            IntervalField::Microsecond => "MICROSECOND",
+            IntervalField::Legacy(crate::ast::legacy::IntervalField::Millisecond) => "MILLISECOND",
+            IntervalField::Legacy(crate::ast::legacy::IntervalField::Microsecond) => "MICROSECOND",
         });
     }
     fn write_subquery_expr(&mut self, expression: &SubqueryExpr) {
@@ -2016,29 +2020,34 @@ impl ComparisonOperator {
 impl BinaryOperator {
     const fn precedence(self) -> u8 {
         match self {
-            Self::NamedArgument => 1,
-            Self::BitwiseOr => 35,
-            Self::BitwiseXor => 36,
-            Self::BitwiseAnd => 37,
-            Self::ShiftLeft | Self::ShiftRight => 40,
-            Self::StringConcat | Self::Add | Self::Subtract => 50,
+            Self::Add | Self::Subtract => 50,
             Self::Multiply | Self::Divide | Self::Modulo => 60,
+            Self::Legacy(operator) => match operator {
+                LegacyBinaryOperator::NamedArgument => 1,
+                LegacyBinaryOperator::BitwiseOr => 35,
+                LegacyBinaryOperator::BitwiseXor => 36,
+                LegacyBinaryOperator::BitwiseAnd => 37,
+                LegacyBinaryOperator::ShiftLeft | LegacyBinaryOperator::ShiftRight => 40,
+                LegacyBinaryOperator::StringConcat => 50,
+            },
         }
     }
     const fn sql(self) -> &'static str {
         match self {
-            Self::NamedArgument => "=>",
             Self::Add => "+",
             Self::Subtract => "-",
             Self::Multiply => "*",
             Self::Divide => "/",
             Self::Modulo => "%",
-            Self::BitwiseAnd => "&",
-            Self::BitwiseOr => "|",
-            Self::BitwiseXor => "^",
-            Self::ShiftLeft => "<<",
-            Self::ShiftRight => ">>",
-            Self::StringConcat => "||",
+            Self::Legacy(operator) => match operator {
+                LegacyBinaryOperator::NamedArgument => "=>",
+                LegacyBinaryOperator::BitwiseAnd => "&",
+                LegacyBinaryOperator::BitwiseOr => "|",
+                LegacyBinaryOperator::BitwiseXor => "^",
+                LegacyBinaryOperator::ShiftLeft => "<<",
+                LegacyBinaryOperator::ShiftRight => ">>",
+                LegacyBinaryOperator::StringConcat => "||",
+            },
         }
     }
 }
@@ -2895,7 +2904,7 @@ mod tests {
                 selection: None,
                 group_by: None,
                 having: None,
-                qualify: None,
+                legacy: Default::default(),
                 windows: AstVec::new(),
                 modifiers: QueryModifiers {
                     order_by: Some(OrderBy {

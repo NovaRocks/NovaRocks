@@ -156,7 +156,7 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
         ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
             negate_literal(expr_to_literal(&unary.expression)?)
         }
-        ast::Expr::Nested(nested) => expr_to_literal(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => expr_to_literal(&nested.expression),
         // Handle CAST(expr AS type): peel the CAST and evaluate the inner literal,
         // EXCEPT for DECIMAL targets. CAST to a DECIMAL type carries an explicit
         // (precision, scale) that the literal fast-path ignores — it always writes
@@ -831,7 +831,7 @@ fn parse_single_arrow_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)> {
             .arguments
             .first()
             .map(|argument| (argument.name.value.to_lowercase(), &lambda.body)),
-        ast::Expr::Nested(nested) => parse_single_arrow_lambda(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => parse_single_arrow_lambda(&nested.expression),
         _ => None,
     }
 }
@@ -841,7 +841,7 @@ fn lambda_body_casts_param_to_string(
     param_name: &str,
 ) -> Result<bool, LiteralFailure> {
     match expr {
-        ast::Expr::Nested(nested) => {
+        ast::Expr::LegacyParenthesized(nested) => {
             lambda_body_casts_param_to_string(&nested.expression, param_name)
         }
         ast::Expr::Cast(cast) if lambda_expr_is_param(&cast.expression, param_name) => {
@@ -855,7 +855,9 @@ fn lambda_body_casts_param_to_string(
 fn lambda_expr_is_param(expr: &ast::Expr, param_name: &str) -> bool {
     match expr {
         ast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(param_name),
-        ast::Expr::Nested(nested) => lambda_expr_is_param(&nested.expression, param_name),
+        ast::Expr::LegacyParenthesized(nested) => {
+            lambda_expr_is_param(&nested.expression, param_name)
+        }
         _ => false,
     }
 }

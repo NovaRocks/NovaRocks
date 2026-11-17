@@ -232,7 +232,9 @@ pub(crate) fn resolve_expression_site<'a>(
                 invalid("constant source grouping column differs from its owned syntax")
             })?,
             (SqlConstantExpressionStep::TrimSource, ast::Expr::Trim(node)) => &node.trim_source,
-            (SqlConstantExpressionStep::Nested, ast::Expr::Nested(nested)) => &nested.expression,
+            (SqlConstantExpressionStep::Nested, ast::Expr::LegacyParenthesized(nested)) => {
+                &nested.expression
+            }
             (SqlConstantExpressionStep::LogicalTerm(index), ast::Expr::Logical(logical)) => {
                 logical.terms.get(*index).ok_or_else(|| {
                     invalid("constant source logical term index differs from its owned syntax")

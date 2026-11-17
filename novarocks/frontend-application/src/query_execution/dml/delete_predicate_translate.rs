@@ -131,7 +131,7 @@ fn flatten_and(expr: &Expr) -> Result<Vec<&Expr>, String> {
                  use only AND of comparisons / IN / IS NULL"
                     .to_string())
             }
-            Expr::Nested(expression) => walk(&expression.expression, out),
+            Expr::LegacyParenthesized(expression) => walk(&expression.expression, out),
             _ => {
                 out.push(e);
                 Ok(())
@@ -215,7 +215,7 @@ fn translate_atom(
                 "DELETE WHERE supports comparison / IN / IS NULL only; got {other:?}"
             )),
         },
-        Expr::Nested(expression) => {
+        Expr::LegacyParenthesized(expression) => {
             translate_atom(&expression.expression, schema, keys, keys_type, out)
         }
         other => Err(format!(
@@ -539,7 +539,7 @@ mod tests {
         let Expr::Logical(root) = &predicate else {
             panic!("root AND");
         };
-        let Expr::Nested(nested) = &root.terms[1] else {
+        let Expr::LegacyParenthesized(nested) = &root.terms[1] else {
             panic!("explicit group");
         };
         let Expr::Logical(group) = nested.expression.as_ref() else {

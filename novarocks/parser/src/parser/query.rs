@@ -470,7 +470,7 @@ fn parse_select(
             selection: selection,
             group_by: group_by,
             having: having,
-            qualify: qualify,
+            legacy: crate::ast::legacy::SelectExtensions { qualify },
             windows: windows.into(),
             modifiers: Default::default(),
             span: Span::new(start, end),
@@ -994,7 +994,7 @@ fn old_table_function(
     let plain=match &expr {
         Expr::FunctionCall(call)=>!call.distinct && call.order_by.is_none() && call.filter.is_none()
             && call.window.is_none() && call.null_treatment.is_none() && call.processing_mode.is_none()
-            && call.arguments.iter().all(|arg|!matches!(&arg.value,Expr::Binary(binary) if binary.operator==crate::ast::BinaryOperator::NamedArgument && !matches!(binary.left.as_ref(),Expr::Identifier(_)))),
+            && call.arguments.iter().all(|arg|!matches!(&arg.value,Expr::Binary(binary) if binary.operator==crate::ast::BinaryOperator::Legacy(crate::ast::legacy::BinaryOperator::NamedArgument) && !matches!(binary.left.as_ref(),Expr::Identifier(_)))),
         _=>false,
     };
     if !plain {
@@ -1016,7 +1016,10 @@ fn old_table_function(
             let crate::ast::CallArgument { name, value, span } = argument;
             let (name, value) = match value {
                 Expr::Binary(binary)
-                    if binary.operator == crate::ast::BinaryOperator::NamedArgument =>
+                    if binary.operator
+                        == crate::ast::BinaryOperator::Legacy(
+                            crate::ast::legacy::BinaryOperator::NamedArgument,
+                        ) =>
                 {
                     let Expr::Identifier(name) = binary.left.into_inner() else {
                         unreachable!()

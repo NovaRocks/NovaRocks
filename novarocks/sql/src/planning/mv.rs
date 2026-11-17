@@ -2500,7 +2500,7 @@ fn collect_join_equality_predicates(
     predicates: &mut Vec<SqlMvJoinPredicateColumns>,
 ) -> Result<(), String> {
     match condition {
-        ast::Expr::Nested(nested) => {
+        ast::Expr::LegacyParenthesized(nested) => {
             collect_join_equality_predicates(&nested.expression, predicates)
         }
         ast::Expr::Logical(logical) if logical.operator == ast::LogicalOperator::And => {
@@ -2972,7 +2972,7 @@ fn collect_equi_join_keys(
     out: &mut Vec<JoinKeyPairShape>,
 ) -> Result<(), String> {
     match expr {
-        Expr::Nested(inner) => {
+        Expr::LegacyParenthesized(inner) => {
             collect_equi_join_keys(&inner.expression, left_alias, right_alias, out)
         }
         Expr::Logical(logical) if logical.operator == ast::LogicalOperator::And => {
@@ -3021,7 +3021,7 @@ fn collect_equi_join_keys(
 }
 
 fn qualified_column_alias(mut expr: &Expr) -> Result<String, String> {
-    while let Expr::Nested(inner) = expr {
+    while let Expr::LegacyParenthesized(inner) = expr {
         expr = &inner.expression;
     }
     let chain = ast::identifier_chain_observed(expr, |_| Ok::<(), String>(()))?
@@ -3066,7 +3066,7 @@ fn reject_unsupported_select_clauses(select: &Select) -> Result<(), String> {
         || select.group_by.is_some()
         || select.having.is_some()
         || !select.windows.is_empty()
-        || select.qualify.is_some()
+        || select.legacy.qualify.is_some()
         || !select.modifiers.is_empty()
     {
         return Err(projection_filter_error());
@@ -3078,7 +3078,7 @@ fn reject_unsupported_aggregate_select_clauses(select: &Select) -> Result<(), St
     if select.distinct
         || select.having.is_some()
         || !select.windows.is_empty()
-        || select.qualify.is_some()
+        || select.legacy.qualify.is_some()
         || !select.modifiers.is_empty()
     {
         return Err(aggregate_error());
@@ -3417,7 +3417,7 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
         }
         Expr::Logical(logical) => logical.terms.iter().any(expr_contains_aggregate_function),
         Expr::Unary(unary) => expr_contains_aggregate_function(&unary.expression),
-        Expr::Nested(nested) => expr_contains_aggregate_function(&nested.expression),
+        Expr::LegacyParenthesized(nested) => expr_contains_aggregate_function(&nested.expression),
         Expr::Cast(cast) => expr_contains_aggregate_function(&cast.expression),
         Expr::Predicated(node) => {
             expr_contains_aggregate_function(&node.value)
@@ -3597,7 +3597,7 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
         }
         Expr::ArrayWildcardSubscript(_) => return Err(projection_filter_error()),
         Expr::Unary(unary) => reject_unsupported_expr(&unary.expression)?,
-        Expr::Nested(nested) => reject_unsupported_expr(&nested.expression)?,
+        Expr::LegacyParenthesized(nested) => reject_unsupported_expr(&nested.expression)?,
         Expr::Predicated(node) => {
             if crate::analyzer::unsupported_predicate_reason(node).is_some() {
                 return Err(projection_filter_error());
@@ -3627,7 +3627,7 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
                 reject_unsupported_expr(&field.expression)?;
             }
         }
-        Expr::Interval(interval) => reject_unsupported_expr(&interval.value)?,
+        Expr::LegacyInterval(interval) => reject_unsupported_expr(&interval.value)?,
         Expr::Lambda(lambda) => reject_unsupported_expr(&lambda.body)?,
         Expr::Identifier(ident) => {
             if is_non_deterministic_bare_identifier(&ident.value) {

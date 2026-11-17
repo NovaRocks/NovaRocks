@@ -1446,7 +1446,10 @@ fn table_argument_named_arg<'r>(
 
 fn generate_series_named_arg(expr: &ast::Expr) -> Option<(&ast::Ident, &ast::Expr)> {
     let (left, right) = match expr {
-        ast::Expr::Binary(binary) if binary.operator == ast::BinaryOperator::NamedArgument => {
+        ast::Expr::Binary(binary)
+            if binary.operator
+                == ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::NamedArgument) =>
+        {
             (binary.left.as_ref(), binary.right.as_ref())
         }
         ast::Expr::Predicated(node) => {
@@ -1489,13 +1492,17 @@ fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
                 ast::BinaryOperator::Multiply => Ok(left * right),
                 ast::BinaryOperator::Divide if right != 0 => Ok(left / right),
                 ast::BinaryOperator::Modulo if right != 0 => Ok(left % right),
+                ast::BinaryOperator::Legacy(operator) => Err(AnalyzeError::invalid_argument(
+                    format!("unsupported operator in constant expression: {operator:?}"),
+                    expr.span(),
+                )),
                 operator => Err(AnalyzeError::invalid_argument(
                     format!("unsupported operator in constant expression: {operator:?}"),
                     expr.span(),
                 )),
             }
         }
-        ast::Expr::Nested(nested) => eval_const_i64(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => eval_const_i64(&nested.expression),
         _ => Err(AnalyzeError::invalid_literal(
             format!("expected constant integer expression, got: {expr:?}"),
             expr.span(),

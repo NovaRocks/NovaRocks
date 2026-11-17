@@ -322,7 +322,7 @@ fn exact_constructor_constraints_and_name_projection_do_not_infer_global_policy(
     );
     for column in [
         build::integer(1),
-        build::nested(build::identifier(id("x", false))),
+        build::legacy_nested(build::identifier(id("x", false))),
         Expr::Dereference(AstBox::new(crate::ast::DereferenceExpr {
             base: build::identifier(id("label", false)),
             field: None,
@@ -339,7 +339,7 @@ fn exact_constructor_constraints_and_name_projection_do_not_infer_global_policy(
     }
     for zone in [
         build::integer(1),
-        build::nested(build::string("UTC")),
+        build::legacy_nested(build::string("UTC")),
         Expr::CurrentDate(CurrentDate { span: span() }),
     ] {
         assert_eq!(

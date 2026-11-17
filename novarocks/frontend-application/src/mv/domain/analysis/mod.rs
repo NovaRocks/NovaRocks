@@ -213,7 +213,7 @@ fn validate_mv_select_raw_select_clauses(
     if !select.windows.is_empty() {
         return Err(unsupported_mv_select_clause("named WINDOW clauses"));
     }
-    if select.qualify.is_some() {
+    if select.legacy.qualify.is_some() {
         return Err(unsupported_mv_select_clause("QUALIFY"));
     }
     Ok(())

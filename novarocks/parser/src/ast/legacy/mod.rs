@@ -58,6 +58,11 @@ pub struct TableAlias {
     pub span: Span,
 }
 
+mod expr;
+pub use expr::{
+    BinaryOperator, IntervalExpr, IntervalField, ParenthesizedExpr, SelectExtensions, UnaryOperator,
+};
+
 pub(crate) mod catalog;
 pub(crate) mod command;
 pub(crate) mod dml;

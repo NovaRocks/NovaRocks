@@ -96,7 +96,7 @@ mod tests {
         };
         assert_eq!(not.operator, UnaryOperator::Not);
         assert_eq!(not.span, Span::new(0, 11));
-        assert!(matches!(*not.expression, Expr::Nested(_)));
+        assert!(matches!(*not.expression, Expr::LegacyParenthesized(_)));
 
         let Expr::Coalesce(call) = terms.next().unwrap() else {
             panic!("expected COALESCE");
@@ -156,7 +156,7 @@ mod tests {
         };
         assert_eq!(unary.operator, UnaryOperator::Minus);
         assert_eq!(unary.span, Span::new(0, source.len()));
-        let Expr::Nested(nested) = unary.expression.into_inner() else {
+        let Expr::LegacyParenthesized(nested) = unary.expression.into_inner() else {
             panic!("expected original parentheses");
         };
         assert_eq!(nested.span, Span::new(1, source.len()));
@@ -174,7 +174,7 @@ mod tests {
         let Expr::Unary(outer) = parse("-(-9223372036854775808)") else {
             panic!("expected outer unary, without parser evaluation");
         };
-        let Expr::Nested(nested) = outer.expression.into_inner() else {
+        let Expr::LegacyParenthesized(nested) = outer.expression.into_inner() else {
             panic!("expected nested signed minimum");
         };
         let Expr::Literal(minimum) = nested.expression.into_inner() else {

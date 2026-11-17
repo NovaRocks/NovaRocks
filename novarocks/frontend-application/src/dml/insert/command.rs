@@ -80,7 +80,7 @@ pub fn convert_insert_command(insert: &Insert) -> Result<InsertCommand, String> 
 pub(crate) fn is_literal_expr(expr: &ast::Expr) -> bool {
     match expr {
         ast::Expr::Literal(_) => true,
-        ast::Expr::Nested(nested) => is_literal_expr(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => is_literal_expr(&nested.expression),
         ast::Expr::Unary(unary) => {
             matches!(unary.operator, ast::UnaryOperator::Minus)
                 && is_literal_expr(&unary.expression)
@@ -189,7 +189,7 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
             _ => Other,
         }),
         ast::Expr::Identifier(_) => Some(String),
-        ast::Expr::Nested(nested) => legacy_literal_shape(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => legacy_literal_shape(&nested.expression),
         ast::Expr::Cast(cast) => {
             if matches!(
                 match &cast.data_type.kind {

@@ -98,7 +98,9 @@ impl SqlMode {
                 _ => novarocks_parser::printer::print_expr(value),
             },
             ast::Expr::Identifier(name) => name.value.clone(),
-            ast::Expr::Nested(nested) => return Self::from_expression(&nested.expression),
+            ast::Expr::LegacyParenthesized(nested) => {
+                return Self::from_expression(&nested.expression);
+            }
             _ => novarocks_parser::printer::print_expr(value),
         };
         Self::from_assignment(&value)
@@ -168,7 +170,7 @@ fn decimal_flag(value: &ast::Expr) -> Result<bool, crate::analyze_error::Analyze
             _ => "",
         },
         ast::Expr::Identifier(name) => name.value.as_str(),
-        ast::Expr::Nested(nested) => return decimal_flag(&nested.expression),
+        ast::Expr::LegacyParenthesized(nested) => return decimal_flag(&nested.expression),
         _ => "",
     };
     match text.trim().to_ascii_lowercase().as_str() {

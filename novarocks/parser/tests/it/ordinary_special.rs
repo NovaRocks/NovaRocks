@@ -100,7 +100,10 @@ fn position_in_reverses_actual_children_but_all_ordinary_position_call_grammars_
     let expr = expression("POSITION((a IN (b)) IN text_value)");
     let node = call(&expr);
     assert_eq!(node.name.parts[0].value, "strpos");
-    assert!(matches!(&node.arguments[1].value, Expr::Nested(_)));
+    assert!(matches!(
+        &node.arguments[1].value,
+        Expr::LegacyParenthesized(_)
+    ));
 }
 #[test]
 fn normalize_keeps_the_delimited_name_raw_form_text_context_literal_location_and_default() {

@@ -3174,8 +3174,8 @@ impl Visit for CompletionRetainedBytes {
             | Expr::FunctionCall(_)
             | Expr::Unary(_)
             | Expr::Binary(_)
-            | Expr::Nested(_)
-            | Expr::Interval(_)
+            | Expr::LegacyParenthesized(_)
+            | Expr::LegacyInterval(_)
             | Expr::Subquery(_) => {}
         }
         walk_expr(self, expression);

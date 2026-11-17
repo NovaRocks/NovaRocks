@@ -141,7 +141,7 @@ pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast
                     span,
                 )
             }),
-            qualify: None,
+            legacy: ast::LegacySelectExtensions::default(),
             windows: Vec::new().into(),
             modifiers: Default::default(),
             span,
