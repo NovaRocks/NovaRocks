@@ -33,3 +33,5 @@ mod frozen_call_claims;
 mod static_requests;
 
 mod root_use_contract;
+
+mod diagnostics;

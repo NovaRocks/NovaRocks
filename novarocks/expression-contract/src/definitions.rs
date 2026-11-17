@@ -340,16 +340,6 @@ impl ExprKind {
         .into_iter()
     }
 
-    pub(crate) fn expression_references(&self, output: &mut Vec<ExprId>) {
-        let result = self.expression_references_observed::<std::convert::Infallible>(|id| {
-            output.push(id);
-            Ok(())
-        });
-        match result {
-            Ok(()) => {}
-            Err(never) => match never {},
-        }
-    }
     /// Visit actual ordered children without copying the DAG edge table.
     /// The caller meters each callback and admits its own output allocations.
     /// This loan uses the same ordered children as definition correspondence.

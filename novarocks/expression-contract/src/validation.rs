@@ -356,7 +356,7 @@ pub(crate) fn validate(
             return Err(UnitError::invalid(
                 Some(expression.id),
                 None,
-                format!("{}: {}", issue.path, issue.message),
+                format!("definitions[{}]: {}", issue.definition.get(), issue.message),
             ));
         }
     }

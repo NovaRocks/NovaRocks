@@ -89,3 +89,55 @@ fn aggregate_state_inputs_keep_actual_expression_demand_and_the_same_materialize
             )))
     );
 }
+
+// Declaration validation is borrowed even when all closed environment keys
+// participate. The original header/kind/control errors keep their priority.
+#[test]
+fn declaration_environment_rejects_each_duplicate_after_original_header_checks() {
+    let keys = [
+        SemanticParameterKey::StatementStartUtc,
+        SemanticParameterKey::TimeZone,
+        SemanticParameterKey::AllowThrowException,
+        SemanticParameterKey::DecimalOverflowToDouble,
+        SemanticParameterKey::GroupConcatLegacy,
+        SemanticParameterKey::GroupConcatMaxLen,
+    ];
+    let mut declaration = FunctionEffectDeclaration {
+        value_stability: FunctionVolatility::Stable,
+        own_row_error: FunctionIntrinsicRowError::NoRowError,
+        failure_behavior: FunctionFailureBehavior::Propagate,
+        null_behavior: FunctionNullBehavior::CalledOnNull,
+        argument_control: ArgumentControl::Eager,
+        instance_state: FunctionInstanceState::None,
+        observable_effects: ObservableEffects::NONE,
+        environment_dependencies: keys.into(),
+    };
+    declaration.validate(FunctionKind::Scalar).unwrap();
+    for duplicate in keys {
+        let mut dependencies = keys.to_vec();
+        dependencies.push(duplicate);
+        declaration.environment_dependencies = dependencies.into_boxed_slice();
+        assert_eq!(
+            declaration.validate(FunctionKind::Scalar),
+            Err(EffectContractError::DuplicateEnvironmentKey)
+        );
+        assert_eq!(
+            declaration.validate(FunctionKind::Table),
+            Err(EffectContractError::KindMismatch)
+        );
+        declaration.null_behavior = FunctionNullBehavior::Strict;
+        declaration.argument_control = ArgumentControl::If;
+        assert_eq!(
+            declaration.validate(FunctionKind::Scalar),
+            Err(EffectContractError::ControlMismatch)
+        );
+        declaration.null_behavior = FunctionNullBehavior::CalledOnNull;
+        declaration.argument_control = ArgumentControl::Eager;
+    }
+    declaration.environment_dependencies =
+        vec![keys[0]; MAX_SEMANTIC_PARAMETERS + 1].into_boxed_slice();
+    assert_eq!(
+        declaration.validate(FunctionKind::Table),
+        Err(EffectContractError::InvalidEnvironmentReference)
+    );
+}

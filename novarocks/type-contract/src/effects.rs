@@ -248,13 +248,27 @@ impl FunctionEffectDeclaration {
         {
             return Err(EffectContractError::ControlMismatch);
         }
-        let mut keys = BTreeSet::new();
-        if self
-            .environment_dependencies
-            .iter()
-            .any(|key| !keys.insert(*key))
-        {
-            return Err(EffectContractError::DuplicateEnvironmentKey);
+        // The closed key vocabulary needs no heap-backed membership set.
+        // Each exhaustive match arm names an actual semantic key, not an ID
+        // range or a new limit on declarations.
+        let mut statement_start_utc = false;
+        let mut time_zone = false;
+        let mut allow_throw_exception = false;
+        let mut decimal_overflow_to_double = false;
+        let mut group_concat_legacy = false;
+        let mut group_concat_max_len = false;
+        for key in &self.environment_dependencies {
+            let seen = match key {
+                SemanticParameterKey::StatementStartUtc => &mut statement_start_utc,
+                SemanticParameterKey::TimeZone => &mut time_zone,
+                SemanticParameterKey::AllowThrowException => &mut allow_throw_exception,
+                SemanticParameterKey::DecimalOverflowToDouble => &mut decimal_overflow_to_double,
+                SemanticParameterKey::GroupConcatLegacy => &mut group_concat_legacy,
+                SemanticParameterKey::GroupConcatMaxLen => &mut group_concat_max_len,
+            };
+            if std::mem::replace(seen, true) {
+                return Err(EffectContractError::DuplicateEnvironmentKey);
+            }
         }
         Ok(())
     }

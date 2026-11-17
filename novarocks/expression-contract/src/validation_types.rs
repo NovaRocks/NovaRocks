@@ -18,29 +18,113 @@
 use crate::{ExprId, ExprKind, ValueType};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    FunctionArgumentType, FunctionKind, arithmetic_result_value_type_with_op,
+    FunctionArgumentType, FunctionKind, arithmetic_result_value_shape_with_op,
     is_integer_value_type, is_numeric_value_type,
 };
 use std::collections::BTreeSet;
 
-pub(crate) struct TypeIssue {
-    pub(crate) path: String,
-    pub(crate) message: String,
+/// Borrow the first original diagnosis until the enclosing validator returns.
+/// Successful checks never build a path, message, or copied type payload.
+pub(crate) struct TypeIssue<'a> {
+    pub(crate) definition: ExprId,
+    pub(crate) message: TypeIssueMessage<'a>,
 }
-impl TypeIssue {
-    fn new(path: impl AsRef<str>, message: impl Into<String>) -> Self {
+pub(crate) enum TypeIssueMessage<'a> {
+    Static(&'static str),
+    LambdaPlacement(Option<ExprId>),
+    CastTarget {
+        actual: &'a DataType,
+        target: &'a DataType,
+    },
+    BooleanArgument(usize),
+    CaseComparison {
+        operand: Option<&'a DataType>,
+        when: &'a DataType,
+    },
+    ArgumentCount {
+        expected: usize,
+        actual: usize,
+    },
+    FunctionArgument {
+        function: &'a novarocks_type_contract::FunctionId,
+        ordinal: usize,
+        expected: &'a FunctionArgumentType,
+        actual: Option<&'a ValueType>,
+    },
+}
+impl<'a> From<&'static str> for TypeIssueMessage<'a> {
+    fn from(message: &'static str) -> Self {
+        Self::Static(message)
+    }
+}
+impl std::fmt::Display for TypeIssueMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(message) => f.write_str(message),
+            Self::LambdaPlacement(parent) => {
+                f.write_str("lambda must appear only as an exact bound-function lambda argument")?;
+                if let Some(parent) = parent {
+                    write!(
+                        f,
+                        "; expression {} references it outside a bound lambda argument position",
+                        parent.get()
+                    )?;
+                }
+                Ok(())
+            }
+            Self::CastTarget { actual, target } => write!(
+                f,
+                "cast result type {actual:?} differs from its target {target:?}"
+            ),
+            Self::BooleanArgument(ordinal) => {
+                write!(f, "boolean connective argument {ordinal} is not boolean")
+            }
+            Self::CaseComparison {
+                operand: Some(operand),
+                when,
+            } => write!(f, "CASE compares {operand:?} against a branch of {when:?}"),
+            Self::CaseComparison {
+                operand: None,
+                when,
+            } => write!(f, "CASE condition is {when:?}, not a boolean"),
+            Self::ArgumentCount { expected, actual } => write!(
+                f,
+                "bound function expects {expected} arguments, got {actual}"
+            ),
+            Self::FunctionArgument {
+                function,
+                ordinal,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "function `{}` argument {ordinal} shape differs from its bound signature: bound {expected:?}, got ",
+                    function.as_str()
+                )?;
+                if let Some(actual) = actual {
+                    write!(f, "{actual:?}")
+                } else {
+                    f.write_str("absent")
+                }
+            }
+        }
+    }
+}
+impl<'a> TypeIssue<'a> {
+    fn new(definition: ExprId, message: impl Into<TypeIssueMessage<'a>>) -> Self {
         Self {
-            path: path.as_ref().to_owned(),
+            definition,
             message: message.into(),
         }
     }
 }
 #[derive(Default)]
-pub(crate) struct TypeChecks {
-    pub(crate) issue: Option<TypeIssue>,
+pub(crate) struct TypeChecks<'a> {
+    pub(crate) issue: Option<TypeIssue<'a>>,
 }
-impl TypeChecks {
-    fn push(&mut self, issue: TypeIssue) {
+impl<'a> TypeChecks<'a> {
+    fn push(&mut self, issue: TypeIssue<'a>) {
         if self.issue.is_none() {
             self.issue = Some(issue);
         }
@@ -84,25 +168,28 @@ pub(crate) fn expression_parent_references(
             }
         }
         _ => {
-            let mut references = Vec::new();
-            parent.kind.expression_references(&mut references);
-            output.extend(
-                references
-                    .into_iter()
-                    .map(|reference| (reference, ExpressionParentRole::Other)),
-            );
+            // The caller has already reserved one output slot per reference.
+            // Borrow the same ordered edges instead of allocating a second Vec.
+            let result = parent.kind.expression_references_observed(|reference| {
+                output.push((reference, ExpressionParentRole::Other));
+                Ok::<_, std::convert::Infallible>(())
+            });
+            match result {
+                Ok(()) => {}
+                Err(never) => match never {},
+            }
         }
     }
 }
 
-pub(crate) fn validate_expression_types(
-    definitions: &[crate::ExprNode],
-    expression: &crate::ExprNode,
+pub(crate) fn validate_expression_types<'a>(
+    definitions: &'a [crate::ExprNode],
+    expression: &'a crate::ExprNode,
     operator_roots: &BTreeSet<ExprId>,
     parents: &[ExpressionParentReference],
-    errors: &mut TypeChecks,
+    errors: &mut TypeChecks<'a>,
 ) {
-    let path = format!("definitions[{}]", expression.id.get());
+    let path = expression.id;
     match &expression.kind {
         ExprKind::Value(_) => {}
         // Exact table/address/value checks are mandatory at plan/package publication.
@@ -120,11 +207,11 @@ pub(crate) fn validate_expression_types(
                     .and_then(|ordinal| parameter_types.get(ordinal))
                     == Some(&expression.ty) => {}
                 Some(_) => errors.push(TypeIssue::new(
-                    &path,
+                    path,
                     "lambda parameter does not reference a matching lambda owner",
                 )),
                 None => errors.push(TypeIssue::new(
-                    &path,
+                    path,
                     "lambda parameter owner is not defined",
                 )),
             }
@@ -134,7 +221,7 @@ pub(crate) fn validate_expression_types(
             // it names is the scope it stands in or one enclosing that.
             if !lambda_scope_contains(definitions, expression.lambda_scope, *lambda) {
                 errors.push(TypeIssue::new(
-                    &path,
+                    path,
                     "lambda parameter stands outside the lambda it names",
                 ));
             }
@@ -150,27 +237,19 @@ pub(crate) fn validate_expression_types(
                 || parents.is_empty()
                 || invalid_parent.is_some()
             {
-                let detail = invalid_parent.map_or_else(String::new, |parent| {
-                    format!(
-                        "; expression {} references it outside a bound lambda argument position",
-                        parent.parent.get()
-                    )
-                });
                 errors.push(TypeIssue::new(
-                    &path,
-                    format!(
-                        "lambda must appear only as an exact bound-function lambda argument{detail}"
-                    ),
+                    path,
+                    TypeIssueMessage::LambdaPlacement(invalid_parent.map(|parent| parent.parent)),
                 ));
             }
             if parameter_types.is_empty() {
-                errors.push(TypeIssue::new(&path, "lambda has no parameters"));
+                errors.push(TypeIssue::new(path, "lambda has no parameters"));
             }
             if let Some(body) = definitions.get((*body).get() as usize)
                 && body.ty != expression.ty
             {
                 errors.push(TypeIssue::new(
-                    &path,
+                    path,
                     "lambda type differs from its body type",
                 ));
             }
@@ -207,7 +286,7 @@ pub(crate) fn validate_expression_types(
                 };
                 if !valid {
                     errors.push(TypeIssue::new(
-                        &path,
+                        path,
                         "unary expression types are inconsistent with its operator",
                     ));
                 }
@@ -235,7 +314,7 @@ pub(crate) fn validate_expression_types(
                 })
             {
                 errors.push(TypeIssue::new(
-                    &path,
+                    path,
                     "binary ALLOW_THROW_EXCEPTION reference differs from its operator profile",
                 ));
             }
@@ -250,7 +329,7 @@ pub(crate) fn validate_expression_types(
                 != novarocks_type_contract::DecimalOverflowPolicy::OutputNull
             {
                 errors.push(TypeIssue::new(
-                    &path,
+                    path,
                     "non-arithmetic binary expression requires OutputNull decimal policy",
                 ));
             }
@@ -258,17 +337,17 @@ pub(crate) fn validate_expression_types(
                 definitions.get((*left).get() as usize),
                 definitions.get((*right).get() as usize),
             ) {
-                validate_binary_types(left, *op, right, expression, &path, errors);
+                validate_binary_types(left, *op, right, expression, path, errors);
             }
         }
         ExprKind::Conjunction { args } | ExprKind::Disjunction { args } => {
-            validate_boolean_connective_types(definitions, args, expression, &path, errors);
+            validate_boolean_connective_types(definitions, args, expression, path, errors);
         }
         ExprKind::FunctionCall { function, args } => {
             if function.kind != FunctionKind::Scalar {
-                errors.push(TypeIssue::new(&path, "scalar call has non-scalar binding"));
+                errors.push(TypeIssue::new(path, "scalar call has non-scalar binding"));
             }
-            validate_function_call(definitions, expression, function, args, &path, errors);
+            validate_function_call(definitions, expression, function, args, path, errors);
         }
         ExprKind::Cast {
             expr,
@@ -280,7 +359,7 @@ pub(crate) fn validate_expression_types(
                 != novarocks_type_contract::SemanticParameterKey::AllowThrowException
             {
                 errors.push(TypeIssue::new(
-                    &path,
+                    path,
                     "CAST requires an ALLOW_THROW_EXCEPTION semantic reference",
                 ));
             }
@@ -297,7 +376,7 @@ pub(crate) fn validate_expression_types(
                 .unwrap_or(false)
             {
                 errors.push(TypeIssue::new(
-                    &path,
+                    path,
                     "carrier CAST cannot establish or erase a logical identity",
                 ));
             }
@@ -309,7 +388,7 @@ pub(crate) fn validate_expression_types(
                 )
             {
                 errors.push(TypeIssue::new(
-                    &path,
+                    path,
                     "ReportError decimal CAST does not support nested type conversion",
                 ));
             }
@@ -321,27 +400,27 @@ pub(crate) fn validate_expression_types(
             if !novarocks_type_contract::arrow_data_types_exact(expression.ty.data_type(), target) {
                 // Both types, because which half drifted is the diagnosis.
                 errors.push(TypeIssue::new(
-                    &path,
-                    format!(
-                        "cast result type {:?} differs from its target {target:?}",
-                        expression.ty.data_type()
-                    ),
+                    path,
+                    TypeIssueMessage::CastTarget {
+                        actual: expression.ty.data_type(),
+                        target,
+                    },
                 ));
             } else if definitions
                 .get((*expr).get() as usize)
                 .is_some_and(|input| input.ty.nullable() && !expression.ty.nullable())
             {
                 errors.push(TypeIssue::new(
-                    &path,
+                    path,
                     "cast stops admitting null its input admits",
                 ));
             }
         }
         ExprKind::IsNull { .. } | ExprKind::IsTruthValue { .. } => {
-            require_non_nullable_boolean(&expression.ty, &path, errors);
+            require_non_nullable_boolean(&expression.ty, path, errors);
         }
         ExprKind::InList { expr, list, .. } => {
-            require_boolean_result(&expression.ty, &path, errors);
+            require_boolean_result(&expression.ty, path, errors);
             if let Some(input) = definitions.get((*expr).get() as usize) {
                 let nullable = input.ty.nullable()
                     || list.iter().any(|candidate| {
@@ -351,7 +430,7 @@ pub(crate) fn validate_expression_types(
                     });
                 if nullable && !expression.ty.nullable() {
                     errors.push(TypeIssue::new(
-                        &path,
+                        path,
                         "IN-list result stops admitting null its operands admit",
                     ));
                 }
@@ -361,7 +440,7 @@ pub(crate) fn validate_expression_types(
                         .is_some_and(|candidate| !candidate.ty.same_value_domain(&input.ty))
                     {
                         errors.push(TypeIssue::new(
-                            &path,
+                            path,
                             "IN-list candidate type differs from its input",
                         ));
                     }
@@ -371,7 +450,7 @@ pub(crate) fn validate_expression_types(
         ExprKind::Between {
             expr, low, high, ..
         } => {
-            require_boolean_result(&expression.ty, &path, errors);
+            require_boolean_result(&expression.ty, path, errors);
             if let Some(input) = definitions.get((*expr).get() as usize) {
                 let nullable = [*low, *high].into_iter().any(|bound| {
                     definitions
@@ -380,7 +459,7 @@ pub(crate) fn validate_expression_types(
                 }) || input.ty.nullable();
                 if nullable && !expression.ty.nullable() {
                     errors.push(TypeIssue::new(
-                        &path,
+                        path,
                         "BETWEEN result stops admitting null its operands admit",
                     ));
                 }
@@ -390,7 +469,7 @@ pub(crate) fn validate_expression_types(
                         .is_some_and(|bound| !bound.ty.same_value_domain(&input.ty))
                     {
                         errors.push(TypeIssue::new(
-                            &path,
+                            path,
                             "BETWEEN bound type differs from its input",
                         ));
                     }
@@ -398,7 +477,7 @@ pub(crate) fn validate_expression_types(
             }
         }
         ExprKind::Like { expr, pattern, .. } => {
-            require_boolean_result(&expression.ty, &path, errors);
+            require_boolean_result(&expression.ty, path, errors);
             let nullable = [*expr, *pattern].into_iter().any(|id| {
                 definitions
                     .get((id).get() as usize)
@@ -406,7 +485,7 @@ pub(crate) fn validate_expression_types(
             });
             if nullable && !expression.ty.nullable() {
                 errors.push(TypeIssue::new(
-                    &path,
+                    path,
                     "LIKE result stops admitting null its operands admit",
                 ));
             }
@@ -415,7 +494,7 @@ pub(crate) fn validate_expression_types(
                     .get((id).get() as usize)
                     .is_some_and(|value| !is_utf8(value.ty.data_type()))
             }) {
-                errors.push(TypeIssue::new(&path, "LIKE operands must use a UTF-8 type"));
+                errors.push(TypeIssue::new(path, "LIKE operands must use a UTF-8 type"));
             }
         }
         ExprKind::Case {
@@ -428,7 +507,7 @@ pub(crate) fn validate_expression_types(
             *operand,
             when_then,
             *else_expr,
-            &path,
+            path,
             errors,
         ),
     }
@@ -474,12 +553,12 @@ pub(crate) fn lambda_scope_contains(
 /// Arity is checked here rather than left open: a connective over fewer than
 /// two arguments would give the same predicate two spellings, and the point of
 /// making the connective n-ary is to have exactly one.
-pub(crate) fn validate_boolean_connective_types(
-    definitions: &[crate::ExprNode],
+pub(crate) fn validate_boolean_connective_types<'a>(
+    definitions: &'a [crate::ExprNode],
     args: &[ExprId],
-    output: &crate::ExprNode,
-    path: &str,
-    errors: &mut TypeChecks,
+    output: &'a crate::ExprNode,
+    path: ExprId,
+    errors: &mut TypeChecks<'a>,
 ) {
     if args.len() < 2 {
         errors.push(TypeIssue::new(
@@ -496,7 +575,7 @@ pub(crate) fn validate_boolean_connective_types(
         if *arg.ty.data_type() != DataType::Boolean {
             errors.push(TypeIssue::new(
                 path,
-                format!("boolean connective argument {ordinal} is not boolean"),
+                TypeIssueMessage::BooleanArgument(ordinal),
             ));
         }
         nullable |= arg.ty.nullable();
@@ -512,13 +591,13 @@ pub(crate) fn validate_boolean_connective_types(
     }
 }
 
-pub(crate) fn validate_binary_types(
+pub(crate) fn validate_binary_types<'a>(
     left: &crate::ExprNode,
     op: crate::BinaryOperator,
     right: &crate::ExprNode,
-    output: &crate::ExprNode,
-    path: &str,
-    errors: &mut TypeChecks,
+    output: &'a crate::ExprNode,
+    path: ExprId,
+    errors: &mut TypeChecks<'a>,
 ) {
     let same_inputs = left.ty.same_value_domain(&right.ty);
     // An operator may admit null neither operand does -- arithmetic answers
@@ -548,9 +627,13 @@ pub(crate) fn validate_binary_types(
                 }
                 _ => unreachable!(),
             };
-            arithmetic_result_value_type_with_op(&left.ty, &right.ty, operation).is_some_and(
-                |expected| {
-                    output.ty.same_value_domain(&expected)
+            arithmetic_result_value_shape_with_op(&left.ty, &right.ty, operation).is_some_and(
+                |(carrier, domain)| {
+                    output.ty.logical_type() == domain
+                        && novarocks_type_contract::arrow_data_types_exact(
+                            output.ty.data_type(),
+                            &carrier,
+                        )
                         && nullability_widens(output.ty.nullable())
                 },
             )
@@ -585,14 +668,14 @@ pub(crate) fn validate_binary_types(
     }
 }
 
-pub(crate) fn validate_case_types(
-    definitions: &[crate::ExprNode],
-    expression: &crate::ExprNode,
+pub(crate) fn validate_case_types<'a>(
+    definitions: &'a [crate::ExprNode],
+    expression: &'a crate::ExprNode,
     operand: Option<ExprId>,
     when_then: &[(ExprId, ExprId)],
     else_expr: Option<ExprId>,
-    path: &str,
-    errors: &mut TypeChecks,
+    path: ExprId,
+    errors: &mut TypeChecks<'a>,
 ) {
     if when_then.is_empty() {
         errors.push(TypeIssue::new(path, "CASE expression has no branches"));
@@ -607,15 +690,9 @@ pub(crate) fn validate_case_types(
             if !valid {
                 errors.push(TypeIssue::new(
                     path,
-                    match operand_type {
-                        Some(operand) => format!(
-                            "CASE compares {:?} against a branch of {:?}",
-                            operand.data_type(),
-                            when.ty.data_type()
-                        ),
-                        None => {
-                            format!("CASE condition is {:?}, not a boolean", when.ty.data_type())
-                        }
+                    TypeIssueMessage::CaseComparison {
+                        operand: operand_type.map(ValueType::data_type),
+                        when: when.ty.data_type(),
                     },
                 ));
             }
@@ -660,13 +737,17 @@ pub(crate) fn validate_case_types(
     }
 }
 
-pub(crate) fn require_boolean_result(ty: &ValueType, path: &str, errors: &mut TypeChecks) {
+pub(crate) fn require_boolean_result(ty: &ValueType, path: ExprId, errors: &mut TypeChecks<'_>) {
     if *ty.data_type() != DataType::Boolean {
         errors.push(TypeIssue::new(path, "expression result is not Boolean"));
     }
 }
 
-pub(crate) fn require_non_nullable_boolean(ty: &ValueType, path: &str, errors: &mut TypeChecks) {
+pub(crate) fn require_non_nullable_boolean(
+    ty: &ValueType,
+    path: ExprId,
+    errors: &mut TypeChecks<'_>,
+) {
     if *ty.data_type() != DataType::Boolean || ty.nullable() {
         errors.push(TypeIssue::new(
             path,
@@ -682,13 +763,13 @@ pub(crate) fn is_utf8(ty: &DataType) -> bool {
     )
 }
 
-pub(crate) fn validate_function_call(
-    definitions: &[crate::ExprNode],
-    expression: &crate::ExprNode,
-    function: &crate::BoundFunction,
+pub(crate) fn validate_function_call<'a>(
+    definitions: &'a [crate::ExprNode],
+    expression: &'a crate::ExprNode,
+    function: &'a crate::BoundFunction,
     args: &[ExprId],
-    path: &str,
-    errors: &mut TypeChecks,
+    path: ExprId,
+    errors: &mut TypeChecks<'a>,
 ) {
     validate_function_arguments(
         definitions,
@@ -706,22 +787,21 @@ pub(crate) fn validate_function_call(
     }
 }
 
-pub(crate) fn validate_function_arguments(
-    definitions: &[crate::ExprNode],
-    function: &novarocks_type_contract::FunctionId,
-    expected: &[FunctionArgumentType],
+pub(crate) fn validate_function_arguments<'a>(
+    definitions: &'a [crate::ExprNode],
+    function: &'a novarocks_type_contract::FunctionId,
+    expected: &'a [FunctionArgumentType],
     args: &[ExprId],
-    path: &str,
-    errors: &mut TypeChecks,
+    path: ExprId,
+    errors: &mut TypeChecks<'a>,
 ) {
     if expected.len() != args.len() {
         errors.push(TypeIssue::new(
             path,
-            format!(
-                "bound function expects {} arguments, got {}",
-                expected.len(),
-                args.len()
-            ),
+            TypeIssueMessage::ArgumentCount {
+                expected: expected.len(),
+                actual: args.len(),
+            },
         ));
         return;
     }
@@ -753,15 +833,16 @@ pub(crate) fn validate_function_arguments(
                 }
             });
         if !valid {
-            let actual = definitions
-                .get((*argument).get() as usize)
-                .map_or_else(|| "absent".to_string(), |actual| format!("{:?}", actual.ty));
             errors.push(TypeIssue::new(
                 path,
-                format!(
-                    "function `{}` argument {ordinal} shape differs from its bound signature: bound {expected:?}, got {actual}",
-                    function.as_str()
-                ),
+                TypeIssueMessage::FunctionArgument {
+                    function,
+                    ordinal,
+                    expected,
+                    actual: definitions
+                        .get(argument.get() as usize)
+                        .map(|actual| &actual.ty),
+                },
             ));
         }
     }
