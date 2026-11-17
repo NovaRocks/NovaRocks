@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Tests the actual emitted definition author, not an earlier SQL syntax tree.
-use super::physical_temporal_source::{
+use arrow_schema::{DataType, TimeUnit};
+use novarocks_expression_contract::{
+    BoundFunction, ExprId, ExprKind, ExprNode, ValueId, ValueType,
+};
+use novarocks_expression_contract::{
     TemporalSourceProjectionError as SourceError, temporal_source_definitions_observed as author,
 };
-use crate::{
-    BoundFunction, ExprArena, ExprId, ExprKind, ExprNode, NodeId, PlanLimits, ValueId, ValueType,
-};
-use arrow_schema::{DataType, TimeUnit};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
     PureCompileControl, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
@@ -52,8 +52,7 @@ impl PureCompileControl for Control {
 }
 fn node(id: u32, ty: DataType, kind: ExprKind) -> ExprNode {
     ExprNode {
-        id: ExprId::new(id),
-        owner: NodeId::new(1),
+        id: ExprId::new(id - 1),
         lambda_scope: None,
         ty: ValueType::new(ty, true),
         kind,
@@ -70,7 +69,7 @@ fn cast(id: u32, child: u32, target: DataType) -> ExprNode {
         id,
         target.clone(),
         ExprKind::Cast {
-            expr: ExprId::new(child),
+            expr: ExprId::new(child - 1),
             target,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             allow_throw_exception: SemanticParameterRef {
@@ -97,25 +96,27 @@ fn call(id: u32, identity: &str, child: u32, ty: DataType) -> ExprNode {
                 result_type: ValueType::new(ty, true),
                 legacy_metadata: None,
             },
-            args: Box::from([ExprId::new(child)]),
+            args: Box::from([ExprId::new(child - 1)]),
         },
     )
 }
-fn arena(nodes: Vec<ExprNode>) -> ExprArena {
-    ExprArena::try_from_definitions_observed(
-        nodes.into_iter(),
-        &PlanLimits::FROZEN,
-        &Control::default(),
-    )
-    .unwrap()
+fn definitions(nodes: Vec<ExprNode>) -> Vec<ExprNode> {
+    for (ordinal, node) in nodes.iter().enumerate() {
+        assert_eq!(node.id.get() as usize, ordinal);
+    }
+    nodes
 }
+
 fn run(
-    a: &ExprArena,
+    a: &[ExprNode],
     kind: Kind,
     args: &[u32],
     control: &Control,
 ) -> Result<TemporalSourceDefinitions<ExprId>, SourceError> {
-    let ids = args.iter().map(|id| ExprId::new(*id)).collect::<Vec<_>>();
+    let ids = args
+        .iter()
+        .map(|id| ExprId::new(*id - 1))
+        .collect::<Vec<_>>();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     let result = author(kind, a, &ids, &mut work);
     if matches!(result, Err(SourceError::Control(_))) {
@@ -126,7 +127,7 @@ fn run(
 }
 #[test]
 fn physical_format_source_tracks_only_actual_immediate_ordinary_cast() {
-    let a = arena(vec![
+    let a = definitions(vec![
         leaf(1, DataType::Utf8),
         cast(2, 1, ts()),
         leaf(3, DataType::Utf8),
@@ -141,20 +142,20 @@ fn physical_format_source_tracks_only_actual_immediate_ordinary_cast() {
     );
     assert_eq!(
         override_source.definitions.as_ref(),
-        [ExprId::new(1), ExprId::new(2), ExprId::new(3)]
+        [ExprId::new(0), ExprId::new(1), ExprId::new(2)]
     );
     for normal in [4, 5] {
         let plain = run(&a, Kind::TimeFormat, &[normal, 3], &c).unwrap();
         assert_eq!(plain.facts, TemporalSourceFacts::FormatOrdinary);
         assert_eq!(
             plain.definitions.as_ref(),
-            [ExprId::new(normal), ExprId::new(3)]
+            [ExprId::new(normal - 1), ExprId::new(2)]
         );
     }
 }
 #[test]
 fn physical_seconds_source_prunes_actual_unreachable_fallback_definitions() {
-    let a = arena(vec![
+    let a = definitions(vec![
         leaf(1, DataType::Utf8),
         cast(2, 1, ts()),
         cast(3, 2, DataType::Utf8),
@@ -166,7 +167,7 @@ fn physical_seconds_source_prunes_actual_unreachable_fallback_definitions() {
         direct.facts.shape(),
         novarocks_type_contract::TemporalSourceShape::SecondsDirect
     );
-    assert_eq!(direct.definitions.as_ref(), [ExprId::new(3)]);
+    assert_eq!(direct.definitions.as_ref(), [ExprId::new(2)]);
     assert_eq!(
         direct.facts.cast_chain(),
         [TemporalCastKind::Ordinary, TemporalCastKind::Ordinary]
@@ -174,7 +175,7 @@ fn physical_seconds_source_prunes_actual_unreachable_fallback_definitions() {
     let string = run(&a, Kind::TimeToSec, &[2], &Control::default()).unwrap();
     assert_eq!(
         string.definitions.as_ref(),
-        [ExprId::new(2), ExprId::new(1)]
+        [ExprId::new(1), ExprId::new(0)]
     );
     assert!(matches!(
         string.facts,
@@ -188,7 +189,7 @@ fn physical_seconds_source_prunes_actual_unreachable_fallback_definitions() {
     // Same definition is demanded twice; an occurrence author must mint fresh IDs.
     assert_eq!(
         other.definitions.as_ref(),
-        [ExprId::new(5), ExprId::new(4), ExprId::new(4)]
+        [ExprId::new(4), ExprId::new(3), ExprId::new(3)]
     );
 }
 #[test]
@@ -197,14 +198,14 @@ fn physical_seconds_roundtrip_uses_emitted_original_argument_not_transformed_chi
         "builtin.scalar/sec_to_time/v1",
         "parametric.scalar/sec_to_time/v1",
     ] {
-        let a = arena(vec![
+        let a = definitions(vec![
             leaf(1, DataType::Int64),
             call(2, identity, 1, DataType::Utf8),
             cast(3, 2, ts()),
             cast(4, 3, DataType::Time64(TimeUnit::Microsecond)),
         ]);
         let source = run(&a, Kind::TimeToSec, &[4], &Control::default()).unwrap();
-        assert_eq!(source.definitions.as_ref(), [ExprId::new(1)]);
+        assert_eq!(source.definitions.as_ref(), [ExprId::new(0)]);
         assert_eq!(
             source.facts.cast_chain(),
             [
@@ -220,7 +221,7 @@ fn physical_seconds_roundtrip_uses_emitted_original_argument_not_transformed_chi
 }
 #[test]
 fn physical_value_conversion_call_is_not_an_ordinary_cast_or_sec_roundtrip() {
-    let a = arena(vec![
+    let a = definitions(vec![
         leaf(1, DataType::Int64),
         call(2, "builtin.scalar/cast_text/v1", 1, DataType::Utf8),
     ]);
@@ -230,18 +231,18 @@ fn physical_value_conversion_call_is_not_an_ordinary_cast_or_sec_roundtrip() {
         TemporalSourceFacts::SecondsDirect { .. }
     ));
     assert!(source.facts.cast_chain().is_empty());
-    assert_eq!(source.definitions.as_ref(), [ExprId::new(2)]);
+    assert_eq!(source.definitions.as_ref(), [ExprId::new(1)]);
 }
 #[test]
 fn physical_source_author_refuses_wrong_arity_and_missing_definitions_without_defaults() {
-    let a = arena(vec![leaf(1, ts())]);
+    let a = definitions(vec![leaf(1, ts())]);
     for args in [vec![], vec![1, 1], vec![999]] {
         assert!(run(&a, Kind::TimeToSec, &args, &Control::default()).is_err());
     }
 }
 #[test]
 fn physical_source_author_preserves_three_typed_compile_causes_at_every_callback() {
-    let a = arena(vec![
+    let a = definitions(vec![
         leaf(1, DataType::Int64),
         call(2, "builtin.scalar/sec_to_time/v1", 1, DataType::Utf8),
         cast(3, 2, ts()),

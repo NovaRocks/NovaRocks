@@ -266,7 +266,6 @@ fn predicate_borrowed_ports_preserve_actual_source_guards_and_all_callback_cause
             let result = (|| {
                 let exact = ExactPredicateResponsibility::try_new_in(
                     package.fragment(),
-                    package.expression_uses(),
                     site,
                     &mut observed,
                 )
@@ -274,7 +273,6 @@ fn predicate_borrowed_ports_preserve_actual_source_guards_and_all_callback_cause
                 assert_eq!(exact.anchor(), witness.sources[0].responsibility);
                 let selected = PredicateConjunctSource::try_new_in(
                     package.fragment(),
-                    package.expression_uses(),
                     site,
                     if bad { vec![0] } else { vec![] },
                     &mut observed,

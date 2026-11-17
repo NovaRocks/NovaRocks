@@ -612,3 +612,142 @@ fn numeric_not_keeps_the_original_successful_domain_and_nullability() {
         );
     }
 }
+
+#[test]
+fn uuid_is_not_a_numeric_largeint_domain() {
+    let uuid = ValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        false,
+        ValueLogicalType::Uuid,
+    )
+    .unwrap();
+    for op in [BinaryOperator::Add, BinaryOperator::BitAnd] {
+        assert!(!binary_valid(uuid.clone(), op, uuid.clone(), uuid.clone()));
+    }
+    let integer = largeint(false);
+    let plain = ValueType::new(DataType::FixedSizeBinary(16), false);
+    for (input, output, valid) in [
+        (&integer, &integer, true),
+        (&integer, &plain, false),
+        (&plain, &integer, false),
+    ] {
+        assert_eq!(
+            binary_valid(
+                input.clone(),
+                BinaryOperator::Add,
+                input.clone(),
+                output.clone()
+            ),
+            valid
+        );
+    }
+}
+#[test]
+fn comparison_refuses_equal_carriers_with_different_root_domains() {
+    let json =
+        ValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap();
+    let plain = ValueType::new(DataType::Utf8, true);
+    assert!(!binary_valid(
+        json.clone(),
+        BinaryOperator::Eq,
+        plain,
+        boolean(true)
+    ));
+    assert!(binary_valid(
+        json.clone(),
+        BinaryOperator::Eq,
+        json,
+        boolean(true)
+    ));
+}
+#[test]
+fn mixed_decimal_largeint_validates_only_exact_new_add_sub_output() {
+    let decimal = ValueType::new(DataType::Decimal128(38, 15), true);
+    let integer = largeint(true);
+    let exact = ValueType::new(DataType::Decimal256(55, 15), true);
+    for op in [BinaryOperator::Add, BinaryOperator::Subtract] {
+        assert!(binary_valid(
+            decimal.clone(),
+            op,
+            integer.clone(),
+            exact.clone()
+        ));
+        assert!(!binary_valid(
+            decimal.clone(),
+            op,
+            integer.clone(),
+            decimal.clone()
+        ));
+    }
+    for op in [
+        BinaryOperator::Multiply,
+        BinaryOperator::Divide,
+        BinaryOperator::Modulo,
+    ] {
+        assert!(!binary_valid(
+            decimal.clone(),
+            op,
+            integer.clone(),
+            exact.clone()
+        ));
+    }
+}
+#[test]
+fn binary_arithmetic_uses_the_type_contract_largeint_domain() {
+    let left = largeint(false);
+    let right = integer(false);
+    assert!(binary_valid(
+        left.clone(),
+        BinaryOperator::Add,
+        right.clone(),
+        left.clone()
+    ));
+    let opaque = ValueType::new(
+        DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH),
+        false,
+    );
+    for (input, result) in [(&opaque, &left), (&left, &opaque)] {
+        assert!(!binary_valid(
+            input.clone(),
+            BinaryOperator::Add,
+            right.clone(),
+            result.clone()
+        ));
+    }
+}
+
+// A table binding is a relation call, even when its advertised result is scalar.
+#[test]
+fn table_function_binding_cannot_be_published_as_a_scalar_call() {
+    let mut builder = BoundExprSetBuilder::new(limits());
+    let mut binding = function("builtin/test_relation/v1", vec![], integer(false));
+    binding.overload = FunctionOverloadId::try_new("disguised-scalar").unwrap();
+    binding.kind = FunctionKind::Table;
+    binding.legacy_metadata = Some(LegacyBindingMetadata {
+        semantic_parameters: Box::default(),
+        volatility: FunctionVolatility::Immutable,
+        argument_evaluation: FunctionArgumentEvaluation::Eager,
+        failure_behavior: FunctionFailureBehavior::Propagate,
+        intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+    });
+    let definition = builder
+        .add(
+            None,
+            integer(false),
+            ExprKind::FunctionCall {
+                function: binding,
+                args: Box::default(),
+            },
+        )
+        .unwrap();
+    builder
+        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let error = no_calls(builder, vec![], &Control::good()).unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert!(
+        error
+            .to_string()
+            .contains("scalar call has non-scalar binding")
+    );
+}

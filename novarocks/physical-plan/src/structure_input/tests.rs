@@ -19,8 +19,8 @@ use super::*;
 #[path = "owned_tests.rs"]
 mod owned_tests;
 use crate::{
-    Distribution, ExprId, ExprKind, ExprNode, NodeKind, OutputPort, PhysicalProperties,
-    RowMultiplicity, ValidationErrorCategory, ValueOrigin, ValueType,
+    Distribution, NodeKind, OutputPort, PhysicalProperties, RowMultiplicity,
+    ValidationErrorCategory, ValueOrigin, ValueType,
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::CompileControlError;
@@ -60,18 +60,37 @@ fn input(
     let ids = (0..count)
         .map(|i| if i + 1 == count { u32::MAX } else { i as u32 })
         .collect::<Vec<_>>();
-    let expressions = ExprArena::try_from_definitions_observed(
-        ids.iter().map(|id| ExprNode {
-            id: ExprId::new(*id),
-            owner: NodeId::new(0),
-            lambda_scope: None,
-            ty: ValueType::new(DataType::Int64, false),
-            kind: fixture_constants.i64(i64::from(*id), &ValueType::new(DataType::Int64, false)),
-        }),
-        &PlanLimits::FROZEN,
-        &Control::default(),
-    )
-    .unwrap();
+    let mut unit = novarocks_expression_contract::BoundExprSetBuilder::new(
+        novarocks_expression_contract::UnitLimits {
+            expression_semantic_depth: PlanLimits::FROZEN.expression_semantic_depth,
+        },
+    );
+    let mut roots = Vec::new();
+    for id in &ids {
+        let definition = unit
+            .add(
+                None,
+                ValueType::new(DataType::Int64, false),
+                fixture_constants.i64(i64::from(*id), &ValueType::new(DataType::Int64, false)),
+            )
+            .unwrap();
+        roots.push(
+            unit.root(
+                definition,
+                novarocks_type_contract::EvaluationDemand::Value,
+                novarocks_expression_contract::RootScope::AllPorts,
+            )
+            .unwrap(),
+        );
+    }
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let unit = unit
+        .seal(vec![], &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
     let values = ids
         .iter()
         .enumerate()
@@ -90,8 +109,9 @@ fn input(
         })
         .collect();
     let columns = ids.iter().map(|id| ValueId::new(*id)).collect::<Box<_>>();
-    let rows = Box::from([ids.iter().map(|id| ExprId::new(*id)).collect::<Box<_>>()]);
+    let rows = Box::new([roots.into_boxed_slice()]);
     let source = PhysicalNode {
+        expressions: Some(std::sync::Arc::new(unit)),
         id: NodeId::new(0),
         inputs: Box::default(),
         required_inputs: Box::default(),
@@ -103,6 +123,7 @@ fn input(
         kind: NodeKind::Values { rows },
     };
     let root = PhysicalNode {
+        expressions: None,
         id: NodeId::new(u32::MAX),
         inputs: Box::from([NodeId::new(0)]),
         required_inputs: Box::from([properties()]),
@@ -122,7 +143,6 @@ fn input(
         id: FragmentId::new(u32::MAX),
         root: root.id,
         values,
-        expressions,
         nodes: BTreeMap::from([(source.id, source), (root.id, root)]),
         sink: FragmentSink::Noop,
         dop_domain: PipelineDopDomain {
@@ -150,46 +170,37 @@ fn receiving_structure_preserves_zero_max_namespaces_and_original_ordered_fields
     assert_eq!(result.root(), NodeId::new(u32::MAX));
     assert_eq!(result.values(), &expected.values);
     assert_eq!(result.nodes(), &expected.nodes);
-    assert_eq!(result.expressions(), &expected.expressions);
+    assert_eq!(
+        result.unit(NodeId::new(0)),
+        expected.nodes[&NodeId::new(0)].expressions.as_deref()
+    );
     assert_eq!(result.sink(), &expected.sink);
     assert_eq!(result.dop_domain(), expected.dop_domain);
     assert_eq!(result.runtime_filters(), &*expected.runtime_filters);
     assert_eq!(
         result
-            .expressions()
-            .iter()
-            .map(|(id, _)| id.get())
+            .values()
+            .keys()
+            .map(|id| id.get())
             .collect::<Vec<_>>(),
         [0, u32::MAX]
     );
     assert_eq!(result.call_requests().fragment(), result.id());
     // This unpublished structural stage does not fabricate call requests,
-    // frozen effects, roots, property proof or a final Package certificate.
+    // frozen effects, property proof or a final Package certificate. Supplied
+    // immutable units keep their already-authored roots without rebuilding them.
     assert!(result.call_requests().entries().is_empty());
 
-    let mut source = input(2, &mut fixture_constants);
-    let mut definition = source
-        .expressions
-        .get(ExprId::new(u32::MAX))
-        .unwrap()
-        .clone();
-    definition.kind = ExprKind::FunctionCall {
-        function: crate::BoundFunction::from_exact_signature(
-            crate::FunctionId::try_new("fixture/receiving/static-request").unwrap(),
-            crate::FunctionOverloadId::try_new("fixture/receiving/zero-to-i64").unwrap(),
-            crate::FunctionKind::Scalar,
-            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::default()),
-            definition.ty.clone(),
-        ),
-        args: Box::default(),
-    };
-    source.expressions.insert(definition);
-    let unpublished = construct(source, PlanLimits::FROZEN, &Control::default()).unwrap();
-    assert!(matches!(
-        unpublished.call_requests().validate_fragment(&unpublished, &Control::default()),
-        Err(crate::CallRequestError::MissingDefinition(crate::PhysicalCallDefinition::Expression(id)))
-            if id == ExprId::new(u32::MAX)
-    ));
+    assert_eq!(
+        result
+            .unit(NodeId::new(0))
+            .unwrap()
+            .definitions()
+            .iter()
+            .map(|node| node.id.get())
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
 }
 #[test]
 fn receiving_structure_rejects_key_drift_and_keeps_original_count_graph_and_dop_gates() {

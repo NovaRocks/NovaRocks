@@ -15,19 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase, ControlShape,
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    FunctionInstanceState, FunctionNullBehavior, ObservableEffects, PureCompileControl,
+    ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompileControlError,
+    CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionDefinitionMembership, ExpressionUseId, FunctionInstanceState,
+    FunctionNullBehavior, ObservableEffects, PureCompileControl,
 };
 
 use super::*;
+use novarocks_expression_contract::{
+    BoundExprSet, DefinitionControl, ExpressionCallClaim, PhysicalCallRequest, RootScope,
+    UnitLimits,
+};
+use std::{collections::BTreeMap, sync::Arc};
 
 const MISSING_PROOF: &str = "predicate guarantee has no exact function proof";
 
@@ -93,92 +100,185 @@ fn occurrence_effects(volatility: FunctionVolatility) -> CallEffects {
     }
 }
 
-fn add_invocation(
-    fragment: &Fragment,
-    expression: ExprId,
-    demand: EvaluationDemand,
-    invocations: &mut Vec<ExpressionInvocation<ExprId>>,
-) -> ExpressionUseId {
-    let id = ExpressionUseId::new(u32::try_from(invocations.len()).unwrap());
-    let definition = fragment.expressions().get(expression).unwrap();
-    invocations.push(ExpressionInvocation {
-        context: ExpressionEffectContext {
-            use_id: id,
-            region: EvaluationRegionId::new(0),
-            demand,
-        },
-        definition: expression,
-        control: ControlShape::Eager,
-        arguments: Box::default(),
-    });
-    let mut arguments = Vec::new();
-    definition
-        .kind
-        .expression_references_observed::<std::convert::Infallible>(|child| {
-            arguments.push(add_invocation(
-                fragment,
-                child,
-                EvaluationDemand::Value,
-                invocations,
-            ));
-            Ok(())
+// This fixture author declares the exact zero-argument call facts before
+// seal. The resulting same-use claims are real expression facts, never a
+// dedicated provider guarantee proof or an installed implementation receipt.
+fn install_unit(builder: &mut FragmentBuilder, node: NodeId) {
+    let ports = builder.node_ports(node).unwrap();
+    let mut draft = builder.take_unit_builder(node).unwrap();
+    let functions = draft
+        .definitions()
+        .filter_map(|definition| {
+            if let ExprKind::FunctionCall { function, .. } = &definition.kind {
+                Some((definition.id, function.clone()))
+            } else {
+                None
+            }
         })
-        .unwrap();
-    invocations[id.get() as usize].arguments = arguments.into_boxed_slice();
-    id
-}
-
-fn fixture_uses_and_calls(fragment: &Fragment) -> (PhysicalRootUses, FrozenFragmentCalls) {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &Control).unwrap();
-    let mut invocations = Vec::new();
-    let mut bindings = Vec::new();
-    for (site, root) in roots.sites() {
-        bindings.push((
-            *site,
-            add_invocation(fragment, root.expr, root.demand, &mut invocations),
-        ));
+        .collect::<Vec<_>>();
+    for (id, function) in functions {
+        assert_eq!(function.function_id.as_str(), "fixture/guarantee/boolean");
+        assert!(function.argument_types.is_empty());
+        draft
+            .request(
+                id,
+                PhysicalCallRequest {
+                    arguments: Box::default(),
+                    logical_argument_count: 0,
+                    expected_result_type: None,
+                    constant_policy: crate::ConstantPolicy {
+                        max_rows: 16,
+                        max_array_nodes: 32,
+                        max_logical_elements: 128,
+                        max_retained_buffer_bytes: 64 * 1024,
+                        max_type_depth: 16,
+                        max_type_nodes: 128,
+                        max_dictionary_depth: 8,
+                        max_metadata_bytes: 4096,
+                        max_library_validation_work: 1_000_000,
+                        max_library_validation_bytes: 1_000_000,
+                    },
+                },
+            )
+            .unwrap();
+        draft
+            .definition_control(
+                id,
+                DefinitionControl {
+                    shape: ControlShape::Eager,
+                    temporal_sources: None,
+                },
+            )
+            .unwrap();
     }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: EvaluationRegionId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(fragment, flow, bindings, &Control).unwrap();
-    let calls = uses
-        .flow()
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    let sealed = draft.seal(ports, &mut work).unwrap();
+    let claims = sealed
         .uses()
         .iter()
         .filter_map(|(id, invocation)| {
-            let ExprKind::FunctionCall { function, .. } = &fragment
-                .expressions()
-                .get(invocation.definition)
-                .unwrap()
-                .kind
+            let ExprKind::FunctionCall { function, .. } =
+                &sealed.definition(invocation.definition).unwrap().kind
             else {
                 return None;
             };
-            assert_eq!(function.function_id.as_str(), "fixture/guarantee/boolean");
-            Some(FrozenPhysicalCall {
-                materialized_writer_input: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                site: PhysicalCallSite::Expression(*id),
-                context: invocation.context,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                effects: occurrence_effects(function.legacy_metadata.as_ref().unwrap().volatility),
-            })
+            Some((
+                *id,
+                ExpressionCallClaim {
+                    context: invocation.context,
+                    effects: occurrence_effects(
+                        function.legacy_metadata.as_ref().unwrap().volatility,
+                    ),
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    temporal_source: None,
+                    regexp_count_pattern_source: None,
+                    to_base64_byte_source: None,
+                },
+            ))
         })
         .collect();
-    let calls = FrozenFragmentCalls::try_new(fragment, &uses, calls, &Control).unwrap();
-    (uses, calls)
+    let unit = sealed.finish(claims, &mut work).unwrap();
+    work.finish().unwrap();
+    builder.install_unit(node, Arc::new(unit)).unwrap();
+}
+struct Membership(usize);
+impl ExpressionDefinitionMembership<ExprId> for Membership {
+    fn definition_count(&self) -> usize {
+        self.0
+    }
+    fn contains_definition(&self, id: ExprId) -> bool {
+        (id.get() as usize) < self.0
+    }
+}
+// Definitions are dense. Use/region IDs are opaque; exercise sparse keys at
+// the neutral checked constructor rather than restoring a global sparse arena.
+fn sparsify_unit(fragment: Fragment, node: NodeId) -> Fragment {
+    let mut fragment_parts = fragment.into_parts();
+    let source = fragment_parts
+        .nodes
+        .get_mut(&node)
+        .unwrap()
+        .expressions
+        .take()
+        .unwrap();
+    let mut parts = Arc::try_unwrap(source)
+        .expect("fixture uniquely owns its installed unit")
+        .into_parts();
+    assert!(parts.claims.is_empty());
+    let map = parts
+        .control
+        .uses()
+        .keys()
+        .enumerate()
+        .map(|(ordinal, old)| {
+            (
+                *old,
+                ExpressionUseId::new(u32::MAX - u32::try_from(ordinal).unwrap()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let regions_map = parts
+        .control
+        .regions()
+        .keys()
+        .enumerate()
+        .map(|(ordinal, old)| {
+            (
+                *old,
+                EvaluationRegionId::new(u32::MAX - u32::try_from(ordinal).unwrap()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let regions = parts
+        .control
+        .regions()
+        .values()
+        .map(|region| {
+            let mut region = *region;
+            region.id = regions_map[&region.id];
+            region.parent = region.parent.map(|id| regions_map[&id]);
+            if let Some(guard) = &mut region.guard {
+                guard.owner = map[&guard.owner];
+            }
+            region
+        })
+        .collect();
+    let uses = parts
+        .control
+        .uses()
+        .values()
+        .map(|invocation| {
+            let mut invocation = invocation.clone();
+            invocation.context.use_id = map[&invocation.context.use_id];
+            invocation.context.region = regions_map[&invocation.context.region];
+            invocation.arguments = invocation.arguments.iter().map(|id| map[id]).collect();
+            invocation
+        })
+        .collect();
+    parts.root_uses = parts.root_uses.iter().map(|id| map[id]).collect();
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    parts.control = ExpressionControlFlow::try_new_in(
+        regions,
+        uses,
+        &Membership(parts.definitions.len()),
+        &mut |_| Ok(()),
+        &mut work,
+    )
+    .unwrap();
+    let unit = BoundExprSet::try_from_parts_in(
+        parts,
+        UnitLimits {
+            expression_semantic_depth: PlanLimits::FROZEN.expression_semantic_depth,
+        },
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    fragment_parts.nodes.get_mut(&node).unwrap().expressions = Some(Arc::new(unit));
+    Fragment::from(fragment_parts)
+}
+fn unit(input: &FragmentPackageInput) -> &BoundExprSet {
+    input.fragment.unit(input.fragment.root()).unwrap()
 }
 
 fn fixture(
@@ -198,7 +298,7 @@ fn fixture_with_guarantee_count(
     guarantee_count: usize,
     sparse_last: bool,
 ) -> FragmentPackageInput {
-    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let binding = connector_binding();
     let column = ProviderColumnReference {
         column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 33),
@@ -218,10 +318,10 @@ fn fixture_with_guarantee_count(
     let predicate = match predicate {
         Predicate::Primitive => {
             let value = builder
-                .add_expression(scan, ty(DataType::Int64, false), ExprKind::Value(source))
+                .define(scan, ty(DataType::Int64, false), ExprKind::Value(source))
                 .unwrap();
             builder
-                .add_expression(
+                .define(
                     scan,
                     ty(DataType::Boolean, false),
                     ExprKind::IsNull {
@@ -232,7 +332,7 @@ fn fixture_with_guarantee_count(
                 .unwrap()
         }
         Predicate::Function(volatility) => builder
-            .add_expression(
+            .define(
                 scan,
                 ty(DataType::Boolean, false),
                 ExprKind::FunctionCall {
@@ -243,7 +343,7 @@ fn fixture_with_guarantee_count(
             .unwrap(),
         Predicate::IntrinsicDescendant => {
             let call = builder
-                .add_expression(
+                .define(
                     scan,
                     ty(DataType::Boolean, false),
                     ExprKind::FunctionCall {
@@ -253,7 +353,7 @@ fn fixture_with_guarantee_count(
                 )
                 .unwrap();
             let negation = builder
-                .add_expression(
+                .define(
                     scan,
                     ty(DataType::Boolean, false),
                     ExprKind::Unary {
@@ -263,7 +363,7 @@ fn fixture_with_guarantee_count(
                 )
                 .unwrap();
             builder
-                .add_expression(
+                .define(
                     scan,
                     ty(DataType::Boolean, false),
                     ExprKind::IsNull {
@@ -274,22 +374,38 @@ fn fixture_with_guarantee_count(
                 .unwrap()
         }
     };
+    let predicate_definition = predicate;
+    let predicate_root = (guarantee.is_some() || residual).then(|| {
+        builder.root_definition(
+            scan,
+            predicate_definition,
+            EvaluationDemand::TruthOnly,
+            RootScope::Port(0),
+        )
+    });
     if let Some(kind) = guarantee {
+        let predicate = predicate_root.unwrap();
         let mut guarantees = vec![PredicateGuarantee { predicate, kind }];
         // Distinct guarantee roots share the same primitive subtree. The
         // source has no duplicate guarantee and no fabricated runtime use.
         for _ in 1..guarantee_count {
             let expression = builder
-                .add_expression(
+                .define(
                     scan,
                     ty(DataType::Boolean, false),
                     ExprKind::IsTruthValue {
-                        expr: predicate,
+                        expr: predicate_definition,
                         value: true,
                         negated: false,
                     },
                 )
                 .unwrap();
+            let expression = builder.root_definition(
+                scan,
+                expression,
+                EvaluationDemand::TruthOnly,
+                RootScope::Port(0),
+            );
             guarantees.push(PredicateGuarantee {
                 predicate: expression,
                 kind,
@@ -302,12 +418,18 @@ fn fixture_with_guarantee_count(
     }
     let mut columns = vec![source];
     let derived_values = if derived {
+        let derived_root = builder.root_definition(
+            scan,
+            predicate_definition,
+            EvaluationDemand::Value,
+            RootScope::Port(0),
+        );
         let value = builder
             .add_value(
                 ty(DataType::Boolean, false),
                 ValueOrigin::Expr {
                     node: scan,
-                    expr: predicate,
+                    root: derived_root,
                 },
             )
             .unwrap();
@@ -318,6 +440,7 @@ fn fixture_with_guarantee_count(
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -332,7 +455,7 @@ fn fixture_with_guarantee_count(
                 read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, source)]),
                 residuals: if residual {
-                    Box::from([predicate])
+                    Box::from([predicate_root.unwrap()])
                 } else {
                     Box::default()
                 },
@@ -340,6 +463,7 @@ fn fixture_with_guarantee_count(
             },
         })
         .unwrap();
+    install_unit(&mut builder, scan);
     let mut fragment = builder
         .finish_structure(
             scan,
@@ -351,89 +475,27 @@ fn fixture_with_guarantee_count(
         )
         .expect("the real construction stage must accept the source structure");
     if sparse_last {
-        // Renumber a leaf root via the sole sparse arena ownership API. No
-        // type, child, source owner, or guarantee occurrence is replaced.
-        let mut parts = fragment.into_parts();
-        let NodeKind::Scan { relation, .. } = &mut parts.nodes.get_mut(&scan).unwrap().kind else {
-            unreachable!()
-        };
-        let Relation::Metadata(metadata) = relation.as_mut() else {
-            unreachable!()
-        };
-        let last = metadata.predicate_guarantees.last_mut().unwrap();
-        let old = last.predicate;
-        last.predicate = ExprId::new(u32::MAX);
-        let definitions = parts
-            .expressions
-            .iter()
-            .map(|(_, definition)| {
-                let mut definition = definition.clone();
-                if definition.id == old {
-                    definition.id = ExprId::new(u32::MAX);
-                }
-                definition
-            })
-            .collect::<Vec<_>>();
-        parts.expressions = ExprArena::try_from_definitions_observed(
-            definitions.into_iter(),
-            &PlanLimits::FROZEN,
-            &Control,
-        )
-        .unwrap();
-        fragment = Fragment::from(parts);
+        fragment = sparsify_unit(fragment, scan);
     }
-    // Each FunctionCall definition publishes its own original request: Value
-    // arguments of its exact signature, none of which is a constant.
-    let requests = fragment
-        .expressions()
-        .iter()
-        .filter_map(|(id, definition)| match &definition.kind {
-            ExprKind::FunctionCall { function, .. } => Some((
-                crate::PhysicalCallDefinition::Expression(*id),
-                crate::PhysicalCallRequest {
-                    arguments: function
-                        .argument_types
-                        .iter()
-                        .map(|argument| match argument {
-                            novarocks_type_contract::FunctionArgumentType::Value(value_type) => {
-                                crate::StaticFunctionArgument::Value {
-                                    value_type: value_type.clone(),
-                                    constant: None,
-                                }
-                            }
-                            _ => panic!("guarantee fixture calls take Value arguments"),
-                        })
-                        .collect(),
-                    logical_argument_count: function.argument_types.len(),
-                    expected_result_type: None,
-                    constant_policy: crate::ConstantPolicy {
-                        max_rows: 16,
-                        max_array_nodes: 32,
-                        max_logical_elements: 128,
-                        max_retained_buffer_bytes: 64 * 1024,
-                        max_type_depth: 16,
-                        max_type_nodes: 128,
-                        max_dictionary_depth: 8,
-                        max_metadata_bytes: 4096,
-                        max_library_validation_work: 1_000_000,
-                        max_library_validation_bytes: 1_000_000,
-                    },
-                },
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let fragment = fragment
-        .with_call_requests_observed(requests, &Control)
-        .unwrap();
+    // Scalar claims are in the installed unit. This fixture has no relational
+    // call and therefore publishes a genuinely empty fragment call table.
+    let fragment = fragment.with_calls_observed(Vec::new(), &Control).unwrap();
     let read = package_contract::frozen_scan(&fragment);
-    let (uses, calls) = fixture_uses_and_calls(&fragment);
-    let mut input = package_contract::package_input_with_controls(
+    let mut input = FragmentPackageInput {
+        constants: fixture_constants.for_fragment(&fragment),
+        statement_constant_policy: crate::tests::constant_fixture::policy(),
+        version: version(),
+        required: RequiredContracts::default(),
+        pruning: FrozenFragmentPruning::try_new(fragment.id(), Vec::new(), &Control).unwrap(),
         fragment,
-        uses,
-        calls,
-        &mut fixture_constants,
-    );
+        cuts: FragmentCuts::default(),
+        result: None,
+        parameters: novarocks_type_contract::SemanticParameters::default(),
+        scans: BTreeMap::new(),
+        writes: BTreeMap::new(),
+        layouts: Default::default(),
+        annotations: Box::default(),
+    };
     input.scans.insert(scan, read);
     input
 }
@@ -448,20 +510,32 @@ fn guarantee_shared_sparse_dag_preserves_exact_combined_projection_ceilings() {
         320,
         true,
     );
+    let source = unit(&input);
     assert!(
-        input
-            .fragment
-            .expressions()
-            .get(ExprId::new(u32::MAX))
-            .is_some()
+        source
+            .definitions()
+            .iter()
+            .enumerate()
+            .all(|(ordinal, definition)| definition.id.get() as usize == ordinal)
     );
-    assert!(input.expression_uses.flow().uses().is_empty());
-    assert!(input.calls.entries().is_empty());
+    assert!(
+        source
+            .control_flow()
+            .uses()
+            .contains_key(&ExpressionUseId::new(u32::MAX))
+    );
+    assert!(
+        source
+            .control_flow()
+            .regions()
+            .contains_key(&EvaluationRegionId::new(u32::MAX))
+    );
+    assert_eq!(source.roots().len(), 320);
+    assert!(source.claims().is_empty());
+    assert!(input.fragment.calls().entries().is_empty());
     let admitted = admission();
     let facts = validate_fragment_output_properties_observed(
         &input.fragment,
-        &input.expression_uses,
-        &input.calls,
         admitted.plan_limits,
         admitted.source_retained_bytes,
         admitted.property_projection_limits,
@@ -537,8 +611,8 @@ fn guarantee_only_function_refuses_missing_proof_independent_of_legacy_stability
             false,
             false,
         );
-        assert!(input.expression_uses.flow().uses().is_empty());
-        assert!(input.calls.entries().is_empty());
+        assert_eq!(unit(&input).claims().len(), 1);
+        assert!(input.fragment.calls().entries().is_empty());
         assert_missing_proof(input);
     }
 }
@@ -557,15 +631,32 @@ fn guarantee_intrinsic_descendants_and_actual_row_calls_cannot_supply_own_proof(
         false,
         true,
     );
-    assert_eq!(derived.calls.entries().len(), 1);
-    assert!(
-        derived
-            .expression_uses
-            .roots()
-            .sites()
-            .keys()
-            .any(|site| { matches!(site.role, ExpressionRootRole::ScanDerived { derived: 0 }) })
+    let source = unit(&derived);
+    assert_eq!(source.claims().len(), 2);
+    let NodeKind::Scan {
+        derived_values,
+        relation,
+        ..
+    } = &derived.fragment.nodes()[&derived.fragment.root()].kind
+    else {
+        unreachable!()
+    };
+    let ValueOrigin::Expr { node, root } = &derived.fragment.values()[&derived_values[0]].origin
+    else {
+        unreachable!()
+    };
+    assert_eq!(*node, derived.fragment.root());
+    assert_eq!(source.root(*root).unwrap().demand, EvaluationDemand::Value);
+    let guaranteed = relation.predicate_guarantees()[0].predicate;
+    assert_eq!(
+        source.root(guaranteed).unwrap().demand,
+        EvaluationDemand::TruthOnly
     );
+    assert_eq!(
+        source.root(*root).unwrap().definition,
+        source.root(guaranteed).unwrap().definition
+    );
+    assert_ne!(source.root_use(*root), source.root_use(guaranteed));
     assert_missing_proof(derived);
     let pruning = fixture(
         Predicate::Function(FunctionVolatility::Immutable),
@@ -573,7 +664,7 @@ fn guarantee_intrinsic_descendants_and_actual_row_calls_cannot_supply_own_proof(
         true,
         false,
     );
-    assert_eq!(pruning.calls.entries().len(), 1);
+    assert_eq!(unit(&pruning).claims().len(), 1);
     assert_missing_proof(pruning);
 }
 
@@ -585,15 +676,16 @@ fn primitive_guarantees_and_ordinary_function_residuals_keep_actual_package_capa
         (PredicateGuaranteeKind::PruningOnly, true),
     ] {
         let input = fixture(Predicate::Primitive, Some(kind), residual, false);
-        assert!(input.calls.entries().is_empty());
+        assert!(unit(&input).claims().is_empty());
         FragmentPackage::try_new(input, admission(), &Control).unwrap();
     }
     for volatility in [FunctionVolatility::Immutable, FunctionVolatility::Volatile] {
         let input = fixture(Predicate::Function(volatility), None, true, false);
-        assert_eq!(input.calls.entries().len(), 1);
+        assert_eq!(unit(&input).claims().len(), 1);
         let package = FragmentPackage::try_new(input, admission(), &Control).unwrap();
         assert!(matches!(
-            package.calls().entries().values().next().unwrap().effects.value_stability,
+            package.fragment().unit(package.fragment().root()).unwrap()
+                .claims().values().next().unwrap().effects.value_stability,
             stability if stability == volatility
         ));
     }

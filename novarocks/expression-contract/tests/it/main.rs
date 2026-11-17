@@ -19,3 +19,17 @@ mod control_derivation;
 mod support;
 mod unit_construction;
 mod unit_validation;
+
+mod legacy_scalar_properties;
+
+mod temporal_sources;
+
+mod higher_order_properties;
+
+mod ordered_correspondence;
+
+mod frozen_call_claims;
+
+mod static_requests;
+
+mod root_use_contract;

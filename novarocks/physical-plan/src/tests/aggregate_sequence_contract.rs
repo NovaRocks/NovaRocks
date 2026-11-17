@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 
 const SEQUENCE: AggregateSequenceId = AggregateSequenceId::new(71);
 
@@ -36,7 +38,15 @@ impl novarocks_type_contract::PureCompileControl for Unbounded {
 /// its aggregate calls, so the sequence and grouping laws below are what
 /// publication actually checks.
 fn with_requests(fragment: Fragment) -> Fragment {
-    super::original_call_requests::with_original_relational_requests(fragment, &Unbounded)
+    with_requests_checked(fragment).expect("positive sequence fixture has complete local facts")
+}
+
+fn with_requests_checked(fragment: Fragment) -> Result<Fragment, ValidationErrors> {
+    let fragment =
+        super::original_call_requests::with_original_relational_requests(fragment, &Unbounded);
+    let fragment = super::unit_fixture::with_immutable_relation_claims(fragment);
+    crate::validate_fragment_definition(&fragment)?;
+    Ok(fragment)
 }
 
 #[derive(Clone, Copy)]
@@ -149,6 +159,7 @@ fn add_provider_scan(
     metadata.provided_properties = output_properties.clone();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -199,6 +210,7 @@ fn add_exchange_source(
         .collect::<Vec<_>>();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -267,13 +279,19 @@ fn add_aggregate_with_grouping(
         .iter()
         .map(|value| {
             let expression = builder
-                .add_expression(
+                .define(
                     node,
                     builder.value(*value).unwrap().ty.clone(),
                     ExprKind::Value(*value),
                 )
                 .unwrap();
-            (expression, *value)
+            let root = builder.root_definition(
+                node,
+                expression,
+                novarocks_type_contract::EvaluationDemand::Value,
+                crate::RootScope::Port(0),
+            );
+            (root, *value)
         })
         .collect::<Vec<_>>();
     let argument_type = if phase.consumes_logical_arguments() {
@@ -282,8 +300,14 @@ fn add_aggregate_with_grouping(
         ty(DataType::Binary, false)
     };
     let argument_expression = builder
-        .add_expression(node, argument_type, ExprKind::Value(argument))
+        .define(node, argument_type, ExprKind::Value(argument))
         .unwrap();
+    let argument_expression = builder.root_definition(
+        node,
+        argument_expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let binding = aggregate_binding(phase, drift);
     let output_type = if phase.produces_final_result() {
         binding.function.result_type.clone()
@@ -312,6 +336,7 @@ fn add_aggregate_with_grouping(
     columns.push(output);
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([input_properties]),
@@ -419,7 +444,7 @@ fn finish_two_stage_sequence(drift: BindingDrift, final_groups: FinalGroups) -> 
     );
     let source = with_requests(
         source
-            .finish_definition(
+            .finish_fixture_structure(
                 partial,
                 FragmentSink::Stream { edge },
                 dop(),
@@ -458,7 +483,7 @@ fn finish_two_stage_sequence(drift: BindingDrift, final_groups: FinalGroups) -> 
     );
     let destination = with_requests(
         destination
-            .finish_definition(
+            .finish_fixture_structure(
                 final_node,
                 FragmentSink::Noop,
                 dop(),
@@ -467,7 +492,7 @@ fn finish_two_stage_sequence(drift: BindingDrift, final_groups: FinalGroups) -> 
             .unwrap(),
     );
 
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     add_edge(
@@ -530,7 +555,7 @@ fn aggregate_sequence_rejects_an_orphan_partial() {
     );
     let fragment = with_requests(
         fragment
-            .finish_definition(
+            .finish_fixture_structure(
                 partial,
                 FragmentSink::Noop,
                 dop(),
@@ -538,7 +563,7 @@ fn aggregate_sequence_rejects_an_orphan_partial() {
             )
             .unwrap(),
     );
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(fragment).unwrap();
     assert!(
         plan.finish_observed(&Unbounded)
@@ -573,7 +598,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
     );
     let source = with_requests(
         source
-            .finish_definition(
+            .finish_fixture_structure(
                 partial,
                 FragmentSink::Stream { edge },
                 dop(),
@@ -592,7 +617,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
     );
     let final_node = destination.reserve_node_id().unwrap();
     let state = destination
-        .add_expression(
+        .define(
             final_node,
             ty(DataType::Binary, false),
             ExprKind::Value(imports[0]),
@@ -613,7 +638,12 @@ fn aggregate_sequence_rejects_duplicate_finals() {
                     AggregatePhase::Final { sequence: SEQUENCE },
                     BindingDrift::None,
                 ),
-                arguments: Box::from([state]),
+                arguments: Box::from([destination.root_definition(
+                    final_node,
+                    state,
+                    novarocks_type_contract::EvaluationDemand::Value,
+                    crate::RootScope::Port(0),
+                )]),
                 distinct: false,
                 order_by: Box::default(),
                 output,
@@ -622,6 +652,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
         .collect::<Vec<_>>();
     destination
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: final_node,
             inputs: Box::from([exchange]),
             required_inputs: Box::from([singleton.clone()]),
@@ -643,7 +674,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
         .unwrap();
     let destination = with_requests(
         destination
-            .finish_definition(
+            .finish_fixture_structure(
                 final_node,
                 FragmentSink::Noop,
                 dop(),
@@ -652,7 +683,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
             .unwrap(),
     );
 
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     add_edge(
@@ -722,7 +753,7 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
     );
     let source = with_requests(
         source
-            .finish_definition(
+            .finish_fixture_structure(
                 partial,
                 FragmentSink::Stream { edge: first_edge },
                 dop(),
@@ -752,7 +783,7 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
     );
     let middle = with_requests(
         middle
-            .finish_definition(
+            .finish_fixture_structure(
                 intermediate,
                 FragmentSink::Stream { edge: second_edge },
                 dop(),
@@ -782,7 +813,7 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
     );
     let destination = with_requests(
         destination
-            .finish_definition(
+            .finish_fixture_structure(
                 final_node,
                 FragmentSink::Noop,
                 dop(),
@@ -791,7 +822,7 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
             .unwrap(),
     );
 
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(middle).unwrap();
     plan.add_fragment(destination).unwrap();
@@ -843,7 +874,7 @@ fn invalid_finalization(
         input_properties,
     );
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             aggregate,
             FragmentSink::Noop,
             dop(),
@@ -939,7 +970,7 @@ fn aggregate_call_identity_is_unique_across_a_fragment() {
     );
 
     let error = builder
-        .finish_definition(
+        .finish_fixture_definition(
             second,
             FragmentSink::Noop,
             dop(),
@@ -1082,6 +1113,7 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
             )
             .unwrap();
         b.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: union,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([singleton.clone(), singleton.clone()]),
@@ -1114,15 +1146,27 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
         values = vec![values[0], *values.last().unwrap()];
         let projection = b.reserve_node_id().unwrap();
         let key = b
-            .add_expression(projection, key_type.clone(), ExprKind::Value(values[0]))
+            .define(projection, key_type.clone(), ExprKind::Value(values[0]))
             .unwrap();
         let state = b
-            .add_expression(
+            .define(
                 projection,
                 ty(DataType::Binary, false),
                 ExprKind::Value(values[1]),
             )
             .unwrap();
+        let key = b.root_definition(
+            projection,
+            key,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
+        let state = b.root_definition(
+            projection,
+            state,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
         let output_key = if matches!(
             fixture,
             GroupedReductionFixture::RenamedDroppedGroupingKey
@@ -1132,7 +1176,7 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
                 key_type.clone(),
                 ValueOrigin::Expr {
                     node: projection,
-                    expr: key,
+                    root: key,
                 },
             )
             .unwrap()
@@ -1157,12 +1201,14 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
     };
     let topn = b.reserve_node_id().unwrap();
     let key_expr = b
-        .add_expression(topn, key_type.clone(), ExprKind::Value(values[0]))
+        .define(topn, key_type.clone(), ExprKind::Value(values[0]))
         .unwrap();
-    let state_expr = if row_budget {
+    // MissingState intentionally has no consuming call, so do not author an
+    // unreachable scalar definition that would mask the relation-path fault.
+    let state_expr = if row_budget || matches!(fixture, GroupedReductionFixture::MissingState) {
         key_expr
     } else {
-        b.add_expression(
+        b.define(
             topn,
             ty(DataType::Binary, false),
             ExprKind::Value(values[1]),
@@ -1189,10 +1235,19 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
         )
         .unwrap()
     };
+    let state_root = (!row_budget && !matches!(fixture, GroupedReductionFixture::MissingState))
+        .then(|| {
+            b.root_definition(
+                topn,
+                state_expr,
+                novarocks_type_contract::EvaluationDemand::Value,
+                crate::RootScope::Port(0),
+            )
+        });
     let call = AggregateCall {
         id: call_id,
         binding: aggregate_binding(phase, BindingDrift::None),
-        arguments: Box::from([state_expr]),
+        arguments: state_root.into_iter().collect(),
         distinct: false,
         order_by: Box::default(),
         output: state,
@@ -1200,7 +1255,16 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
     let calls = if matches!(fixture, GroupedReductionFixture::MissingState) {
         Box::default()
     } else if matches!(fixture, GroupedReductionFixture::DuplicateState) {
-        Box::from([call.clone(), call])
+        let mut duplicate = call.clone();
+        // Duplicate contribution identity/output is the tested defect; each
+        // ordered argument field must still own its actual root occurrence.
+        duplicate.arguments = Box::from([b.root_definition(
+            topn,
+            state_expr,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        )]);
+        Box::from([call, duplicate])
     } else {
         Box::from([call])
     };
@@ -1208,7 +1272,15 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
         TopNReduction::Rows
     } else {
         TopNReduction::GroupedStates {
-            group_by: Box::from([(key_expr, values[0])]),
+            group_by: Box::from([(
+                b.root_definition(
+                    topn,
+                    key_expr,
+                    novarocks_type_contract::EvaluationDemand::Value,
+                    crate::RootScope::Port(0),
+                ),
+                values[0],
+            )]),
             calls,
             comparator: OrderedComparisonAlgorithm::NativeScalarOrderV1,
         }
@@ -1218,6 +1290,12 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
     } else {
         key_expr
     };
+    let order = b.root_definition(
+        topn,
+        order,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let output_state = if row_budget { values[1] } else { state };
     let ordered_value = if matches!(fixture, GroupedReductionFixture::StateRanking) {
         values[1]
@@ -1225,6 +1303,7 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
         values[0]
     };
     b.insert_node_unchecked(PhysicalNode {
+        expressions: None,
         id: topn,
         inputs: Box::from([partial]),
         required_inputs: Box::from([singleton.clone()]),
@@ -1264,8 +1343,14 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
     let topn = if matches!(fixture, GroupedReductionFixture::StagedRowBudget) {
         let rows = b.reserve_node_id().unwrap();
         let order = b
-            .add_expression(rows, key_type.clone(), ExprKind::Value(values[0]))
+            .define(rows, key_type.clone(), ExprKind::Value(values[0]))
             .unwrap();
+        let order = b.root_definition(
+            rows,
+            order,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
         b.add_top_n(
             rows,
             topn,
@@ -1298,8 +1383,14 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
     );
     let final_topn = b.reserve_node_id().unwrap();
     let order = b
-        .add_expression(final_topn, key_type.clone(), ExprKind::Value(outputs[0]))
+        .define(final_topn, key_type.clone(), ExprKind::Value(outputs[0]))
         .unwrap();
+    let order = b.root_definition(
+        final_topn,
+        order,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     b.add_top_n(
         final_topn,
         final_agg,
@@ -1315,16 +1406,17 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
         },
     )
     .unwrap();
-    let fragment = with_requests(
-        b.finish_definition(
+    let fragment = with_requests_checked(
+        b.finish_fixture_structure(
             final_topn,
             FragmentSink::Noop,
             dop(),
             crate::StagePlacementPolicy::Singleton,
         )
         .map_err(|e| e.to_string())?,
-    );
-    let mut plan = PlanBuilder::new(version());
+    )
+    .map_err(|e| e.to_string())?;
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(fragment).unwrap();
     plan.finish_observed(&Unbounded).map_err(|e| e.to_string())
 }
@@ -1352,7 +1444,7 @@ fn grouped_topn_merges_new_exact_intermediate_states_in_both_sequences() {
     assert_eq!(calls.len(), 1);
     assert_ne!(
         calls[0].output,
-        crate::expression_value(fragment.expressions(), calls[0].arguments[0]).unwrap()
+        crate::expression_value(fragment, grouped.id, calls[0].arguments[0]).unwrap()
     );
 }
 #[test]

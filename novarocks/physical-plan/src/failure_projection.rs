@@ -31,29 +31,6 @@ enum PhysicalReason {
     IdentityZeroPlanVersion = 1,
     IdentityEmptyStableIdentity = 2,
     IdentityStableIdentityTooLong = 3,
-    MissingLegacyMetadata = 4,
-    ExprArenaConstructionTooManyDefinitions = 10,
-    ExprArenaConstructionDefinitionCountMismatch = 11,
-    ExprArenaConstructionDuplicateDefinition = 12,
-    ExpressionRootTooManyRoots = 20,
-    ExpressionRootInvalidDerivedValue = 21,
-    ExpressionRootInvalidExpressionOwner = 22,
-    ExpressionRootInvalidExpressionScope = 23,
-    ExpressionRootDuplicateSite = 24,
-    ExpressionRootSourceModel = 25,
-    RootUseBindingIncompleteCoverage = 30,
-    RootUseBindingInvalidSite = 31,
-    RootUseBindingInvalidUse = 32,
-    RootUseBindingDuplicateSite = 33,
-    RootUseBindingSharedUse = 34,
-    RootUseBindingWrongDefinition = 35,
-    RootUseBindingWrongDemand = 36,
-    RootUseBindingGuardedRoot = 37,
-    RootUseBindingWrongControl = 38,
-    RootUseBindingWrongArguments = 39,
-    RootUseBindingWrongFragment = 40,
-    RootUseBindingChangedRoots = 41,
-    RootUseBindingSourceModel = 42,
     PredicateSourceTooDeep = 50,
     PredicateSourceInvalidFragment = 51,
     PredicateSourceInvalidSite = 52,
@@ -93,7 +70,6 @@ enum PhysicalReason {
     FrozenCallMissingSite = 105,
     FrozenCallWrongContext = 106,
     FrozenCallSharedUse = 107,
-    FrozenCallInvalidDomain = 108,
     FrozenCallWrongProofScope = 109,
     FrozenCallWrongControl = 110,
     FrozenCallReplicaEquivalence = 111,
@@ -141,128 +117,6 @@ impl FailureProjection for IdentityError {
             Self::StableIdentityTooLong { .. } => fact(
                 FailureClass::Resource,
                 PhysicalReason::IdentityStableIdentityTooLong,
-            ),
-        }
-    }
-}
-
-impl FailureProjection for MissingLegacyBindingMetadata {
-    fn failure_fact(&self) -> FailureFact {
-        fact(
-            FailureClass::Invariant,
-            PhysicalReason::MissingLegacyMetadata,
-        )
-    }
-}
-
-impl FailureProjection for ExprArenaConstructionError {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::Control(source) => source.failure_fact(),
-            Self::TooManyDefinitions => fact(
-                FailureClass::Resource,
-                PhysicalReason::ExprArenaConstructionTooManyDefinitions,
-            ),
-            Self::DefinitionCountMismatch { .. } => fact(
-                FailureClass::Invariant,
-                PhysicalReason::ExprArenaConstructionDefinitionCountMismatch,
-            ),
-            Self::DuplicateDefinition(_) => fact(
-                FailureClass::Invariant,
-                PhysicalReason::ExprArenaConstructionDuplicateDefinition,
-            ),
-        }
-    }
-}
-
-impl FailureProjection for ExpressionRootError {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::Control(source) => source.failure_fact(),
-            Self::TooManyRoots => fact(
-                FailureClass::Resource,
-                PhysicalReason::ExpressionRootTooManyRoots,
-            ),
-            Self::InvalidDerivedValue => fact(
-                FailureClass::Invariant,
-                PhysicalReason::ExpressionRootInvalidDerivedValue,
-            ),
-            Self::InvalidExpressionOwner => fact(
-                FailureClass::Invariant,
-                PhysicalReason::ExpressionRootInvalidExpressionOwner,
-            ),
-            Self::InvalidExpressionScope => fact(
-                FailureClass::Invariant,
-                PhysicalReason::ExpressionRootInvalidExpressionScope,
-            ),
-            Self::DuplicateSite => fact(
-                FailureClass::Invariant,
-                PhysicalReason::ExpressionRootDuplicateSite,
-            ),
-            Self::SourceModel(_) => fact(
-                FailureClass::Invariant,
-                PhysicalReason::ExpressionRootSourceModel,
-            ),
-        }
-    }
-}
-
-impl FailureProjection for RootUseBindingError {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::Control(source) => source.failure_fact(),
-            Self::Roots(source) => source.failure_fact(),
-            Self::IncompleteCoverage => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingIncompleteCoverage,
-            ),
-            Self::InvalidSite => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingInvalidSite,
-            ),
-            Self::InvalidUse => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingInvalidUse,
-            ),
-            Self::DuplicateSite => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingDuplicateSite,
-            ),
-            Self::SharedUse => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingSharedUse,
-            ),
-            Self::WrongDefinition => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingWrongDefinition,
-            ),
-            Self::WrongDemand => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingWrongDemand,
-            ),
-            Self::GuardedRoot => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingGuardedRoot,
-            ),
-            Self::WrongControl => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingWrongControl,
-            ),
-            Self::WrongArguments => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingWrongArguments,
-            ),
-            Self::WrongFragment => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingWrongFragment,
-            ),
-            Self::ChangedRoots => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingChangedRoots,
-            ),
-            Self::SourceModel(_) => fact(
-                FailureClass::Invariant,
-                PhysicalReason::RootUseBindingSourceModel,
             ),
         }
     }
@@ -423,7 +277,6 @@ impl FailureProjection for FrozenCallError {
         match self {
             Self::MissingLegacyMetadata(source) => source.failure_fact(),
             Self::Control(source) => source.failure_fact(),
-            Self::Roots(source) => source.failure_fact(),
             Self::InvalidEffects(source) => source.failure_fact(),
             Self::ResourceSource(_) => fact(
                 FailureClass::Invariant,
@@ -453,11 +306,9 @@ impl FailureProjection for FrozenCallError {
                 FailureClass::Invariant,
                 PhysicalReason::FrozenCallWrongContext,
             ),
-            Self::SharedUse => fact(FailureClass::Invariant, PhysicalReason::FrozenCallSharedUse),
-            Self::InvalidRegion => fact(
-                FailureClass::Invariant,
-                PhysicalReason::FrozenCallInvalidDomain,
-            ),
+            Self::DuplicateIdentity => {
+                fact(FailureClass::Invariant, PhysicalReason::FrozenCallSharedUse)
+            }
             Self::WrongProofScope => fact(
                 FailureClass::Invariant,
                 PhysicalReason::FrozenCallWrongProofScope,
@@ -466,7 +317,7 @@ impl FailureProjection for FrozenCallError {
                 FailureClass::Invariant,
                 PhysicalReason::FrozenCallWrongControl,
             ),
-            Self::ReplicaEquivalence(_) => fact(
+            Self::ReplicaEquivalence(_) | Self::ReplicaExpression { .. } => fact(
                 FailureClass::Invariant,
                 PhysicalReason::FrozenCallReplicaEquivalence,
             ),
@@ -546,7 +397,6 @@ impl FailureProjection for FragmentPackageError {
             Self::Control(source) => source.failure_fact(),
             Self::Constant(source) => source.failure_fact(),
             Self::Structure(source) => source.failure_fact(),
-            Self::ExpressionUses(source) => source.failure_fact(),
             Self::Calls(source) => source.failure_fact(),
             Self::Pruning(source) => source.failure_fact(),
             Self::Parameter(source) => source.failure_fact(),

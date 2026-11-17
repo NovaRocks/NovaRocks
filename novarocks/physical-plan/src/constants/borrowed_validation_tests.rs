@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::{Fragment, PlanLimits, UnpivotConstant, ValueId};
 use arrow_array::builder::{Int32Builder, ListBuilder, MapBuilder, StringBuilder};
 
@@ -164,18 +166,24 @@ fn collection_fragment_with_scalar(
         .add_values(empty, Box::default(), Box::from([source_value]))
         .unwrap();
     let expression = builder
-        .add_expression(
+        .define(
             project,
             integer.clone(),
             crate::ExprKind::Value(source_value),
         )
         .unwrap();
+    let expression = builder.root_definition(
+        project,
+        expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let input = builder
         .add_value(
             integer.clone(),
             crate::ValueOrigin::Expr {
                 node: project,
-                expr: expression,
+                root: expression,
             },
         )
         .unwrap();
@@ -189,8 +197,14 @@ fn collection_fragment_with_scalar(
         .unwrap();
     let scalar = scalar.map(|reference| {
         let expression = builder
-            .add_expression(unpivot, ty.clone(), crate::ExprKind::Constant(reference))
+            .define(unpivot, ty.clone(), crate::ExprKind::Constant(reference))
             .unwrap();
+        let expression = builder.root_definition(
+            unpivot,
+            expression,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
         UnpivotConstant::Scalar(expression)
     });
     let constants = scalar.as_ref().map_or(constants, std::slice::from_ref);
@@ -237,6 +251,12 @@ fn collection_fragment_with_scalar(
             },
         )
         .unwrap();
+    // Seal the real node-private Value source before the independent
+    // constant-source gate below. This fixture has no function claims.
+    crate::tests::unit_fixture::seal_pure_unit(&mut builder, project);
+    if builder.construction_unit(unpivot).is_some() {
+        crate::tests::unit_fixture::seal_pure_unit(&mut builder, unpivot);
+    }
     let fragment = builder
         .finish_structure(
             unpivot,
@@ -271,7 +291,9 @@ fn borrowed_fragment_scalar_sparse_source_and_closed_ordinary_errors_keep_every_
     );
     let c = BorrowedControl::new(None);
     let selected = borrowed(&c, |w| {
-        pools.resolve_source_observed(reference(u32::MAX, 1), w).map_err(ConstantReferenceError::from)
+        pools
+            .resolve_source_observed(reference(u32::MAX, 1), w)
+            .map_err(ConstantReferenceError::from)
     })
     .unwrap();
     assert_eq!(selected.ordinal(), 1);
@@ -286,7 +308,11 @@ fn borrowed_fragment_scalar_sparse_source_and_closed_ordinary_errors_keep_every_
         (
             reference(4, 1),
             backing.value_type().clone(),
-            ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::MissingPool(ConstantPoolId::new(4))),
+            ConstantReferenceError::Table(
+                novarocks_constant_contract::ConstantTableError::MissingPool(ConstantPoolId::new(
+                    4,
+                )),
+            ),
         ),
         (
             reference(0, 2),
@@ -298,7 +324,11 @@ fn borrowed_fragment_scalar_sparse_source_and_closed_ordinary_errors_keep_every_
         (
             reference(0, 1),
             FunctionValueType::new(DataType::Int64, true),
-            ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(reference(0, 1))),
+            ConstantReferenceError::Table(
+                novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(reference(
+                    0, 1,
+                )),
+            ),
         ),
     ] {
         let invalid = constant_fragment(202, &[(address, ty)]);
@@ -416,7 +446,9 @@ fn borrowed_utf8_map_keeps_actual_nonzero_row_and_rejects_unsorted_source_with_c
                 w,
             )?;
             assert_eq!((usage.items, usage.payload_bytes), (2, 9));
-            let selected = pools.resolve_source_observed(reference(u32::MAX, 1), w).map_err(ConstantReferenceError::from)?;
+            let selected = pools
+                .resolve_source_observed(reference(u32::MAX, 1), w)
+                .map_err(ConstantReferenceError::from)?;
             let view = selected.utf8_map_in(w)?.unwrap();
             assert_eq!(view.item_observed(0, w)?, (Some("a"), Some("λ\0")));
             assert_eq!(view.item_observed(1, w)?, (Some("z"), Some("tail")));
@@ -440,19 +472,11 @@ fn borrowed_utf8_map_keeps_actual_nonzero_row_and_rejects_unsorted_source_with_c
 fn borrowed_window_frame_owner_uses_exact_checked_offsets_and_original_current_row_rule() {
     let backing = plain(Arc::new(Int64Array::from(vec![99, 7, 3, 0])), false);
     let pools = table(&backing, &[u32::MAX]);
-    let fragment = constant_fragment(
-        220,
-        &[
-            (reference(u32::MAX, 1), backing.value_type().clone()),
-            (reference(u32::MAX, 2), backing.value_type().clone()),
-            (reference(u32::MAX, 3), backing.value_type().clone()),
-        ],
-    );
-    let ids = fragment
-        .expressions()
-        .iter()
-        .map(|(id, _)| *id)
-        .collect::<Vec<_>>();
+    let ids = [
+        reference(u32::MAX, 1),
+        reference(u32::MAX, 2),
+        reference(u32::MAX, 3),
+    ];
     let frame = crate::WindowFrame {
         units: crate::WindowFrameUnits::Rows,
         start: crate::WindowBound::Preceding(ids[0]),
@@ -460,23 +484,20 @@ fn borrowed_window_frame_owner_uses_exact_checked_offsets_and_original_current_r
         exclusion: crate::WindowFrameExclusion::NoOthers,
     };
     // Actual frame/constant owner component; this does not certify a Window kernel.
-    every_prefix(
-        |w| validate_window_constants(&fragment, &pools, &frame, w),
-        Ok(()),
-    );
+    every_prefix(|w| validate_window_constants(&pools, &frame, w), Ok(()));
     let reversed = crate::WindowFrame {
         start: frame.end,
         end: frame.start,
         ..frame
     };
     every_prefix(
-        |w| validate_window_constants(&fragment, &pools, &reversed, w),
+        |w| validate_window_constants(&pools, &reversed, w),
         Err(ConstantReferenceError::InvalidConsumer(
             "window frame start follows its end after comparing exact constant offsets",
         )),
     );
     every_prefix(
-        |w| window_offset_observed(&fragment, &pools, ids[2], w).map(|_| ()),
+        |w| window_offset_observed(&pools, ids[2], w).map(|_| ()),
         Err(ConstantReferenceError::InvalidConsumer(
             "window constant offset must be a non-negative non-null exact I64/U64; zero requires CURRENT ROW",
         )),
@@ -499,7 +520,9 @@ fn borrowed_unpivot_scalar_payload_reads_only_actual_selected_constant_on_caller
     );
     every_prefix(
         |w| {
-            let selected = pools.resolve_source_observed(reference(u32::MAX, 1), w).map_err(ConstantReferenceError::from)?;
+            let selected = pools
+                .resolve_source_observed(reference(u32::MAX, 1), w)
+                .map_err(ConstantReferenceError::from)?;
             assert_eq!(selected.selected_payload_bytes_in(w)?, 3);
             assert_eq!(selected.ordinal(), 1);
             assert!(Arc::ptr_eq(selected.pool().array(), backing.array()));

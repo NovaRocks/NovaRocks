@@ -27,6 +27,10 @@ fn expected_relational_sites() -> Vec<PhysicalCallSite> {
             node: NodeId::new(1),
             call: 1,
         },
+        PhysicalCallSite::Window {
+            node: NodeId::new(2),
+            call: 0,
+        },
         PhysicalCallSite::Table {
             node: NodeId::new(3),
         },
@@ -117,7 +121,7 @@ fn assert_relational_prefixes(fragment: &Fragment, failure: Option<usize>) {
 #[test]
 fn relational_visitor_preserves_all_actual_site_order_and_original_binding_addresses() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    let (fragment, uses) = all_sites(&mut fixture_constants);
+    let fragment = all_sites(&mut fixture_constants);
     let control = TraceControl::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
     let mut actual = Vec::new();
@@ -178,6 +182,26 @@ fn relational_visitor_preserves_all_actual_site_order_and_original_binding_addre
                     &finish.final_aggregates[call as usize].binding
                 ));
             }
+            (
+                PhysicalCallSite::Window { node, call },
+                PhysicalCallBinding::Window {
+                    function: binding,
+                    aggregate,
+                },
+            ) => {
+                let NodeKind::Window(spec) = &fragment.nodes()[&node].kind else {
+                    panic!("window")
+                };
+                let source = &spec.calls[call as usize];
+                assert!(std::ptr::eq(binding, &source.binding));
+                assert!(std::ptr::eq(
+                    aggregate.unwrap(),
+                    source.aggregate_binding.as_deref().unwrap()
+                ));
+                assert_eq!(binding.kind, FunctionKind::Aggregate);
+                assert!(source.arguments.is_empty());
+                assert!(source.order_by.is_empty());
+            }
             (PhysicalCallSite::Table { node }, PhysicalCallBinding::Table(binding)) => {
                 let NodeKind::TableFunction {
                     function,
@@ -190,7 +214,7 @@ fn relational_visitor_preserves_all_actual_site_order_and_original_binding_addre
                 assert!(std::ptr::eq(binding, function));
                 assert!(arguments.is_empty());
             }
-            _ => panic!("raw relational visitor must not expose expression calls"),
+            _ => panic!("raw relational visitor must return the exact actual relation binding"),
         }
         actual.push(site);
         Ok(())
@@ -200,19 +224,23 @@ fn relational_visitor_preserves_all_actual_site_order_and_original_binding_addre
     assert_eq!(actual, expected_relational_sites());
     // The complete visitor exposes expressions first and delegates this same
     // relational ordering, without using AggregateCallId as its array ordinal.
-    let complete = run(&fragment, &uses, &TraceControl::default(), None).unwrap();
-    let mut expected = vec![
-        PhysicalCallSite::Expression(ExpressionUseId::new(0)),
-        PhysicalCallSite::Expression(ExpressionUseId::new(u32::MAX)),
-    ];
-    expected.extend(expected_relational_sites());
+    let complete = run(&fragment, &TraceControl::default(), None).unwrap();
+    let mut expected = vec![VisitSite::Scalar {
+        node: NodeId::new(0),
+        invocation: ExpressionUseId::new(0),
+    }];
+    expected.extend(
+        expected_relational_sites()
+            .into_iter()
+            .map(VisitSite::Relation),
+    );
     assert_eq!(complete, expected);
 }
 
 #[test]
 fn relational_visitor_needs_no_expression_roots_for_zero_argument_occurrences() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    let (source, _) = all_sites(&mut fixture_constants);
+    let source = all_sites(&mut fixture_constants);
     // This is a raw representation fixture, deliberately not a full writer
     // placement/admission claim. The visitor has no RootUses prerequisite.
     let mut nodes = source.nodes().clone();
@@ -220,6 +248,7 @@ fn relational_visitor_needs_no_expression_roots_for_zero_argument_occurrences() 
         matches!(
             node.kind,
             NodeKind::Aggregate { .. }
+                | NodeKind::Window(_)
                 | NodeKind::TopN {
                     reduction: TopNReduction::GroupedStates { .. },
                     ..
@@ -229,27 +258,26 @@ fn relational_visitor_needs_no_expression_roots_for_zero_argument_occurrences() 
                 | NodeKind::TableFunction { .. }
         )
     });
-    let expressions = ExprArena::try_from_definitions_observed(
-        std::iter::empty(),
-        &PlanLimits::default(),
-        &Control::default(),
-    )
-    .unwrap();
     let rootless: Fragment = FragmentParts {
         summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
         id: source.id(),
         root: source.root(),
         values: source.values().clone(),
-        expressions,
         nodes,
         sink: source.sink().clone(),
         dop_domain: source.dop_domain(),
         runtime_filters: Box::default(),
         call_requests: source.call_requests().clone(),
+        calls: source.calls().clone(),
     }
     .into();
-    assert!(rootless.expressions().is_empty());
+    assert!(
+        rootless
+            .nodes()
+            .values()
+            .all(|node| node.expressions.is_none())
+    );
     assert_eq!(
         relational_run(&rootless, &TraceControl::default(), None).unwrap(),
         expected_relational_sites()
@@ -269,7 +297,7 @@ fn relational_visitor_needs_no_expression_roots_for_zero_argument_occurrences() 
 #[test]
 fn relational_visitor_leaves_success_and_ordinary_error_tails_to_original_caller() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    let (fragment, _) = all_sites(&mut fixture_constants);
+    let fragment = all_sites(&mut fixture_constants);
     let control = TraceControl::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
     let mut count = 0;
@@ -278,16 +306,16 @@ fn relational_visitor_leaves_success_and_ordinary_error_tails_to_original_caller
         Ok(())
     })
     .unwrap();
-    assert_eq!(count, 9);
+    assert_eq!(count, 10);
     assert_eq!(control.trace(), vec![(CompilePhase::LowerProgram, 0)]);
     work.finish().unwrap();
-    // Eight aggregate-array occurrences and seven node visits were completed;
+    // Nine array occurrences (including Window) and seven node visits were completed;
     // the Table occurrence shares its single node visit, not an extra step.
     assert_eq!(
         control.trace(),
         vec![
             (CompilePhase::LowerProgram, 0),
-            (CompilePhase::LowerProgram, 15)
+            (CompilePhase::LowerProgram, 16)
         ]
     );
     let ordinary = TraceControl::default();
@@ -307,10 +335,10 @@ fn relational_visitor_leaves_success_and_ordinary_error_tails_to_original_caller
 #[test]
 fn relational_visitor_all_small_actual_callback_prefixes_preserve_three_first_causes() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    let (fragment, _) = all_sites(&mut fixture_constants);
+    let fragment = all_sites(&mut fixture_constants);
     assert_relational_prefixes(&fragment, None);
     assert_relational_prefixes(&fragment, Some(1));
-    assert_relational_prefixes(&fragment, Some(9));
+    assert_relational_prefixes(&fragment, Some(10));
 }
 
 #[test]
@@ -339,6 +367,17 @@ fn relational_visitor_wide_real_call_array_observes_quantum_without_binding_dedu
             call,
         })
         .collect();
+    let window = fixture
+        .fragment
+        .nodes()
+        .values()
+        .find(|node| matches!(node.kind, NodeKind::Window(_)))
+        .unwrap()
+        .id;
+    expected.push(PhysicalCallSite::Window {
+        node: window,
+        call: 0,
+    });
     expected.push(PhysicalCallSite::Table {
         node: fixture.fragment.root(),
     });

@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::{Fragment, PlanLimits, UnpivotConstant, ValueId};
 use arrow_array::builder::{Int32Builder, ListBuilder, MapBuilder, StringBuilder};
 
@@ -88,18 +90,24 @@ fn collection_fragment(
         .add_values(empty, Box::default(), Box::from([source_value]))
         .unwrap();
     let expression = builder
-        .add_expression(
+        .define(
             project,
             integer.clone(),
             crate::ExprKind::Value(source_value),
         )
         .unwrap();
+    let expression = builder.root_definition(
+        project,
+        expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let input = builder
         .add_value(
             integer.clone(),
             crate::ValueOrigin::Expr {
                 node: project,
-                expr: expression,
+                root: expression,
             },
         )
         .unwrap();
@@ -154,6 +162,9 @@ fn collection_fragment(
             },
         )
         .unwrap();
+    // Seal the real node-private Value source before the independent
+    // constant-source gate below. This fixture has no function claims.
+    crate::tests::unit_fixture::seal_pure_unit(&mut builder, project);
     let fragment = builder
         .finish_structure(
             unpivot,
@@ -669,24 +680,22 @@ fn actual_plan_extraction_publishes_direct_collection_closure_without_scalar_pla
     );
     assert!(
         fragment
-            .expressions()
-            .iter()
-            .all(|(_, node)| !matches!(node.kind, crate::ExprKind::Constant(_)))
+            .nodes()
+            .values()
+            .filter_map(|node| node.expressions.as_ref())
+            .flat_map(|unit| unit.definitions())
+            .all(|node| !matches!(node.kind, crate::ExprKind::Constant(_)))
     );
     let plan = plan_builder(std::slice::from_ref(&fragment), pools.clone())
         .finish_observed(&Control::good())
         .unwrap();
     let input = package_input(fragment.clone(), pools);
-    let uses = BTreeMap::from([(fragment.id(), input.expression_uses)]);
-    let calls = BTreeMap::from([(fragment.id(), input.calls)]);
     let pruning = BTreeMap::from([(fragment.id(), input.pruning)]);
     let extract = |control: &Control| {
         crate::extract_fragment_packages(
             &plan,
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &uses,
-            &calls,
             &pruning,
             &package_admissions(&plan),
             control,

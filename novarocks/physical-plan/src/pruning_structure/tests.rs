@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::*;
 use arrow_schema::DataType;
 use novarocks_connector_contract::{
@@ -25,10 +27,10 @@ use novarocks_connector_contract::{
     ConnectorReadRelationPayload, ConnectorReadRelationRecipeDraft, ConnectorValue,
     ConnectorValueType, Domain, FrozenConnectorScan, StaticScanAssignment,
 };
+use novarocks_expression_contract::{RootOrdinal, RootScope};
 use novarocks_type_contract::{
-    ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
-    ExpressionInvocation, ExpressionUseId, SemanticParameters, control_argument_semantics,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
+    SemanticParameters,
 };
 use std::{
     num::NonZeroU64,
@@ -112,7 +114,15 @@ fn append_scan(
             },
         )
         .unwrap();
-    let predicate = residual.then(|| predicate(builder, node, value, fixture_constants));
+    let predicate = residual.then(|| {
+        let definition = predicate(builder, node, value, fixture_constants);
+        builder.root_definition(
+            node,
+            definition,
+            EvaluationDemand::TruthOnly,
+            RootScope::Port(0),
+        )
+    });
     let relation = Relation::Data(DataRelation {
         read: ProviderReadReference {
             binding: binding.clone(),
@@ -140,6 +150,7 @@ fn append_scan(
     });
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -167,17 +178,17 @@ fn predicate(
     fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> ExprId {
     let left = builder
-        .add_expression(node, ty(DataType::Int64), ExprKind::Value(value))
+        .define(node, ty(DataType::Int64), ExprKind::Value(value))
         .unwrap();
     let right = builder
-        .add_expression(
+        .define(
             node,
             (ty(DataType::Int64)).clone(),
             fixture_constants.i64(0, &(ty(DataType::Int64))),
         )
         .unwrap();
     builder
-        .add_expression(
+        .define(
             node,
             ty(DataType::Boolean),
             ExprKind::Binary {
@@ -199,10 +210,19 @@ fn append_filter(
 ) -> NodeId {
     let node = builder.reserve_node_id().unwrap();
     let predicates = (0..count)
-        .map(|_| predicate(builder, node, value, fixture_constants))
+        .map(|_| {
+            let definition = predicate(builder, node, value, fixture_constants);
+            builder.root_definition(
+                node,
+                definition,
+                EvaluationDemand::TruthOnly,
+                RootScope::Port(0),
+            )
+        })
         .collect();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([child]),
             required_inputs: Box::from([properties()]),
@@ -215,68 +235,6 @@ fn append_filter(
         })
         .unwrap();
     node
-}
-fn expression_uses(fragment: &Fragment) -> PhysicalRootUses {
-    fn add(
-        fragment: &Fragment,
-        definition: ExprId,
-        demand: EvaluationDemand,
-        uses: &mut Vec<ExpressionInvocation<ExprId>>,
-    ) -> ExpressionUseId {
-        let id = ExpressionUseId::new(uses.len() as u32);
-        let shape = match &fragment.expressions().get(definition).unwrap().kind {
-            ExprKind::Conjunction { .. } => ControlShape::Conjunction,
-            _ => ControlShape::Eager,
-        };
-        let children = match &fragment.expressions().get(definition).unwrap().kind {
-            ExprKind::Binary { left, right, .. } => vec![*left, *right],
-            ExprKind::Conjunction { args } => args.to_vec(),
-            ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
-            other => panic!("fixture requires explicit control for {other:?}"),
-        };
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                region: EvaluationRegionId::new(0),
-                demand,
-            },
-            definition,
-            control: shape,
-            arguments: Box::default(),
-        });
-        let arguments = children
-            .iter()
-            .enumerate()
-            .map(|(ordinal, child)| {
-                let (child_demand, guard) =
-                    control_argument_semantics(shape, children.len(), ordinal, demand).unwrap();
-                assert_eq!(guard, None);
-                add(fragment, *child, child_demand, uses)
-            })
-            .collect();
-        uses[id.get() as usize].arguments = arguments;
-        id
-    }
-    let roots = PhysicalExpressionRoots::try_new(fragment, &Control::default()).unwrap();
-    let mut uses = Vec::new();
-    let bindings = roots
-        .sites()
-        .iter()
-        .map(|(site, root)| (*site, add(fragment, root.expr, root.demand, &mut uses)))
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: EvaluationRegionId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::default(),
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &Control::default()).unwrap()
 }
 fn public_read(
     fragment: &Fragment,
@@ -369,7 +327,7 @@ fn package(
     fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> FragmentPackage {
     let fragment = builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Noop,
             PipelineDopDomain {
@@ -380,7 +338,11 @@ fn package(
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let expression_uses = expression_uses(&fragment);
+    // There are no relational calls in these fixtures. Publish the real
+    // fragment table; scalar/intrinsic occurrences live in each sealed unit.
+    let fragment = fragment
+        .with_calls_observed(Vec::new(), &Control::default())
+        .unwrap();
     let NodeKind::Scan { relation, .. } = &fragment.nodes()[&scan].kind else {
         unreachable!()
     };
@@ -416,24 +378,20 @@ fn package(
     let read = public_read(&fragment, scan, frozen).unwrap();
     let version = PlanVersionId::try_new([7; 16]).unwrap();
     // Derive cuts from a fully checked real plan, never bypass package checks.
-    let mut plan = PlanBuilder::new(version);
+    let mut plan = PlanBuilder::new(version, crate::tests::constant_fixture::policy());
     plan.add_fragment(fragment.clone()).unwrap();
     let plan = crate::tests::constant_fixture::publish_plan(plan, fixture_constants).unwrap();
     let mut cuts = derive_fragment_cuts(&plan).unwrap();
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &expression_uses, Vec::new(), &Control::default())
-            .unwrap();
     let pruning =
         FrozenFragmentPruning::try_new(fragment.id(), Vec::new(), &Control::default()).unwrap();
     FragmentPackage::try_new(
         FragmentPackageInput {
             constants: fixture_constants.for_fragment(&fragment),
+            statement_constant_policy: crate::tests::constant_fixture::policy(),
             version,
             required: RequiredContracts::default(),
             cuts: cuts.remove(&fragment.id()).unwrap(),
             fragment,
-            expression_uses,
-            calls,
             pruning,
             result: None,
             parameters: SemanticParameters::default(),
@@ -449,12 +407,11 @@ fn package(
 }
 fn source_claim(
     package: &FragmentPackage,
-    site: ExpressionRootSite,
+    site: PredicateSourceSite,
     path: &[u32],
 ) -> (PredicateResponsibilityRef, ExpressionEffectContext) {
     let source = PredicateConjunctSource::try_new(
         package.fragment(),
-        package.expression_uses(),
         site,
         path.to_vec(),
         &Control::default(),
@@ -484,15 +441,9 @@ fn fixture(
         },
         sources: (0..if residual { 1 } else { count })
             .map(|ordinal| {
-                let site = ExpressionRootSite {
+                let site = PredicateSourceSite {
                     node,
-                    role: if residual {
-                        ExpressionRootRole::ScanResidual { predicate: 0 }
-                    } else {
-                        ExpressionRootRole::FilterPredicate {
-                            predicate: ordinal as u32,
-                        }
-                    },
+                    root: RootOrdinal::new(ordinal as u32),
                 };
                 let (responsibility, context) = source_claim(&package, site, &[]);
                 PruningSourceWitness {
@@ -540,7 +491,16 @@ fn actual_enforced_and_unenforced_domain_fields_borrow_exact_read_and_keep_origi
         else {
             unreachable!()
         };
-        assert_eq!(checked.sources()[0].definition(), predicates[0]);
+        assert_eq!(
+            checked.sources()[0].definition(),
+            package
+                .fragment()
+                .unit(witness.sources[0].responsibility.site.node)
+                .unwrap()
+                .root(predicates[0])
+                .unwrap()
+                .definition
+        );
         assert_eq!(
             checked.sources()[0].responsibility().anchor().site,
             witness.sources[0].responsibility.site
@@ -555,8 +515,9 @@ fn stronger_arbitrary_q_can_be_structurally_sound_without_implication_or_pruning
     let checked = PruningDomainStructure::try_new(&package, &witness, &Control::default()).unwrap();
     let expression = package
         .fragment()
-        .expressions()
-        .get(checked.sources()[0].definition())
+        .unit(witness.sources[0].responsibility.site.node)
+        .unwrap()
+        .definition(checked.sources()[0].definition())
         .unwrap();
     assert!(matches!(
         expression.kind,
@@ -597,7 +558,16 @@ fn scan_owned_residual_has_a_zero_edge_path_and_remains_an_exact_p_responsibilit
         unreachable!()
     };
     assert_eq!(*occurrence, witness.target.occurrence);
-    assert_eq!(checked.sources()[0].definition(), residuals[0]);
+    assert_eq!(
+        checked.sources()[0].definition(),
+        package
+            .fragment()
+            .unit(witness.target.scan)
+            .unwrap()
+            .root(residuals[0])
+            .unwrap()
+            .definition
+    );
     assert_eq!(relation.predicate_guarantees()[0].predicate, residuals[0]);
     assert_eq!(
         relation.predicate_guarantees()[0].kind,
@@ -611,19 +581,26 @@ fn project_fixture(
     let (scan, value) = append_scan(&mut builder, false, fixture_constants);
     let project = builder.reserve_node_id().unwrap();
     let expression = builder
-        .add_expression(project, ty(DataType::Int64), ExprKind::Value(value))
+        .define(project, ty(DataType::Int64), ExprKind::Value(value))
         .unwrap();
+    let expression = builder.root_definition(
+        project,
+        expression,
+        EvaluationDemand::Value,
+        RootScope::Port(0),
+    );
     let alias = builder
         .add_value(
             ty(DataType::Int64),
             ValueOrigin::Expr {
                 node: project,
-                expr: expression,
+                root: expression,
             },
         )
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: project,
             inputs: Box::from([scan]),
             required_inputs: Box::from([properties()]),
@@ -641,9 +618,9 @@ fn project_fixture(
     let package = package(builder, filter, scan, fixture_constants);
     let (responsibility, context) = source_claim(
         &package,
-        ExpressionRootSite {
+        PredicateSourceSite {
             node: filter,
-            role: ExpressionRootRole::FilterPredicate { predicate: 0 },
+            root: RootOrdinal::new(0),
         },
         &[],
     );
@@ -732,8 +709,15 @@ fn fragment_occurrence_scan_and_exact_source_sites_are_checked_against_the_packa
         );
     }
     let mut forged = witness.clone();
-    forged.sources[0].responsibility.site.role =
-        ExpressionRootRole::FilterPredicate { predicate: 99 };
+    forged.sources[0].responsibility.site.root = RootOrdinal::new(99);
+    assert_eq!(
+        PruningDomainStructure::try_new(&package, &forged, &Control::default()).unwrap_err(),
+        PruningStructureError::Source(PredicateSourceError::NotSearchPredicate)
+    );
+    // Membership in an actual search field is checked before unit lookup.
+    // A genuinely absent source node retains the independent InvalidSite law.
+    let mut forged = witness.clone();
+    forged.sources[0].responsibility.site.node = NodeId::new(u32::MAX);
     assert_eq!(
         PruningDomainStructure::try_new(&package, &forged, &Control::default()).unwrap_err(),
         PruningStructureError::Source(PredicateSourceError::InvalidSite)
@@ -807,7 +791,7 @@ fn shared_conjunct_definition_preserves_distinct_uses_and_cannot_swap_claimed_co
     let filter = builder.reserve_node_id().unwrap();
     let shared = predicate(&mut builder, filter, value, &mut fixture_constants);
     let conjunction = builder
-        .add_expression(
+        .define(
             filter,
             ty(DataType::Boolean),
             ExprKind::Conjunction {
@@ -815,8 +799,15 @@ fn shared_conjunct_definition_preserves_distinct_uses_and_cannot_swap_claimed_co
             },
         )
         .unwrap();
+    let conjunction = builder.root_definition(
+        filter,
+        conjunction,
+        EvaluationDemand::TruthOnly,
+        RootScope::Port(0),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: filter,
             inputs: Box::from([scan]),
             required_inputs: Box::from([properties()]),
@@ -831,9 +822,9 @@ fn shared_conjunct_definition_preserves_distinct_uses_and_cannot_swap_claimed_co
         })
         .unwrap();
     let package = package(builder, filter, scan, &mut fixture_constants);
-    let site = ExpressionRootSite {
+    let site = PredicateSourceSite {
         node: filter,
-        role: ExpressionRootRole::FilterPredicate { predicate: 0 },
+        root: RootOrdinal::new(0),
     };
     let witness = PruningDomainWitness {
         target: PruningDomainSite {
@@ -1013,6 +1004,7 @@ fn shared_scan_fixture(
     let union = builder.reserve_node_id().unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: union,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([properties(), properties()]),
@@ -1059,9 +1051,9 @@ fn shared_scan_fixture(
     let values = vec![value; input_path.len() + 1].into_boxed_slice();
     let (responsibility, context) = source_claim(
         &package,
-        ExpressionRootSite {
+        PredicateSourceSite {
             node: source,
-            role: ExpressionRootRole::FilterPredicate { predicate: 0 },
+            root: RootOrdinal::new(0),
         },
         &[],
     );

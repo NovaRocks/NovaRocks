@@ -40,7 +40,7 @@ pub(super) fn numbered_plan() -> PhysicalPlan {
     let broadcast =
         super::runtime_filter_wait_contract::acyclic_cross_fragment_fixture(&mut fixture_constants)
             .plan;
-    let mut builder = PlanBuilder::new(version());
+    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     for plan in [&partitioned, &broadcast] {
         for fragment in plan.fragments().values() {
             builder.add_fragment(fragment.clone()).unwrap();
@@ -260,7 +260,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
             id: source.id(),
             root: source.root(),
             values: source.values().clone(),
-            expressions: source.expressions().clone(),
+
             nodes: source.nodes().clone(),
             sink: source.sink().clone(),
             dop_domain: source.dop_domain(),
@@ -270,6 +270,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
                 .map(RuntimeFilterId::new)
                 .collect::<Box<[_]>>(),
             call_requests: source.call_requests().clone(),
+            calls: source.calls().clone(),
         };
         fragments.insert(source.id(), Fragment::from(parts));
     }
@@ -281,6 +282,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
             PhysicalPlan::from(crate::PhysicalPlanParts {
                 constants: crate::ConstantPools::empty(),
                 parameters: novarocks_type_contract::SemanticParameters::default(),
+                statement_constant_policy: checked.statement_constant_policy(),
                 version: checked.version(),
                 fragments,
                 edges: checked.edges().clone(),
@@ -323,12 +325,13 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
             id: source.id(),
             root: source.root(),
             values: source.values().clone(),
-            expressions: source.expressions().clone(),
+
             nodes: source.nodes().clone(),
             sink: source.sink().clone(),
             dop_domain: source.dop_domain(),
             runtime_filters: Box::from([RuntimeFilterId::new(PARTITIONED_FILTER)]),
             call_requests: source.call_requests().clone(),
+            calls: source.calls().clone(),
         }),
     );
     let plan = unchecked(detached, runtime_filters.clone());

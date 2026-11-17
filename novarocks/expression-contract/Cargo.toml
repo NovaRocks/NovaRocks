@@ -34,6 +34,9 @@ novarocks-function-contract.workspace = true
 novarocks-failure-contract.workspace = true
 arrow-schema.workspace = true
 
+[dev-dependencies]
+arrow-array.workspace = true
+
 [package.metadata.novarocks.test]
 runtime-inputs = []
 env-inputs = []

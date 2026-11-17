@@ -22,7 +22,7 @@ use novarocks_type_contract::{FunctionInstanceState, FunctionVolatility};
 // One criterion for both claimed-broadcast validation and the private
 // occurrence property proof. Relational lifecycle state is not scalar state;
 // row errors do not authorize movement and do not invalidate identical replay.
-pub(super) fn call_is_replica_equivalent(kind: FunctionKind, effects: &CallEffects) -> bool {
+pub(crate) fn call_is_replica_equivalent(kind: FunctionKind, effects: &CallEffects) -> bool {
     effects.value_stability == FunctionVolatility::Immutable
         && (kind != FunctionKind::Scalar || effects.instance_state == FunctionInstanceState::None)
         && effects.observable_effects.is_empty()
@@ -46,52 +46,28 @@ impl FrozenFragmentCalls {
     pub fn validate_replica_equivalence(
         &self,
         fragment: &Fragment,
-        uses: &PhysicalRootUses,
         control: &dyn PureCompileControl,
     ) -> Result<(), FrozenCallError> {
-        self.validate_fragment(fragment, uses, control)?;
+        self.validate_fragment(fragment, control)?;
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = visit_calls(fragment, uses, &mut work, |site, binding, work| {
-            work.step()?;
-            let node = match site {
-                PhysicalCallSite::Expression(id) => {
-                    let invocation = uses
-                        .flow()
-                        .uses()
-                        .get(&id)
-                        .ok_or(FrozenCallError::InvalidSite)?;
-                    fragment
-                        .expressions()
-                        .get(invocation.definition)
-                        .ok_or(FrozenCallError::InvalidSite)?
-                        .owner
+        let result = super::property_proof::visit_occurrence_calls::<FrozenCallError>(
+            fragment,
+            self,
+            &mut work,
+            |site, kind, effects, work| {
+                let node = fragment
+                    .nodes()
+                    .get(&site.node())
+                    .ok_or(FrozenCallError::InvalidSite)?;
+                work.step()?;
+                if node.output_properties.distribution == Distribution::Broadcast
+                    && !call_is_replica_equivalent(kind, effects)
+                {
+                    return Err(site.failure());
                 }
-                PhysicalCallSite::Aggregate { node, .. }
-                | PhysicalCallSite::TopNState { node, .. }
-                | PhysicalCallSite::WriterPartial { node, .. }
-                | PhysicalCallSite::WriterFinal { node, .. }
-                | PhysicalCallSite::Table { node } => node,
-            };
-            let node = fragment
-                .nodes()
-                .get(&node)
-                .ok_or(FrozenCallError::InvalidSite)?;
-            if node.output_properties.distribution != Distribution::Broadcast {
-                return Ok(());
-            }
-            let call = self
-                .entries
-                .get(&site)
-                .ok_or(FrozenCallError::MissingSite(site))?;
-            // Relational lifecycle state is required even for deterministic
-            // iteration. Its exact kind was checked above; it does not by
-            // itself mean the scalar-instance state that forbids replication.
-            // Existing relational property proofs remain mandatory.
-            if !call_is_replica_equivalent(binding.kind(), &call.effects) {
-                return Err(FrozenCallError::ReplicaEquivalence(site));
-            }
-            Ok(())
-        });
+                Ok(())
+            },
+        );
         if matches!(result, Err(FrozenCallError::Control(_))) {
             return result;
         }

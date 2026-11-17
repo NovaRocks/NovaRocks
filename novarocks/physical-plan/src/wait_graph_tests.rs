@@ -20,6 +20,8 @@
 //! stated producer/input order, not from the graph implementation's output.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::{
     AggregateGrouping, DeliveryRequirement, Distribution, EdgeDestination, EdgeKind,
     EdgePartitioning, EdgeSource, FragmentBuilder, FragmentOutputPort, FragmentSink,
@@ -115,12 +117,24 @@ impl Fixture {
             .i64(1, &ValueType::new(DataType::Int64, false));
         let builder = self.builder(fragment, node);
         let key = builder
-            .add_expression(
+            .define(
                 NodeId::new(node),
                 ValueType::new(DataType::Int64, false),
                 key_kind,
             )
             .unwrap();
+        let left_key = builder.root_definition(
+            NodeId::new(node),
+            key,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
+        let right_key = builder.root_definition(
+            NodeId::new(node),
+            key,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(1),
+        );
         builder
             .add_join(
                 NodeId::new(node),
@@ -132,8 +146,8 @@ impl Fixture {
                     kind: JoinKind::Inner,
                     condition: HashJoinCondition::Ordinary {
                         keys: Box::from([JoinKey {
-                            left: key,
-                            right: key,
+                            left: left_key,
+                            right: right_key,
                             null_safe: false,
                         }]),
                         residual: None,
@@ -234,7 +248,7 @@ impl Fixture {
                 },
             };
             let fragment = builder
-                .finish_definition(
+                .finish_fixture_definition(
                     self.roots[&id],
                     sink,
                     PipelineDopDomain {

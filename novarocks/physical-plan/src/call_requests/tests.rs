@@ -18,19 +18,18 @@
 use super::*;
 use crate::{
     AggregateBinding, AggregateCall, AggregateCallId, AggregateGrouping, AggregatePhase,
-    AggregateStateFormatId, ConstantPoolId, Distribution, ExprArena, ExprNode, FragmentParts,
-    FragmentSink, FunctionArgumentType, NodeId, NodeKind, OutputPort, PhysicalNode,
-    PhysicalProperties, PipelineDopDomain, RowMultiplicity, ValueId,
+    AggregateStateFormatId, FragmentSink, FunctionArgumentType, NodeId, NodeKind, OutputPort,
+    PhysicalCallSite, PhysicalNode, PipelineDopDomain, ValueId,
 };
 use arrow_schema::{DataType, Field};
-use novarocks_type_contract::{
-    AggregateStateArgumentContract, ControlShape, EvaluationDemand, EvaluationRegionId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
-    ExpressionInvocation, ExpressionUseId, FunctionArgumentEvaluation, FunctionFailureBehavior,
-    FunctionId, FunctionIntrinsicRowError, FunctionKind, FunctionOverloadId, FunctionVolatility,
-    ValueLogicalType,
+use novarocks_constant_contract::{ConstantPolicy, ConstantPoolId, ConstantReference};
+use novarocks_expression_contract::{ExprKind, PhysicalCallRequest, ValueType};
+use novarocks_function_contract::FunctionArgument;
+use novarocks_type_contract::{FunctionId, FunctionKind, FunctionOverloadId};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
 };
-use std::sync::Mutex;
 
 const PHASE: CompilePhase = CompilePhase::Validate;
 const CAUSES: [CompileControlError; 3] = [
@@ -109,89 +108,6 @@ fn value(ty: ValueType) -> FunctionArgument<ConstantReference> {
         constant: None,
     }
 }
-fn function(types: Vec<FunctionArgumentType>) -> crate::BoundFunction {
-    crate::BoundFunction {
-        function_id: FunctionId::try_new("fixture/static-request/component").unwrap(),
-        overload: FunctionOverloadId::try_new("fixture/static-request/exact").unwrap(),
-        kind: FunctionKind::Scalar,
-        argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
-            types.into_boxed_slice(),
-        ),
-        result_type: integer(false),
-        legacy_metadata: Some(crate::LegacyBindingMetadata {
-            volatility: FunctionVolatility::Immutable,
-            argument_evaluation: FunctionArgumentEvaluation::Eager,
-            failure_behavior: FunctionFailureBehavior::Propagate,
-            intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-            semantic_parameters: Box::default(),
-        }),
-    }
-}
-fn expression(id: u32, types: Vec<FunctionArgumentType>, args: Vec<ExprId>) -> ExprNode {
-    ExprNode {
-        id: ExprId::new(id),
-        owner: NodeId::new(9),
-        lambda_scope: None,
-        ty: integer(false),
-        kind: ExprKind::FunctionCall {
-            function: function(types),
-            args: args.into_boxed_slice(),
-        },
-    }
-}
-// Raw, unpublished component data deliberately includes dead definitions.
-// No package admission, SQL provenance or installed owner is claimed here.
-fn fragment(id: u32, definitions: Vec<ExprNode>, kind: NodeKind) -> Fragment {
-    let expressions = ExprArena::try_from_definitions_observed(
-        definitions.into_iter(),
-        &crate::PlanLimits::FROZEN,
-        &Control::default(),
-    )
-    .unwrap();
-    let node = NodeId::new(9);
-    Fragment::from(FragmentParts {
-        summaries: Box::default(),
-        stage_placement: crate::StagePlacementPolicy::Singleton,
-        id: FragmentId::new(id),
-        root: node,
-        values: BTreeMap::new(),
-        expressions,
-        nodes: BTreeMap::from([(
-            node,
-            PhysicalNode {
-                id: node,
-                inputs: Box::default(),
-                required_inputs: Box::default(),
-                output: OutputPort {
-                    node,
-                    columns: Box::default(),
-                },
-                output_properties: PhysicalProperties {
-                    distribution: Distribution::Singleton,
-                    row_multiplicity: RowMultiplicity::SingleCopy,
-                    ordering: Box::default(),
-                },
-                kind,
-            },
-        )]),
-        sink: FragmentSink::Noop,
-        dop_domain: PipelineDopDomain {
-            min: 1,
-            max: 1,
-            requires_power_of_two: false,
-        },
-        runtime_filters: Box::default(),
-        call_requests: FragmentCallRequests::unpublished_empty(FragmentId::new(id)),
-    })
-}
-fn values() -> NodeKind {
-    NodeKind::Values {
-        rows: Box::from([Box::default()]),
-    }
-}
-fn key(id: u32) -> PhysicalCallDefinition {
-    PhysicalCallDefinition::Expression(ExprId::new(id))
-}
 
 #[test]
 fn created_request_table_clone_keeps_original_and_new_storage_after_fragment_exit() {
@@ -222,7 +138,7 @@ fn created_request_table_clone_keeps_original_and_new_storage_after_fragment_exi
     let mut creation = ValueSchemaCreation::new(new_storage, &mut exact, &mut opaque);
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
-    let fragment = fragment(7, vec![expression(1, vec![], vec![])], values())
+    let fragment = relation_fragment(7, vec![(1, vec![])])
         .with_call_requests_created_in(
             vec![(key(1), request(vec![]))],
             source_storage,
@@ -239,7 +155,7 @@ fn created_request_table_clone_keeps_original_and_new_storage_after_fragment_exi
     assert_eq!(trace.iter().filter(|(exact, _)| *exact).count(), 2);
     assert_eq!(trace.iter().filter(|(exact, _)| !*exact).count(), 1);
     let expected = novarocks_type_contract::owned_resources::btree::insertion_only::<
-        PhysicalCallDefinition,
+        PhysicalCallSite,
         PhysicalCallRequest,
     >(1)
     .unwrap();
@@ -285,13 +201,12 @@ fn created_request_table_returns_first_host_before_tree_or_arc_without_tail_cont
         let mut opaque = |bytes: usize| callback(bytes);
         let mut creation =
             ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
-        let result = fragment(7, vec![expression(1, vec![], vec![])], values())
-            .with_call_requests_created_in(
-                vec![(key(1), request(vec![]))],
-                ValueTypeStorageLifetime::pure(),
-                &mut creation,
-                &mut work,
-            );
+        let result = relation_fragment(7, vec![(1, vec![])]).with_call_requests_created_in(
+            vec![(key(1), request(vec![]))],
+            ValueTypeStorageLifetime::pure(),
+            &mut creation,
+            &mut work,
+        );
         let Err(CallRequestCreationFailure::Creator(actual)) = result else {
             panic!("host refusal was reclassified")
         };
@@ -301,7 +216,7 @@ fn created_request_table_returns_first_host_before_tree_or_arc_without_tail_cont
 }
 fn attach(
     source: &Fragment,
-    entries: &[(PhysicalCallDefinition, PhysicalCallRequest)],
+    entries: &[(PhysicalCallSite, PhysicalCallRequest)],
     control: &dyn PureCompileControl,
 ) -> Result<(), CallRequestError> {
     source
@@ -311,68 +226,8 @@ fn attach(
 }
 
 #[test]
-fn static_requests_cover_dead_and_type_only_definitions_without_runtime_use_fallback() {
-    let child = expression(u32::MAX, vec![], vec![]);
-    let parent = expression(
-        7,
-        vec![FunctionArgumentType::Value(integer(false))],
-        vec![child.id],
-    );
-    let source = fragment(0, vec![parent, child], values());
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(100),
-        region: EvaluationRegionId::new(3),
-        demand: EvaluationDemand::Value,
-    };
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: context.region,
-            parent: None,
-            guard: None,
-        }],
-        vec![ExpressionInvocation {
-            context,
-            definition: ExprId::new(7),
-            control: ControlShape::TypeOnly,
-            arguments: Box::default(),
-        }],
-        source.expressions(),
-        PHASE,
-        &Control::default(),
-    )
-    .unwrap();
-    assert_eq!(flow.uses().len(), 1);
-    assert!(
-        !flow
-            .uses()
-            .values()
-            .any(|u| u.definition == ExprId::new(u32::MAX))
-    );
-    let entries = vec![
-        (key(7), request(vec![value(integer(false))])),
-        (key(u32::MAX), request(vec![])),
-    ];
-    prefixes(|control| attach(&source, &entries, control), None);
-    prefixes(
-        |control| attach(&source, &entries[..1], control),
-        Some(CallRequestError::MissingDefinition(key(u32::MAX))),
-    );
-    prefixes(
-        |control| attach(&source, &[], control),
-        Some(CallRequestError::MissingDefinition(key(7))),
-    );
-}
-
-#[test]
 fn static_requests_sparse_keys_duplicate_missing_extra_and_wrong_fragment_are_exact() {
-    let source = fragment(
-        7,
-        vec![
-            expression(0, vec![], vec![]),
-            expression(u32::MAX, vec![], vec![]),
-        ],
-        values(),
-    );
+    let source = relation_fragment(7, vec![(0, vec![]), (u32::MAX, vec![])]);
     let entries = vec![(key(0), request(vec![])), (key(u32::MAX), request(vec![]))];
     let attached = source
         .clone()
@@ -391,80 +246,28 @@ fn static_requests_sparse_keys_duplicate_missing_extra_and_wrong_fragment_are_ex
     let mut duplicate = entries.clone();
     duplicate.push(entries[0].clone());
     prefixes(
-        |control| attach(&source, &duplicate, control),
+        |c| attach(&source, &duplicate, c),
         Some(CallRequestError::DuplicateDefinition(key(0))),
+    );
+    prefixes(
+        |c| attach(&source, &entries[..1], c),
+        Some(CallRequestError::MissingDefinition(key(u32::MAX))),
     );
     let mut extra = entries;
     extra.push((key(8), request(vec![])));
     prefixes(
-        |control| attach(&source, &extra, control),
+        |c| attach(&source, &extra, c),
         Some(CallRequestError::ExtraDefinition),
     );
-    let foreign = fragment(8, vec![expression(0, vec![], vec![])], values());
+    let foreign = relation_fragment(8, vec![(0, vec![])]);
     prefixes(
-        |control| {
-            attached
-                .call_requests()
-                .validate_fragment(&foreign, control)
-        },
+        |c| attached.call_requests().validate_fragment(&foreign, c),
         Some(CallRequestError::WrongFragment),
     );
-    // Runtime UseId=100 is not the static ExprId=0 key.
+    // A static physical call site is not an expression invocation identity.
     prefixes(
-        |control| attach(&source, &[(key(100), request(vec![]))], control),
+        |c| attach(&source, &[(key(100), request(vec![]))], c),
         Some(CallRequestError::MissingDefinition(key(0))),
-    );
-}
-
-#[test]
-fn static_requests_keep_original_none_some_constraint_and_reference_address() {
-    let source = fragment(
-        1,
-        vec![expression(
-            7,
-            vec![FunctionArgumentType::Value(integer(true))],
-            vec![],
-        )],
-        values(),
-    );
-    let mut original = request(vec![value(integer(false))]);
-    let address = ConstantReference {
-        pool: ConstantPoolId::new(u32::MAX),
-        ordinal: 3,
-    };
-    let with_constant = request(vec![FunctionArgument::Value {
-        value_type: integer(false),
-        constant: Some(address),
-    }]);
-    // This table preserves a reference only; the original pool closure must
-    // separately validate its existence, ordinal, NULL and full type.
-    for constraint in [None, Some(integer(true))] {
-        original.expected_result_type = constraint.clone();
-        let mut constant = with_constant.clone();
-        constant.expected_result_type = constraint.clone();
-        for explicit in [&original, &constant] {
-            let entries = vec![(key(7), explicit.clone())];
-            prefixes(|control| attach(&source, &entries, control), None);
-            let attached = source
-                .clone()
-                .with_call_requests_observed(entries, &Control::default())
-                .unwrap();
-            let retained = attached.call_requests().get(key(7)).unwrap();
-            assert_eq!(retained, explicit);
-            assert_eq!(retained.request().expected_result_type, constraint.as_ref());
-            assert!(std::ptr::eq(
-                retained.request().arguments,
-                retained.arguments.as_ref()
-            ));
-            assert_eq!(retained.constant_policy, policy());
-        }
-    }
-    assert!(matches!(
-        original.arguments[0],
-        FunctionArgument::Value { constant: None, .. }
-    ));
-    assert!(
-        matches!(with_constant.arguments[0], FunctionArgument::Value { constant: Some(actual), .. } if actual == address)
     );
 }
 
@@ -488,170 +291,45 @@ fn nested(root_nullable: bool, child_nullable: bool, metadata: &str) -> ValueTyp
         root_nullable,
     )
 }
-#[test]
-fn static_requests_value_nullable_covariance_and_lambda_complete_exactness_stay_distinct() {
-    let expected = nested(true, true, "original");
-    let source = fragment(
-        1,
-        vec![expression(
-            7,
-            vec![FunctionArgumentType::Value(expected)],
-            vec![],
-        )],
-        values(),
-    );
-    prefixes(
-        |control| {
-            attach(
-                &source,
-                &[(
-                    key(7),
-                    request(vec![value(nested(false, false, "original"))]),
-                )],
-                control,
-            )
-        },
-        None,
-    );
-    let strict = fragment(
-        1,
-        vec![expression(
-            7,
-            vec![FunctionArgumentType::Value(nested(
-                false, false, "original",
-            ))],
-            vec![],
-        )],
-        values(),
-    );
-    for actual in [
-        nested(true, false, "original"),
-        nested(false, true, "original"),
-    ] {
-        prefixes(
-            |control| {
-                attach(
-                    &strict,
-                    &[(key(7), request(vec![value(actual.clone())]))],
-                    control,
-                )
-            },
-            Some(CallRequestError::ArgumentTypeMismatch(key(7))),
-        );
-    }
-    let nominal = ValueType::try_with_logical_type(
-        DataType::FixedSizeBinary(16),
-        false,
-        ValueLogicalType::LargeInt,
-    )
-    .unwrap();
-    let expected_lambda = FunctionArgumentType::Lambda {
-        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-            nominal.clone(),
-            nested(false, false, "original"),
-        ])),
-        result_type: integer(true),
-    };
-    let lambda_source = fragment(
-        1,
-        vec![expression(7, vec![expected_lambda], vec![])],
-        values(),
-    );
-    let lambda = |nominal: ValueType, metadata: &str, result: ValueType| FunctionArgument::Lambda {
-        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-            nominal,
-            nested(false, false, metadata),
-        ])),
-        result_type: result,
-    };
-    let correct = request(vec![lambda(nominal.clone(), "original", integer(true))]);
-    prefixes(
-        |control| attach(&lambda_source, &[(key(7), correct.clone())], control),
-        None,
-    );
-    for wrong in [
-        lambda(
-            ValueType::new(DataType::FixedSizeBinary(16), false),
-            "original",
-            integer(true),
-        ),
-        lambda(nominal.clone(), "foreign", integer(true)),
-        lambda(nominal, "original", integer(false)),
-    ] {
-        prefixes(
-            |control| {
-                attach(
-                    &lambda_source,
-                    &[(key(7), request(vec![wrong.clone()]))],
-                    control,
-                )
-            },
-            Some(CallRequestError::ArgumentTypeMismatch(key(7))),
-        );
-    }
-}
 
 #[test]
 fn static_requests_relational_call_ordinal_is_not_aggregate_id_or_expression_use() {
-    let binding = AggregateBinding {
-        state_interpretation: None,
-        function: crate::BoundFunction {
-            kind: FunctionKind::Aggregate,
-            ..function(vec![])
-        },
-        phase: AggregatePhase::Single,
-        logical_argument_count: 0,
-        intermediate_type: integer(false),
-        state_format: AggregateStateFormatId::try_new("fixture/state/v1").unwrap(),
-        state_argument_contract: AggregateStateArgumentContract::ExactSignature,
+    let source = aggregate_fragment();
+    let NodeKind::Aggregate { calls, .. } = &source.nodes()[&NodeId::new(9)].kind else {
+        unreachable!()
     };
-    let make_call = |id| AggregateCall {
-        id: AggregateCallId::new(id),
-        binding: binding.clone(),
-        arguments: Box::default(),
-        distinct: false,
-        order_by: Box::default(),
-        output: ValueId::new(id),
-    };
-    let source = fragment(
-        1,
-        vec![],
-        NodeKind::Aggregate {
-            group_by: Box::default(),
-            calls: Box::from([make_call(u32::MAX), make_call(7)]),
-            grouping: AggregateGrouping::Complete,
-        },
-    );
-    let first = PhysicalCallDefinition::Relational(PhysicalCallSite::Aggregate {
+    assert_eq!(calls[0].id, AggregateCallId::new(u32::MAX));
+    assert_eq!(calls[1].id, AggregateCallId::new(7));
+    let first = PhysicalCallSite::Aggregate {
         node: NodeId::new(9),
         call: 0,
-    });
-    let second = PhysicalCallDefinition::Relational(PhysicalCallSite::Aggregate {
+    };
+    let second = PhysicalCallSite::Aggregate {
         node: NodeId::new(9),
         call: 1,
-    });
+    };
     let entries = vec![(first, request(vec![])), (second, request(vec![]))];
-    prefixes(|control| attach(&source, &entries, control), None);
+    prefixes(|c| attach(&source, &entries, c), None);
     for wrong in [
-        PhysicalCallDefinition::Relational(PhysicalCallSite::Aggregate {
+        PhysicalCallSite::Aggregate {
             node: NodeId::new(9),
             call: u32::MAX,
-        }),
-        PhysicalCallDefinition::Relational(PhysicalCallSite::TopNState {
+        },
+        PhysicalCallSite::TopNState {
             node: NodeId::new(9),
             call: 1,
-        }),
-        PhysicalCallDefinition::Relational(PhysicalCallSite::Aggregate {
+        },
+        PhysicalCallSite::Aggregate {
             node: NodeId::new(10),
             call: 1,
-        }),
+        },
     ] {
         prefixes(
-            |control| {
+            |c| {
                 attach(
                     &source,
                     &[(first, request(vec![])), (wrong, request(vec![]))],
-                    control,
+                    c,
                 )
             },
             Some(CallRequestError::MissingDefinition(second)),
@@ -661,15 +339,7 @@ fn static_requests_relational_call_ordinal_is_not_aggregate_id_or_expression_use
 
 #[test]
 fn static_requests_wrong_channel_kind_arity_and_logical_count_refuse_with_ordinary_tail() {
-    let source = fragment(
-        1,
-        vec![expression(
-            7,
-            vec![FunctionArgumentType::Value(integer(true))],
-            vec![],
-        )],
-        values(),
-    );
+    let source = relation_fragment(1, vec![(7, vec![integer(true)])]);
     for wrong in [
         request(vec![]),
         request(vec![value(integer(false)), value(integer(false))]),
@@ -679,7 +349,7 @@ fn static_requests_wrong_channel_kind_arity_and_logical_count_refuse_with_ordina
         },
     ] {
         prefixes(
-            |control| attach(&source, &[(key(7), wrong.clone())], control),
+            |c| attach(&source, &[(key(7), wrong.clone())], c),
             Some(CallRequestError::InvalidArgumentCount(key(7))),
         );
     }
@@ -688,73 +358,403 @@ fn static_requests_wrong_channel_kind_arity_and_logical_count_refuse_with_ordina
         result_type: integer(true),
     }]);
     prefixes(
-        |control| attach(&source, &[(key(7), lambda.clone())], control),
+        |c| attach(&source, &[(key(7), lambda.clone())], c),
         Some(CallRequestError::ArgumentTypeMismatch(key(7))),
     );
-    let empty = fragment(8, vec![], values());
-    prefixes(|control| attach(&empty, &[], control), None);
+    let empty = relation_fragment(8, vec![]);
+    prefixes(|c| attach(&empty, &[], c), None);
     prefixes(
-        |control| attach(&empty, &[(key(7), request(vec![]))], control),
+        |c| attach(&empty, &[(key(7), request(vec![]))], c),
         Some(CallRequestError::ExtraDefinition),
     );
 }
 
 #[test]
 fn static_requests_window_logical_count_excludes_function_order_channels() {
-    let leaf = |id, number| ExprNode {
-        id: ExprId::new(id),
-        owner: NodeId::new(9),
-        lambda_scope: None,
-        ty: integer(false),
-        kind: ExprKind::Value(crate::ValueId::new(number)),
+    let source = ordered_window_fragment();
+    let site = PhysicalCallSite::Window {
+        node: NodeId::new(9),
+        call: 0,
     };
-    // This is an unpublished receiver-shape fixture, not an installed Window
-    // capability: one logical argument and one independent function ORDER.
-    let window = ExprNode {
-        id: ExprId::new(7),
-        owner: NodeId::new(9),
-        lambda_scope: None,
-        ty: integer(false),
-        kind: ExprKind::WindowCall {
-            function: crate::BoundFunction {
-                kind: FunctionKind::Window,
-                ..function(vec![
-                    FunctionArgumentType::Value(integer(false)),
-                    FunctionArgumentType::Value(integer(false)),
-                ])
-            },
-            distinct: false,
-            args: Box::from([ExprId::new(0)]),
-            function_order_by: Box::from([crate::SortExpr {
-                expr: ExprId::new(1),
-                direction: crate::SortDirection::Ascending,
-                null_ordering: crate::NullOrdering::Last,
-            }]),
-            frame: None,
-            ignore_nulls: false,
-            aggregate_binding: None,
-        },
-    };
-    let source = fragment(1, vec![window, leaf(0, 11), leaf(1, 23)], values());
     let original = PhysicalCallRequest {
         logical_argument_count: 1,
         ..request(vec![value(integer(false)), value(integer(false))])
     };
-    prefixes(
-        |control| attach(&source, &[(key(7), original.clone())], control),
-        None,
-    );
+    prefixes(|c| attach(&source, &[(site, original.clone())], c), None);
     for logical_argument_count in [0, 2] {
         let wrong = PhysicalCallRequest {
             logical_argument_count,
             ..original.clone()
         };
         prefixes(
-            |control| attach(&source, &[(key(7), wrong.clone())], control),
-            Some(CallRequestError::InvalidArgumentCount(key(7))),
+            |c| attach(&source, &[(site, wrong.clone())], c),
+            Some(CallRequestError::InvalidArgumentCount(site)),
         );
     }
 }
 
 #[path = "owned_tests.rs"]
 mod owned;
+
+fn source_values(
+    builder: &mut crate::FragmentBuilder,
+    node: NodeId,
+    types: &[ValueType],
+) -> Vec<ValueId> {
+    let values = types
+        .iter()
+        .enumerate()
+        .map(|(ordinal, ty)| {
+            builder
+                .add_value(
+                    ty.clone(),
+                    crate::ValueOrigin::NodeOutput {
+                        node,
+                        output_ordinal: ordinal as u32,
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    // A real empty relation has declared typed output and no synthetic literals.
+    builder
+        .add_values(node, Box::default(), values.clone().into_boxed_slice())
+        .unwrap();
+    values
+}
+fn install_pure(builder: &mut crate::FragmentBuilder, node: NodeId) {
+    if builder.construction_unit(node).is_none() {
+        return;
+    }
+    let ports = builder.node_ports(node).unwrap();
+    let draft = builder.take_unit_builder(node).unwrap();
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
+    let unit = draft
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    builder.install_unit(node, Arc::new(unit)).unwrap();
+}
+fn relation_claim(
+    site: PhysicalCallSite,
+    ordinal: u32,
+    kind: FunctionKind,
+) -> crate::FrozenPhysicalCall {
+    use novarocks_type_contract::*;
+    let context = RelationEffectContext::call(RelationCallId::new(ordinal));
+    let (argument_control, instance_state) = match kind {
+        FunctionKind::Aggregate => (
+            ArgumentControl::Aggregate,
+            FunctionInstanceState::AggregateInstance,
+        ),
+        FunctionKind::Window => (
+            ArgumentControl::Window,
+            FunctionInstanceState::WindowPartition,
+        ),
+        FunctionKind::Table => (ArgumentControl::Table, FunctionInstanceState::TableInstance),
+        FunctionKind::Scalar => unreachable!("this fixture authors only relation declarations"),
+    };
+    crate::FrozenPhysicalCall {
+        site,
+        context,
+        materialized_writer_input: None,
+        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        effects: CallEffects {
+            value_stability: FunctionVolatility::Immutable,
+            own_row_error: if kind == FunctionKind::Table {
+                FunctionIntrinsicRowError::NoRowError
+            } else {
+                FunctionIntrinsicRowError::NotRowEvaluated
+            },
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            null_behavior: FunctionNullBehavior::CalledOnNull,
+            argument_control,
+            instance_state,
+            observable_effects: ObservableEffects::NONE,
+            environment: Box::default(),
+            proof_scope: CallProofScope::Relation(context.identity),
+        },
+    }
+}
+fn finish_relation(
+    builder: crate::FragmentBuilder,
+    node: NodeId,
+    claims: Vec<crate::FrozenPhysicalCall>,
+) -> Fragment {
+    let fragment = builder
+        .finish_structure(
+            node,
+            FragmentSink::Noop,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            crate::PlanLimits::FROZEN,
+            &Control::default(),
+            crate::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
+    fragment
+        .with_calls_observed(claims, &Control::default())
+        .unwrap()
+}
+// Each record is a real TableFunction node, with original Value roots in its
+// checked unit. Later fixture nodes are explicitly zero-argument consumers.
+// Lambda signature tests belong to the neutral scalar author below.
+fn relation_fragment(id: u32, calls: Vec<(u32, Vec<ValueType>)>) -> Fragment {
+    let mut builder = crate::FragmentBuilder::new(FragmentId::new(id));
+    let source = NodeId::new(9);
+    assert!(!calls.iter().any(|(id, _)| *id == source.get()));
+    let source_types = calls
+        .first()
+        .map(|(_, types)| types.as_slice())
+        .unwrap_or_default();
+    let mut input_values = source_values(&mut builder, source, source_types);
+    let mut input = source;
+    let mut claims = Vec::new();
+    for (ordinal, (id, types)) in calls.into_iter().enumerate() {
+        let node = NodeId::new(id);
+        assert!(ordinal == 0 || types.is_empty());
+        let mut roots = Vec::new();
+        for (&value, ty) in input_values.iter().zip(&types) {
+            let draft = builder.unit(node).unwrap();
+            let definition = draft.add(None, ty.clone(), ExprKind::Value(value)).unwrap();
+            roots.push(
+                draft
+                    .root(
+                        definition,
+                        novarocks_type_contract::EvaluationDemand::Value,
+                        crate::RootScope::Port(0),
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(roots.len(), types.len());
+        let output = builder
+            .add_value(
+                integer(false),
+                crate::ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        let properties = builder.node_output_properties(input).unwrap().clone();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                expressions: None,
+                id: node,
+                inputs: Box::from([input]),
+                required_inputs: Box::from([properties.clone()]),
+                output_properties: properties,
+                output: OutputPort {
+                    node,
+                    columns: Box::from([output]),
+                },
+                kind: NodeKind::TableFunction {
+                    function: crate::BoundTableFunction::from_exact_signature(
+                        FunctionId::try_new("fixture/static-request/table").unwrap(),
+                        FunctionOverloadId::try_new("fixture/static-request/table-exact").unwrap(),
+                        novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                            types.into_iter().map(FunctionArgumentType::Value).collect(),
+                        ),
+                        novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                            integer(false),
+                        ])),
+                    ),
+                    arguments: roots.into_boxed_slice(),
+                    outputs: Box::from([crate::TableFunctionOutput::FunctionResult {
+                        result_ordinal: 0,
+                        value: output,
+                    }]),
+                    left_outer: false,
+                },
+            })
+            .unwrap();
+        install_pure(&mut builder, node);
+        claims.push(relation_claim(
+            PhysicalCallSite::Table { node },
+            ordinal as u32,
+            FunctionKind::Table,
+        ));
+        input = node;
+        input_values = vec![output];
+    }
+    finish_relation(builder, input, claims)
+}
+fn key(id: u32) -> PhysicalCallSite {
+    PhysicalCallSite::Table {
+        node: NodeId::new(id),
+    }
+}
+
+fn aggregate_fragment() -> Fragment {
+    let mut builder = crate::FragmentBuilder::new(FragmentId::new(1));
+    let input = NodeId::new(0);
+    source_values(&mut builder, input, &[]);
+    let node = NodeId::new(9);
+    let mut calls = Vec::new();
+    let mut output = Vec::new();
+    for id in [u32::MAX, 7] {
+        let id = AggregateCallId::new(id);
+        let value = builder
+            .add_value(
+                integer(false),
+                crate::ValueOrigin::AggregateResult { call: id },
+            )
+            .unwrap();
+        output.push(value);
+        calls.push(AggregateCall {
+            id,
+            binding: AggregateBinding {
+                state_interpretation: None,
+                function: crate::BoundFunction::from_exact_signature(
+                    FunctionId::try_new("fixture/static-request/aggregate").unwrap(),
+                    FunctionOverloadId::try_new("fixture/static-request/aggregate-exact").unwrap(),
+                    FunctionKind::Aggregate,
+                    novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::default()),
+                    integer(false),
+                ),
+                phase: AggregatePhase::Single,
+                logical_argument_count: 0,
+                intermediate_type: integer(false),
+                state_format: AggregateStateFormatId::try_new("fixture/state/v1").unwrap(),
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+            },
+            arguments: Box::default(),
+            distinct: false,
+            order_by: Box::default(),
+            output: value,
+        });
+    }
+    let properties = builder.node_output_properties(input).unwrap().clone();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            expressions: None,
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([properties.clone()]),
+            output_properties: properties,
+            output: OutputPort {
+                node,
+                columns: output.into_boxed_slice(),
+            },
+            kind: NodeKind::Aggregate {
+                group_by: Box::default(),
+                calls: calls.into_boxed_slice(),
+                grouping: AggregateGrouping::Complete,
+            },
+        })
+        .unwrap();
+    let claims = (0..2)
+        .map(|call| {
+            relation_claim(
+                PhysicalCallSite::Aggregate { node, call },
+                call,
+                FunctionKind::Aggregate,
+            )
+        })
+        .collect();
+    finish_relation(builder, node, claims)
+}
+
+// Valid aggregate OVER: one logical input and a separate function ORDER input.
+fn ordered_window_fragment() -> Fragment {
+    let mut builder = crate::FragmentBuilder::new(FragmentId::new(1));
+    let input = NodeId::new(0);
+    let ty = integer(false);
+    let values = source_values(&mut builder, input, &[ty.clone(), ty.clone()]);
+    let node = NodeId::new(9);
+    let draft = builder.unit(node).unwrap();
+    let roots = values
+        .iter()
+        .map(|value| {
+            let definition = draft
+                .add(None, ty.clone(), ExprKind::Value(*value))
+                .unwrap();
+            draft
+                .root(
+                    definition,
+                    novarocks_type_contract::EvaluationDemand::Value,
+                    crate::RootScope::Port(0),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let output = builder
+        .add_value(
+            ty.clone(),
+            crate::ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 2,
+            },
+        )
+        .unwrap();
+    let binding = crate::BoundFunction::from_exact_signature(
+        FunctionId::try_new("fixture/window/ordered-aggregate").unwrap(),
+        FunctionOverloadId::try_new("fixture/window/one-logical-one-order").unwrap(),
+        FunctionKind::Aggregate,
+        novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+            FunctionArgumentType::Value(ty.clone()),
+            FunctionArgumentType::Value(ty.clone()),
+        ])),
+        ty.clone(),
+    );
+    let aggregate = AggregateBinding {
+        function: binding.clone(),
+        phase: AggregatePhase::Single,
+        logical_argument_count: 1,
+        intermediate_type: ty,
+        state_format: AggregateStateFormatId::try_new("fixture/window/state").unwrap(),
+        state_argument_contract:
+            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+        state_interpretation: None,
+    };
+    let properties = builder.node_output_properties(input).unwrap().clone();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            expressions: None,
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([properties.clone()]),
+            output_properties: properties,
+            output: OutputPort {
+                node,
+                columns: Box::from([values[0], values[1], output]),
+            },
+            kind: NodeKind::Window(crate::WindowSpec {
+                partition_by: Box::default(),
+                order_by: Box::default(),
+                calls: Box::from([crate::WindowCallSpec {
+                    binding,
+                    arguments: Box::from([roots[0]]),
+                    order_by: Box::from([crate::SortExpr {
+                        expr: roots[1],
+                        direction: crate::SortDirection::Ascending,
+                        null_ordering: crate::NullOrdering::Last,
+                    }]),
+                    distinct: false,
+                    frame: None,
+                    ignore_nulls: false,
+                    aggregate_binding: Some(Box::new(aggregate)),
+                    output,
+                }]),
+            }),
+        })
+        .unwrap();
+    install_pure(&mut builder, node);
+    finish_relation(
+        builder,
+        node,
+        vec![relation_claim(
+            PhysicalCallSite::Window { node, call: 0 },
+            0,
+            FunctionKind::Aggregate,
+        )],
+    )
+}

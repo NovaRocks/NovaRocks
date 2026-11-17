@@ -75,6 +75,10 @@ impl BoundExprSetBuilder {
     pub fn definitions(&self) -> impl Iterator<Item = &ExprNode> {
         self.definitions.iter().filter_map(Option::as_ref)
     }
+    /// Inspect root declarations while constructing the owning physical node.
+    pub fn roots(&self) -> &[ExprRoot] {
+        &self.roots
+    }
     /// Reserve before a lambda body is authored. IDs remain dense; insertion
     /// order need not be topological. The caller admits these source buffers.
     pub fn reserve(&mut self) -> Result<ExprId, UnitError> {

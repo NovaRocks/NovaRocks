@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 
 fn append_hash_exchange(
     builder: &mut FragmentBuilder,
@@ -43,6 +45,7 @@ fn append_hash_exchange(
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -99,6 +102,7 @@ fn finish_duplicate_comparison_intersect(
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: set_op,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([left_properties, right_properties]),
@@ -124,7 +128,7 @@ fn finish_duplicate_comparison_intersect(
         })
         .unwrap();
 
-    builder.finish_definition(
+    builder.finish_fixture_definition(
         set_op,
         FragmentSink::Noop,
         dop(),

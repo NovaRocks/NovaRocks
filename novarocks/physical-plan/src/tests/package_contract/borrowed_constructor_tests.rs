@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use novarocks_type_contract::{
     CompileCheckpoints, ControlOwnedResourceFacts, ControlResourceCounter, SemanticParameterError,
 };
@@ -156,6 +158,20 @@ fn borrowed_complete_package_keeps_source_and_leaves_success_tail_to_decode_call
         package.fragment().call_requests(),
         input.fragment.call_requests()
     );
+    assert_eq!(
+        parameter_unit(package.fragment()).requests(),
+        parameter_unit(&input.fragment).requests()
+    );
+    assert!(Arc::ptr_eq(
+        package.fragment().nodes()[&package.fragment().root()]
+            .expressions
+            .as_ref()
+            .unwrap(),
+        input.fragment.nodes()[&input.fragment.root()]
+            .expressions
+            .as_ref()
+            .unwrap(),
+    ));
     let before = c.trace();
     w.finish().unwrap();
     assert_eq!(&c.trace()[..before.len()], before);
@@ -225,18 +241,18 @@ fn borrowed_complete_package_parameters_keep_missing_wrong_key_unused_and_sparse
 fn borrowed_package_keeps_original_requests_constants_and_pruning_error_order() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let input = parameter_input(1, &mut fixture_constants);
-    let definition = *input
+    let request_input = package_input(package_window_fragment(), &mut fixture_constants);
+    let definition = *request_input
         .fragment
         .call_requests()
         .entries()
         .keys()
         .next()
         .unwrap();
-    let mut parts = input.fragment.clone().into_parts();
+    let mut parts = request_input.fragment.into_parts();
     // A deliberate malformed source, never a substitute for mandatory facts.
     parts.call_requests = crate::FragmentCallRequests::unpublished_empty(parts.id);
     let mut missing = package_input(Fragment::from(parts), &mut fixture_constants);
-    missing.parameters = input.parameters.clone();
     every_prefix(
         &missing,
         Err(FragmentPackageError::Requests(
@@ -253,10 +269,8 @@ fn borrowed_package_keeps_original_requests_constants_and_pruning_error_order() 
         )),
     );
     let mut unused = input.clone();
-    let original_policy = input
-        .fragment
-        .call_requests()
-        .entries()
+    let original_policy = parameter_unit(&input.fragment)
+        .requests()
         .values()
         .next()
         .unwrap()
@@ -301,6 +315,8 @@ fn borrowed_package_parameter_projection_has_independent_vec_tree_and_unique_box
         let count = repetitions as usize;
         // Original count walk, collection, then two real projection hooks per reference.
         let tail = &facts[facts.len() - (2 + 2 * count)..];
+        // One unit plus count scalar claims are the newly explicit observed
+        // prepass; the original definition/environment collection remains.
         let count_snapshot = tail[0].0;
         let collection = tail[1].0;
         let layout = Layout::array::<SemanticParameterRef>(count).unwrap();
@@ -316,7 +332,7 @@ fn borrowed_package_parameter_projection_has_independent_vec_tree_and_unique_box
         );
         assert_eq!(
             collection.cumulative_work_upper_bound - count_snapshot.cumulative_work_upper_bound,
-            2 * count + 2 + layout.size() + 32
+            3 * count + 5 + layout.size() + 32
         );
         let mut tree = ControlResourceCounter::default();
         tree.tree::<SemanticParameterId, SemanticParameterValue>(1)
@@ -416,10 +432,9 @@ fn original_pool(
     fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> crate::ConstantPool {
     let value_type = ty(array.data_type().clone(), false);
-    let original_policy = parameter_input(1, fixture_constants)
-        .fragment
-        .call_requests()
-        .entries()
+    let input = parameter_input(1, fixture_constants);
+    let original_policy = parameter_unit(&input.fragment)
+        .requests()
         .values()
         .next()
         .unwrap()
@@ -457,18 +472,24 @@ fn collection_fragment(
         .add_values(empty, Box::default(), Box::from([source_value]))
         .unwrap();
     let expression = builder
-        .add_expression(
+        .define(
             project,
             integer.clone(),
             crate::ExprKind::Value(source_value),
         )
         .unwrap();
+    let root = builder.root_definition(
+        project,
+        expression,
+        EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let input = builder
         .add_value(
             integer.clone(),
             crate::ValueOrigin::Expr {
                 node: project,
-                expr: expression,
+                root,
             },
         )
         .unwrap();
@@ -476,7 +497,7 @@ fn collection_fragment(
         .add_project(
             project,
             empty,
-            Box::from([(expression, input)]),
+            Box::from([(root, input)]),
             Box::from([input]),
         )
         .unwrap();
@@ -523,6 +544,7 @@ fn collection_fragment(
             },
         )
         .unwrap();
+    crate::tests::unit_fixture::seal_pure_unit(&mut builder, project);
     let fragment = builder
         .finish_structure(
             unpivot,

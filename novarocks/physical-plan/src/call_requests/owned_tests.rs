@@ -47,7 +47,7 @@ fn complete<T>(
 }
 fn publish(
     source: &Fragment,
-    entries: &[(PhysicalCallDefinition, PhysicalCallRequest)],
+    entries: &[(PhysicalCallSite, PhysicalCallRequest)],
     control: &dyn PureCompileControl,
 ) -> Result<Fragment, CallRequestError> {
     complete(control, |work| {
@@ -105,44 +105,9 @@ fn caller_owned_publication_retains_dead_type_only_none_and_original_typed_null(
     assert!(Arc::ptr_eq(original_null.pool().array(), backing.array()));
     assert!(Arc::ptr_eq(original_null.pool().field_ref(), &field));
 
-    let child = expression(u32::MAX, vec![], vec![]);
-    let parent = expression(
-        0,
-        vec![
-            FunctionArgumentType::Value(ty.clone()),
-            FunctionArgumentType::Value(ty.clone()),
-        ],
-        vec![child.id, child.id],
-    );
-    let source = fragment(u32::MAX, vec![parent, child], values());
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(100),
-        region: EvaluationRegionId::new(3),
-        demand: EvaluationDemand::Value,
-    };
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: context.region,
-            parent: None,
-            guard: None,
-        }],
-        vec![ExpressionInvocation {
-            context,
-            definition: ExprId::new(0),
-            control: ControlShape::TypeOnly,
-            arguments: Box::default(),
-        }],
-        source.expressions(),
-        PHASE,
-        &Control::default(),
-    )
-    .unwrap();
-    assert_eq!(flow.uses().len(), 1);
-    assert!(
-        !flow
-            .uses()
-            .values()
-            .any(|u| u.definition == ExprId::new(u32::MAX))
+    let source = relation_fragment(
+        u32::MAX,
+        vec![(0, vec![ty.clone(), ty.clone()]), (u32::MAX, vec![])],
     );
     let original = PhysicalCallRequest {
         expected_result_type: Some(integer(true)),
@@ -180,27 +145,14 @@ fn caller_owned_publication_retains_dead_type_only_none_and_original_typed_null(
 
 #[test]
 fn caller_owned_complete_binding_and_sparse_coverage_keep_first_control_refusal() {
-    let lambda = FunctionArgument::Lambda {
-        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-            nested(false, false, "original"),
-        ])),
-        result_type: integer(true),
-    };
-    let source = fragment(
-        7,
-        vec![expression(
-            u32::MAX,
-            vec![FunctionArgumentType::Lambda {
-                parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
-                    Box::from([nested(false, false, "original")]),
-                ),
-                result_type: integer(true),
-            }],
-            vec![],
-        )],
-        values(),
-    );
-    let entries = vec![(key(u32::MAX), request(vec![lambda]))];
+    // Value channel and exact full nested source stay a genuine Table binding.
+    // The original Lambda's complete parameter/result/nominal cases are moved
+    // unchanged in meaning to the neutral scalar borrowed-scope candidate.
+    let source = relation_fragment(7, vec![(u32::MAX, vec![nested(false, false, "original")])]);
+    let entries = vec![(
+        key(u32::MAX),
+        request(vec![value(nested(false, false, "original"))]),
+    )];
     owned_prefixes(|c| publish(&source, &entries, c).map(|_| ()), None);
     let mut duplicate = entries.clone();
     duplicate.push(entries[0].clone());
@@ -216,19 +168,14 @@ fn caller_owned_complete_binding_and_sparse_coverage_keep_first_control_refusal(
     );
     for wrong in [
         request(vec![]),
-        request(vec![value(integer(true))]),
         request(vec![FunctionArgument::Lambda {
-            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-                nested(false, false, "foreign"),
-            ])),
+            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                Box::default(),
+            ),
             result_type: integer(true),
         }]),
-        request(vec![FunctionArgument::Lambda {
-            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-                nested(false, false, "original"),
-            ])),
-            result_type: integer(false),
-        }]),
+        request(vec![value(nested(false, false, "foreign"))]),
+        request(vec![value(nested(true, false, "original"))]),
     ] {
         let expected = if wrong.arguments.is_empty() {
             CallRequestError::InvalidArgumentCount(key(u32::MAX))
@@ -244,7 +191,7 @@ fn caller_owned_complete_binding_and_sparse_coverage_keep_first_control_refusal(
 
 #[test]
 fn caller_owned_validation_leaves_empty_success_and_wrong_fragment_tail_to_caller() {
-    let source = fragment(7, vec![], values());
+    let source = relation_fragment(7, vec![]);
     let table = FragmentCallRequests::try_new(&source, vec![], &Control::default()).unwrap();
     let control = OwnedControl::default();
     let mut work = CompileCheckpoints::try_new(&control, CALLER).unwrap();
@@ -256,7 +203,7 @@ fn caller_owned_validation_leaves_empty_success_and_wrong_fragment_tail_to_calle
         *control.trace.lock().unwrap(),
         vec![(CALLER, 0), (CALLER, 3)]
     );
-    let foreign = fragment(8, vec![], values());
+    let foreign = relation_fragment(8, vec![]);
     let control = OwnedControl::default();
     let mut work = CompileCheckpoints::try_new(&control, CALLER).unwrap();
     let result = table.validate_fragment_in(&foreign, &mut work);
@@ -284,40 +231,10 @@ fn caller_owned_validation_leaves_empty_success_and_wrong_fragment_tail_to_calle
 
 #[test]
 fn caller_owned_relational_records_follow_actual_call_array_ordinals() {
-    let binding = AggregateBinding {
-        state_interpretation: None,
-        function: crate::BoundFunction {
-            kind: FunctionKind::Aggregate,
-            ..function(vec![])
-        },
-        phase: AggregatePhase::Single,
-        logical_argument_count: 0,
-        intermediate_type: integer(false),
-        state_format: AggregateStateFormatId::try_new("fixture/state/v1").unwrap(),
-        state_argument_contract: AggregateStateArgumentContract::ExactSignature,
-    };
-    let call = |id| AggregateCall {
-        id: AggregateCallId::new(id),
-        binding: binding.clone(),
-        arguments: Box::default(),
-        distinct: false,
-        order_by: Box::default(),
-        output: ValueId::new(id),
-    };
-    let source = fragment(
-        1,
-        vec![],
-        NodeKind::Aggregate {
-            group_by: Box::default(),
-            calls: Box::from([call(u32::MAX), call(7)]),
-            grouping: AggregateGrouping::Complete,
-        },
-    );
-    let site = |ordinal| {
-        PhysicalCallDefinition::Relational(PhysicalCallSite::Aggregate {
-            node: NodeId::new(9),
-            call: ordinal,
-        })
+    let source = aggregate_fragment();
+    let site = |call| PhysicalCallSite::Aggregate {
+        node: NodeId::new(9),
+        call,
     };
     let entries = vec![(site(0), request(vec![])), (site(1), request(vec![]))];
     let published = publish(&source, &entries, &OwnedControl::default()).unwrap();

@@ -18,7 +18,7 @@
 use super::*;
 use crate::resource::CutResourcePreflight;
 use crate::validation::ValidationContext;
-use crate::{ExprId, ExprNode, PhysicalNode, PlanLimits, ValueDef, ValueId};
+use crate::{ExprId, ExprKind, ExprNode, PhysicalNode, PlanLimits, ValueDef, ValueId};
 use std::alloc::Layout;
 
 /// Explicit projection ceilings supplied by the complete property caller.
@@ -80,15 +80,13 @@ pub(super) fn projection_facts(
 // Only an independently checkable lower floor. The caller must invoice ALL
 // structural source backing; deeper BTree/string owners are not guessed.
 // Arc-held system-relation data is a separate resource contribution.
-pub(super) fn source_floor(
+// Fixed header facts are available before any source traversal. Fragment
+// already contains the relation-table header; count its backing entries below.
+fn source_header_floor(
     fragment: &Fragment,
-    uses: &PhysicalRootUses,
     calls: &FrozenFragmentCalls,
 ) -> Result<usize, FrozenCallError> {
-    let mut bytes = std::mem::size_of_val(fragment)
-        .checked_add(std::mem::size_of_val(uses))
-        .and_then(|n| n.checked_add(std::mem::size_of_val(calls)))
-        .ok_or(FrozenCallError::TooManyItems)?;
+    let mut bytes = std::mem::size_of_val(fragment);
     for (count, width) in [
         (
             fragment.nodes().len(),
@@ -97,10 +95,6 @@ pub(super) fn source_floor(
         (
             fragment.values().len(),
             std::mem::size_of::<(ValueId, ValueDef)>(),
-        ),
-        (
-            fragment.expressions().len(),
-            std::mem::size_of::<(ExprId, ExprNode)>(),
         ),
         (
             calls.entries.len(),
@@ -115,10 +109,218 @@ pub(super) fn source_floor(
     Ok(bytes)
 }
 
+// The production owner borrows the caller's original work scope. No entry or
+// footer is created while walking the original unit/port source.
+fn source_floor_in(
+    fragment: &Fragment,
+    calls: &FrozenFragmentCalls,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<usize, FrozenCallError> {
+    let mut bytes = source_header_floor(fragment, calls)?;
+    // A unit Arc can be shared by several nodes. Without allocating a second
+    // owner index before admission, the largest actual unit is an independent
+    // shallow lower bound. The caller still invoices ALL source backing; this
+    // floor never substitutes for that invoice or grants construction capacity.
+    let mut largest_unit = 0usize;
+    for node in fragment.nodes().values() {
+        let current = node.expressions.as_ref();
+        work.step()?;
+        let Some(unit) = current else {
+            continue;
+        };
+        let mut unit_bytes = std::mem::size_of_val(unit.as_ref());
+        for (count, width) in [
+            (unit.definitions().len(), std::mem::size_of::<ExprNode>()),
+            (unit.ports().len(), std::mem::size_of::<crate::ExprPort>()),
+            (unit.roots().len(), std::mem::size_of::<crate::ExprRoot>()),
+            (
+                unit.root_use_ids().len(),
+                std::mem::size_of::<novarocks_type_contract::ExpressionUseId>(),
+            ),
+            (
+                unit.control_flow().uses().len(),
+                std::mem::size_of::<(
+                    novarocks_type_contract::ExpressionUseId,
+                    novarocks_type_contract::ExpressionInvocation<ExprId>,
+                )>(),
+            ),
+            (
+                unit.control_flow().regions().len(),
+                std::mem::size_of::<(
+                    novarocks_type_contract::EvaluationRegionId,
+                    novarocks_type_contract::ExpressionEvaluationRegion,
+                )>(),
+            ),
+            (
+                unit.claims().len(),
+                std::mem::size_of::<(
+                    novarocks_type_contract::ExpressionUseId,
+                    novarocks_expression_contract::ExpressionCallClaim,
+                )>(),
+            ),
+            (
+                unit.requests().len(),
+                std::mem::size_of::<(ExprId, crate::PhysicalCallRequest)>(),
+            ),
+        ] {
+            unit_bytes = count
+                .checked_mul(width)
+                .and_then(|n| unit_bytes.checked_add(n))
+                .ok_or(FrozenCallError::TooManyItems)?;
+        }
+        for port in unit.ports() {
+            unit_bytes = port
+                .values
+                .len()
+                .checked_mul(std::mem::size_of::<(ValueId, crate::ValueType)>())
+                .and_then(|n| unit_bytes.checked_add(n))
+                .ok_or(FrozenCallError::TooManyItems)?;
+            work.step()?;
+        }
+        largest_unit = largest_unit.max(unit_bytes);
+    }
+    bytes = bytes
+        .checked_add(largest_unit)
+        .ok_or(FrozenCallError::TooManyItems)?;
+    Ok(bytes)
+}
+
+// Existing direct numerical tests use the same core through a test-only owner.
+#[cfg(test)]
+pub(super) fn source_floor(
+    fragment: &Fragment,
+    calls: &FrozenFragmentCalls,
+) -> Result<usize, FrozenCallError> {
+    struct FloorControl;
+    impl PureCompileControl for FloorControl {
+        fn checkpoint(&self, _phase: CompilePhase, _units: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    let control = FloorControl;
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate)?;
+    let result = source_floor_in(fragment, calls, &mut work);
+    finish_frozen_calls(work, result)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum OccurrenceSite {
+    Expression {
+        node: NodeId,
+        invocation: novarocks_type_contract::ExpressionUseId,
+    },
+    Relation(PhysicalCallSite),
+}
+impl OccurrenceSite {
+    pub(super) fn node(self) -> NodeId {
+        match self {
+            Self::Expression { node, .. } => node,
+            Self::Relation(site) => site.node(),
+        }
+    }
+    pub(super) fn failure(self) -> FrozenCallError {
+        match self {
+            Self::Expression { node, invocation } => {
+                FrozenCallError::ReplicaExpression { node, invocation }
+            }
+            Self::Relation(site) => FrozenCallError::ReplicaEquivalence(site),
+        }
+    }
+}
+/// Deterministic actual occurrence order: node/local use, then original
+/// relational node/call order. Local IDs from different nodes never collide.
+pub(super) fn visit_occurrence_calls<E: From<FrozenCallError>>(
+    fragment: &Fragment,
+    calls: &FrozenFragmentCalls,
+    work: &mut CompileCheckpoints<'_>,
+    mut visit: impl FnMut(
+        OccurrenceSite,
+        FunctionKind,
+        &CallEffects,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), E>,
+) -> Result<(), E> {
+    for node in fragment.nodes().values() {
+        if let Some(unit) = &node.expressions {
+            for (id, invocation) in unit.control_flow().uses() {
+                let definition = unit
+                    .definition(invocation.definition)
+                    .ok_or(FrozenCallError::InvalidSite)?;
+                if let ExprKind::FunctionCall { function, .. } = &definition.kind {
+                    let claim = unit.claims().get(id).ok_or(FrozenCallError::WrongControl)?;
+                    visit(
+                        OccurrenceSite::Expression {
+                            node: node.id,
+                            invocation: *id,
+                        },
+                        function.kind,
+                        &claim.effects,
+                        work,
+                    )?;
+                }
+                work.step().map_err(FrozenCallError::Control)?;
+            }
+        }
+        work.step().map_err(FrozenCallError::Control)?;
+    }
+    visit_relational_calls_observed(fragment, work, |site, binding, work| {
+        let call = calls
+            .entries
+            .get(&site)
+            .ok_or(FrozenCallError::MissingSite(site))?;
+        visit(
+            OccurrenceSite::Relation(site),
+            binding.kind(),
+            &call.effects,
+            work,
+        )
+    })
+}
+#[derive(Default)]
+struct UnitCounts {
+    definitions: usize,
+    uses: usize,
+    references: usize,
+    roots: usize,
+    regions: usize,
+    claims: usize,
+    ports: usize,
+}
+impl UnitCounts {
+    fn read(
+        fragment: &Fragment,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, FrozenCallError> {
+        let mut counts = Self::default();
+        for node in fragment.nodes().values() {
+            if let Some(unit) = &node.expressions {
+                for (count, amount) in [
+                    (&mut counts.definitions, unit.definitions().len()),
+                    (&mut counts.uses, unit.control_flow().uses().len()),
+                    (
+                        &mut counts.references,
+                        unit.control_flow().use_reference_count(),
+                    ),
+                    (&mut counts.roots, unit.roots().len()),
+                    (&mut counts.regions, unit.control_flow().regions().len()),
+                    (&mut counts.claims, unit.claims().len()),
+                    (&mut counts.ports, unit.ports().len()),
+                ] {
+                    *count = count
+                        .checked_add(amount)
+                        .ok_or(FrozenCallError::TooManyItems)?;
+                }
+            }
+            work.step()?;
+        }
+        Ok(counts)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NodeProof {
     node: NodeId,
-    first_unsafe: Option<PhysicalCallSite>,
+    first_unsafe: Option<OccurrenceSite>,
     declared_broadcast: bool,
 }
 
@@ -127,11 +329,10 @@ struct NodeProof {
 /// The immutable loans prevent replacement of any source while it is used.
 pub(crate) struct OccurrencePropertyProof<'a> {
     fragment: &'a Fragment,
-    _uses: &'a PhysicalRootUses,
     _calls: &'a FrozenFragmentCalls,
     nodes: Vec<NodeProof>,
     facts: PropertyProofProjectionFacts,
-    first_broadcast_unsafe: Option<PhysicalCallSite>,
+    first_broadcast_unsafe: Option<OccurrenceSite>,
 }
 impl OccurrencePropertyProof<'_> {
     pub(crate) fn facts(&self) -> PropertyProofProjectionFacts {
@@ -145,7 +346,7 @@ impl OccurrencePropertyProof<'_> {
         let first = self.first_broadcast_unsafe;
         work.step()?;
         match first {
-            Some(site) => Err(FrozenCallError::ReplicaEquivalence(site)),
+            Some(site) => Err(site.failure()),
             None => Ok(()),
         }
     }
@@ -202,7 +403,6 @@ impl FrozenFragmentCalls {
     pub(crate) fn property_proof<'a>(
         &'a self,
         fragment: &'a Fragment,
-        uses: &'a PhysicalRootUses,
         limits: &PlanLimits,
         source_retained_bytes: usize,
         projection_limits: PropertyProofProjectionLimits,
@@ -211,7 +411,6 @@ impl FrozenFragmentCalls {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         let result = self.property_proof_core(
             fragment,
-            uses,
             limits,
             source_retained_bytes,
             projection_limits,
@@ -226,7 +425,6 @@ impl FrozenFragmentCalls {
     pub(crate) fn property_proof_in<'a>(
         &'a self,
         fragment: &'a Fragment,
-        uses: &'a PhysicalRootUses,
         limits: &PlanLimits,
         source_retained_bytes: usize,
         projection_limits: PropertyProofProjectionLimits,
@@ -237,7 +435,6 @@ impl FrozenFragmentCalls {
     ) -> Result<OccurrencePropertyProof<'a>, FrozenCallError> {
         self.property_proof_core(
             fragment,
-            uses,
             limits,
             source_retained_bytes,
             projection_limits,
@@ -249,7 +446,6 @@ impl FrozenFragmentCalls {
     fn property_proof_core<'a>(
         &'a self,
         fragment: &'a Fragment,
-        uses: &'a PhysicalRootUses,
         limits: &PlanLimits,
         source_retained_bytes: usize,
         projection_limits: PropertyProofProjectionLimits,
@@ -257,19 +453,29 @@ impl FrozenFragmentCalls {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<OccurrencePropertyProof<'a>, FrozenCallError> {
         (|| {
+            if !std::ptr::eq(self, fragment.calls()) {
+                return Err(FrozenCallError::WrongFragment);
+            }
+            // These bounded header laws require no source scan. Keep their
+            // ordinary refusal ahead of later controller observations.
+            if fragment.nodes().len() > limits.fragment_nodes
+                || fragment.values().len() > limits.fragment_values
+                || self.entries.len() > MAX_CONTROL_USE_REFERENCES
+                || source_retained_bytes < source_header_floor(fragment, self)?
+            {
+                return Err(FrozenCallError::TooManyItems);
+            }
+            let counts = UnitCounts::read(fragment, work)?;
             // Bound source cardinalities before a source validator or the new
             // canonical node index allocates. Limits count definitions, not IDs.
             for (count, maximum) in [
                 (fragment.nodes().len(), limits.fragment_nodes),
                 (fragment.values().len(), limits.fragment_values),
-                (fragment.expressions().len(), limits.fragment_expressions),
+                (counts.definitions, limits.fragment_expressions),
                 (self.entries.len(), MAX_CONTROL_USE_REFERENCES),
-                (
-                    uses.flow().use_reference_count(),
-                    MAX_CONTROL_USE_REFERENCES,
-                ),
-                (uses.bindings().len(), MAX_CONTROL_USE_REFERENCES),
-                (uses.roots().sites().len(), MAX_CONTROL_USE_REFERENCES),
+                (counts.references, MAX_CONTROL_USE_REFERENCES),
+                (counts.roots, MAX_CONTROL_USE_REFERENCES),
+                (counts.roots, MAX_CONTROL_USE_REFERENCES),
             ] {
                 let admitted = count <= maximum;
                 work.step()?;
@@ -278,18 +484,46 @@ impl FrozenFragmentCalls {
                 }
             }
             let projected = (|| {
-                if source_retained_bytes < source_floor(fragment, uses, self)? {
+                if source_retained_bytes < source_floor_in(fragment, self, work)? {
                     return Err(FrozenCallError::TooManyItems);
                 }
                 projection_facts(
                     fragment.nodes().len(),
-                    uses.flow().uses().len(),
-                    self.entries.len(),
+                    counts.uses,
+                    self.entries
+                        .len()
+                        .checked_add(counts.claims)
+                        .ok_or(FrozenCallError::TooManyItems)?,
                     source_retained_bytes,
                 )
             })();
             work.step()?;
-            let facts = projected?;
+            let mut facts = projected?;
+            let source_lookups = novarocks_type_contract::ControlResourceCounter::lookup_work(
+                fragment.nodes().len(),
+            )
+            .map_err(resource_error)?;
+            facts.projection_work = facts
+                .projection_work
+                .checked_add(
+                    fragment
+                        .nodes()
+                        .len()
+                        .checked_mul(
+                            source_lookups
+                                .checked_add(11)
+                                .ok_or(FrozenCallError::TooManyItems)?,
+                        )
+                        .ok_or(FrozenCallError::TooManyItems)?,
+                )
+                .ok_or(FrozenCallError::TooManyItems)?;
+            facts.projection_work = facts
+                .projection_work
+                // The floor scans each node once; its per-port visits are
+                // the original explicit port contribution below.
+                .checked_add(fragment.nodes().len())
+                .and_then(|n| n.checked_add(counts.ports))
+                .ok_or(FrozenCallError::TooManyItems)?;
             for (amount, maximum) in [
                 (facts.request_bytes, projection_limits.max_request_bytes),
                 (
@@ -318,16 +552,10 @@ impl FrozenFragmentCalls {
             source.add_fragment(fragment, &mut errors);
             work.step()?;
             work.flush()?;
-            for count in [
-                call_items,
-                uses.flow().regions().len(),
-                uses.flow().use_reference_count(),
-                uses.bindings().len(),
-                uses.roots().sites().len(),
-            ] {
-                source.add_items(count);
-                work.step()?;
-            }
+            // Unit-owned control and scalar claim collections were counted by
+            // add_fragment. Only the separate relation table remains here.
+            source.add_items(call_items);
+            work.step()?;
             source.validate("fragment.property_proof.resources", &mut errors);
             work.step()?;
             if !errors.is_empty() {
@@ -335,9 +563,9 @@ impl FrozenFragmentCalls {
             }
             work.flush()?;
             if let Some(admit) = admit.as_deref_mut() {
-                self.validate_fragment_in(fragment, uses, &mut |facts| admit(facts), work)?;
+                self.validate_fragment_in(fragment, &mut |facts| admit(facts), work)?;
             } else {
-                self.validate_fragment(fragment, uses, work.control())?;
+                self.validate_fragment(fragment, work.control())?;
             }
             work.flush()?;
             let mut nodes = Vec::new();
@@ -363,42 +591,28 @@ impl FrozenFragmentCalls {
                 work.step()?;
             }
             let mut first_broadcast_unsafe = None;
-            visit_calls::<FrozenCallError>(fragment, uses, work, |site, binding, work| {
-                let owner = match site {
-                    PhysicalCallSite::Expression(id) => {
-                        let invocation = uses.flow().uses().get(&id);
-                        work.step()?;
-                        let invocation = invocation.ok_or(FrozenCallError::InvalidSite)?;
-                        let expression = fragment.expressions().get(invocation.definition);
-                        work.step()?;
-                        expression.ok_or(FrozenCallError::InvalidSite)?.owner
+            visit_occurrence_calls::<FrozenCallError>(
+                fragment,
+                self,
+                work,
+                |site, kind, effects, work| {
+                    let owner = site.node();
+                    let index = find_node(&nodes, owner, work)?;
+                    let safe = super::replica::call_is_replica_equivalent(kind, effects);
+                    if !safe {
+                        if nodes[index].first_unsafe.is_none() {
+                            nodes[index].first_unsafe = Some(site);
+                        }
+                        if nodes[index].declared_broadcast && first_broadcast_unsafe.is_none() {
+                            first_broadcast_unsafe = Some(site);
+                        }
                     }
-                    PhysicalCallSite::Aggregate { node, .. }
-                    | PhysicalCallSite::TopNState { node, .. }
-                    | PhysicalCallSite::WriterPartial { node, .. }
-                    | PhysicalCallSite::WriterFinal { node, .. }
-                    | PhysicalCallSite::Table { node } => node,
-                };
-                let index = find_node(&nodes, owner, work)?;
-                let call = self.entries.get(&site);
-                work.step()?;
-                let call = call.ok_or(FrozenCallError::MissingSite(site))?;
-                let safe =
-                    super::replica::call_is_replica_equivalent(binding.kind(), &call.effects);
-                if !safe {
-                    if nodes[index].first_unsafe.is_none() {
-                        nodes[index].first_unsafe = Some(site);
-                    }
-                    if nodes[index].declared_broadcast && first_broadcast_unsafe.is_none() {
-                        first_broadcast_unsafe = Some(site);
-                    }
-                }
-                work.step()?;
-                Ok(())
-            })?;
+                    work.step()?;
+                    Ok(())
+                },
+            )?;
             Ok(OccurrencePropertyProof {
                 fragment,
-                _uses: uses,
                 _calls: self,
                 nodes,
                 facts,

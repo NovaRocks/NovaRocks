@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -23,11 +25,12 @@ use arrow_schema::DataType;
 use novarocks_type_contract::SemanticParameters;
 
 use crate::{
-    Edge, EdgeId, ExprArena, ExprId, ExprKind, ExprNode, Fragment, FragmentId, FragmentParts,
-    FragmentSink, NodeId, NodeKind, OutputPort, PhysicalNode, PhysicalPlan, PhysicalPlanParts,
-    PipelineDopDomain, PlanAnnotation, PlanVersionId, RequiredContracts, ResultPort, RuntimeFilter,
-    RuntimeFilterId, ValidationErrors, ValueDef, ValueId, ValueOrigin, ValueType,
-    validate_fragment_definition, validate_plan,
+    BoundExprSet, BoundExprSetBuilder, Edge, EdgeId, ExprKind, ExprNode, ExprPort, Fragment,
+    FragmentId, FragmentParts, FragmentSink, NodeId, NodeKind, OutputPort, PhysicalNode,
+    PhysicalPlan, PhysicalPlanParts, PipelineDopDomain, PlanAnnotation, PlanVersionId,
+    RequiredContracts, ResultPort, RootOrdinal, RuntimeFilter, RuntimeFilterId, UnitLimits,
+    ValidationErrors, ValueDef, ValueId, ValueOrigin, ValueType, validate_fragment_definition,
+    validate_plan,
 };
 
 #[cfg(test)]
@@ -49,10 +52,9 @@ mod structure_tests;
 pub struct FragmentBuilder {
     id: FragmentId,
     next_value: u32,
-    next_expr: u32,
     next_node: Option<u32>,
     values: BTreeMap<ValueId, ValueDef>,
-    expressions: ExprArena,
+    unit_builders: BTreeMap<NodeId, BoundExprSetBuilder>,
     nodes: BTreeMap<NodeId, PhysicalNode>,
     contains_scan: bool,
     runtime_filters: BTreeSet<RuntimeFilterId>,
@@ -64,10 +66,9 @@ impl FragmentBuilder {
         Self {
             id,
             next_value: 0,
-            next_expr: 0,
             next_node: Some(0),
             values: BTreeMap::new(),
-            expressions: ExprArena::default(),
+            unit_builders: BTreeMap::new(),
             nodes: BTreeMap::new(),
             contains_scan: false,
             runtime_filters: BTreeSet::new(),
@@ -89,8 +90,113 @@ impl FragmentBuilder {
         self.id
     }
 
-    pub const fn expressions(&self) -> &ExprArena {
-        &self.expressions
+    /// Open this node's private construction unit. Installed units are immutable.
+    pub fn unit(&mut self, node: NodeId) -> Result<&mut BoundExprSetBuilder, BuildError> {
+        if self
+            .nodes
+            .get(&node)
+            .is_some_and(|n| n.expressions.is_some())
+        {
+            return Err(BuildError::UnitState(
+                node,
+                "node already has an installed unit",
+            ));
+        }
+        Ok(self.unit_builders.entry(node).or_insert_with(|| {
+            BoundExprSetBuilder::new(UnitLimits {
+                expression_semantic_depth: crate::PlanLimits::FROZEN.expression_semantic_depth,
+            })
+        }))
+    }
+
+    /// Transfer the original draft to its caller for sealing after final rebind.
+    pub fn take_unit_builder(&mut self, node: NodeId) -> Result<BoundExprSetBuilder, BuildError> {
+        self.unit_builders
+            .remove(&node)
+            .ok_or(BuildError::UnitState(node, "node has no expression draft"))
+    }
+
+    /// Exact input declarations, in the node's input order. A Scan sees only
+    /// its provider outputs; derived scan outputs cannot feed their own unit.
+    pub fn node_ports(&self, node: NodeId) -> Result<Vec<ExprPort>, BuildError> {
+        let definition = self
+            .nodes
+            .get(&node)
+            .ok_or(BuildError::UnitState(node, "node is not defined"))?;
+        let columns: Vec<Vec<ValueId>> = match &definition.kind {
+            NodeKind::Scan {
+                provider_outputs, ..
+            } => vec![provider_outputs.iter().map(|(_, v)| *v).collect()],
+            _ => definition
+                .inputs
+                .iter()
+                .map(|id| {
+                    self.nodes
+                        .get(id)
+                        .map(|n| n.output.columns.to_vec())
+                        .ok_or(BuildError::UndefinedInput { node, input: *id })
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        columns
+            .into_iter()
+            .map(|columns| {
+                let mut values = Vec::new();
+                let mut seen = BTreeSet::new();
+                for id in columns {
+                    if seen.insert(id) {
+                        values.push((
+                            id,
+                            self.values
+                                .get(&id)
+                                .ok_or(BuildError::UndefinedValue(id))?
+                                .ty
+                                .clone(),
+                        ));
+                    }
+                }
+                Ok(ExprPort {
+                    values: values.into_boxed_slice(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn install_unit(
+        &mut self,
+        node: NodeId,
+        unit: std::sync::Arc<BoundExprSet>,
+    ) -> Result<(), BuildError> {
+        if self.unit_builders.contains_key(&node) {
+            return Err(BuildError::UnitState(
+                node,
+                "take and seal the original draft before installation",
+            ));
+        }
+        let definition = self
+            .nodes
+            .get_mut(&node)
+            .ok_or(BuildError::UnitState(node, "node is not defined"))?;
+        if definition.expressions.is_some() {
+            return Err(BuildError::UnitState(
+                node,
+                "node already has an installed unit",
+            ));
+        }
+        definition.expressions = Some(unit);
+        Ok(())
+    }
+
+    fn ensure_units_finished(&self) -> Result<(), ValidationErrors> {
+        if let Some(node) = self.unit_builders.keys().next() {
+            let mut errors = crate::validation::ValidationContext::new();
+            errors.push(crate::ValidationError::new(
+                format!("nodes[{}].expressions", node.get()),
+                "expression draft has not been sealed and installed",
+            ));
+            return Err(ValidationErrors::from_collector(errors));
+        }
+        Ok(())
     }
 
     /// One value this fragment has already defined.
@@ -104,15 +210,6 @@ impl FragmentBuilder {
             .ok_or(BuildError::IdentitySpaceExhausted("node"))?;
         let id = NodeId::new(next);
         self.next_node = next.checked_add(1);
-        Ok(id)
-    }
-
-    pub fn reserve_expression_id(&mut self) -> Result<ExprId, BuildError> {
-        let id = ExprId::new(self.next_expr);
-        self.next_expr = self
-            .next_expr
-            .checked_add(1)
-            .ok_or(BuildError::IdentitySpaceExhausted("expression"))?;
         Ok(id)
     }
 
@@ -143,50 +240,6 @@ impl FragmentBuilder {
         Ok(())
     }
 
-    pub fn add_expression(
-        &mut self,
-        owner: NodeId,
-        ty: ValueType,
-        kind: ExprKind,
-    ) -> Result<ExprId, BuildError> {
-        self.add_expression_in_scope(owner, None, ty, kind)
-    }
-
-    pub fn add_expression_in_scope(
-        &mut self,
-        owner: NodeId,
-        lambda_scope: Option<ExprId>,
-        ty: ValueType,
-        kind: ExprKind,
-    ) -> Result<ExprId, BuildError> {
-        let id = self.reserve_expression_id()?;
-        self.insert_expression(ExprNode {
-            id,
-            owner,
-            lambda_scope,
-            ty,
-            kind,
-        })?;
-        Ok(id)
-    }
-
-    pub fn insert_expression(&mut self, expression: ExprNode) -> Result<(), BuildError> {
-        let id = expression.id;
-        let next_expr = self.next_expr.max(
-            id.get()
-                .checked_add(1)
-                .ok_or(BuildError::IdentitySpaceExhausted("expression"))?,
-        );
-        match self.expressions.get(id) {
-            Some(_) => return Err(BuildError::DuplicateExpression(id)),
-            None => {
-                self.expressions.insert(expression);
-                self.next_expr = next_expr;
-            }
-        }
-        Ok(())
-    }
-
     /// Adds a filter over `input`, retaining rows for which every predicate
     /// holds.
     ///
@@ -199,7 +252,7 @@ impl FragmentBuilder {
         &mut self,
         node: NodeId,
         input: NodeId,
-        predicates: Box<[ExprId]>,
+        predicates: Box<[RootOrdinal]>,
     ) -> Result<(), BuildError> {
         if predicates.is_empty() {
             return Err(BuildError::FilterWithoutPredicate(node));
@@ -216,15 +269,13 @@ impl FragmentBuilder {
                 return Err(BuildError::PredicateIsNotBoolean(*predicate));
             }
         }
-        let replica_deterministic = crate::expressions_are_replica_deterministic(
-            &self.expressions,
-            predicates.iter().copied(),
-            true,
-        )
-        .map_err(BuildError::MissingLegacyMetadata)?;
+        let replica_deterministic = self
+            .draft_replica_deterministic(node, predicates.iter().copied(), true)
+            .map_err(BuildError::MissingLegacyMetadata)?;
         let output_properties =
             crate::derive_filter_output_properties(&input_properties, replica_deterministic);
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
@@ -263,6 +314,7 @@ impl FragmentBuilder {
             ordering: source.output_properties.ordering.clone(),
         };
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([crate::PhysicalProperties {
@@ -301,6 +353,7 @@ impl FragmentBuilder {
             ordering: Box::default(),
         };
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([required]),
@@ -340,7 +393,8 @@ impl FragmentBuilder {
         if order_by.is_empty() && partition_by.is_empty() {
             return Err(BuildError::OrderingWithoutKeys(node));
         }
-        let ordering = crate::ordering_keys(&self.expressions, partition_by, &order_by)
+        let ordering = self
+            .draft_ordering_keys(node, partition_by, &order_by)
             .unwrap_or_default()
             .into_boxed_slice();
         let (output_properties, required) =
@@ -348,6 +402,7 @@ impl FragmentBuilder {
         let source = self.nodes.get(&input).expect("checked above");
         let columns = source.output.columns.clone();
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([required]),
@@ -376,7 +431,8 @@ impl FragmentBuilder {
         if order_by.is_empty() {
             return Err(BuildError::OrderingWithoutKeys(node));
         }
-        let ordering = crate::ordering_keys(&self.expressions, &[], &order_by)
+        let ordering = self
+            .draft_ordering_keys(node, &[], &order_by)
             .unwrap_or_default()
             .into_boxed_slice();
         let mode = if require_singleton {
@@ -391,6 +447,7 @@ impl FragmentBuilder {
         let source = self.nodes.get(&input).expect("checked above");
         let columns = source.output.columns.clone();
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([required]),
@@ -417,7 +474,7 @@ impl FragmentBuilder {
         &mut self,
         node: NodeId,
         input: NodeId,
-        expressions: Box<[(ExprId, ValueId)]>,
+        expressions: Box<[(RootOrdinal, ValueId)]>,
         output: Box<[ValueId]>,
     ) -> Result<(), BuildError> {
         let source = self
@@ -436,18 +493,20 @@ impl FragmentBuilder {
                 return Err(BuildError::UndefinedValue(*value));
             }
         }
-        let replica_deterministic = crate::expressions_are_replica_deterministic(
-            &self.expressions,
-            expressions.iter().map(|(expression, _)| *expression),
-            true,
-        )
-        .map_err(BuildError::MissingLegacyMetadata)?;
+        let replica_deterministic = self
+            .draft_replica_deterministic(
+                node,
+                expressions.iter().map(|(expression, _)| *expression),
+                true,
+            )
+            .map_err(BuildError::MissingLegacyMetadata)?;
         let output_properties = crate::derive_project_output_properties(
             &input_properties,
             &output,
             replica_deterministic,
         );
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
@@ -495,6 +554,7 @@ impl FragmentBuilder {
             }
         }
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -519,7 +579,7 @@ impl FragmentBuilder {
     pub fn add_values(
         &mut self,
         node: NodeId,
-        rows: Box<[Box<[ExprId]>]>,
+        rows: Box<[Box<[RootOrdinal]>]>,
         output: Box<[ValueId]>,
     ) -> Result<(), BuildError> {
         for row in &rows {
@@ -581,9 +641,9 @@ impl FragmentBuilder {
     pub fn add_generate_series(
         &mut self,
         node: NodeId,
-        start: ExprId,
-        stop: ExprId,
-        step: Option<ExprId>,
+        start: RootOrdinal,
+        stop: RootOrdinal,
+        step: Option<RootOrdinal>,
         value: ValueId,
     ) -> Result<(), BuildError> {
         for bound in [Some(start), Some(stop), step].into_iter().flatten() {
@@ -632,6 +692,7 @@ impl FragmentBuilder {
         let output_properties =
             crate::remap_properties_through_values(&input_properties, &passthrough);
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
@@ -688,6 +749,7 @@ impl FragmentBuilder {
             return Err(BuildError::JoinWithoutOwnershipAnchor(node));
         }
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from(sides),
             required_inputs,
@@ -723,6 +785,7 @@ impl FragmentBuilder {
         };
         let output_properties = relation.provided_properties().clone();
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -787,6 +850,7 @@ impl FragmentBuilder {
             _ => derived,
         };
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs,
             required_inputs: required.into_boxed_slice(),
@@ -821,6 +885,7 @@ impl FragmentBuilder {
             .ok_or(BuildError::UndefinedInput { node, input })?;
         let properties = source.output_properties.clone();
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([properties.clone()]),
@@ -864,6 +929,7 @@ impl FragmentBuilder {
             },
         };
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
@@ -896,6 +962,7 @@ impl FragmentBuilder {
             .ok_or(BuildError::UndefinedInput { node, input })?;
         let input_properties = source.output_properties.clone();
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
@@ -920,6 +987,7 @@ impl FragmentBuilder {
         kind: NodeKind,
     ) -> Result<(), BuildError> {
         self.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -939,20 +1007,98 @@ impl FragmentBuilder {
     fn require_owned_expression(
         &self,
         node: NodeId,
-        expression: ExprId,
+        expression: RootOrdinal,
     ) -> Result<&ExprNode, BuildError> {
-        let found = self
-            .expressions
-            .get(expression)
-            .ok_or(BuildError::UndefinedExpression(expression))?;
-        if found.owner != node {
-            return Err(BuildError::ExpressionOutsideOwner {
-                expr: expression,
-                owner: found.owner,
+        let unit = self
+            .unit_builders
+            .get(&node)
+            .ok_or(BuildError::UndefinedRoot {
                 node,
-            });
+                root: expression,
+            })?;
+        let root =
+            unit.roots()
+                .get(expression.get() as usize)
+                .ok_or(BuildError::UndefinedRoot {
+                    node,
+                    root: expression,
+                })?;
+        unit.definition(root.definition)
+            .ok_or(BuildError::UndefinedRoot {
+                node,
+                root: expression,
+            })
+    }
+
+    // Unpublished constructor properties retain the original legacy prerequisite.
+    // Executable publication separately authenticates every actual occurrence's
+    // sealed unit claims; this helper cannot establish that proof.
+    fn draft_replica_deterministic(
+        &self,
+        node: NodeId,
+        roots: impl IntoIterator<Item = RootOrdinal>,
+        allow_values: bool,
+    ) -> Result<bool, crate::MissingLegacyBindingMetadata> {
+        let Some(unit) = self.unit_builders.get(&node) else {
+            return Ok(false);
+        };
+        let mut pending = Vec::new();
+        for root in roots {
+            let Some(root) = unit.roots().get(root.get() as usize) else {
+                return Ok(false);
+            };
+            pending.push(root.definition);
         }
-        Ok(found)
+        let mut seen = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(definition) = unit.definition(id) else {
+                return Ok(false);
+            };
+            match &definition.kind {
+                ExprKind::Value(_) if !allow_values => return Ok(false),
+                ExprKind::FunctionCall { function, .. }
+                    if function.require_legacy_metadata()?.volatility
+                        != crate::FunctionVolatility::Immutable =>
+                {
+                    return Ok(false);
+                }
+                _ => {}
+            }
+            definition
+                .kind
+                .expression_references_observed::<std::convert::Infallible>(|id| {
+                    pending.push(id);
+                    Ok(())
+                })
+                .unwrap_or_else(|never| match never {});
+        }
+        Ok(true)
+    }
+
+    fn draft_ordering_keys(
+        &self,
+        node: NodeId,
+        partition: &[crate::SortExpr],
+        order: &[crate::SortExpr],
+    ) -> Option<Vec<crate::OrderingKey>> {
+        partition
+            .iter()
+            .chain(order)
+            .map(|item| {
+                let expression = self.require_owned_expression(node, item.expr).ok()?;
+                let ExprKind::Value(value) = expression.kind else {
+                    return None;
+                };
+                Some(crate::OrderingKey {
+                    value,
+                    direction: item.direction,
+                    null_ordering: item.null_ordering,
+                })
+            })
+            .collect()
     }
 
     /// Output and input properties for an operator that orders rows it passes
@@ -1052,6 +1198,7 @@ impl FragmentBuilder {
         dop_domain: PipelineDopDomain,
         stage_placement: crate::StagePlacementPolicy,
     ) -> Result<Fragment, ValidationErrors> {
+        self.ensure_units_finished()?;
         let (mut parts, runtime_filters) =
             self.into_fragment_parts(root, sink, dop_domain, stage_placement);
         parts.runtime_filters = runtime_filters.into_iter().collect();
@@ -1071,7 +1218,6 @@ impl FragmentBuilder {
             id: self.id,
             root,
             values: self.values,
-            expressions: self.expressions,
             nodes: self.nodes,
             sink,
             summaries: self.summaries,
@@ -1081,6 +1227,7 @@ impl FragmentBuilder {
             // unpublished construction input reaches any validator.
             runtime_filters: Box::default(),
             call_requests: crate::FragmentCallRequests::unpublished_empty(self.id),
+            calls: crate::FrozenFragmentCalls::unpublished_empty(self.id),
         };
         (parts, self.runtime_filters)
     }
@@ -1089,6 +1236,7 @@ impl FragmentBuilder {
 pub struct PlanBuilder {
     constants: crate::ConstantPools,
     parameters: SemanticParameters,
+    statement_constant_policy: crate::ConstantPolicy,
     version: PlanVersionId,
     next_edge: u32,
     fragments: BTreeMap<FragmentId, Fragment>,
@@ -1104,11 +1252,12 @@ pub struct PlanBuilder {
 }
 
 impl PlanBuilder {
-    pub fn new(version: PlanVersionId) -> Self {
+    pub fn new(version: PlanVersionId, statement_constant_policy: crate::ConstantPolicy) -> Self {
         Self {
             constants: crate::ConstantPools::empty(),
             // An empty table supplies no semantic value or implicit flag.
             parameters: SemanticParameters::default(),
+            statement_constant_policy,
             version,
             next_edge: 0,
             fragments: BTreeMap::new(),
@@ -1234,6 +1383,7 @@ impl PlanBuilder {
         let plan = PhysicalPlan::from(PhysicalPlanParts {
             constants: self.constants,
             parameters: self.parameters,
+            statement_constant_policy: self.statement_constant_policy,
             version: self.version,
             fragments: self.fragments,
             edges: self.edges,
@@ -1249,16 +1399,18 @@ impl PlanBuilder {
     pub fn finish(self) -> Result<PhysicalPlan, ValidationErrors> {
         if self.fragments.values().any(|fragment| {
             !fragment.call_requests().entries().is_empty()
-                || fragment.expressions().iter().any(|(_, node)| {
-                    matches!(
-                        node.kind,
-                        crate::ExprKind::FunctionCall { .. } | crate::ExprKind::WindowCall { .. }
-                    )
-                })
                 || fragment
-                    .expressions()
-                    .iter()
-                    .any(|(_, node)| matches!(node.kind, crate::ExprKind::Constant(_)))
+                    .nodes()
+                    .values()
+                    .filter_map(|n| n.expressions.as_ref())
+                    .flat_map(|u| u.definitions())
+                    .any(|node| matches!(node.kind, crate::ExprKind::FunctionCall { .. }))
+                || fragment
+                    .nodes()
+                    .values()
+                    .filter_map(|n| n.expressions.as_ref())
+                    .flat_map(|u| u.definitions())
+                    .any(|node| matches!(node.kind, crate::ExprKind::Constant(_)))
                 || fragment.nodes().values().any(|node| match &node.kind {
                     crate::NodeKind::Aggregate { calls, .. } => !calls.is_empty(),
                     crate::NodeKind::TopN {
@@ -1270,6 +1422,7 @@ impl PlanBuilder {
                     }
                     crate::NodeKind::TableFinish(finish) => !finish.final_aggregates.is_empty(),
                     crate::NodeKind::TableFunction { .. } => true,
+                    crate::NodeKind::Window(spec) => !spec.calls.is_empty(),
                     _ => false,
                 })
                 || fragment.nodes().values().any(|node| {
@@ -1304,6 +1457,7 @@ impl PlanBuilder {
         let plan = PhysicalPlan::from(PhysicalPlanParts {
             constants: self.constants,
             parameters: self.parameters,
+            statement_constant_policy: self.statement_constant_policy,
             version: self.version,
             fragments: self.fragments,
             edges: self.edges,
@@ -1325,7 +1479,11 @@ pub enum BuildError {
     DuplicateFragment(FragmentId),
     DuplicateNode(NodeId),
     DuplicateValue(ValueId),
-    DuplicateExpression(ExprId),
+    UnitState(NodeId, &'static str),
+    UndefinedRoot {
+        node: NodeId,
+        root: RootOrdinal,
+    },
     DuplicateEdge(EdgeId),
     DuplicateWriteLayout(FragmentId, NodeId),
     DuplicateRuntimeFilter(RuntimeFilterId),
@@ -1336,16 +1494,9 @@ pub enum BuildError {
         node: NodeId,
         input: NodeId,
     },
-    UndefinedExpression(ExprId),
+    UndefinedExpression(RootOrdinal),
     UndefinedValue(ValueId),
-    /// Expressions belong to exactly one node's evaluation scope, so using one
-    /// under a different node is a scope violation rather than a type error.
-    ExpressionOutsideOwner {
-        expr: ExprId,
-        owner: NodeId,
-        node: NodeId,
-    },
-    PredicateIsNotBoolean(ExprId),
+    PredicateIsNotBoolean(RootOrdinal),
     FilterWithoutPredicate(NodeId),
     /// A global limit was built over rows that are not one single-copy stream,
     /// where "the first N rows" has no single meaning.
@@ -1419,7 +1570,13 @@ impl fmt::Display for BuildError {
             Self::DuplicateFragment(id) => write!(formatter, "duplicate fragment {}", id.get()),
             Self::DuplicateNode(id) => write!(formatter, "duplicate node {}", id.get()),
             Self::DuplicateValue(id) => write!(formatter, "duplicate value {}", id.get()),
-            Self::DuplicateExpression(id) => write!(formatter, "duplicate expression {}", id.get()),
+            Self::UnitState(node, message) => write!(formatter, "node {}: {message}", node.get()),
+            Self::UndefinedRoot { node, root } => write!(
+                formatter,
+                "node {} has no expression root {}",
+                node.get(),
+                root.get()
+            ),
             Self::DuplicateEdge(id) => write!(formatter, "duplicate edge {}", id.get()),
             Self::DuplicateWriteLayout(fragment, node) => write!(
                 formatter,
@@ -1440,13 +1597,6 @@ impl fmt::Display for BuildError {
                 write!(formatter, "expression {} is not defined", id.get())
             }
             Self::UndefinedValue(id) => write!(formatter, "value {} is not defined", id.get()),
-            Self::ExpressionOutsideOwner { expr, owner, node } => write!(
-                formatter,
-                "expression {} belongs to node {}, not node {}",
-                expr.get(),
-                owner.get(),
-                node.get()
-            ),
             Self::PredicateIsNotBoolean(id) => {
                 write!(
                     formatter,
@@ -1531,7 +1681,7 @@ mod sparse_node_identity_tests {
         builder
             .add_values(
                 NodeId::new(id),
-                Box::from([Box::<[ExprId]>::default()]),
+                Box::from([Box::<[RootOrdinal]>::default()]),
                 Box::default(),
             )
             .unwrap();
@@ -1548,7 +1698,7 @@ mod sparse_node_identity_tests {
             ));
         }
         let fragment = builder
-            .finish_definition(
+            .finish_fixture_definition(
                 NodeId::new(u32::MAX),
                 FragmentSink::Noop,
                 PipelineDopDomain {
@@ -1590,7 +1740,7 @@ mod sparse_node_identity_tests {
             Err(BuildError::DuplicateNode(id)) if id.get() == u32::MAX
         ));
         let fragment = builder
-            .finish_definition(
+            .finish_fixture_definition(
                 NodeId::new(u32::MAX),
                 FragmentSink::Noop,
                 PipelineDopDomain {
@@ -1610,9 +1760,20 @@ mod sparse_node_identity_tests {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlanConstructionError {
+    Calls(crate::FrozenCallError),
     Requests(crate::CallRequestError),
     Constants(crate::ConstantReferenceError),
     Structure(crate::ValidationErrors),
+}
+impl From<crate::FrozenCallError> for PlanConstructionError {
+    fn from(error: crate::FrozenCallError) -> Self {
+        match error {
+            crate::FrozenCallError::Control(cause) => {
+                Self::Constants(crate::ConstantReferenceError::Control(cause))
+            }
+            other => Self::Calls(other),
+        }
+    }
 }
 impl From<crate::CallRequestError> for PlanConstructionError {
     fn from(error: crate::CallRequestError) -> Self {
@@ -1637,6 +1798,7 @@ impl From<crate::ValidationErrors> for PlanConstructionError {
 impl fmt::Display for PlanConstructionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Calls(error) => error.fmt(formatter),
             Self::Requests(error) => error.fmt(formatter),
             Self::Constants(error) => error.fmt(formatter),
             Self::Structure(error) => error.fmt(formatter),
@@ -1652,6 +1814,7 @@ pub fn validate_plan_observed(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(), PlanConstructionError> {
     for fragment in plan.fragments().values() {
+        fragment.calls().validate_fragment(fragment, control)?;
         fragment
             .call_requests()
             .validate_fragment(fragment, control)

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use arrow_schema::DataType;
 use novarocks_connector_contract::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
@@ -28,18 +30,17 @@ use super::*;
 mod aggregate_sequence_contract;
 pub(crate) mod constant_fixture;
 mod contract_regressions;
-mod definition_control_contract;
 mod exchange_occurrence_contract;
-mod expression_site_contract;
 mod guarantee_admission;
 mod ordering_window_assertion_contract;
-mod original_call_requests;
+pub(crate) mod original_call_requests;
 mod package_contract;
 mod partition_scan_contract;
 mod runtime_filter_binding_contract;
 mod runtime_filter_wait_contract;
 mod set_operation_contract;
 mod sink_contract;
+pub(crate) mod unit_fixture;
 mod unpivot_contract;
 
 fn version() -> PlanVersionId {
@@ -157,12 +158,18 @@ fn literal_fragment(
     let node = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, nullable);
     let expression = builder
-        .add_expression(
+        .define(
             node,
             (value_type.clone()).clone(),
             fixture_constants.i64(11, &(value_type.clone())),
         )
         .unwrap();
+    let expression = builder.root_definition(
+        node,
+        expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     let value = builder
         .add_value(
             value_type,
@@ -174,6 +181,7 @@ fn literal_fragment(
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -187,9 +195,10 @@ fn literal_fragment(
             },
         })
         .unwrap();
+    crate::tests::unit_fixture::seal_pure_unit(&mut builder, node);
     (
         builder
-            .finish_definition(node, sink, dop(), crate::StagePlacementPolicy::Singleton)
+            .finish_fixture_definition(node, sink, dop(), crate::StagePlacementPolicy::Singleton)
             .unwrap(),
         value,
     )
@@ -279,6 +288,7 @@ fn finish_scan_relation_at(
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -297,7 +307,7 @@ fn finish_scan_relation_at(
             },
         })
         .unwrap();
-    builder.finish_definition(
+    builder.finish_fixture_definition(
         scan,
         FragmentSink::Noop,
         dop(),
@@ -334,7 +344,7 @@ fn scan_occurrence_is_unique_without_splitting_provider_relation_identity() {
             _ => unreachable!(),
         }
     );
-    let mut valid = PlanBuilder::new(version());
+    let mut valid = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     valid.add_fragment(first).unwrap();
     valid.add_fragment(second).unwrap();
     valid.finish().expect("distinct scan occurrences are valid");
@@ -351,7 +361,7 @@ fn scan_occurrence_is_unique_without_splitting_provider_relation_identity() {
         ProviderReadOccurrenceId::new(13),
     )
     .unwrap();
-    let mut duplicate = PlanBuilder::new(version());
+    let mut duplicate = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     duplicate.add_fragment(duplicate_first).unwrap();
     duplicate.add_fragment(duplicate_second).unwrap();
     let error = duplicate.finish().unwrap_err().to_string();
@@ -380,12 +390,18 @@ fn finish_scan_predicate_contract(
         )
         .unwrap();
     let predicate = builder
-        .add_expression(
+        .define(
             scan,
             (ty(DataType::Boolean, false)).clone(),
             fixture_constants.boolean(true, &(ty(DataType::Boolean, false))),
         )
         .unwrap();
+    let predicate = builder.root_definition(
+        scan,
+        predicate,
+        novarocks_type_contract::EvaluationDemand::TruthOnly,
+        crate::RootScope::Port(0),
+    );
     let predicate_guarantees = guarantees
         .iter()
         .map(|kind| PredicateGuarantee {
@@ -400,6 +416,7 @@ fn finish_scan_predicate_contract(
     }
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -420,7 +437,8 @@ fn finish_scan_predicate_contract(
             },
         })
         .unwrap();
-    builder.finish_definition(
+    crate::tests::unit_fixture::seal_pure_unit(&mut builder, scan);
+    builder.finish_fixture_definition(
         scan,
         FragmentSink::Noop,
         dop(),
@@ -539,6 +557,7 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
         .unwrap();
     destination_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: destination_node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -555,14 +574,27 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
         .unwrap();
     let result_node = destination_builder.reserve_node_id().unwrap();
     let result_expression = destination_builder
-        .add_expression(
+        .define(
             result_node,
             ty(DataType::Int64, false),
             ExprKind::Value(destination_value),
         )
         .unwrap();
+    let result_root_0 = destination_builder.root_definition(
+        result_node,
+        result_expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        RootScope::Port(0),
+    );
+    let result_root_1 = destination_builder.root_definition(
+        result_node,
+        result_expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        RootScope::Port(0),
+    );
     destination_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: result_node,
             inputs: Box::from([destination_node]),
             required_inputs: Box::from([unconstrained()]),
@@ -573,14 +605,14 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
             },
             kind: NodeKind::Project {
                 expressions: Box::from([
-                    (result_expression, destination_value),
-                    (result_expression, destination_value),
+                    (result_root_0, destination_value),
+                    (result_root_1, destination_value),
                 ]),
             },
         })
         .unwrap();
     let destination = destination_builder
-        .finish_definition(
+        .finish_fixture_definition(
             result_node,
             FragmentSink::Result,
             dop(),
@@ -588,7 +620,7 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
@@ -689,6 +721,7 @@ fn edge_rejects_a_receiver_that_narrows_nullability_before_plan_publication() {
         .unwrap();
     destination_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: destination_node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -704,14 +737,14 @@ fn edge_rejects_a_receiver_that_narrows_nullability_before_plan_publication() {
         })
         .unwrap();
     let destination = destination_builder
-        .finish_definition(
+        .finish_fixture_definition(
             destination_node,
             FragmentSink::Noop,
             dop(),
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
@@ -764,6 +797,7 @@ fn edge_accepts_a_receiver_that_admits_null_the_sender_never_writes() {
         .unwrap();
     destination_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: destination_node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -779,14 +813,14 @@ fn edge_accepts_a_receiver_that_admits_null_the_sender_never_writes() {
         })
         .unwrap();
     let destination = destination_builder
-        .finish_definition(
+        .finish_fixture_definition(
             destination_node,
             FragmentSink::Noop,
             dop(),
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
@@ -837,6 +871,7 @@ fn broadcast_edge_plan(
         .unwrap();
     destination_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: receiver,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -856,14 +891,14 @@ fn broadcast_edge_plan(
         })
         .unwrap();
     let destination = destination_builder
-        .finish_definition(
+        .finish_fixture_definition(
             receiver,
             FragmentSink::Noop,
             dop(),
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
@@ -910,7 +945,7 @@ fn broadcast_properties_cannot_claim_single_copy_rows() {
     let mut builder = FragmentBuilder::new(FragmentId::new(5));
     let node = builder.reserve_node_id().unwrap();
     let expression = builder
-        .add_expression(
+        .define(
             node,
             (ty(DataType::Int64, false)).clone(),
             fixture_constants.i64(1, &(ty(DataType::Int64, false))),
@@ -925,8 +960,15 @@ fn broadcast_properties_cannot_claim_single_copy_rows() {
             },
         )
         .unwrap();
+    let value_field_root_0 = builder.root_definition(
+        node,
+        expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -940,13 +982,13 @@ fn broadcast_properties_cannot_claim_single_copy_rows() {
                 columns: Box::from([value]),
             },
             kind: NodeKind::Values {
-                rows: Box::from([Box::from([expression])]),
+                rows: Box::from([Box::from([value_field_root_0])]),
             },
         })
         .unwrap();
 
     let error = builder
-        .finish_definition(
+        .finish_fixture_definition(
             node,
             FragmentSink::Noop,
             dop(),
@@ -965,7 +1007,7 @@ fn non_empty_values_require_an_exact_singleton_or_replicated_broadcast_placement
         let node = builder.reserve_node_id().unwrap();
         let value_type = ty(DataType::Int64, false);
         let expression = builder
-            .add_expression(
+            .define(
                 node,
                 (value_type.clone()).clone(),
                 fixture_constants.i64(1, &(value_type.clone())),
@@ -980,8 +1022,15 @@ fn non_empty_values_require_an_exact_singleton_or_replicated_broadcast_placement
                 },
             )
             .unwrap();
+        let value_field_root_0 = builder.root_definition(
+            node,
+            expression,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::AllPorts,
+        );
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: node,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -991,11 +1040,11 @@ fn non_empty_values_require_an_exact_singleton_or_replicated_broadcast_placement
                     columns: Box::from([value]),
                 },
                 kind: NodeKind::Values {
-                    rows: Box::from([Box::from([expression])]),
+                    rows: Box::from([Box::from([value_field_root_0])]),
                 },
             })
             .unwrap();
-        builder.finish_definition(
+        builder.finish_fixture_definition(
             node,
             FragmentSink::Noop,
             dop(),
@@ -1049,6 +1098,7 @@ fn metadata_relation_retains_its_closed_source_contract() {
             .unwrap();
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: node,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -1071,7 +1121,7 @@ fn metadata_relation_retains_its_closed_source_contract() {
                 },
             })
             .unwrap();
-        builder.finish_definition(
+        builder.finish_fixture_definition(
             node,
             FragmentSink::Noop,
             dop(),
@@ -1079,7 +1129,7 @@ fn metadata_relation_retains_its_closed_source_contract() {
         )
     };
     let fragment = build(relation.clone()).unwrap();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(fragment).unwrap();
     let plan = plan.finish().unwrap();
     assert!(matches!(
@@ -1192,6 +1242,7 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
         .unwrap();
     consumer_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: receiver,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1207,7 +1258,7 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
         })
         .unwrap();
     let consumer = consumer_builder
-        .finish_definition(
+        .finish_fixture_definition(
             receiver,
             FragmentSink::Noop,
             dop(),
@@ -1215,7 +1266,7 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
         )
         .unwrap();
 
-    let mut builder = PlanBuilder::new(version());
+    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     builder.add_fragment(producer).unwrap();
     builder.add_fragment(consumer).unwrap();
     builder
@@ -1276,154 +1327,27 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
     );
 }
 
-#[test]
-fn expression_semantic_depth_is_bounded_without_recursive_validation() {
-    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    let mut builder = FragmentBuilder::new(FragmentId::new(8));
-    let node = builder.reserve_node_id().unwrap();
-    let value_type = ty(DataType::Int64, false);
-    let mut expression = builder
-        .add_expression(
-            node,
-            (value_type.clone()).clone(),
-            fixture_constants.i64(1, &(value_type.clone())),
-        )
-        .unwrap();
-    for _ in 1..=PlanLimits::FROZEN.expression_semantic_depth {
-        expression = builder
-            .add_expression(
-                node,
-                value_type.clone(),
-                ExprKind::Cast {
-                    allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
-                        id: novarocks_type_contract::SemanticParameterId::new(0),
-                        expected_key:
-                            novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-                    },
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    expr: expression,
-                    target: DataType::Int64,
-                },
-            )
-            .unwrap();
-    }
-    let value = builder
-        .add_value(
-            value_type,
-            ValueOrigin::NodeOutput {
-                node,
-                output_ordinal: 0,
-            },
-        )
-        .unwrap();
-    builder
-        .insert_node_unchecked(PhysicalNode {
-            id: node,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: singleton(),
-            output: OutputPort {
-                node,
-                columns: Box::from([value]),
-            },
-            kind: NodeKind::Values {
-                rows: Box::from([Box::from([expression])]),
-            },
-        })
-        .unwrap();
-
-    let errors = builder
-        .finish_definition(
-            node,
-            FragmentSink::Noop,
-            dop(),
-            crate::StagePlacementPolicy::Singleton,
-        )
-        .unwrap_err();
-    assert!(
-        errors
-            .to_string()
-            .contains("expression semantic depth exceeds 256")
-    );
-    // Exceeding a declared bound is admission information, not proof that the
-    // producer emitted an illegal plan. A consumer must be able to tell those
-    // apart without reading the prose.
-    assert!(errors.has(ValidationErrorCategory::ResourceLimit));
-    assert!(!errors.is_producer_defect());
-}
-
-/// Builds a fragment whose only expression is one n-ary connective over
-/// `count` boolean literals, and returns the validation outcome.
-fn wide_connective_fragment(
-    count: usize,
-    connective: fn(Box<[ExprId]>) -> ExprKind,
-    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
-) -> Result<Fragment, ValidationErrors> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(9));
-    let node = builder.reserve_node_id().unwrap();
-    let boolean = ty(DataType::Boolean, false);
-    let args = (0..count)
-        .map(|_| {
-            builder
-                .add_expression(
-                    node,
-                    (boolean.clone()).clone(),
-                    fixture_constants.boolean(true, &(boolean.clone())),
-                )
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let root = builder
-        .add_expression(node, boolean.clone(), connective(args.into_boxed_slice()))
-        .unwrap();
-    let value = builder
-        .add_value(
-            boolean,
-            ValueOrigin::NodeOutput {
-                node,
-                output_ordinal: 0,
-            },
-        )
-        .unwrap();
-    builder
-        .insert_node_unchecked(PhysicalNode {
-            id: node,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: singleton(),
-            output: OutputPort {
-                node,
-                columns: Box::from([value]),
-            },
-            kind: NodeKind::Values {
-                rows: Box::from([Box::from([root])]),
-            },
-        })
-        .unwrap();
-    builder.finish_definition(
-        node,
-        FragmentSink::Noop,
-        dop(),
-        crate::StagePlacementPolicy::Singleton,
-    )
-}
-
 /// Builds a single-copy singleton `Values` node returning one boolean column,
 /// and returns the builder plus that node.
 fn boolean_source(
     fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
-) -> (FragmentBuilder, NodeId, ExprId) {
+) -> (FragmentBuilder, NodeId, RootOrdinal) {
     let mut builder = FragmentBuilder::new(FragmentId::new(12));
     let values = builder.reserve_node_id().unwrap();
     let boolean = ty(DataType::Boolean, false);
     let literal = builder
-        .add_expression(
+        .define(
             values,
             (boolean.clone()).clone(),
             fixture_constants.boolean(true, &(boolean.clone())),
         )
         .unwrap();
+    let literal = builder.root_definition(
+        values,
+        literal,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     let value = builder
         .add_value(
             boolean,
@@ -1435,6 +1359,7 @@ fn boolean_source(
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: values,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1448,6 +1373,7 @@ fn boolean_source(
             },
         })
         .unwrap();
+    crate::tests::unit_fixture::seal_pure_unit(&mut builder, values);
     (builder, values, literal)
 }
 
@@ -1469,10 +1395,10 @@ fn a_typed_constructor_refuses_before_a_node_exists() {
         builder.add_filter(filter, NodeId::new(404), Box::from([literal])),
         Err(BuildError::UndefinedInput { .. })
     ));
-    // The literal belongs to the Values node, not to the filter.
+    // The ordinal is local to Values; this filter has no such unit root.
     assert!(matches!(
         builder.add_filter(filter, values, Box::from([literal])),
-        Err(BuildError::ExpressionOutsideOwner { .. })
+        Err(BuildError::UndefinedRoot { .. })
     ));
 
     // A fresh builder, because a rejected predicate would otherwise leave an
@@ -1481,12 +1407,18 @@ fn a_typed_constructor_refuses_before_a_node_exists() {
         let (mut other, other_values, _) = boolean_source(&mut fixture_constants);
         let other_filter = other.reserve_node_id().unwrap();
         let non_boolean = other
-            .add_expression(
+            .define(
                 other_filter,
                 (ty(DataType::Int64, false)).clone(),
                 fixture_constants.i64(1, &(ty(DataType::Int64, false))),
             )
             .unwrap();
+        let non_boolean = other.root_definition(
+            other_filter,
+            non_boolean,
+            novarocks_type_contract::EvaluationDemand::Value,
+            RootScope::Port(0),
+        );
         assert!(matches!(
             other.add_filter(other_filter, other_values, Box::from([non_boolean])),
             Err(BuildError::PredicateIsNotBoolean(_))
@@ -1497,12 +1429,18 @@ fn a_typed_constructor_refuses_before_a_node_exists() {
     assert!(builder.node_output_properties(filter).is_none());
 
     let predicate = builder
-        .add_expression(
+        .define(
             filter,
             (ty(DataType::Boolean, false)).clone(),
             fixture_constants.boolean(true, &(ty(DataType::Boolean, false))),
         )
         .unwrap();
+    let predicate = builder.root_definition(
+        filter,
+        predicate,
+        novarocks_type_contract::EvaluationDemand::TruthOnly,
+        RootScope::Port(0),
+    );
     builder
         .add_filter(filter, values, Box::from([predicate]))
         .expect("a boolean predicate over an existing input is a filter");
@@ -1514,7 +1452,7 @@ fn a_typed_constructor_refuses_before_a_node_exists() {
         derive_filter_output_properties(&singleton(), true)
     );
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             filter,
             FragmentSink::Noop,
             dop(),
@@ -1524,60 +1462,13 @@ fn a_typed_constructor_refuses_before_a_node_exists() {
 }
 
 #[test]
-fn a_wide_predicate_is_width_and_not_depth() {
-    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    // Comfortably past PlanLimits::FROZEN.expression_semantic_depth. A dashboard filter panel
-    // or a generated `(a=1 AND b=2) OR ...` reaches this size routinely, so it
-    // must validate: the depth bound exists to stop pathological nesting, not
-    // to cap how many conditions a query may state.
-    const CONJUNCTS: usize = PlanLimits::FROZEN.expression_semantic_depth * 2;
-    const _: () = assert!(
-        CONJUNCTS > PlanLimits::FROZEN.expression_semantic_depth,
-        "the fixture must exceed the depth bound or it proves nothing"
-    );
-    wide_connective_fragment(
-        CONJUNCTS,
-        |args| ExprKind::Conjunction { args },
-        &mut fixture_constants,
-    )
-    .expect("a wide conjunction is an ordinary query");
-    wide_connective_fragment(
-        CONJUNCTS,
-        |args| ExprKind::Disjunction { args },
-        &mut fixture_constants,
-    )
-    .expect("a wide disjunction is an ordinary query");
-}
-
-#[test]
-fn a_boolean_connective_needs_at_least_two_arguments() {
-    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    // One spelling per predicate: a single-argument connective would be a
-    // second way to write the argument itself.
-    for count in [0, 1] {
-        let errors = wide_connective_fragment(
-            count,
-            |args| ExprKind::Conjunction { args },
-            &mut fixture_constants,
-        )
-        .expect_err("a connective below arity two has no meaning");
-        assert!(errors.is_producer_defect());
-        assert!(
-            errors
-                .to_string()
-                .contains("boolean connective requires at least two arguments")
-        );
-    }
-}
-
-#[test]
 fn a_violated_contract_invariant_is_reported_as_a_producer_defect() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let mut builder = FragmentBuilder::new(FragmentId::new(8));
     let node = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, false);
     let expression = builder
-        .add_expression(
+        .define(
             node,
             (value_type.clone()).clone(),
             fixture_constants.i64(1, &(value_type.clone())),
@@ -1592,8 +1483,15 @@ fn a_violated_contract_invariant_is_reported_as_a_producer_defect() {
             },
         )
         .unwrap();
+    let value_field_root_0 = builder.root_definition(
+        node,
+        expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1603,7 +1501,7 @@ fn a_violated_contract_invariant_is_reported_as_a_producer_defect() {
                 columns: Box::from([value]),
             },
             kind: NodeKind::Values {
-                rows: Box::from([Box::from([expression])]),
+                rows: Box::from([Box::from([value_field_root_0])]),
             },
         })
         .unwrap();
@@ -1612,7 +1510,7 @@ fn a_violated_contract_invariant_is_reported_as_a_producer_defect() {
     // planner, cannot succeed on another backend, and cannot be cleared by
     // raising a limit.
     let errors = builder
-        .finish_definition(
+        .finish_fixture_definition(
             NodeId::new(999),
             FragmentSink::Noop,
             dop(),
@@ -1631,7 +1529,7 @@ fn output_properties_cannot_name_a_value_absent_from_the_output_port() {
     let node = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, false);
     let expression = builder
-        .add_expression(
+        .define(
             node,
             (value_type.clone()).clone(),
             fixture_constants.i64(1, &(value_type.clone())),
@@ -1655,8 +1553,15 @@ fn output_properties_cannot_name_a_value_absent_from_the_output_port() {
             },
         )
         .unwrap();
+    let value_field_root_0 = builder.root_definition(
+        node,
+        expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1673,13 +1578,13 @@ fn output_properties_cannot_name_a_value_absent_from_the_output_port() {
                 columns: Box::from([visible]),
             },
             kind: NodeKind::Values {
-                rows: Box::from([Box::from([expression])]),
+                rows: Box::from([Box::from([value_field_root_0])]),
             },
         })
         .unwrap();
 
     let error = builder
-        .finish_definition(
+        .finish_fixture_definition(
             node,
             FragmentSink::Noop,
             dop(),
@@ -1696,7 +1601,7 @@ fn project_cannot_publish_an_uncomputed_output() {
     let mut builder = FragmentBuilder::new(FragmentId::new(11));
     let source = builder.reserve_node_id().unwrap();
     let source_expression = builder
-        .add_expression(
+        .define(
             source,
             (ty(DataType::Int64, false)).clone(),
             fixture_constants.i64(1, &(ty(DataType::Int64, false))),
@@ -1711,8 +1616,15 @@ fn project_cannot_publish_an_uncomputed_output() {
             },
         )
         .unwrap();
+    let value_field_root_0 = builder.root_definition(
+        source,
+        source_expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1722,29 +1634,23 @@ fn project_cannot_publish_an_uncomputed_output() {
                 columns: Box::from([source_value]),
             },
             kind: NodeKind::Values {
-                rows: Box::from([Box::from([source_expression])]),
+                rows: Box::from([Box::from([value_field_root_0])]),
             },
         })
         .unwrap();
     let project = builder.reserve_node_id().unwrap();
-    let fabricated_expression = builder
-        .add_expression(
-            project,
-            (ty(DataType::Int64, false)).clone(),
-            fixture_constants.i64(2, &(ty(DataType::Int64, false))),
-        )
-        .unwrap();
     let fabricated = builder
         .add_value(
             ty(DataType::Int64, false),
             ValueOrigin::Expr {
                 node: project,
-                expr: fabricated_expression,
+                root: RootOrdinal::new(0),
             },
         )
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: project,
             inputs: Box::from([source]),
             required_inputs: Box::from([unconstrained()]),
@@ -1760,7 +1666,7 @@ fn project_cannot_publish_an_uncomputed_output() {
         .unwrap();
 
     let error = builder
-        .finish_definition(
+        .finish_fixture_definition(
             project,
             FragmentSink::Noop,
             dop(),
@@ -1791,6 +1697,7 @@ fn exchange_partitioning_maps_source_and_destination_value_domains() {
         .unwrap();
     receiver
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: receiver_node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1806,14 +1713,14 @@ fn exchange_partitioning_maps_source_and_destination_value_domains() {
         })
         .unwrap();
     let receiver = receiver
-        .finish_definition(
+        .finish_fixture_definition(
             receiver_node,
             FragmentSink::Noop,
             dop(),
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(receiver).unwrap();
     plan.add_edge(Edge {
@@ -1855,21 +1762,21 @@ fn integer_division_keeps_its_resolved_signed_result() {
     let mut builder = FragmentBuilder::new(FragmentId::new(23));
     let node = builder.reserve_node_id().unwrap();
     let left = builder
-        .add_expression(
+        .define(
             node,
             (ty(DataType::Int64, false)).clone(),
             fixture_constants.i64(6, &(ty(DataType::Int64, false))),
         )
         .unwrap();
     let right = builder
-        .add_expression(
+        .define(
             node,
             (ty(DataType::Int64, false)).clone(),
             fixture_constants.i64(2, &(ty(DataType::Int64, false))),
         )
         .unwrap();
     let divide = builder
-        .add_expression(
+        .define(
             node,
             ty(DataType::Int64, false),
             ExprKind::Binary {
@@ -1894,8 +1801,15 @@ fn integer_division_keeps_its_resolved_signed_result() {
             },
         )
         .unwrap();
+    let value_field_root_0 = builder.root_definition(
+        node,
+        divide,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1905,12 +1819,12 @@ fn integer_division_keeps_its_resolved_signed_result() {
                 columns: Box::from([output]),
             },
             kind: NodeKind::Values {
-                rows: Box::from([Box::from([divide])]),
+                rows: Box::from([Box::from([value_field_root_0])]),
             },
         })
         .unwrap();
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             node,
             FragmentSink::Noop,
             dop(),
@@ -1925,7 +1839,7 @@ fn left_outer_join_cannot_publish_the_original_build_value() {
     let mut builder = FragmentBuilder::new(FragmentId::new(24));
     let left_node = builder.reserve_node_id().unwrap();
     let left_expr = builder
-        .add_expression(
+        .define(
             left_node,
             (ty(DataType::Int64, false)).clone(),
             fixture_constants.i64(1, &(ty(DataType::Int64, false))),
@@ -1940,8 +1854,15 @@ fn left_outer_join_cannot_publish_the_original_build_value() {
             },
         )
         .unwrap();
+    let value_field_root_0 = builder.root_definition(
+        left_node,
+        left_expr,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: left_node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1951,7 +1872,7 @@ fn left_outer_join_cannot_publish_the_original_build_value() {
                 columns: Box::from([left]),
             },
             kind: NodeKind::Values {
-                rows: Box::from([Box::from([left_expr])]),
+                rows: Box::from([Box::from([value_field_root_0])]),
             },
         })
         .unwrap();
@@ -1967,6 +1888,7 @@ fn left_outer_join_cannot_publish_the_original_build_value() {
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: right_node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1983,6 +1905,7 @@ fn left_outer_join_cannot_publish_the_original_build_value() {
     let join = builder.reserve_node_id().unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: join,
             inputs: Box::from([left_node, right_node]),
             required_inputs: Box::from([unconstrained(), unconstrained()]),
@@ -2000,7 +1923,7 @@ fn left_outer_join_cannot_publish_the_original_build_value() {
         })
         .unwrap();
     let error = builder
-        .finish_definition(
+        .finish_fixture_definition(
             join,
             FragmentSink::Noop,
             dop(),
@@ -2038,6 +1961,7 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -2058,8 +1982,14 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
         .unwrap();
     let sort = builder.reserve_node_id().unwrap();
     let sort_key = builder
-        .add_expression(sort, ty(DataType::Int64, false), ExprKind::Value(a))
+        .define(sort, ty(DataType::Int64, false), ExprKind::Value(a))
         .unwrap();
+    let sort_key = builder.root_definition(
+        sort,
+        sort_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        RootScope::Port(0),
+    );
     let sorted = PhysicalProperties {
         distribution: Distribution::Singleton,
         row_multiplicity: RowMultiplicity::SingleCopy,
@@ -2071,6 +2001,7 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: sort,
             inputs: Box::from([source]),
             required_inputs: Box::from([PhysicalProperties {
@@ -2095,10 +2026,17 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
         .unwrap();
     let project = builder.reserve_node_id().unwrap();
     let project_b = builder
-        .add_expression(project, ty(DataType::Int64, false), ExprKind::Value(b))
+        .define(project, ty(DataType::Int64, false), ExprKind::Value(b))
         .unwrap();
+    let project_b = builder.root_definition(
+        project,
+        project_b,
+        novarocks_type_contract::EvaluationDemand::Value,
+        RootScope::Port(0),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: project,
             inputs: Box::from([sort]),
             required_inputs: Box::from([unconstrained()]),
@@ -2117,7 +2055,7 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
         })
         .unwrap();
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             project,
             FragmentSink::Noop,
             dop(),
@@ -2132,7 +2070,7 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
     let mut builder = FragmentBuilder::new(FragmentId::new(28));
     let source = builder.reserve_node_id().unwrap();
     let expression = builder
-        .add_expression(
+        .define(
             source,
             (ty(DataType::Int64, false)).clone(),
             fixture_constants.i64(1, &(ty(DataType::Int64, false))),
@@ -2147,8 +2085,15 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
             },
         )
         .unwrap();
+    let value_field_root_0 = builder.root_definition(
+        source,
+        expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -2158,7 +2103,7 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
                 columns: Box::from([input]),
             },
             kind: NodeKind::Values {
-                rows: Box::from([Box::from([expression])]),
+                rows: Box::from([Box::from([value_field_root_0])]),
             },
         })
         .unwrap();
@@ -2174,6 +2119,7 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: repeat,
             inputs: Box::from([source]),
             required_inputs: Box::from([unconstrained()]),
@@ -2191,74 +2137,13 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
         })
         .unwrap();
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             repeat,
             FragmentSink::Noop,
             dop(),
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-}
-
-#[test]
-fn lambda_parameter_type_is_part_of_its_declaration() {
-    let mut builder = FragmentBuilder::new(FragmentId::new(29));
-    let node = builder.reserve_node_id().unwrap();
-    let lambda = builder.reserve_expression_id().unwrap();
-    let parameter = builder
-        .add_expression_in_scope(
-            node,
-            Some(lambda),
-            ty(DataType::Utf8, false),
-            ExprKind::LambdaParameter { lambda, ordinal: 0 },
-        )
-        .unwrap();
-    builder
-        .insert_expression(ExprNode {
-            id: lambda,
-            owner: node,
-            lambda_scope: None,
-            ty: ty(DataType::Utf8, false),
-            kind: ExprKind::Lambda {
-                parameter_types: Box::from([ty(DataType::Int64, false)]),
-                body: parameter,
-            },
-        })
-        .unwrap();
-    let output = builder
-        .add_value(
-            ty(DataType::Utf8, false),
-            ValueOrigin::NodeOutput {
-                node,
-                output_ordinal: 0,
-            },
-        )
-        .unwrap();
-    builder
-        .insert_node_unchecked(PhysicalNode {
-            id: node,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: singleton(),
-            output: OutputPort {
-                node,
-                columns: Box::from([output]),
-            },
-            kind: NodeKind::Values {
-                rows: Box::from([Box::from([lambda])]),
-            },
-        })
-        .unwrap();
-    let error = builder
-        .finish_definition(
-            node,
-            FragmentSink::Noop,
-            dop(),
-            crate::StagePlacementPolicy::Singleton,
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("lambda parameter does not reference a matching lambda owner"));
 }
 
 #[test]
@@ -2366,7 +2251,7 @@ fn annotation_count_and_value_bytes_are_bounded() {
         false,
         &mut fixture_constants,
     );
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(fragment).unwrap();
     for _ in 0..=MAX_ANNOTATIONS {
         plan.add_annotation(PlanAnnotation {
@@ -2386,7 +2271,7 @@ fn annotation_count_and_value_bytes_are_bounded() {
         false,
         &mut fixture_constants,
     );
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(fragment).unwrap();
     plan.add_annotation(PlanAnnotation {
         subject: AnnotationSubject::Plan,
@@ -2436,185 +2321,4 @@ fn independent_fragment_cut_checks_complete_valid_value_binding() {
     };
     let error = validate_fragment(&fragment, &cuts).unwrap_err().to_string();
     assert!(error.contains("outbound cut type differs from its source value"));
-}
-
-#[test]
-fn physical_binary_policy_rejects_reporting_comparisons_before_publication() {
-    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    use novarocks_type_contract::DecimalOverflowPolicy as Policy;
-    for (op, policy, accepted) in [
-        (BinaryOperator::Eq, Policy::OutputNull, true),
-        (BinaryOperator::Eq, Policy::ReportError, false),
-        (BinaryOperator::Add, Policy::OutputNull, true),
-        (BinaryOperator::Add, Policy::ReportError, true),
-    ] {
-        let mut builder = FragmentBuilder::new(FragmentId::new(31));
-        let node = builder.reserve_node_id().unwrap();
-        let operand = builder
-            .add_expression(
-                node,
-                (ty(DataType::Int64, false)).clone(),
-                fixture_constants.i64(1, &(ty(DataType::Int64, false))),
-            )
-            .unwrap();
-        let result_type = if matches!(op, BinaryOperator::Eq) {
-            DataType::Boolean
-        } else {
-            DataType::Int64
-        };
-        let expr = builder
-            .add_expression(
-                node,
-                ty(result_type.clone(), false),
-                ExprKind::Binary {
-                    allow_throw_exception: matches!(
-                        op,
-                        BinaryOperator::Add
-                            | BinaryOperator::Subtract
-                            | BinaryOperator::Multiply
-                            | BinaryOperator::Divide
-                            | BinaryOperator::Modulo
-                    )
-                    .then_some(novarocks_type_contract::SemanticParameterRef {
-                        id: novarocks_type_contract::SemanticParameterId::new(0),
-                        expected_key:
-                            novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-                    }),
-                    left: operand,
-                    op,
-                    right: operand,
-                    decimal_overflow_policy: policy,
-                },
-            )
-            .unwrap();
-        let value = builder
-            .add_value(
-                ty(result_type, false),
-                ValueOrigin::NodeOutput {
-                    node,
-                    output_ordinal: 0,
-                },
-            )
-            .unwrap();
-        builder
-            .insert_node_unchecked(PhysicalNode {
-                id: node,
-                inputs: Box::default(),
-                required_inputs: Box::default(),
-                output_properties: singleton(),
-                output: OutputPort {
-                    node,
-                    columns: Box::from([value]),
-                },
-                kind: NodeKind::Values {
-                    rows: Box::from([Box::from([expr])]),
-                },
-            })
-            .unwrap();
-        let result = builder.finish_definition(
-            node,
-            FragmentSink::Noop,
-            dop(),
-            crate::StagePlacementPolicy::Singleton,
-        );
-        if accepted {
-            result.unwrap();
-        } else {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("requires OutputNull decimal policy")
-            );
-        }
-    }
-}
-
-#[test]
-fn physical_nested_decimal_cast_requires_a_supported_frozen_policy() {
-    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    use arrow_schema::Field;
-    use novarocks_type_contract::DecimalOverflowPolicy as Policy;
-    use std::sync::Arc;
-    let source = DataType::List(Arc::new(Field::new(
-        "element",
-        DataType::Decimal128(10, 2),
-        true,
-    )));
-    let target = DataType::List(Arc::new(Field::new(
-        "element",
-        DataType::Decimal128(12, 3),
-        true,
-    )));
-    for (result_type, policy, accepted) in [
-        (target.clone(), Policy::ReportError, false),
-        (target, Policy::OutputNull, true),
-        (source.clone(), Policy::ReportError, true),
-    ] {
-        let mut builder = FragmentBuilder::new(FragmentId::new(32));
-        let node = builder.reserve_node_id().unwrap();
-        let operand = builder
-            .add_expression(
-                node,
-                (ty(source.clone(), true)).clone(),
-                fixture_constants.null(&(ty(source.clone(), true))),
-            )
-            .unwrap();
-        let expression = builder
-            .add_expression(
-                node,
-                ty(result_type.clone(), true),
-                ExprKind::Cast {
-                    allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
-                        id: novarocks_type_contract::SemanticParameterId::new(0),
-                        expected_key:
-                            novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-                    },
-                    expr: operand,
-                    target: ty(result_type.clone(), true).data_type().clone(),
-                    decimal_overflow_policy: policy,
-                },
-            )
-            .unwrap();
-        let value = builder
-            .add_value(
-                ty(result_type, true),
-                ValueOrigin::NodeOutput {
-                    node,
-                    output_ordinal: 0,
-                },
-            )
-            .unwrap();
-        builder
-            .insert_node_unchecked(PhysicalNode {
-                id: node,
-                inputs: Box::default(),
-                required_inputs: Box::default(),
-                output_properties: singleton(),
-                output: OutputPort {
-                    node,
-                    columns: Box::from([value]),
-                },
-                kind: NodeKind::Values {
-                    rows: Box::from([Box::from([expression])]),
-                },
-            })
-            .unwrap();
-        let result = builder.finish_definition(
-            node,
-            FragmentSink::Noop,
-            dop(),
-            crate::StagePlacementPolicy::Singleton,
-        );
-        if accepted {
-            result.unwrap();
-        } else {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("does not support nested type conversion")
-            );
-        }
-    }
 }

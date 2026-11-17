@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use arrow_array::{Array, Int64Array, new_null_array};
 use arrow_schema::{DataType, Field};
 use novarocks_constant_contract::ConstantPolicy;
@@ -123,9 +125,7 @@ fn request_fragment(
         .add_values(NodeId::new(99), Box::default(), Box::from([source_value]))
         .unwrap();
     let argument_kind = ExprKind::Value(source_value);
-    let input = builder
-        .add_expression(owner, ty.clone(), argument_kind)
-        .unwrap();
+    let input = builder.define(owner, ty.clone(), argument_kind).unwrap();
     let result = FunctionValueType::new(DataType::Int64, true);
     let function = crate::BoundFunction {
         function_id: FunctionId::try_new("test/request-source").unwrap(),
@@ -147,7 +147,7 @@ fn request_fragment(
         }),
     };
     let call = builder
-        .add_expression(
+        .define(
             owner,
             result.clone(),
             ExprKind::FunctionCall {
@@ -156,27 +156,39 @@ fn request_fragment(
             },
         )
         .unwrap();
+    let call_root = builder.root_definition(
+        owner,
+        call,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let output = builder
         .add_value(
             result,
             crate::ValueOrigin::Expr {
                 node: owner,
-                expr: call,
+                root: call_root,
             },
         )
         .unwrap();
-    let mut assignments = vec![(call, output)];
+    let mut assignments = vec![(call_root, output)];
     let mut outputs = vec![output];
     if let Some(reference) = shared_expression {
         let expression = builder
-            .add_expression(owner, ty.clone(), ExprKind::Constant(reference))
+            .define(owner, ty.clone(), ExprKind::Constant(reference))
             .unwrap();
+        let expression = builder.root_definition(
+            owner,
+            expression,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
         let value = builder
             .add_value(
                 ty.clone(),
                 crate::ValueOrigin::Expr {
                     node: owner,
-                    expr: expression,
+                    root: expression,
                 },
             )
             .unwrap();
@@ -191,8 +203,69 @@ fn request_fragment(
             outputs.into_boxed_slice(),
         )
         .unwrap();
+    // The fixture explicitly authors an eager scalar call and its original
+    // selected constant arguments before publishing this node's checked unit.
+    let original = crate::PhysicalCallRequest {
+        arguments: refs
+            .iter()
+            .map(|reference| FunctionArgument::Value {
+                value_type: ty.clone(),
+                constant: *reference,
+            })
+            .collect(),
+        logical_argument_count: refs.len(),
+        expected_result_type: None,
+        constant_policy: policy(),
+    };
+    let unit = builder.unit(owner).unwrap();
+    unit.request(call, original).unwrap();
+    unit.definition_control(
+        call,
+        novarocks_expression_contract::DefinitionControl {
+            shape: novarocks_type_contract::ControlShape::Eager,
+            temporal_sources: None,
+        },
+    )
+    .unwrap();
+    let ports = builder.node_ports(owner).unwrap();
+    let draft = builder.take_unit_builder(owner).unwrap();
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
+    let sealed = draft.seal(ports, &mut work).unwrap();
+    let claims = sealed
+        .uses()
+        .iter()
+        .filter(|(_, invocation)| invocation.definition == call)
+        .map(|(&id, invocation)| {
+            use novarocks_type_contract::*;
+            (
+                id,
+                novarocks_expression_contract::ExpressionCallClaim {
+                    context: invocation.context,
+                    effects: CallEffects {
+                        value_stability: FunctionVolatility::Immutable,
+                        own_row_error: FunctionIntrinsicRowError::NoRowError,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        null_behavior: FunctionNullBehavior::CalledOnNull,
+                        argument_control: ArgumentControl::Eager,
+                        instance_state: FunctionInstanceState::None,
+                        observable_effects: ObservableEffects::NONE,
+                        environment: Box::default(),
+                        proof_scope: CallProofScope::Region(invocation.context.region),
+                    },
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    temporal_source: None,
+                    regexp_count_pattern_source: None,
+                    to_base64_byte_source: None,
+                },
+            )
+        })
+        .collect();
+    let unit = sealed.finish(claims, &mut work).unwrap();
+    work.finish().unwrap();
+    builder.install_unit(owner, Arc::new(unit)).unwrap();
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             owner,
             crate::FragmentSink::Noop,
             crate::PipelineDopDomain {
@@ -203,26 +276,8 @@ fn request_fragment(
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap()
-        .with_call_requests_observed(
-            vec![(
-                crate::PhysicalCallDefinition::Expression(call),
-                crate::PhysicalCallRequest {
-                    arguments: refs
-                        .iter()
-                        .map(|reference| FunctionArgument::Value {
-                            value_type: ty.clone(),
-                            constant: *reference,
-                        })
-                        .collect(),
-                    logical_argument_count: refs.len(),
-                    expected_result_type: None,
-                    constant_policy: policy(),
-                },
-            )],
-            &Control::default(),
-        )
-        .unwrap()
 }
+
 fn project(
     fragment: &crate::Fragment,
     pools: &ConstantPools,
@@ -244,8 +299,11 @@ fn closed(
     validate_fragment_constants_observed(fragment, pools, true, crate::PlanLimits::FROZEN, control)
 }
 fn plan(fragment: &crate::Fragment, pools: ConstantPools) -> crate::PhysicalPlan {
-    let mut builder = crate::PlanBuilder::new(crate::PlanVersionId::try_new([81; 16]).unwrap())
-        .with_constant_pools(pools);
+    let mut builder = crate::PlanBuilder::new(
+        crate::PlanVersionId::try_new([81; 16]).unwrap(),
+        crate::tests::constant_fixture::policy(),
+    )
+    .with_constant_pools(pools);
     builder.add_fragment(fragment.clone()).unwrap();
     builder.finish_observed(&Control::default()).unwrap()
 }
@@ -284,9 +342,11 @@ fn request_only_selected_constant_projects_original_source_and_closes_local_and_
     );
     assert!(
         !fragment
-            .expressions()
-            .iter()
-            .any(|(_, node)| matches!(node.kind, crate::ExprKind::Constant(_)))
+            .nodes()
+            .values()
+            .filter_map(|node| node.expressions.as_ref())
+            .flat_map(|unit| unit.definitions())
+            .any(|node| matches!(node.kind, crate::ExprKind::Constant(_)))
     );
     let pools = table(&[0, u32::MAX], &pool);
     let projected = project(&fragment, &pools, &Control::default()).unwrap();

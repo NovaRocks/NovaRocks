@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use novarocks_connector_contract::{
     ConnectorCodecCategory, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
 };
@@ -47,14 +49,14 @@ fn literal_root(
     let mut builder = FragmentBuilder::new(FragmentId::new(721));
     let node = builder.reserve_node_id().unwrap();
     let effect_expression = builder
-        .add_expression(
+        .define(
             node,
             (ty(DataType::Int64, false)).clone(),
             fixture_constants.i64(1, &(ty(DataType::Int64, false))),
         )
         .unwrap();
     let input_expression = builder
-        .add_expression(
+        .define(
             node,
             (ty(DataType::Int64, false)).clone(),
             fixture_constants.i64(2, &(ty(DataType::Int64, false))),
@@ -78,8 +80,21 @@ fn literal_root(
             },
         )
         .unwrap();
+    let value_field_root_0 = builder.root_definition(
+        node,
+        effect_expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
+    let value_field_root_1 = builder.root_definition(
+        node,
+        input_expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -89,7 +104,7 @@ fn literal_root(
                 columns: Box::from([effect, input]),
             },
             kind: NodeKind::Values {
-                rows: Box::from([Box::from([effect_expression, input_expression])]),
+                rows: Box::from([Box::from([value_field_root_0, value_field_root_1])]),
             },
         })
         .unwrap();
@@ -117,7 +132,7 @@ fn change_event_root_with_assignment(
     let (mut builder, source, _, source_value) = literal_root(fixture_constants);
     let node = builder.reserve_node_id().unwrap();
     let assignment = builder
-        .add_expression(
+        .define(
             node,
             ty(DataType::Int64, false),
             ExprKind::Value(source_value),
@@ -153,8 +168,23 @@ fn change_event_root_with_assignment(
             vec![(input, Some(assignment)), (input, Some(assignment))]
         }
     };
+    let assignments = assignments
+        .into_iter()
+        .map(|(output, definition)| {
+            let expression = definition.map(|definition| {
+                builder.root_definition(
+                    node,
+                    definition,
+                    novarocks_type_contract::EvaluationDemand::Value,
+                    crate::RootScope::Port(0),
+                )
+            });
+            crate::ChangeAssignment::exact(output, expression)
+        })
+        .collect();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([unconstrained()]),
@@ -167,12 +197,7 @@ fn change_event_root_with_assignment(
                 events: Box::from([ChangeEventSpec {
                     predicate: None,
                     effect: ConnectorRowMutationEffect::Insert,
-                    assignments: assignments
-                        .into_iter()
-                        .map(|(output, expression)| {
-                            crate::ChangeAssignment::exact(output, expression)
-                        })
-                        .collect(),
+                    assignments,
                 }]),
                 effect_output: effect,
             },
@@ -187,7 +212,7 @@ fn change_event_assignments_reject_the_generated_effect_output() {
     let (builder, root, _, _) =
         change_event_root_with_assignment(AssignmentShape::EffectTarget, &mut fixture_constants);
     let errors = builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Noop,
             dop(),
@@ -207,7 +232,7 @@ fn change_event_assignments_reject_outputs_absent_from_the_node_port() {
     let (builder, root, _, _) =
         change_event_root_with_assignment(AssignmentShape::OffPortTarget, &mut fixture_constants);
     let errors = builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Noop,
             dop(),
@@ -227,7 +252,7 @@ fn change_event_assignments_reject_duplicate_outputs() {
     let (builder, root, _, _) =
         change_event_root_with_assignment(AssignmentShape::DuplicateTarget, &mut fixture_constants);
     let errors = builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Noop,
             dop(),
@@ -305,7 +330,7 @@ fn finish_router_writer_fixture(
         _ => Distribution::Singleton,
     };
     let source = source_builder
-        .finish_definition(
+        .finish_fixture_definition(
             source_root,
             FragmentSink::Router {
                 effect,
@@ -355,6 +380,7 @@ fn finish_router_writer_fixture(
     });
     destination_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: exchange,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -474,6 +500,7 @@ fn finish_router_writer_fixture(
         }]);
     destination_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: writer,
             inputs: Box::from([exchange]),
             required_inputs: Box::from([PhysicalProperties {
@@ -506,7 +533,7 @@ fn finish_router_writer_fixture(
         })
         .unwrap();
     let destination = destination_builder
-        .finish_definition(
+        .finish_fixture_definition(
             writer,
             FragmentSink::Stream { edge: finish_edge },
             dop(),
@@ -538,6 +565,7 @@ fn finish_router_writer_fixture(
         .collect::<Vec<_>>();
     finish_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: finish_exchange,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -584,6 +612,7 @@ fn finish_router_writer_fixture(
             .unwrap();
         local_builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: local_input,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -656,6 +685,7 @@ fn finish_router_writer_fixture(
             }]);
         local_builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: local_writer,
                 inputs: Box::from([local_input]),
                 required_inputs: Box::from([PhysicalProperties {
@@ -689,7 +719,7 @@ fn finish_router_writer_fixture(
             .map(|field| field.value)
             .collect::<Box<[_]>>();
         let local_fragment = local_builder
-            .finish_definition(
+            .finish_fixture_definition(
                 local_writer,
                 FragmentSink::Stream { edge: union_edge },
                 dop(),
@@ -719,6 +749,7 @@ fn finish_router_writer_fixture(
             .collect::<Vec<_>>();
         finish_builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: local_exchange,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -775,6 +806,7 @@ fn finish_router_writer_fixture(
         }
         finish_builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: union,
                 inputs: Box::from([finish_exchange, local_exchange]),
                 required_inputs: Box::from([
@@ -869,6 +901,7 @@ fn finish_router_writer_fixture(
     );
     finish_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: summary_exchange,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1015,6 +1048,7 @@ fn finish_router_writer_fixture(
         .collect::<Vec<_>>();
     finish_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: finish,
             inputs: Box::from([finish_input_node, summary_exchange]),
             required_inputs: Box::from([singleton(), singleton()]),
@@ -1055,7 +1089,7 @@ fn finish_router_writer_fixture(
         })
         .unwrap();
     let finish_fragment = finish_builder
-        .finish_definition(
+        .finish_fixture_definition(
             finish,
             FragmentSink::Noop,
             dop(),
@@ -1063,7 +1097,7 @@ fn finish_router_writer_fixture(
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     if let Some((node, _)) = layout {
         let draft = novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft::try_new(
             novarocks_connector_contract::ConnectorWriteBinding::new(
@@ -1198,6 +1232,7 @@ fn append_write_layout_key(
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::new([child]),
             required_inputs: Box::new([unconstrained()]),
@@ -1312,6 +1347,7 @@ fn stream_affinity_rejects_layout_key_leakage_and_nested_layout() {
     parts.nodes.insert(
         wrapper,
         PhysicalNode {
+            expressions: None,
             id: wrapper,
             inputs: Box::new([old_root]),
             required_inputs: Box::new([unconstrained()]),
@@ -1557,7 +1593,7 @@ fn router_data_inputs_exclude_the_generated_effect_value() {
     let (mut builder, root, effect, _) = change_event_root(&mut fixture_constants);
     add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Router {
                 effect,
@@ -1586,7 +1622,7 @@ fn router_allows_two_target_fields_to_read_one_value_identity() {
     let (mut builder, root, effect, input) = change_event_root(&mut fixture_constants);
     add_router_summary(&mut builder, EdgeId::new(907));
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Router {
                 effect,
@@ -1616,7 +1652,7 @@ fn independent_fragment_rejects_duplicate_multicast_destinations() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let (builder, root, _, _) = literal_root(&mut fixture_constants);
     let errors = builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Multicast {
                 edges: Box::from([EdgeId::new(721), EdgeId::new(721)]),
@@ -1638,7 +1674,7 @@ fn independent_fragment_rejects_invalid_router_identity_and_layout() {
     let (mut builder, root, _, input) = literal_root(&mut fixture_constants);
     add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Router {
                 effect: ValueId::new(999_721),
@@ -1696,7 +1732,7 @@ fn independent_fragment_rejects_duplicate_router_identity() {
     let (mut builder, root, effect, input) = change_event_root(&mut fixture_constants);
     add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Router {
                 effect,
@@ -1806,7 +1842,7 @@ fn logical_summary_origin_requires_nonnull_int64_and_its_exact_counter_role() {
             author: crate::SummaryAuthor::RouterSink,
         }]));
         let errors = builder
-            .finish_definition(
+            .finish_fixture_definition(
                 root,
                 FragmentSink::Router {
                     effect,
@@ -1855,7 +1891,7 @@ fn placement_rejects_absent_scan_and_ambiguous_source_sets_before_scheduling() {
     ] {
         let (builder, root, _, _) = literal_root(&mut fixture_constants);
         let errors = builder
-            .finish_definition(root, FragmentSink::Noop, dop(), policy)
+            .finish_fixture_definition(root, FragmentSink::Noop, dop(), policy)
             .unwrap_err();
         assert!(
             errors
@@ -2003,7 +2039,7 @@ fn summary_authors_are_closed_facts_and_kinds_cannot_borrow_a_router() {
             FragmentSink::Noop
         };
         let errors = builder
-            .finish_definition(root, sink, dop(), crate::StagePlacementPolicy::Singleton)
+            .finish_fixture_definition(root, sink, dop(), crate::StagePlacementPolicy::Singleton)
             .unwrap_err();
         assert!(errors.errors().iter().any(
             |error| error.message() == "summary kind has no exact legal author in its fragment"
@@ -2024,7 +2060,7 @@ fn a_fragment_cannot_declare_two_outputs_of_the_same_summary_kind() {
         },
     ]));
     let errors = builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Router {
                 effect,
@@ -2096,13 +2132,14 @@ fn writer_projected_values_have_one_exact_private_owner_and_type() {
             root: writer,
             values,
             nodes,
-            expressions: original.expressions().clone(),
+
             sink: original.sink().clone(),
             summaries: original.summaries().into(),
             dop_domain: original.dop_domain(),
             stage_placement: original.stage_placement().clone(),
             runtime_filters: original.runtime_filters().into(),
             call_requests: original.call_requests().clone(),
+            calls: original.calls().clone(),
         });
         let error = crate::validation::validate_fragment_definition(&fragment)
             .unwrap_err()
@@ -2131,6 +2168,7 @@ fn writer_projected_values_cannot_be_transported_by_an_edge() {
     let invalid = PhysicalPlan::from(crate::plan::PhysicalPlanParts {
         constants: plan.constants().clone(),
         parameters: plan.parameters().clone(),
+        statement_constant_policy: plan.statement_constant_policy(),
         version: plan.version(),
         fragments: plan.fragments().clone(),
         edges,

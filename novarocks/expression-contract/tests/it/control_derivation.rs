@@ -153,6 +153,31 @@ fn type_only_retains_hidden_function_request_without_inventing_its_control_or_us
     work.finish().unwrap();
     assert_eq!(unit.definitions().len(), 2);
     assert_eq!(unit.claims().len(), 1);
+    let parent_id = unit.root_use(RootOrdinal::new(0)).unwrap();
+    let mut parent = unit.control_flow().uses()[&parent_id].clone();
+    let child_id = ExpressionUseId::new(u32::MAX);
+    parent.arguments = Box::new([child_id]);
+    let child = ExpressionInvocation {
+        context: ExpressionEffectContext {
+            use_id: child_id,
+            region: parent.context.region,
+            demand: EvaluationDemand::Value,
+        },
+        definition: inner_id,
+        control: ControlShape::Eager,
+        arguments: Box::default(),
+    };
+    assert_eq!(
+        ExpressionControlFlow::try_new(
+            unit.control_flow().regions().values().copied().collect(),
+            vec![parent, child],
+            &Definitions(unit.definitions().iter().map(|node| node.id).collect()),
+            CompilePhase::Validate,
+            &c,
+        )
+        .unwrap_err(),
+        ExpressionControlFlowError::InvalidControlShape
+    );
 }
 struct Definitions(Vec<ExprId>);
 impl ExpressionDefinitionMembership<ExprId> for Definitions {

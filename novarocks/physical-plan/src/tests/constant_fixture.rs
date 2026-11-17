@@ -167,9 +167,31 @@ impl ConstantFixture {
     // plan/package gate still validates the assembled table and every address.
     pub(crate) fn for_fragment(&self, fragment: &crate::Fragment) -> ConstantPools {
         let mut selected = ConstantPools::empty();
-        for (_, expression) in fragment.expressions().iter() {
-            if let ExprKind::Constant(reference) = expression.kind
-                && let Some(pool) = self.pools.entries().get(&reference.pool)
+        let mut references = Vec::new();
+        for node in fragment.nodes().values() {
+            if let Some(unit) = &node.expressions {
+                for expression in unit.definitions() {
+                    if let ExprKind::Constant(reference) = expression.kind {
+                        references.push(reference);
+                    }
+                }
+            }
+            if let crate::NodeKind::Window(spec) = &node.kind {
+                for call in &spec.calls {
+                    if let Some(frame) = &call.frame {
+                        for bound in [&frame.start, &frame.end] {
+                            if let crate::WindowBound::Preceding(reference)
+                            | crate::WindowBound::Following(reference) = bound
+                            {
+                                references.push(*reference);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for reference in references {
+            if let Some(pool) = self.pools.entries().get(&reference.pool)
                 && !selected.entries().contains_key(&reference.pool)
             {
                 selected.insert(reference.pool, pool.clone()).unwrap();

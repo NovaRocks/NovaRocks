@@ -57,6 +57,16 @@ pub fn project_fragment_constants_observed(
         }
         Ok(())
     })?;
+    visit_window_constant_references_in(fragment, work, |reference, work| {
+        let value = pools.resolve_source_observed(reference, work)?;
+        work.flush()?;
+        if !projected.entries().contains_key(&reference.pool) {
+            projected.insert(reference.pool, value.pool().clone())?;
+        }
+        work.step()?;
+        work.flush()?;
+        Ok(())
+    })?;
     Ok(projected)
 }
 
@@ -74,13 +84,21 @@ fn visit_typed_constant_references_observed(
         &mut CompileCheckpoints<'_>,
     ) -> Result<(), ConstantReferenceError>,
 ) -> Result<(), ConstantReferenceError> {
-    for (_, expression) in fragment.expressions().iter() {
+    for node in fragment.nodes().values() {
+        let unit = node.expressions.as_ref();
         work.step()?;
-        if let crate::ExprKind::Constant(reference) = expression.kind {
-            visit(reference, &expression.ty, work)?;
+        if let Some(unit) = unit {
+            for expression in unit.definitions() {
+                work.step()?;
+                if let crate::ExprKind::Constant(reference) = expression.kind {
+                    visit(reference, &expression.ty, work)?;
+                }
+            }
         }
     }
-    for request in fragment.call_requests().entries().values() {
+    let mut request = |request: &crate::PhysicalCallRequest,
+                       work: &mut CompileCheckpoints<'_>|
+     -> Result<(), ConstantReferenceError> {
         work.step()?;
         for argument in &request.arguments {
             work.step()?;
@@ -90,6 +108,19 @@ fn visit_typed_constant_references_observed(
             } = argument
             {
                 visit(*reference, value_type, work)?;
+            }
+        }
+        Ok(())
+    };
+    for original in fragment.call_requests().entries().values() {
+        request(original, work)?;
+    }
+    for node in fragment.nodes().values() {
+        let unit = node.expressions.as_ref();
+        work.step()?;
+        if let Some(unit) = unit {
+            for original in unit.requests().values() {
+                request(original, work)?;
             }
         }
     }
@@ -535,15 +566,28 @@ fn validate_fragment_constants_core(
         }
         Ok(())
     })?;
-    for (_, expression) in fragment.expressions().iter() {
+    for node in fragment.nodes().values() {
         work.step()?;
-        if let crate::ExprKind::WindowCall {
-            frame: Some(frame), ..
-        } = &expression.kind
-        {
-            validate_window_constants(fragment, pools, frame, work)?;
+        if let crate::NodeKind::Window(spec) = &node.kind {
+            for call in &spec.calls {
+                work.step()?;
+                if let Some(frame) = &call.frame {
+                    validate_window_constants(pools, frame, work)?;
+                }
+            }
         }
     }
+    visit_window_constant_references_in(fragment, work, |reference, work| {
+        let value = pools.resolve_source_observed(reference, work)?;
+        if require_closed {
+            work.flush()?;
+            used.insert(reference.pool);
+            work.step()?;
+            work.flush()?;
+        }
+        drop(value);
+        Ok(())
+    })?;
     validate_unpivot_constants(fragment, pools, limits, &mut used, mode, work)?;
     if require_closed && used.len() != pools.entries().len() {
         return Err(ConstantReferenceError::UnusedPools);
@@ -556,27 +600,19 @@ fn validate_fragment_constants_core(
 /// The caller owns entry and the ordinary/success footer. Originating control
 /// or resource failures return without an additional observation.
 pub fn window_offset_observed(
-    fragment: &crate::Fragment,
     pools: &ConstantPools,
-    id: crate::ExprId,
+    reference: ConstantReference,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<u64>, ConstantReferenceError> {
     work.step()?;
-    let Some(node) = fragment.expressions().get(id) else {
-        return Ok(None);
-    };
-    let crate::ExprKind::Constant(reference) = node.kind else {
-        return Ok(None);
-    };
-    let value = pools.resolve_observed(reference, &node.ty, work)?;
-    if node.ty.nullable()
-        || node.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
-    {
+    let value = pools.resolve_source_observed(reference, work)?;
+    let ty = value.value_type();
+    if ty.nullable() || ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical {
         return Err(ConstantReferenceError::InvalidConsumer(
             "window constant offset must be an exact non-null physical integer",
         ));
     }
-    let offset = match node.ty.data_type() {
+    let offset = match ty.data_type() {
         arrow_schema::DataType::UInt64 => value.try_u64()?,
         arrow_schema::DataType::Int64 => {
             value.try_i64()?.and_then(|value| u64::try_from(value).ok())
@@ -591,7 +627,6 @@ pub fn window_offset_observed(
     Ok(offset)
 }
 fn validate_window_constants(
-    fragment: &crate::Fragment,
     pools: &ConstantPools,
     frame: &crate::WindowFrame,
     work: &mut CompileCheckpoints<'_>,
@@ -600,7 +635,7 @@ fn validate_window_constants(
     for (index, bound) in [&frame.start, &frame.end].into_iter().enumerate() {
         work.step()?;
         if let crate::WindowBound::Preceding(id) | crate::WindowBound::Following(id) = bound {
-            offsets[index] = window_offset_observed(fragment, pools, *id, work)?;
+            offsets[index] = window_offset_observed(pools, *id, work)?;
         }
     }
     let ordered = match (&frame.start, &frame.end, offsets) {
@@ -642,7 +677,7 @@ fn validate_unpivot_constants(
         }
         let selected = match constant {
             crate::UnpivotConstant::Scalar(id) => {
-                let Some(expression) = fragment.expressions().get(*id) else {
+                let Some(expression) = fragment.root_expression(node, *id) else {
                     return Ok(());
                 };
                 if let crate::ExprKind::Constant(reference) = expression.kind {
@@ -773,6 +808,13 @@ fn validate_plan_constants_core(
             }
             Ok(())
         })?;
+        visit_window_constant_references_in(fragment, work, |reference, work| {
+            work.flush()?;
+            used.insert(reference.pool);
+            work.step()?;
+            work.flush()?;
+            Ok(())
+        })?;
     }
     if used.len() != plan.constants().entries().len() {
         return Err(ConstantReferenceError::UnusedPools);
@@ -785,3 +827,32 @@ fn validate_plan_constants_core(
 mod request_reference_tests;
 #[cfg(test)]
 mod tests;
+
+fn visit_window_constant_references_in(
+    fragment: &crate::Fragment,
+    work: &mut CompileCheckpoints<'_>,
+    mut visit: impl FnMut(
+        ConstantReference,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), ConstantReferenceError>,
+) -> Result<(), ConstantReferenceError> {
+    for node in fragment.nodes().values() {
+        work.step()?;
+        if let crate::NodeKind::Window(spec) = &node.kind {
+            for call in &spec.calls {
+                if let Some(frame) = &call.frame {
+                    for bound in [&frame.start, &frame.end] {
+                        work.step()?;
+                        if let crate::WindowBound::Preceding(reference)
+                        | crate::WindowBound::Following(reference) = bound
+                        {
+                            visit(*reference, work)?;
+                        }
+                    }
+                }
+                work.step()?;
+            }
+        }
+    }
+    Ok(())
+}

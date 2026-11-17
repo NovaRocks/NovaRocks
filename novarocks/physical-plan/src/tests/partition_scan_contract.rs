@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 
 fn bucket_scheme(seed: u8) -> BucketPartitionScheme {
     BucketPartitionScheme {
@@ -56,6 +58,7 @@ fn append_exchange_input(
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -85,21 +88,34 @@ fn finish_join(
         append_exchange_input(&mut builder, EdgeId::new(302), right_distribution);
     let join = builder.reserve_node_id().unwrap();
     let left_key = builder
-        .add_expression(
+        .define(
             join,
             ty(DataType::Int64, false),
             ExprKind::Value(left_value),
         )
         .unwrap();
     let right_key = builder
-        .add_expression(
+        .define(
             join,
             ty(DataType::Int64, false),
             ExprKind::Value(right_value),
         )
         .unwrap();
+    let left_key = builder.root_definition(
+        join,
+        left_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
+    let right_key = builder.root_definition(
+        join,
+        right_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(1),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: join,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([left_properties.clone(), right_properties]),
@@ -124,7 +140,7 @@ fn finish_join(
             },
         })
         .unwrap();
-    builder.finish_definition(
+    builder.finish_fixture_definition(
         join,
         FragmentSink::Noop,
         dop(),
@@ -150,6 +166,7 @@ fn finish_scan_with_budget(
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -168,7 +185,7 @@ fn finish_scan_with_budget(
             },
         })
         .unwrap();
-    builder.finish_definition(
+    builder.finish_fixture_definition(
         scan,
         FragmentSink::Noop,
         dop(),
@@ -188,7 +205,7 @@ fn finish_plan_with_partition_distributions(
     distributions: impl IntoIterator<Item = Distribution>,
 ) -> Result<PhysicalPlan, ValidationErrors> {
     let binding = connector_binding();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     for (ordinal, distribution) in distributions.into_iter().enumerate() {
         let fragment_id = FragmentId::new(500 + u32::try_from(ordinal).unwrap());
         let mut relation = metadata_relation(
@@ -225,6 +242,7 @@ fn finish_plan_with_partition_distributions(
         assert_eq!(value, ValueId::new(0));
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: scan,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -245,7 +263,7 @@ fn finish_plan_with_partition_distributions(
             .unwrap();
         plan.add_fragment(
             builder
-                .finish_definition(
+                .finish_fixture_definition(
                     scan,
                     FragmentSink::Noop,
                     dop(),

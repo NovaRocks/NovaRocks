@@ -25,8 +25,8 @@ use novarocks_connector_contract::{
 };
 
 use crate::{
-    AggregatePhase, Distribution, ExprId, ExprKind, Fragment, FunctionKind, NodeId, NodeKind,
-    PhysicalNode, ProviderColumnReference, ProviderReadReference, Relation, RowMultiplicity,
+    AggregatePhase, Distribution, ExprKind, Fragment, FunctionKind, NodeId, NodeKind, PhysicalNode,
+    ProviderColumnReference, ProviderReadReference, Relation, RootOrdinal, RowMultiplicity,
     ValueDef, ValueId, ValueOrigin,
 };
 
@@ -136,9 +136,9 @@ pub(crate) fn validate_value(
             }
             validate_column_reference(None, field, &path, errors);
         }
-        ValueOrigin::Expr { node, expr } => {
+        ValueOrigin::Expr { node, root } => {
             require_node(fragment, *node, &path, errors);
-            if let Some(expression) = fragment.expressions().get(*expr) {
+            if let Some(expression) = fragment.root_expression(*node, *root) {
                 // The value names what the expression produces, and may admit
                 // null where the expression does not: an exact value standing
                 // where null is admitted is sound. The reverse is not.
@@ -153,7 +153,7 @@ pub(crate) fn validate_value(
             } else {
                 errors.push(ValidationError::new(
                     &path,
-                    format!("expression {} is not defined", expr.get()),
+                    format!("expression {} is not defined", root.get()),
                 ));
             }
         }
@@ -366,24 +366,6 @@ pub(crate) fn validate_node(
     if errors.checks_output_and_effect_proofs() {
         validate_node_output_properties(fragment, node, &path, errors);
     }
-    let mut expressions = Vec::new();
-    node.kind.expression_references(&mut expressions);
-    for expression in expressions {
-        match fragment.expressions().get(expression) {
-            Some(expression) if expression.owner != node.id => errors.push(ValidationError::new(
-                &path,
-                "node references an expression owned by another physical node",
-            )),
-            Some(expression) if expression.lambda_scope.is_some() => errors.push(
-                ValidationError::new(&path, "node expression root is inside a lambda scope"),
-            ),
-            Some(_) => {}
-            None => errors.push(ValidationError::new(
-                &path,
-                format!("expression {} is not defined", expression.get()),
-            )),
-        }
-    }
     validate_node_arity(node, &path, errors);
     validate_node_semantics(fragment, node, indexes, &path, errors);
     validate_node_output_closure(fragment, node, indexes, &path, errors);
@@ -463,7 +445,7 @@ pub(crate) fn validate_node_output_closure(
             input_columns
                 .iter()
                 .copied()
-                .chain(spec.expressions.iter().map(|expression| expression.output))
+                .chain(spec.calls.iter().map(|expression| expression.output))
                 .collect(),
         ),
         NodeKind::Repeat {
@@ -718,7 +700,7 @@ pub(crate) fn value_origin_allowed(
             *scan_node == node.id
         }
         (
-            NodeKind::Scan { .. } | NodeKind::Project { .. } | NodeKind::Window { .. },
+            NodeKind::Scan { .. } | NodeKind::Project { .. },
             ValueOrigin::Expr { node: owner, .. },
         ) => *owner == node.id,
         (
@@ -760,7 +742,8 @@ pub(crate) fn value_origin_allowed(
                     == Some(&definition.id)
         }
         (
-            NodeKind::Values { .. }
+            NodeKind::Window(_)
+            | NodeKind::Values { .. }
             | NodeKind::SystemRelation { .. }
             | NodeKind::Repeat { .. }
             | NodeKind::Unpivot { .. }
@@ -834,7 +817,7 @@ pub(crate) fn validate_node_semantics(
             derived_values,
             ..
         } => {
-            validate_relation(fragment, relation, path, errors);
+            validate_relation(fragment, node, relation, path, errors);
             if read_budget.max_batch_rows == 0
                 || read_budget.max_batch_rows > MAX_SCAN_BATCH_ROWS
                 || read_budget.max_batch_bytes == 0
@@ -885,7 +868,7 @@ pub(crate) fn validate_node_semantics(
                 }
             }
             for residual in residuals {
-                require_boolean_expression(fragment, *residual, path, errors);
+                require_boolean_expression(fragment, node, *residual, path, errors);
             }
             validate_scan_predicate_contract(fragment, node.id, relation, residuals, path, errors);
         }
@@ -897,7 +880,7 @@ pub(crate) fn validate_node_semantics(
                 ));
             }
             for predicate in predicates {
-                require_boolean_expression(fragment, *predicate, path, errors);
+                require_boolean_expression(fragment, node, *predicate, path, errors);
             }
             require_passthrough_output(fragment, node, path, errors);
         }
@@ -906,15 +889,17 @@ pub(crate) fn validate_node_semantics(
             let input_values = input.and_then(|input| indexes.output(input.id));
             for (expression, value) in expressions {
                 match (
-                    fragment.expressions().get(*expression),
+                    fragment.root_expression(node.id, *expression),
                     fragment.values().get(value),
                 ) {
                     (Some(expression_node), Some(value_def))
                         if expression_node.ty == value_def.ty
                             && (matches!(
                                 value_def.origin,
-                                ValueOrigin::Expr { node: owner, expr: source }
-                                    if owner == node.id && source == expression_node.id
+                                ValueOrigin::Expr { node: owner, root: source }
+                                    if owner == node.id
+                                        && fragment.root_expression(owner, source)
+                                            .is_some_and(|canonical| canonical.id == expression_node.id)
                             ) || matches!(
                                 expression_node.kind,
                                 ExprKind::Value(source)
@@ -957,9 +942,11 @@ pub(crate) fn validate_node_semantics(
                     && condition.keys().iter().all(|key| {
                         !key.null_safe
                             && [key.left, key.right].iter().all(|id| {
-                                fragment.expressions().get(*id).is_some_and(|expression| {
-                                    *expression.ty.data_type() == DataType::Utf8
-                                })
+                                fragment
+                                    .root_expression(node.id, *id)
+                                    .is_some_and(|expression| {
+                                        *expression.ty.data_type() == DataType::Utf8
+                                    })
                             })
                     });
                 if !supported {
@@ -1014,8 +1001,8 @@ pub(crate) fn validate_node_semantics(
                 .chain(condition.scope_keys().into_iter().flatten())
             {
                 if let (Some(left), Some(right)) = (
-                    fragment.expressions().get(key.left),
-                    fragment.expressions().get(key.right),
+                    fragment.root_expression(node.id, key.left),
+                    fragment.root_expression(node.id, key.right),
                 ) && !super::value_bindings_match_ignoring_root_nullability(&left.ty, &right.ty)
                 {
                     errors.push(ValidationError::new(
@@ -1025,48 +1012,18 @@ pub(crate) fn validate_node_semantics(
                 }
             }
             if let Some(residual) = residual {
-                require_boolean_expression(fragment, *residual, path, errors);
+                require_boolean_expression(fragment, node, *residual, path, errors);
             }
-            if let (Some(left), Some(right)) = (
-                node.inputs.first().and_then(|id| fragment.nodes().get(id)),
-                node.inputs.get(1).and_then(|id| fragment.nodes().get(id)),
-            ) {
-                validate_expression_values_on_port(
-                    fragment,
-                    &keys
-                        .iter()
-                        .chain(condition.scope_keys().into_iter().flatten())
-                        .map(|key| key.left)
-                        .collect::<Vec<_>>(),
-                    indexes
-                        .output(left.id)
-                        .expect("every fragment node has one indexed output port"),
-                    path,
-                    errors,
-                );
-                validate_expression_values_on_port(
-                    fragment,
-                    &keys
-                        .iter()
-                        .chain(condition.scope_keys().into_iter().flatten())
-                        .map(|key| key.right)
-                        .collect::<Vec<_>>(),
-                    indexes
-                        .output(right.id)
-                        .expect("every fragment node has one indexed output port"),
-                    path,
-                    errors,
-                );
-            }
+            // Each key's exact side is checked by its unit root's Port scope.
             validate_null_extended(fragment, node.id, null_extended, path, errors);
             if node.required_inputs.len() == 2 {
                 let left_keys = keys
                     .iter()
-                    .filter_map(|key| crate::expression_value(fragment.expressions(), key.left))
+                    .filter_map(|key| crate::expression_value(fragment, node.id, key.left))
                     .collect::<Vec<_>>();
                 let right_keys = keys
                     .iter()
-                    .filter_map(|key| crate::expression_value(fragment.expressions(), key.right))
+                    .filter_map(|key| crate::expression_value(fragment, node.id, key.right))
                     .collect::<Vec<_>>();
                 let compatible = match (
                     distribution,
@@ -1184,7 +1141,7 @@ pub(crate) fn validate_node_semantics(
                 ));
             }
             if let Some(predicate) = predicate {
-                require_boolean_expression(fragment, *predicate, path, errors);
+                require_boolean_expression(fragment, node, *predicate, path, errors);
             }
             validate_null_extended(fragment, node.id, null_extended, path, errors);
             if nest_loop_join_placement_distribution(fragment, node, *kind, *distribution).is_none()
@@ -1425,7 +1382,7 @@ pub(crate) fn validate_node_semantics(
                 for (ordinal, expression) in row.iter().enumerate() {
                     if let Some(output) = node.output.columns.get(ordinal)
                         && let (Some(expression), Some(output)) = (
-                            fragment.expressions().get(*expression),
+                            fragment.root_expression(node.id, *expression),
                             fragment.values().get(output),
                         )
                         && expression.ty != output.ty
@@ -1771,13 +1728,6 @@ pub(crate) fn validate_node_semantics(
             outputs,
             left_outer,
         } => {
-            validate_legacy_binding_metadata(
-                function.legacy_metadata.as_ref(),
-                crate::FunctionKind::Table,
-                path,
-                "bound table function has a non-row intrinsic fact",
-                errors,
-            );
             if function.result_types.is_empty() {
                 errors.push(ValidationError::new(
                     path,
@@ -1786,6 +1736,7 @@ pub(crate) fn validate_node_semantics(
             }
             validate_function_arguments(
                 fragment,
+                node.id,
                 &function.function_id,
                 &function.argument_types,
                 arguments,
@@ -1971,54 +1922,17 @@ pub(crate) fn validate_node_semantics(
                 );
             }
             validate_ordering_expressions(fragment, node, indexes, &spec.order_by, path, errors);
-            if spec.expressions.is_empty() {
+            if spec.calls.is_empty() {
                 errors.push(ValidationError::new(
                     path,
                     "window node has no function calls",
                 ));
             }
-            for item in &spec.expressions {
-                if let Some(expression) = fragment.expressions().get(item.expression)
-                    && let ExprKind::WindowCall {
-                        frame: Some(frame), ..
-                    } = &expression.kind
-                    && frame_has_offset(frame)
-                {
-                    if frame.units == crate::WindowFrameUnits::Range && spec.order_by.len() != 1 {
-                        errors.push(ValidationError::new(
-                            path,
-                            "RANGE window frame with an offset requires exactly one order key",
-                        ));
-                    }
-                    if frame.units == crate::WindowFrameUnits::Groups && spec.order_by.is_empty() {
-                        errors.push(ValidationError::new(
-                            path,
-                            "GROUPS window frame with an offset requires an order key",
-                        ));
-                    }
-                }
-                match (
-                    fragment.expressions().get(item.expression),
-                    fragment.values().get(&item.output),
-                ) {
-                    (Some(expression), Some(output))
-                        if expression.ty == output.ty
-                            && expression.owner == node.id
-                            && expression.lambda_scope.is_none()
-                            && matches!(expression.kind, ExprKind::WindowCall { .. })
-                            && matches!(
-                                output.origin,
-                                ValueOrigin::Expr { node: owner, expr }
-                                    if owner == node.id && expr == item.expression
-                            ) => {}
-                    (Some(_), Some(_)) => errors.push(ValidationError::new(
-                        path,
-                        "window output has inconsistent expression, type or origin",
-                    )),
-                    _ => {}
-                }
+            for item in &spec.calls {
+                validate_window_call(fragment, node, spec, item, path, errors);
             }
         }
+
         NodeKind::Repeat {
             rollup_keys,
             grouping_sets,
@@ -2111,7 +2025,7 @@ pub(crate) fn validate_node_semantics(
                 .map(|value| &value.ty);
             for argument in [Some(*start), Some(*stop), *step].into_iter().flatten() {
                 if let (Some(output_type), Some(argument)) =
-                    (output_type, fragment.expressions().get(argument))
+                    (output_type, fragment.root_expression(node.id, argument))
                     && &argument.ty != output_type
                 {
                     errors.push(ValidationError::new(
@@ -2264,7 +2178,7 @@ pub(crate) fn validate_node_semantics(
                 .expect("every fragment node has one indexed output port");
             for event in events {
                 if let Some(predicate) = event.predicate {
-                    require_boolean_expression(fragment, predicate, path, errors);
+                    require_boolean_expression(fragment, node, predicate, path, errors);
                 }
                 let mut assigned_outputs = BTreeMap::new();
                 for assignment in &event.assignments {
@@ -2295,7 +2209,7 @@ pub(crate) fn validate_node_semantics(
                         (Some(declaration), Some(expression)) => {
                             if let (Some(output), Some(expression)) = (
                                 fragment.values().get(output),
-                                fragment.expressions().get(*expression),
+                                fragment.root_expression(node.id, *expression),
                             ) && (!super::value_bindings_match_ignoring_root_nullability(
                                 &output.ty,
                                 &declaration.input,
@@ -2314,7 +2228,7 @@ pub(crate) fn validate_node_semantics(
                         (None, Some(expression)) => {
                             if let (Some(output), Some(expression)) = (
                                 fragment.values().get(output),
-                                fragment.expressions().get(*expression),
+                                fragment.root_expression(node.id, *expression),
                             ) && !super::write_assignment_bindings_match(
                                 &output.ty,
                                 &expression.ty,
@@ -2354,13 +2268,14 @@ pub(crate) fn validate_node_semantics(
 
 pub(crate) fn validate_aggregate_value_inputs(
     fragment: &Fragment,
+    node: &PhysicalNode,
     binding: &crate::AggregateBinding,
-    args: &[ExprId],
+    args: &[RootOrdinal],
     order_by: &[crate::SortExpr],
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    validate_aggregate_arguments(fragment, binding, args, order_by, path, errors);
+    validate_aggregate_arguments(fragment, node.id, binding, args, order_by, path, errors);
 }
 
 /// An ordering key reads the rows the node receives.
@@ -2382,7 +2297,7 @@ pub(crate) fn validate_ordering_expressions(
 ) {
     let input_values = node.inputs.first().and_then(|input| indexes.output(*input));
     for key in ordering {
-        let Some(value) = crate::expression_value(fragment.expressions(), key.expr) else {
+        let Some(value) = crate::expression_value(fragment, node.id, key.expr) else {
             continue;
         };
         if !input_values.is_some_and(|input| input.contains(&value)) {
@@ -2839,9 +2754,9 @@ pub(crate) fn validate_unpivot(
             .zip(&spec.literal_outputs)
             .enumerate()
         {
-            if let Some(nullable) =
-                validate_unpivot_constant(fragment, constant, *output, "unpivot", path, errors)
-            {
+            if let Some(nullable) = validate_unpivot_constant(
+                fragment, node, constant, *output, "unpivot", path, errors,
+            ) {
                 literal_nullable[index] |= nullable;
             }
         }
@@ -3113,6 +3028,10 @@ pub(crate) fn validate_writer_grouped_unpivot(
         for (constant, output) in mapping.constants.iter().zip(&spec.literal_outputs) {
             validate_unpivot_constant(
                 fragment,
+                fragment
+                    .nodes()
+                    .get(&owner)
+                    .expect("finish owner was checked"),
                 constant,
                 *output,
                 "writer grouped Unpivot",
@@ -3235,6 +3154,7 @@ pub(crate) fn unpivot_collection_carrier_matches(
 
 pub(crate) fn validate_unpivot_constant(
     fragment: &Fragment,
+    node: &PhysicalNode,
     constant: &crate::UnpivotConstant,
     output: ValueId,
     context: &str,
@@ -3243,24 +3163,25 @@ pub(crate) fn validate_unpivot_constant(
 ) -> Option<bool> {
     let output_type = fragment.values().get(&output).map(|value| &value.ty)?;
     let (matches, nullable) = match constant {
-        crate::UnpivotConstant::Scalar(expression) => match fragment.expressions().get(*expression)
-        {
-            Some(expression) => (
-                matches!(expression.kind, ExprKind::Constant(_))
-                    && super::value_bindings_match_ignoring_root_nullability(
-                        &expression.ty,
-                        output_type,
-                    ),
-                expression.ty.nullable(),
-            ),
-            None => {
-                errors.push(ValidationError::new(
-                    path,
-                    format!("{context} scalar constant expression is not defined"),
-                ));
-                return None;
+        crate::UnpivotConstant::Scalar(expression) => {
+            match fragment.root_expression(node.id, *expression) {
+                Some(expression) => (
+                    matches!(expression.kind, ExprKind::Constant(_))
+                        && super::value_bindings_match_ignoring_root_nullability(
+                            &expression.ty,
+                            output_type,
+                        ),
+                    expression.ty.nullable(),
+                ),
+                None => {
+                    errors.push(ValidationError::new(
+                        path,
+                        format!("{context} scalar constant expression is not defined"),
+                    ));
+                    return None;
+                }
             }
-        },
+        }
         crate::UnpivotConstant::Int32List(_) | crate::UnpivotConstant::Utf8Map(_) => (
             unpivot_collection_binding_matches(constant, output_type),
             false,
@@ -3277,6 +3198,7 @@ pub(crate) fn validate_unpivot_constant(
 
 pub(crate) fn validate_relation(
     fragment: &Fragment,
+    node: &PhysicalNode,
     relation: &Relation,
     path: &str,
     errors: &mut ValidationContext,
@@ -3295,7 +3217,7 @@ pub(crate) fn validate_relation(
         validate_column_reference(Some(relation.read()), &field.column, path, errors);
     }
     for guarantee in relation.predicate_guarantees() {
-        require_boolean_expression(fragment, guarantee.predicate, path, errors);
+        require_boolean_expression(fragment, node, guarantee.predicate, path, errors);
     }
     validate_distribution(
         fragment,
@@ -3321,7 +3243,7 @@ pub(crate) fn validate_scan_predicate_contract(
     fragment: &Fragment,
     scan: NodeId,
     relation: &Relation,
-    residuals: &[ExprId],
+    residuals: &[RootOrdinal],
     path: &str,
     errors: &mut ValidationContext,
 ) {
@@ -3341,18 +3263,18 @@ pub(crate) fn validate_scan_predicate_contract(
             }
         }
         if fragment
-            .expressions()
-            .get(guarantee.predicate)
-            .is_some_and(|expression| expression.owner != scan)
+            .root_expression(scan, guarantee.predicate)
+            .is_none()
         {
             errors.push(ValidationError::new(
                 path,
-                "relation predicate guarantee is not owned by its scan",
+                "relation predicate guarantee is not a root of its scan",
             ));
         }
         if errors.checks_output_and_effect_proofs() {
-            match fragment_expressions_are_replica_deterministic(
+            match node_expressions_are_replica_deterministic(
                 fragment,
+                scan,
                 std::iter::once(guarantee.predicate),
                 true,
             ) {
@@ -3377,14 +3299,10 @@ pub(crate) fn validate_scan_predicate_contract(
                 "scan contains a duplicate residual predicate",
             ));
         }
-        if fragment
-            .expressions()
-            .get(*residual)
-            .is_some_and(|expression| expression.owner != scan)
-        {
+        if fragment.root_expression(scan, *residual).is_none() {
             errors.push(ValidationError::new(
                 path,
-                "scan residual predicate is not owned by its scan",
+                "scan residual predicate is not a root of its scan",
             ));
         }
     }
@@ -3513,11 +3431,12 @@ pub(crate) fn require_passthrough_output(
 
 pub(crate) fn require_boolean_expression(
     fragment: &Fragment,
-    expression: ExprId,
+    node: &PhysicalNode,
+    expression: RootOrdinal,
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    match fragment.expressions().get(expression) {
+    match fragment.root_expression(node.id, expression) {
         Some(expression) if *expression.ty.data_type() == DataType::Boolean => {}
         Some(_) => errors.push(ValidationError::new(
             path,
@@ -3548,7 +3467,7 @@ pub(crate) fn writer_schema_shapes_match(
 fn validate_aggregate_contract(
     fragment: &Fragment,
     node: &PhysicalNode,
-    group_by: &[(ExprId, ValueId)],
+    group_by: &[(RootOrdinal, ValueId)],
     calls: &[crate::AggregateCall],
     grouping: crate::AggregateGrouping,
     path: &str,
@@ -3575,7 +3494,7 @@ fn validate_aggregate_contract(
     }
     for (expression_id, output) in group_by {
         match (
-            fragment.expressions().get(*expression_id),
+            fragment.root_expression(node.id, *expression_id),
             fragment.values().get(output),
         ) {
             (Some(expression_node), Some(value))
@@ -3583,7 +3502,7 @@ fn validate_aggregate_contract(
                     && (matches!(expression_node.kind, ExprKind::Value(source) if source == *output)
                         || matches!(
                             value.origin,
-                            ValueOrigin::Expr { node: owner, expr }
+                            ValueOrigin::Expr { node: owner, root:expr }
                                 if owner == node.id && expr == *expression_id
                         )) => {}
             (Some(_), Some(_)) => errors.push(ValidationError::new(
@@ -3626,6 +3545,7 @@ fn validate_aggregate_contract(
         }
         validate_aggregate_value_inputs(
             fragment,
+            node,
             &call.binding,
             &call.arguments,
             &call.order_by,
@@ -3682,7 +3602,7 @@ fn validate_grouped_topn(
     order_by: &[crate::SortExpr],
     offset: u64,
     phase: crate::TopNPhase,
-    group_by: &[(ExprId, ValueId)],
+    group_by: &[(RootOrdinal, ValueId)],
     calls: &[crate::AggregateCall],
     comparator: crate::OrderedComparisonAlgorithm,
     path: &str,
@@ -3696,12 +3616,14 @@ fn validate_grouped_topn(
     }
     let mut keys = BTreeSet::new();
     for (expression, output) in group_by {
-        let valid = fragment.expressions().get(*expression).is_some_and(|expr| {
-            matches!(expr.kind, ExprKind::Value(source) if source == *output)
-                && comparator.supports_value_type(&expr.ty)
-                && novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
-                    .supports_partition_key(expr.ty.data_type())
-        });
+        let valid = fragment
+            .root_expression(node.id, *expression)
+            .is_some_and(|expr| {
+                matches!(expr.kind, ExprKind::Value(source) if source == *output)
+                    && comparator.supports_value_type(&expr.ty)
+                    && novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
+                        .supports_partition_key(expr.ty.data_type())
+            });
         if !valid || !keys.insert(*output) {
             errors.push(ValidationError::new(
                 path,
@@ -3711,7 +3633,7 @@ fn validate_grouped_topn(
     }
     let ordered = order_by
         .iter()
-        .filter_map(|key| crate::expression_value(fragment.expressions(), key.expr))
+        .filter_map(|key| crate::expression_value(fragment, node.id, key.expr))
         .collect::<BTreeSet<_>>();
     if ordered != keys || order_by.len() != keys.len() {
         errors.push(ValidationError::new(
@@ -3729,7 +3651,7 @@ fn validate_grouped_topn(
             errors.push(ValidationError::new(path, "grouped TopN must merge exact intermediate states without DISTINCT or state ranking"));
             continue;
         }
-        let input = crate::expression_value(fragment.expressions(), call.arguments[0]);
+        let input = crate::expression_value(fragment, node.id, call.arguments[0]);
         if input.is_none_or(|input| input == call.output || !consumed.insert(input)) {
             errors.push(ValidationError::new(
                 path,
@@ -3771,5 +3693,87 @@ fn validate_grouped_topn(
         .unwrap_or(0);
     if consumed != input_values || input_values.len() != input_occurrences {
         errors.push(ValidationError::new(path, "grouped TopN must merge every input state channel and retain exactly the complete keys"));
+    }
+}
+
+fn validate_window_call(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    spec: &crate::WindowSpec,
+    item: &crate::WindowCallSpec,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    let function = &item.binding;
+    match function.kind {
+        FunctionKind::Window => {
+            if item.aggregate_binding.is_some() || item.distinct || !item.order_by.is_empty() {
+                errors.push(ValidationError::new(
+                    path,
+                    "window function carries aggregate-only semantics",
+                ));
+            }
+            validate_function_arguments(
+                fragment,
+                node.id,
+                &function.function_id,
+                &function.argument_types,
+                &item.arguments,
+                path,
+                errors,
+            );
+        }
+        FunctionKind::Aggregate => match &item.aggregate_binding {
+            Some(binding)
+                if binding.function.signature_matches(function)
+                    && binding.phase == AggregatePhase::Single =>
+            {
+                validate_aggregate_arguments(
+                    fragment,
+                    node.id,
+                    binding,
+                    &item.arguments,
+                    &item.order_by,
+                    path,
+                    errors,
+                )
+            }
+            _ => errors.push(ValidationError::new(
+                path,
+                "aggregate window requires the exact single-phase aggregate binding",
+            )),
+        },
+        _ => errors.push(ValidationError::new(
+            path,
+            "window call has invalid function kind",
+        )),
+    }
+    if let Some(frame) = &item.frame {
+        validate_window_frame(fragment, frame, path, errors);
+        if frame_has_offset(frame) {
+            if frame.units == crate::WindowFrameUnits::Range && spec.order_by.len() != 1 {
+                errors.push(ValidationError::new(
+                    path,
+                    "RANGE window frame with an offset requires exactly one order key",
+                ));
+            }
+            if frame.units == crate::WindowFrameUnits::Groups && spec.order_by.is_empty() {
+                errors.push(ValidationError::new(
+                    path,
+                    "GROUPS window frame with an offset requires an order key",
+                ));
+            }
+        }
+    }
+    match fragment.values().get(&item.output) {
+        Some(output)
+            if output.ty == function.result_type
+                && matches!(output.origin,ValueOrigin::NodeOutput {node:owner,output_ordinal} if owner==node.id&&node.output.columns.get(output_ordinal as usize)==Some(&item.output)) =>
+            {}
+        Some(_) => errors.push(ValidationError::new(
+            path,
+            "window output has inconsistent signature, type or call origin",
+        )),
+        None => errors.push(ValidationError::new(path, "window output is not defined")),
     }
 }

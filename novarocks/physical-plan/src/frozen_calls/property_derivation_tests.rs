@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use arrow_schema::Field;
 use std::collections::HashMap;
 
@@ -53,36 +55,99 @@ impl PureCompileControl for DeriveControl {
     }
 }
 
-// An explicit test flow for literal, Value and zero-argument function roots.
-// No production control inference or new effect owner is implied.
-fn roots_for_fixture(fragment: &Fragment) -> PhysicalRootUses {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &Control::default()).unwrap();
-    let mut bindings = Vec::new();
-    let mut invocations = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        match &fragment.expressions().get(root.expr).unwrap().kind {
-            ExprKind::Constant(_) | ExprKind::Value(_) => {}
-            ExprKind::FunctionCall { args, .. } => assert!(args.is_empty()),
-            _ => panic!("fixture uses explicit leaf roots only"),
+// Fixed leaf fixtures explicitly declare Eager zero-argument calls; no
+// binding metadata is used to recover either control or effect authority.
+fn seal_leaf_units(builder: &mut FragmentBuilder) {
+    let nodes = builder
+        .construction_nodes()
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    for node in nodes {
+        let Some(draft) = builder.construction_unit(node) else {
+            continue;
+        };
+        let calls = draft
+            .definitions()
+            .filter_map(|definition| match &definition.kind {
+                ExprKind::FunctionCall { args, .. } => {
+                    assert!(args.is_empty());
+                    Some(definition.id)
+                }
+                ExprKind::Constant(_) | ExprKind::Value(_) => None,
+                _ => panic!("this fixed fixture declares only leaf expressions"),
+            })
+            .collect::<Vec<_>>();
+        let ports = builder.node_ports(node).unwrap();
+        let mut draft = builder.take_unit_builder(node).unwrap();
+        for definition in calls {
+            draft.request(definition, zero_argument_request()).unwrap();
+            draft
+                .definition_control(
+                    definition,
+                    novarocks_expression_contract::DefinitionControl {
+                        shape: ControlShape::Eager,
+                        temporal_sources: None,
+                    },
+                )
+                .unwrap();
         }
-        let current = context(ordinal as u32, 0, root.demand);
-        bindings.push((*site, current.use_id));
-        invocations.push(ExpressionInvocation {
-            context: current,
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let sealed = draft.seal(ports, &mut work).unwrap();
+        let claims = sealed
+            .uses()
+            .iter()
+            .filter(|(_, invocation)| {
+                matches!(
+                    sealed.definition(invocation.definition).unwrap().kind,
+                    ExprKind::FunctionCall { .. }
+                )
+            })
+            .map(|(&id, invocation)| {
+                let mut claim = scalar_claim(invocation.context);
+                claim.decimal_overflow_policy =
+                    novarocks_type_contract::DecimalOverflowPolicy::ReportError;
+                (id, claim)
+            })
+            .collect();
+        let unit = sealed.finish(claims, &mut work).unwrap();
+        work.finish().unwrap();
+        builder.install_unit(node, Arc::new(unit)).unwrap();
     }
-    let flow = ExpressionControlFlow::try_new(
-        vec![domain(0)],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::default(),
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &Control::default()).unwrap()
+}
+fn target_effect(fixture: &Fixture) -> &CallEffects {
+    if let Some(unit) = fixture.fragment.unit(fixture.primary) {
+        assert_eq!(unit.claims().len(), 1);
+        &unit.claims().first_key_value().unwrap().1.effects
+    } else {
+        &fixture.relations()[&PhysicalCallSite::Table {
+            node: fixture.primary,
+        }]
+            .effects
+    }
+}
+fn edit_target_effect(fixture: &mut Fixture, change: impl FnOnce(&mut CallEffects)) {
+    if fixture.fragment.unit(fixture.primary).is_some() {
+        fixture.edit_unit(|parts| {
+            assert_eq!(parts.claims.len(), 1);
+            change(&mut parts.claims.first_entry().unwrap().get_mut().effects);
+        });
+    } else {
+        let site = PhysicalCallSite::Table {
+            node: fixture.primary,
+        };
+        fixture.fragment = fixture
+            .candidate_relations(|calls| {
+                change(
+                    &mut calls
+                        .iter_mut()
+                        .find(|call| call.site == site)
+                        .unwrap()
+                        .effects,
+                )
+            })
+            .unwrap();
+    }
 }
 fn rich_result() -> ValueType {
     ValueType::new(
@@ -109,15 +174,22 @@ fn fixture(
         Operator::Project => 802,
         Operator::Table => 803,
     }));
-    let (values, _) = add_values(&mut builder, 1, false, fixture_constants);
+    let values = add_values(&mut builder, 1, false, fixture_constants);
     let input_value = ValueId::new(0);
     let child = if ordered {
         let sort = builder.reserve_node_id().unwrap();
         let expression = builder
-            .add_expression(sort, integer(), ExprKind::Value(input_value))
+            .define(sort, integer(), ExprKind::Value(input_value))
             .unwrap();
+        let expression = builder.root_definition(
+            sort,
+            expression,
+            EvaluationDemand::Value,
+            RootScope::Port(0),
+        );
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: sort,
                 inputs: Box::from([values]),
                 required_inputs: Box::from([properties()]),
@@ -156,7 +228,7 @@ fn fixture(
     match operator {
         Operator::Filter => {
             let predicate = builder
-                .add_expression(
+                .define(
                     target,
                     result.clone(),
                     ExprKind::FunctionCall {
@@ -165,13 +237,19 @@ fn fixture(
                     },
                 )
                 .unwrap();
+            let predicate = builder.root_definition(
+                target,
+                predicate,
+                EvaluationDemand::TruthOnly,
+                RootScope::Port(0),
+            );
             builder
                 .add_filter(target, child, Box::from([predicate]))
                 .unwrap();
         }
         Operator::Project => {
             let expression = builder
-                .add_expression(
+                .define(
                     target,
                     result.clone(),
                     ExprKind::FunctionCall {
@@ -180,18 +258,36 @@ fn fixture(
                     },
                 )
                 .unwrap();
+            let expression = builder.root_definition(
+                target,
+                expression,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            );
             let output = builder
                 .add_value(
                     result,
                     ValueOrigin::Expr {
                         node: target,
-                        expr: expression,
+                        root: expression,
                     },
                 )
                 .unwrap();
             let passthrough = builder
-                .add_expression(target, integer(), ExprKind::Value(input_value))
+                .define(target, integer(), ExprKind::Value(input_value))
                 .unwrap();
+            let repeated = builder.root_definition(
+                target,
+                passthrough,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            );
+            let passthrough = builder.root_definition(
+                target,
+                passthrough,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            );
             builder
                 .add_project(
                     target,
@@ -199,7 +295,7 @@ fn fixture(
                     Box::from([
                         (passthrough, input_value),
                         (expression, output),
-                        (passthrough, input_value),
+                        (repeated, input_value),
                     ]),
                     Box::from([input_value, output, input_value]),
                 )
@@ -219,6 +315,7 @@ fn fixture(
             let input_properties = builder.node_output_properties(child).unwrap().clone();
             builder
                 .insert_node_unchecked(PhysicalNode {
+                    expressions: None,
                     id: target,
                     inputs: Box::from([child]),
                     required_inputs: Box::from([passthrough_requirement(&input_properties)]),
@@ -273,60 +370,43 @@ fn fixture(
                 .unwrap();
         }
     }
+    seal_leaf_units(&mut builder);
     let fragment = builder
-        .finish_definition(
+        .finish_structure(
             target,
             FragmentSink::Noop,
             dop(),
-            crate::StagePlacementPolicy::Singleton,
+            PlanLimits::FROZEN,
+            &Control::default(),
+            StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    validate_fragment_definition(&fragment).unwrap();
-    let uses = roots_for_fixture(&fragment);
-    let mut calls: Vec<_> = uses
-        .flow()
-        .uses()
+    let fragment = crate::tests::original_call_requests::with_original_relational_requests(
+        fragment,
+        &Control::default(),
+    );
+    let fragment = crate::tests::unit_fixture::with_immutable_relation_claims(fragment);
+    let relation_claims = fragment
+        .calls()
+        .entries()
         .values()
-        .filter(|&invocation| {
-            matches!(
-                fragment
-                    .expressions()
-                    .get(invocation.definition)
-                    .unwrap()
-                    .kind,
-                ExprKind::FunctionCall { .. }
-            )
-        })
-        .map(|invocation| FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: PhysicalCallSite::Expression(invocation.context.use_id),
-            context: invocation.context,
-            effects: effects(FunctionKind::Scalar, invocation.context.region),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+        .cloned()
+        .map(|mut claim| {
+            claim.decimal_overflow_policy =
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError;
+            claim
         })
         .collect();
-    if matches!(operator, Operator::Table) {
-        let current = context(777, 0, EvaluationDemand::Value);
-        calls.push(FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: PhysicalCallSite::Table { node: target },
-            context: current,
-            effects: effects(FunctionKind::Table, current.region),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-        });
-    }
+    let fragment = fragment
+        .with_calls_observed(relation_claims, &Control::default())
+        .unwrap();
+    validate_fragment_definition(&fragment).unwrap();
     Fixture {
         fragment,
-        uses,
-        calls,
+        primary: target,
     }
 }
+
 fn edit(fixture: &mut Fixture, change: impl FnOnce(&mut crate::plan::FragmentParts)) {
     let mut parts = fixture.fragment.clone().into_parts();
     change(&mut parts);
@@ -345,15 +425,12 @@ fn broadcast(fixture: &mut Fixture) {
 }
 fn derive(
     fixture: &Fixture,
-    calls: &FrozenFragmentCalls,
     node: NodeId,
     source: usize,
     control: &dyn PureCompileControl,
 ) -> Result<Option<(PhysicalProperties, PropertyProofProjectionFacts)>, FragmentPropertyError> {
     derive_replica_sensitive_output_properties_observed(
         &fixture.fragment,
-        &fixture.uses,
-        calls,
         node,
         PlanLimits::FROZEN,
         source,
@@ -361,14 +438,9 @@ fn derive(
         control,
     )
 }
-fn validate(
-    fixture: &Fixture,
-    calls: &FrozenFragmentCalls,
-) -> Result<PropertyProofProjectionFacts, FragmentPropertyError> {
+fn validate(fixture: &Fixture) -> Result<PropertyProofProjectionFacts, FragmentPropertyError> {
     validate_fragment_output_properties_observed(
         &fixture.fragment,
-        &fixture.uses,
-        calls,
         PlanLimits::FROZEN,
         SOURCE,
         PROJECTION,
@@ -377,7 +449,6 @@ fn validate(
 }
 fn prefixes(
     fixture: &Fixture,
-    calls: &FrozenFragmentCalls,
     node: NodeId,
     source: usize,
     expected_ok: bool,
@@ -387,7 +458,7 @@ fn prefixes(
         .output_properties
         .clone();
     let baseline = DeriveControl::default();
-    let result = derive(fixture, calls, node, source, &baseline);
+    let result = derive(fixture, node, source, &baseline);
     assert_eq!(result.is_ok(), expected_ok);
     if let Ok(value) = result {
         assert_eq!(value.is_some(), expected_some);
@@ -411,7 +482,7 @@ fn prefixes(
                 refusal: Some((stop, cause.clone())),
             };
             assert!(
-                matches!(derive(fixture, calls, node, source, &control), Err(FragmentPropertyError::Control(actual)) if actual == cause)
+                matches!(derive(fixture, node, source, &control), Err(FragmentPropertyError::Control(actual)) if actual == cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
             assert_eq!(
@@ -427,10 +498,9 @@ fn replica_property_derivation_uses_three_original_formulas_and_keeps_row_error_
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for operator in [Operator::Filter, Operator::Project, Operator::Table] {
         let fixture = fixture(operator, false, &mut fixture_constants);
-        let calls = fixture.checked().unwrap();
+        fixture.checked().unwrap();
         let (actual, facts) = derive(
             &fixture,
-            &calls,
             fixture.fragment.root(),
             SOURCE,
             &DeriveControl::default(),
@@ -439,15 +509,16 @@ fn replica_property_derivation_uses_three_original_formulas_and_keeps_row_error_
         .unwrap();
         assert_eq!(actual, properties());
         assert!(facts.request_bytes > 0);
-        validate(&fixture, &calls).unwrap();
+        validate(&fixture).unwrap();
         let mut with_row_error = fixture;
-        with_row_error.calls[0].effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
-        with_row_error.calls[0].effects.failure_behavior = FunctionFailureBehavior::ReturnsNull;
-        let calls = with_row_error.checked().unwrap();
+        edit_target_effect(&mut with_row_error, |effects| {
+            effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
+            effects.failure_behavior = FunctionFailureBehavior::ReturnsNull;
+        });
+        with_row_error.checked().unwrap();
         assert_eq!(
             derive(
                 &with_row_error,
-                &calls,
                 with_row_error.fragment.root(),
                 SOURCE,
                 &DeriveControl::default()
@@ -458,9 +529,7 @@ fn replica_property_derivation_uses_three_original_formulas_and_keeps_row_error_
             properties()
         );
         assert_eq!(
-            calls.entries()[&with_row_error.calls[0].site]
-                .effects
-                .own_row_error,
+            target_effect(&with_row_error).own_row_error,
             FunctionIntrinsicRowError::MayRaise
         );
     }
@@ -473,29 +542,37 @@ fn replica_property_derivation_relinquishes_only_unsafe_broadcast_without_mutati
         for mode in 0..3 {
             let mut fixture = fixture(operator, false, &mut fixture_constants);
             broadcast(&mut fixture);
-            match mode {
-                0 => fixture.calls[0].effects.value_stability = FunctionVolatility::Volatile,
-                1 => fixture.calls[0].effects.observable_effects.warnings = true,
+            edit_target_effect(&mut fixture, |effects| match mode {
+                0 => effects.value_stability = FunctionVolatility::Volatile,
+                1 => effects.observable_effects.warnings = true,
                 2 => {
-                    fixture.calls[0].effects.instance_state = if matches!(operator, Operator::Table)
-                    {
-                        fixture.calls[0].effects.observable_effects.rng_sampling = true;
+                    effects.instance_state = if matches!(operator, Operator::Table) {
+                        effects.observable_effects.rng_sampling = true;
                         FunctionInstanceState::TableInstance
                     } else {
                         FunctionInstanceState::ScalarInstance
-                    }
+                    };
                 }
                 _ => unreachable!(),
+            });
+            fixture.checked().unwrap();
+            let error = validate(&fixture).unwrap_err();
+            match operator {
+                Operator::Table => assert!(
+                    matches!(error, FragmentPropertyError::Calls(FrozenCallError::ReplicaEquivalence(site)) if site == PhysicalCallSite::Table { node: fixture.primary })
+                ),
+                Operator::Filter | Operator::Project => {
+                    let invocation = *fixture.claims().first_key_value().unwrap().0;
+                    assert!(
+                        matches!(error, FragmentPropertyError::Calls(FrozenCallError::ReplicaExpression { node, invocation: actual }) if node == fixture.primary && actual == invocation)
+                    );
+                }
             }
-            let calls = fixture.checked().unwrap();
-            assert!(matches!(validate(&fixture, &calls),
-                Err(FragmentPropertyError::Calls(FrozenCallError::ReplicaEquivalence(site))) if site == fixture.calls[0].site));
             let original = fixture.fragment.nodes()[&fixture.fragment.root()]
                 .output_properties
                 .clone();
             let derived = derive(
                 &fixture,
-                &calls,
                 fixture.fragment.root(),
                 SOURCE,
                 &DeriveControl::default(),
@@ -526,14 +603,15 @@ fn replica_property_derivation_immutable_table_lifecycle_and_maskable_errors_pre
     for operator in [Operator::Filter, Operator::Project, Operator::Table] {
         let mut fixture = fixture(operator, false, &mut fixture_constants);
         broadcast(&mut fixture);
-        fixture.calls[0].effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
-        fixture.calls[0].effects.failure_behavior = FunctionFailureBehavior::ReturnsNull;
-        let calls = fixture.checked().unwrap();
-        validate(&fixture, &calls).unwrap();
+        edit_target_effect(&mut fixture, |effects| {
+            effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
+            effects.failure_behavior = FunctionFailureBehavior::ReturnsNull;
+        });
+        fixture.checked().unwrap();
+        validate(&fixture).unwrap();
         assert_eq!(
             derive(
                 &fixture,
-                &calls,
                 fixture.fragment.root(),
                 SOURCE,
                 &DeriveControl::default()
@@ -549,9 +627,7 @@ fn replica_property_derivation_immutable_table_lifecycle_and_maskable_errors_pre
         );
         if matches!(operator, Operator::Table) {
             assert_eq!(
-                calls.entries()[&fixture.calls[0].site]
-                    .effects
-                    .instance_state,
+                target_effect(&fixture).instance_state,
                 FunctionInstanceState::TableInstance
             );
         }
@@ -563,8 +639,8 @@ fn replica_property_derivation_keeps_final_child_ordering_repeated_columns_and_c
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for operator in [Operator::Filter, Operator::Project, Operator::Table] {
         let fixture = fixture(operator, true, &mut fixture_constants);
-        let calls = fixture.checked().unwrap();
-        validate(&fixture, &calls).unwrap();
+        fixture.checked().unwrap();
+        validate(&fixture).unwrap();
         let child = fixture.fragment.nodes()[&fixture.fragment.root()].inputs[0];
         let expected = PhysicalProperties {
             ordering: Box::from([OrderingKey {
@@ -578,7 +654,6 @@ fn replica_property_derivation_keeps_final_child_ordering_repeated_columns_and_c
         assert_eq!(
             derive(
                 &fixture,
-                &calls,
                 fixture.fragment.root(),
                 SOURCE,
                 &DeriveControl::default()
@@ -614,8 +689,7 @@ fn replica_property_derivation_keeps_final_child_ordering_repeated_columns_and_c
                 NodeKind::Project { expressions } => {
                     let ExprKind::FunctionCall { function, .. } = &fixture
                         .fragment
-                        .expressions()
-                        .get(expressions[1].0)
+                        .root_expression(fixture.primary, expressions[1].0)
                         .unwrap()
                         .kind
                     else {
@@ -652,14 +726,13 @@ fn replica_property_derivation_corrects_wrong_provisional_claim_and_leaves_other
             .output_properties
             .ordering = Box::default();
     });
-    let calls = fixture.checked().unwrap();
+    fixture.checked().unwrap();
     assert!(matches!(
-        validate(&fixture, &calls),
+        validate(&fixture),
         Err(FragmentPropertyError::Structure(_))
     ));
     let derived = derive(
         &fixture,
-        &calls,
         fixture.fragment.root(),
         SOURCE,
         &DeriveControl::default(),
@@ -681,7 +754,7 @@ fn replica_property_derivation_corrects_wrong_provisional_claim_and_leaves_other
         NodeKind::Values { .. }
     ));
     assert!(
-        derive(&fixture, &calls, values, SOURCE, &DeriveControl::default())
+        derive(&fixture, values, SOURCE, &DeriveControl::default())
             .unwrap()
             .is_none()
     );
@@ -693,7 +766,7 @@ fn replica_property_derivation_unknown_node_and_source_floor_have_typed_ordinary
     let fixture = fixture(Operator::Filter, false, &mut fixture_constants);
     let calls = fixture.checked().unwrap();
     let control = DeriveControl::default();
-    let error = derive(&fixture, &calls, NodeId::new(u32::MAX), SOURCE, &control).unwrap_err();
+    let error = derive(&fixture, NodeId::new(u32::MAX), SOURCE, &control).unwrap_err();
     // The absent-node lookup completed one step; ordinary finish exposes it.
     assert_eq!(
         control.trace.lock().unwrap().last(),
@@ -712,13 +785,11 @@ fn replica_property_derivation_unknown_node_and_source_floor_have_typed_ordinary
         "property derivation references an absent node"
     );
     let floor =
-        crate::frozen_calls::property_proof::source_floor(&fixture.fragment, &fixture.uses, &calls)
-            .unwrap();
+        crate::frozen_calls::property_proof::source_floor(&fixture.fragment, calls).unwrap();
     assert!(floor > 0);
     assert!(matches!(
         derive(
             &fixture,
-            &calls,
             fixture.fragment.root(),
             floor - 1,
             &DeriveControl::default()
@@ -734,38 +805,15 @@ fn replica_property_derivation_every_actual_callback_keeps_three_causes_and_ordi
     for operator in [Operator::Filter, Operator::Project, Operator::Table] {
         let mut fixture = fixture(operator, false, &mut fixture_constants);
         broadcast(&mut fixture);
-        fixture.calls[0].effects.observable_effects.warnings = true;
+        edit_target_effect(&mut fixture, |effects| {
+            effects.observable_effects.warnings = true
+        });
         let calls = fixture.checked().unwrap();
-        prefixes(
-            &fixture,
-            &calls,
-            fixture.fragment.root(),
-            SOURCE,
-            true,
-            true,
-        );
-        prefixes(&fixture, &calls, NodeId::new(0), SOURCE, true, false);
-        prefixes(
-            &fixture,
-            &calls,
-            NodeId::new(u32::MAX),
-            SOURCE,
-            false,
-            false,
-        );
-        let floor = crate::frozen_calls::property_proof::source_floor(
-            &fixture.fragment,
-            &fixture.uses,
-            &calls,
-        )
-        .unwrap();
-        prefixes(
-            &fixture,
-            &calls,
-            fixture.fragment.root(),
-            floor - 1,
-            false,
-            false,
-        );
+        prefixes(&fixture, fixture.fragment.root(), SOURCE, true, true);
+        prefixes(&fixture, NodeId::new(0), SOURCE, true, false);
+        prefixes(&fixture, NodeId::new(u32::MAX), SOURCE, false, false);
+        let floor =
+            crate::frozen_calls::property_proof::source_floor(&fixture.fragment, calls).unwrap();
+        prefixes(&fixture, fixture.fragment.root(), floor - 1, false, false);
     }
 }

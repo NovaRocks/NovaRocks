@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 
 fn broadcast() -> PhysicalProperties {
     PhysicalProperties {
@@ -57,7 +59,7 @@ fn append_single_copy_literal(
     let node = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, false);
     let expression = builder
-        .add_expression(
+        .define(
             node,
             (value_type.clone()).clone(),
             fixture_constants.i64(11, &(value_type.clone())),
@@ -72,8 +74,15 @@ fn append_single_copy_literal(
             },
         )
         .unwrap();
+    let value_field_root_0 = builder.root_definition(
+        node,
+        expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -83,7 +92,7 @@ fn append_single_copy_literal(
                 columns: Box::from([value]),
             },
             kind: NodeKind::Values {
-                rows: Box::from([Box::from([expression])]),
+                rows: Box::from([Box::from([value_field_root_0])]),
             },
         })
         .unwrap();
@@ -105,6 +114,7 @@ fn append_exchange(
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -141,6 +151,7 @@ fn append_cte_exchange(
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -165,13 +176,26 @@ fn append_broadcast_join(
 ) -> NodeId {
     let node = builder.reserve_node_id().unwrap();
     let left_key = builder
-        .add_expression(node, ty(DataType::Int64, false), ExprKind::Value(left.1))
+        .define(node, ty(DataType::Int64, false), ExprKind::Value(left.1))
         .unwrap();
     let right_key = builder
-        .add_expression(node, ty(DataType::Int64, false), ExprKind::Value(right.1))
+        .define(node, ty(DataType::Int64, false), ExprKind::Value(right.1))
         .unwrap();
+    let left_key = builder.root_definition(
+        node,
+        left_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
+    let right_key = builder.root_definition(
+        node,
+        right_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(1),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([left.0, right.0]),
             required_inputs: Box::from([single_copy(), broadcast()]),
@@ -370,7 +394,7 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
     let (source_root, source_value) =
         append_single_copy_literal(&mut source_builder, &mut fixture_constants);
     let source_fragment = source_builder
-        .finish_definition(
+        .finish_fixture_definition(
             source_root,
             FragmentSink::Multicast {
                 edges: Box::from([build_branch, probe_branch]),
@@ -388,7 +412,7 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
         source_value,
     );
     let build_fragment = build_builder
-        .finish_definition(
+        .finish_fixture_definition(
             build_root,
             FragmentSink::Stream {
                 edge: join_build_edge,
@@ -414,7 +438,7 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
     let join = append_broadcast_join(&mut probe_builder, probe, build);
     probe_builder.attach_runtime_filter(filter_id).unwrap();
     let probe_fragment = probe_builder
-        .finish_definition(
+        .finish_fixture_definition(
             join,
             FragmentSink::Noop,
             dop(),
@@ -438,7 +462,7 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
     filter.producers[0].progress.non_build_edges = Box::from([probe_branch]);
 
     let finish = |filter: RuntimeFilter| {
-        let mut plan = PlanBuilder::new(version());
+        let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
         for fragment in [
             source_fragment.clone(),
             build_fragment.clone(),
@@ -526,7 +550,7 @@ fn nested_unicast_plan(
     let (build_root, build_value) =
         append_single_copy_literal(&mut build_builder, fixture_constants);
     let build_fragment = build_builder
-        .finish_definition(
+        .finish_fixture_definition(
             build_root,
             FragmentSink::Stream { edge: build_edge },
             dop(),
@@ -585,7 +609,7 @@ fn nested_unicast_plan(
         }
     }
     let inner_fragment = inner_builder
-        .finish_definition(
+        .finish_fixture_definition(
             inner_join,
             FragmentSink::Stream {
                 edge: nested_build_edge,
@@ -595,7 +619,7 @@ fn nested_unicast_plan(
         )
         .unwrap();
     let outer_fragment = outer_builder
-        .finish_definition(
+        .finish_fixture_definition(
             outer_join,
             FragmentSink::Noop,
             dop(),
@@ -603,7 +627,7 @@ fn nested_unicast_plan(
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(build_fragment).unwrap();
     plan.add_fragment(inner_fragment).unwrap();
     plan.add_fragment(outer_fragment).unwrap();
@@ -801,7 +825,7 @@ pub(super) fn acyclic_cross_fragment_fixture(
     let (source_root, source_value) =
         append_single_copy_literal(&mut source_builder, fixture_constants);
     let source = source_builder
-        .finish_definition(
+        .finish_fixture_definition(
             source_root,
             FragmentSink::Stream {
                 edge: recursive_build_edge,
@@ -819,7 +843,7 @@ pub(super) fn acyclic_cross_fragment_fixture(
         single_copy(),
     );
     let relay = relay_builder
-        .finish_definition(
+        .finish_fixture_definition(
             relay_root,
             FragmentSink::Stream {
                 edge: direct_build_edge,
@@ -840,7 +864,7 @@ pub(super) fn acyclic_cross_fragment_fixture(
     let join = append_broadcast_join(&mut target_builder, probe, build);
     target_builder.attach_runtime_filter(filter_id).unwrap();
     let target = target_builder
-        .finish_definition(
+        .finish_fixture_definition(
             join,
             FragmentSink::Noop,
             dop(),
@@ -862,7 +886,7 @@ pub(super) fn acyclic_cross_fragment_fixture(
         Box::from([blocking_consumer(410, target_fragment, join, probe.1)]),
     );
 
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     for fragment in [source, relay, target] {
         plan.add_fragment(fragment).unwrap();
     }
@@ -912,19 +936,21 @@ fn replace_source_fragment(
         id: source.id(),
         root: source.root(),
         values: source.values().clone(),
-        expressions: source.expressions().clone(),
+
         nodes: source.nodes().clone(),
         sink: source.sink().clone(),
         dop_domain: source.dop_domain(),
         runtime_filters: source.runtime_filters().to_vec().into_boxed_slice(),
         call_requests: source.call_requests().clone(),
+        calls: source.calls().clone(),
     };
     change(&mut parts);
     let mut fragments = plan.fragments().clone();
     fragments.insert(source_id, Fragment::from(parts));
     PhysicalPlan::from(crate::PhysicalPlanParts {
-        constants: crate::ConstantPools::empty(),
-        parameters: novarocks_type_contract::SemanticParameters::default(),
+        constants: plan.constants().clone(),
+        parameters: plan.parameters().clone(),
+        statement_constant_policy: plan.statement_constant_policy(),
         version: plan.version(),
         fragments,
         edges: plan.edges().clone(),
@@ -947,6 +973,22 @@ fn blocking_runtime_filter_accepts_an_acyclic_recursive_build_dependency() {
 
 #[test]
 fn remote_execution_growth_does_not_expand_local_boundary_facts() {
+    use novarocks_expression_contract::{BoundExprSet, BoundExprSetBuilder, UnitLimits};
+    use novarocks_type_contract::{
+        CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand,
+        PureCompileControl, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    };
+    use std::sync::Arc;
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    struct Source {
+        _unit: Arc<BoundExprSet>,
+    }
+    impl ValueTypeStorageHold for Source {}
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let fixture = acyclic_cross_fragment_fixture(&mut fixture_constants);
     let cuts = fragment_cuts(&fixture.plan, fixture.target_fragment).unwrap();
@@ -954,11 +996,76 @@ fn remote_execution_growth_does_not_expand_local_boundary_facts() {
         let enlarged =
             replace_source_fragment(&fixture.plan, fixture.recursive_source_fragment, |parts| {
                 let node = parts.nodes.get_mut(&parts.root).unwrap();
-                let NodeKind::Values { rows } = &mut node.kind else {
-                    panic!("fixture source must contain literal rows");
+                let NodeKind::Values { rows } = &node.kind else {
+                    panic!("fixture source must contain literal rows")
                 };
-                *rows = vec![rows[0].clone(); count].into_boxed_slice();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].len(), 1);
+                let source = node.expressions.take().unwrap();
+                assert_eq!(source.definitions().len(), 1);
+                let definition = &source.definitions()[0];
+                let ExprKind::Constant(reference) = definition.kind else {
+                    panic!("the actual source fixture is one checked constant")
+                };
+                let ty = definition.ty.clone();
+                let ports = source.ports().to_vec();
+                let mut draft = BoundExprSetBuilder::new(UnitLimits {
+                    expression_semantic_depth: PlanLimits::FROZEN.expression_semantic_depth,
+                })
+                .with_storage_lifetime(ValueTypeStorageLifetime::held(Arc::new(Source {
+                    _unit: source,
+                })))
+                .unwrap();
+                let shared_definition = draft.add(None, ty, ExprKind::Constant(reference)).unwrap();
+                let mut rows = Vec::with_capacity(count);
+                for _ in 0..count {
+                    // A new field occurrence owns its own root/use even when the
+                    // original checked constant definition is genuinely shared.
+                    let root = draft
+                        .root(
+                            shared_definition,
+                            EvaluationDemand::Value,
+                            crate::RootScope::AllPorts,
+                        )
+                        .unwrap();
+                    rows.push(Box::from([root]));
+                }
+                let mut work =
+                    CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+                let unit = draft
+                    .seal(ports, &mut work)
+                    .unwrap()
+                    .finish(std::collections::BTreeMap::new(), &mut work)
+                    .unwrap();
+                work.finish().unwrap();
+                assert_eq!(unit.definitions().len(), 1);
+                assert_eq!(unit.roots().len(), count);
+                assert_eq!(unit.root_use_ids().len(), count);
+                assert!(
+                    unit.roots()
+                        .iter()
+                        .all(|root| root.definition == shared_definition)
+                );
+                node.kind = NodeKind::Values {
+                    rows: rows.into_boxed_slice(),
+                };
+                node.expressions = Some(Arc::new(unit));
             });
+        assert_eq!(
+            enlarged.constants().entries().keys().collect::<Vec<_>>(),
+            fixture
+                .plan
+                .constants()
+                .entries()
+                .keys()
+                .collect::<Vec<_>>()
+        );
+        for (id, pool) in fixture.plan.constants().entries() {
+            assert_eq!(
+                enlarged.constants().entries()[id].backing_identity(),
+                pool.backing_identity()
+            );
+        }
         validate_plan(&enlarged).unwrap();
         let local = fragment_cuts(&enlarged, fixture.target_fragment).unwrap();
         assert_eq!(cuts, local);

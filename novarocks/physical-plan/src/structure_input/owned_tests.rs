@@ -44,7 +44,10 @@ fn borrowed_original_sparse_structure_preserves_all_fields_and_only_caller_phase
     assert_eq!(decoded.root(), NodeId::new(u32::MAX));
     assert_eq!(decoded.values(), &expected.values);
     assert_eq!(decoded.nodes(), &expected.nodes);
-    assert_eq!(decoded.expressions(), &expected.expressions);
+    assert_eq!(
+        decoded.unit(NodeId::new(0)),
+        expected.nodes[&NodeId::new(0)].expressions.as_deref()
+    );
     assert_eq!(decoded.sink(), &expected.sink);
     assert_eq!(decoded.dop_domain(), expected.dop_domain);
     assert_eq!(decoded.runtime_filters(), &*expected.runtime_filters);

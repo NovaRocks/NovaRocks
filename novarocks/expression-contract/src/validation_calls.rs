@@ -307,6 +307,20 @@ pub(crate) fn validate(
             }
             work.step()?;
         }
+        if let (ExprKind::FunctionCall { args, .. }, ControlShape::HigherOrder { body_ordinal, .. }) =
+            (&node.kind, invocation.control)
+            && !args
+                .get(body_ordinal as usize)
+                .and_then(|id| parts.definitions.get(id.get() as usize))
+                .is_some_and(|body| matches!(body.kind, ExprKind::Lambda { .. }))
+        {
+            return Err(UnitError::invalid(
+                Some(node.id),
+                None,
+                "higher-order control does not name an actual lambda argument",
+            ));
+        }
+        work.step()?;
     }
     if call_count != parts.claims.len() {
         return Err(UnitError::invalid(

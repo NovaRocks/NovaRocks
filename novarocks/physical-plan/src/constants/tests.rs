@@ -17,6 +17,8 @@
 
 //! Sparse table address tests, not package, allocator or provider closure.
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use arrow_array::{Array, ArrayRef, Int64Array, StringArray, new_null_array};
 use arrow_schema::{DataType, Field};
 use novarocks_constant_contract::ConstantPolicy;
@@ -126,18 +128,24 @@ fn constant_fragment(
     let mut outputs = Vec::new();
     for (reference, ty) in definitions {
         let expression = builder
-            .add_expression(
+            .define(
                 crate::NodeId::new(8),
                 ty.clone(),
                 crate::ExprKind::Constant(*reference),
             )
             .unwrap();
+        let expression = builder.root_definition(
+            crate::NodeId::new(8),
+            expression,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
         let value = builder
             .add_value(
                 ty.clone(),
                 crate::ValueOrigin::Expr {
                     node: crate::NodeId::new(8),
-                    expr: expression,
+                    root: expression,
                 },
             )
             .unwrap();
@@ -153,7 +161,7 @@ fn constant_fragment(
         )
         .unwrap();
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             crate::NodeId::new(8),
             crate::FragmentSink::Noop,
             crate::PipelineDopDomain {
@@ -169,49 +177,6 @@ fn package_input(
     fragment: crate::Fragment,
     constants: ConstantPools,
 ) -> crate::FragmentPackageInput {
-    use novarocks_type_contract::{
-        ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
-        ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    };
-    let roots = crate::PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();
-    let domain = EvaluationRegionId::new(17);
-    let mut invocations = Vec::new();
-    let bindings = roots
-        .sites()
-        .iter()
-        .enumerate()
-        .map(|(ordinal, (&site, root))| {
-            let use_id = ExpressionUseId::new(ordinal as u32 + 42);
-            invocations.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    region: domain,
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (site, use_id)
-        })
-        .collect();
-    let flow = ExpressionControlFlow::<crate::ExprId>::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::good(),
-    )
-    .unwrap();
-    let expression_uses =
-        crate::PhysicalRootUses::try_new(&fragment, flow, bindings, &Control::good()).unwrap();
-    let calls =
-        crate::FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &Control::good())
-            .unwrap();
     let pruning =
         crate::FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control::good()).unwrap();
     crate::FragmentPackageInput {
@@ -219,8 +184,7 @@ fn package_input(
         version: crate::PlanVersionId::try_new([91; 16]).unwrap(),
         required: crate::RequiredContracts::default(),
         fragment,
-        expression_uses,
-        calls,
+        statement_constant_policy: policy(),
         pruning,
         cuts: crate::FragmentCuts::default(),
         result: None,
@@ -232,8 +196,11 @@ fn package_input(
     }
 }
 fn plan_builder(fragments: &[crate::Fragment], constants: ConstantPools) -> crate::PlanBuilder {
-    let mut builder = crate::PlanBuilder::new(crate::PlanVersionId::try_new([91; 16]).unwrap())
-        .with_constant_pools(constants);
+    let mut builder = crate::PlanBuilder::new(
+        crate::PlanVersionId::try_new([91; 16]).unwrap(),
+        crate::tests::constant_fixture::policy(),
+    )
+    .with_constant_pools(constants);
     for fragment in fragments {
         builder.add_fragment(fragment.clone()).unwrap();
     }
@@ -415,8 +382,6 @@ fn actual_peer_fragments_project_their_own_constants_without_global_local_charge
             ConstantReferenceError::Structure(_)
         ))
     ));
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     for fragment in &fragments {
         let mut projected = ConstantPools::empty();
@@ -432,16 +397,12 @@ fn actual_peer_fragments_project_their_own_constants_without_global_local_charge
             )
             .unwrap();
         let input = package_input(fragment.clone(), projected);
-        uses.insert(fragment.id(), input.expression_uses);
-        calls.insert(fragment.id(), input.calls);
         pruning.insert(fragment.id(), input.pruning);
     }
     let packages = crate::extract_fragment_packages(
         &plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &package_admissions(&plan),
         &Control::good(),

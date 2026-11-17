@@ -19,54 +19,24 @@
 //! Representation equality compares pool addresses, never selected values.
 //! This table supplies no SQL provenance, effects or installed capability.
 
-mod materialize;
-pub use materialize::{
+use novarocks_expression_contract::PhysicalCallRequest;
+pub use novarocks_expression_contract::{
     CallRequestMaterializationError, CallRequestMaterializationFailure, MaterializedCallRequest,
     materialize_call_request_observed, materialize_call_request_with_creator_in,
     materialize_call_request_with_factory_in,
 };
 
-use crate::{
-    ConstantPolicy, ConstantReference, ExprId, ExprKind, Fragment, FragmentId, FrozenCallError,
-    PhysicalCallBinding, PhysicalCallSite, ValueType,
-};
-use novarocks_function_contract::{FunctionArgument, FunctionBindingError, FunctionBindingRequest};
+use crate::{Fragment, FragmentId, FrozenCallError, PhysicalCallBinding, PhysicalCallSite};
+use novarocks_function_contract::FunctionBindingError;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
-/// The expression key names a definition, including dead and TypeOnly nodes.
-/// Relational keys retain their existing lifecycle and ordered call position.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum PhysicalCallDefinition {
-    Expression(ExprId),
-    Relational(PhysicalCallSite),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PhysicalCallRequest {
-    pub arguments: Box<[FunctionArgument<ConstantReference>]>,
-    pub logical_argument_count: usize,
-    /// The original request's optional constraint, never its selected result.
-    pub expected_result_type: Option<ValueType>,
-    /// Source admission facts, not a receiver allocation grant.
-    pub constant_policy: ConstantPolicy,
-}
-impl PhysicalCallRequest {
-    pub fn request(&self) -> FunctionBindingRequest<'_, ConstantReference> {
-        FunctionBindingRequest {
-            arguments: &self.arguments,
-            logical_argument_count: self.logical_argument_count,
-            expected_result_type: self.expected_result_type.as_ref(),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct FragmentCallRequests {
     fragment: FragmentId,
-    entries: Arc<BTreeMap<PhysicalCallDefinition, PhysicalCallRequest>>,
+    entries: Arc<BTreeMap<PhysicalCallSite, PhysicalCallRequest>>,
     // The independent table may outlive its Fragment and decoded request Vec.
     storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
@@ -83,11 +53,11 @@ pub enum CallRequestError {
     Calls(FrozenCallError),
     Structure(crate::ValidationErrors),
     WrongFragment,
-    DuplicateDefinition(PhysicalCallDefinition),
-    MissingDefinition(PhysicalCallDefinition),
+    DuplicateDefinition(PhysicalCallSite),
+    MissingDefinition(PhysicalCallSite),
     ExtraDefinition,
-    InvalidArgumentCount(PhysicalCallDefinition),
-    ArgumentTypeMismatch(PhysicalCallDefinition),
+    InvalidArgumentCount(PhysicalCallSite),
+    ArgumentTypeMismatch(PhysicalCallSite),
     ConstructionResource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
     ConstructionTree(novarocks_type_contract::owned_resources::btree::BTreeResourceError),
 }
@@ -197,15 +167,15 @@ impl FragmentCallRequests {
     pub const fn fragment(&self) -> FragmentId {
         self.fragment
     }
-    pub fn entries(&self) -> &BTreeMap<PhysicalCallDefinition, PhysicalCallRequest> {
+    pub fn entries(&self) -> &BTreeMap<PhysicalCallSite, PhysicalCallRequest> {
         &self.entries
     }
-    pub fn get(&self, definition: PhysicalCallDefinition) -> Option<&PhysicalCallRequest> {
+    pub fn get(&self, definition: PhysicalCallSite) -> Option<&PhysicalCallRequest> {
         self.entries.get(&definition)
     }
     pub fn try_new(
         fragment: &Fragment,
-        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        entries: Vec<(PhysicalCallSite, PhysicalCallRequest)>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, CallRequestError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
@@ -224,7 +194,7 @@ impl FragmentCallRequests {
     /// This port supplies neither provenance nor an allocation/MEM grant.
     pub fn try_new_in(
         fragment: &Fragment,
-        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        entries: Vec<(PhysicalCallSite, PhysicalCallRequest)>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, CallRequestError> {
         Self::try_new_core(
@@ -240,7 +210,7 @@ impl FragmentCallRequests {
     /// Known Arc layout and locked BTree operation bounds remain distinct.
     pub fn try_new_created_in<H>(
         fragment: &Fragment,
-        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        entries: Vec<(PhysicalCallSite, PhysicalCallRequest)>,
         storage: novarocks_type_contract::ValueTypeStorageLifetime,
         creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
         work: &mut CompileCheckpoints<'_>,
@@ -265,7 +235,7 @@ impl FragmentCallRequests {
     }
     fn try_new_core<E>(
         fragment: &Fragment,
-        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        entries: Vec<(PhysicalCallSite, PhysicalCallRequest)>,
         storage: novarocks_type_contract::ValueTypeStorageLifetime,
         creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, E>>,
         work: &mut CompileCheckpoints<'_>,
@@ -283,7 +253,7 @@ impl FragmentCallRequests {
                 .storage_lifetime()
                 .retaining_observed(&storage, |layout| creation.request_layout(layout))?;
             let tree = novarocks_type_contract::owned_resources::btree::insertion_only::<
-                PhysicalCallDefinition,
+                PhysicalCallSite,
                 PhysicalCallRequest,
             >(entries.len())
             .map_err(CallRequestError::ConstructionTree)?;
@@ -291,7 +261,7 @@ impl FragmentCallRequests {
                 creation.observe_opaque_upper_bound(tree.request_bytes_upper_bound)?;
             }
             let arc = novarocks_type_contract::owned_resources::layout::arc_layout(
-                std::alloc::Layout::new::<BTreeMap<PhysicalCallDefinition, PhysicalCallRequest>>(),
+                std::alloc::Layout::new::<BTreeMap<PhysicalCallSite, PhysicalCallRequest>>(),
             )?;
             creation.request_layout(arc)?;
             storage
@@ -356,40 +326,8 @@ impl FragmentCallRequests {
             work.step()?;
             Ok(())
         };
-        for (&id, expression) in fragment.expressions().iter() {
-            work.step()?;
-            let (binding, window_logical_count) = match &expression.kind {
-                ExprKind::FunctionCall { function, .. } => {
-                    (PhysicalCallBinding::Scalar(function), None)
-                }
-                ExprKind::WindowCall {
-                    function,
-                    aggregate_binding,
-                    args,
-                    ..
-                } => (
-                    PhysicalCallBinding::Window {
-                        function,
-                        aggregate: aggregate_binding.as_deref(),
-                    },
-                    aggregate_binding.is_none().then_some(args.len()),
-                ),
-                _ => continue,
-            };
-            check(
-                PhysicalCallDefinition::Expression(id),
-                binding,
-                window_logical_count,
-                work,
-            )?;
-        }
         crate::visit_relational_calls_observed(fragment, work, |site, binding, work| {
-            check(
-                PhysicalCallDefinition::Relational(site),
-                binding,
-                None,
-                work,
-            )
+            check(site, binding, None, work)
         })?;
         let extra = visited != self.entries.len();
         work.step()?;
@@ -400,17 +338,13 @@ impl FragmentCallRequests {
     }
 }
 fn validate_request_binding(
-    definition: PhysicalCallDefinition,
+    definition: PhysicalCallSite,
     request: &PhysicalCallRequest,
     binding: PhysicalCallBinding<'_>,
     window_logical_count: Option<usize>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), CallRequestError> {
     let (types, logical) = match binding {
-        PhysicalCallBinding::Scalar(function) => (
-            &*function.argument_types,
-            Some(function.argument_types.len()),
-        ),
         PhysicalCallBinding::Window {
             function,
             aggregate,
@@ -418,7 +352,8 @@ fn validate_request_binding(
             &*function.argument_types,
             aggregate
                 .map(|value| value.logical_argument_count as usize)
-                .or(window_logical_count),
+                .or(window_logical_count)
+                .or(Some(function.argument_types.len())),
         ),
         PhysicalCallBinding::Aggregate(binding) => (
             &*binding.function.argument_types,
@@ -449,7 +384,7 @@ impl Fragment {
     /// is recovered from constants, selected results, names or runtime uses.
     pub fn with_call_requests_observed(
         mut self,
-        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        entries: Vec<(PhysicalCallSite, PhysicalCallRequest)>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, CallRequestError> {
         let requests = FragmentCallRequests::try_new(&self, entries, control)?;
@@ -460,7 +395,7 @@ impl Fragment {
     /// meter. Complete source/resource/binding coverage is still rechecked.
     pub fn with_call_requests_in(
         mut self,
-        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        entries: Vec<(PhysicalCallSite, PhysicalCallRequest)>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, CallRequestError> {
         let requests = FragmentCallRequests::try_new_in(&self, entries, work)?;
@@ -469,7 +404,7 @@ impl Fragment {
     }
     pub fn with_call_requests_created_in<H>(
         mut self,
-        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        entries: Vec<(PhysicalCallSite, PhysicalCallRequest)>,
         storage: novarocks_type_contract::ValueTypeStorageLifetime,
         creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
         work: &mut CompileCheckpoints<'_>,

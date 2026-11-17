@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 
 fn coverage(
     witnesses: impl IntoIterator<Item = RuntimeFilterWitnessId>,
@@ -70,7 +72,7 @@ fn append_literal_with_distribution(
     let node = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, nullable);
     let expression = builder
-        .add_expression(
+        .define(
             node,
             value_type.clone(),
             if nullable {
@@ -80,6 +82,12 @@ fn append_literal_with_distribution(
             },
         )
         .unwrap();
+    let expression = builder.root_definition(
+        node,
+        expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     let value = builder
         .add_value(
             value_type,
@@ -91,6 +99,7 @@ fn append_literal_with_distribution(
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -108,6 +117,7 @@ fn append_literal_with_distribution(
             },
         })
         .unwrap();
+    crate::tests::unit_fixture::seal_pure_unit(builder, node);
     (node, value)
 }
 
@@ -120,7 +130,7 @@ fn finish_largeint_literal(
         .reserve_node_id()
         .map_err(|error| error.to_string())?;
     let expression = builder
-        .add_expression(
+        .define(
             node,
             (value_type.clone()).clone(),
             fixture_constants
@@ -128,6 +138,12 @@ fn finish_largeint_literal(
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
+    let expression = builder.root_definition(
+        node,
+        expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     let value = builder
         .add_value(
             value_type,
@@ -139,6 +155,7 @@ fn finish_largeint_literal(
         .map_err(|error| error.to_string())?;
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -152,8 +169,9 @@ fn finish_largeint_literal(
             },
         })
         .map_err(|error| error.to_string())?;
+    crate::tests::unit_fixture::seal_pure_unit(&mut builder, node);
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             node,
             FragmentSink::Noop,
             dop(),
@@ -200,26 +218,39 @@ fn null_safe_join_filter(
     let (left_source, left_value) = append_literal(&mut builder, true, fixture_constants);
     let left = builder.reserve_node_id().unwrap();
     let left_identity = builder
-        .add_expression(left, ty(DataType::Int64, true), ExprKind::Value(left_value))
+        .define(left, ty(DataType::Int64, true), ExprKind::Value(left_value))
         .unwrap();
+    let left_identity = builder.root_definition(
+        left,
+        left_identity,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let other_expression = builder
-        .add_expression(
+        .define(
             left,
             (ty(DataType::Int64, true)).clone(),
             fixture_constants.null(&(ty(DataType::Int64, true))),
         )
         .unwrap();
+    let other_expression = builder.root_definition(
+        left,
+        other_expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let other_left_value = builder
         .add_value(
             ty(DataType::Int64, true),
             ValueOrigin::Expr {
                 node: left,
-                expr: other_expression,
+                root: other_expression,
             },
         )
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: left,
             inputs: Box::from([left_source]),
             required_inputs: Box::from([unconstrained()]),
@@ -249,13 +280,26 @@ fn null_safe_join_filter(
     let join = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, true);
     let left_key = builder
-        .add_expression(join, value_type.clone(), ExprKind::Value(left_value))
+        .define(join, value_type.clone(), ExprKind::Value(left_value))
         .unwrap();
+    let left_key = builder.root_definition(
+        join,
+        left_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let right_key = builder
-        .add_expression(join, value_type.clone(), ExprKind::Value(right_value))
+        .define(join, value_type.clone(), ExprKind::Value(right_value))
         .unwrap();
+    let right_key = builder.root_definition(
+        join,
+        right_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(1),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: join,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([
@@ -294,7 +338,7 @@ fn null_safe_join_filter(
     let filter_id = RuntimeFilterId::new(100);
     builder.attach_runtime_filter(filter_id).unwrap();
     let fragment = builder
-        .finish_definition(
+        .finish_fixture_definition(
             join,
             FragmentSink::Noop,
             dop(),
@@ -421,6 +465,7 @@ pub(super) fn scan_lineage_filter(
         .collect::<Vec<_>>();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -443,14 +488,21 @@ pub(super) fn scan_lineage_filter(
     let (lineage_input, lineage_value, mut lineage) = if through_filter {
         let filter = builder.reserve_node_id().unwrap();
         let predicate = builder
-            .add_expression(
+            .define(
                 filter,
                 (ty(DataType::Boolean, false)).clone(),
                 fixture_constants.boolean(true, &(ty(DataType::Boolean, false))),
             )
             .unwrap();
+        let predicate = builder.root_definition(
+            filter,
+            predicate,
+            novarocks_type_contract::EvaluationDemand::TruthOnly,
+            crate::RootScope::Port(0),
+        );
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: filter,
                 inputs: Box::from([scan]),
                 required_inputs: Box::from([unconstrained()]),
@@ -480,39 +532,58 @@ pub(super) fn scan_lineage_filter(
     let (mut probe_node, probe_value, mut lineage) = if through_project {
         let project = builder.reserve_node_id().unwrap();
         let identity = builder
-            .add_expression(
+            .define(
                 project,
                 ty(DataType::Int64, false),
                 ExprKind::Value(lineage_value),
             )
             .unwrap();
+        let identity = builder.root_definition(
+            project,
+            identity,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
+        let identity_repeat = builder.root_definition(
+            project,
+            builder.construction_unit(project).unwrap().roots()[identity.get() as usize].definition,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
         let projected = builder
             .add_value(
                 ty(DataType::Int64, false),
                 ValueOrigin::Expr {
                     node: project,
-                    expr: identity,
+                    root: identity,
                 },
             )
             .unwrap();
         let other_expression = builder
-            .add_expression(
+            .define(
                 project,
                 (ty(DataType::Int64, false)).clone(),
                 fixture_constants.i64(7, &(ty(DataType::Int64, false))),
             )
             .unwrap();
+        let other_expression = builder.root_definition(
+            project,
+            other_expression,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
         let other = builder
             .add_value(
                 ty(DataType::Int64, false),
                 ValueOrigin::Expr {
                     node: project,
-                    expr: other_expression,
+                    root: other_expression,
                 },
             )
             .unwrap();
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: project,
                 inputs: Box::from([lineage_input]),
                 required_inputs: Box::from([unconstrained()]),
@@ -524,7 +595,7 @@ pub(super) fn scan_lineage_filter(
                 kind: NodeKind::Project {
                     expressions: Box::from([
                         (identity, projected),
-                        (identity, projected),
+                        (identity_repeat, projected),
                         (other_expression, other),
                     ]),
                 },
@@ -552,21 +623,34 @@ pub(super) fn scan_lineage_filter(
         );
         let inner_join = builder.reserve_node_id().unwrap();
         let left_key = builder
-            .add_expression(
+            .define(
                 inner_join,
                 ty(DataType::Int64, false),
                 ExprKind::Value(probe_value),
             )
             .unwrap();
+        let left_key = builder.root_definition(
+            inner_join,
+            left_key,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
         let right_key = builder
-            .add_expression(
+            .define(
                 inner_join,
                 ty(DataType::Int64, false),
                 ExprKind::Value(equivalent_value),
             )
             .unwrap();
+        let right_key = builder.root_definition(
+            inner_join,
+            right_key,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(1),
+        );
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: inner_join,
                 inputs: Box::from([probe_node, equivalent]),
                 required_inputs: Box::from([
@@ -619,21 +703,34 @@ pub(super) fn scan_lineage_filter(
     );
     let join = builder.reserve_node_id().unwrap();
     let probe_key = builder
-        .add_expression(
+        .define(
             join,
             ty(DataType::Int64, false),
             ExprKind::Value(probe_value),
         )
         .unwrap();
+    let probe_key = builder.root_definition(
+        join,
+        probe_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let build_key = builder
-        .add_expression(
+        .define(
             join,
             ty(DataType::Int64, false),
             ExprKind::Value(build_value),
         )
         .unwrap();
+    let build_key = builder.root_definition(
+        join,
+        build_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(1),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: join,
             inputs: Box::from([probe_node, build]),
             required_inputs: Box::from([
@@ -668,7 +765,7 @@ pub(super) fn scan_lineage_filter(
     let filter_id = RuntimeFilterId::new(101);
     builder.attach_runtime_filter(filter_id).unwrap();
     let fragment = builder
-        .finish_definition(
+        .finish_fixture_definition(
             join,
             FragmentSink::Noop,
             dop(),
@@ -750,7 +847,7 @@ fn assert_runtime_filter_plan_accepted(
 ) {
     let cuts = local_runtime_filter_cuts(&fragment, &filter);
     validate_fragment(&fragment, &cuts).unwrap();
-    let mut builder = PlanBuilder::new(version());
+    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     builder.add_fragment(fragment).unwrap();
     builder.add_runtime_filter(filter).unwrap();
     crate::tests::constant_fixture::publish_plan(builder, fixture_constants).unwrap();
@@ -792,6 +889,7 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -812,14 +910,21 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
         .unwrap();
     let aggregate = builder.reserve_node_id().unwrap();
     let group_key = builder
-        .add_expression(
+        .define(
             aggregate,
             ty(DataType::Int64, false),
             ExprKind::Value(scan_value),
         )
         .unwrap();
+    let group_key = builder.root_definition(
+        aggregate,
+        group_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: aggregate,
             inputs: Box::from([scan]),
             required_inputs: Box::from([singleton()]),
@@ -837,14 +942,21 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
         .unwrap();
     let topn = builder.reserve_node_id().unwrap();
     let order_key = builder
-        .add_expression(
+        .define(
             topn,
             ty(DataType::Int64, false),
             ExprKind::Value(scan_value),
         )
         .unwrap();
+    let order_key = builder.root_definition(
+        topn,
+        order_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: topn,
             inputs: Box::from([aggregate]),
             required_inputs: Box::from([singleton()]),
@@ -877,7 +989,7 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
     let filter_id = RuntimeFilterId::new(105);
     builder.attach_runtime_filter(filter_id).unwrap();
     let fragment = builder
-        .finish_definition(
+        .finish_fixture_definition(
             topn,
             FragmentSink::Noop,
             dop(),
@@ -1128,17 +1240,6 @@ pub(super) fn cross_fragment_scan_lineage_plan(
     let output = original.nodes()[&probe_root].output.columns.clone();
     let mut source = FragmentBuilder::new(source_id);
     let mut destination = FragmentBuilder::new(destination_id);
-    for expression in original
-        .expressions()
-        .iter()
-        .map(|(_, expression)| expression)
-    {
-        if source_nodes.contains(&expression.owner) {
-            source.insert_expression(expression.clone()).unwrap();
-        } else {
-            destination.insert_expression(expression.clone()).unwrap();
-        }
-    }
     for value in original.values().values() {
         if source_owns_value(value) {
             source.insert_value(value.clone()).unwrap();
@@ -1164,6 +1265,7 @@ pub(super) fn cross_fragment_scan_lineage_plan(
     let properties = original.nodes()[&probe_root].output_properties.clone();
     destination
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: probe_root,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1200,7 +1302,7 @@ pub(super) fn cross_fragment_scan_lineage_plan(
     *lineage = steps.into_boxed_slice();
     filter.producers[0].progress.non_build_edges = Box::from([edge_id]);
     let source = source
-        .finish_definition(
+        .finish_fixture_definition(
             probe_root,
             FragmentSink::Stream { edge: edge_id },
             dop(),
@@ -1208,14 +1310,14 @@ pub(super) fn cross_fragment_scan_lineage_plan(
         )
         .unwrap();
     let destination = destination
-        .finish_definition(
+        .finish_fixture_definition(
             original.root(),
             original.sink().clone(),
             dop(),
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
@@ -1400,7 +1502,7 @@ fn runtime_filter_scan_field_rejects_a_same_typed_non_key_provider_field() {
     assert!(independent.to_string().contains(
         "runtime filter scan consumer is not connected to its exact probe key by a safe lineage"
     ));
-    let mut builder = PlanBuilder::new(version());
+    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     builder.add_fragment(fragment).unwrap();
     builder.add_runtime_filter(filter).unwrap();
     let error =
@@ -1420,7 +1522,7 @@ fn null_safe_join_membership_filter_preserves_null_matches_at_both_boundaries() 
         let (fragment, filter, _) = null_safe_join_filter(null_semantics, &mut fixture_constants);
         let cuts = local_runtime_filter_cuts(&fragment, &filter);
         let standalone_result = validate_fragment(&fragment, &cuts);
-        let mut builder = PlanBuilder::new(version());
+        let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
         builder.add_fragment(fragment).unwrap();
         builder.add_runtime_filter(filter).unwrap();
         let plan_result = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants);
@@ -1495,7 +1597,7 @@ fn assert_local_runtime_filter_rejected_at_both_boundaries(
     let cuts = local_runtime_filter_cuts(&fragment, &filter);
     let independent = validate_fragment(&fragment, &cuts).unwrap_err();
 
-    let mut builder = PlanBuilder::new(version());
+    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     builder.add_fragment(fragment).unwrap();
     builder.add_runtime_filter(filter).unwrap();
     let whole_plan =
@@ -1616,14 +1718,21 @@ fn ordered_join_filter() -> (Fragment, RuntimeFilter) {
     );
     let aggregate = builder.reserve_node_id().unwrap();
     let group_key = builder
-        .add_expression(
+        .define(
             aggregate,
             ty(DataType::Int64, false),
             ExprKind::Value(aggregate_value),
         )
         .unwrap();
+    let group_key = builder.root_definition(
+        aggregate,
+        group_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: aggregate,
             inputs: Box::from([aggregate_input]),
             required_inputs: Box::from([PhysicalProperties {
@@ -1671,7 +1780,7 @@ fn ordered_join_filter() -> (Fragment, RuntimeFilter) {
     let filter_id = RuntimeFilterId::new(104);
     builder.attach_runtime_filter(filter_id).unwrap();
     let fragment = builder
-        .finish_definition(
+        .finish_fixture_definition(
             join,
             FragmentSink::Noop,
             dop(),
@@ -1761,6 +1870,7 @@ fn append_hash_exchange_source(
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1795,13 +1905,26 @@ fn append_partitioned_inner_join(
     let node = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, false);
     let left_key = builder
-        .add_expression(node, value_type.clone(), ExprKind::Value(left.1))
+        .define(node, value_type.clone(), ExprKind::Value(left.1))
         .unwrap();
+    let left_key = builder.root_definition(
+        node,
+        left_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let right_key = builder
-        .add_expression(node, value_type, ExprKind::Value(right.1))
+        .define(node, value_type, ExprKind::Value(right.1))
         .unwrap();
+    let right_key = builder.root_definition(
+        node,
+        right_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(1),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([left.0, right.0]),
             required_inputs: Box::from([left_properties.clone(), right_properties]),
@@ -1923,6 +2046,7 @@ fn append_exchange_source(
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1951,13 +2075,26 @@ fn append_inner_join_with_properties(
     let node = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, false);
     let left_key = builder
-        .add_expression(node, value_type.clone(), ExprKind::Value(left.1))
+        .define(node, value_type.clone(), ExprKind::Value(left.1))
         .unwrap();
+    let left_key = builder.root_definition(
+        node,
+        left_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let right_key = builder
-        .add_expression(node, value_type, ExprKind::Value(right.1))
+        .define(node, value_type, ExprKind::Value(right.1))
         .unwrap();
+    let right_key = builder.root_definition(
+        node,
+        right_key,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(1),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([left.0, right.0]),
             required_inputs: Box::from([left_properties, right_properties]),
@@ -2066,7 +2203,7 @@ fn join_build_frontier_fixture(
     );
     let nested_root = append_broadcast_inner_join(&mut nested, nested_probe, nested_leaf_build);
     let nested = nested
-        .finish_definition(
+        .finish_fixture_definition(
             nested_root,
             FragmentSink::Stream {
                 edge: nested_build_edges[0],
@@ -2098,7 +2235,7 @@ fn join_build_frontier_fixture(
     let filter_id = RuntimeFilterId::new(210);
     target.attach_runtime_filter(filter_id).unwrap();
     let target = target
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Noop,
             dop(),
@@ -2269,7 +2406,7 @@ fn build_join_build_frontier_plan(
     filter: RuntimeFilter,
     fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<PhysicalPlan, ValidationErrors> {
-    let mut builder = PlanBuilder::new(version());
+    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     for fragment in &fixture.fragments {
         builder.add_fragment(fragment.clone()).unwrap();
     }
@@ -2343,12 +2480,18 @@ fn table_function_fragment(
     let (input, outer_value) = append_literal(&mut builder, false, fixture_constants);
     let node = builder.reserve_node_id().unwrap();
     let argument = builder
-        .add_expression(
+        .define(
             node,
             ty(DataType::Int64, false),
             ExprKind::Value(outer_value),
         )
         .unwrap();
+    let argument = builder.root_definition(
+        node,
+        argument,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let nullable = left_outer && !matches!(fixture, TableFunctionFixture::NonNullableOuterResult);
     let text_result = builder
         .add_value(
@@ -2374,6 +2517,7 @@ fn table_function_fragment(
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([unconstrained()]),
@@ -2421,12 +2565,19 @@ fn table_function_fragment(
             },
         })
         .unwrap();
-    builder.finish_definition(
+    let fragment = builder.finish_fixture_structure(
         node,
         FragmentSink::Noop,
         dop(),
         crate::StagePlacementPolicy::Singleton,
-    )
+    )?;
+    let fragment = super::original_call_requests::with_original_relational_requests(
+        fragment,
+        &GroupedConstantControl,
+    );
+    let fragment = super::unit_fixture::with_immutable_relation_claims(fragment);
+    crate::validate_fragment_definition(&fragment)?;
+    Ok(fragment)
 }
 
 #[test]
@@ -2453,12 +2604,7 @@ fn table_function_relation_results_and_outer_occurrences_have_separate_mappings(
             fragment.values()[&columns[2]].ty,
             ty(DataType::Int64, left_outer)
         );
-        // The relation's original request: its one bound Value argument.
-        let fragment = super::original_call_requests::with_original_relational_requests(
-            fragment,
-            &GroupedConstantControl,
-        );
-        let mut builder = PlanBuilder::new(version());
+        let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
         builder.add_fragment(fragment).unwrap();
         let plan =
             crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
@@ -2495,268 +2641,6 @@ fn left_outer_table_function_requires_nullable_function_results() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("table function result type differs from its bound schema"));
-}
-
-#[test]
-fn table_function_binding_cannot_be_published_as_a_scalar_call() {
-    let mut builder = FragmentBuilder::new(FragmentId::new(102));
-    let node = builder.reserve_node_id().unwrap();
-    let value_type = ty(DataType::Int64, false);
-    let expression = builder
-        .add_expression(
-            node,
-            value_type.clone(),
-            ExprKind::FunctionCall {
-                function: BoundFunction {
-                    legacy_metadata: Some(crate::LegacyBindingMetadata {
-                        semantic_parameters: Box::default(),
-                        volatility: FunctionVolatility::Immutable,
-                        argument_evaluation: FunctionArgumentEvaluation::Eager,
-                        failure_behavior: FunctionFailureBehavior::Propagate,
-                        intrinsic_row_error:
-                            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
-                    }),
-                    function_id: FunctionId::try_new("builtin/test_relation/v1").unwrap(),
-                    overload: FunctionOverloadId::try_new("disguised-scalar").unwrap(),
-                    kind: FunctionKind::Table,
-                    argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
-                        Box::default(),
-                    ),
-                    result_type: value_type.clone(),
-                },
-                args: Box::default(),
-            },
-        )
-        .unwrap();
-    let value = builder
-        .add_value(
-            value_type,
-            ValueOrigin::NodeOutput {
-                node,
-                output_ordinal: 0,
-            },
-        )
-        .unwrap();
-    builder
-        .insert_node_unchecked(PhysicalNode {
-            id: node,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: PhysicalProperties {
-                distribution: Distribution::Singleton,
-                row_multiplicity: RowMultiplicity::SingleCopy,
-                ordering: Box::default(),
-            },
-            output: OutputPort {
-                node,
-                columns: Box::from([value]),
-            },
-            kind: NodeKind::Values {
-                rows: Box::from([Box::from([expression])]),
-            },
-        })
-        .unwrap();
-    let error = builder
-        .finish_definition(
-            node,
-            FragmentSink::Noop,
-            dop(),
-            crate::StagePlacementPolicy::Singleton,
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("scalar call has non-scalar binding"));
-}
-
-#[derive(Clone, Copy)]
-enum HigherOrderFixture {
-    Valid,
-    ScalarBinding,
-    ParameterTypeDrift,
-    ReusedAsExpressionChild,
-    ReusedAsValueArgument,
-    LambdaOperatorRoot,
-}
-
-fn higher_order_function_fragment(
-    fixture: HigherOrderFixture,
-    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
-) -> Result<Fragment, ValidationErrors> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(104));
-    let (input, _) = append_literal(&mut builder, false, fixture_constants);
-    let node = builder.reserve_node_id().unwrap();
-    let lambda = builder.reserve_expression_id().unwrap();
-    let parameter_type = ty(DataType::Int64, false);
-    let parameter = builder
-        .add_expression_in_scope(
-            node,
-            Some(lambda),
-            parameter_type.clone(),
-            ExprKind::LambdaParameter { lambda, ordinal: 0 },
-        )
-        .unwrap();
-    builder
-        .insert_expression(ExprNode {
-            id: lambda,
-            owner: node,
-            lambda_scope: None,
-            ty: parameter_type.clone(),
-            kind: ExprKind::Lambda {
-                parameter_types: Box::from([parameter_type.clone()]),
-                body: parameter,
-            },
-        })
-        .unwrap();
-    let expected_argument = match fixture {
-        HigherOrderFixture::Valid
-        | HigherOrderFixture::ReusedAsExpressionChild
-        | HigherOrderFixture::ReusedAsValueArgument
-        | HigherOrderFixture::LambdaOperatorRoot => FunctionArgumentType::Lambda {
-            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-                parameter_type.clone(),
-            ])),
-            result_type: parameter_type.clone(),
-        },
-        HigherOrderFixture::ScalarBinding => FunctionArgumentType::Value(parameter_type.clone()),
-        HigherOrderFixture::ParameterTypeDrift => FunctionArgumentType::Lambda {
-            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-                ty(DataType::Utf8, false),
-            ])),
-            result_type: parameter_type.clone(),
-        },
-    };
-    let (argument_types, arguments): (Box<[FunctionArgumentType]>, Box<[ExprId]>) =
-        if matches!(fixture, HigherOrderFixture::ReusedAsValueArgument) {
-            (
-                Box::from([
-                    expected_argument,
-                    FunctionArgumentType::Value(parameter_type.clone()),
-                ]),
-                Box::from([lambda, lambda]),
-            )
-        } else {
-            (Box::from([expected_argument]), Box::from([lambda]))
-        };
-    let call = builder
-        .add_expression(
-            node,
-            parameter_type.clone(),
-            ExprKind::FunctionCall {
-                function: BoundFunction {
-                    legacy_metadata: Some(crate::LegacyBindingMetadata {
-                        semantic_parameters: Box::default(),
-                        volatility: FunctionVolatility::Immutable,
-                        argument_evaluation: FunctionArgumentEvaluation::Eager,
-                        failure_behavior: FunctionFailureBehavior::Propagate,
-                        intrinsic_row_error:
-                            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
-                    }),
-                    function_id: FunctionId::try_new("builtin/test_higher_order/v1").unwrap(),
-                    overload: FunctionOverloadId::try_new("lambda-i64-to-i64").unwrap(),
-                    kind: FunctionKind::Scalar,
-                    argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
-                        argument_types,
-                    ),
-                    result_type: parameter_type.clone(),
-                },
-                args: arguments,
-            },
-        )
-        .unwrap();
-    let result = if matches!(fixture, HigherOrderFixture::ReusedAsExpressionChild) {
-        builder
-            .add_expression(
-                node,
-                parameter_type.clone(),
-                ExprKind::Binary {
-                    allow_throw_exception: Some(novarocks_type_contract::SemanticParameterRef {
-                        id: novarocks_type_contract::SemanticParameterId::new(0),
-                        expected_key:
-                            novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-                    }),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    left: call,
-                    op: BinaryOperator::Add,
-                    right: lambda,
-                },
-            )
-            .unwrap()
-    } else {
-        call
-    };
-    let output = builder
-        .add_value(
-            parameter_type.clone(),
-            ValueOrigin::Expr { node, expr: result },
-        )
-        .unwrap();
-    let mut outputs = vec![output];
-    let mut projections = vec![(result, output)];
-    if matches!(fixture, HigherOrderFixture::LambdaOperatorRoot) {
-        let lambda_output = builder
-            .add_value(parameter_type, ValueOrigin::Expr { node, expr: lambda })
-            .unwrap();
-        outputs.push(lambda_output);
-        projections.push((lambda, lambda_output));
-    }
-    builder
-        .insert_node_unchecked(PhysicalNode {
-            id: node,
-            inputs: Box::from([input]),
-            required_inputs: Box::from([unconstrained()]),
-            output_properties: PhysicalProperties {
-                distribution: Distribution::Singleton,
-                row_multiplicity: RowMultiplicity::SingleCopy,
-                ordering: Box::default(),
-            },
-            output: OutputPort {
-                node,
-                columns: outputs.into_boxed_slice(),
-            },
-            kind: NodeKind::Project {
-                expressions: projections.into_boxed_slice(),
-            },
-        })
-        .unwrap();
-    builder.finish_definition(
-        node,
-        FragmentSink::Noop,
-        dop(),
-        crate::StagePlacementPolicy::Singleton,
-    )
-}
-
-#[test]
-fn higher_order_function_binding_matches_the_exact_lambda_shape() {
-    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    higher_order_function_fragment(HigherOrderFixture::Valid, &mut fixture_constants).unwrap();
-    for fixture in [
-        HigherOrderFixture::ScalarBinding,
-        HigherOrderFixture::ParameterTypeDrift,
-    ] {
-        let error = higher_order_function_fragment(fixture, &mut fixture_constants)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("argument 0 shape differs from its bound signature"));
-    }
-}
-
-#[test]
-fn lambda_cannot_be_reused_outside_its_exact_bound_argument_positions() {
-    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    for fixture in [
-        HigherOrderFixture::ReusedAsExpressionChild,
-        HigherOrderFixture::ReusedAsValueArgument,
-        HigherOrderFixture::LambdaOperatorRoot,
-    ] {
-        let error = higher_order_function_fragment(fixture, &mut fixture_constants)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("lambda must appear only as an exact bound-function lambda argument")
-        );
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -2866,6 +2750,7 @@ pub(super) fn invalid_table_writer_fragment(
         }]);
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: writer,
             inputs: Box::from([input]),
             required_inputs: Box::from([unconstrained()]),
@@ -2898,7 +2783,7 @@ pub(super) fn invalid_table_writer_fragment(
             },
         })
         .unwrap();
-    builder.finish_definition(
+    builder.finish_fixture_definition(
         writer,
         FragmentSink::Noop,
         dop(),
@@ -3176,6 +3061,7 @@ fn grouped_writer_fragment_with_sources(
         .collect::<Vec<_>>();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: input,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -3350,16 +3236,36 @@ fn grouped_writer_fragment_with_sources(
         2
     } {
         let scalar_constant = if matches!(fixture, GroupedWriterFixture::NonLiteralScalar) {
-            builder
-                .add_expression(
+            // A valid, closed, non-literal scalar isolates the grouped-Unpivot
+            // constant-only law without borrowing this node's own output.
+            let ty = output_fields[ROOT_WRITE_RESULT_BLOB_TYPE_INDEX].ty.clone();
+            let literal = builder
+                .define(
                     finish,
-                    output_fields[ROOT_WRITE_RESULT_BLOB_TYPE_INDEX].ty.clone(),
-                    ExprKind::Value(output_fields[ROOT_WRITE_RESULT_BLOB_TYPE_INDEX].value),
+                    ty.clone(),
+                    fixture_constants.utf8("statistics", &ty),
+                )
+                .unwrap();
+            builder
+                .define(
+                    finish,
+                    ty,
+                    ExprKind::Cast {
+                        expr: literal,
+                        target: DataType::Utf8,
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
+                            id: novarocks_type_contract::SemanticParameterId::new(0),
+                            expected_key:
+                                novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+                        },
+                    },
                 )
                 .unwrap()
         } else if matches!(fixture, GroupedWriterFixture::MismatchedValueOutputType) {
             builder
-                .add_expression(
+                .define(
                     finish,
                     (ty(DataType::Binary, false)).clone(),
                     fixture_constants.binary(
@@ -3370,7 +3276,7 @@ fn grouped_writer_fragment_with_sources(
                 .unwrap()
         } else {
             builder
-                .add_expression(
+                .define(
                     finish,
                     (ty(DataType::Utf8, false)).clone(),
                     fixture_constants.utf8(
@@ -3380,6 +3286,12 @@ fn grouped_writer_fragment_with_sources(
                 )
                 .unwrap()
         };
+        let scalar_constant = builder.root_definition(
+            finish,
+            scalar_constant,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
         let mut constants = vec![
             if matches!(fixture, GroupedWriterFixture::WrongConstantType) {
                 UnpivotConstant::Utf8Map(grouped_reference(u32::MAX, target))
@@ -3403,7 +3315,21 @@ fn grouped_writer_fragment_with_sources(
         });
     }
     if matches!(fixture, GroupedWriterFixture::DuplicateMapping) {
-        mappings.insert(1, mappings[0].clone());
+        let mut repeated = mappings[0].clone();
+        for constant in &mut repeated.constants {
+            if let UnpivotConstant::Scalar(root) = constant {
+                let definition = builder.construction_unit(finish).unwrap().roots()
+                    [root.get() as usize]
+                    .definition;
+                *root = builder.root_definition(
+                    finish,
+                    definition,
+                    novarocks_type_contract::EvaluationDemand::Value,
+                    crate::RootScope::Port(0),
+                );
+            }
+        }
+        mappings.insert(1, repeated);
     }
     let value_output = if matches!(fixture, GroupedWriterFixture::MismatchedValueOutputType) {
         output_fields[ROOT_WRITE_RESULT_BLOB_TYPE_INDEX].value
@@ -3464,6 +3390,7 @@ fn grouped_writer_fragment_with_sources(
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: finish,
             inputs: Box::from([input]),
             required_inputs: Box::from([PhysicalProperties {
@@ -3505,12 +3432,16 @@ fn grouped_writer_fragment_with_sources(
             }),
         })
         .unwrap();
-    let fragment = builder.finish_definition(
+    let fragment = builder.finish_fixture_structure(
         finish,
         FragmentSink::Noop,
         dop(),
         crate::StagePlacementPolicy::Singleton,
     )?;
+    let fragment =
+        super::original_call_requests::with_original_relational_requests(fragment, &control);
+    let fragment = super::unit_fixture::with_immutable_relation_claims(fragment);
+    crate::validate_fragment_definition(&fragment)?;
     for (id, pool) in fixture_constants.for_fragment(&fragment).entries() {
         pools.insert(*id, pool.clone()).unwrap();
     }
@@ -3974,11 +3905,10 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     use novarocks_type_contract::{
         ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase,
-        ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
-        ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionInstanceState,
-        FunctionNullBehavior, ObservableEffects, PureCompileControl, SemanticParameterError,
-        SemanticParameterId, SemanticParameterKey, SemanticParameterProjectionError,
-        SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+        FunctionInstanceState, FunctionNullBehavior, ObservableEffects, PureCompileControl,
+        RelationCallId, RelationEffectContext, SemanticParameterError, SemanticParameterId,
+        SemanticParameterKey, SemanticParameterProjectionError, SemanticParameterRef,
+        SemanticParameterValue, SemanticParameters,
     };
     struct Control;
     impl PureCompileControl for Control {
@@ -3993,48 +3923,6 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         id: SemanticParameterId::new(u32::MAX),
         expected_key: SemanticParameterKey::TimeZone,
     };
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationRegionId::new(0);
-    let mut invocations = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        assert!(matches!(
-            fragment.expressions().get(root.expr).unwrap().kind,
-            ExprKind::Constant(_)
-        ));
-        let id = ExpressionUseId::new(ordinal as u32);
-        invocations.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                region: domain,
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![
-            ExpressionEvaluationRegion {
-                id: domain,
-                parent: None,
-                guard: None,
-            },
-            ExpressionEvaluationRegion {
-                id: EvaluationRegionId::new(1),
-                parent: None,
-                guard: None,
-            },
-        ],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
     // This is a real checked writer definition. Complete occurrence claims
     // remain independent of its legacy binding metadata and are not an owner
     // authentication receipt or a fabricated writer-cut package.
@@ -4043,21 +3931,12 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         call: 0,
     };
     let call = FrozenPhysicalCall {
-        materialized_writer_input: Some(ExpressionEffectContext {
-            use_id: ExpressionUseId::new(u32::MAX - 1),
-            region: EvaluationRegionId::new(1),
-            demand: novarocks_type_contract::EvaluationDemand::Value,
-        }),
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
-        temporal_source: None,
+        materialized_writer_input: Some(RelationEffectContext::materialized_input(
+            RelationCallId::new(u32::MAX),
+        )),
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         site,
-        context: ExpressionEffectContext {
-            use_id: ExpressionUseId::new(u32::MAX),
-            region: domain,
-            demand: novarocks_type_contract::EvaluationDemand::Value,
-        },
+        context: RelationEffectContext::call(RelationCallId::new(u32::MAX)),
         effects: CallEffects {
             value_stability: FunctionVolatility::Stable,
             own_row_error: FunctionIntrinsicRowError::NotRowEvaluated,
@@ -4070,13 +3949,11 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
             proof_scope: CallProofScope::Unconditional,
         },
     };
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &uses, vec![call.clone()], &Control).unwrap();
+    let calls = FrozenFragmentCalls::try_new(&fragment, vec![call.clone()], &Control).unwrap();
     let NodeKind::TableFinish(finish) = &fragment.nodes()[&fragment.root()].kind else {
         unreachable!()
     };
-    let Some(PhysicalCallBinding::Aggregate(binding)) = calls.binding(&fragment, &uses, site)
-    else {
+    let Some(PhysicalCallBinding::Aggregate(binding)) = calls.binding(&fragment, site) else {
         unreachable!()
     };
     assert!(std::ptr::eq(binding, &finish.final_aggregates[0].binding));
@@ -4099,7 +3976,7 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         call: 0,
     };
     assert_eq!(
-        FrozenFragmentCalls::try_new(&fragment, &uses, vec![wrong_site], &Control),
+        FrozenFragmentCalls::try_new(&fragment, vec![wrong_site], &Control),
         Err(FrozenCallError::MissingSite(site))
     );
     let required = SemanticParameters::try_new([(
@@ -4182,7 +4059,7 @@ fn grouped_runtime_filter_parent_fixture(nullable: bool) -> (Fragment, RuntimeFi
     else {
         panic!("original partial aggregate required")
     };
-    let input = crate::expression_value(fragment.expressions(), group_by[0].0).unwrap();
+    let input = crate::expression_value(&fragment, aggregate.id, group_by[0].0).unwrap();
     let NodeKind::TopN {
         order_by,
         limit,
@@ -4254,7 +4131,7 @@ fn runtime_filter_grouped_parent_accepts_exact_sequence_at_both_boundaries() {
         let (fragment, filter) = grouped_runtime_filter_parent_fixture(nullable);
         let cuts = local_runtime_filter_cuts(&fragment, &filter);
         validate_fragment(&fragment, &cuts).unwrap();
-        let mut builder = PlanBuilder::new(version());
+        let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
         builder.add_fragment(fragment).unwrap();
         builder.add_runtime_filter(filter).unwrap();
         builder.finish_observed(&GroupedConstantControl).unwrap();
@@ -4281,7 +4158,7 @@ fn runtime_filter_grouped_parent_preserves_the_exact_frozen_witness_at_both_boun
     for invalid in [wrong, reversed] {
         let cuts = local_runtime_filter_cuts(&fragment, &invalid);
         let cut_error = validate_fragment(&fragment, &cuts).unwrap_err();
-        let mut builder = PlanBuilder::new(version());
+        let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
         builder.add_fragment(fragment.clone()).unwrap();
         builder.add_runtime_filter(invalid).unwrap();
         let plan_error = builder
