@@ -1,0 +1,241 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use novarocks_parser::ast::*;
+use novarocks_parser::{ParseError, ParserError, Span, trino_parser::parse_expression};
+
+#[test]
+fn arithmetic_and_concat_follow_the_value_grammar_and_keep_true_operand_extent() {
+    let Expr::Binary(product) = parse_expression("(1 + 2) * 3").unwrap() else {
+        panic!("product")
+    };
+    assert_eq!(product.operator, BinaryOperator::Multiply);
+    assert_eq!(product.left_operand_span, Span::new(0, 7));
+    let Expr::Binary(sum) = product.left.as_ref() else {
+        panic!("sum")
+    };
+    assert_eq!(sum.operator, BinaryOperator::Add);
+    assert_eq!(sum.span, Span::new(1, 6));
+    let Expr::FunctionCall(concat) = parse_expression("1 + 2 || 3 * 4").unwrap() else {
+        panic!("concat")
+    };
+    assert_eq!(concat.name.parts[0].value, "concat");
+    assert_eq!(concat.arguments.len(), 2);
+    assert!(
+        matches!(&concat.arguments[0].value, Expr::Binary(value) if value.operator == BinaryOperator::Add)
+    );
+    assert!(
+        matches!(&concat.arguments[1].value, Expr::Binary(value) if value.operator == BinaryOperator::Multiply)
+    );
+}
+
+#[test]
+fn logical_flattening_respects_parenthesized_grammar_contexts() {
+    let Expr::Logical(flat) = parse_expression("a OR b OR c").unwrap() else {
+        panic!("OR")
+    };
+    assert_eq!(flat.operator, LogicalOperator::Or);
+    assert_eq!(flat.terms.len(), 3);
+    let Expr::Logical(left) = parse_expression("(a OR b) OR c").unwrap() else {
+        panic!("OR")
+    };
+    assert_eq!(left.terms.len(), 2);
+    assert!(
+        matches!(&left.terms[0], Expr::Logical(inner) if inner.operator == LogicalOperator::Or && inner.terms.len() == 2)
+    );
+    let Expr::Logical(right) = parse_expression("a OR (b OR c)").unwrap() else {
+        panic!("OR")
+    };
+    assert_eq!(right.terms.len(), 2);
+    assert!(
+        matches!(&right.terms[1], Expr::Logical(inner) if inner.operator == LogicalOperator::Or && inner.terms.len() == 2)
+    );
+    let Expr::Logical(mixed) = parse_expression("a OR b AND c").unwrap() else {
+        panic!("OR")
+    };
+    assert_eq!(mixed.terms.len(), 2);
+    assert!(
+        matches!(&mixed.terms[1], Expr::Logical(inner) if inner.operator == LogicalOperator::And && inner.terms.len() == 2)
+    );
+}
+
+#[test]
+fn number_signs_and_nonreserved_interval_names_keep_their_actual_productions() {
+    assert!(
+        matches!(parse_expression("-1").unwrap(), Expr::Literal(Literal { kind: LiteralKind::Long { spelling, parsed_value: -1 }, .. }) if spelling == "-1")
+    );
+    assert!(
+        matches!(parse_expression("+1").unwrap(), Expr::Unary(node) if node.operator == UnaryOperator::Plus)
+    );
+    assert!(
+        matches!(parse_expression("-(1)").unwrap(), Expr::Unary(node) if node.operator == UnaryOperator::Minus)
+    );
+    for (source, expected) in [
+        ("INTERVAL + value", BinaryOperator::Add),
+        ("INTERVAL - value", BinaryOperator::Subtract),
+    ] {
+        let Expr::Binary(node) = parse_expression(source).unwrap() else {
+            panic!("arithmetic column")
+        };
+        assert_eq!(node.operator, expected);
+        assert!(matches!(node.left.as_ref(), Expr::Identifier(name) if name.value == "INTERVAL"));
+    }
+}
+
+#[test]
+fn predicates_not_and_value_boundaries_remain_distinct() {
+    let Expr::Logical(logical) = parse_expression("NOT a = b AND c").unwrap() else {
+        panic!("AND")
+    };
+    assert_eq!(logical.operator, LogicalOperator::And);
+    assert_eq!(logical.terms.len(), 2);
+    let Expr::Unary(not) = &logical.terms[0] else {
+        panic!("NOT")
+    };
+    assert_eq!(not.operator, UnaryOperator::Not);
+    assert!(
+        matches!(not.expression.as_ref(), Expr::Predicated(node) if matches!(node.predicate, Predicate::Comparison(_)))
+    );
+    let Expr::Predicated(value) = parse_expression("a IS NOT DISTINCT FROM b").unwrap() else {
+        panic!("predicate")
+    };
+    assert!(matches!(
+        value.predicate,
+        Predicate::DistinctFrom(DistinctFromPredicate { negated: true, .. })
+    ));
+    let Expr::Predicated(value) = parse_expression("a NOT BETWEEN 1 AND 2").unwrap() else {
+        panic!("between")
+    };
+    assert!(matches!(
+        value.predicate,
+        Predicate::Between(BetweenPredicate { negated: true, .. })
+    ));
+    for source in [
+        "a = b = c",
+        "a = NOT b",
+        "a + NOT b",
+        "a IN ()",
+        "a LIKE b ESCAPE",
+        "a IS",
+    ] {
+        assert!(parse_expression(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn parameters_are_committed_productions_and_keep_control_call_visit_holes() {
+    let Expr::FunctionCall(call) = parse_expression("f('?', ?) /* ? */").unwrap() else {
+        panic!("call")
+    };
+    assert!(
+        matches!(&call.arguments[1].value, Expr::Parameter(parameter) if parameter.position == 0 && parameter.span == Span::new(7, 8))
+    );
+    // The pinned builder visits ORDER BY before arguments, then IF discards it.
+    let Expr::If(call) = parse_expression("IF(?, ? ORDER BY ?)").unwrap() else {
+        panic!("IF")
+    };
+    assert!(matches!(&call.condition, Expr::Parameter(parameter) if parameter.position == 1));
+    assert!(matches!(&call.true_value, Expr::Parameter(parameter) if parameter.position == 2));
+    assert!(call.false_value.is_none());
+}
+
+#[test]
+fn control_calls_enforce_the_reference_constructor_constraints() {
+    assert!(matches!(
+        parse_expression("IF(TRUE, 1, 2)").unwrap(),
+        Expr::If(_)
+    ));
+    assert!(matches!(
+        parse_expression("NULLIF(1, 2)").unwrap(),
+        Expr::NullIf(_)
+    ));
+    assert!(matches!(
+        parse_expression("COALESCE(1, 2)").unwrap(),
+        Expr::Coalesce(_)
+    ));
+    assert!(matches!(parse_expression("TRY(1)").unwrap(), Expr::Try(_)));
+    assert!(matches!(
+        parse_expression("FORMAT('%s', 1)").unwrap(),
+        Expr::Format(_)
+    ));
+    for source in [
+        "IF(1)",
+        "NULLIF(1)",
+        "COALESCE(1)",
+        "TRY(1,2)",
+        "FORMAT(1)",
+        "IF(a=>1,b=>2)",
+        "IF(DISTINCT 1,2)",
+        "TRY(1) FILTER(WHERE TRUE)",
+        "f(DISTINCT)",
+        "f(ALL *)",
+        "f(* ORDER BY 1)",
+        "f(*) IGNORE NULLS OVER ()",
+    ] {
+        assert!(parse_expression(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn standalone_expressions_require_the_original_end_boundary() {
+    for (source, span) in [
+        ("1;", Span::new(1, 2)),
+        ("1 2", Span::new(2, 3)),
+        ("a.*", Span::new(1, 2)),
+        ("(1", Span::new(2, 2)),
+    ] {
+        let ParserError::Parse(ParseError::UnexpectedToken { span: actual, .. }) =
+            parse_expression(source).unwrap_err()
+        else {
+            panic!("syntax boundary")
+        };
+        assert_eq!(actual, span, "{source}");
+    }
+}
+
+#[test]
+fn deeply_nested_parentheses_and_calls_use_the_default_test_thread_stack() {
+    let parentheses = format!("{}1{}", "(".repeat(10_000), ")".repeat(10_000));
+    assert!(matches!(
+        parse_expression(&parentheses).unwrap(),
+        Expr::Literal(_)
+    ));
+    let calls = format!("{}1{}", "f(".repeat(5_000), ")".repeat(5_000));
+    let parsed = parse_expression(&calls).unwrap();
+    let printed = novarocks_parser::trino_printer::print_expression(&parsed);
+    let reparsed = parse_expression(&printed).unwrap();
+    assert!(parsed.syntax_eq(&reparsed));
+    drop(reparsed);
+    drop(parsed);
+}
+
+#[test]
+fn long_or_chain_is_one_ordered_multiterm_node() {
+    let source = std::iter::repeat_n("a", 20_000)
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let Expr::Logical(node) = parse_expression(&source).unwrap() else {
+        panic!("OR")
+    };
+    assert_eq!(node.operator, LogicalOperator::Or);
+    assert_eq!(node.terms.len(), 20_000);
+    assert!(
+        node.terms
+            .iter()
+            .all(|term| matches!(term, Expr::Identifier(name) if name.value == "a"))
+    );
+}

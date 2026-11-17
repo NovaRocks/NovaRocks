@@ -37,3 +37,9 @@ mod group_by;
 mod relation;
 
 mod projection_values;
+
+mod expression;
+mod printer_first_slice;
+mod query;
+mod trino_special;
+mod types;

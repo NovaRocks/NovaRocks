@@ -24,6 +24,8 @@ pub mod printer;
 pub mod recursion;
 pub mod trino_keyword;
 pub mod trino_lexer;
+pub mod trino_parser;
+pub mod trino_printer;
 pub mod trino_token;
 
 mod error;
