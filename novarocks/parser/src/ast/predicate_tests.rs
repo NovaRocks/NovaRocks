@@ -280,7 +280,7 @@ fn predicate_owning_cycle_and_all_synchronous_traversals_grow_the_actual_stack()
     let crate::ast::SetExpr::Select(select) = query.body.as_mut() else {
         unreachable!()
     };
-    select.projection[0] = crate::ast::SelectItem::UnnamedExpr(folded);
+    select.projection[0] = crate::build::item(folded, None);
     crate::ast::validate_statement(&statements[0]).unwrap();
     drop(statements);
     drop(node);

@@ -2646,7 +2646,10 @@ mod tests {
         let crate::ast::SetExpr::Values(values) = node.query.body.as_ref() else {
             panic!("original VALUES")
         };
-        let crate::ast::Expr::Literal(value) = &values.rows[0][0] else {
+        let crate::ast::Expr::Literal(value) = crate::ast::ValuesRowCells::new(&values.rows[0])
+            .get(0)
+            .unwrap()
+        else {
             panic!("literal")
         };
         assert!(matches!(

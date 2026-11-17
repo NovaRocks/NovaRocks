@@ -3290,7 +3290,7 @@ impl<'a> AnalyzerContext<'a> {
 
         self.validate_grouping_calls(&group_by)?;
 
-        let distinct = matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. });
+        let distinct = select.distinct;
 
         let mut resolved_select = ResolvedSelect {
             from,

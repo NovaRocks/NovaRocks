@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 use novarocks_parser::ast::{
     Expr, FunctionCall, Ident, Literal, LiteralKind, ObjectName, Query, Select, SelectItem,
-    SelectQuantifier, SetExpr, TypeName, Visit, WildcardOptions, WindowSpecification, walk_expr,
-    walk_function_call, walk_object_name, walk_query, walk_type_name,
+    SetExpr, TypeName, Visit, WindowSpecification, walk_expr, walk_function_call, walk_object_name,
+    walk_query, walk_type_name,
 };
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 
@@ -2787,10 +2787,7 @@ impl CompletionRetainedBytes {
             SetExpr::Select(select) => self.add_select_containers(select),
             SetExpr::Values(values) => {
                 self.add(std::mem::size_of::<novarocks_parser::ast::Values>());
-                self.add_vec_capacity::<Vec<Expr>>(values.rows.capacity());
-                for row in &values.rows {
-                    self.add_vec_capacity::<Expr>(row.capacity());
-                }
+                self.add_vec_capacity::<Expr>(values.rows.capacity());
             }
             SetExpr::Query(_) | SetExpr::Table(_) => {}
             SetExpr::SetOperation(operation) => {
@@ -2809,33 +2806,22 @@ impl CompletionRetainedBytes {
     fn add_select_containers(&mut self, select: &Select) {
         self.add_order_by_containers(&select.modifiers.order_by);
         self.add(std::mem::size_of::<Select>());
-        if let SelectQuantifier::Distinct { on, .. } = &select.quantifier {
-            self.add_vec_capacity::<Expr>(on.capacity());
-        }
         self.add_vec_capacity::<SelectItem>(select.projection.capacity());
         for item in &select.projection {
             match item {
-                SelectItem::Wildcard { options, .. } => self.add_wildcard_containers(options),
-                SelectItem::QualifiedWildcard {
-                    prefix, options, ..
-                } => {
-                    self.add_vec_capacity::<Ident>(prefix.capacity());
-                    self.add_wildcard_containers(options);
+                SelectItem::SingleColumn(_) => {
+                    self.add(std::mem::size_of::<novarocks_parser::ast::SingleColumn>())
                 }
-                SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
+                SelectItem::AllColumns(columns) => {
+                    self.add(std::mem::size_of::<novarocks_parser::ast::AllColumns>());
+                    self.add_vec_capacity::<Ident>(columns.aliases.capacity());
+                }
             }
         }
         self.add_vec_capacity::<novarocks_parser::ast::WindowDefinition>(select.windows.capacity());
         for window in &select.windows {
             self.add_window_spec_containers(&window.specification);
         }
-    }
-
-    fn add_wildcard_containers(&mut self, options: &WildcardOptions) {
-        self.add_vec_capacity::<Ident>(options.exclude.capacity());
-        self.add_vec_capacity::<novarocks_parser::ast::ReplaceSelectItem>(
-            options.replace.capacity(),
-        );
     }
 
     fn add_order_by_containers(&mut self, order_by: &Option<novarocks_parser::ast::OrderBy>) {
@@ -4006,12 +3992,19 @@ mod tests {
         use std::mem::size_of;
         fn values(row_capacity: usize, rows_capacity: usize) -> SetExpr {
             let mut row = Vec::with_capacity(row_capacity);
-            row.push(build::boolean(true));
+            let expression = build::boolean(true);
+            row.push(novarocks_parser::ast::RowField {
+                name: None,
+                span: expression.span(),
+                expression,
+            });
             let mut rows = Vec::with_capacity(rows_capacity);
-            rows.push(row);
+            rows.push(Expr::Row(novarocks_parser::ast::RowExpr {
+                fields: row.into(),
+                span: SYNTHETIC,
+            }));
             SetExpr::Values(Values {
-                rows,
-                explicit_row: false,
+                rows: rows.into(),
                 span: SYNTHETIC,
             })
         }
@@ -4042,8 +4035,11 @@ mod tests {
             let SetExpr::Values(side_values) = &side else {
                 unreachable!()
             };
-            added_buffer_bytes += (side_values.rows.capacity() * size_of::<Vec<Expr>>()
-                + side_values.rows[0].capacity() * size_of::<Expr>())
+            let Expr::Row(row) = &side_values.rows[0] else {
+                unreachable!()
+            };
+            added_buffer_bytes += (side_values.rows.capacity() * size_of::<Expr>()
+                + row.fields.capacity() * size_of::<novarocks_parser::ast::RowField>())
                 as u64;
             let mut inputs = Vec::with_capacity(5 + index % 3);
             inputs.push(body);
@@ -4067,7 +4063,7 @@ mod tests {
         let inline_per_layer = 2 * size_of::<SetExpr>()
             + size_of::<SetOperation>()
             + size_of::<Values>()
-            + size_of::<Expr>()
+            + 2 * size_of::<Expr>()
             + size_of::<Literal>();
         let expected = baseline + added_buffer_bytes + (DEPTH * inline_per_layer) as u64;
         assert_eq!(definition.completion_retained_bytes().unwrap(), expected);
@@ -4125,7 +4121,6 @@ mod tests {
                 span: novarocks_parser::SYNTHETIC,
             })),
             None,
-            false,
         );
         let definition = SqlMvRewriteDefinitionFacts::try_new(
             1,

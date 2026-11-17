@@ -11,7 +11,7 @@ fn query_with(expression: Expr) -> Query {
     let SetExpr::Select(select) = query.body.as_mut() else {
         unreachable!()
     };
-    select.projection[0] = SelectItem::UnnamedExpr(expression);
+    select.projection[0] = crate::build::item(expression, None);
     query
 }
 fn id(value: &str) -> Expr {

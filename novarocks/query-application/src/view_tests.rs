@@ -394,13 +394,17 @@ fn ignore_nulls_uses_the_original_parser_and_preserves_local_and_external_raw_so
     let SetExpr::Select(select) = parsed.body.as_ref() else {
         panic!("select")
     };
-    let novarocks_parser::ast::SelectItem::ExprWithAlias {
-        expr: novarocks_parser::ast::Expr::FunctionCall(call),
-        ..
-    } = &select.projection[0]
+    let novarocks_parser::ast::SelectItem::SingleColumn(single_column) = &select.projection[0]
     else {
         panic!("original function call")
     };
+    let Some(_) = &single_column.alias else {
+        panic!("original function call")
+    };
+    let novarocks_parser::ast::Expr::FunctionCall(call) = &single_column.expression else {
+        panic!("original function call")
+    };
+
     assert_eq!(
         call.null_treatment,
         Some(novarocks_parser::ast::NullTreatment::IgnoreNulls)

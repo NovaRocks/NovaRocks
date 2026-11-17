@@ -142,13 +142,20 @@ pub(crate) fn literal_query(query: &ast::Query) -> bool {
 fn literal_body(body: &ast::SetExpr) -> bool {
     match body {
         ast::SetExpr::Table(_) => false,
-        ast::SetExpr::Values(values) => values.rows.iter().flatten().all(is_literal_expr),
+        ast::SetExpr::Values(values) => {
+            !values.rows.is_empty()
+                && values.rows.iter().all(|row| {
+                    let cells = ast::ValuesRowCells::new(row);
+                    !cells.is_empty()
+                        && !cells.has_named_fields()
+                        && cells.iter().all(is_literal_expr)
+                })
+        }
         ast::SetExpr::Select(select) => {
             select.modifiers.is_empty()
                 && select.from.is_none()
                 && select.projection.iter().all(|item| match item {
-                    ast::SelectItem::UnnamedExpr(expr)
-                    | ast::SelectItem::ExprWithAlias { expr, .. } => is_literal_expr(expr),
+                    ast::SelectItem::SingleColumn(column) => is_literal_expr(&column.expression),
                     _ => false,
                 })
         }
@@ -265,18 +272,23 @@ fn legacy_literal_query(query: &ast::Query) -> bool {
                 select.modifiers.is_empty()
                     && select.from.is_none()
                     && select.projection.iter().all(|item| match item {
-                        ast::SelectItem::UnnamedExpr(expr)
-                        | ast::SelectItem::ExprWithAlias { expr, .. } => {
-                            legacy_literal_shape(expr).is_some()
+                        ast::SelectItem::SingleColumn(column) => {
+                            legacy_literal_shape(&column.expression).is_some()
                         }
                         _ => false,
                     })
             }
-            ast::SetExpr::Values(values) => values
-                .rows
-                .iter()
-                .flatten()
-                .all(|value| legacy_literal_shape(value).is_some()),
+            ast::SetExpr::Values(values) => {
+                !values.rows.is_empty()
+                    && values.rows.iter().all(|row| {
+                        let cells = ast::ValuesRowCells::new(row);
+                        !cells.is_empty()
+                            && !cells.has_named_fields()
+                            && cells
+                                .iter()
+                                .all(|value| legacy_literal_shape(value).is_some())
+                    })
+            }
             ast::SetExpr::Query(subquery) => {
                 let query = &subquery.query;
                 legacy_literal_query(query)
@@ -338,14 +350,18 @@ mod tests {
         let ast::SetExpr::Values(values) = command.source.body.as_ref() else {
             panic!("VALUES");
         };
-        let ast::Expr::Literal(value) = &values.rows[0][0] else {
+        let ast::Expr::Literal(value) = ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap()
+        else {
             panic!("numeric literal");
         };
         assert_eq!(
             value.kind,
             ast::LiteralKind::Decimal("123456789.123456789".into())
         );
-        assert!(matches!(&values.rows[1][0], ast::Expr::Cast(_)));
+        assert!(matches!(
+            ast::ValuesRowCells::new(&values.rows[1]).get(0).unwrap(),
+            ast::Expr::Cast(_)
+        ));
     }
 
     #[test]
@@ -432,7 +448,10 @@ mod tests {
         let ast::SetExpr::Values(values) = command.source.body.as_ref() else {
             panic!("VALUES");
         };
-        assert!(matches!(&values.rows[0][0], ast::Expr::FunctionCall(_)));
+        assert!(matches!(
+            ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap(),
+            ast::Expr::FunctionCall(_)
+        ));
     }
 
     #[test]

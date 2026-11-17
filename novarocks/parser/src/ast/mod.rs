@@ -91,11 +91,10 @@ pub use materialized_view::{
     MaterializedViewRefreshPolicy, MaterializedViewStatement, RefreshMaterializedView,
 };
 pub use query::{
-    AutoGroupBy, Corresponding, Cte, ExplainFormat, ExplainQuery, FetchFirst, GroupBy,
+    AllColumns, AutoGroupBy, Corresponding, Cte, ExplainFormat, ExplainQuery, FetchFirst, GroupBy,
     GroupingElement, GroupingSets, GroupingSetsKind, Limit, NullOrdering, Offset, OrderBy, Query,
-    QueryLimit, QueryModifiers, ReplaceSelectItem, Select, SelectItem, SelectQuantifier,
-    SessionProperty, SetExpr, SetOperation, SetOperator, SimpleGroupBy, SortItem, SortOrdering,
-    Values, WildcardOptions, With,
+    QueryLimit, QueryModifiers, Select, SelectItem, SessionProperty, SetExpr, SetOperation,
+    SetOperator, SimpleGroupBy, SingleColumn, SortItem, SortOrdering, Values, ValuesRowCells, With,
 };
 pub use relation::*;
 pub use row_pattern::{
@@ -116,14 +115,16 @@ pub use table::{
 pub use validate::{validate_statement, validate_statements};
 pub use view::{CreateView, DropView, ShowCreateView, ViewStatement};
 pub use visit::{
-    Fold, Visit, fold_auto_group_by, fold_binary_expr, fold_cte, fold_expr, fold_function_call,
-    fold_group_by, fold_grouping_element, fold_grouping_sets, fold_ident, fold_logical_expr,
-    fold_nested_expr, fold_object_name, fold_query, fold_select, fold_set_expr,
-    fold_simple_group_by, fold_statement, fold_unary_expr, fold_view_statement, fold_with,
+    Fold, Visit, fold_all_columns, fold_auto_group_by, fold_binary_expr, fold_cte, fold_expr,
+    fold_function_call, fold_group_by, fold_grouping_element, fold_grouping_sets, fold_ident,
+    fold_logical_expr, fold_nested_expr, fold_object_name, fold_query, fold_select,
+    fold_select_item, fold_set_expr, fold_simple_group_by, fold_single_column, fold_statement,
+    fold_unary_expr, fold_values, fold_view_statement, fold_with, walk_all_columns,
     walk_auto_group_by, walk_binary_expr, walk_cte, walk_expr, walk_function_call, walk_group_by,
     walk_grouping_element, walk_grouping_sets, walk_ident, walk_logical_expr, walk_nested_expr,
-    walk_object_name, walk_query, walk_select, walk_simple_group_by, walk_statement,
-    walk_unary_expr, walk_view_statement, walk_with,
+    walk_object_name, walk_query, walk_select, walk_select_item, walk_simple_group_by,
+    walk_single_column, walk_statement, walk_unary_expr, walk_values, walk_view_statement,
+    walk_with,
 };
 pub use window::{
     Window, WindowDefinition, WindowFrame, WindowFrameBound, WindowFrameExclusion,

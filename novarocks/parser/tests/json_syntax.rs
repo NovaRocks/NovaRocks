@@ -30,7 +30,7 @@ fn invocation() -> JsonPathInvocation {
 fn expression_query(expression: Expr) -> Statement {
     Statement::Query(build::query(SetExpr::Select(
         novarocks_parser::ast::AstBox::new(
-            build::select(vec![build::item(expression, None, false)], None, None, None).unwrap(),
+            build::select(vec![build::item(expression, None)], None, None, None).unwrap(),
         ),
     )))
 }

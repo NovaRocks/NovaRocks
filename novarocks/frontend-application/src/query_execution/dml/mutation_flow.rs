@@ -931,7 +931,6 @@ fn build_update_match_query(
         build::item(
             build::column(target_alias.clone(), build::ident(name, false)),
             Some(build::ident(alias, false)),
-            true,
         )
     })
     .collect::<Vec<_>>();
@@ -945,7 +944,6 @@ fn build_update_match_query(
                 false,
                 column.span,
             )),
-            true,
         )
     }));
     let mut from = target;
@@ -1075,19 +1073,16 @@ fn build_merge_match_query(
         projection.push(build::item(
             nullable(name)?,
             Some(build::ident(alias, false)),
-            true,
         ));
     }
     projection.push(build::item(
         build::nested(action),
         Some(build::ident("__nr_merge_action", false)),
-        true,
     ));
     for column in target_columns {
         projection.push(build::item(
             nullable(&column.name)?,
             Some(build::ident(&column.name, true)),
-            true,
         ));
     }
     for (prefix, values) in [
@@ -1102,7 +1097,6 @@ fn build_merge_match_query(
                     false,
                     column.span,
                 )),
-                true,
             )
         }));
     }
@@ -1395,10 +1389,11 @@ mod tests {
         let ast::SetExpr::Select(mut select) = query.body.into_inner() else {
             panic!("select fixture");
         };
-        let ast::SelectItem::UnnamedExpr(expr) = select.projection.remove(0) else {
+        let ast::SelectItem::SingleColumn(column) = select.projection.remove(0) else {
             panic!("expression fixture");
         };
-        expr
+        assert!(column.alias.is_none());
+        column.into_inner().expression
     }
     fn prepared_update(source: &str) -> PreparedUpdateStatement {
         let [ast::Statement::Dml(statement)]: [ast::Statement; 1] =
@@ -1580,9 +1575,13 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        let ast::SelectItem::ExprWithAlias { alias, .. } = select.projection.last().unwrap() else {
+        let ast::SelectItem::SingleColumn(single_column) = select.projection.last().unwrap() else {
             panic!("assignment alias");
         };
+        let Some(alias) = &single_column.alias else {
+            panic!("assignment alias");
+        };
+
         assert_eq!(alias.value, "__nr_new_odd name");
         assert_eq!(alias.span, prepared.assignments[0].column_span);
     }
@@ -1699,10 +1698,13 @@ mod tests {
                     .iter()
                     .enumerate()
                     .find_map(|(ordinal, item)| match item {
-                        ast::SelectItem::ExprWithAlias { alias, expr, .. }
-                            if alias.value == "__nr_new_v" =>
+                        ast::SelectItem::SingleColumn(column)
+                            if column
+                                .alias
+                                .as_ref()
+                                .is_some_and(|alias| alias.value == "__nr_new_v") =>
                         {
-                            Some((ordinal, expr.span()))
+                            Some((ordinal, column.expression.span()))
                         }
                         _ => None,
                     })
@@ -1934,10 +1936,13 @@ mod tests {
             .projection
             .iter()
             .find_map(|item| match item {
-                ast::SelectItem::ExprWithAlias { expr, alias, .. }
-                    if alias.value == "__nr_merge_action" =>
+                ast::SelectItem::SingleColumn(column)
+                    if column
+                        .alias
+                        .as_ref()
+                        .is_some_and(|alias| alias.value == "__nr_merge_action") =>
                 {
-                    Some(expr)
+                    Some(&column.expression)
                 }
                 _ => None,
             })
@@ -2019,10 +2024,12 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        assert!(!select.projection.iter().any(|item| matches!(
-            item,
-            ast::SelectItem::QualifiedWildcard { .. } | ast::SelectItem::Wildcard { .. }
-        )));
+        assert!(
+            !select
+                .projection
+                .iter()
+                .any(|item| matches!(item, ast::SelectItem::AllColumns(_)))
+        );
         for (alias, expected) in [
             (
                 "id",
@@ -2039,15 +2046,20 @@ mod tests {
                 .projection
                 .iter()
                 .find_map(|item| match item {
-                    ast::SelectItem::ExprWithAlias {
-                        expr, alias: name, ..
-                    } if name.value == alias => Some(expr),
+                    ast::SelectItem::SingleColumn(column)
+                        if column
+                            .alias
+                            .as_ref()
+                            .is_some_and(|name| name.value == alias) =>
+                    {
+                        Some(&column.expression)
+                    }
                     _ => None,
                 })
                 .expect("projected alias");
             assert!(expr.syntax_eq(&test_expr(expected)), "{alias}");
         }
-        assert!(select.projection.iter().any(|item| matches!(item, ast::SelectItem::ExprWithAlias { alias, .. } if alias.value == "__nr_merge_action")));
+        assert!(select.projection.iter().any(|item| matches!(item, ast::SelectItem::SingleColumn(column) if column.alias.as_ref().is_some_and(|alias| alias.value == "__nr_merge_action"))));
     }
 
     // ---- the merge-on-read write-session data plane ----------------------

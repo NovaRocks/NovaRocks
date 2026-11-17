@@ -1085,23 +1085,14 @@ fn alias_incremental_select_projection_item(
 
     let alias = incremental_alias_ident(alias);
     match item {
-        SelectItem::UnnamedExpr(expr) => {
-            let expr = expr.clone();
-            *item = SelectItem::ExprWithAlias {
-                expr,
-                alias,
-                explicit_as: true,
-                span: Span::new(0, 0),
-            };
+        SelectItem::SingleColumn(column) => {
+            if column.alias.is_none() {
+                column.span = Span::new(0, 0);
+            }
+            column.alias = Some(alias);
             Ok(())
         }
-        SelectItem::ExprWithAlias {
-            alias: existing, ..
-        } => {
-            *existing = alias;
-            Ok(())
-        }
-        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => {
+        SelectItem::AllColumns(_) => {
             Err("aggregate MV group key projection cannot be a wildcard".to_string())
         }
     }
@@ -2993,7 +2984,7 @@ fn aggregate_physical_query(
 }
 
 fn aggregate_projection_item(expr: ast::Expr, alias: &str) -> ast::SelectItem {
-    build::item(expr, Some(build::ident(alias, true)), true)
+    build::item(expr, Some(build::ident(alias, true)))
 }
 
 fn aggregate_visible_type_witness(data_type: &DataType) -> Result<ast::Expr, String> {
@@ -3535,7 +3526,13 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("fixture must retain SELECT body");
         };
-        let ast::SelectItem::ExprWithAlias { alias, .. } = &select.projection[0] else {
+        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+            panic!("group key must have SQL-owned alias");
+        };
+        let ast::SingleColumn {
+            alias: Some(alias), ..
+        } = projection_column.as_ref()
+        else {
             panic!("group key must have SQL-owned alias");
         };
         assert_eq!(alias.value, "k");
@@ -3880,8 +3877,13 @@ mod tests {
             .projection
             .iter()
             .find_map(|item| match item {
-                ast::SelectItem::ExprWithAlias { expr, alias, .. } if alias.value == output => {
-                    Some(expr)
+                ast::SelectItem::SingleColumn(column)
+                    if column
+                        .alias
+                        .as_ref()
+                        .is_some_and(|alias| alias.value == output) =>
+                {
+                    Some(&column.expression)
                 }
                 _ => None,
             })
@@ -4285,8 +4287,8 @@ mod tests {
             for name in ["k", "total", SQL_MV_ROW_ID_COLUMN, BRANCH_ID_COLUMN_NAME] {
                 assert!(
                     select.projection.iter().any(|item| matches!(item,
-                        ast::SelectItem::ExprWithAlias { alias, .. }
-                            if alias.value == name && alias.quoted
+                        ast::SelectItem::SingleColumn(column)
+                            if column.alias.as_ref().is_some_and(|alias| alias.value == name && alias.quoted)
                     )),
                     "branch {index} lost exact output alias {name}"
                 );
@@ -4329,10 +4331,13 @@ mod tests {
                         .projection
                         .iter()
                         .find_map(|item| match item {
-                            ast::SelectItem::ExprWithAlias { expr, alias, .. }
-                                if alias.value == BRANCH_ID_COLUMN_NAME =>
+                            ast::SelectItem::SingleColumn(column)
+                                if column
+                                    .alias
+                                    .as_ref()
+                                    .is_some_and(|alias| alias.value == BRANCH_ID_COLUMN_NAME) =>
                             {
-                                Some(expr)
+                                Some(&column.expression)
                             }
                             _ => None,
                         })

@@ -531,7 +531,7 @@ mod tests {
     fn projection_query(expression: ast::Expr, from: Vec<ast::Relation>) -> ast::Query {
         build::query(ast::SetExpr::Select(ast::AstBox::new(
             build::select(
-                vec![ast::SelectItem::UnnamedExpr(expression)],
+                vec![novarocks_parser::build::item(expression, None)],
                 from.into_iter()
                     .reduce(|left, right| build::join(left, ast::JoinType::Implicit, right, None)),
                 None,
@@ -788,8 +788,11 @@ mod tests {
         let ast::SetExpr::Select(select) = actual_query.body.as_ref() else {
             panic!("select")
         };
-        let ast::SelectItem::UnnamedExpr(ast::Expr::JsonObject(after)) = &select.projection[0]
-        else {
+        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+            panic!("object")
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let ast::Expr::JsonObject(after) = &projection_column.expression else {
             panic!("object")
         };
         assert_eq!(after.as_ref(), &original);
@@ -974,9 +977,12 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT fixture")
         };
-        let [ast::SelectItem::UnnamedExpr(expression)] = select.projection.as_slice() else {
+        let [ast::SelectItem::SingleColumn(projection_column)] = select.projection.as_slice()
+        else {
             panic!("one projection fixture")
         };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let expression = &projection_column.expression;
         expression
     }
 
@@ -1369,9 +1375,12 @@ mod tests {
             let ast::SetExpr::Select(select) = query.body.as_ref() else {
                 panic!("select");
             };
-            let ast::SelectItem::UnnamedExpr(mut expression) = select.projection[0].clone() else {
+            let ast::SelectItem::SingleColumn(projection_column) = select.projection[0].clone()
+            else {
                 panic!("typeof");
             };
+            assert!(projection_column.alias.is_none(), "anonymous projection");
+            let mut expression = projection_column.into_inner().expression;
             let ast::Expr::FunctionCall(call) = &mut expression else {
                 panic!("typeof call");
             };

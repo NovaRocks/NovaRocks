@@ -70,9 +70,11 @@ fn projection(query: &ast::Query) -> &ast::Expr {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select fixture")
     };
-    let ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+    let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
         panic!("projection fixture")
     };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let expr = &projection_column.expression;
     expr
 }
 fn same_typed(actual: &TypedExpr, expected: &TypedExpr, control: &SqlCompileControl) {
@@ -232,13 +234,14 @@ fn unsupported_predicate_profiles_precede_original_children_and_catalog_discover
         let ast::SetExpr::Select(select) = query.body.as_mut() else {
             panic!("select")
         };
-        select.projection[0] = ast::SelectItem::UnnamedExpr(ast::Expr::Predicated(
-            ast::AstBox::new(ast::PredicatedExpr {
+        select.projection[0] = novarocks_parser::build::item(
+            ast::Expr::Predicated(ast::AstBox::new(ast::PredicatedExpr {
                 value: unknown(),
                 predicate,
                 span,
-            }),
-        ));
+            })),
+            None,
+        );
         let direct = ctx.analyze_expr(projection(&query), &scope).unwrap_err();
         assert_eq!(direct.kind(), AnalyzeErrorKind::UnsupportedExpression);
         assert_eq!(direct.message(), expected);

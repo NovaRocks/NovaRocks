@@ -590,20 +590,38 @@ fn mutation_write_assignments(
     } else {
         old_start + columns.len()
     };
-    if wildcard
-        && !matches!(
-            select.projection.get(6),
-            Some(ast::SelectItem::QualifiedWildcard { .. })
-        )
-    {
-        return Err(invalid(
-            "generated UPDATE lost its target wildcard occurrence",
-        ));
+    if wildcard {
+        let valid = if let Some(ast::SelectItem::AllColumns(columns)) = select.projection.get(6) {
+            if columns.aliases.is_empty() {
+                if let Some(target) = &columns.target {
+                    ast::identifier_chain_observed(target, |_| {
+                        control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+                    })?
+                    .is_some()
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !valid {
+            return Err(invalid(
+                "generated UPDATE lost its target wildcard occurrence",
+            ));
+        }
     }
     for (index, item) in select.projection.iter().enumerate().skip(first_assignment) {
-        let ast::SelectItem::ExprWithAlias { alias, expr, .. } = item else {
+        let ast::SelectItem::SingleColumn(single_column) = item else {
             return Err(invalid("mutation assignment lost its exact output alias"));
         };
+        let Some(alias) = &single_column.alias else {
+            return Err(invalid("mutation assignment lost its exact output alias"));
+        };
+        let expr = &single_column.expression;
+
         let name = alias
             .value
             .strip_prefix("__nr_new_")
@@ -745,9 +763,14 @@ mod typed_assignment_tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        let ast::SelectItem::ExprWithAlias { expr, .. } = &select.projection[7] else {
+        let ast::SelectItem::SingleColumn(single_column) = &select.projection[7] else {
             panic!("assignment");
         };
+        let Some(_) = &single_column.alias else {
+            panic!("assignment");
+        };
+        let expr = &single_column.expression;
+
         assert_eq!(assignments.sites()[1].source_span(), Some(expr.span()));
     }
     #[test]

@@ -21,14 +21,14 @@ use crate::{
     Span, Token, TokenKind,
     ast::legacy::JoinOperator,
     ast::{
-        AliasedRelation, AllRows, AstBox, AstVec, Cte, ExplainFormat, ExplainQuery, Expr,
-        FetchFirst, GroupBy, GroupingElement, GroupingSets, GroupingSetsKind, Ident, Join,
+        AliasedRelation, AllColumns, AllRows, AstBox, AstVec, Cte, ExplainFormat, ExplainQuery,
+        Expr, FetchFirst, GroupBy, GroupingElement, GroupingSets, GroupingSetsKind, Ident, Join,
         JoinCriteria, JoinOn, JoinType, JoinUsing, Lateral, Limit, Literal, LiteralKind,
         NaturalJoin, NullOrdering, Offset, OrderBy, Query, QueryLimit, QueryPeriod,
-        QueryPeriodRangeType, Relation, Select, SelectItem, SelectQuantifier, SetExpr, SetOperator,
-        SimpleGroupBy, SortItem, SortOrdering, Statement, Table, TableFunctionArgument,
-        TableFunctionArgumentValue, TableFunctionInvocation, TableSubquery, Unnest, Values,
-        WildcardOptions, WindowDefinition, With,
+        QueryPeriodRangeType, Relation, RowExpr, RowField, Select, SelectItem, SetExpr,
+        SetOperator, SimpleGroupBy, SingleColumn, SortItem, SortOrdering, Statement, Table,
+        TableFunctionArgument, TableFunctionArgumentValue, TableFunctionInvocation, TableSubquery,
+        Unnest, Values, WindowDefinition, With,
     },
     lex,
     token::{Keyword, Symbol},
@@ -395,15 +395,10 @@ fn parse_select(
     let select = parser.consume_word("SELECT")?;
     let start = select.start();
     let hints = parse_select_hints(parser, select)?;
-    let quantifier = if parser.consume_if_word("ALL") {
-        SelectQuantifier::All(Span::new(start, parser.current_offset()))
-    } else if parser.consume_if_word("DISTINCT") {
-        SelectQuantifier::Distinct {
-            on: Vec::new(),
-            span: Span::new(start, parser.current_offset()),
-        }
+    let distinct = if parser.consume_if_word("ALL") {
+        false
     } else {
-        SelectQuantifier::None
+        parser.consume_if_word("DISTINCT")
     };
     let projection = parse_projection(parser)?;
     let from = if parser.consume_if_word("FROM") {
@@ -469,8 +464,8 @@ fn parse_select(
         );
     Ok((
         Select {
-            quantifier: quantifier,
-            projection: projection,
+            distinct: distinct,
+            projection: projection.into(),
             from: from,
             selection: selection,
             group_by: group_by,
@@ -646,10 +641,11 @@ fn parse_projection(
     loop {
         if parser.current_is_symbol(Symbol::Star) {
             let span = parser.consume_symbol(Symbol::Star)?;
-            items.push(SelectItem::Wildcard {
-                options: WildcardOptions::default(),
+            items.push(SelectItem::AllColumns(AstBox::new(AllColumns {
+                target: None,
+                aliases: Vec::new(),
                 span,
-            });
+            })));
         } else if qualified_wildcard_ahead(parser) {
             let start = parser.current_span().start();
             let mut prefix = vec![parser.parse_ident()?];
@@ -657,11 +653,13 @@ fn parse_projection(
                 parser.consume_symbol(Symbol::Dot)?;
                 if parser.current_is_symbol(Symbol::Star) {
                     let end = parser.consume_symbol(Symbol::Star)?.end();
-                    items.push(SelectItem::QualifiedWildcard {
-                        prefix,
-                        options: WildcardOptions::default(),
-                        span: Span::new(start, end),
-                    });
+                    let SelectItem::AllColumns(mut item) = crate::build::qualified_wildcard(prefix)
+                        .expect("qualified wildcard has a prefix")
+                    else {
+                        unreachable!()
+                    };
+                    item.span = Span::new(start, end);
+                    items.push(SelectItem::AllColumns(item));
                     break;
                 }
                 prefix.push(parser.parse_ident()?);
@@ -686,26 +684,19 @@ fn parse_projection(
                 ],
                 &[Symbol::Comma, Symbol::Semicolon, Symbol::RParen],
             )?;
-            if parser.consume_if_word("AS") {
-                let alias = parser.parse_ident()?;
-                let span = Span::new(expr.span().start(), alias.span.end());
-                items.push(SelectItem::ExprWithAlias {
-                    expr,
-                    alias,
-                    explicit_as: true,
-                    span,
-                });
-            } else if let Some(alias) = implicit_alias {
-                let span = Span::new(expr.span().start(), alias.span.end());
-                items.push(SelectItem::ExprWithAlias {
-                    expr,
-                    alias,
-                    explicit_as: false,
-                    span,
-                });
+            let alias = if parser.consume_if_word("AS") {
+                Some(parser.parse_ident()?)
             } else {
-                items.push(SelectItem::UnnamedExpr(expr));
-            }
+                implicit_alias
+            };
+            let span = alias
+                .as_ref()
+                .map_or(expr.span(), |alias| expr.span().cover(alias.span));
+            items.push(SelectItem::SingleColumn(AstBox::new(SingleColumn {
+                expression: expr,
+                alias,
+                span,
+            })));
         }
         if !parser.consume_if_symbol(Symbol::Comma) {
             break;
@@ -1478,7 +1469,7 @@ fn parse_values(parser: &mut StatementParser<'_, '_>) -> Result<Values, crate::P
     let start = parser.consume_word("VALUES")?.start();
     let mut rows = Vec::new();
     loop {
-        parser.consume_symbol(Symbol::LParen)?;
+        let row_start = parser.consume_symbol(Symbol::LParen)?.start();
         let mut row = Vec::new();
         loop {
             row.push(parse_expression_until(
@@ -1491,11 +1482,20 @@ fn parse_values(parser: &mut StatementParser<'_, '_>) -> Result<Values, crate::P
             }
         }
         let end = parser.consume_symbol(Symbol::RParen)?.end();
-        rows.push(row);
+        rows.push(Expr::Row(RowExpr {
+            fields: row
+                .into_iter()
+                .map(|expression| RowField {
+                    name: None,
+                    span: expression.span(),
+                    expression,
+                })
+                .collect(),
+            span: Span::new(row_start, end),
+        }));
         if !parser.consume_if_symbol(Symbol::Comma) {
             return Ok(Values {
-                rows,
-                explicit_row: false,
+                rows: rows.into(),
                 span: Span::new(start, end),
             });
         }

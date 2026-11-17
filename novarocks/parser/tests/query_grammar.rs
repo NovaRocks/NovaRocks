@@ -316,9 +316,10 @@ fn deep_cte_and_derived_sources_preserve_the_actual_queries_and_leaf_spans() {
     let SetExpr::Select(select) = cursor.body.as_ref() else {
         panic!("actual leaf SELECT")
     };
-    let novarocks_parser::ast::SelectItem::UnnamedExpr(Expr::Literal(value)) =
-        &select.projection[0]
-    else {
+    let novarocks_parser::ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
+        panic!("leaf literal")
+    };
+    let Expr::Literal(value) = &column.expression else {
         panic!("leaf literal")
     };
     assert!(matches!(
@@ -355,9 +356,10 @@ fn deep_cte_and_derived_sources_preserve_the_actual_queries_and_leaf_spans() {
         panic!("leaf SELECT")
     };
     assert!(select.from.is_none());
-    let novarocks_parser::ast::SelectItem::UnnamedExpr(Expr::Literal(value)) =
-        &select.projection[0]
-    else {
+    let novarocks_parser::ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
+        panic!("leaf literal")
+    };
+    let Expr::Literal(value) = &column.expression else {
         panic!("leaf literal")
     };
     assert!(matches!(
@@ -386,9 +388,10 @@ fn deep_cte_and_derived_sources_preserve_the_actual_queries_and_leaf_spans() {
         let SetExpr::Select(select) = cursor.body.as_ref() else {
             panic!("actual scalar SELECT")
         };
-        let novarocks_parser::ast::SelectItem::UnnamedExpr(Expr::Subquery(child)) =
-            &select.projection[0]
-        else {
+        let novarocks_parser::ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
+            panic!("actual scalar subquery")
+        };
+        let Expr::Subquery(child) = &column.expression else {
             panic!("actual scalar subquery")
         };
         cursor = &child.query;
@@ -396,9 +399,10 @@ fn deep_cte_and_derived_sources_preserve_the_actual_queries_and_leaf_spans() {
     let SetExpr::Select(select) = cursor.body.as_ref() else {
         panic!("leaf SELECT")
     };
-    let novarocks_parser::ast::SelectItem::UnnamedExpr(Expr::Literal(value)) =
-        &select.projection[0]
-    else {
+    let novarocks_parser::ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
+        panic!("leaf literal")
+    };
+    let Expr::Literal(value) = &column.expression else {
         panic!("leaf literal")
     };
     assert!(matches!(

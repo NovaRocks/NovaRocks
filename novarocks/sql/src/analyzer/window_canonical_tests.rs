@@ -888,9 +888,11 @@ fn complete_window_metadata_refuses_before_missing_names_or_catalog_lookup() {
         let SetExpr::Select(select) = query.body.as_mut() else {
             panic!("select");
         };
-        let SelectItem::UnnamedExpr(expression) = &mut select.projection[0] else {
+        let SelectItem::SingleColumn(projection_column) = &mut select.projection[0] else {
             panic!("expression");
         };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let expression = &mut projection_column.expression;
         let Expr::FunctionCall(call) = expression else {
             panic!("function");
         };

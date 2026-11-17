@@ -70,9 +70,11 @@ fn projection(query: &ast::Query) -> &ast::Expr {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select fixture")
     };
-    let ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+    let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
         panic!("projection fixture")
     };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let expr = &projection_column.expression;
     expr
 }
 fn same_typed(actual: &TypedExpr, expected: &TypedExpr, control: &SqlCompileControl) {
@@ -222,7 +224,7 @@ fn partial_case_unique_and_invalid_exists_fail_before_inputs_and_table_lookup() 
         let ast::SetExpr::Select(select) = query.body.as_mut() else {
             panic!("select")
         };
-        select.projection[0] = ast::SelectItem::UnnamedExpr(expression);
+        select.projection[0] = novarocks_parser::build::item(expression, None);
         let whole = super::analyze(&query, &NoTables, "default").unwrap_err();
         assert_eq!(whole.kind(), AnalyzeErrorKind::UnsupportedExpression);
         assert_eq!(whole.message(), reason);
@@ -519,9 +521,11 @@ fn named_arguments_and_processing_modes_refuse_before_ordinary_or_table_lookup()
                 };
                 &mut node.expr
             } else {
-                let SelectItem::UnnamedExpr(expr) = &mut select.projection[0] else {
+                let SelectItem::SingleColumn(projection_column) = &mut select.projection[0] else {
                     panic!("projection");
                 };
+                assert!(projection_column.alias.is_none(), "anonymous projection");
+                let expr = &mut projection_column.expression;
                 expr
             };
             let Expr::FunctionCall(call) = expression else {

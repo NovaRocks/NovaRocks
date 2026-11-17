@@ -18,9 +18,8 @@
 use novarocks_parser::{
     ParserError, Span, ValidateError,
     ast::{
-        AstVec, Query, Select, SelectItem, SelectQuantifier, SetExpr, Statement, Values,
-        WindowDefinition, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits,
-        WindowSpecification, validate_statement,
+        AstVec, Query, Select, SetExpr, Statement, WindowDefinition, WindowFrame, WindowFrameBound,
+        WindowFrameExclusion, WindowFrameUnits, WindowSpecification, validate_statement,
     },
     parse,
 };
@@ -90,21 +89,17 @@ fn quoted_window_names_keep_their_syntax_identity() {
 
 #[test]
 fn construction_only_empty_lists_retain_the_generic_structure_code() {
-    let statement = Statement::Query(Query {
-        session_properties: novarocks_parser::ast::AstVec::new(),
-        functions: novarocks_parser::ast::AstVec::new(),
-        with: None,
-        body: novarocks_parser::ast::AstBox::new(SetExpr::Values(Values {
-            rows: Vec::new(),
-            explicit_row: false,
-            span: SPAN,
-        })),
-        modifiers: Default::default(),
-        span: SPAN,
-    });
-    let error = validate_statement(&statement).expect_err("empty VALUES rows are invalid AST");
+    let mut statement = select_statement(Vec::new());
+    let Statement::Query(query) = &mut statement else {
+        unreachable!()
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        unreachable!()
+    };
+    select.projection.clear();
+    let error = validate_statement(&statement).expect_err("empty SELECT projection is invalid AST");
     assert!(matches!(error, ValidateError::InvalidStructure { .. }));
-    let user_error = ParserError::from(error).to_user_error("VALUES");
+    let user_error = ParserError::from(error).to_user_error("SELECT");
     assert_eq!(user_error.code().as_str(), "sql.validate.invalid_structure");
     assert_eq!(user_error.phase(), ErrorPhase::Validate);
     assert_eq!(user_error.location().expect("location").column(), 1);
@@ -185,8 +180,7 @@ fn select_statement(windows: Vec<WindowDefinition>) -> Statement {
         with: None,
         body: novarocks_parser::ast::AstBox::new(SetExpr::Select(
             novarocks_parser::ast::AstBox::new(Select {
-                quantifier: SelectQuantifier::None,
-                projection: vec![SelectItem::UnnamedExpr(number("1"))],
+                projection: (vec![novarocks_parser::build::item(number("1"), None)]).into(),
                 from: None,
                 selection: None,
                 group_by: None,
@@ -195,6 +189,7 @@ fn select_statement(windows: Vec<WindowDefinition>) -> Statement {
                 windows: windows.into(),
                 modifiers: Default::default(),
                 span: SPAN,
+                distinct: false,
             }),
         )),
         modifiers: Default::default(),

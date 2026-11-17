@@ -259,10 +259,7 @@ fn append_physical_apply_key(mut query: ast::Query) -> Result<ast::Query, String
         &[(HIDDEN_APPLY_KEY_COLUMN_NAME, "apply key")],
     )?;
     for item in &select.projection {
-        if matches!(
-            item,
-            ast::SelectItem::Wildcard { .. } | ast::SelectItem::QualifiedWildcard { .. }
-        ) {
+        if matches!(item, ast::SelectItem::AllColumns(_)) {
             return Err(
                 "iceberg MV physical SELECT requires explicit projection columns".to_string(),
             );
@@ -271,7 +268,6 @@ fn append_physical_apply_key(mut query: ast::Query) -> Result<ast::Query, String
     select.projection.push(build::item(
         build::identifier(build::ident("_row_id", false)),
         Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, false)),
-        true,
     ));
     Ok(query)
 }
@@ -282,9 +278,14 @@ fn validate_reserved_projection_output_names(
 ) -> Result<(), String> {
     for item in &select.projection {
         let output_name = match item {
-            ast::SelectItem::UnnamedExpr(expr) => Some(printer::print_expr(expr)),
-            ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
-            ast::SelectItem::Wildcard { .. } | ast::SelectItem::QualifiedWildcard { .. } => None,
+            ast::SelectItem::SingleColumn(column) => Some(
+                column
+                    .alias
+                    .as_ref()
+                    .map(|alias| alias.value.clone())
+                    .unwrap_or_else(|| printer::print_expr(&column.expression)),
+            ),
+            ast::SelectItem::AllColumns(_) => None,
         };
         let Some(output_name) = output_name else {
             continue;
@@ -391,7 +392,6 @@ fn append_union_projection_hidden_columns(
             select.projection.push(build::item(
                 build::identifier(build::ident("_row_id", false)),
                 Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, false)),
-                true,
             ));
             select.projection.push(build::item(
                 build::cast(
@@ -399,7 +399,6 @@ fn append_union_projection_hidden_columns(
                     build::simple_type("INT"),
                 ),
                 Some(build::ident(BRANCH_ID_COLUMN_NAME, false)),
-                true,
             ));
             Ok(())
         }
@@ -762,8 +761,16 @@ mod tests {
                     .unwrap()
                     .syntax_eq(&build::integer(if index == 0 { 11 } else { 22 }))
             );
-            let ast::SelectItem::ExprWithAlias { expr, alias, .. } =
+            let ast::SelectItem::SingleColumn(projection_column) =
                 select.projection.last().unwrap()
+            else {
+                panic!("branch id");
+            };
+            let ast::SingleColumn {
+                expression: expr,
+                alias: Some(alias),
+                ..
+            } = projection_column.as_ref()
             else {
                 panic!("branch id");
             };

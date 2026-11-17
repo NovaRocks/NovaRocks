@@ -206,12 +206,14 @@ pub(crate) fn resolve_expression_site<'a>(
                 .map(|item| &item.sort_key)
         }
         (SqlConstantExpressionSite::ValuesCell { row, column }, ast::SetExpr::Values(values)) => {
-            values.rows.get(row).and_then(|row| row.get(column))
+            values
+                .rows
+                .get(row)
+                .and_then(|row| ast::ValuesRowCells::new(row).get(column))
         }
         (SqlConstantExpressionSite::SelectProjection { column }, ast::SetExpr::Select(select)) => {
             select.projection.get(column).and_then(|item| match item {
-                ast::SelectItem::UnnamedExpr(expr)
-                | ast::SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+                ast::SelectItem::SingleColumn(column) => Some(&column.expression),
                 _ => None,
             })
         }

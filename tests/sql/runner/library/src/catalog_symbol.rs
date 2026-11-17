@@ -695,17 +695,23 @@ impl Visit for CatalogEdits<'_> {
                 collect_scope(relation, &mut self.aliases, &mut self.relations);
             }
             for item in &select.projection {
-                if let SelectItem::QualifiedWildcard { prefix, .. } = item
-                    && prefix.len() >= 3
-                    && self.relations.contains(
+                if let SelectItem::AllColumns(columns) = item
+                    && columns.aliases.is_empty()
+                    && let Some(target) = &columns.target
+                    && let Some(chain) = syntax_identifier_chain(target)
+                    && chain.len() >= 3
+                {
+                    let mut prefix = chain.iter_rev().collect::<Vec<_>>();
+                    prefix.reverse();
+                    if self.relations.contains(
                         &prefix[..3]
                             .iter()
                             .map(|part| key(&part.value))
                             .collect::<Vec<_>>(),
-                    )
-                    && !self.aliases.contains(&key(&prefix[0].value))
-                {
-                    self.ident(&prefix[0]);
+                    ) && !self.aliases.contains(&key(&prefix[0].value))
+                    {
+                        self.ident(prefix[0]);
+                    }
                 }
             }
         }
@@ -843,12 +849,16 @@ fn catalog_output_plan(sql: &str) -> Vec<OutputColumn> {
                     result.clear();
                     for item in &select.projection {
                         let (expr, alias) = match item {
-                            SelectItem::UnnamedExpr(expr) => (expr, None),
-                            SelectItem::ExprWithAlias { expr, alias, .. } => {
-                                (expr, Some(alias.value.clone()))
-                            }
-                            SelectItem::Wildcard { .. } | SelectItem::QualifiedWildcard { .. }
-                                if metadata =>
+                            SelectItem::SingleColumn(column) => (
+                                &column.expression,
+                                column.alias.as_ref().map(|alias| alias.value.clone()),
+                            ),
+                            SelectItem::AllColumns(columns)
+                                if metadata
+                                    && columns.aliases.is_empty()
+                                    && columns.target.as_ref().is_none_or(|target| {
+                                        syntax_identifier_chain(target).is_some()
+                                    }) =>
                             {
                                 result.push(OutputColumn::MetadataWildcard {
                                     relations: state_table,

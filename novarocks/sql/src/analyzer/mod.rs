@@ -1214,16 +1214,37 @@ impl<'a> AnalyzerContext<'a> {
         values: &ast::Values,
     ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
         let scope = self.new_scope();
+        if values.rows.is_empty() {
+            return Err(AnalyzeError::unsupported_expression(
+                "empty VALUES rows are not supported",
+                values.span,
+            ));
+        }
         let row_count = values.rows.len();
         let mut resolved_rows = Vec::with_capacity(row_count);
         let mut column_types = Vec::new();
         for row_idx in 0..row_count {
             self.check_control()?;
-            let width = values.rows[row_idx].len();
-            let mut resolved_row = Vec::with_capacity(width);
-            for col_idx in 0..width {
+            let row = &values.rows[row_idx];
+            let cells = ast::ValuesRowCells::new(row);
+            if cells.is_empty() || cells.has_named_fields() {
+                return Err(AnalyzeError::unsupported_expression(
+                    "empty or named VALUES rows are not supported",
+                    row.span(),
+                ));
+            }
+            let mut resolved_row = Vec::with_capacity(cells.len());
+            for (col_idx, expression) in cells.iter().enumerate() {
                 self.check_control()?;
-                let typed = self.analyze_expr(&values.rows[row_idx][col_idx], &scope)?;
+                let typed = self.analyze_expr(expression, &scope)?;
+                if !matches!(row, ast::Expr::Row(_))
+                    && matches!(typed.value_type.data_type(), DataType::Struct(_))
+                {
+                    return Err(AnalyzeError::unsupported_expression(
+                        "generic row-valued VALUES expressions are not supported",
+                        row.span(),
+                    ));
+                }
                 if col_idx < column_types.len() {
                     column_types[col_idx] = helpers::assignment_common_value_type(
                         &column_types[col_idx],
@@ -1358,8 +1379,7 @@ impl<'a> AnalyzerContext<'a> {
                     )
                 })?;
                 let select_expr = match select_item {
-                    ast::SelectItem::UnnamedExpr(expr)
-                    | ast::SelectItem::ExprWithAlias { expr, .. } => expr,
+                    ast::SelectItem::SingleColumn(column) => &column.expression,
                     _ => {
                         return Err(AnalyzeError::invalid_argument(
                             format!("GROUP BY position {pos} must reference a select expression"),
@@ -1467,7 +1487,7 @@ impl<'a> AnalyzerContext<'a> {
         // --- DISTINCT ---
         self.validate_grouping_calls(&group_by)?;
 
-        let distinct = matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. });
+        let distinct = select.distinct;
 
         let mut resolved_select = ResolvedSelect {
             from,
@@ -2167,114 +2187,137 @@ impl<'a> AnalyzerContext<'a> {
         for item in items {
             self.check_control()?;
             match item {
-                ast::SelectItem::UnnamedExpr(expr) => {
-                    let typed = self.analyze_expr(expr, &effective_scope)?;
-                    let typed =
-                        self.substitute_select_aliases_for_select(typed, &projection, scope);
-                    let (name, column_id) = match &typed.kind {
-                        ExprKind::ColumnRef {
-                            column_id, column, ..
-                        } if !matches!(expr, ast::Expr::Cast(_)) && !is_grouping_call(expr) => {
-                            (column.clone(), *column_id)
-                        }
-                        _ => {
-                            let n = self.grouping_display_name(expr);
-                            let id =
-                                self.alloc_column_id(None, n.clone(), typed.value_type.clone());
-                            (n, id)
-                        }
-                    };
-                    // A direct reference keeps its original source record. New
-                    // occurrences retain the exact producer's complete witness
-                    // before planner symbol rewrites hand it to the root owner.
-                    // A same-carrier explicit CAST may simplify to a reference,
-                    // but still owns a separate output domain occurrence.
-                    if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
-                        || matches!(expr, ast::Expr::Cast(_))
-                        || is_grouping_call(expr)
-                    {
-                        let logical =
-                            self.logical_output_type(Some(expr), &typed, &effective_scope)?;
-                        self.factory
-                            .borrow_mut()
-                            .set_logical_type(column_id, logical);
-                    }
-                    output_columns.push(OutputColumn {
-                        field_name: natural_field_name(expr),
-                        column_id,
-                        name: name.clone(),
-                        value_type: typed.value_type.clone(),
-
-                        is_internal: false,
-                    });
-                    projection.push(ProjectItem {
-                        field_name: natural_field_name(expr),
-                        expr: typed,
-                        output_name: name,
-                        output_column_id: column_id,
-                    });
-                }
-                ast::SelectItem::ExprWithAlias { expr, alias, .. } => {
-                    let typed = self.analyze_expr(expr, &effective_scope)?;
-                    let typed =
-                        self.substitute_select_aliases_for_select(typed, &projection, scope);
-                    let name = alias.value.clone();
-                    let column_id = match &typed.kind {
-                        ExprKind::ColumnRef { column_id, .. }
-                            if !matches!(expr, ast::Expr::Cast(_)) && !is_grouping_call(expr) =>
+                ast::SelectItem::SingleColumn(column) => {
+                    let expr = &column.expression;
+                    if let Some(alias) = &column.alias {
+                        let typed = self.analyze_expr(expr, &effective_scope)?;
+                        let typed =
+                            self.substitute_select_aliases_for_select(typed, &projection, scope);
+                        let name = alias.value.clone();
+                        let column_id = match &typed.kind {
+                            ExprKind::ColumnRef { column_id, .. }
+                                if !matches!(expr, ast::Expr::Cast(_))
+                                    && !is_grouping_call(expr) =>
+                            {
+                                *column_id
+                            }
+                            _ => self.alloc_column_id(None, name.clone(), typed.value_type.clone()),
+                        };
+                        // A direct reference keeps its original source record. New
+                        // occurrences retain the exact producer's complete witness
+                        // before planner symbol rewrites hand it to the root owner.
+                        // A same-carrier explicit CAST may simplify to a reference,
+                        // but still owns a separate output domain occurrence.
+                        if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
+                            || matches!(expr, ast::Expr::Cast(_))
+                            || is_grouping_call(expr)
                         {
-                            *column_id
+                            let logical =
+                                self.logical_output_type(Some(expr), &typed, &effective_scope)?;
+                            self.factory
+                                .borrow_mut()
+                                .set_logical_type(column_id, logical);
                         }
-                        _ => self.alloc_column_id(None, name.clone(), typed.value_type.clone()),
-                    };
-                    // A direct reference keeps its original source record. New
-                    // occurrences retain the exact producer's complete witness
-                    // before planner symbol rewrites hand it to the root owner.
-                    // A same-carrier explicit CAST may simplify to a reference,
-                    // but still owns a separate output domain occurrence.
-                    if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
-                        || matches!(expr, ast::Expr::Cast(_))
-                        || is_grouping_call(expr)
-                    {
-                        let logical =
-                            self.logical_output_type(Some(expr), &typed, &effective_scope)?;
-                        self.factory
-                            .borrow_mut()
-                            .set_logical_type(column_id, logical);
-                    }
-                    output_columns.push(OutputColumn {
-                        field_name: Some(name.clone()),
-                        column_id,
-                        name: name.clone(),
-                        value_type: typed.value_type.clone(),
-
-                        is_internal: false,
-                    });
-                    // Make the alias visible to later items in the same
-                    // projection list, but only if it does not already
-                    // collide with a column from the FROM scope; otherwise
-                    // the alias would shadow the underlying column and
-                    // future items would resolve to the alias expression
-                    // instead of the FROM column.
-                    if scope.resolve(None, &name).is_err() {
-                        effective_scope.add_column_with_id(
-                            None,
-                            &name,
+                        output_columns.push(OutputColumn {
+                            field_name: Some(name.clone()),
                             column_id,
-                            typed.value_type.clone(),
-                        );
+                            name: name.clone(),
+                            value_type: typed.value_type.clone(),
+
+                            is_internal: false,
+                        });
+                        // Make the alias visible to later items in the same
+                        // projection list, but only if it does not already
+                        // collide with a column from the FROM scope; otherwise
+                        // the alias would shadow the underlying column and
+                        // future items would resolve to the alias expression
+                        // instead of the FROM column.
+                        if scope.resolve(None, &name).is_err() {
+                            effective_scope.add_column_with_id(
+                                None,
+                                &name,
+                                column_id,
+                                typed.value_type.clone(),
+                            );
+                        }
+                        projection.push(ProjectItem {
+                            field_name: Some(name.clone()),
+                            expr: typed,
+                            output_name: name,
+                            output_column_id: column_id,
+                        });
+                    } else {
+                        let typed = self.analyze_expr(expr, &effective_scope)?;
+                        let typed =
+                            self.substitute_select_aliases_for_select(typed, &projection, scope);
+                        let (name, column_id) = match &typed.kind {
+                            ExprKind::ColumnRef {
+                                column_id, column, ..
+                            } if !matches!(expr, ast::Expr::Cast(_)) && !is_grouping_call(expr) => {
+                                (column.clone(), *column_id)
+                            }
+                            _ => {
+                                let n = self.grouping_display_name(expr);
+                                let id =
+                                    self.alloc_column_id(None, n.clone(), typed.value_type.clone());
+                                (n, id)
+                            }
+                        };
+                        // A direct reference keeps its original source record. New
+                        // occurrences retain the exact producer's complete witness
+                        // before planner symbol rewrites hand it to the root owner.
+                        // A same-carrier explicit CAST may simplify to a reference,
+                        // but still owns a separate output domain occurrence.
+                        if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
+                            || matches!(expr, ast::Expr::Cast(_))
+                            || is_grouping_call(expr)
+                        {
+                            let logical =
+                                self.logical_output_type(Some(expr), &typed, &effective_scope)?;
+                            self.factory
+                                .borrow_mut()
+                                .set_logical_type(column_id, logical);
+                        }
+                        output_columns.push(OutputColumn {
+                            field_name: natural_field_name(expr),
+                            column_id,
+                            name: name.clone(),
+                            value_type: typed.value_type.clone(),
+
+                            is_internal: false,
+                        });
+                        projection.push(ProjectItem {
+                            field_name: natural_field_name(expr),
+                            expr: typed,
+                            output_name: name,
+                            output_column_id: column_id,
+                        });
                     }
-                    projection.push(ProjectItem {
-                        field_name: Some(name.clone()),
-                        expr: typed,
-                        output_name: name,
-                        output_column_id: column_id,
-                    });
                 }
-                ast::SelectItem::Wildcard { .. } => {
-                    self.append_wildcard_projection(scope, &mut projection, &mut output_columns)?
-                }
-                ast::SelectItem::QualifiedWildcard { prefix, span, .. } => {
+                ast::SelectItem::AllColumns(columns) => {
+                    if !columns.aliases.is_empty() {
+                        return Err(AnalyzeError::unsupported_expression(
+                            "wildcard column aliases are not supported",
+                            columns.span,
+                        ));
+                    }
+                    let Some(target) = &columns.target else {
+                        self.append_wildcard_projection(
+                            scope,
+                            &mut projection,
+                            &mut output_columns,
+                        )?;
+                        continue;
+                    };
+                    let chain = ast::identifier_chain_observed(target, |_| self.check_control())?
+                        .ok_or_else(|| {
+                        AnalyzeError::unsupported_expression(
+                            "computed wildcard targets are not supported",
+                            columns.span,
+                        )
+                    })?;
+                    let mut prefix = chain.iter_rev().collect::<Vec<_>>();
+                    prefix.reverse();
                     let qualifier_str = prefix
                         .iter()
                         .map(|ident| ident.value.as_str())
@@ -2331,7 +2374,7 @@ impl<'a> AnalyzerContext<'a> {
                     if !found {
                         return Err(AnalyzeError::unknown_table(
                             format!("no columns found for qualifier `{qualifier_str}`"),
-                            *span,
+                            columns.span,
                         ));
                     }
                 }
@@ -2403,7 +2446,13 @@ impl<'a> AnalyzerContext<'a> {
         for item in items {
             self.check_control()?;
             match item {
-                ast::SelectItem::Wildcard { .. } => {
+                ast::SelectItem::AllColumns(columns) if columns.target.is_none() => {
+                    if !columns.aliases.is_empty() {
+                        return Err(AnalyzeError::unsupported_expression(
+                            "wildcard column aliases are not supported",
+                            columns.span,
+                        ));
+                    }
                     for (qualifier, col_name, col_id, value_type, field_name) in
                         wildcard_scope.iter_columns()
                     {
@@ -2751,8 +2800,9 @@ impl<'a> AnalyzerContext<'a> {
                                 break;
                             }
                             let ast_expr_text = match ast_item {
-                                ast::SelectItem::ExprWithAlias { expr, .. }
-                                | ast::SelectItem::UnnamedExpr(expr) => expr_syntax_key(expr),
+                                ast::SelectItem::SingleColumn(column) => {
+                                    expr_syntax_key(&column.expression)
+                                }
                                 _ => continue,
                             };
                             // Exact AST match means the user wrote the
@@ -3337,6 +3387,88 @@ mod tests {
     };
     use novarocks_types::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
+
+    #[test]
+    fn projection_values_real_envelopes_and_direct_capability_boundaries() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_parser::{SYNTHETIC, ast, build};
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        for (sql, struct_width) in [("VALUES (1)", None), ("VALUES (ROW(1, 2))", Some(2))] {
+            let query = parse_native_query(sql).unwrap();
+            let ast::SetExpr::Values(values) = query.body.as_ref() else {
+                panic!("VALUES")
+            };
+            assert_eq!(ast::ValuesRowCells::new(&values.rows[0]).len(), 1);
+            let (resolved, _, _) = super::analyze(&query, &catalog, "default").unwrap();
+            assert_eq!(resolved.output_columns.len(), 1);
+            if let Some(width) = struct_width {
+                let DataType::Struct(fields) = resolved.output_columns[0].value_type.data_type()
+                else {
+                    panic!("one Struct cell")
+                };
+                assert_eq!(fields.len(), width);
+            } else {
+                assert!(!matches!(
+                    resolved.output_columns[0].value_type.data_type(),
+                    DataType::Struct(_)
+                ));
+            }
+        }
+        let mut query = parse_native_query("VALUES (1)").unwrap();
+        for rows in [
+            ast::AstVec::new(),
+            vec![ast::Expr::Row(ast::RowExpr {
+                fields: ast::AstVec::new(),
+                span: SYNTHETIC,
+            })]
+            .into(),
+            vec![ast::Expr::Row(ast::RowExpr {
+                fields: vec![ast::RowField {
+                    name: Some(build::ident("named", false)),
+                    expression: build::identifier(build::ident("must_not_resolve", false)),
+                    span: SYNTHETIC,
+                }]
+                .into(),
+                span: SYNTHETIC,
+            })]
+            .into(),
+            vec![build::nested(
+                build::tuple_value(vec![build::integer(1), build::integer(2)]).unwrap(),
+            )]
+            .into(),
+        ] {
+            let ast::SetExpr::Values(values) = query.body.as_mut() else {
+                panic!("VALUES")
+            };
+            values.rows = rows;
+            assert_eq!(
+                super::analyze(&query, &catalog, "default")
+                    .unwrap_err()
+                    .kind(),
+                AnalyzeErrorKind::UnsupportedExpression
+            );
+        }
+        let mut query = parse_native_query("SELECT *").unwrap();
+        for (target, aliases) in [
+            (Some(build::integer(7)), Vec::new()),
+            (None, vec![build::ident("renamed", false)]),
+        ] {
+            let ast::SetExpr::Select(select) = query.body.as_mut() else {
+                panic!("SELECT")
+            };
+            let ast::SelectItem::AllColumns(columns) = &mut select.projection[0] else {
+                panic!("wildcard")
+            };
+            columns.target = target;
+            columns.aliases = aliases;
+            assert_eq!(
+                super::analyze(&query, &catalog, "default")
+                    .unwrap_err()
+                    .kind(),
+                AnalyzeErrorKind::UnsupportedExpression
+            );
+        }
+    }
 
     struct TestCatalog;
 

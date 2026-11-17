@@ -213,9 +213,12 @@ fn element_at_type_probe_keeps_original_ordinary_binding_error_without_rebinding
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("select");
         };
-        let [ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(function))] =
-            select.projection.as_slice()
+        let [ast::SelectItem::SingleColumn(projection_column)] = select.projection.as_slice()
         else {
+            panic!("element_at call");
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let ast::Expr::FunctionCall(function) = &projection_column.expression else {
             panic!("element_at call");
         };
         let Some(ast::Expr::Array(array)) =

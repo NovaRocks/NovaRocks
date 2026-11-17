@@ -1550,10 +1550,13 @@ mod tests {
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select");
         };
-        let [novarocks_parser::ast::SelectItem::UnnamedExpr(expr)] = select.projection.as_slice()
+        let [novarocks_parser::ast::SelectItem::SingleColumn(projection_column)] =
+            select.projection.as_slice()
         else {
             panic!("expected expression projection");
         };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let expr = &projection_column.expression;
         expr.clone()
     }
 

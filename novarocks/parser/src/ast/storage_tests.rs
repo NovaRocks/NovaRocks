@@ -269,13 +269,7 @@ fn actual_array_owning_carrier_guards_deep_traits_move_and_drop() {
     assert_ne!(tree, copy);
     drop(copy);
     let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
-        build::select(
-            vec![build::item(tree.clone(), None, false)],
-            None,
-            None,
-            None,
-        )
-        .unwrap(),
+        build::select(vec![build::item(tree.clone(), None)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -361,7 +355,7 @@ fn actual_array_semantic_walk_fold_and_equivalence_preserve_deep_values_and_orde
     );
     assert!(!tree.syntax_eq(&shifted));
     let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
-        build::select(vec![build::item(shifted, None, false)], None, None, None).unwrap(),
+        build::select(vec![build::item(shifted, None)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -600,7 +594,7 @@ fn actual_row_fields_preserve_names_order_spans_and_deep_semantic_children() {
     seen.visit_expr(&changed);
     assert_eq!(seen.0, expected_changed);
     let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
-        build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
+        build::select(vec![build::item(changed, None)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -866,7 +860,7 @@ fn actual_access_children_keep_deep_visit_fold_equivalence_validation_and_printi
     actual.visit_expr(&changed);
     assert_eq!(actual.0, expected_changed);
     let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
-        build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
+        build::select(vec![build::item(changed, None)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -1205,7 +1199,7 @@ fn actual_function_order_by_preserves_facts_and_deep_semantic_children() {
     actual.visit_expr(&changed);
     assert_eq!(actual.0, expected_changed);
     let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
-        build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
+        build::select(vec![build::item(changed, None)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -1419,7 +1413,7 @@ fn actual_window_operation_cycle_keeps_partition_and_frame_expression_children()
     seen.visit_expr(&changed);
     assert_eq!(seen.0, expected_changed);
     let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
-        build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
+        build::select(vec![build::item(changed, None)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -1672,7 +1666,7 @@ fn actual_row_pattern_box_vec_cycle_keeps_quantifier_facts_and_real_children() {
     assert_eq!(seen.0, expected_changed);
     let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
         build::select(
-            vec![build::item(operation(changed), None, false)],
+            vec![build::item(operation(changed), None)],
             None,
             None,
             None,
@@ -1900,13 +1894,7 @@ fn assert_actual_call_argument_or_filter_cycle(filter_child: bool) {
     );
     let statement = crate::ast::Statement::Query(build::query(crate::ast::SetExpr::Select(
         crate::ast::AstBox::new(
-            build::select(
-                vec![build::item(tree.clone(), None, false)],
-                None,
-                None,
-                None,
-            )
-            .unwrap(),
+            build::select(vec![build::item(tree.clone(), None)], None, None, None).unwrap(),
         ),
     )));
     crate::ast::validate_statement(&statement).unwrap();
@@ -2190,13 +2178,7 @@ fn actual_control_call_cycles_keep_all_alternative_child_slots_and_order() {
     drop(changed);
     let statement = crate::ast::Statement::Query(build::query(crate::ast::SetExpr::Select(
         crate::ast::AstBox::new(
-            build::select(
-                vec![build::item(tree.clone(), None, false)],
-                None,
-                None,
-                None,
-            )
-            .unwrap(),
+            build::select(vec![build::item(tree.clone(), None)], None, None, None).unwrap(),
         ),
     )));
     crate::ast::validate_statement(&statement).unwrap();
@@ -2313,7 +2295,7 @@ fn actual_extract_owning_and_semantic_cycle_keeps_deep_fields_and_original_leaf(
     assert_eq!(printed.matches("EXTRACT(").count(), DEPTH);
     assert_eq!(printed.matches('7').count(), 1);
     let statement = Statement::Query(build::query(SetExpr::Select(crate::ast::AstBox::new(
-        build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
+        build::select(vec![build::item(changed, None)], None, None, None).unwrap(),
     ))));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
@@ -2335,8 +2317,22 @@ fn actual_mixed_set_operation_inputs_keep_deep_owning_semantic_and_printing_edge
     const DEPTH: i64 = 20_000;
     fn leaf(value: i64) -> SetExpr {
         SetExpr::Values(Values {
-            rows: vec![vec![build::integer(value)]],
-            explicit_row: false,
+            rows: (vec![vec![build::integer(value)]])
+                .into_iter()
+                .map(|cells| {
+                    crate::ast::Expr::Row(crate::ast::RowExpr {
+                        fields: cells
+                            .into_iter()
+                            .map(|expression| crate::ast::RowField {
+                                name: None,
+                                span: expression.span(),
+                                expression,
+                            })
+                            .collect(),
+                        span: Span::new(1, 2),
+                    })
+                })
+                .collect(),
             span: Span::new(1, 2),
         })
     }
@@ -2378,7 +2374,10 @@ fn actual_mixed_set_operation_inputs_keep_deep_owning_semantic_and_printing_edge
     let SetExpr::Values(value) = cursor else {
         panic!("original terminal");
     };
-    value.rows[0][0] = build::integer(-1);
+    let Expr::Row(row) = &mut value.rows[0] else {
+        panic!("actual VALUES row")
+    };
+    row.fields[0].expression = build::integer(-1);
     assert_ne!(tree, copy);
     assert!(!tree.syntax_eq(&copy));
     drop(copy);
@@ -2552,7 +2551,7 @@ fn actual_plain_json_query_owning_chain_preserves_path_facts_and_original_input(
     assert!(!tree.syntax_eq(&changed));
     let statement = Statement::Query(build::query(crate::ast::SetExpr::Select(
         crate::ast::AstBox::new(
-            build::select(vec![build::item(changed, None, false)], None, None, None).unwrap(),
+            build::select(vec![build::item(changed, None)], None, None, None).unwrap(),
         ),
     )));
     crate::ast::validate_statement(&statement).unwrap();
@@ -2731,7 +2730,7 @@ fn actual_relation_query_alias_join_cycle_preserves_owning_and_all_original_chil
         }));
         tree = build::query(SetExpr::Select(AstBox::new(
             build::select(
-                vec![build::item(build::integer(marker), None, false)],
+                vec![build::item(build::integer(marker), None)],
                 Some(join),
                 None,
                 None,
@@ -2944,4 +2943,166 @@ fn actual_cte_query_cycle_preserves_optional_column_names_and_query_carriers() {
         unreachable!()
     };
     assert_eq!(values.rows.len(), 1);
+}
+
+#[test]
+fn actual_projection_values_cycles_keep_owning_traits_real_children_and_semantic_order() {
+    use crate::ast::{
+        AllColumns, Expr, Fold, Ident, Literal, LiteralKind, Query, RowExpr, RowField, SelectItem,
+        SetExpr, Statement, SubqueryExpr, SyntaxEq, Values, Visit,
+    };
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    let span = Span::new(10, 30);
+    let mut tree = build::query(build::values(vec![vec![build::integer(7)]]).unwrap());
+    for marker in 1..=DEPTH {
+        let child = Expr::Subquery(SubqueryExpr {
+            query: AstBox::new(tree),
+            span,
+        });
+        tree = if marker % 3 == 0 {
+            build::query(SetExpr::Values(Values {
+                rows: vec![Expr::Row(RowExpr {
+                    fields: vec![
+                        RowField {
+                            name: None,
+                            expression: build::integer(marker),
+                            span,
+                        },
+                        RowField {
+                            name: None,
+                            expression: child,
+                            span,
+                        },
+                    ]
+                    .into(),
+                    span,
+                })]
+                .into(),
+                span,
+            }))
+        } else {
+            let item = if marker % 3 == 1 {
+                build::item(child, Some(build::ident(format!("a{marker}"), false)))
+            } else {
+                SelectItem::AllColumns(AstBox::new(AllColumns {
+                    target: Some(child),
+                    aliases: vec![build::ident(format!("a{marker}"), true)],
+                    span,
+                }))
+            };
+            build::query(SetExpr::Select(AstBox::new(
+                build::select(vec![item], None, None, None).unwrap(),
+            )))
+        };
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    let mut cursor = &mut copy;
+    for marker in (1..=DEPTH).rev() {
+        let expression = match cursor.body.as_mut() {
+            SetExpr::Values(values) => {
+                let Expr::Row(row) = &mut values.rows[0] else {
+                    panic!("actual row")
+                };
+                assert_eq!(row.fields.len(), 2);
+                &mut row.fields[1].expression
+            }
+            SetExpr::Select(select) => match &mut select.projection[0] {
+                SelectItem::SingleColumn(node) => {
+                    assert_eq!(node.alias.as_ref().unwrap().value, format!("a{marker}"));
+                    &mut node.expression
+                }
+                SelectItem::AllColumns(node) => {
+                    assert_eq!(node.aliases[0].value, format!("a{marker}"));
+                    assert!(node.aliases[0].quoted);
+                    node.target.as_mut().unwrap()
+                }
+            },
+            _ => panic!("actual projection or row cycle"),
+        };
+        let Expr::Subquery(child) = expression else {
+            panic!("original query edge")
+        };
+        cursor = &mut child.query;
+    }
+    let SetExpr::Values(values) = cursor.body.as_mut() else {
+        unreachable!()
+    };
+    let Expr::Row(row) = &mut values.rows[0] else {
+        unreachable!()
+    };
+    row.fields[0].expression = build::integer(8);
+    assert!(!tree.syntax_eq(&copy));
+    drop(copy);
+    #[derive(Default)]
+    struct Facts {
+        numbers: Vec<i64>,
+        names: Vec<(String, bool)>,
+    }
+    impl Visit for Facts {
+        fn visit_literal(&mut self, node: &Literal) {
+            if let LiteralKind::Long { parsed_value, .. } = node.kind {
+                self.numbers.push(parsed_value);
+            }
+        }
+        fn visit_ident(&mut self, node: &Ident) {
+            self.names.push((node.value.clone(), node.quoted));
+        }
+    }
+    let mut facts = Facts::default();
+    facts.visit_query(&tree);
+    let expected = (1..=DEPTH)
+        .rev()
+        .filter(|marker| marker % 3 == 0)
+        .chain(std::iter::once(7))
+        .collect::<Vec<_>>();
+    assert_eq!(facts.numbers, expected);
+    let names = (1..=DEPTH)
+        .filter(|marker| marker % 3 != 0)
+        .map(|marker| (format!("a{marker}"), marker % 3 == 2))
+        .collect::<Vec<_>>();
+    assert_eq!(facts.names, names);
+    struct Change;
+    impl Fold for Change {
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                return node;
+            };
+            let Expr::Literal(mut next) = build::integer(parsed_value + 1) else {
+                unreachable!()
+            };
+            next.span = node.span;
+            next
+        }
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.value.push_str("_next");
+            node
+        }
+    }
+    let changed = Change.fold_query(tree.clone());
+    let mut changed_facts = Facts::default();
+    changed_facts.visit_query(&changed);
+    assert_eq!(
+        changed_facts.numbers,
+        expected.iter().map(|value| value + 1).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        changed_facts.names,
+        names
+            .iter()
+            .map(|(name, quoted)| (format!("{name}_next"), *quoted))
+            .collect::<Vec<_>>()
+    );
+    assert!(!tree.syntax_eq(&changed));
+    crate::ast::validate_statement(&Statement::Query(changed)).unwrap();
+    let printed = crate::printer::print_query(&tree);
+    assert!(printed.contains("VALUES (7)"));
+    assert!(printed.contains(" AS (`a2`)"));
+    let Query { body, .. } = tree;
+    drop(body.into_inner());
 }

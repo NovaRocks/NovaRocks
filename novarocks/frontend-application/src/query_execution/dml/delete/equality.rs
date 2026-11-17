@@ -271,7 +271,6 @@ fn equality_delete_sink_query_ast(
                         .map_err(|error| error.to_string())?,
                 ),
                 Some(build::ident(column_name, true)),
-                true,
             ))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -767,7 +766,31 @@ mod tests {
         let novarocks_parser::ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!("VALUES");
         };
-        values.rows.clone()
+        values
+            .rows
+            .iter()
+            .map(|row| {
+                let cells = novarocks_parser::ast::ValuesRowCells::new(row);
+                assert!(!cells.has_named_fields());
+                cells.iter().cloned().collect()
+            })
+            .collect()
+    }
+
+    fn assert_sink_rows(
+        query: &novarocks_parser::ast::Query,
+        expected: &[Vec<novarocks_parser::ast::Expr>],
+    ) {
+        let actual = sink_values(query);
+        assert_eq!(actual.rows.len(), expected.len());
+        for (row, expected) in actual.rows.iter().zip(expected) {
+            let cells = novarocks_parser::ast::ValuesRowCells::new(row);
+            assert!(!cells.has_named_fields());
+            assert_eq!(cells.len(), expected.len());
+            for (actual, expected) in cells.iter().zip(expected) {
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     fn sink_values(query: &novarocks_parser::ast::Query) -> &novarocks_parser::ast::Values {
@@ -1167,7 +1190,7 @@ mod tests {
         );
         let raw_rows = parsed_rows("VALUES (2, 'B'), (4, NULL)");
         let query = super::build_equality_delete_sink_query(&fields, &raw_rows).expect("query");
-        assert_eq!(sink_values(&query).rows, raw_rows);
+        assert_sink_rows(&query, &raw_rows);
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
@@ -1178,17 +1201,17 @@ mod tests {
             .zip(["INT", "STRING"])
             .map(|((item, name), ty)| (item, name, ty))
         {
-            let novarocks_parser::ast::SelectItem::ExprWithAlias {
-                expr: novarocks_parser::ast::Expr::Cast(cast),
-                alias,
-                explicit_as,
-                ..
-            } = item
-            else {
+            let novarocks_parser::ast::SelectItem::SingleColumn(single_column) = item else {
                 panic!("typed equality-key projection");
             };
+            let Some(alias) = &single_column.alias else {
+                panic!("typed equality-key projection");
+            };
+            let novarocks_parser::ast::Expr::Cast(cast) = &single_column.expression else {
+                panic!("typed equality-key projection");
+            };
+
             assert_eq!(alias.value, name);
-            assert!(*explicit_as);
             assert!(
                 matches!(&cast.data_type.kind, novarocks_parser::ast::TypeKind::Generic(generic) if generic.name.value == ty)
             );
@@ -1218,7 +1241,7 @@ mod tests {
                 .unwrap(),
             ];
             let query = super::equality_delete_sink_query_ast(&fields, &rows).unwrap();
-            assert_eq!(sink_values(&query).rows, rows, "{source}");
+            assert_sink_rows(&query, &rows);
         }
     }
 
@@ -1238,7 +1261,11 @@ mod tests {
             .unwrap(),
         ];
         let query = super::build_equality_delete_sink_query(&fields, &[vec![value]]).unwrap();
-        let novarocks_parser::ast::Expr::Literal(literal) = &sink_values(&query).rows[0][0] else {
+        let novarocks_parser::ast::Expr::Literal(literal) =
+            novarocks_parser::ast::ValuesRowCells::new(&sink_values(&query).rows[0])
+                .get(0)
+                .unwrap()
+        else {
             panic!("hexadecimal binary value");
         };
         assert_eq!(
@@ -1292,7 +1319,7 @@ mod tests {
         let raw_rows = parsed_rows("VALUES (7, NULL)");
         let query =
             super::build_equality_delete_sink_query(&after, &raw_rows).expect("same shape author");
-        assert_eq!(sink_values(&query).rows, raw_rows);
+        assert_sink_rows(&query, &raw_rows);
     }
 
     #[test]
@@ -1413,6 +1440,6 @@ mod tests {
         assert!(Arc::ptr_eq(&session, &original_session));
         let raw_rows = parsed_rows("VALUES (7)");
         let query = super::build_equality_delete_sink_query(&fields, &raw_rows).unwrap();
-        assert_eq!(sink_values(&query).rows, raw_rows);
+        assert_sink_rows(&query, &raw_rows);
     }
 }

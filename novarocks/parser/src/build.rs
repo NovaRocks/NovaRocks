@@ -446,34 +446,41 @@ pub fn count_star() -> Expr {
     )
 }
 
-pub fn item(expr: Expr, alias: Option<Ident>, explicit_as: bool) -> SelectItem {
-    match alias {
-        Some(alias) => SelectItem::ExprWithAlias {
-            span: expr.span().cover(alias.span),
-            expr,
-            alias,
-            explicit_as,
-        },
-        None => SelectItem::UnnamedExpr(expr),
-    }
+pub fn item(expression: Expr, alias: Option<Ident>) -> SelectItem {
+    let span = alias.as_ref().map_or(expression.span(), |alias| {
+        expression.span().cover(alias.span)
+    });
+    SelectItem::SingleColumn(AstBox::new(SingleColumn {
+        expression,
+        alias,
+        span,
+    }))
 }
-
 pub fn wildcard() -> SelectItem {
-    SelectItem::Wildcard {
-        options: WildcardOptions::default(),
+    SelectItem::AllColumns(AstBox::new(AllColumns {
+        target: None,
+        aliases: Vec::new(),
         span: SYNTHETIC,
-    }
+    }))
 }
-
 pub fn qualified_wildcard(prefix: Vec<Ident>) -> Result<SelectItem, BuildError> {
-    if prefix.is_empty() {
-        return Err(BuildError::EmptyWildcardPrefix);
+    let mut parts = prefix.into_iter();
+    let first = parts.next().ok_or(BuildError::EmptyWildcardPrefix)?;
+    let mut target = Expr::Identifier(first);
+    for field in parts {
+        let span = target.span().cover(field.span);
+        target = Expr::Dereference(AstBox::new(DereferenceExpr {
+            base: target,
+            field: Some(field),
+            span,
+        }));
     }
-    Ok(SelectItem::QualifiedWildcard {
-        span: cover(prefix.iter().map(|part| part.span)),
-        prefix,
-        options: WildcardOptions::default(),
-    })
+    let span = target.span();
+    Ok(SelectItem::AllColumns(AstBox::new(AllColumns {
+        target: Some(target),
+        aliases: Vec::new(),
+        span,
+    })))
 }
 
 /// Wraps one real relation with its authored alias and optional column list.
@@ -532,8 +539,22 @@ pub fn values(rows: Vec<Vec<Expr>>) -> Result<SetExpr, BuildError> {
         return Err(BuildError::EmptyValuesRow);
     }
     Ok(SetExpr::Values(Values {
-        rows,
-        explicit_row: false,
+        rows: rows
+            .into_iter()
+            .map(|cells| {
+                Expr::Row(RowExpr {
+                    fields: cells
+                        .into_iter()
+                        .map(|expression| RowField {
+                            name: None,
+                            span: expression.span(),
+                            expression,
+                        })
+                        .collect(),
+                    span: SYNTHETIC,
+                })
+            })
+            .collect(),
         span: SYNTHETIC,
     }))
 }
@@ -548,8 +569,8 @@ pub fn select(
         return Err(BuildError::EmptyProjection);
     }
     Ok(Select {
-        quantifier: SelectQuantifier::None,
-        projection: projection,
+        distinct: false,
+        projection: projection.into(),
         from: from,
         selection: selection,
         group_by: group_by,

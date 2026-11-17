@@ -136,15 +136,51 @@ pub enum SetOperator {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Values {
-    pub rows: Vec<Vec<Expr>>,
-    pub explicit_row: bool,
+    pub rows: AstVec<Expr>,
     pub span: Span,
+}
+
+/// A neutral borrowed view of the actual row syntax. It grants no analysis
+/// capability and never expands an inner struct-valued cell or clones a child.
+#[derive(Clone, Copy)]
+pub enum ValuesRowCells<'a> {
+    Row(&'a super::RowExpr),
+    Single(&'a Expr),
+}
+impl<'a> ValuesRowCells<'a> {
+    pub fn new(row: &'a Expr) -> Self {
+        match row {
+            Expr::Row(row) => Self::Row(row),
+            other => Self::Single(other),
+        }
+    }
+    pub fn len(&self) -> usize {
+        match *self {
+            Self::Row(row) => row.fields.len(),
+            Self::Single(_) => 1,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn get(&self, index: usize) -> Option<&'a Expr> {
+        match *self {
+            Self::Row(row) => row.fields.get(index).map(|field| &field.expression),
+            Self::Single(expr) => (index == 0).then_some(expr),
+        }
+    }
+    pub fn iter(self) -> impl ExactSizeIterator<Item = &'a Expr> + 'a {
+        (0..self.len()).map(move |index| self.get(index).expect("bounded VALUES cell index"))
+    }
+    pub fn has_named_fields(&self) -> bool {
+        matches!(*self,Self::Row(row)if row.fields.iter().any(|field|field.name.is_some()))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Select {
-    pub quantifier: SelectQuantifier,
-    pub projection: Vec<SelectItem>,
+    pub distinct: bool,
+    pub projection: AstVec<SelectItem>,
     pub from: Option<Relation>,
     pub selection: Option<Expr>,
     pub group_by: Option<GroupBy>,
@@ -156,54 +192,29 @@ pub struct Select {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SelectQuantifier {
-    None,
-    All(Span),
-    Distinct { on: Vec<Expr>, span: Span },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SelectItem {
-    UnnamedExpr(Expr),
-    ExprWithAlias {
-        expr: Expr,
-        alias: Ident,
-        explicit_as: bool,
-        span: Span,
-    },
-    Wildcard {
-        options: WildcardOptions,
-        span: Span,
-    },
-    QualifiedWildcard {
-        prefix: Vec<Ident>,
-        options: WildcardOptions,
-        span: Span,
-    },
+    SingleColumn(AstBox<SingleColumn>),
+    AllColumns(AstBox<AllColumns>),
 }
-
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleColumn {
+    pub expression: Expr,
+    pub alias: Option<Ident>,
+    pub span: Span,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllColumns {
+    pub target: Option<Expr>,
+    pub aliases: Vec<Ident>,
+    pub span: Span,
+}
 impl SelectItem {
     pub fn span(&self) -> Span {
         match self {
-            Self::UnnamedExpr(expr) => expr.span(),
-            Self::ExprWithAlias { span, .. }
-            | Self::Wildcard { span, .. }
-            | Self::QualifiedWildcard { span, .. } => *span,
+            Self::SingleColumn(node) => node.span,
+            Self::AllColumns(node) => node.span,
         }
     }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct WildcardOptions {
-    pub exclude: Vec<Ident>,
-    pub replace: Vec<ReplaceSelectItem>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReplaceSelectItem {
-    pub expr: Expr,
-    pub alias: Ident,
-    pub span: Span,
 }
 
 /// One GROUP BY clause; empty element lists remain structurally legal.

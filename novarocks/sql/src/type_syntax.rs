@@ -184,7 +184,11 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        let ast::SelectItem::UnnamedExpr(ast::Expr::Cast(cast)) = &select.projection[0] else {
+        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+            panic!("CAST");
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let ast::Expr::Cast(cast) = &projection_column.expression else {
             panic!("CAST");
         };
         assert!(constructed.syntax_eq(&cast.data_type), "{spelling}");

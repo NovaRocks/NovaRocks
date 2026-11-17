@@ -96,27 +96,31 @@ pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast
     }
     let mut projection = Vec::new();
     if partitioned {
-        projection.push(ast::SelectItem::UnnamedExpr(column("partition", span)));
+        projection.push(novarocks_parser::build::item(
+            column("partition", span),
+            None,
+        ));
     }
     for (name, argument, alias) in [
         ("sum", "record_count", "record_count"),
         ("count", "*", "file_count"),
         ("sum", "file_size_in_bytes", "total_size"),
     ] {
-        projection.push(ast::SelectItem::ExprWithAlias {
-            expr: call(name, argument, span),
-            alias: ident(alias, span),
-            explicit_as: true,
-            span,
-        });
+        projection.push(ast::SelectItem::SingleColumn(ast::AstBox::new(
+            ast::SingleColumn {
+                expression: call(name, argument, span),
+                alias: Some(ident(alias, span)),
+                span,
+            },
+        )));
     }
     ast::Query {
         session_properties: Vec::new().into(),
         functions: Vec::new().into(),
         with: None,
         body: ast::AstBox::new(ast::SetExpr::Select(ast::AstBox::new(ast::Select {
-            quantifier: ast::SelectQuantifier::None,
-            projection,
+            distinct: false,
+            projection: projection.into(),
             from: Some(novarocks_parser::build::table(source, None, None)),
             selection: Some(comparison(
                 column("content", span),

@@ -250,8 +250,22 @@ fn parameter_and_all_rows_keep_leaf_identity_and_fetch_none_stays_distinct_from_
 
 fn values(value: i64) -> SetExpr {
     SetExpr::Values(Values {
-        rows: vec![vec![count(value)]],
-        explicit_row: false,
+        rows: (vec![vec![count(value)]])
+            .into_iter()
+            .map(|cells| {
+                novarocks_parser::ast::Expr::Row(novarocks_parser::ast::RowExpr {
+                    fields: cells
+                        .into_iter()
+                        .map(|expression| novarocks_parser::ast::RowField {
+                            name: None,
+                            span: expression.span(),
+                            expression,
+                        })
+                        .collect(),
+                    span: Span::new(1, 2),
+                })
+            })
+            .collect(),
         span: Span::new(1, 2),
     })
 }

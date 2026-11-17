@@ -121,14 +121,13 @@ fn dynamic_null_and_parenthesized_paths_remain_real_expressions_in_the_old_bridg
     let SetExpr::Select(select) = query.body.as_ref() else {
         unreachable!()
     };
-    let SelectItem::ExprWithAlias {
-        expr: Expr::FunctionCall(typeof_call),
-        alias,
-        ..
-    } = &select.projection[0]
-    else {
-        panic!("typeof projection");
+    let SelectItem::SingleColumn(column) = &select.projection[0] else {
+        panic!("typeof projection")
     };
+    let Expr::FunctionCall(typeof_call) = &column.expression else {
+        panic!("typeof expression")
+    };
+    let alias = column.alias.as_ref().expect("original alias");
     assert_eq!(alias.value, "observed");
     let Expr::Cast(cast) = &typeof_call.arguments[0].value else {
         panic!("original Cast declaration");

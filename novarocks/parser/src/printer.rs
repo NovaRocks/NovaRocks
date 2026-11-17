@@ -310,18 +310,26 @@ impl Printer {
         }
     }
 
+    #[recursive::recursive]
     fn write_values(&mut self, values: &Values) {
         self.output.push_str("VALUES ");
-        for (row_index, row) in values.rows.iter().enumerate() {
-            if row_index != 0 {
+        for (index, row) in values.rows.iter().enumerate() {
+            if index != 0 {
                 self.output.push_str(", ");
             }
-            if values.explicit_row {
-                self.output.push_str("ROW");
+            match row {
+                Expr::Row(row) if row.fields.iter().all(|field| field.name.is_none()) => {
+                    self.output.push('(');
+                    for (index, field) in row.fields.iter().enumerate() {
+                        if index != 0 {
+                            self.output.push_str(", ");
+                        }
+                        self.write_expr(&field.expression);
+                    }
+                    self.output.push(')');
+                }
+                other => self.write_expr(other),
             }
-            self.output.push('(');
-            self.write_expr_list(row);
-            self.output.push(')');
         }
     }
 
@@ -336,17 +344,8 @@ impl Printer {
             self.write_session_properties(properties);
             self.output.push_str(") */");
         }
-        match &select.quantifier {
-            SelectQuantifier::None => {}
-            SelectQuantifier::All(_) => self.output.push_str(" ALL"),
-            SelectQuantifier::Distinct { on, .. } => {
-                self.output.push_str(" DISTINCT");
-                if !on.is_empty() {
-                    self.output.push_str(" ON (");
-                    self.write_expr_list(on);
-                    self.output.push(')');
-                }
-            }
+        if select.distinct {
+            self.output.push_str(" DISTINCT");
         }
         if !select.projection.is_empty() {
             self.output.push(' ');
@@ -401,53 +400,45 @@ impl Printer {
         }
     }
 
+    #[recursive::recursive]
     fn write_select_item(&mut self, item: &SelectItem) {
         match item {
-            SelectItem::UnnamedExpr(expr) => self.write_expr(expr),
-            SelectItem::ExprWithAlias {
-                expr,
-                alias,
-                explicit_as,
-                ..
-            } => {
-                self.write_expr(expr);
-                if *explicit_as {
-                    self.output.push_str(" AS ");
-                } else {
-                    self.output.push(' ');
-                }
-                self.write_ident(alias);
-            }
-            SelectItem::Wildcard { options, .. } => {
-                self.output.push('*');
-                self.write_wildcard_options(options);
-            }
-            SelectItem::QualifiedWildcard {
-                prefix, options, ..
-            } => {
-                self.write_ident_list_with_separator(prefix, ".");
-                self.output.push_str(".*");
-                self.write_wildcard_options(options);
-            }
+            SelectItem::SingleColumn(node) => self.write_single_column(node),
+            SelectItem::AllColumns(node) => self.write_all_columns(node),
         }
     }
-
-    fn write_wildcard_options(&mut self, options: &WildcardOptions) {
-        if !options.exclude.is_empty() {
-            self.output.push_str(" EXCLUDE (");
-            self.write_ident_list(&options.exclude);
-            self.output.push(')');
+    #[recursive::recursive]
+    fn write_single_column(&mut self, node: &SingleColumn) {
+        self.write_expr(&node.expression);
+        if let Some(alias) = &node.alias {
+            self.output.push_str(" AS ");
+            self.write_ident(alias);
         }
-        if !options.replace.is_empty() {
-            self.output.push_str(" REPLACE (");
-            for (index, item) in options.replace.iter().enumerate() {
-                if index != 0 {
-                    self.output.push_str(", ");
-                }
-                self.write_expr(&item.expr);
-                self.output.push_str(" AS ");
-                self.write_ident(&item.alias);
+    }
+    #[recursive::recursive]
+    fn write_all_columns(&mut self, node: &AllColumns) {
+        if let Some(target) = &node.target {
+            let parenthesize = !matches!(
+                target,
+                Expr::Identifier(_)
+                    | Expr::Dereference(_)
+                    | Expr::Nested(_)
+                    | Expr::FunctionCall(_)
+                    | Expr::Subscript(_)
+            );
+            if parenthesize {
+                self.output.push('(');
             }
+            self.write_expr(target);
+            if parenthesize {
+                self.output.push(')');
+            }
+            self.output.push('.');
+        }
+        self.output.push('*');
+        if !node.aliases.is_empty() {
+            self.output.push_str(" AS (");
+            self.write_ident_list(&node.aliases);
             self.output.push(')');
         }
     }
@@ -2836,8 +2827,22 @@ mod tests {
                         functions: crate::ast::AstVec::new(),
                         with: None,
                         body: crate::ast::AstBox::new(SetExpr::Values(Values {
-                            rows: vec![vec![number("1")]],
-                            explicit_row: false,
+                            rows: (vec![vec![number("1")]])
+                                .into_iter()
+                                .map(|cells| {
+                                    crate::ast::Expr::Row(crate::ast::RowExpr {
+                                        fields: cells
+                                            .into_iter()
+                                            .map(|expression| crate::ast::RowField {
+                                                name: None,
+                                                span: expression.span(),
+                                                expression,
+                                            })
+                                            .collect(),
+                                        span: span(),
+                                    })
+                                })
+                                .collect(),
                             span: span(),
                         })),
                         modifiers: Default::default(),
@@ -2849,16 +2854,14 @@ mod tests {
                 span: span(),
             }),
             body: crate::ast::AstBox::new(SetExpr::Select(crate::ast::AstBox::new(Select {
-                quantifier: SelectQuantifier::Distinct {
-                    on: vec![identifier("s")],
-                    span: span(),
-                },
-                projection: vec![SelectItem::ExprWithAlias {
-                    expr: identifier("s"),
-                    alias: ident("value"),
-                    explicit_as: true,
-                    span: span(),
-                }],
+                projection: (vec![crate::ast::SelectItem::SingleColumn(
+                    crate::ast::AstBox::new(crate::ast::SingleColumn {
+                        expression: identifier("s"),
+                        alias: Some(ident("value")),
+                        span: span(),
+                    }),
+                )])
+                .into(),
                 from: Some(crate::build::alias(
                     crate::build::table(object_name("source"), None, None),
                     ident("s"),
@@ -2890,6 +2893,7 @@ mod tests {
                     }),
                 },
                 span: span(),
+                distinct: true,
             }))),
             modifiers: Default::default(),
             span: span(),
@@ -2902,7 +2906,7 @@ mod tests {
                 query: Box::new(query),
                 span: span(),
             })),
-            "EXPLAIN VERBOSE WITH source AS (VALUES (1)) SELECT DISTINCT ON (s) s AS value FROM source AS s ORDER BY value DESC NULLS LAST OFFSET 2 ROWS LIMIT 10"
+            "EXPLAIN VERBOSE WITH source AS (VALUES (1)) SELECT DISTINCT s AS value FROM source AS s ORDER BY value DESC NULLS LAST OFFSET 2 ROWS LIMIT 10"
         );
     }
 

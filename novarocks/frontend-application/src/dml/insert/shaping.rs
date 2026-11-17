@@ -226,15 +226,23 @@ fn shape_body(
         }
         ast::SetExpr::Values(values) => {
             for (row_index, row) in values.rows.iter_mut().enumerate() {
+                let cells = ast::ValuesRowCells::new(row);
+                if cells.has_named_fields() {
+                    return Err(
+                        "INSERT literal VALUES source does not support named row fields".into(),
+                    );
+                }
+                let row_span = row.span();
                 let (syntax, authored) = shape_row_in(
-                    row,
+                    cells.len(),
+                    |index| cells.get(index),
                     mapping,
                     width,
                     columns,
                     constants.capture,
                     constants.typed_write,
                 )?;
-                *row = syntax;
+                *row = values_row(syntax, row_span);
                 constants.publish(authored, |column| {
                     novarocks_sql::compiler::SqlConstantExpressionSite::ValuesCell {
                         row: row_index,
@@ -244,17 +252,19 @@ fn shape_body(
             }
         }
         ast::SetExpr::Select(select) => {
-            let row = select
+            if !select
                 .projection
                 .iter()
-                .map(|item| match item {
-                    ast::SelectItem::UnnamedExpr(expr)
-                    | ast::SelectItem::ExprWithAlias { expr, .. } => Ok(expr.clone()),
-                    _ => Err("INSERT literal SELECT source only supports expressions".to_string()),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                .all(|item| matches!(item, ast::SelectItem::SingleColumn(_)))
+            {
+                return Err("INSERT literal SELECT source only supports expressions".to_string());
+            }
             let (expressions, authored) = shape_row_in(
-                &row,
+                select.projection.len(),
+                |index| match select.projection.get(index) {
+                    Some(ast::SelectItem::SingleColumn(column)) => Some(&column.expression),
+                    _ => None,
+                },
                 mapping,
                 width,
                 columns,
@@ -270,7 +280,7 @@ fn shape_body(
                 build::select(
                     expressions
                         .into_iter()
-                        .map(|expr| build::item(expr, None, false))
+                        .map(|expr| build::item(expr, None))
                         .collect(),
                     Some(build::alias(
                         build::derived(inner),
@@ -296,11 +306,11 @@ fn shape_body(
                 let ast::SetExpr::Select(wrapper) = wrapper.query.body.as_ref() else {
                     unreachable!("published target SELECT")
                 };
-                let relation_path = wrapper
+                let (original, relation_path) = wrapper
                     .from
                     .as_ref()
                     .and_then(derived_source)
-                    .map(|(_, _, path)| path)
+                    .map(|(query, _, path)| (query, path))
                     .ok_or_else(|| {
                         "INSERT literal source lost its actual derived wrapper".to_string()
                     })?;
@@ -308,7 +318,15 @@ fn shape_body(
                     let (Some(value), Some(source_column)) = (value, mapping[column]) else {
                         continue;
                     };
-                    let Some(expression_path) = explicit_variant_source_path(&row[source_column])
+                    let ast::SetExpr::Select(original) = original.body.as_ref() else {
+                        return Err("INSERT literal source lost its original SELECT".into());
+                    };
+                    let Some(ast::SelectItem::SingleColumn(column)) =
+                        original.projection.get(source_column)
+                    else {
+                        return Err("INSERT literal source lost its original projection".into());
+                    };
+                    let Some(expression_path) = explicit_variant_source_path(&column.expression)
                     else {
                         continue;
                     };
@@ -363,13 +381,28 @@ fn shape_body(
     Ok(())
 }
 
+fn values_row(cells: Vec<ast::Expr>, span: Span) -> ast::Expr {
+    ast::Expr::Row(ast::RowExpr {
+        fields: cells
+            .into_iter()
+            .map(|expression| ast::RowField {
+                span: expression.span(),
+                name: None,
+                expression,
+            })
+            .collect(),
+        span,
+    })
+}
+
 type ShapedInsertRow = (
     Vec<ast::Expr>,
     Option<Vec<Option<novarocks_functions::ConstantValue>>>,
 );
 
-fn shape_row_in(
-    row: &[ast::Expr],
+fn shape_row_in<'a>(
+    row_len: usize,
+    cell: impl Fn(usize) -> Option<&'a ast::Expr>,
     mapping: &[Option<usize>],
     width: usize,
     columns: &[ColumnDef],
@@ -379,10 +412,10 @@ fn shape_row_in(
     )>,
     typed_write: bool,
 ) -> Result<ShapedInsertRow, String> {
-    if row.len() != width {
+    if row_len != width {
         return Err(format!(
             "insert column count mismatch: expected {width} values for column list, got {}",
-            row.len()
+            row_len
         ));
     }
     let mut constants = capture.map(|_| Vec::with_capacity(columns.len()));
@@ -391,7 +424,9 @@ fn shape_row_in(
         .zip(columns)
         .map(|(index, column)| {
             let expr = match index {
-                Some(index) => row[*index].clone(),
+                Some(index) => cell(*index)
+                    .ok_or_else(|| "INSERT source lost its original cell ordinal".to_string())?
+                    .clone(),
                 None => omitted_insert_expr(column)?,
             };
             let target = column
@@ -936,12 +971,11 @@ pub(crate) fn attach_write_literal_contexts(
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(assignments);
     };
-    let assignments = if select.projection.iter().all(|item| {
-        matches!(
-            item,
-            ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
-        )
-    }) {
+    let assignments = if select
+        .projection
+        .iter()
+        .all(|item| matches!(item, ast::SelectItem::SingleColumn(_)))
+    {
         let mut sites = Vec::new();
         sites
             .try_reserve_exact(assignments.sites().len())
@@ -958,10 +992,9 @@ pub(crate) fn attach_write_literal_contexts(
         for site in assignments.sites() {
             control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
             let site = match select.projection.get(site.output_ordinal()) {
-                Some(
-                    ast::SelectItem::UnnamedExpr(expr)
-                    | ast::SelectItem::ExprWithAlias { expr, .. },
-                ) => site.clone().with_source_span(expr.span()),
+                Some(ast::SelectItem::SingleColumn(column)) => {
+                    site.clone().with_source_span(column.expression.span())
+                }
                 _ => site.clone(),
             };
             sites.push(site);
@@ -984,11 +1017,12 @@ pub(crate) fn attach_write_literal_contexts(
     let mut contexts = Vec::new();
     for site in assignments.sites() {
         control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
-        let Some(ast::SelectItem::ExprWithAlias { expr, .. } | ast::SelectItem::UnnamedExpr(expr)) =
+        let Some(ast::SelectItem::SingleColumn(column)) =
             select.projection.get(site.output_ordinal())
         else {
             continue;
         };
+        let expr = &column.expression;
         let Some(chain) = ast::identifier_chain_observed(expr, |_| {
             control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
         })?
@@ -1080,16 +1114,15 @@ fn source_assignment_before_common_type(query: &ast::Query) -> bool {
             ast::SetExpr::Select(select) => {
                 select.modifiers.is_empty()
                     && select.from.is_none()
-                    && !matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. })
+                    && !select.distinct
                     && select.selection.is_none()
                     && select.group_by.is_none()
                     && select.having.is_none()
                     && select.qualify.is_none()
                     && select.windows.is_empty()
                     && select.projection.iter().all(|item| match item {
-                        ast::SelectItem::UnnamedExpr(expr)
-                        | ast::SelectItem::ExprWithAlias { expr, .. } => {
-                            super::command::is_literal_expr(expr)
+                        ast::SelectItem::SingleColumn(column) => {
+                            super::command::is_literal_expr(&column.expression)
                         }
                         _ => false,
                     })
@@ -1130,8 +1163,14 @@ fn append_write_literal_sites(
             ));
         }
         ast::SetExpr::Values(values) => {
-            for (row, values) in values.rows.iter().enumerate() {
-                if source_ordinal >= values.len() {
+            for (row, value) in values.rows.iter().enumerate() {
+                let cells = ast::ValuesRowCells::new(value);
+                if cells.has_named_fields() {
+                    return Err(novarocks_sql::compiler::SqlCompileError::InvalidRequest(
+                        "VALUES write context does not support named row fields".into(),
+                    ));
+                }
+                if source_ordinal >= cells.len() {
                     continue;
                 }
                 let context = SqlWriteLiteralContext::new(
@@ -1150,12 +1189,11 @@ fn append_write_literal_sites(
             }
         }
         ast::SetExpr::Select(select) => {
-            if select.projection.iter().all(|item| {
-                matches!(
-                    item,
-                    ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
-                )
-            }) && source_ordinal < select.projection.len()
+            if select
+                .projection
+                .iter()
+                .all(|item| matches!(item, ast::SelectItem::SingleColumn(_)))
+                && source_ordinal < select.projection.len()
             {
                 let context = SqlWriteLiteralContext::new(
                     path.clone(),
@@ -1247,6 +1285,19 @@ pub(crate) fn capture_typed_write_constants(
     }
     Ok((!source.constants.is_empty()).then(|| source.constants.into()))
 }
+fn values_cell_mut(row: &mut ast::Expr, index: usize) -> Result<Option<&mut ast::Expr>, String> {
+    match row {
+        ast::Expr::Row(row) => {
+            if row.fields.iter().any(|field| field.name.is_some()) {
+                return Err("VALUES write constants do not support named row fields".into());
+            }
+            Ok(row.fields.get_mut(index).map(|field| &mut field.expression))
+        }
+        expression if index == 0 => Ok(Some(expression)),
+        _ => Ok(None),
+    }
+}
+
 fn capture_typed_write_body(
     body: &mut ast::SetExpr,
     mapping: &[Option<usize>],
@@ -1290,7 +1341,7 @@ fn capture_typed_write_body(
             for (row_index, row) in values.rows.iter_mut().enumerate() {
                 for (target, source_index) in columns.iter().zip(mapping) {
                     if let Some(index) = source_index
-                        && let Some(expression) = row.get_mut(*index)
+                        && let Some(expression) = values_cell_mut(row, *index)?
                     {
                         capture(
                             expression,
@@ -1305,23 +1356,19 @@ fn capture_typed_write_body(
             }
         }
         ast::SetExpr::Select(select) => {
-            if select.projection.iter().any(|item| {
-                !matches!(
-                    item,
-                    ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
-                )
-            }) {
+            if select
+                .projection
+                .iter()
+                .any(|item| !matches!(item, ast::SelectItem::SingleColumn(_)))
+            {
                 return Ok(());
             }
             for (target, source_index) in columns.iter().zip(mapping) {
                 if let Some(index) = source_index
-                    && let Some(
-                        ast::SelectItem::UnnamedExpr(expression)
-                        | ast::SelectItem::ExprWithAlias {
-                            expr: expression, ..
-                        },
-                    ) = select.projection.get_mut(*index)
+                    && let Some(ast::SelectItem::SingleColumn(column)) =
+                        select.projection.get_mut(*index)
                 {
+                    let expression = &mut column.expression;
                     capture(
                         expression,
                         Site::SelectProjection { column: *index },
@@ -1387,10 +1434,10 @@ mod typed_write_source_tests {
             panic!("VALUES");
         };
         assert!(
-            matches!(&values.rows[0][0], ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::String(bytes), .. }) if bytes == "abc")
+            matches!(ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap(), ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::String(bytes), .. }) if bytes == "abc")
         );
         assert!(matches!(
-            &values.rows[0][1],
+            ast::ValuesRowCells::new(&values.rows[0]).get(1).unwrap(),
             ast::Expr::Literal(ast::Literal {
                 kind: ast::LiteralKind::Long {
                     parsed_value: 9007199254740993,
@@ -1472,13 +1519,16 @@ mod typed_write_source_tests {
         let ast::SetExpr::Select(select) = source.body.as_ref() else {
             panic!("SELECT");
         };
-        let ast::SelectItem::ExprWithAlias {
-            expr: ast::Expr::Cast(cast),
-            ..
-        } = &select.projection[0]
-        else {
+        let ast::SelectItem::SingleColumn(single_column) = &select.projection[0] else {
             panic!("original explicit CAST");
         };
+        let Some(_) = &single_column.alias else {
+            panic!("original explicit CAST");
+        };
+        let ast::Expr::Cast(cast) = &single_column.expression else {
+            panic!("original explicit CAST");
+        };
+
         assert!(is_variant_cast(cast));
         assert!(matches!(
             &cast.expression,

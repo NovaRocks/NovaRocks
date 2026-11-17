@@ -4339,8 +4339,7 @@ impl<'a> super::AnalyzerContext<'a> {
     pub(super) fn select_has_aggregate_functions(&self, projection: &[ast::SelectItem]) -> bool {
         for item in projection {
             let expr = match item {
-                ast::SelectItem::UnnamedExpr(e) => e,
-                ast::SelectItem::ExprWithAlias { expr, .. } => expr,
+                ast::SelectItem::SingleColumn(column) => &column.expression,
                 _ => continue,
             };
             if self.expr_contains_aggregate(expr) {
@@ -7518,9 +7517,11 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("select")
         };
-        let ast::SelectItem::UnnamedExpr(expression @ ast::Expr::Logical(logical)) =
-            &select.projection[0]
-        else {
+        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+            panic!("logical projection")
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let expression @ ast::Expr::Logical(logical) = &projection_column.expression else {
             panic!("logical projection")
         };
         let control = crate::compiler::SqlCompileControl::unbounded();
@@ -7624,9 +7625,11 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("select")
         };
-        let ast::SelectItem::UnnamedExpr(expression @ ast::Expr::Logical(logical)) =
-            &select.projection[0]
-        else {
+        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+            panic!("logical")
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let expression @ ast::Expr::Logical(logical) = &projection_column.expression else {
             panic!("logical")
         };
         let constants = vec![
@@ -7896,9 +7899,12 @@ mod tests {
             let ast::SetExpr::Select(select) = query.body.as_ref() else {
                 panic!("select");
             };
-            let ast::SelectItem::UnnamedExpr(mut opaque) = select.projection[0].clone() else {
+            let ast::SelectItem::SingleColumn(projection_column) = select.projection[0].clone()
+            else {
                 panic!("projection");
             };
+            assert!(projection_column.alias.is_none(), "anonymous projection");
+            let mut opaque = projection_column.into_inner().expression;
             let ast::Expr::FunctionCall(call) = &mut opaque else {
                 panic!("typeof");
             };
@@ -9310,9 +9316,11 @@ mod tests {
                 let ast::SetExpr::Select(select) = query.body.as_ref() else {
                     panic!("select")
                 };
-                let ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+                let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
                     panic!("expression")
                 };
+                assert!(projection_column.alias.is_none(), "anonymous projection");
+                let expr = &projection_column.expression;
                 let error = context.analyze_expr(expr, &scope).unwrap_err();
                 assert!(
                     matches!(
@@ -9480,9 +9488,11 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("select");
         };
-        let ast::SelectItem::UnnamedExpr(syntax) = &select.projection[0] else {
+        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
             panic!("expression");
         };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let syntax = &projection_column.expression;
         for ordinal in [1, 2] {
             let original = pool.value(ordinal).unwrap();
             let source = TypedExpr {
@@ -9918,9 +9928,12 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_mut() else {
             return Err("expected select".to_string());
         };
-        let Some(ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(func))) =
-            select.projection.first_mut()
+        let Some(ast::SelectItem::SingleColumn(projection_column)) = select.projection.first_mut()
         else {
+            return Err("expected ordinary scalar function".to_string());
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let ast::Expr::FunctionCall(func) = &mut projection_column.expression else {
             return Err("expected ordinary scalar function".to_string());
         };
         let Some(last_name_part) = func.name.parts.last_mut() else {

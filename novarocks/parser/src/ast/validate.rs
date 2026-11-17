@@ -176,41 +176,21 @@ fn validate_set_expr(set_expr: &SetExpr) -> Result<(), ValidateError> {
     }
 }
 
+#[recursive::recursive]
 fn validate_values(values: &Values) -> Result<(), ValidateError> {
-    if values.rows.is_empty() {
-        return Err(ValidateError::invalid_structure(
-            StructuralViolation::EmptyValuesRowList,
-            values.span,
-        ));
-    }
     for row in &values.rows {
-        if row.is_empty() {
-            return Err(ValidateError::invalid_structure(
-                StructuralViolation::EmptyValuesRow,
-                values.span,
-            ));
-        }
-        for expression in row {
-            validate_expr(expression)?;
-        }
+        validate_expr(row)?;
     }
     Ok(())
 }
 
+#[recursive::recursive]
 fn validate_select(select: &Select) -> Result<(), ValidateError> {
     if select.projection.is_empty() {
         return Err(ValidateError::invalid_structure(
             StructuralViolation::EmptySelectProjection,
             select.span,
         ));
-    }
-    match &select.quantifier {
-        super::SelectQuantifier::Distinct { on, .. } => {
-            for expression in on {
-                validate_expr(expression)?;
-            }
-        }
-        super::SelectQuantifier::None | super::SelectQuantifier::All(_) => {}
     }
     for item in &select.projection {
         validate_select_item(item)?;
@@ -244,15 +224,13 @@ fn validate_select(select: &Select) -> Result<(), ValidateError> {
     Ok(())
 }
 
+#[recursive::recursive]
 fn validate_select_item(item: &SelectItem) -> Result<(), ValidateError> {
     match item {
-        SelectItem::UnnamedExpr(expression)
-        | SelectItem::ExprWithAlias {
-            expr: expression, ..
-        } => validate_expr(expression),
-        SelectItem::Wildcard { options, .. } | SelectItem::QualifiedWildcard { options, .. } => {
-            for replacement in &options.replace {
-                validate_expr(&replacement.expr)?;
+        SelectItem::SingleColumn(node) => validate_expr(&node.expression),
+        SelectItem::AllColumns(node) => {
+            if let Some(target) = &node.target {
+                validate_expr(target)?;
             }
             Ok(())
         }

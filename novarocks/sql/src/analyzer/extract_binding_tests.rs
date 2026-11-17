@@ -273,7 +273,11 @@ fn extract_binding_rejects_carrier_only_largeint_and_unsupported_field_at_origin
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select");
     };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::Extract(extract)) = &select.projection[0] else {
+    let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+        panic!("extract");
+    };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let ast::Expr::Extract(extract) = &projection_column.expression else {
         panic!("extract");
     };
     let error = analyze(sql, &catalog, crate::constant::test_constant_policy()).unwrap_err();

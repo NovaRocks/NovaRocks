@@ -1848,10 +1848,15 @@ mod original_stage_tests {
         let novarocks_parser::ast::SetExpr::Select(select) = refreshed.body.as_ref() else {
             panic!("stored aggregate SELECT");
         };
-        let novarocks_parser::ast::SelectItem::ExprWithAlias { expr, .. } = &select.projection[1]
+        let novarocks_parser::ast::SelectItem::SingleColumn(single_column) = &select.projection[1]
         else {
             panic!("stored aggregate expression");
         };
+        let Some(_) = &single_column.alias else {
+            panic!("stored aggregate expression");
+        };
+        let expr = &single_column.expression;
+
         let count_offset = expected_source.find("count(").unwrap();
         assert!(expected_source[..count_offset].chars().count() < count_offset);
         assert_eq!(expr.span().start(), count_offset);

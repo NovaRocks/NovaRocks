@@ -206,8 +206,10 @@ fn checked_build_and_public_validation_reject_each_empty_order_owner() {
         if owner == 0 {
             select.modifiers.order_by = Some(empty);
         } else {
-            let SelectItem::UnnamedExpr(Expr::FunctionCall(call)) = &mut select.projection[0]
-            else {
+            let SelectItem::SingleColumn(column) = &mut select.projection[0] else {
+                panic!("unaliased function call");
+            };
+            let Expr::FunctionCall(call) = &mut column.expression else {
                 panic!("unaliased function call");
             };
             if owner == 1 {

@@ -122,7 +122,10 @@ fn original_encoder_keeps_variant_constants_and_mixed_multiline_syntax() {
     assert!(shaped.body.syntax_eq(&original.body));
     for (row, original_row) in actual.rows.iter().zip(&expected.rows) {
         assert!(
-            row[0].syntax_eq(&original_row[0]),
+            ast::ValuesRowCells::new(row)
+                .get(0)
+                .unwrap()
+                .syntax_eq(ast::ValuesRowCells::new(original_row).get(0).unwrap()),
             "other cells use their original source"
         );
     }

@@ -21,6 +21,19 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_values(&mut self, node: &Values) {
+        walk_values(self, node);
+    }
+    fn visit_select_item(&mut self, node: &SelectItem) {
+        walk_select_item(self, node);
+    }
+    fn visit_single_column(&mut self, node: &SingleColumn) {
+        walk_single_column(self, node);
+    }
+    fn visit_all_columns(&mut self, node: &AllColumns) {
+        walk_all_columns(self, node);
+    }
+
     fn visit_with(&mut self, node: &With) {
         walk_with(self, node);
     }
@@ -726,13 +739,7 @@ pub fn walk_query_modifiers<V: Visit + ?Sized>(visitor: &mut V, modifiers: &Quer
 pub fn walk_set_expr<V: Visit + ?Sized>(visitor: &mut V, set_expr: &SetExpr) {
     match set_expr {
         SetExpr::Select(select) => visitor.visit_select(select),
-        SetExpr::Values(values) => {
-            for row in &values.rows {
-                for expr in row {
-                    visitor.visit_expr(expr);
-                }
-            }
-        }
+        SetExpr::Values(values) => visitor.visit_values(values),
         SetExpr::Table(table) => visitor.visit_table(table),
         SetExpr::Query(query) => visitor.visit_table_subquery(query),
         SetExpr::SetOperation(operation) => visitor.visit_set_operation(operation),
@@ -740,34 +747,8 @@ pub fn walk_set_expr<V: Visit + ?Sized>(visitor: &mut V, set_expr: &SetExpr) {
 }
 
 pub fn walk_select<V: Visit + ?Sized>(visitor: &mut V, select: &Select) {
-    if let SelectQuantifier::Distinct { on, .. } = &select.quantifier {
-        for expr in on {
-            visitor.visit_expr(expr);
-        }
-    }
     for item in &select.projection {
-        match item {
-            SelectItem::UnnamedExpr(expr) => visitor.visit_expr(expr),
-            SelectItem::ExprWithAlias { expr, alias, .. } => {
-                visitor.visit_expr(expr);
-                visitor.visit_ident(alias);
-            }
-            SelectItem::Wildcard { options, .. }
-            | SelectItem::QualifiedWildcard { options, .. } => {
-                for ident in &options.exclude {
-                    visitor.visit_ident(ident);
-                }
-                for replacement in &options.replace {
-                    visitor.visit_expr(&replacement.expr);
-                    visitor.visit_ident(&replacement.alias);
-                }
-            }
-        }
-        if let SelectItem::QualifiedWildcard { prefix, .. } = item {
-            for ident in prefix {
-                visitor.visit_ident(ident);
-            }
-        }
+        visitor.visit_select_item(item);
     }
     if let Some(relation) = &select.from {
         visitor.visit_relation(relation);
@@ -950,6 +931,19 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_values(&mut self, node: Values) -> Values {
+        fold_values(self, node)
+    }
+    fn fold_select_item(&mut self, node: SelectItem) -> SelectItem {
+        fold_select_item(self, node)
+    }
+    fn fold_single_column(&mut self, node: SingleColumn) -> SingleColumn {
+        fold_single_column(self, node)
+    }
+    fn fold_all_columns(&mut self, node: AllColumns) -> AllColumns {
+        fold_all_columns(self, node)
+    }
+
     fn fold_with(&mut self, node: With) -> With {
         fold_with(self, node)
     }
@@ -1829,14 +1823,7 @@ pub fn fold_set_expr<F: Fold + ?Sized>(folder: &mut F, set_expr: SetExpr) -> Set
         SetExpr::Select(select) => {
             SetExpr::Select(AstBox::new(folder.fold_select(select.into_inner())))
         }
-        SetExpr::Values(mut values) => {
-            values.rows = values
-                .rows
-                .into_iter()
-                .map(|row| row.into_iter().map(|expr| folder.fold_expr(expr)).collect())
-                .collect();
-            SetExpr::Values(values)
-        }
+        SetExpr::Values(values) => SetExpr::Values(folder.fold_values(values)),
         SetExpr::Table(table) => SetExpr::Table(AstBox::new(folder.fold_table(table.into_inner()))),
         SetExpr::Query(query) => {
             SetExpr::Query(AstBox::new(folder.fold_table_subquery(query.into_inner())))
@@ -1848,49 +1835,10 @@ pub fn fold_set_expr<F: Fold + ?Sized>(folder: &mut F, set_expr: SetExpr) -> Set
 }
 
 pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Select {
-    select.quantifier = match select.quantifier {
-        SelectQuantifier::Distinct { on, span } => SelectQuantifier::Distinct {
-            on: on.into_iter().map(|expr| folder.fold_expr(expr)).collect(),
-            span,
-        },
-        quantifier => quantifier,
-    };
     select.projection = select
         .projection
         .into_iter()
-        .map(|item| match item {
-            SelectItem::UnnamedExpr(expr) => SelectItem::UnnamedExpr(folder.fold_expr(expr)),
-            SelectItem::ExprWithAlias {
-                expr,
-                alias,
-                explicit_as,
-                span,
-            } => SelectItem::ExprWithAlias {
-                expr: folder.fold_expr(expr),
-                alias: folder.fold_ident(alias),
-                explicit_as,
-                span,
-            },
-            SelectItem::Wildcard { mut options, span } => {
-                options = fold_wildcard_options(folder, options);
-                SelectItem::Wildcard { options, span }
-            }
-            SelectItem::QualifiedWildcard {
-                prefix,
-                mut options,
-                span,
-            } => {
-                options = fold_wildcard_options(folder, options);
-                SelectItem::QualifiedWildcard {
-                    prefix: prefix
-                        .into_iter()
-                        .map(|part| folder.fold_ident(part))
-                        .collect(),
-                    options,
-                    span,
-                }
-            }
-        })
+        .map(|item| folder.fold_select_item(item))
         .collect();
     select.from = select.from.map(|relation| folder.fold_relation(relation));
     select.selection = select.selection.map(|expr| folder.fold_expr(expr));
@@ -1904,27 +1852,6 @@ pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Sele
         .collect();
     select.modifiers = fold_query_modifiers(folder, select.modifiers);
     select
-}
-
-fn fold_wildcard_options<F: Fold + ?Sized>(
-    folder: &mut F,
-    mut options: WildcardOptions,
-) -> WildcardOptions {
-    options.exclude = options
-        .exclude
-        .into_iter()
-        .map(|ident| folder.fold_ident(ident))
-        .collect();
-    options.replace = options
-        .replace
-        .into_iter()
-        .map(|mut item| {
-            item.expr = folder.fold_expr(item.expr);
-            item.alias = folder.fold_ident(item.alias);
-            item
-        })
-        .collect();
-    options
 }
 
 #[recursive::recursive]
@@ -2479,5 +2406,74 @@ pub fn fold_cte<F: Fold + ?Sized>(folder: &mut F, mut node: Cte) -> Cte {
             .collect()
     });
     node.query = AstBox::new(folder.fold_query(node.query.into_inner()));
+    node
+}
+
+#[recursive::recursive]
+pub fn walk_values<V: Visit + ?Sized>(visitor: &mut V, node: &Values) {
+    for row in &node.rows {
+        visitor.visit_expr(row);
+    }
+}
+#[recursive::recursive]
+pub fn fold_values<F: Fold + ?Sized>(folder: &mut F, mut node: Values) -> Values {
+    node.rows = node
+        .rows
+        .into_iter()
+        .map(|row| folder.fold_expr(row))
+        .collect();
+    node
+}
+#[recursive::recursive]
+pub fn walk_select_item<V: Visit + ?Sized>(visitor: &mut V, node: &SelectItem) {
+    match node {
+        SelectItem::SingleColumn(node) => visitor.visit_single_column(node),
+        SelectItem::AllColumns(node) => visitor.visit_all_columns(node),
+    }
+}
+#[recursive::recursive]
+pub fn walk_single_column<V: Visit + ?Sized>(visitor: &mut V, node: &SingleColumn) {
+    visitor.visit_expr(&node.expression);
+    if let Some(alias) = &node.alias {
+        visitor.visit_ident(alias);
+    }
+}
+#[recursive::recursive]
+pub fn walk_all_columns<V: Visit + ?Sized>(visitor: &mut V, node: &AllColumns) {
+    if let Some(target) = &node.target {
+        visitor.visit_expr(target);
+    }
+    for alias in &node.aliases {
+        visitor.visit_ident(alias);
+    }
+}
+#[recursive::recursive]
+pub fn fold_select_item<F: Fold + ?Sized>(folder: &mut F, node: SelectItem) -> SelectItem {
+    match node {
+        SelectItem::SingleColumn(node) => {
+            SelectItem::SingleColumn(AstBox::new(folder.fold_single_column(node.into_inner())))
+        }
+        SelectItem::AllColumns(node) => {
+            SelectItem::AllColumns(AstBox::new(folder.fold_all_columns(node.into_inner())))
+        }
+    }
+}
+#[recursive::recursive]
+pub fn fold_single_column<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut node: SingleColumn,
+) -> SingleColumn {
+    node.expression = folder.fold_expr(node.expression);
+    node.alias = node.alias.map(|alias| folder.fold_ident(alias));
+    node
+}
+#[recursive::recursive]
+pub fn fold_all_columns<F: Fold + ?Sized>(folder: &mut F, mut node: AllColumns) -> AllColumns {
+    node.target = node.target.map(|target| folder.fold_expr(target));
+    node.aliases = node
+        .aliases
+        .into_iter()
+        .map(|alias| folder.fold_ident(alias))
+        .collect();
     node
 }

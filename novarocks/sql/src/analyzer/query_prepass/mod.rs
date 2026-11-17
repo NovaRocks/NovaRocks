@@ -455,44 +455,26 @@ fn derive_column_aliases(
 }
 
 fn projection_alias(item: &SelectItem) -> Option<Ident> {
-    match item {
-        SelectItem::ExprWithAlias { alias, .. } => Some(alias.clone()),
-        SelectItem::UnnamedExpr(Expr::Identifier(ident)) => Some(ident.clone()),
-        SelectItem::UnnamedExpr(expression @ Expr::Dereference(_)) => {
-            novarocks_parser::ast::identifier_chain_observed(expression, |_| {
-                Ok::<(), std::convert::Infallible>(())
-            })
-            .unwrap_or_else(|never| match never {})
-            .map(|chain| chain.last().clone())
-        }
-        SelectItem::UnnamedExpr(_)
-        | SelectItem::Wildcard { .. }
-        | SelectItem::QualifiedWildcard { .. } => None,
-    }
+    let SelectItem::SingleColumn(column) = item else {
+        return None;
+    };
+    column.alias.clone().or_else(|| {
+        ast::identifier_chain_observed(&column.expression, |_| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap_or_else(|never| match never {})
+        .map(|chain| chain.last().clone())
+    })
 }
 
 fn pin_projection_aliases(expr: &mut SetExpr, aliases: &[Ident]) {
     match expr {
         SetExpr::Select(select) => {
             for (item, alias) in select.projection.iter_mut().zip(aliases) {
-                let replacement = match std::mem::replace(
-                    item,
-                    SelectItem::Wildcard {
-                        options: Default::default(),
-                        span: alias.span,
-                    },
-                ) {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        SelectItem::ExprWithAlias {
-                            expr,
-                            alias: alias.clone(),
-                            explicit_as: true,
-                            span: alias.span,
-                        }
-                    }
-                    other => other,
-                };
-                *item = replacement;
+                if let SelectItem::SingleColumn(column) = item {
+                    column.alias = Some(alias.clone());
+                    column.span = alias.span;
+                }
             }
         }
         SetExpr::Query(query) => pin_projection_aliases(query.query.body.as_mut(), aliases),
@@ -546,11 +528,13 @@ fn inline_iteration(
         node.span = span;
     }
     SetExpr::Select(ast::AstBox::new(Select {
-        quantifier: ast::SelectQuantifier::None,
-        projection: vec![SelectItem::Wildcard {
-            options: Default::default(),
+        distinct: false,
+        projection: vec![SelectItem::AllColumns(ast::AstBox::new(ast::AllColumns {
+            target: None,
+            aliases: Vec::new(),
             span,
-        }],
+        }))]
+        .into(),
         from: Some(relation),
         selection: None,
         group_by: None,
@@ -627,22 +611,12 @@ fn scan_query_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, query
 fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, expr: &SetExpr) {
     match expr {
         SetExpr::Select(select) => {
-            if let novarocks_parser::ast::SelectQuantifier::Distinct { on, .. } = &select.quantifier
-            {
-                for expression in on {
-                    visitor.visit_expr(expression);
-                }
-            }
             for item in &select.projection {
                 match item {
-                    SelectItem::UnnamedExpr(expression)
-                    | SelectItem::ExprWithAlias {
-                        expr: expression, ..
-                    } => visitor.visit_expr(expression),
-                    SelectItem::Wildcard { options, .. }
-                    | SelectItem::QualifiedWildcard { options, .. } => {
-                        for replacement in &options.replace {
-                            visitor.visit_expr(&replacement.expr);
+                    SelectItem::SingleColumn(column) => visitor.visit_expr(&column.expression),
+                    SelectItem::AllColumns(columns) => {
+                        if let Some(target) = &columns.target {
+                            visitor.visit_expr(target);
                         }
                     }
                 }
@@ -682,9 +656,7 @@ fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, ex
         }
         SetExpr::Values(values) => {
             for row in &values.rows {
-                for expression in row {
-                    visitor.visit_expr(expression);
-                }
+                visitor.visit_expr(row);
             }
         }
         SetExpr::Query(query) => scan_query_for_table_reference(visitor, &query.query),
@@ -1031,7 +1003,11 @@ mod tests {
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select");
         };
-        let SelectItem::UnnamedExpr(Expr::Exists(exists)) = &select.projection[0] else {
+        let SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+            panic!("expected EXISTS predicate");
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let Expr::Exists(exists) = &projection_column.expression else {
             panic!("expected EXISTS predicate");
         };
         let Expr::Subquery(subquery) = &exists.subquery else {

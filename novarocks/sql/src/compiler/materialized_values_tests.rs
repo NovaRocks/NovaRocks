@@ -71,14 +71,21 @@ fn expression_loan_matches_only_the_actual_owned_occurrence() {
     let ast::SetExpr::Values(values) = original.body.as_ref() else {
         panic!("values")
     };
-    assert!(loan.constant_at(&values.rows[0][0]).is_none());
-    assert!(loan.constant_at(&values.rows[0][1]).is_some());
+    assert!(
+        loan.constant_at(ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap())
+            .is_none()
+    );
+    assert!(
+        loan.constant_at(ast::ValuesRowCells::new(&values.rows[0]).get(1).unwrap())
+            .is_some()
+    );
     let independent = query("VALUES (1, NULL)");
     let ast::SetExpr::Values(values) = independent.body.as_ref() else {
         panic!("values")
     };
     assert!(
-        loan.constant_at(&values.rows[0][1]).is_none(),
+        loan.constant_at(ast::ValuesRowCells::new(&values.rows[0]).get(1).unwrap())
+            .is_none(),
         "equal syntax is not this analysis occurrence"
     );
     assert!(source.loan(&query("VALUES (1)"), &control).is_err());
@@ -189,7 +196,11 @@ fn logical_term_paths_borrow_only_the_authored_occurrence_and_reject_wrong_edges
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select")
     };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::Logical(logical)) = &select.projection[0] else {
+    let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+        panic!("logical projection")
+    };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let ast::Expr::Logical(logical) = &projection_column.expression else {
         panic!("logical projection")
     };
     assert_eq!(logical.terms.len(), 3);
@@ -344,8 +355,11 @@ fn predicate_source_paths_keep_actual_children_and_refuse_wrong_fields_or_clones
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("select")
         };
-        let ast::SelectItem::UnnamedExpr(ast::Expr::Predicated(node)) = &select.projection[0]
-        else {
+        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+            panic!("predicated projection")
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let ast::Expr::Predicated(node) = &projection_column.expression else {
             panic!("predicated projection")
         };
         let source = MaterializedValues::try_new_expressions(
@@ -377,7 +391,9 @@ fn predicate_source_paths_keep_actual_children_and_refuse_wrong_fields_or_clones
                         .projection
                         .iter()
                         .find_map(|item| match item {
-                            ast::SelectItem::UnnamedExpr(expr) => Some(expr),
+                            ast::SelectItem::SingleColumn(column) if column.alias.is_none() => {
+                                Some(&column.expression)
+                            }
                             _ => None,
                         })
                         .unwrap()
@@ -584,9 +600,11 @@ fn control_expression_edges_resolve_only_real_fields_and_reject_partial_or_absen
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("select")
         };
-        let ast::SelectItem::UnnamedExpr(expression) = &select.projection[0] else {
+        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
             panic!("projection")
         };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let expression = &projection_column.expression;
         let source = MaterializedValues::try_new_expressions(
             &query,
             vec![
@@ -646,8 +664,11 @@ fn control_expression_edges_resolve_only_real_fields_and_reject_partial_or_absen
     let ast::SetExpr::Select(select) = partial.body.as_mut() else {
         panic!("select")
     };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::SearchedCase(case)) = &mut select.projection[0]
-    else {
+    let ast::SelectItem::SingleColumn(projection_column) = &mut select.projection[0] else {
+        panic!("CASE")
+    };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let ast::Expr::SearchedCase(case) = &mut projection_column.expression else {
         panic!("CASE")
     };
     case.when_clauses[0].match_value =
@@ -724,7 +745,11 @@ fn dereference_borrows_its_original_interior_constant_before_name_resolution() {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select");
     };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::Dereference(node)) = &select.projection[0] else {
+    let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+        panic!("dereference");
+    };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let ast::Expr::Dereference(node) = &projection_column.expression else {
         panic!("dereference");
     };
     let owned = source.loan(&query, &control).unwrap();
@@ -936,9 +961,11 @@ fn order_key_loans_keep_their_exact_owner_field_ordinal_and_null_rules() {
             let ast::SetExpr::Select(select) = reference_query.body.as_mut() else {
                 panic!("select");
             };
-            let ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(call)) =
-                &mut select.projection[0]
-            else {
+            let ast::SelectItem::SingleColumn(projection_column) = &mut select.projection[0] else {
+                panic!("call");
+            };
+            assert!(projection_column.alias.is_none(), "anonymous projection");
+            let ast::Expr::FunctionCall(call) = &mut projection_column.expression else {
                 panic!("call");
             };
             call.window = Some(ast::Window::Reference(ast::WindowReference {
@@ -1052,7 +1079,11 @@ fn function_argument_value_borrows_original_nonzero_full_field_and_refuses_forei
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select");
     };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(call)) = &select.projection[0] else {
+    let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+        panic!("call");
+    };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let ast::Expr::FunctionCall(call) = &projection_column.expression else {
         panic!("call");
     };
     let original = &call.arguments[0].value;
@@ -1167,7 +1198,11 @@ fn dedicated_control_children_keep_mixed_original_pool_occurrences() {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select");
     };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::If(node)) = &select.projection[0] else {
+    let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+        panic!("if");
+    };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let ast::Expr::If(node) = &projection_column.expression else {
         panic!("if");
     };
     let ast::Expr::Coalesce(coalesce) = &node.true_value else {
@@ -1303,7 +1338,11 @@ fn extract_input_borrows_original_nonzero_date_pool_and_refuses_foreign_edges() 
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select");
     };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::Extract(node)) = &select.projection[0] else {
+    let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+        panic!("extract");
+    };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let ast::Expr::Extract(node) = &projection_column.expression else {
         panic!("extract");
     };
     let owned = source.loan(&query, &control).unwrap();
@@ -1416,7 +1455,11 @@ fn row_field_expression_keeps_original_nonzero_full_field_pool() {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select");
     };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::Row(row)) = &select.projection[0] else {
+    let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+        panic!("row");
+    };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let ast::Expr::Row(row) = &projection_column.expression else {
         panic!("row");
     };
     let original = &row.fields[1].expression;
@@ -1531,8 +1574,11 @@ fn concat_normalization_reloans_original_value_separator_and_order_occurrences()
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("original SELECT");
         };
-        let ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(call)) = &select.projection[0]
-        else {
+        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+            panic!("original concatenation call");
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let ast::Expr::FunctionCall(call) = &projection_column.expression else {
             panic!("original concatenation call");
         };
         call
@@ -1760,7 +1806,15 @@ fn actual_relation_path_keeps_right_derived_nonzero_pool_and_full_field() {
     let ast::SetExpr::Select(inner) = derived.query.body.as_ref() else {
         panic!("inner SELECT");
     };
-    let ast::SelectItem::ExprWithAlias { expr, .. } = &inner.projection[0] else {
+    let ast::SelectItem::SingleColumn(projection_column) = &inner.projection[0] else {
+        panic!("source value");
+    };
+    let ast::SingleColumn {
+        alias: Some(_),
+        expression: expr,
+        ..
+    } = projection_column.as_ref()
+    else {
         panic!("source value");
     };
     let owned = source.loan(&query, &control).unwrap();
@@ -1823,4 +1877,139 @@ fn actual_relation_path_keeps_right_derived_nonzero_pool_and_full_field() {
     assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
     assert_eq!(actual.field(), field.as_ref());
     assert_eq!(actual.value_type(), &ty);
+}
+
+#[test]
+fn values_and_single_column_sites_keep_original_nonzero_full_field_sources() {
+    use arrow::array::{Array, Int32Array};
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_functions::ConstantPool;
+    let control = SqlCompileControl::unbounded();
+    let policy = crate::constant::test_constant_policy();
+    let ty = FunctionValueType::new(DataType::Int32, false);
+    let field = Arc::new(
+        Field::new("original_projection_value", DataType::Int32, false).with_metadata(
+            std::collections::HashMap::from([(
+                "provider.unknown".to_string(),
+                "projection-values".to_string(),
+            )]),
+        ),
+    );
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        Int32Array::from(vec![13, -23]).to_data(),
+        policy,
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let retained = pool.value(1).unwrap();
+    for (sql, site, wrong_kind, wrong_index) in [
+        (
+            "VALUES (1, only_original_value)",
+            SqlConstantExpressionSite::ValuesCell { row: 0, column: 1 },
+            SqlConstantExpressionSite::SelectProjection { column: 1 },
+            SqlConstantExpressionSite::ValuesCell { row: 0, column: 2 },
+        ),
+        (
+            "SELECT 1, only_original_value AS preserved_alias",
+            SqlConstantExpressionSite::SelectProjection { column: 1 },
+            SqlConstantExpressionSite::ValuesCell { row: 0, column: 1 },
+            SqlConstantExpressionSite::SelectProjection { column: 2 },
+        ),
+    ] {
+        let query = query(sql);
+        let constants = |site| {
+            vec![SqlExpressionConstant::new(
+                Vec::new(),
+                site,
+                retained.clone(),
+            )]
+            .into()
+        };
+        let source =
+            MaterializedValues::try_new_expressions(&query, constants(site), &control).unwrap();
+        let expression = match query.body.as_ref() {
+            ast::SetExpr::Values(values) => {
+                ast::ValuesRowCells::new(&values.rows[0]).get(1).unwrap()
+            }
+            ast::SetExpr::Select(select) => {
+                let ast::SelectItem::SingleColumn(column) = &select.projection[1] else {
+                    panic!("single column")
+                };
+                assert_eq!(column.alias.as_ref().unwrap().value, "preserved_alias");
+                &column.expression
+            }
+            _ => panic!("actual source owner"),
+        };
+        let owned = source.loan(&query, &control).unwrap();
+        let loan = owned.view();
+        let actual = loan.constant_at(expression).unwrap();
+        assert_eq!(actual.ordinal(), 1);
+        assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+        assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+        assert_eq!(actual.field(), field.as_ref());
+        assert_eq!(actual.value_type(), &ty);
+        assert_eq!(
+            actual
+                .field()
+                .metadata()
+                .get("provider.unknown")
+                .map(String::as_str),
+            Some("projection-values")
+        );
+        assert!(loan.constant_at(&(*expression).clone()).is_none());
+        for wrong in [wrong_kind, wrong_index] {
+            assert!(
+                MaterializedValues::try_new_expressions(&query, constants(wrong), &control)
+                    .is_err()
+            );
+        }
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let functions = build_builtin_engine_function_catalog().unwrap();
+        let (resolved, _, _) = crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
+            &query,
+            &catalog,
+            "db",
+            &functions,
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            policy,
+            &control,
+            Some(&source),
+        )
+        .unwrap();
+        let actual = match &resolved.body {
+            crate::analysis::QueryBody::Values(values) => &values.rows[0][1],
+            crate::analysis::QueryBody::Select(select) => {
+                assert_eq!(
+                    select.projection[1].field_name.as_deref(),
+                    Some("preserved_alias")
+                );
+                &select.projection[1].expr
+            }
+            _ => panic!("resolved source owner"),
+        };
+        let crate::analysis::ExprKind::Constant(actual) = &actual.kind else {
+            panic!("source constant")
+        };
+        assert_eq!(actual.ordinal(), 1);
+        assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+        assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+        assert_eq!(actual.value_type(), &ty);
+    }
+    let wildcard = query("SELECT *");
+    assert!(
+        MaterializedValues::try_new_expressions(
+            &wildcard,
+            vec![SqlExpressionConstant::new(
+                Vec::new(),
+                SqlConstantExpressionSite::SelectProjection { column: 0 },
+                retained
+            )]
+            .into(),
+            &control
+        )
+        .is_err()
+    );
 }

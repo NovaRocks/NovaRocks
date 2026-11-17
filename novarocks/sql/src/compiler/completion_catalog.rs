@@ -558,9 +558,7 @@ impl<'a> CatalogNeedCollector<'a> {
             ast::SetExpr::Select(select) => self.collect_select(select, scope),
             ast::SetExpr::Values(values) => {
                 for row in &values.rows {
-                    for expression in row {
-                        self.collect_expr(expression, scope)?;
-                    }
+                    self.collect_expr(row, scope)?;
                 }
                 Ok(())
             }
@@ -581,23 +579,14 @@ impl<'a> CatalogNeedCollector<'a> {
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
         self.step()?;
-        if let ast::SelectQuantifier::Distinct { on, .. } = &select.quantifier {
-            for expression in on {
-                self.collect_expr(expression, scope)?;
-            }
-        }
         for item in &select.projection {
             match item {
-                ast::SelectItem::UnnamedExpr(expression)
-                | ast::SelectItem::ExprWithAlias {
-                    expr: expression, ..
-                } => {
-                    self.collect_expr(expression, scope)?;
+                ast::SelectItem::SingleColumn(column) => {
+                    self.collect_expr(&column.expression, scope)?
                 }
-                ast::SelectItem::Wildcard { options, .. }
-                | ast::SelectItem::QualifiedWildcard { options, .. } => {
-                    for replacement in &options.replace {
-                        self.collect_expr(&replacement.expr, scope)?;
+                ast::SelectItem::AllColumns(columns) => {
+                    if let Some(target) = &columns.target {
+                        self.collect_expr(target, scope)?;
                     }
                 }
             }

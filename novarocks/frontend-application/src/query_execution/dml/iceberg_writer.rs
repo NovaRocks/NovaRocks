@@ -540,7 +540,6 @@ fn wrap_insert_query_with_write_projection(
         projection.push(build::item(
             expression,
             Some(build::ident(&column.name, true)),
-            true,
         ));
     }
     let alias_source_columns = if insert_columns.is_empty() {
@@ -584,8 +583,7 @@ fn insert_source_expression_span(query: &Query, ordinal: usize) -> novarocks_par
                 .projection
                 .get(ordinal)
                 .map_or(SYNTHETIC, |item| match item {
-                    ast::SelectItem::UnnamedExpr(expr)
-                    | ast::SelectItem::ExprWithAlias { expr, .. } => expr.span(),
+                    ast::SelectItem::SingleColumn(column) => column.expression.span(),
                     _ => SYNTHETIC,
                 })
         }
@@ -1051,7 +1049,10 @@ mod tests {
             );
         };
         let row = values.rows.first().expect("one row");
-        let rendered: Vec<String> = row.iter().map(printer::print_expr).collect();
+        let rendered: Vec<String> = ast::ValuesRowCells::new(row)
+            .iter()
+            .map(printer::print_expr)
+            .collect();
         assert_eq!(rendered, vec!["10", "5", "30"]);
     }
 
@@ -1085,8 +1086,14 @@ mod tests {
                 printer::print_query(&query)
             );
         };
-        let first_row: Vec<String> = values.rows[0].iter().map(printer::print_expr).collect();
-        let second_row: Vec<String> = values.rows[1].iter().map(printer::print_expr).collect();
+        let first_row: Vec<String> = ast::ValuesRowCells::new(&values.rows[0])
+            .iter()
+            .map(printer::print_expr)
+            .collect();
+        let second_row: Vec<String> = ast::ValuesRowCells::new(&values.rows[1])
+            .iter()
+            .map(printer::print_expr)
+            .collect();
         assert_eq!(first_row, vec!["1", "'us'", "10.5"]);
         assert_eq!(second_row, vec!["2", "'eu'", "20"]);
     }
@@ -1116,7 +1123,10 @@ mod tests {
                 printer::print_query(&query)
             );
         };
-        let row: Vec<String> = values.rows[0].iter().map(printer::print_expr).collect();
+        let row: Vec<String> = ast::ValuesRowCells::new(&values.rows[0])
+            .iter()
+            .map(printer::print_expr)
+            .collect();
         assert_eq!(row, vec!["1", "NULL", "10"]);
     }
 
@@ -1158,7 +1168,8 @@ mod tests {
                 printer::print_query(&query)
             );
         };
-        let ast::Expr::Literal(value) = &values.rows[0][0] else {
+        let ast::Expr::Literal(value) = ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap()
+        else {
             panic!("original source string literal");
         };
         let ast::LiteralKind::String(s) = &value.kind else {
@@ -1184,7 +1195,8 @@ mod tests {
                 printer::print_query(&query)
             );
         };
-        let ast::Expr::Literal(value) = &values.rows[0][0] else {
+        let ast::Expr::Literal(value) = ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap()
+        else {
             panic!("original literal");
         };
         let ast::LiteralKind::String(s) = &value.kind else {
@@ -1263,9 +1275,14 @@ mod tests {
         let ast::SetExpr::Select(original) = source.body.as_ref() else {
             panic!("source SELECT");
         };
-        let ast::SelectItem::ExprWithAlias { expr, .. } = &outer.projection[0] else {
+        let ast::SelectItem::SingleColumn(single_column) = &outer.projection[0] else {
             panic!("target source reference");
         };
+        let Some(_) = &single_column.alias else {
+            panic!("target source reference");
+        };
+        let expr = &single_column.expression;
+
         assert_eq!(expr.span(), original.projection[1].span());
     }
 
@@ -1297,9 +1314,14 @@ mod tests {
             panic!("outer SELECT");
         };
         for item in &outer.projection[1..] {
-            let ast::SelectItem::ExprWithAlias { expr, .. } = item else {
+            let ast::SelectItem::SingleColumn(single_column) = item else {
                 panic!("target source expression");
             };
+            let Some(_) = &single_column.alias else {
+                panic!("target source expression");
+            };
+            let expr = &single_column.expression;
+
             assert!(
                 matches!(
                     expr,
@@ -1336,23 +1358,30 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("outer SELECT");
         };
-        let ast::SelectItem::ExprWithAlias {
-            expr: ast::Expr::Dereference(reference),
-            alias,
-            ..
-        } = &select.projection[0]
-        else {
+        let ast::SelectItem::SingleColumn(single_column) = &select.projection[0] else {
             panic!("source column reference");
         };
+        let Some(alias) = &single_column.alias else {
+            panic!("source column reference");
+        };
+        let ast::Expr::Dereference(reference) = &single_column.expression else {
+            panic!("source column reference");
+        };
+
         assert!(alias.quoted);
         assert!(reference.field.as_ref().unwrap().quoted);
         assert!(
             matches!(&reference.base, ast::Expr::Identifier(qualifier) if qualifier.quoted && qualifier.value == "__nr_insert_src")
         );
         assert_eq!(reference.span, insert_source_expression_span(&source, 0));
-        let ast::SelectItem::ExprWithAlias { expr, alias, .. } = &select.projection[1] else {
+        let ast::SelectItem::SingleColumn(single_column) = &select.projection[1] else {
             panic!("default projection");
         };
+        let Some(alias) = &single_column.alias else {
+            panic!("default projection");
+        };
+        let expr = &single_column.expression;
+
         assert!(alias.quoted);
         assert!(matches!(expr, ast::Expr::Row(row) if row.fields.len() == 1));
         assert_eq!(

@@ -184,7 +184,6 @@ pub(crate) fn rewrite_select_sql_for_state(
                 projection.push(build::item(
                     key.expr.clone(),
                     Some(select_alias_ident(&key.output_name)),
-                    true,
                 ));
             }
             VisibleAggregateOutput::Aggregate(index) => {
@@ -200,15 +199,21 @@ pub(crate) fn rewrite_select_sql_for_state(
             SQL_MV_AGG_RETRACTION_COUNT_STATE_COLUMN,
         ));
     }
-    select.projection = projection;
+    select.projection = projection.into();
     Ok(query)
 }
 
 fn projection_expr_and_output_name(item: &ast::SelectItem) -> Result<(&ast::Expr, String), String> {
     match item {
-        ast::SelectItem::UnnamedExpr(expr) => Ok((expr, printer::print_expr(expr))),
-        ast::SelectItem::ExprWithAlias { expr, alias, .. } => Ok((expr, alias.value.clone())),
-        ast::SelectItem::QualifiedWildcard { .. } | ast::SelectItem::Wildcard { .. } => Err(
+        ast::SelectItem::SingleColumn(column) => Ok((
+            &column.expression,
+            column
+                .alias
+                .as_ref()
+                .map(|alias| alias.value.clone())
+                .unwrap_or_else(|| printer::print_expr(&column.expression)),
+        )),
+        ast::SelectItem::AllColumns(_) => Err(
             "incremental aggregate MV projection can only contain expressions or aliases"
                 .to_string(),
         ),
@@ -410,12 +415,11 @@ fn aggregate_select_item(
             vec![argument],
         ),
         Some(build::ident(alias, false)),
-        true,
     ))
 }
 
 fn count_star_select_item(alias: &str) -> ast::SelectItem {
-    build::item(build::count_star(), Some(build::ident(alias, false)), true)
+    build::item(build::count_star(), Some(build::ident(alias, false)))
 }
 
 #[cfg(test)]

@@ -68,9 +68,11 @@ fn projection(query: &ast::Query) -> &ast::Expr {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("SELECT fixture");
     };
-    let [ast::SelectItem::UnnamedExpr(expression)] = select.projection.as_slice() else {
+    let [ast::SelectItem::SingleColumn(projection_column)] = select.projection.as_slice() else {
         panic!("one expression fixture");
     };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let expression = &projection_column.expression;
     expression
 }
 fn json_list_target() -> novarocks_type_contract::FunctionValueType {
@@ -715,7 +717,7 @@ fn unsupported_access_profiles_refuse_before_base_or_table_resolution() {
         let ast::SetExpr::Select(select) = parsed.body.as_mut() else {
             panic!("SELECT fixture");
         };
-        select.projection[0] = ast::SelectItem::UnnamedExpr(expression);
+        select.projection[0] = novarocks_parser::build::item(expression, None);
         // NoTables panics on lookup, so this also protects public prepass order.
         let error = crate::analyzer::analyze(&parsed, &NoTables, "default").unwrap_err();
         assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
@@ -808,7 +810,11 @@ fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly()
     let ast::SetExpr::Select(select) = parsed.body.as_mut() else {
         panic!("select");
     };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::Row(row)) = &mut select.projection[0] else {
+    let ast::SelectItem::SingleColumn(projection_column) = &mut select.projection[0] else {
+        panic!("row");
+    };
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let ast::Expr::Row(row) = &mut projection_column.expression else {
         panic!("row");
     };
     row.fields[0].name = Some(build::ident("Named", true));

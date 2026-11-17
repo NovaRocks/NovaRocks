@@ -315,12 +315,15 @@ fn context_body<'a>(
             for site in assignments.sites() {
                 let mut only_holes = true;
                 for row in &values.rows {
-                    if let Some(expression) = row.get(site.output_ordinal()) {
+                    if let Some(expression) =
+                        ast::ValuesRowCells::new(row).get(site.output_ordinal())
+                    {
                         only_holes &= context_hole(expression, source, control)?;
                     }
                 }
                 for row in &values.rows {
-                    if let Some(expression) = row.get(site.output_ordinal())
+                    if let Some(expression) =
+                        ast::ValuesRowCells::new(row).get(site.output_ordinal())
                         && (only_holes || !context_hole(expression, source, control)?)
                     {
                         context_literal(expression, site.input(), source, policy, control)?;
@@ -331,12 +334,10 @@ fn context_body<'a>(
         ast::SetExpr::Select(select) => {
             // With a wildcard, AST item ordinal is not output ordinal. Exact
             // producer-authored paths may still supply a literal context.
-            let scalar_projection = select.projection.iter().all(|item| {
-                matches!(
-                    item,
-                    ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
-                )
-            });
+            let scalar_projection = select
+                .projection
+                .iter()
+                .all(|item| matches!(item, ast::SelectItem::SingleColumn(_)));
             if scalar_projection {
                 for site in assignments.sites() {
                     let expression =
@@ -344,8 +345,7 @@ fn context_body<'a>(
                             .projection
                             .get(site.output_ordinal())
                             .and_then(|item| match item {
-                                ast::SelectItem::UnnamedExpr(expr)
-                                | ast::SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+                                ast::SelectItem::SingleColumn(column) => Some(&column.expression),
                                 _ => None,
                             });
                     if let Some(expression) = expression {
@@ -750,9 +750,11 @@ mod case_context_tests {
             let ast::SetExpr::Select(select) = query.body.as_ref() else {
                 panic!("select")
             };
-            let ast::SelectItem::UnnamedExpr(expression) = &select.projection[0] else {
+            let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
                 panic!("CASE projection")
             };
+            assert!(projection_column.alias.is_none(), "anonymous projection");
+            let expression = &projection_column.expression;
             let mut source = MaterializedSourceBorrow::empty(query);
             assert_eq!(
                 context_hole(expression, &source, &control).unwrap(),

@@ -115,8 +115,8 @@ fn validate_imv_aggregate_star_set_expr(expr: &SetExpr) -> Result<(), AnalyzeErr
         SetExpr::Select(select) => {
             for item in &select.projection {
                 let expr = match item {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
-                    SelectItem::Wildcard { .. } | SelectItem::QualifiedWildcard { .. } => continue,
+                    SelectItem::SingleColumn(column) => &column.expression,
+                    SelectItem::AllColumns(_) => continue,
                 };
                 validate_imv_aggregate_star_expr(expr)?;
             }
@@ -3062,10 +3062,8 @@ fn reject_unsupported_query_clauses(query: &Query) -> Result<(), String> {
 }
 
 fn reject_unsupported_select_clauses(select: &Select) -> Result<(), String> {
-    if !matches!(
-        select.quantifier,
-        ast::SelectQuantifier::None | ast::SelectQuantifier::All(_)
-    ) || select.group_by.is_some()
+    if select.distinct
+        || select.group_by.is_some()
         || select.having.is_some()
         || !select.windows.is_empty()
         || select.qualify.is_some()
@@ -3077,10 +3075,8 @@ fn reject_unsupported_select_clauses(select: &Select) -> Result<(), String> {
 }
 
 fn reject_unsupported_aggregate_select_clauses(select: &Select) -> Result<(), String> {
-    if !matches!(
-        select.quantifier,
-        ast::SelectQuantifier::None | ast::SelectQuantifier::All(_)
-    ) || select.having.is_some()
+    if select.distinct
+        || select.having.is_some()
         || !select.windows.is_empty()
         || select.qualify.is_some()
         || !select.modifiers.is_empty()
@@ -3122,9 +3118,15 @@ fn aggregate_group_by_exprs(group_by: &Option<ast::GroupBy>) -> Result<Vec<&Expr
 
 fn projection_expr_and_output_name(item: &SelectItem) -> Result<(&Expr, String), String> {
     match item {
-        SelectItem::UnnamedExpr(expr) => Ok((expr, printer::print_expr(expr))),
-        SelectItem::ExprWithAlias { expr, alias, .. } => Ok((expr, alias.value.clone())),
-        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => Err(
+        SelectItem::SingleColumn(column) => Ok((
+            &column.expression,
+            column
+                .alias
+                .as_ref()
+                .map(|alias| alias.value.clone())
+                .unwrap_or_else(|| printer::print_expr(&column.expression)),
+        )),
+        SelectItem::AllColumns(_) => Err(
             "incremental aggregate MV projection can only contain expressions or aliases"
                 .to_string(),
         ),
@@ -3329,10 +3331,8 @@ fn is_probably_aggregate_query(query: &Query) -> bool {
 
 fn select_item_contains_aggregate_function(item: &SelectItem) -> bool {
     match item {
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            expr_contains_aggregate_function(expr)
-        }
-        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => false,
+        SelectItem::SingleColumn(column) => expr_contains_aggregate_function(&column.expression),
+        SelectItem::AllColumns(_) => false,
     }
 }
 
@@ -3452,22 +3452,20 @@ fn reject_unsupported_projection_filter_exprs(select: &Select) -> Result<(), Str
 
 fn reject_unsupported_select_item_expr(item: &SelectItem) -> Result<(), String> {
     match item {
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            reject_unsupported_expr(expr)
-        }
-        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => Ok(()),
+        SelectItem::SingleColumn(column) => reject_unsupported_expr(&column.expression),
+        SelectItem::AllColumns(_) => Ok(()),
     }
 }
 
 fn reject_match_against_before_from_shape_check(select: &Select) -> Result<(), String> {
     for item in &select.projection {
         match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                if contains_match_against(expr) {
+            SelectItem::SingleColumn(column) => {
+                if contains_match_against(&column.expression) {
                     return Err(projection_filter_error());
                 }
             }
-            SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => {}
+            SelectItem::AllColumns(_) => {}
         }
     }
     if let Some(selection) = &select.selection
@@ -4028,16 +4026,19 @@ mod tests {
                 span: novarocks_parser::SYNTHETIC,
             })),
             Some(novarocks_parser::build::ident("value", false)),
-            true,
         );
         assert!(classify_incremental_mv_query(&query).is_ok());
         let SetExpr::Select(select) = query.body.as_mut() else {
             panic!("SELECT")
         };
-        let ast::SelectItem::ExprWithAlias {
-            expr: Expr::JsonObject(node),
+        let ast::SelectItem::SingleColumn(projection_column) = &mut select.projection[0] else {
+            panic!("JSON_OBJECT")
+        };
+        let ast::SingleColumn {
+            alias: Some(_),
+            expression: Expr::JsonObject(node),
             ..
-        } = &mut select.projection[0]
+        } = projection_column.as_mut()
         else {
             panic!("JSON_OBJECT")
         };
@@ -4065,7 +4066,6 @@ mod tests {
                 novarocks_parser::SYNTHETIC,
             ))),
             Some(novarocks_parser::build::ident("value", false)),
-            true,
         );
         assert!(classify_incremental_mv_query(&query).is_ok());
     }

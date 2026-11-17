@@ -484,9 +484,13 @@ fn round_and_truncate_decimal_result_is_the_exact_selected_binding() {
                 let ast::SetExpr::Select(select) = query.body.as_mut() else {
                     panic!("expected the decimal call projection");
                 };
-                let Some(ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(call))) =
+                let Some(ast::SelectItem::SingleColumn(projection_column)) =
                     select.projection.first_mut()
                 else {
+                    panic!("expected the ordinary scalar call AST");
+                };
+                assert!(projection_column.alias.is_none(), "anonymous projection");
+                let ast::Expr::FunctionCall(call) = &mut projection_column.expression else {
                     panic!("expected the ordinary scalar call AST");
                 };
                 call.name.parts.last_mut().unwrap().value = "truncate".to_string();

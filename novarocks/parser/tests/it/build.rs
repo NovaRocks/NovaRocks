@@ -60,7 +60,7 @@ fn assert_expression(built: Expr, source: &str) {
 fn select_body(value: i64) -> SetExpr {
     SetExpr::Select(novarocks_parser::ast::AstBox::new(
         build::select(
-            vec![build::item(build::integer(value), None, false)],
+            vec![build::item(build::integer(value), None)],
             None,
             None,
             None,
@@ -441,8 +441,8 @@ fn select_relation_aliases_and_grouping_match_parser() {
     let column = build::column(build::ident("s", false), build::ident("k1", false));
     let select = build::select(
         vec![
-            build::item(column.clone(), Some(build::ident("k", false)), true),
-            build::item(build::count_star(), Some(build::ident("n", false)), false),
+            build::item(column.clone(), Some(build::ident("k", false))),
+            build::item(build::count_star(), Some(build::ident("n", false))),
         ],
         Some(joined),
         Some(build::is_null(column.clone(), true)),
@@ -508,7 +508,10 @@ fn union_all_preserves_input_order_and_set_boundaries() {
             let SetExpr::Select(select) = input else {
                 panic!("SELECT operand")
             };
-            let ast::SelectItem::UnnamedExpr(Expr::Literal(value)) = &select.projection[0] else {
+            let ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
+                panic!("literal projection")
+            };
+            let Expr::Literal(value) = &column.expression else {
                 panic!("literal projection")
             };
             value.kind.clone()
@@ -556,7 +559,7 @@ fn derived_expressions_retain_source_locations_and_envelopes_are_synthetic() {
         source_span
     );
     let built = build::query(SetExpr::Select(novarocks_parser::ast::AstBox::new(
-        build::select(vec![build::item(cast, None, false)], None, None, None).expect("SELECT"),
+        build::select(vec![build::item(cast, None)], None, None, None).expect("SELECT"),
     )));
     assert_eq!(built.span, SYNTHETIC);
     assert_eq!(built.body.span(), SYNTHETIC);
@@ -618,7 +621,10 @@ fn public_literals_retain_categories_decoded_bytes_and_numeric_facts() {
         .projection
         .iter()
         .map(|item| {
-            let ast::SelectItem::UnnamedExpr(Expr::Literal(value)) = item else {
+            let ast::SelectItem::SingleColumn(column) = item else {
+                panic!("literal")
+            };
+            let Expr::Literal(value) = &column.expression else {
                 panic!("literal")
             };
             &value.kind
@@ -750,11 +756,14 @@ fn logical_minimum_arity_is_checked_without_catalog_or_analysis() {
             panic!("SELECT")
         };
         let span = Span::new(30, 40);
-        select.projection[0] = ast::SelectItem::UnnamedExpr(Expr::Logical(ast::LogicalExpr {
-            operator: ast::LogicalOperator::And,
-            terms: terms.into(),
-            span,
-        }));
+        select.projection[0] = novarocks_parser::build::item(
+            Expr::Logical(ast::LogicalExpr {
+                operator: ast::LogicalOperator::And,
+                terms: terms.into(),
+                span,
+            }),
+            None,
+        );
         let error = ast::validate_statement(&ast::Statement::Query(parsed)).unwrap_err();
         assert!(
             matches!(error, novarocks_parser::ValidateError::InvalidStructure { violation: novarocks_parser::StructuralViolation::InvalidLogicalTermCount, span: actual } if actual == span)
@@ -801,7 +810,7 @@ fn actual_recursive_logical_storage_guards_clone_walk_fold_compare_validation_pr
     let SetExpr::Select(select) = parsed.body.as_mut() else {
         unreachable!()
     };
-    select.projection[0] = ast::SelectItem::UnnamedExpr(folded);
+    select.projection[0] = novarocks_parser::build::item(folded, None);
     ast::validate_statement(&ast::Statement::Query(parsed)).unwrap();
     drop(node);
 }
@@ -973,9 +982,10 @@ fn old_input_identifier_delimiters_share_facts_without_reclassifying_strings() {
     let SetExpr::Select(select) = quoted.body.as_ref() else {
         panic!("SELECT");
     };
-    let ast::SelectItem::ExprWithAlias { alias, .. } = &select.projection[0] else {
+    let ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
         panic!("explicit alias");
     };
+    let alias = column.alias.as_ref().expect("original alias");
     assert_eq!(alias.value, "a\"b");
     assert!(alias.quoted);
     assert_eq!(alias.span, Span::new(12, source.len()));

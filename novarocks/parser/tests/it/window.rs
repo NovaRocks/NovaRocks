@@ -102,7 +102,7 @@ fn operation(frame: WindowFrame) -> Expr {
 fn statement(expr: Expr) -> Statement {
     Statement::Query(build::query(SetExpr::Select(
         novarocks_parser::ast::AstBox::new(
-            build::select(vec![build::item(expr, None, false)], None, None, None).unwrap(),
+            build::select(vec![build::item(expr, None)], None, None, None).unwrap(),
         ),
     )))
 }

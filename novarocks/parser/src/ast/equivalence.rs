@@ -138,14 +138,16 @@ impl SyntaxEq for Corresponding {
 }
 
 impl SyntaxEq for Values {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.explicit_row == other.explicit_row && syntax_eq_nested_slice(&self.rows, &other.rows)
+        syntax_eq_slice(&self.rows, &other.rows)
     }
 }
 
 impl SyntaxEq for Select {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.quantifier.syntax_eq(&other.quantifier)
+        self.distinct == other.distinct
             && syntax_eq_slice(&self.projection, &other.projection)
             && syntax_eq_option(&self.from, &other.from)
             && syntax_eq_option(&self.selection, &other.selection)
@@ -157,72 +159,27 @@ impl SyntaxEq for Select {
     }
 }
 
-impl SyntaxEq for SelectQuantifier {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::None, Self::None) | (Self::All(_), Self::All(_)) => true,
-            (Self::Distinct { on: left, .. }, Self::Distinct { on: right, .. }) => {
-                syntax_eq_slice(left, right)
-            }
-            _ => false,
-        }
-    }
-}
-
 impl SyntaxEq for SelectItem {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::UnnamedExpr(left), Self::UnnamedExpr(right)) => left.syntax_eq(right),
-            (
-                Self::ExprWithAlias {
-                    expr: left_expr,
-                    alias: left_alias,
-                    explicit_as: left_explicit_as,
-                    ..
-                },
-                Self::ExprWithAlias {
-                    expr: right_expr,
-                    alias: right_alias,
-                    explicit_as: right_explicit_as,
-                    ..
-                },
-            ) => {
-                left_expr.syntax_eq(right_expr)
-                    && left_alias.syntax_eq(right_alias)
-                    && left_explicit_as == right_explicit_as
-            }
-            (Self::Wildcard { options: left, .. }, Self::Wildcard { options: right, .. }) => {
-                left.syntax_eq(right)
-            }
-            (
-                Self::QualifiedWildcard {
-                    prefix: left_prefix,
-                    options: left_options,
-                    ..
-                },
-                Self::QualifiedWildcard {
-                    prefix: right_prefix,
-                    options: right_options,
-                    ..
-                },
-            ) => {
-                syntax_eq_slice(left_prefix, right_prefix) && left_options.syntax_eq(right_options)
-            }
+            (Self::SingleColumn(a), Self::SingleColumn(b)) => a.syntax_eq(b),
+            (Self::AllColumns(a), Self::AllColumns(b)) => a.syntax_eq(b),
             _ => false,
         }
     }
 }
-
-impl SyntaxEq for WildcardOptions {
+impl SyntaxEq for SingleColumn {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_slice(&self.exclude, &other.exclude)
-            && syntax_eq_slice(&self.replace, &other.replace)
+        self.expression.syntax_eq(&other.expression) && syntax_eq_option(&self.alias, &other.alias)
     }
 }
-
-impl SyntaxEq for ReplaceSelectItem {
+impl SyntaxEq for AllColumns {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.expr.syntax_eq(&other.expr) && self.alias.syntax_eq(&other.alias)
+        syntax_eq_option(&self.target, &other.target)
+            && syntax_eq_slice(&self.aliases, &other.aliases)
     }
 }
 
@@ -536,14 +493,6 @@ fn syntax_eq_slice<T: SyntaxEq>(left: &[T], right: &[T]) -> bool {
             .all(|(left, right)| left.syntax_eq(right))
 }
 
-fn syntax_eq_nested_slice<T: SyntaxEq>(left: &[Vec<T>], right: &[Vec<T>]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| syntax_eq_slice(left, right))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,8 +629,22 @@ mod tests {
                         functions: crate::ast::AstVec::new(),
                         with: None,
                         body: crate::ast::AstBox::new(SetExpr::Values(Values {
-                            rows: vec![vec![number("1", start + 2)]],
-                            explicit_row: true,
+                            rows: (vec![vec![number("1", start + 2)]])
+                                .into_iter()
+                                .map(|cells| {
+                                    crate::ast::Expr::Row(crate::ast::RowExpr {
+                                        fields: cells
+                                            .into_iter()
+                                            .map(|expression| crate::ast::RowField {
+                                                name: None,
+                                                span: expression.span(),
+                                                expression,
+                                            })
+                                            .collect(),
+                                        span: span(start + 3),
+                                    })
+                                })
+                                .collect(),
                             span: span(start + 3),
                         })),
                         modifiers: Default::default(),
@@ -693,16 +656,14 @@ mod tests {
                 span: span(start + 6),
             }),
             body: crate::ast::AstBox::new(SetExpr::Select(crate::ast::AstBox::new(Select {
-                quantifier: SelectQuantifier::Distinct {
-                    on: vec![sample_expr(start + 7)],
-                    span: span(start + 8),
-                },
-                projection: vec![SelectItem::ExprWithAlias {
-                    expr: sample_expr(start + 9),
-                    alias: ident("result", start + 10),
-                    explicit_as: true,
-                    span: span(start + 11),
-                }],
+                projection: (vec![crate::ast::SelectItem::SingleColumn(
+                    crate::ast::AstBox::new(crate::ast::SingleColumn {
+                        expression: sample_expr(start + 9),
+                        alias: Some(ident("result", start + 10)),
+                        span: span(start + 11),
+                    }),
+                )])
+                .into(),
                 from: None,
                 selection: None,
                 group_by: Some(GroupBy {
@@ -739,6 +700,7 @@ mod tests {
                     }),
                 },
                 span: span(start + 14),
+                distinct: true,
             }))),
             modifiers: Default::default(),
             span: span(start + 22),

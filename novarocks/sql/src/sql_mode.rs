@@ -636,9 +636,12 @@ mod tests {
                 let ast::SetExpr::Select(select) = quoted.body.as_mut() else {
                     panic!("select");
                 };
-                let ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(call)) =
-                    &mut select.projection[0]
+                let ast::SelectItem::SingleColumn(projection_column) = &mut select.projection[0]
                 else {
+                    panic!("call");
+                };
+                assert!(projection_column.alias.is_none(), "anonymous projection");
+                let ast::Expr::FunctionCall(call) = &mut projection_column.expression else {
                     panic!("call");
                 };
                 call.name.parts[0].quoted = true;

@@ -497,17 +497,32 @@ fn select_projects_target_wildcard(
     {
         return true;
     }
-    select.projection.iter().any(|item| match item {
-        novarocks_parser::ast::SelectItem::Wildcard { .. } => !qualifiers.is_empty(),
-        novarocks_parser::ast::SelectItem::QualifiedWildcard { prefix, .. } => prefix
+    select.projection.iter().any(|item| {
+        let novarocks_parser::ast::SelectItem::AllColumns(columns) = item else {
+            return false;
+        };
+        if !columns.aliases.is_empty() {
+            return false;
+        }
+        let Some(target) = &columns.target else {
+            return !qualifiers.is_empty();
+        };
+        let Some(chain) = novarocks_parser::ast::identifier_chain_observed(target, |_| {
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .unwrap_or_else(|never| match never {}) else {
+            return false;
+        };
+        let mut parts = chain.iter_rev().collect::<Vec<_>>();
+        parts.reverse();
+        parts
             .iter()
             .map(|ident| normalize_identifier(&ident.value))
             .collect::<Result<Vec<_>, _>>()
             .map(|parts| qualifier_keys_from_parts(&parts))
             .unwrap_or_default()
             .into_iter()
-            .any(|key| qualifiers.contains(&key)),
-        _ => false,
+            .any(|key| qualifiers.contains(&key))
     })
 }
 

@@ -300,13 +300,7 @@ fn delete_position_sink_query_ast(
 ) -> Result<Query, String> {
     let projection = sink_columns
         .iter()
-        .map(|column| {
-            build::item(
-                build::identifier(build::ident(&column.name, true)),
-                None,
-                false,
-            )
-        })
+        .map(|column| build::item(build::identifier(build::ident(&column.name, true)), None))
         .collect();
     let name = build::object_name(
         [&target.catalog, &target.namespace, &target.table]
@@ -1014,8 +1008,11 @@ mod tests {
         assert_eq!(select.selection.as_ref(), Some(&where_clause));
         assert_eq!(select.projection.len(), 3);
         for (item, expected) in select.projection.iter().zip(["_file", "_pos", "region"]) {
-            let novarocks_parser::ast::SelectItem::UnnamedExpr(Expr::Identifier(name)) = item
-            else {
+            let novarocks_parser::ast::SelectItem::SingleColumn(column) = item else {
+                panic!("identity or partition-source column");
+            };
+            assert!(column.alias.is_none());
+            let Expr::Identifier(name) = &column.expression else {
                 panic!("identity or partition-source column");
             };
             assert_eq!(name.value, expected);

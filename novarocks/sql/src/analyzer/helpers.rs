@@ -1812,10 +1812,13 @@ mod tests {
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select body");
         };
-        let [novarocks_parser::ast::SelectItem::UnnamedExpr(expr)] = select.projection.as_slice()
+        let [novarocks_parser::ast::SelectItem::SingleColumn(projection_column)] =
+            select.projection.as_slice()
         else {
             panic!("expected unnamed expr");
         };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let expr = &projection_column.expression;
         expr.clone()
     }
 
@@ -1827,10 +1830,13 @@ mod tests {
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected native select body");
         };
-        let [
-            novarocks_parser::ast::SelectItem::UnnamedExpr(novarocks_parser::ast::Expr::Cast(cast)),
-        ] = select.projection.as_slice()
+        let [novarocks_parser::ast::SelectItem::SingleColumn(projection_column)] =
+            select.projection.as_slice()
         else {
+            panic!("expected native cast expression");
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let novarocks_parser::ast::Expr::Cast(cast) = &projection_column.expression else {
             panic!("expected native cast expression");
         };
         cast.data_type.clone()
@@ -2287,7 +2293,7 @@ mod tests {
             let ast::SetExpr::Select(select) = query.body.as_mut() else {
                 panic!("select")
             };
-            select.projection[0] = ast::SelectItem::UnnamedExpr(expression);
+            select.projection[0] = novarocks_parser::build::item(expression, None);
             let error = crate::analyzer::analyze(query, &NoLookup, "default").unwrap_err();
             assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
             assert_eq!(error.span(), Some(span));
