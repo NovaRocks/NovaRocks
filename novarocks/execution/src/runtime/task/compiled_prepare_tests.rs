@@ -539,14 +539,32 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
             Err(novarocks_functions::KernelFailure::ResourceExhausted.into())
         }
     }
+    // The commit port still runs before the result writer. Both probes must
+    // stay at zero: a submission-boundary refusal cannot reach either host call.
+    struct FirstResultOpen(AtomicUsize);
+    impl TaskResultWriter for FirstResultOpen {
+        fn open(&self, _: ResultWriteSpec) -> Result<Arc<dyn TaskResultSession>, TaskIoError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(TaskIoError::new(
+                crate::runtime::task::io::TaskIoOperation::ResultOpen,
+                crate::runtime::task::io::TaskIoErrorKind::Unavailable,
+                "result writer probe",
+            ))
+        }
+    }
     // No first-host-call refusal is allowed to hide a missing role/control
     // error. Each malformed Task binding must fail at the submission boundary.
     for scenario in 0..6 {
         let owner = Owner::new();
         let foreign = Owner::new();
-        let calls = Arc::new(FirstHostCall(AtomicUsize::new(0)));
+        let commit_calls = Arc::new(FirstHostCall(AtomicUsize::new(0)));
+        let writer_calls = Arc::new(FirstResultOpen(AtomicUsize::new(0)));
         let control = Arc::new(owner.view(TaskFailurePhase::Execution));
-        let mut context = LocalTaskPrepareContext::default().with_task_commit_port(calls.clone());
+        let mut context = LocalTaskPrepareContext {
+            result_writer: writer_calls.clone(),
+            ..LocalTaskPrepareContext::default()
+        }
+        .with_task_commit_port(commit_calls.clone());
         context = match scenario {
             0 => context
                 .with_result_identity(owner.identity())
@@ -588,9 +606,14 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
             "scenario {scenario}"
         );
         assert_eq!(
-            calls.0.load(Ordering::SeqCst),
+            commit_calls.0.load(Ordering::SeqCst),
             0,
-            "scenario {scenario} reached host acquisition"
+            "scenario {scenario} reached commit-port acquisition"
+        );
+        assert_eq!(
+            writer_calls.0.load(Ordering::SeqCst),
+            0,
+            "scenario {scenario} reached result-writer acquisition"
         );
         assert!(error.cleanup_diagnostics().is_empty());
     }

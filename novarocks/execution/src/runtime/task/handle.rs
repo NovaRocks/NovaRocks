@@ -1866,72 +1866,138 @@ mod owner_tests {
                 .expect("one original registration"))
         }
     }
-    struct CommitHolderGate {
-        registered: AtomicBool,
-        rollback_count: AtomicUsize,
+    struct ResourceHolderGate {
         drops: AtomicUsize,
         entered: AtomicBool,
         released: Mutex<bool>,
         cv: Condvar,
     }
-    struct GatedCommitPort {
-        gate: Arc<CommitHolderGate>,
-        tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
-    }
-    struct GatedCommitRegistration {
-        gate: Arc<CommitHolderGate>,
+    /// Healthy sibling holder. Every Task stores the injected receiver port,
+    /// and an empty result submission leaves no extra receiver alias.
+    struct GatedReceiverPort {
+        inner: Arc<dyn ExchangeReceiverPort>,
+        gate: Arc<ResourceHolderGate>,
         charge: Option<crate::runtime::mem_tracker::TrackedBytes>,
     }
-    impl crate::runtime::task::io::TaskCommitPort for GatedCommitPort {
-        fn acquire(
+    impl ExchangeReceiverPort for GatedReceiverPort {
+        fn bind_unit_receiver(
             &self,
-            _: UniqueId,
-        ) -> super::super::ExecutionResult<Box<dyn crate::runtime::task::io::TaskCommitRegistration>>
-        {
-            assert!(!self.gate.registered.swap(true, Ordering::AcqRel));
-            Ok(Box::new(GatedCommitRegistration {
-                gate: self.gate.clone(),
-                charge: Some(
-                    crate::runtime::mem_tracker::TrackedBytes::try_new(256, self.tracker.clone())
-                        .unwrap(),
-                ),
-            }))
+            key: ExchangeReceiverKey,
+            streams: Vec<novarocks_execution_contract::ExchangeStreamIdentity>,
+            control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+            grantable_unit_bytes: u64,
+        ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
+            self.inner
+                .bind_unit_receiver(key, streams, control, grantable_unit_bytes)
+        }
+        fn register_unit_demand(
+            &self,
+            key: ExchangeReceiverKey,
+            entry: crate::runtime::task::io::exchange_unit::ExchangeDemandEntry,
+        ) -> Result<
+            crate::runtime::task::io::exchange_unit::ExchangeStreamObservation,
+            novarocks_failure_contract::FailureFact,
+        > {
+            self.inner.register_unit_demand(key, entry)
+        }
+        fn receive_unit(
+            &self,
+            key: ExchangeReceiverKey,
+            frame: crate::runtime::task::io::exchange_unit::ExchangeUnitReceiverFrame,
+        ) -> Result<
+            crate::runtime::task::io::exchange_unit::ExchangeUnitReceipt,
+            novarocks_failure_contract::FailureFact,
+        > {
+            self.inner.receive_unit(key, frame)
+        }
+        fn unit_sender_states(
+            &self,
+            sender: novarocks_types::BackendProcessId,
+            after: Option<novarocks_execution_contract::ExchangeStreamIdentity>,
+            limit: usize,
+        ) -> Result<
+            Vec<crate::runtime::task::io::exchange_unit::ExchangeStreamObservation>,
+            novarocks_failure_contract::FailureFact,
+        > {
+            self.inner.unit_sender_states(sender, after, limit)
+        }
+        fn set_unit_state_listener(
+            &self,
+            listener: Arc<dyn crate::runtime::task::io::exchange_unit::ExchangeUnitStateListener>,
+        ) -> Result<(), novarocks_failure_contract::FailureFact> {
+            self.inner.set_unit_state_listener(listener)
+        }
+        fn register(
+            &self,
+            registration: ExchangeReceiverRegistration,
+        ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
+            self.inner.register(registration)
+        }
+        fn register_with_close_observer(
+            &self,
+            registration: ExchangeReceiverRegistration,
+        ) -> Result<
+            crate::runtime::exchange::ExchangeReceiverCloseObserver,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
+            self.inner.register_with_close_observer(registration)
+        }
+        fn close_observer(
+            &self,
+            key: ExchangeReceiverKey,
+        ) -> Result<
+            crate::runtime::exchange::ExchangeReceiverCloseObserver,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
+            self.inner.close_observer(key)
+        }
+        fn cancel(&self, key: ExchangeReceiverKey) {
+            self.inner.cancel(key);
+        }
+        fn remove(&self, key: ExchangeReceiverKey) {
+            self.inner.remove(key);
+        }
+        fn cancel_task(&self, task_key: UniqueId) {
+            self.inner.cancel_task(task_key);
+        }
+        fn receiver_pin(
+            &self,
+            key: ExchangeReceiverKey,
+            expected_senders: usize,
+        ) -> Result<
+            crate::runtime::exchange::ExchangeReceiverPin,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
+            self.inner.receiver_pin(key, expected_senders)
+        }
+        fn stream_close_facts(
+            &self,
+            key: ExchangeReceiverKey,
+            expected: &[novarocks_execution_contract::ExchangeStreamIdentity],
+        ) -> Result<
+            Vec<novarocks_execution_contract::ExchangeStreamClose>,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
+            self.inner.stream_close_facts(key, expected)
+        }
+        fn ensure_mem_tracker(
+            &self,
+            key: ExchangeReceiverKey,
+            root: &Arc<crate::runtime::mem_tracker::MemTracker>,
+        ) -> Result<
+            Arc<crate::runtime::mem_tracker::MemTracker>,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
+            self.inner.ensure_mem_tracker(key, root)
+        }
+        fn snapshot(
+            &self,
+            key: ExchangeReceiverKey,
+        ) -> Option<crate::runtime::exchange::ExchangeReceiverSnapshot> {
+            self.inner.snapshot(key)
         }
     }
-    impl crate::runtime::task::io::TaskCommitRegistration for GatedCommitRegistration {
-        fn add_load_stats(
-            &mut self,
-            _: crate::runtime::task::io::TaskSinkLoadStats,
-        ) -> super::super::ExecutionResult<()> {
-            Ok(())
-        }
-        fn add_tablet_commit_info(
-            &mut self,
-            _: crate::runtime::task::io::TabletCommitInfo,
-        ) -> super::super::ExecutionResult<()> {
-            Ok(())
-        }
-        fn add_tablet_fail_info(
-            &mut self,
-            _: crate::runtime::task::io::TabletFailInfo,
-        ) -> super::super::ExecutionResult<()> {
-            Ok(())
-        }
-        fn finish(
-            &mut self,
-        ) -> super::super::ExecutionResult<crate::runtime::task::io::TaskCommitReport> {
-            unreachable!("no write commit in retirement")
-        }
-        fn handoff(&mut self) -> super::super::ExecutionResult<()> {
-            unreachable!("no write commit in retirement")
-        }
-        fn rollback(&mut self) -> super::super::ExecutionResult<()> {
-            self.gate.rollback_count.fetch_add(1, Ordering::SeqCst);
-            assert!(self.gate.registered.swap(false, Ordering::AcqRel));
-            Ok(())
-        }
-    }
-    impl Drop for GatedCommitRegistration {
+    impl Drop for GatedReceiverPort {
         fn drop(&mut self) {
             self.gate.drops.fetch_add(1, Ordering::SeqCst);
             self.gate.entered.store(true, Ordering::Release);
@@ -2017,7 +2083,7 @@ mod owner_tests {
     }
 
     #[test]
-    fn unknown_result_holder_does_not_block_healthy_commit_holder_or_revoke_body_fact() {
+    fn unknown_result_holder_does_not_block_healthy_receiver_port_holder_or_revoke_body_fact() {
         let id = UniqueId::new(98_602, 1);
         let query = original_query_resources(
             novarocks_types::QueryExecutionId::new(
@@ -2026,9 +2092,7 @@ mod owner_tests {
             )
             .unwrap(),
         );
-        let gate = Arc::new(CommitHolderGate {
-            registered: AtomicBool::new(false),
-            rollback_count: AtomicUsize::new(0),
+        let gate = Arc::new(ResourceHolderGate {
             drops: AtomicUsize::new(0),
             entered: AtomicBool::new(false),
             released: Mutex::new(false),
@@ -2040,14 +2104,19 @@ mod owner_tests {
             crate::runtime::mem_tracker::MemTracker::new_root("unresolved fragment holder");
         let result_drops = Arc::new(AtomicUsize::new(0));
         let payload_drops = Arc::new(AtomicUsize::new(0));
-        let context = LocalTaskPrepareContext {
-            commit_port: Arc::new(GatedCommitPort {
-                gate: gate.clone(),
-                tracker: healthy_tracker.clone(),
-            }),
-            ..LocalTaskPrepareContext::default()
-        }
-        .with_query_task_guard(query.task_guard());
+        let context = LocalTaskPrepareContext::default()
+            .with_exchange_receiver_port(Arc::new(GatedReceiverPort {
+                inner: crate::runtime::task::io::exchange::in_process_test_exchange_receiver_port(),
+                gate: Arc::clone(&gate),
+                charge: Some(
+                    crate::runtime::mem_tracker::TrackedBytes::try_new(
+                        256,
+                        healthy_tracker.clone(),
+                    )
+                    .unwrap(),
+                ),
+            }))
+            .with_query_task_guard(query.task_guard());
         let mut dormant = prepare_compiled_task(empty_result_submission(id), context).unwrap();
         let writer: Arc<dyn TaskResultWriter> = Arc::new(SingleResultHolderWriter(Mutex::new(
             Some(Arc::new(UnknownResultHolder {
@@ -2127,12 +2196,10 @@ mod owner_tests {
         assert_eq!(
             query.active_tasks(),
             1,
-            "the unknown sibling retains the original Task guard after healthy commit exit"
+            "the unknown sibling retains the original Task guard after the healthy receiver port reaches its destructor"
         );
         assert_eq!(healthy_tracker.current(), 0);
         assert_eq!(unknown_tracker.current(), 512);
-        assert!(!gate.registered.load(Ordering::Acquire));
-        assert_eq!(gate.rollback_count.load(Ordering::SeqCst), 1);
         assert_eq!(gate.drops.load(Ordering::SeqCst), 1);
         assert_eq!(result_drops.load(Ordering::SeqCst), 1);
         assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
@@ -2152,7 +2219,6 @@ mod owner_tests {
             1,
             "re-observation cannot manufacture unknown holder exit"
         );
-        assert_eq!(gate.rollback_count.load(Ordering::SeqCst), 1);
         assert_eq!(gate.drops.load(Ordering::SeqCst), 1);
         assert_eq!(result_drops.load(Ordering::SeqCst), 1);
     }
